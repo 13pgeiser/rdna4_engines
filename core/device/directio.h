@@ -30,11 +30,11 @@ enum {
 
     /* Open buffered when the filesystem refuses O_DIRECT, instead of failing the open.
      *
-     * Off by default, and that default is the point. The weight tier and the prefix cache are
-     * sized in gigabytes and read in megabyte runs; a silent buffered fallback turns both into a
-     * page-cache pump that is three times slower and looks like nothing at all in a profile. An
-     * operator who pointed --prefix-cache-dir at tmpfs wants to be told, not accommodated. The flag is
-     * for tests, which have to run on whatever /tmp happens to be. */
+     * Off by default, and that default is the point. The weight tier is sized in gigabytes and
+     * read in megabyte runs; a silent buffered fallback turns it into a page-cache pump that is
+     * three times slower and looks like nothing at all in a profile. An operator whose container
+     * sits on tmpfs wants to be told, not accommodated. The flag is for tests, which have to run
+     * on whatever /tmp happens to be. */
     RAD_DIO_ALLOW_BUFFERED = 16,
 };
 

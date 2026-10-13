@@ -463,6 +463,8 @@ static const RadOperandSpec oRowTopk[] = { OPD("x"), OUT("idx"), OUT("val"), OUT
 static const RadParamSpec pRowTopkMerge[] = { P_INT("M"), P_INT("R"), P_INT("world_size"),
                                               P_STR("dtype") };
 static const RadOperandSpec oRowTopkMerge[] = { OPD("gathered"), OUT("idx"), OUT("val") };
+static const RadParamSpec pPairArgmax[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oPairArgmax[] = { OPD("pairs"), OUT("idx"), OUT_O("val") };
 
 static const RadParamSpec pLogitRerank[] = { P_INT("M"), P_INT("R"), P_INT("n_vocab"),
                                             P_INT("n_embd"), P_INTO("vocab_off"), P_STR("dtype") };
@@ -976,6 +978,11 @@ static const RadOpSchema kSchemas[] = {
   "(idx, val) form the single-rank top-R produces. `gathered` is [M, world_size * R, 2] pairs, "
   "rank r's at [r*R, (r+1)*R); id -1 is a pad and is dropped. Ties break on the LOWER id, which is "
   "what makes the merged answer agree with a top-R over the unsharded plane." },
+{ "pair_argmax", ARR(pPairArgmax), ARR(oPairArgmax),
+  "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in the first "
+  "f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties to the lower "
+  "id, a negative id skipped, -1 and -inf where nothing is valid. row_topk_merge at R = 1, "
+  "written one element a row at the output's own pitch." },
 
 { "logit_rerank", ARR(pLogitRerank), ARR(oLogitRerank),
   "Rescore R candidate ids a row EXACTLY against the full-precision head and re-sort on those "
@@ -1297,6 +1304,7 @@ SIMPLE("ref_qsa_block_key", "qsa_block_key", "attn",
        ref_qsa_block_key),
 SIMPLE("ref_row_topk", "row_topk", "moe", "exact per-row top-R", DT_FLOAT, ref_row_topk),
 SIMPLE("ref_row_topk_merge", "row_topk_merge", "moe", "the global top-R of the gathered per-rank candidate sets", DT_FLOAT, ref_row_topk_merge),
+SIMPLE("ref_pair_argmax", "pair_argmax", "moe", "the global top-1 of a row of gathered (id, value) pairs, one id a row", DT_FLOAT, ref_pair_argmax),
 SIMPLE("ref_logit_rerank", "logit_rerank", "moe", "R candidates a row rescored exactly against the full-precision head", DT_FLOAT, ref_logit_rerank),
 
 SIMPLE("ref_gdn_conv_prep", "gdn_conv_prep", "gdn",

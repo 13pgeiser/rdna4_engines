@@ -138,6 +138,7 @@ struct OaiRequest {
     int         n_tools = 0;
     std::string last_user;
     std::string peer;             /* the handler sets it from the transport; "" in-process */
+    int64_t     t_received_ns = -1;   /* HttpRequest::t_received_ns, for timings' ttft and total */
     bool parse_tools = false;
     /* The reply parser this request's render produced. Per request and not per server: it is the
      * model's format bound to the tools THIS call sent, so two concurrent requests against the
@@ -362,6 +363,11 @@ struct UsageOut {
  *   draft_n, draft_n_accepted
  *                 speculative tokens proposed for this request and accepted; present when any
  *                 were proposed, as llama.cpp does
+ *   ttft_ms       from the moment the server had the whole request body to the first token: the
+ *                 parse, the chat template, tokenisation, the wait for admission and the prefill.
+ *                 The time the body took to arrive is not in it, so a client far from the server
+ *                 reads the server's own share of what it measured
+ *   total_ms      from the same moment to the last token
  *
  * The rates divide the tokens by the time that produced them: prompt_n by prompt_ms, and the
  * predicted_n - 1 tokens after the first by predicted_ms, since the first token is the prompt
@@ -376,6 +382,7 @@ struct TimingsOut {
     int64_t decode_n = 0;        /* of predicted_n, the tokens after each choice's first */
     double  predicted_ms = 0.0;
     int64_t draft_n = 0, draft_n_accepted = 0;
+    double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
 };
 
 /* `timings` is added at the top level when it is valid. */

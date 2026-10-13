@@ -99,10 +99,7 @@ than stacked over. The result is resolved and checked exactly as a converted con
 
 Startup says what the rotary is (`rope: YaRN factor 2 over 262144 trained positions -- the rotary
 reaches 524288`) and warns when `--max-model-len` is past what it covers -- also with no scaling
-at all, past the trained length. A persisted prefix cache (`--prefix-cache-dir`) is fingerprinted
-with the resolved rotary of the target and the drafter, so a store written under a different
-one -- another `--rope-scaling`, or a container converted with YaRN -- is not reused: every cached
-key was rotated differently.
+at all, past the trained length.
 
 The flag is for trying a factor, or serving a container whose source checkpoints are not at hand;
 a deployment that settles on one can convert it in as above and drop the flag.

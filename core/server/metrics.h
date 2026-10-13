@@ -156,6 +156,7 @@ private:
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;
+    Counter c_prefix_expired_, c_prefix_ckpt_expired_;
     Gauge   g_linear_hit_;
     Counter c_success_[(size_t)SuccessReason::N_];
     Counter c_rejected_, c_disconnect_, c_overflow_;

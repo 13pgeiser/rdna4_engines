@@ -16,9 +16,6 @@
  *   - a restore in makes the COMPUTE stream wait for it, so the step that reads the restored
  *     blocks runs after they land without the host having waited for anything.
  *
- * The disk store is the one part that is synchronous by nature, and it runs on a thread of its own
- * (TierIO below), so the engine thread never waits on a file either.
- *
  * ============================== THE TRANSFER, AND WHY IT IS SHAPED THIS WAY ====================
  *
  * A paged pool is LAYER-MAJOR: layer l of group g owns `[base + l*layer_stride, + layer_stride)`
@@ -44,19 +41,12 @@
 #include "plugin/registry.h"
 #include "rad_core.h"
 
-#include <functional>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace rad {
-
-class SSDTier;
 
 class TierExec {
 public:
@@ -68,10 +58,10 @@ public:
      * `max_batch` is the staging buffer in entries, `max_copy` the most entries one copy out may
      * carry, and `max_chain` the longest chain one restore brings back -- the index buffers are
      * sized from the last two. */
-    int  configure(Registry* reg, KVManager* kv, IdleTiers* tiers, SSDTier* disk,
+    int  configure(Registry* reg, KVManager* kv, IdleTiers* tiers,
                    const std::vector<int32_t>& groups, int max_batch, int64_t max_copy,
                    int64_t max_chain, bool leader, int device, int64_t slot_off,
-                   const HostArena* ck_store, RadStream shared);
+                   RadStream shared);
     void close();
     bool enabled() const { return enabled_; }
     std::string report() const { return report_; }
@@ -115,34 +105,14 @@ public:
 
     /* ---------------- restore ----------------
      *
-     * Enqueue a chain of ToDevice jobs, in chain order, and make `compute` wait for them. Every
-     * job's bytes are in host memory -- a disk entry was read in first (run_fetch) -- so nothing
-     * here waits on a file. The leader chooses every block first, recalling the loan for the
+     * Enqueue a chain of ToDevice jobs, in chain order, and make `compute` wait for them. The
+     * leader chooses every block first, recalling the loan for the
      * whole chain at once; a chain the pool cannot hold is cut where the reservation ran out, and
      * the jobs past the cut are left unstarted. `ok[i]` is whether job i was fully enqueued on
      * this rank. */
     int  issue_restore(std::vector<TierJob>& jobs, RadStream compute, std::vector<char>* ok);
-    /* A MARK ON THIS RANK'S TRANSFER STREAM, after everything enqueued on it so far -- or on
-     * `on`, the rank's compute stream, when it is given. A restore reads host slots
-     * asynchronously, and a slot it is still reading may be given up and handed to a read off
-     * disk the moment the restore has reported; the IO thread waits for this mark before it
-     * writes into any slot it was handed. A snapshot's store slot is read and written by copies
-     * on the compute stream (KVManager::checkpoint_save), so a disk write or read of one waits
-     * for that stream's mark. Null when nothing was ever enqueued on the transfer stream. The
-     * caller owns the event. */
-    int  fence(RadEvent* out, RadStream on = nullptr);
-
-    /* ---------------- the disk store (leader only; TierIO's thread) ---------------- */
-    void run_disk(std::vector<TierJob>& jobs, std::vector<char>* ok);
-    /* One ToDisk job; true when it was written. */
-    bool run_write(TierJob& j);
-    /* ToHost jobs: the blocks read in parallel into the host slots they were given, then the
-     * snapshots into their store slots. `ok[i]` is the blocks' result, `ck_ok` the snapshot's. */
-    void run_fetch(std::vector<TierJob>& jobs, std::vector<char>* ok);
-
-    /* Leader only. Gives back what a failed job held -- a restore's blocks -- reports every job to
-     * the policy, and frees the store slots a finished write or an unclaimed read was holding on
-     * the cache's behalf. `now_ns` is when the pass ran: a promotion is a use. */
+    /* Leader only. Gives back what a failed job held -- a restore's blocks -- and reports every
+     * job to the policy. `now_ns` is when the pass ran: a promotion is a use. */
     void report_pass(std::vector<TierJob>& jobs, const std::vector<char>& ok, uint64_t now_ns);
 
     /* A lookup hit off-device: the job that would bring it back, or false when the entry is not
@@ -209,14 +179,8 @@ private:
     Registry* reg_ = nullptr;
     KVManager* kv_ = nullptr;
     IdleTiers* tiers_ = nullptr;
-    SSDTier*  disk_ = nullptr;
     std::vector<GroupInfo> gi_;
     int64_t   entry_bytes_ = 0;
-    /* ---- the linear half ----
-     * The engine's snapshot store, whose slots the disk thread writes out and reads back whole --
-     * every rank's shard of a snapshot together. Null on a model with no recurrent state, which
-     * is the whole of the "off" path here. */
-    const HostArena* ck_store_ = nullptr;
     int       max_batch_ = 0;
     int64_t   max_copy_ = 0;
     int64_t   max_chain_ = 0;
@@ -273,60 +237,6 @@ private:
 
     std::string report_;
     Stats     st_;
-};
-
-/* ------------------------------------------------------------------ the disk thread */
-/* THE DISK STORE ON A THREAD OF ITS OWN. A host-to-disk move is a file write of the whole slot,
- * and a pass that makes room for a conversation's worth of copies is hundreds of megabytes of it
- * -- the engine thread would build no step for as long as the writes took. So a batch is handed
- * over and collected later. The thread touches the host arena and the disk store and nothing
- * else: every decision about the records is made before the hand-over and after the collection,
- * on the engine thread, under the scheduler's lock.
- *
- * TWO KINDS OF WORK, AND THE READS GO FIRST. A write batch is the background copy to disk: one at
- * a time, and the engine does not hand over the next until it has collected the last. A read
- * batch is a conversation a request is waiting on (IdleTiers::plan_fetch), so reads queue in the
- * order they were asked for and each one is taken ahead of whatever write is out -- between two
- * of its jobs, not after the whole batch. */
-class TierIO {
-public:
-    ~TierIO();
-    void start(TierExec* leader);
-    void stop();
-    /* False when a batch is already out. `fences` are waited on before the first job is written --
-     * a snapshot's store slot is filled by a copy on the compute stream (TierExec::fence) -- and
-     * come back with the batch from take(), still the caller's to destroy. */
-    bool submit(std::vector<TierJob>&& jobs, std::vector<RadEvent>&& fences = {});
-    /* The finished batch, when there is one. */
-    bool take(std::vector<TierJob>* jobs, std::vector<char>* ok,
-              std::vector<RadEvent>* fences = nullptr);
-    bool busy() const;
-
-    /* A read off disk. `tag` is the caller's (the request waiting on it); `fences` are waited on
-     * before the first byte is written (TierExec::fence) and stay the caller's to destroy. */
-    struct Fetch {
-        uint64_t             tag = 0;
-        std::vector<TierJob> jobs;
-        std::vector<RadEvent> fences;
-        std::vector<char>    ok;
-    };
-    /* False when the thread is not running. */
-    bool submit_fetch(Fetch&& f);
-    /* A finished read, oldest first. */
-    bool take_fetch(Fetch* out);
-
-private:
-    void loop();
-    TierExec* x_ = nullptr;
-    std::thread th_;
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
-    std::vector<TierJob> work_, done_;
-    std::vector<RadEvent> work_fences_, done_fences_;
-    std::vector<char> ok_;
-    size_t work_at_ = 0;          /* the next write job; the thread's alone while has_work_ */
-    bool has_work_ = false, has_done_ = false, stop_ = false;
-    std::deque<Fetch> fetch_q_, fetch_done_;
 };
 
 }  /* namespace rad */

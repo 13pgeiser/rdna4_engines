@@ -72,6 +72,10 @@ static const Flag g_flags[] = {
     "                                    pins it in host memory beside --host-pool-mib, read over the\n"
     "                                    link in place; by default a model whose output head reads the\n"
     "                                    table, or a host without the memory, keeps it on the card" },
+    { "--vision-tower-placement", "WHERE", "vram (default) | ram: where the encoder towers live (the\n"
+    "                                    vision tower; the audio encoder too). ram pins them in host\n"
+    "                                    memory beside --host-pool-mib, read over the link once an\n"
+    "                                    image, and gives their VRAM to the KV cache" },
     { "--ngram-placement",    "WHERE",  "auto (default) | vram | ram | disk: where an n-gram\n"
     "                                    embedding table lives (Qwen3.8-Flash-Next: 47.7 GiB).\n"
     "                                    vram puts all of it on every card; ram copies it into\n"
@@ -82,16 +86,13 @@ static const Flag g_flags[] = {
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT); a routed expert is read a layer\n"
     "                                    at a time, so a step is paced by the drive" },
-    { "--prefix-cache-host-mib", "N",   "copy finished conversations' KV to host memory, up to N MiB,\n"
+    { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
-    "                                    instead of re-prefilling. 0 is off. Part of it holds\n"
-    "                                    snapshots on a hybrid or sliding-window model;\n"
-    "                                    startup says how many" },
-    { "--prefix-cache-dir",   "DIR",    "where the disk tier keeps them. Not --weights-disk-tier, which is\n"
-    "                                    about WEIGHTS" },
-    { "--prefix-cache-disk-mib", "N",   "and copy them on to disk under --prefix-cache-dir, up to N MiB,\n"
-    "                                    so a full host tier gives slots up for nothing. Holds\n"
-    "                                    conversation content unencrypted. 0 is off" },
+    "                                    instead of re-prefilling. A full tier drops its least\n"
+    "                                    recently used entries. 0 is off" },
+    { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
+    "                                    or host memory (default 3600). 0 keeps it until the memory\n"
+    "                                    is wanted" },
 
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
@@ -469,7 +470,12 @@ int config_parse(int argc, char** argv, Config* c) {
              * ram the default wherever it can be honoured, nothing left for auto to choose. */
             if (emb && (!parse_table_placement(v, &p) ||
                         (p != TablePlacement::Ram && p != TablePlacement::Vram))) {
-                RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
+                if (parse_table_placement(v, &p) && p == TablePlacement::Auto)
+                    RAD_ERR("--embedding-placement auto was removed in 1.3.0: ram, the default, "
+                            "holds the table in pinned host memory, and vram keeps it on the card. "
+                            "Drop the flag or name one of the two");
+                else
+                    RAD_ERR("--embedding-placement takes ram or vram, not '%s'", v);
                 return RAD_E_INVAL;
             }
             if (!emb && !parse_table_placement(v, &p)) {
@@ -479,10 +485,35 @@ int config_parse(int argc, char** argv, Config* c) {
             (emb ? c->embedding_placement : c->ngram_placement) = p;
             if (emb) c->embedding_placement_given = true;
         }
+        else if (S("--vision-tower-placement")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            TablePlacement p;
+            /* Two tiers, for the embedding's reason: an encoder writes activations the card reads. */
+            if (!parse_table_placement(v, &p) || (p != TablePlacement::Ram && p != TablePlacement::Vram)) {
+                RAD_ERR("--vision-tower-placement takes vram or ram, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->tower_placement = p;
+        }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
-        else if (S("--prefix-cache-host-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_host_mib = atoll(v); }
-        else if (S("--prefix-cache-dir"))          { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_dir = v; }
-        else if (S("--prefix-cache-disk-mib"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_disk_mib = atoll(v); }
+        else if (S("--prefix-cache-mib"))          { if (!(v = need(i)) ||
+                                                         !parse_int(a.c_str(), v, 0, INT32_MAX, &c->prefix_cache_mib))
+                                                         return RAD_E_INVAL; }
+        else if (S("--prefix-cache-ttl"))          { if (!(v = need(i)) ||
+                                                         !parse_int(a.c_str(), v, 0, INT32_MAX, &c->prefix_cache_ttl))
+                                                         return RAD_E_INVAL; }
+        /* THE PREFIX CACHE KEEPS NOTHING ON A DRIVE: a tier there wore it at the rate the server
+         * prefills, and its copies never outlived the process. The old size flags are told what
+         * replaced them rather than "unknown option". */
+        else if (S("--prefix-cache-host-mib")) {
+            RAD_ERR("--prefix-cache-host-mib was renamed: use --prefix-cache-mib");
+            return RAD_E_INVAL;
+        }
+        else if (S("--prefix-cache-dir") || S("--prefix-cache-disk-mib")) {
+            RAD_ERR("%s was removed: the prefix cache is kept in VRAM and host memory only "
+                    "(--prefix-cache-mib), and --prefix-cache-ttl says how long", a.c_str());
+            return RAD_E_INVAL;
+        }
         else if (S("--placement"))             { if (!(v = need(i))) return RAD_E_INVAL; c->placement = v; }
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!(v = need(i))) return RAD_E_INVAL; c->checkpoint_interval = atoll(v); }
@@ -918,12 +949,12 @@ const ShowRow kShow[] = {
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
+    { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
-    { "--prefix-cache-host-mib", [](const Config& c) {
-          return c.prefix_cache_host_mib ? num(c.prefix_cache_host_mib) : std::string("0 (off)"); } },
-    { "--prefix-cache-dir",   [](const Config& c) { return or_none(c.prefix_cache_dir, "none"); } },
-    { "--prefix-cache-disk-mib", [](const Config& c) {
-          return c.prefix_cache_disk_mib ? num(c.prefix_cache_disk_mib) : std::string("0 (off)"); } },
+    { "--prefix-cache-mib",   [](const Config& c) {
+          return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
+    { "--prefix-cache-ttl",   [](const Config& c) {
+          return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
     { "--placement",          [](const Config& c) { return c.placement; } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },

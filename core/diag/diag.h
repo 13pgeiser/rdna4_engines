@@ -167,7 +167,6 @@ struct RunFacts {
     /* Why the engine turned prefix caching off itself (the KL mode, an embedding model); "" when
      * it is on or the operator turned it off. */
     std::string prefix_cache_off_why;
-    int64_t     prefix_host_mib = 0, prefix_disk_mib = 0;
     int64_t     host_pool_mib = 0;       /* a rank, as configured */
     int64_t     pinned_bytes = -1;       /* every pinned host allocation the process made */
     int64_t     host_weight_bytes = 0;   /* weights a rank reads from the pinned host pool */

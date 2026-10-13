@@ -95,10 +95,12 @@ struct MoveUnit {
     Site    site = Site::Device;
     int32_t slab_slot = -1;
     bool    movable = false;     /* may the heat engine relocate it after load */
-    bool    host_forced = false; /* --embedding-placement ram put it in the pinned pool */
+    bool    host_forced = false; /* a placement flag put it in the pinned pool: the embedding's
+                                  * or the encoder tower's */
 
     /* PLACED BEFORE ANY STRATEGY RAN, so every assignment pass skips it and no VRAM total counts
-     * it: the mapped tier (no device kernel can read it) and --embedding-placement ram. */
+     * it: the mapped tier (no device kernel can read it), --embedding-placement ram and
+     * --vision-tower-placement ram. */
     bool preplaced() const { return tier == Tier::Mapped || host_forced; }
     const char* reason = "fits in vram";   /* a fixed string, so the report never guesses */
 
@@ -274,11 +276,13 @@ public:
     int64_t vram_budget = 0, host_budget = 0;
     int64_t file_stage_reserve = 0;
     int64_t file_windows = 0;          /* the read windows' part of it */
-    /* --embedding-placement ram: the pool slots taken out of --host-pool-mib before any strategy
-     * ran, like the file staging above, and reported beside it rather than among the pooled units.
-     * `embedding_host_used` is the same tables' weight bytes, the unit the tier totals count in. */
+    /* --embedding-placement ram and --vision-tower-placement ram: the pool slots each flag's
+     * units took before any strategy ran, like the file staging above, and reported beside it
+     * rather than among the pooled units. `forced_host_used` is both flags' weight bytes, the unit
+     * the tier totals count in, which the pooled weights' figures leave out. */
     int64_t embedding_host_bytes = 0;
-    int64_t embedding_host_used = 0;
+    int64_t tower_host_bytes = 0;
+    int64_t forced_host_used = 0;
     /* --ngram-placement ram: the n-gram tables the load phase copies into host memory. They stay
      * on the mapped tier as far as every pool is concerned; this is what the copy costs in RAM.
      * `ngram_copy_card` says which copy: pinned memory a device kernel reads in place over the
@@ -379,6 +383,7 @@ private:
     void build_units(const Program& prog, Plan* p);
     void pin_mapped(const Program& prog, Plan* p);
     int  pin_embedding(const Program& prog, const Config& cfg, Plan* p) const;
+    int  pin_towers(const Config& cfg, Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -430,11 +435,13 @@ struct WeightFootprint {
     bool    routed           = false;   /* a layer has experts: the file tier's read windows */
     int64_t mapped  = 0;   /* no device kernel can read them; they never enter a pool at all */
     int64_t hosted  = 0;   /* --embedding-placement ram: in the pinned host pool, off the card */
-    /* The tables the two placement flags move, wherever the buckets above count them: `embedding`
+    /* The tables the placement flags move, wherever the buckets above count them: `embedding`
      * is inside statics or hosted, `ngram` inside statics when a device kernel reads it and it is
-     * placed in VRAM, inside mapped otherwise. */
+     * placed in VRAM, inside mapped otherwise. `tower` is the encoder towers' units, every weight
+     * of which the architecture declared read once per request, inside statics. */
     int64_t embedding = 0;
     int64_t ngram     = 0;
+    int64_t tower     = 0;
     /* A device kernel reads the n-gram table, so it can be on the card or read over the link from
      * pinned host memory; without one only the host gather reads it, from RAM or the container. */
     bool    ngram_device = false;

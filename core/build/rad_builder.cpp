@@ -835,6 +835,10 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
     return resolved ? h : RAD_NULL_HANDLE;
 }
 
+int Builder::op_declared(const char* op) const {
+    return op && reg_.schema(op) ? 1 : 0;
+}
+
 int Builder::op_resolved(rad_op h) const {
     if (h == 0 || h >= prog_.ops.size()) return 0;
     const OpInfo& o = prog_.ops[h];
@@ -1747,6 +1751,11 @@ rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_
 int rad_op_resolved(RadBuilder* b, rad_op h) {
     if (!b) return 0;
     return B(b)->op_resolved(h);
+}
+
+int rad_op_declared(RadBuilder* b, const char* op) {
+    if (!b) return 0;
+    return B(b)->op_declared(op);
 }
 
 /* Proposed additions to rad_builder.h -- defined here so the mechanism exists and core-side

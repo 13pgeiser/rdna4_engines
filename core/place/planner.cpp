@@ -80,7 +80,7 @@ int strategy_parse(const char* s, Strategy* out) {
 Budgets Budgets::from(const Config& c) {
     Budgets b;
     b.vram_weights = c.vram_weights_mib * 1024 * 1024;
-    b.host_pool    = (c.host_pool_mib + c.embedding_host_mib) * 1024 * 1024;
+    b.host_pool    = c.host_pool_total_mib() * 1024 * 1024;
     b.ssd          = c.weights_disk_tier;
     return b;
 }
@@ -146,7 +146,8 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
     /* build_units: a model-level weight is its own unit, everything else groups by the declared
      * (layer, expert). Ordered, for the same reason build_units is. */
     struct U { int32_t layer = -1, expert = -1; int64_t bytes = 0; bool mapped = false;
-               bool emb = false, ngram = false, host = true, direct = true; };
+               bool emb = false, ngram = false, host = true, direct = true;
+               int access = -1; };
     std::map<std::pair<int32_t, int32_t>, size_t> by_group;
     std::vector<U> units;
 
@@ -177,6 +178,9 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         if (w < device_ok.size() && !device_ok[w]) mu.mapped = true;
         if (!weight_file_direct(wi, prog.ctx.world_size)) mu.direct = false;
         if (w < host_ok.size() && !host_ok[w]) mu.host = false;
+        /* build_units: the group's strongest access class, which says whether it is a tower's. */
+        if (mu.access < 0 || access_strength(wi.decl.access) > access_strength(mu.access))
+            mu.access = wi.decl.access;
         /* The placement flags' tables: model-level, so the unit is this one weight. */
         if (layer < 0) {
             mu.emb   = is_embedding_table(prog, w);
@@ -198,6 +202,8 @@ void weight_footprint(const Program& prog, WeightFootprint* out, TablePlacement 
         if (mu.emb && !mu.mapped) out->embedding += b;
         if (mu.ngram) out->ngram += b;
         if (mu.ngram && !mu.mapped) out->ngram_device = true;
+        /* pin_towers moves an encoder tower's unit out of the statics on the same test. */
+        if (mu.access == RAD_ACCESS_PER_REQUEST && !mu.mapped && mu.expert < 0) out->tower += b;
         /* pin_mapped: an n-gram table a device kernel reads stays off the card unless it was
          * placed in VRAM. */
         if (mu.mapped || (mu.ngram && ngram != TablePlacement::Vram)) out->mapped += b;
@@ -1073,7 +1079,7 @@ void Planner::finish(const Program& prog, Plan* p) {
             pl.reason = mu.reason;
             pl.bytes = weight_bytes(prog.weights[w]);
             p->totals.bytes[(int)mu.tier] += pl.bytes;
-            if (mu.host_forced) p->embedding_host_used += pl.bytes;
+            if (mu.host_forced) p->forced_host_used += pl.bytes;
         }
     }
 }
@@ -1140,6 +1146,53 @@ int Planner::pin_embedding(const Program& prog, const Config& cfg, Plan* p) cons
         rc = RAD_E_STATE;
     }
     return rc;
+}
+
+/* --vision-tower-placement ram: EVERY UNIT OF AN ENCODER TOWER goes to the pinned host pool before
+ * any strategy runs, as the embedding does, at the DeviceZeroCopy site: the encoder's kernels read
+ * the weights over the link in place, once an image or a clip, and a text-only request never
+ * touches them. A tower's unit is one whose every weight the architecture declared read once per
+ * request (RAD_ACCESS_PER_REQUEST) -- the test weight_footprint counted out of the statics with,
+ * so the budget the card was split by is the one spent here. The test is the access class and not
+ * the unit's level: a tower is model-level weights (a stem, a merger) and a layer unit a block. */
+int Planner::pin_towers(const Config& cfg, Plan* p) const {
+    if (cfg.tower_resolved != TablePlacement::Ram) return RAD_OK;
+    auto tower = [](const MoveUnit& mu) {
+        return mu.access == RAD_ACCESS_PER_REQUEST && mu.expert < 0 && mu.tier != Tier::Mapped &&
+               !mu.host_forced;
+    };
+    int64_t need = 0, n = 0;
+    for (const MoveUnit& mu : p->units)
+        if (tower(mu)) { need += mu.slot_bytes; ++n; }
+    /* Engine::plan resolves Ram only where weight_footprint found a tower with this same test. */
+    if (!n) {
+        RAD_ERR("placement: --vision-tower-placement ram, and this rank's program has no weight it "
+                "reads once per request");
+        p->notes.push_back("--vision-tower-placement ram: no encoder tower to place");
+        return RAD_E_STATE;
+    }
+    if (need > p->host_budget) {
+        RAD_ERR("placement: --vision-tower-placement ram: the encoder towers need %s of the pinned "
+                "host pool and %s of it is left%s", humanb(need).c_str(),
+                humanb(p->host_budget).c_str(),
+                p->file_stage_reserve ? " after the file tier's staging" : "");
+        p->notes.push_back(fmt("--vision-tower-placement ram: the encoder towers (%s) do not fit "
+                               "the host pool", humanb(need).c_str()));
+        return RAD_E_NOMEM;
+    }
+    for (MoveUnit& mu : p->units) {
+        if (!tower(mu)) continue;
+        p->host_budget -= mu.slot_bytes;
+        p->tower_host_bytes += mu.slot_bytes;
+        mu.tier = Tier::HostPinned;
+        mu.site = Site::DeviceZeroCopy;
+        mu.movable = false;
+        mu.host_forced = true;
+        mu.reason = "--vision-tower-placement ram; read over the link in place";
+    }
+    RAD_INFO("placement: the encoder towers, %lld units (%s), in the pinned host pool, read in place "
+             "(--vision-tower-placement ram)", (long long)n, humanb(need).c_str());
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------------ plan */
@@ -1216,7 +1269,9 @@ int Planner::plan(Plan* out) {
     }
 
     /* NOT a RAD_TRY: a refusal still leaves `out` filled in far enough to print. */
-    const int hrc = pin_embedding(prog, cfg, out);
+    int hrc = pin_embedding(prog, cfg, out);
+    const int trc = pin_towers(cfg, out);
+    if (hrc >= 0) hrc = trc;
 
     int rc = assign(out);
     enforce_op_site_agreement(prog, out);
@@ -1329,7 +1384,7 @@ std::string Plan::report(const Program& prog) const {
              humanb(totals.bytes[(int)Tier::VRAM]).c_str());
     s += fmt("  host pinned   %12s  %12s\n",
              host_budget > 0 ? humanb(host_budget).c_str() : "none",
-             humanb(totals.bytes[(int)Tier::HostPinned] - embedding_host_used).c_str());
+             humanb(totals.bytes[(int)Tier::HostPinned] - forced_host_used).c_str());
     if (totals.bytes[(int)Tier::HostPageable])
         s += fmt("  host pageable %12s  %12s\n", "-",
                  humanb(totals.bytes[(int)Tier::HostPageable]).c_str());
@@ -1354,6 +1409,9 @@ std::string Plan::report(const Program& prog) const {
     if (embedding_host_bytes)
         s += fmt("  embedding     %12s  %12s   (--embedding-placement ram, pinned, read in place)\n",
                  "-", humanb(embedding_host_bytes).c_str());
+    if (tower_host_bytes)
+        s += fmt("  encoder tower %12s  %12s   (--vision-tower-placement ram, pinned, read in place)\n",
+                 "-", humanb(tower_host_bytes).c_str());
     if (ngram_copy_bytes)
         s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
                  "-", humanb(ngram_copy_bytes).c_str(),

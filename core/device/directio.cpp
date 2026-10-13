@@ -181,9 +181,7 @@ int DirectFile::read_at(void* dst, int64_t off, int64_t bytes) {
 
 /* ------------------------------------------------------------------ write */
 
-/* The store is written to as well as read: the SSD prefix-cache tier (core/mem/sstier.cpp)
- * publishes blocks, and the SSD weight tier is populated once at load. Both write whole aligned
- * slots, so this has the same shape as read_at -- one fast path, and a read-modify-write for
+/* The same shape as read_at -- one fast path for whole aligned blocks, and a read-modify-write for
  * anything that does not cover a whole block. */
 int DirectFile::write_at(const void* src, int64_t off, int64_t bytes) {
     if (fd_ < 0) return RAD_E_STATE;

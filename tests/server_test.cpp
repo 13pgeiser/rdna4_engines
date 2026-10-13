@@ -854,6 +854,14 @@ TEST(a_body_or_template_json_nested_past_the_bound_is_refused) {
         CHECK_OK(parse_chat_request(call(nest(fine)), f.odeps(), lim, &r, &e));
         CHECK_OK(parse_chat_request(result(nest(fine)), f.odeps(), lim, &r, &e));
     }
+    /* A tool result that is not JSON is never parsed into a tree, so brackets in it are text:
+     * openers that never close, and nesting with text before or after it. */
+    {
+        OaiRequest r; ApiError e;
+        CHECK_OK(parse_chat_request(result(std::string(5000, '[')), f.odeps(), lim, &r, &e));
+        CHECK_OK(parse_chat_request(result("got: " + nest(deep)), f.odeps(), lim, &r, &e));
+        CHECK_OK(parse_chat_request(result(nest(deep) + ","), f.odeps(), lim, &r, &e));
+    }
 }
 
 /* ================================================================== the 400 path */
@@ -2214,6 +2222,62 @@ TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
     CHECK(j["predicted_per_token_ms"].is_null());
     CHECK(j["prompt_ms"].is_null());
     CHECK(j["prompt_per_second"].is_null());
+}
+
+/* THE SERVER'S OWN TIME, from the moment the body had arrived: ttft_ms is everything up to the
+ * first token, total_ms everything up to the last, on the buffered body and on a stream's final
+ * chunk. A request made in-process has no arrival to count from and reports neither. */
+TEST(timings_count_ttft_and_total_from_the_bodys_arrival) {
+    auto arrived = [](const char* path, const std::string& body) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = path;
+        q.body = body;
+        /* Five milliseconds before now, on the steady clock the sinks count on. */
+        q.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count() - 5000000;
+        return q;
+    };
+    auto check = [](const json& t) {
+        REQUIRE(t["ttft_ms"].is_number());
+        REQUIRE(t["total_ms"].is_number());
+        CHECK(t["ttft_ms"].get<double>() >= 5.0);
+        CHECK(t["ttft_ms"].get<double>() >= t["prompt_ms"].get<double>());
+        CHECK_NEAR(t["total_ms"].get<double>(),
+                   t["ttft_ms"].get<double>() + t["predicted_ms"].get<double>(), 1e-6);
+    };
+    {
+        Fixture f;
+        HttpResponse r = f.srv->router().dispatch(
+            arrived("/v1/chat/completions", R"({"messages":[{"role":"user","content":"hi"}]})"));
+        CHECK_EQ(r.status, 200);
+        check(json::parse(r.body)["timings"]);
+    }
+    {
+        Fixture f;
+        HttpResponse r = f.srv->router().dispatch(
+            arrived("/v1/completions", R"({"prompt":"hi","stream":true})"));
+        CHECK_EQ(r.status, 200);
+        int bad = 0, finals = 0;
+        auto p = sse_payloads(drain(r), &bad);
+        CHECK_EQ(bad, 0);
+        for (size_t i = 0; i + 1 < p.size(); ++i) {
+            const json j = json::parse(p[i]);
+            if (j["choices"][0]["finish_reason"].is_null()) continue;
+            ++finals;
+            check(j["timings"]);
+        }
+        CHECK_EQ(finals, 1);
+    }
+    {
+        Fixture f;
+        HttpResponse r = f.post("/v1/chat/completions",
+                                R"({"messages":[{"role":"user","content":"hi"}]})");
+        CHECK_EQ(r.status, 200);
+        const json t = json::parse(r.body)["timings"];
+        CHECK(t["ttft_ms"].is_null());
+        CHECK(t["total_ms"].is_null());
+    }
 }
 
 /* The sink keeps the first admission across a preemption and sums the drafts it is told of. */

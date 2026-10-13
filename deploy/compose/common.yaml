@@ -32,7 +32,6 @@ services:
       memlock: -1
     volumes:
       - ${RADIANCE_MODELS:?set RADIANCE_MODELS in .env}:/models:ro
-      - ${RADIANCE_STATE:?set RADIANCE_STATE in .env}:/data
     # A server finishes the step in flight and releases the cards on SIGTERM.
     stop_grace_period: 60s
     healthcheck:

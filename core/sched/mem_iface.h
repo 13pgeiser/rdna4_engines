@@ -146,18 +146,13 @@ struct IPrefixCache {
      * `blocks_out` receives the block ids per cached group, in cached_groups() order, ready for
      * IKVManager::adopt. */
     /* GIVE BACK WHATEVER THE TIERS HOLD FOR THIS PROMPT, before the lookup that would otherwise
-     * stop at it. `Wait` when part of it is still being read off disk: the request is not
-     * admitted this step -- the ones behind it may be -- and is asked again on the next. Admitting
-     * it anyway would stop its hit at the first entry not yet read, and the hit length is what
-     * its prefill is chunked against, so the same prompt would run different shapes depending on
-     * how far a read had got.
+     * stop at it.
      *
      * The scheduler calls it and must not know what a tier is: a restore allocates blocks and
      * runs a device scatter, so it is the engine's to perform and is installed as a callable
      * rather than reached through this header. A failure is not an error here -- it leaves a
      * shorter prefix, and a shorter prefix is always safe. */
-    enum class Restore { Done, Wait };
-    virtual Restore restore(const Request&) { return Restore::Done; }
+    virtual void restore(const Request&) {}
     /* A step's admissions begin: what the last step's lookups handed out has been read. */
     virtual void begin_step() {}
     /* KEEP THIS WAITING REQUEST'S CHAIN WHERE IT IS until release(). Called when an admission is
@@ -212,6 +207,9 @@ struct IPrefixCache {
      * that has happened; this count rises first. */
     virtual int64_t evictions() const = 0;
     virtual int64_t ckpt_evictions() const = 0;
+    /* And what --prefix-cache-ttl took: not memory pressure, so not evictions. */
+    virtual int64_t expired() const { return 0; }
+    virtual int64_t ckpt_expired() const { return 0; }
 
     /* WHAT IT IS HOLDING ON ITS OWN RIGHT NOW, in tokens of context, as against the counters
      * above which are cumulative. A finished turn's blocks stay held so the next turn can reuse
@@ -237,9 +235,8 @@ struct IPrefixCache {
     /* The state that reservation named is now IN its slot. A reservation is made when the chunk is
      * PLANNED and the state exists only after the step that computes it, so a lookup in between
      * would adopt a slot holding the previous tenant's history. Until this is called, the
-     * reservation is a promise and lookup will not offer it. `resume`: the deepest checkpoint this
-     * prompt gets, the one its next turn resumes from (Scheduler::last_checkpoint). */
-    virtual void commit_checkpoint(const Request& r, int64_t pos, bool resume) = 0;
+     * reservation is a promise and lookup will not offer it. */
+    virtual void commit_checkpoint(const Request& r, int64_t pos) = 0;
 };
 
 /* ------------------------------------------------------------------ block geometry */
@@ -367,9 +364,9 @@ struct PCBinding final : IPrefixCache {
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */
-    std::function<Restore(const Request&)> restore_fn;
-    Restore restore(const Request& r) override {
-        return restore_fn ? restore_fn(r) : Restore::Done;
+    std::function<void(const Request&)> restore_fn;
+    void restore(const Request& r) override {
+        if (restore_fn) restore_fn(r);
     }
     void begin_step() override { m->begin_step(); }
     void hold(const Request& r) override {
@@ -400,9 +397,9 @@ struct PCBinding final : IPrefixCache {
     uint64_t lost_warned_ns_ = 0;
     /* PRESSURE TAKES WHAT CAN LEAVE VRAM AND STAY, FIRST. An entry whose host copy has landed is
      * dropped and kept (trim); a copy still on its way is landed and that entry dropped too; only
-     * what the tiers then still cannot take -- an arena with no room and a disk that has not caught
-     * up, or no tiers at all -- is erased, and an erase with the tiers on is said, because it is
-     * a conversation a later turn will prefill again. */
+     * what the tiers then still cannot take -- an arena with no room, or no tiers at all -- is
+     * erased, and an erase with the tiers on is said, because it is a conversation a later turn
+     * will prefill again. */
     int64_t evict(int64_t n) override {
         int64_t k = m->trim(n);
         if (k < n && flush_fn && flush_fn()) k += m->trim(n - k);
@@ -415,8 +412,8 @@ struct PCBinding final : IPrefixCache {
             if (now - lost_warned_ns_ >= 60ull * 1000000000ull) {
                 lost_warned_ns_ = now;
                 RAD_WARN("prefix cache: %lld entries erased with no copy off the card -- the host "
-                         "tier had no room for them in time (--prefix-cache-host-mib, and the disk "
-                         "behind it); radiance:prefix_cache_evictions_total counts every one",
+                         "tier had no room for them in time (--prefix-cache-mib); "
+                         "radiance:prefix_cache_evictions_total counts every one",
                          (long long)lost);
             }
         }
@@ -430,6 +427,8 @@ struct PCBinding final : IPrefixCache {
     }
     int64_t evictions() const override { return m->stats().evictions; }
     int64_t ckpt_evictions() const override { return m->stats().ckpt_evictions; }
+    int64_t expired() const override { return m->stats().expired; }
+    int64_t ckpt_expired() const override { return m->stats().ckpt_expired; }
     int64_t held_tokens() const override { return m->unshared_tokens(); }
 
     int64_t next_checkpoint_after(int64_t p) const override { return m->next_checkpoint_after(p); }
@@ -448,8 +447,8 @@ struct PCBinding final : IPrefixCache {
         return m->reserve_checkpoint(r.id, pos, prefix_hash(r, pos), slot_out);
     }
 
-    void commit_checkpoint(const Request& r, int64_t pos, bool resume) override {
-        m->commit_checkpoint(prefix_hash(r, pos), resume);
+    void commit_checkpoint(const Request& r, int64_t pos) override {
+        m->commit_checkpoint(prefix_hash(r, pos));
     }
 
 private:

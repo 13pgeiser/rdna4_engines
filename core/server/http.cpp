@@ -412,6 +412,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         req.path = hreq.path;
         req.body = std::move(body);
         req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
+        req.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
         for (auto& h : hreq.headers) req.headers[h.first] = h.second;
         for (auto& p : hreq.params) req.query[p.first] = p.second;
         req.closed = [&hreq] { return hreq.is_connection_closed(); };

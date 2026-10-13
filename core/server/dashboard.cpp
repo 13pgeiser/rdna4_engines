@@ -52,8 +52,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     SessionOccupancy occ;
     if (deps_.sched) deps_.sched->sessions(&v, &occ);
 
-    int64_t dev = 0, host = 0, disk = 0, bytes = 0;
-    int64_t shost = 0, sdisk = 0;
+    int64_t dev = 0, host = 0, bytes = 0;
+    int64_t snaps = 0;
     json a = json::array();
     for (const SessionStat& s : v) {
         json e;
@@ -66,20 +66,16 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["age_s"]     = s.age_s;
         e["on_device"] = s.on_device;
         e["on_host"]   = s.on_host;
-        e["on_disk"]   = s.on_disk;
         e["moving"]    = s.moving;
         /* THE RECURRENT HALF. On a hybrid model a session's attention blocks are only part of
          * what it needs back; the rest is its linear-state snapshots, which are a different size
-         * of object in a different store. Counted where the BYTES are: in the store in host
-         * memory, or on disk alone. */
+         * of object in a different store, in host memory. */
         e["snapshots"]   = s.snapshots;
-        e["snap_host"]   = s.snap_host;
-        e["snap_disk"]   = s.snap_disk;
         e["snap_bytes"]  = s.snap_bytes;
         e["resume_tokens"] = s.resume_tokens;
         a.push_back(std::move(e));
-        dev += s.on_device; host += s.on_host; disk += s.on_disk;
-        shost += s.snap_host; sdisk += s.snap_disk;
+        dev += s.on_device; host += s.on_host;
+        snaps += s.snapshots;
         bytes += s.bytes;
     }
     o["sessions"] = std::move(a);
@@ -87,8 +83,8 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
      * the blocks for it, so these per-session sizes overlap and adding them up over-counts -- on
      * a server carrying long agent transcripts by more than an order of magnitude. The field
      * names say so rather than pretending the sums are totals. */
-    o["blocks_sum_overlapping"] = { { "device", dev }, { "host", host }, { "disk", disk } };
-    o["snapshots"] = { { "host", shost }, { "disk", sdisk } };
+    o["blocks_sum_overlapping"] = { { "device", dev }, { "host", host } };
+    o["snapshots_sum_overlapping"] = snaps;
     o["bytes_sum_overlapping"] = bytes;
     const SchedMetrics sm = deps_.sched ? deps_.sched->metrics() : SchedMetrics{};
     /* AND THE ONE FIGURE THAT IS NOT A SUM, because a view about what the conversations cost has
@@ -103,17 +99,14 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
                   { "bytes_total",     sm.kv_bytes_total } };
     const IScheduler::TierCounters c =
         deps_.sched ? deps_.sched->tier_counters() : IScheduler::TierCounters{};
-    o["moved"] = { { "to_host", c.to_host }, { "dropped", c.dropped }, { "to_disk", c.to_disk },
-                   { "promoted", c.promoted }, { "host_freed", c.host_freed },
-                   { "host_drops", c.host_drops }, { "failures", c.failures },
-                   { "fetched", c.fetched } };
-    /* THE SNAPSHOT COUNTERS ARE NOT OPTIONAL ON A HYBRID MODEL, because a server that moves every
-     * block it has and no snapshots at all looks identical in the block counters to one where
-     * tiering works -- and the difference is a full linear replay on every restored session. */
-    o["snapshots_moved"] = { { "to_disk", c.ck_to_disk }, { "fetched", c.ck_fetched },
-                             { "drops", c.ck_drops }, { "bytes_each", c.ck_bytes },
-                             { "host_slots", c.ck_host_slots },
-                             { "disk_slots", c.ck_disk_slots } };
+    o["moved"] = { { "to_host", c.to_host }, { "dropped", c.dropped },
+                   { "promoted", c.promoted }, { "host_drops", c.host_drops },
+                   { "failures", c.failures } };
+    /* THE SNAPSHOT STORE, on a hybrid model: what one snapshot costs and how many the store
+     * holds. `bytes_each` is 0 on a model with no recurrent state. */
+    o["snapshot_store"] = { { "bytes_each", c.ck_bytes }, { "slots", c.ck_slots } };
+    /* WHAT --prefix-cache-ttl TOOK, entries and snapshots, from whichever tier held them. */
+    o["expired"] = { { "entries", sm.prefix_expired }, { "snapshots", sm.prefix_ckpt_expired } };
     /* THE STEP THREAD'S TIME ON THE TIERS: every request waits through it. */
     o["stall"] = { { "restores", c.restores }, { "restore_ms", (double)c.restore_ns / 1e6 },
                    { "flushes", c.flushes }, { "flush_ms", (double)c.flush_ns / 1e6 } };
@@ -127,15 +120,14 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
     /* WHETHER ANYTHING MOVES, which is not whether anything is STORED. A session is recorded
      * whether or not it can be demoted, so a non-empty table says only that something is held;
      * these say whether a tier exists that can move it. */
-    o["tiers"] = { { "host", c.host_on }, { "disk", c.disk_on } };
+    o["tiers"] = { { "host", c.host_on } };
     /* WHAT IS OFF THE CARD, counted once -- see SessionOccupancy. */
-    o["occupancy"] = { { "host_bytes", occ.host_bytes }, { "disk_bytes", occ.disk_bytes },
-                       { "host_cap_bytes", occ.host_cap_bytes },
-                       { "disk_cap_bytes", occ.disk_cap_bytes } };
+    o["occupancy"] = { { "host_bytes", occ.host_bytes },
+                       { "host_cap_bytes", occ.host_cap_bytes } };
     /* THE ATTENTION HIT RATE, for a model with no recurrent state, where it is the whole answer
      * to how much of the prompt the cache served. On a hybrid model `linear.hit_rate` is. */
     o["prefix_hit_rate"] = sm.prefix_hit_rate;
-    o["enabled"] = c.host_on || c.disk_on;
+    o["enabled"] = c.host_on;
     return HttpResponse::json_body(200, json_dump(o));
 }
 
@@ -695,7 +687,6 @@ th + th, td + td { padding-left:14px; }
 .tbar > i { display:block; height:100%; }
 .t-dev  { background:#4ade80; } .tn-dev  { color:#7fe0a3; }
 .t-host { background:#60a5fa; } .tn-host { color:#8dbcfb; }
-.t-disk { background:#a78bfa; } .tn-disk { color:#c4b5fd; }
 /* The group that starts over is folded by default: it is a count first and rows second. */
 details.sgrp > summary { list-style:none; cursor:pointer; }
 details.sgrp > summary::-webkit-details-marker { display:none; }
@@ -1185,9 +1176,6 @@ nav button.on { color:var(--fg); background:var(--track); }
       <div class="cell" id="s-hostcell"><div class="n" id="s-host">–<u></u></div>
            <span class="cap">moved to host ram</span>
            <span class="det" id="s-hostdet"></span></div>
-      <div class="cell" id="s-diskcell"><div class="n" id="s-disk">–<u></u></div>
-           <span class="cap">moved to disk</span>
-           <span class="det" id="s-diskdet"></span></div>
     </div>
 
     <section class="panel">
@@ -2838,7 +2826,7 @@ $("tab-model").addEventListener("click", () => show("model"));
  * snapshot reuses nothing however many of its blocks are kept. On a model with no recurrent state
  * the blocks are the whole answer and every stored token is reused. */
 const reuseOf = (r, hybrid) => hybrid ? Math.min(r.resume_tokens || 0, r.tokens) : r.tokens;
-const TIERS = [["dev", "on_device", "vram"], ["host", "on_host", "host"], ["disk", "on_disk", "disk"]];
+const TIERS = [["dev", "on_device", "vram"], ["host", "on_host", "host"]];
 
 function sessCols(tr, manyModels) {
   tr.textContent = "";
@@ -2874,7 +2862,7 @@ function sessRow(r, hybrid, manyModels) {
      read as three equal parts. The per-tier counts are blocks, and a block is the same number of
      tokens in every tier, so the proportion is the proportion of its tokens. */
   const wh = tr.appendChild(el("td", "l")), bar = wh.appendChild(el("span", "tbar"));
-  const held = r.on_device + r.on_host + r.on_disk, parts = [];
+  const held = r.on_device + r.on_host, parts = [];
   for (const [k, f, name] of TIERS) {
     if (!(r[f] > 0)) continue;
     bar.appendChild(el("i", "t-" + k)).style.width = (100 * r[f] / held).toFixed(1) + "%";
@@ -2897,7 +2885,7 @@ async function loadSessions() {
     return;
   }
   const rows = (s.sessions || []).slice().sort((x, y) => x.idle_s - y.idle_s);
-  const mv = s.snapshots_moved || {}, ln = s.linear || {};
+  const mv = s.snapshot_store || {}, ln = s.linear || {};
   const pool = s.pool || {}, occ = s.occupancy || {};
   /* The model has recurrent state if its snapshots have a size. */
   const hybrid = mv.bytes_each > 0;
@@ -2913,13 +2901,12 @@ async function loadSessions() {
   $("s-live").firstChild.nodeValue = cnt(live.length);
   $("s-liveof").textContent = "of " + cnt(rows.length);
   $("s-livedet").textContent = cold.length ? cnt(cold.length) + " start over" : "";
-  /* VRAM IN TOKENS, THE OTHER TIERS IN BYTES. The pool's token count is the context the card can
-     serve without a copy; the tiers off the card are sized by --prefix-cache-host-mib and
-     --prefix-cache-disk-mib and are read against them. A tier that is off has no cell. */
+  /* VRAM IN TOKENS, HOST MEMORY IN BYTES. The pool's token count is the context the card can
+     serve without a copy; the host tier is sized by --prefix-cache-mib and read against it. A
+     tier that is off has no cell. */
   $("s-vram").firstChild.nodeValue = cnt3(pool.tokens_used || 0);
   $("s-vramdet").textContent = pool.tokens_total ? "of " + cnt3(pool.tokens_total) + " tok" : "";
-  for (const [id, used, cap] of [["s-host", occ.host_bytes, occ.host_cap_bytes],
-                                 ["s-disk", occ.disk_bytes, occ.disk_cap_bytes]]) {
+  for (const [id, used, cap] of [["s-host", occ.host_bytes, occ.host_cap_bytes]]) {
     $(id + "cell").hidden = !(cap > 0);
     const x = hbs(used || 0);
     $(id).firstChild.nodeValue = x.n;

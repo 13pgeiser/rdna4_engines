@@ -422,8 +422,9 @@ struct MoverStats {
     uint64_t dropped = 0;
     /* Host copies a unit in a lent slot gave to a budgeted victim that had no pool slot to go to
      * (Mover::donor_slot), and such units moved rather than dropped when their loan was recalled
-     * or shrank. */
-    uint64_t donated = 0, relocated = 0;
+     * or shrank. `stranded` counts the recalls that found no free slot for one of them: it stayed
+     * past the loan until a later recall or balance() moved it. */
+    uint64_t donated = 0, relocated = 0, stranded = 0;
     uint64_t ssd_reads = 0, ssd_bytes = 0;
     /* The prefill stager's copies (stage_units): layers staged, units and bytes copied, and
      * pooled units a buffer had no room left for -- those were read across the link in place.

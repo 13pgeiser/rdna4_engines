@@ -79,6 +79,8 @@ struct SchedMetrics {
      * between an alert and a post-mortem. */
     int64_t prefix_evictions = 0;
     int64_t prefix_ckpt_evictions = 0;
+    /* What --prefix-cache-ttl took, cumulative. Not evictions: nothing wanted the memory. */
+    int64_t prefix_expired = 0, prefix_ckpt_expired = 0;
     /* PREFIX CACHING, DECOUPLED (spec §7.3). `prefix_hit_rate` above is the ATTENTION one, because
      * that is what vLLM's single number has always meant. The linear side hits at a different
      * granularity -- whole checkpoints, not blocks -- and averaging the two would hide exactly the
@@ -166,13 +168,12 @@ struct SessionStat {
     int64_t     bytes = 0;
     double      idle_s = 0;       /* since its last turn */
     double      age_s = 0;        /* since it was first seen */
-    int64_t     on_device = 0, on_host = 0, on_disk = 0;   /* blocks */
+    int64_t     on_device = 0, on_host = 0;   /* blocks */
     /* LINEAR STATE, on a hybrid model, and counted apart from blocks because the two are not
-     * interchangeable. A session showing every block on disk and no snapshot anywhere will come
+     * interchangeable. A session showing every block in host memory and no snapshot will come
      * back and re-run every recurrent layer over its whole transcript -- which the hit rate will
      * report as a hit. Zero everywhere on a model that has no recurrent state. */
     int64_t     snapshots = 0;
-    int64_t     snap_host = 0, snap_disk = 0;    /* in the store; only on disk */
     int64_t     snap_bytes = 0;
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
@@ -182,8 +183,8 @@ struct SessionStat {
 /* WHAT THE STORED CONVERSATIONS OCCUPY OFF THE CARD, blocks and snapshots each counted once --
  * the one total the per-session rows cannot be summed into. Caps are 0 for a tier that is off. */
 struct SessionOccupancy {
-    int64_t host_bytes = 0, disk_bytes = 0;
-    int64_t host_cap_bytes = 0, disk_cap_bytes = 0;
+    int64_t host_bytes = 0;
+    int64_t host_cap_bytes = 0;
 };
 
 struct RequestStat {
@@ -268,27 +269,20 @@ public:
      * tiers are working, switched off, or trying and failing every pass -- three very different
      * situations that all render as "everything is in VRAM". */
     struct TierCounters {
-        /* `to_host` and `to_disk` count COPIES; `dropped` is VRAM given up after one and
-         * `host_freed` host slots given up after the disk copy. A conversation that returns before
-         * anything wants its VRAM is copied and never dropped. `host_drops` is entries lost with
-         * no disk tier to hold them. */
-        int64_t to_host = 0, dropped = 0, to_disk = 0, promoted = 0;
-        int64_t host_freed = 0, host_drops = 0, failures = 0;
-        /* Entries and snapshots read off disk into host memory ahead of the restore that wanted
-         * them; `promoted` counts the restore itself. */
-        int64_t fetched = 0, ck_fetched = 0;
-        int64_t host_bytes = 0, disk_bytes = 0;
-        /* THE LINEAR HALF, MOVED. Separate counters because a hybrid server can move every block
-         * it has and no snapshots at all, and no block counter can tell that apart from tiering
-         * working. `ck_drops` is snapshots whose only copy was lost. */
-        int64_t ck_to_disk = 0, ck_drops = 0;
+        /* `to_host` counts COPIES; `dropped` is VRAM given up after one. A conversation that
+         * returns before anything wants its VRAM is copied and never dropped. `host_drops` is
+         * entries a full host tier gave up; `promoted` counts restores. */
+        int64_t to_host = 0, dropped = 0, promoted = 0;
+        int64_t host_drops = 0, failures = 0;
+        int64_t host_bytes = 0;
+        /* THE SNAPSHOT STORE, which lives in host memory and moves nothing. */
         int64_t ck_bytes = 0;      /* one snapshot; 0 on a model with no recurrent state */
-        int64_t ck_host_slots = 0, ck_disk_slots = 0;   /* the store's; the disk store's */
+        int64_t ck_slots = 0;
         int64_t restores = 0, restore_ns = 0, flushes = 0, flush_ns = 0;   /* IdleTiers::Stats */
         /* WHETHER ANYTHING CAN MOVE AT ALL, which no counter above can answer: a tier that is on
          * and has had nothing to do reads the same as one that was never given a size, and the
          * two call for opposite responses from whoever is looking. */
-        bool host_on = false, disk_on = false;
+        bool host_on = false;
     };
     virtual TierCounters tier_counters() const { return TierCounters{}; }
 };

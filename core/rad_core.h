@@ -800,6 +800,17 @@ struct Config {
      * a rank, ON TOP OF host_pool_mib -- so the table never takes the experts' share of the pool,
      * and a dense model that has no pool still has a place for it. */
     int64_t embedding_host_mib = 0;
+    /* --vision-tower-placement: where a model's encoder towers live. A tower is every weight its
+     * architecture declared read once per request (RAD_ACCESS_PER_REQUEST) -- the vision tower,
+     * and the audio encoder where a model has one -- and Vram, the default, keeps it on the card
+     * with the rest. Ram pins it in host memory of its own, `tower_host_mib` a rank on top of
+     * host_pool_mib as the embedding's is, and the encoder's kernels read it over the link in
+     * place, once an image: what it held on the card goes to the KV cache. */
+    TablePlacement tower_placement = TablePlacement::Vram;
+    TablePlacement tower_resolved  = TablePlacement::Vram;
+    int64_t        tower_host_mib  = 0;
+    /* The pinned host pool one rank allocates: --host-pool-mib and the tables placed beside it. */
+    int64_t host_pool_total_mib() const { return host_pool_mib + embedding_host_mib + tower_host_mib; }
     bool    deterministic = false;
     int64_t checkpoint_interval = 2048;   /* linear-state checkpoints (spec §7.3) */
     /* HOW MANY LINEAR-STATE SNAPSHOTS THE SERVER MAY HOLD AT ONCE -- a CAP and not a charge.
@@ -822,23 +833,19 @@ struct Config {
      * live and the least valuable thing in it once the session stops. With a host tier, a
      * finished conversation is COPIED to host memory at once and its VRAM given up the moment
      * something wants it -- the expert slab's loan, or a request -- so no threshold decides when
-     * it leaves the card: the copy makes leaving free. With a disk tier every host copy is copied
-     * on to disk too, so a full host tier gives the oldest slots up for nothing in the same way.
+     * it leaves the card: the copy makes leaving free. A full host tier drops its least recently
+     * used entries. Nothing is written to a drive.
      *
      * Moving is worth it because the alternative is a re-prefill. Recovering a 200K-token turn
      * costs a copy over PCIe; recomputing it costs minutes. The two are not the same order.
      *
      * CAPACITY IS WHAT TURNS THEM ON. Nothing is copied until the host tier has a size: a tier of
-     * zero bytes holds nothing, so the feature is off until an operator says how much memory and
-     * how much disk it may have. */
-    int64_t prefix_cache_host_mib = 0;        /* the host tier's size. 0 is off */
-    int64_t prefix_cache_disk_mib = 0;        /* the disk tier's size. 0 is off */
-    /* WHERE THE DISK TIER LIVES, and a flag of its own rather than a second meaning for
-     * --weights-disk-tier. That one is the WEIGHT planner's permission to place weights on the file
-     * tier -- it reads the container, needs pinned staging, and refuses startup without it. The
-     * two have nothing in common but the word "disk", and a shared flag would make asking for a KV
-     * cache also ask for weight offload, which fails for want of a host pool nobody wanted. */
-    std::string prefix_cache_dir;
+     * zero bytes holds nothing, so the feature is off until an operator says how much memory it
+     * may have. */
+    int64_t prefix_cache_mib = 0;             /* the host tier's size. 0 is off */
+    /* HOW LONG AN UNUSED CONVERSATION IS KEPT, in seconds, whichever tier holds it: VRAM, host
+     * memory, and its snapshots. 0 keeps everything until the memory is wanted. */
+    int64_t prefix_cache_ttl = 3600;
 
     /* THE CACHE ALWAYS LENDS AND THERE IS NO FLAG FOR IT. It keeps the blocks it is using plus a
      * buffer it derives, and lends the rest to the expert plane at the addresses it already owns;

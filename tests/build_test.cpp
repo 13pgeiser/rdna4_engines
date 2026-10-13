@@ -1006,6 +1006,11 @@ TEST(the_c_surface_drives_the_builder) {
     CHECK(op != RAD_NULL_HANDLE);
     CHECK_EQ(rad_op_resolved(h, op), 1);
     CHECK_EQ(rad_op_resolved(h, 99), 0);
+    /* Whether an op is in the vocabulary at all, asked without declaring it: no error either way. */
+    CHECK_EQ(rad_op_declared(h, "t_gemm"), 1);
+    CHECK_EQ(rad_op_declared(h, "t_no_such_op"), 0);
+    CHECK_EQ(rad_op_declared(h, nullptr), 0);
+    CHECK_EQ(b.status(), RAD_OK);
 
     /* A weight declared twice cannot be diagnosed later: the container has one entry for it. */
     CHECK_EQ(rad_decl_weight(h, "blk.0.ffn_gate.weight", &wd), RAD_NULL_HANDLE);

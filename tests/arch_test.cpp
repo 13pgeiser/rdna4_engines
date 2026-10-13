@@ -20,6 +20,7 @@
 
 #include <cstdarg>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -71,7 +72,10 @@ struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
     int64_t                 n = 0;
+    int                     lane = 0;   /* the lane it was issued on (rad_lane) */
 };
+/* A rad_lane_join: `to` behind everything `from` issued before issue number `at`. */
+struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 
 }  /* namespace */
 
@@ -84,8 +88,11 @@ struct RadBuilder {
     std::vector<std::pair<int, rad_kvgroup>> binds;
     std::vector<std::string> notes;
 
-    /* Ops the fake kernel hierarchy refuses, so the fused-op fallback can be driven. */
+    /* Ops the fake kernel hierarchy refuses, so the fused-op fallback can be driven; and ops no
+     * loaded library declares at all (rad_op_declared), as without an optional library. */
     std::set<std::string> refuse;
+    std::set<std::string> undeclared;
+    std::vector<std::string> asked_undeclared;   /* what a real engine would have refused */
     int64_t kv_block = 16;
 
     /* The buffer the plugin named as this step's logits (rad_declare_logits). */
@@ -97,6 +104,9 @@ struct RadBuilder {
     std::string    drafter_name;
     bool           drafter_shared = false;
     int            drafter_pos = -1;
+
+    /* The buffers named to rad_buf_concurrent: the ones a second lane touches. */
+    std::vector<rad_buf> concurrent;
 
     /* The vision tower's declaration (rad_declare_encoder), when the plugin made one, and the
      * audio encoder's. */
@@ -120,6 +130,8 @@ struct RadCtx {
     std::vector<RecIssue> issues;
     std::vector<int>      routed_layers;
     std::string           step_fail;
+    int                   lane = 0;     /* where the next issue goes */
+    std::vector<RecJoin>  joins;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -141,6 +153,10 @@ extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBuf
 
 extern "C" rad_op rad_decl_op(RadBuilder* b, const char* op, const RadParam* params, int n_params,
                               const rad_weight* weights, int n_weights) {
+    if (b->undeclared.count(op)) {
+        b->asked_undeclared.push_back(op);
+        return RAD_NULL_HANDLE;
+    }
     RecOp r;
     r.op = op;
     for (int i = 0; i < n_params; ++i) {
@@ -181,6 +197,10 @@ extern "C" int rad_op_resolved(RadBuilder* b, rad_op h) {
     return h != RAD_NULL_HANDLE && b->ops[h - 1].resolved;
 }
 
+extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
+    return op && b->undeclared.count(op) == 0;
+}
+
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
                                          const RadKVGroupDecl* d) {
     b->kv_groups.push_back({name, *d, false});
@@ -219,8 +239,12 @@ extern "C" int rad_declare_logits(RadBuilder* b, rad_buf logits) {
     return RAD_OK;
 }
 
-/* Recorded as calls and nothing else: no test here reads a lane or a drafter declaration. */
-extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) { (void)b; (void)buf; return RAD_OK; }
+/* Recorded: the gemma4 prefill overlap names the buffers its second lane reduces in place. */
+extern "C" int rad_buf_concurrent(RadBuilder* b, rad_buf buf) {
+    if (!b || !buf) return RAD_E_INVAL;
+    b->concurrent.push_back(buf);
+    return RAD_OK;
+}
 extern "C" int rad_weight_shard_span(RadBuilder* b, rad_weight w, int64_t lo, int64_t hi) {
     if (!b || w == 0 || w > b->weights.size()) return RAD_E_INVAL;
     if (lo < 0 || hi <= lo) return RAD_E_INVAL;
@@ -301,7 +325,19 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
     r.op = op;
     r.n  = n;
     for (int i = 0; i < n_opd; ++i) r.opd.push_back(opd[i]);
+    r.lane = c->lane;
     c->issues.push_back(r);
+    return RAD_OK;
+}
+/* The second lane, recorded: the lane each issue went to, and where each join sits among them. */
+extern "C" int rad_lane(RadCtx* c, int lane) {
+    if (lane != 0 && lane != 1) return RAD_E_INVAL;
+    c->lane = lane;
+    return RAD_OK;
+}
+extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
+    if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
+    c->joins.push_back({ c->issues.size(), from, to });
     return RAD_OK;
 }
 /* A block that refuses the batch records the reason; the recorder is what the tests read. */
@@ -346,6 +382,8 @@ extern "C" void* rad_buf_ptr   (RadCtx* c, rad_buf    b) { (void)c; return (void
 #include "../arch/lfm2_bf16/lfm2_bf16.cpp"
 /* Gemma 4 dense: two attention classes (sliding-window + proportional-RoPE global) on one stream. */
 #include "../arch/gemma4_bf16/gemma4_bf16.cpp"
+/* And the bf16 / fp8-expert Gemma 4 plugin: the 26B-A4B's dense and routed arms side by side. */
+#include "../arch/gemma4/gemma4.cpp"
 /* The PLE block on its own: no architecture in this file declares it, and what its step() hands
  * the two windowed ops is a contract of its own (rad_block_ple.h). */
 #include <arch/rad_block_ple.h>
@@ -4131,4 +4169,801 @@ TEST(gemma4_probe_names_the_heads_operating_depth) {
     RadModelMeta without = gemma4_meta();
     CHECK_OK(gemma4_bf16::probe(&without, &q));
     CHECK_EQ(q.draft_depth, 0);
+}
+
+/* ===================== gemma4: the 26B-A4B, a dense and a routed arm side by side ===================== */
+
+namespace {
+
+/* gemma-4-26B-A4B-it's text geometry cut to SIX layers -- five sliding then one full, the model's
+ * own 5:1 -- with the routed arm on. The keys are the checkpoint's (text_config flattened), which
+ * is what arch/gemma4 reads, and quant is empty: the container this plugin claims. */
+const char* k_g4moe_keys[] = {
+    "hidden_size", "num_attention_heads", "num_key_value_heads", "head_dim", "global_head_dim",
+    "num_global_key_value_heads", "attention_k_eq_v", "vocab_size", "intermediate_size",
+    "rms_norm_eps", "sliding_window", "final_logit_softcapping", "hidden_activation", "layer_types",
+    "rope_parameters.sliding_attention.rope_theta", "rope_parameters.sliding_attention.rope_type",
+    "rope_parameters.full_attention.rope_theta", "rope_parameters.full_attention.rope_type",
+    "rope_parameters.full_attention.partial_rotary_factor", "enable_moe_block", "num_experts",
+    "top_k_experts", "moe_intermediate_size",
+};
+const char* k_g4moe_vals[] = {
+    "2816", "16", "8", "256", "512",
+    "2", "true", "262144", "2112",
+    "1e-06", "1024", "30.0", "gelu_pytorch_tanh",
+    "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+    "\"sliding_attention\", \"full_attention\"]",
+    "10000.0", "default",
+    "1000000.0", "proportional",
+    "0.25", "true", "128",
+    "8", "704",
+};
+static_assert(sizeof(k_g4moe_keys) == sizeof(k_g4moe_vals), "one value a key");
+
+RadModelMeta gemma4_moe_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "gemma4";
+    m.name        = "test-gemma4-26b-a4b";
+    m.quant       = "";
+    m.n_layers    = 6;
+    m.n_embd      = 2816;
+    m.n_head      = 16;
+    m.n_head_kv   = 8;
+    m.head_dim    = 256;
+    m.n_ff        = 2112;
+    m.n_vocab     = 262144;
+    m.n_ctx_train = 262144;
+    m.rms_eps     = 1e-6f;
+    m.n_kv        = (int)(sizeof(k_g4moe_keys) / sizeof(k_g4moe_keys[0]));
+    m.kv_key      = k_g4moe_keys;
+    m.kv_val      = k_g4moe_vals;
+    return m;
+}
+
+int count_resolved(const RadBuilder& b, const std::string& name) {
+    int n = 0;
+    for (const auto& o : b.ops) if (o.op == name && o.resolved) ++n;
+    return n;
+}
+
+int count_issued(const std::vector<std::string>& v, const std::string& name) {
+    return (int)std::count(v.begin(), v.end(), name);
+}
+
+}  /* namespace */
+
+TEST(a_gemma4_moe_trunk_declares_both_arms_and_the_joins) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    /* five sliding layers read q in the fused row (attn_paged_qrow), the full one attn_paged */
+    CHECK_EQ(count_op(b, "attn_paged_qrow"), 5);
+    CHECK_EQ(count_op(b, "attn_paged"),      1);
+    CHECK_EQ(count_op(b, "kv_store"),   6);
+    /* One join after attention and one after the two feed-forward arms, a layer. */
+    CHECK_EQ(count_resolved(b, "norm_add_norm"),  6);
+    CHECK_EQ(count_resolved(b, "join_add_scale"), 6);
+    /* The routed arm: experts served bf16 where the container holds no encoding for them. */
+    CHECK(count_op(b, "moe_gemm") > 0);
+    CHECK_EQ(count_op(b, "moe_gemm_q"), 0);
+    CHECK_EQ(count_op(b, "logit_softcap"), 1);
+    CHECK_EQ(count_op(b, "all_reduce"),    0);   /* world 1 */
+
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights)
+        CHECK(find_map(b, w.name) != nullptr);
+}
+
+/* THE SLIDING GROUP IS FULL, with the window on the attention op: a WINDOW group is not
+ * prefix-cached, and FULL keeps a hit (arch/gemma4/gemma4.cpp, the KV groups). */
+TEST(gemma4_moe_kv_groups_are_both_full_and_the_window_rides_the_op) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    REQUIRE((int)b.kv_groups.size() == 2);
+    for (const auto& g : b.kv_groups) {
+        CHECK_EQ((int)g.d.kind, RAD_KV_FULL);
+        CHECK_EQ(g.d.window, 0);
+    }
+    const RecOp* sl = find_op(b, "attn_paged_qrow", 0);
+    REQUIRE(sl != nullptr);
+    CHECK_EQ(pint(sl, "head_dim"), 256);
+    CHECK_EQ(pint(sl, "window"),   1024);
+    const RecOp* fu = find_op(b, "attn_paged", 0);
+    REQUIRE(fu != nullptr);
+    CHECK_EQ(pint(fu, "head_dim"), 512);
+    CHECK_EQ(pint(fu, "gqa"),      8);
+    CHECK_EQ(pint(fu, "window"),   0);
+}
+
+/* PROPORTIONAL ROPE IS NOT A PARTIAL ROTARY: the full layers rotate the whole 512-wide head as a
+ * NeoX pair (j, j + 256), with every frequency past pair 63 divided away by the YaRN ramp. A
+ * rotary_dim of 128 would pair (j, j + 64) -- fluent, and wrong. */
+TEST(gemma4_full_rope_is_the_whole_head_with_the_frequencies_past_64_pairs_cut) {
+    RadBuilder b;
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    int full = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != "rope" || pint(&o, "head_dim") != 512) continue;
+        ++full;
+        CHECK_EQ(pint(&o, "rotary_dim"), 512);
+        CHECK_EQ(pstr(&o, "mode"), std::string("neox"));
+        CHECK_NEAR(pflt(&o, "theta"),     1e6, 1.0);
+        CHECK_NEAR(pflt(&o, "yarn_low"),  63.5, 1e-9);
+        CHECK_NEAR(pflt(&o, "yarn_high"), 64.0, 1e-9);
+        CHECK(pflt(&o, "yarn_factor") >= 1e30);
+    }
+    CHECK(full > 0);
+}
+
+/* Where no kernel library serves a join, the plugin declares the rmsnorm / add chain instead and
+ * issues that -- and libref has no row for the joins precisely so that this path stays reachable
+ * (docs/OPS.md). */
+TEST(gemma4_falls_back_to_the_chain_where_no_join_resolves) {
+    std::vector<std::string> fused, chain;
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) { b.refuse.insert("norm_add_norm"); b.refuse.insert("join_add_scale"); }
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        (refuse ? chain : fused) = issued_ops(b, c);
+    }
+    CHECK_EQ(count_issued(fused, "norm_add_norm"),  6);
+    CHECK_EQ(count_issued(fused, "join_add_scale"), 6);
+    CHECK_EQ(count_issued(chain, "norm_add_norm"),  0);
+    CHECK_EQ(count_issued(chain, "join_add_scale"), 0);
+    for (const auto* v : { &fused, &chain }) {
+        CHECK_EQ(count_issued(*v, "attn_paged_qrow"), 5);
+        CHECK_EQ(count_issued(*v, "attn_paged"),      1);
+    }
+    /* The chain is longer, by the norms and adds the joins fold in. */
+    CHECK(count_issued(chain, "rmsnorm") > count_issued(fused, "rmsnorm"));
+    CHECK(count_issued(chain, "add") > count_issued(fused, "add"));
+}
+
+/* Both Gemma 4 plugins state the model's reply format, and it is one declaration. */
+TEST(both_gemma4_plugins_export_one_reply_format) {
+    RadModelMeta moe = gemma4_moe_meta(), dense = gemma4_meta();
+    CHECK(gemma4::chat_format(&moe) == rad::arch::gemma4_chat_format());
+    CHECK(gemma4_bf16::chat_format(&dense) == rad::arch::gemma4_chat_format());
+}
+
+/* ================== gemma4 + DFlash: the drafter's taps, live where they are written ================== */
+
+namespace {
+
+/* The MoE trunk above with z-lab's DFlash drafter merged: five layers, four sliding and one full,
+ * reading the trunk at layers 1, 3 and 5. */
+std::vector<const char*> g4df_keys() {
+    std::vector<const char*> k(std::begin(k_g4moe_keys), std::end(k_g4moe_keys));
+    for (const char* s : { "draft.architectures", "draft.num_hidden_layers", "draft.head_dim",
+                           "draft.num_attention_heads", "draft.num_key_value_heads",
+                           "draft.intermediate_size", "draft.rms_norm_eps", "draft.rope_theta",
+                           "draft.hidden_size", "draft.vocab_size", "draft.block_size",
+                           "draft.dflash_config.target_layer_ids",
+                           "draft.dflash_config.mask_token_id", "draft.layer_types",
+                           "draft.sliding_window" })
+        k.push_back(s);
+    return k;
+}
+std::vector<const char*> g4df_vals() {
+    std::vector<const char*> v(std::begin(k_g4moe_vals), std::end(k_g4moe_vals));
+    for (const char* s : { "[\"DFlashDraftModel\"]", "5", "128", "32", "8", "5632", "1e-06",
+                           "1000000.0", "2816", "262144", "16", "[1, 3, 5]", "4",
+                           "[\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                           "\"sliding_attention\", \"full_attention\"]",
+                           "2048" })
+        v.push_back(s);
+    return v;
+}
+
+int buf_named(const RadBuilder& b, const char* name) {
+    for (size_t i = 0; i < b.bufs.size(); ++i)
+        if (b.bufs[i].name == name) return (int)i + 1;
+    return 0;
+}
+
+}  /* namespace */
+
+/* DFlash proposes its block in one pass, so the depth the probe names is the block it was trained
+ * at less the anchor, and fixed; a container without the drafter, or with a DFlash2 one, which
+ * this plugin does not serve, names none. */
+TEST(gemma4_probe_names_the_dflash_blocks_depth) {
+    std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    RadModelMeta meta = gemma4_moe_meta();
+    meta.n_kv   = (int)keys.size();
+    meta.kv_key = keys.data();
+    meta.kv_val = vals.data();
+    RadArchProbe p{};
+    CHECK_OK(gemma4::probe(&meta, &p));
+    CHECK_EQ(p.draft_depth, 15);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+
+    for (size_t i = 0; i < keys.size(); ++i)
+        if (!std::strcmp(keys[i], "draft.architectures")) vals[i] = "[\"DFlash2DraftModel\"]";
+    meta.kv_val = vals.data();
+    RadArchProbe q{};
+    CHECK_OK(gemma4::probe(&meta, &q));
+    CHECK_EQ(q.draft_depth, 0);
+
+    RadModelMeta plain = gemma4_moe_meta();
+    RadArchProbe r{};
+    CHECK_OK(gemma4::probe(&plain, &r));
+    CHECK_EQ(r.draft_depth, 0);
+}
+
+/* THE TAP IS DECLARED WHERE IT IS ISSUED. The buffer planner takes liveness from declaration order,
+ * so `dflash_src` is live from its first DECLARED write. A tap op declared once after the whole
+ * trunk -- and issued inside it, at each tap layer -- made the buffer look born at the end, and the
+ * plan was free to put it on top of `moe_edn`, which every MoE layer writes. At --max-num-seqs 16
+ * it did: every layer after a tap overwrote what the drafter reads, and acceptance fell to 2% with
+ * the reply still fluent. The two ranges must overlap, so no plan can share them. */
+TEST(gemma4_dflash_taps_are_live_from_the_layer_that_writes_them) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    RadModelMeta meta = gemma4_moe_meta();
+    meta.n_kv   = (int)keys.size();
+    meta.kv_key = keys.data();
+    meta.kv_val = vals.data();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_spec = 15;
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+    const int src = buf_named(b, "dflash_src"), edn = buf_named(b, "moe_edn");
+    REQUIRE(src > 0 && edn > 0);
+    int first_src = -1, last_edn = -1;
+    for (size_t i = 0; i < b.ops.size(); ++i)
+        for (rad_buf w : b.ops[i].writes) {
+            if ((int)w == src && first_src < 0) first_src = (int)i;
+            if ((int)w == edn) last_edn = (int)i;
+        }
+    REQUIRE(first_src >= 0 && last_edn >= 0);
+    CHECK(first_src < last_edn);
+
+    /* And a trunk step writes each tap once: three taps, three copies into `dflash_src`. */
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    int taps = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && std::find(o->writes.begin(), o->writes.end(), (rad_buf)src) != o->writes.end())
+            ++taps;
+    }
+    CHECK_EQ(taps, 3);
+}
+
+/* The sliding layers' attention reads q where the fused projection left it -- no copy between the
+ * qkv projection and the attention -- where attn_paged_qrow is served, and lifts q for attn_paged
+ * where it is not. */
+TEST(gemma4_sliding_attention_reads_q_in_the_fused_row) {
+    /* Served, attn_paged_qrow reads the slice and nothing is lifted; refused -- a hierarchy where
+     * nothing serves it -- q is lifted into q_s for attn_paged, and the slice reaches no attn_paged
+     * either way, since that op may resolve to a kernel that reads q only dense. */
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) b.refuse.insert("attn_paged_qrow");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        const int qkv = buf_named(b, "qkv_s"), qs = buf_named(b, "q_s");
+        REQUIRE(qkv > 0);
+        CHECK_EQ(qs > 0, refuse == 1);
+        auto reads = [](const RecOp& o, int buf) {
+            return buf > 0 && std::find(o.reads.begin(), o.reads.end(), (rad_buf)buf) != o.reads.end();
+        };
+        int qrow = 0, paged_slice = 0, paged_lifted = 0;
+        for (const auto& o : b.ops) {
+            if (!o.resolved) continue;
+            if (o.op == "attn_paged_qrow" && reads(o, qkv)) ++qrow;
+            if (o.op == "attn_paged" && reads(o, qkv)) ++paged_slice;
+            if (o.op == "attn_paged" && reads(o, qs)) ++paged_lifted;
+        }
+        const int sliding = refuse ? paged_lifted : qrow;
+        CHECK(sliding > 0);
+        CHECK_EQ(refuse ? qrow : paged_lifted, 0);
+        CHECK_EQ(paged_slice, 0);
+        CHECK_EQ(count_op(b, "cast"), refuse ? sliding : 0);   /* the lifts; no drafter, no taps */
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "attn_paged_qrow"), refuse ? 0 : sliding);
+        CHECK_EQ(count_issued(issued, "cast"), refuse ? sliding : 0);
+        for (const auto& o : b.ops)
+            if (o.resolved) CHECK(o.uses_declared);
+    }
+}
+
+/* The feed-forward join writes the next layer's input norm: with the joins served, the only
+ * rmsnorm from the residual `x` into `h` is layer 0's (nothing precedes it), the final norm is the
+ * last join's, and every join writes `h`. Refused, the chain declares all of them again. */
+TEST(gemma4_feed_forward_join_writes_the_next_input_norm) {
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) { b.refuse.insert("norm_add_norm"); b.refuse.insert("join_add_scale"); }
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        const int x = buf_named(b, "x"), h = buf_named(b, "h");
+        REQUIRE(x > 0 && h > 0);
+        int x_to_h = 0, joins_to_h = 0;
+        for (const auto& o : b.ops) {
+            if (!o.resolved) continue;
+            const bool rx = std::find(o.reads.begin(), o.reads.end(), (rad_buf)x) != o.reads.end();
+            const bool wh = std::find(o.writes.begin(), o.writes.end(), (rad_buf)h) != o.writes.end();
+            if (o.op == "rmsnorm" && rx && wh) ++x_to_h;
+            if (o.op == "join_add_scale" && wh) ++joins_to_h;
+        }
+        /* fused: layer 0's input norm. Chained: six input norms, six pre-feedforward norms, the
+         * final norm. */
+        CHECK_EQ(x_to_h, refuse ? 13 : 1);
+        CHECK_EQ(joins_to_h, refuse ? 0 : 6);
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "join_add_scale"), refuse ? 0 : 6);
+        CHECK_EQ(count_issued(issued, "logits_gemm"), 1);
+    }
+}
+
+/* At decode heights the router, its top-k and the sort are one launch (libr4d's
+ * router_gemm_topk_scatter); refused, the pair (router_topk_scatter) behind the router GEMM; both
+ * refused, the three separate ops as before. The routing's buffers are the same either way. */
+TEST(gemma4_routes_a_decode_step_in_one_launch) {
+    for (int refuse = 0; refuse < 3; ++refuse) {
+        RadBuilder b;
+        if (refuse >= 1) b.refuse.insert("router_gemm_topk_scatter");
+        if (refuse >= 2) b.refuse.insert("router_topk_scatter");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "router_gemm_topk_scatter"), refuse == 0 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "router_topk_scatter"), refuse == 1 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "router_topk"), refuse == 2 ? 6 : 0);
+        CHECK_EQ(count_issued(issued, "moe_scatter"), refuse == 2 ? 6 : 0);
+        /* the per-expert scale and the experts' gather run whichever form routed */
+        CHECK_EQ(count_issued(issued, "expert_scale"), 6);
+        CHECK_EQ(count_issued(issued, "moe_gather"), 6);
+    }
+}
+
+/* The per-expert scale is one launch where `expert_scale` is served, and the table lookup and the
+ * multiply where it is not -- the same buffers read and written either way. */
+TEST(gemma4_scales_the_routing_weights_in_one_launch) {
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        if (refuse) b.refuse.insert("expert_scale");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> issued = issued_ops(b, c);
+        CHECK_EQ(count_issued(issued, "expert_scale"), refuse ? 0 : 6);
+        CHECK_EQ(count_issued(issued, "embed_lookup"), refuse ? 1 + 6 : 1);   /* + the token embedding */
+        CHECK_EQ(count_issued(issued, "mul"), refuse ? 6 : 0);
+        for (const auto& o : b.ops)
+            if (o.resolved) CHECK(o.uses_declared);
+    }
+}
+
+/* The drafter's head reads the container's block-fp8 copy of the target's table where it holds one
+ * -- `dflash.draft_head.weight` -- through quant_act_fp8 and gemm_nt_q, and the bf16 table through
+ * gemm_nt where it does not. The copy is declared only in the first case, so a container converted
+ * without the recipe line is served exactly as before. */
+TEST(gemma4_dflash_head_reads_the_fp8_copy_where_the_container_holds_one) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    for (int fp8 = 0; fp8 < 2; ++fp8) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuilder b;
+        if (fp8)
+            b.encs = { { "dflash.draft_head", rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128) } };
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        CHECK_EQ(find_w(b, "dflash.draft_head.weight") != nullptr, fp8 == 1);
+
+        const int dlog = buf_named(b, "df_dlog"), selh = buf_named(b, "df_selh");
+        REQUIRE(dlog > 0 && selh > 0);
+        const RecOp* head = nullptr;
+        for (const auto& o : b.ops)
+            if (o.resolved &&
+                std::find(o.writes.begin(), o.writes.end(), (rad_buf)dlog) != o.writes.end())
+                head = &o;
+        REQUIRE(head != nullptr);
+        CHECK_EQ(head->op, std::string(fp8 ? "gemm_nt_q" : "gemm_nt"));
+        const bool reads_selh =
+            std::find(head->reads.begin(), head->reads.end(), (rad_buf)selh) != head->reads.end();
+        CHECK_EQ(reads_selh, fp8 == 0);
+
+        /* and a draft pass issues it */
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        int head_issues = 0;
+        for (const auto& i : c.issues)
+            if (b.op_of(i.op) == head) ++head_issues;
+        CHECK_EQ(head_issues, 1);
+    }
+}
+
+/* THE DRAFTER'S RESIDUAL ADD, NORM AND QUANTISER IN ONE LAUNCH (`rmsnorm_quant_fp8`): ten a draft
+ * pass over five layers, each layer's two inputs, layer 0's attention input taking x as the
+ * embedding left it -- and one `add` left, the last layer's, ahead of the final norm. Refused, the
+ * chain: two adds and two quantisers of x a layer. */
+TEST(gemma4_dflash_folds_the_residual_add_norm_and_quantiser_into_one_launch) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuilder b;
+        if (refuse) b.refuse.insert("rmsnorm_quant_fp8");
+        RadBuildCtx ctx = build_ctx();
+        ctx.max_spec = 15;
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        batch.draft_pass = 1;
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        const std::vector<std::string> ops = issued_ops(b, c);
+        CHECK_EQ(count_issued(ops, "rmsnorm_quant_fp8"), refuse ? 0 : 10);
+        CHECK_EQ(count_issued(ops, "add"), refuse ? 10 : 1);
+        /* x's quantiser twice a layer in the chain; the attention output's once a layer always */
+        CHECK_EQ(count_issued(ops, "quant_act_fp8"), refuse ? 15 : 5);
+        if (refuse) continue;
+
+        /* the delta then the residual x past layer 0; layer 0 reads x and adds nothing */
+        const uint32_t x = (uint32_t)buf_named(b, "df_x"), h = (uint32_t)buf_named(b, "df_h");
+        int k = 0;
+        for (const auto& i : c.issues) {
+            const RecOp* o = b.op_of(i.op);
+            if (!o || o->op != "rmsnorm_quant_fp8") continue;
+            REQUIRE(i.opd.size() == 6);
+            if (k++ == 0) {
+                CHECK_EQ(i.opd[0].handle, x);
+                CHECK_EQ((int)i.opd[1].kind, (int)RAD_OPK_NONE);
+            } else {
+                CHECK_EQ(i.opd[0].handle, h);
+                CHECK_EQ(i.opd[1].handle, x);
+            }
+        }
+    }
+}
+
+/* ============ gemma4: the prefill overlap -- two slices, the reductions on lane 1 ============ */
+
+namespace {
+
+/* The elements [lo, hi) of its buffer an operand can reach, whole rows at the declared width. False
+ * for an operand that is not a buffer. */
+bool reach(const RadBuilder& b, const RadOperand& o, rad_buf* buf, int64_t* lo, int64_t* hi) {
+    if (o.kind != RAD_OPK_BUF || o.handle == 0 || o.handle > b.bufs.size()) return false;
+    const RadBufDecl& d = b.bufs[o.handle - 1].d;
+    int64_t pitch = 1;
+    for (uint32_t i = 1; i < d.rank; ++i) pitch *= d.shape[i];
+    *buf = o.handle;
+    *lo  = o.offset - o.offset % pitch;
+    *hi  = *lo + (o.rows > 0 ? o.rows : d.shape[0]) * pitch;
+    return true;
+}
+
+/* Whether issue a runs before issue b (a < b): on one lane by issue order, across the two only
+ * through a join from a's lane to b's issued between them. */
+bool ordered(const RadCtx& c, size_t a, size_t b) {
+    const int la = c.issues[a].lane, lb = c.issues[b].lane;
+    if (la == lb) return true;
+    for (const RecJoin& j : c.joins)
+        if (j.from == la && j.to == lb && j.at > a && j.at <= b) return true;
+    return false;
+}
+
+/* Pairs of issues on different lanes that reach a common element with nothing ordering them.
+ * Every operand is taken as read and written, which can only over-count. */
+int races(const RadBuilder& b, const RadCtx& c) {
+    int n = 0;
+    for (size_t i = 0; i < c.issues.size(); ++i)
+        for (size_t j = i + 1; j < c.issues.size(); ++j) {
+            if (ordered(c, i, j)) continue;
+            bool meet = false;
+            for (const RadOperand& p : c.issues[i].opd)
+                for (const RadOperand& q : c.issues[j].opd) {
+                    rad_buf bp = 0, bq = 0;
+                    int64_t pl = 0, ph = 0, ql = 0, qh = 0;
+                    if (reach(b, p, &bp, &pl, &ph) && reach(b, q, &bq, &ql, &qh) && bp == bq &&
+                        pl < qh && ql < ph)
+                        meet = true;
+                }
+            n += meet ? 1 : 0;
+        }
+    return n;
+}
+
+/* One prompt of T tokens, its last sampled. */
+RadBatch one_prompt(int64_t T, const int32_t* out) {
+    RadBatch b{};
+    b.phase       = RAD_PHASE_PREFILL;
+    b.n_tok       = T;
+    b.n_seq       = 1;
+    b.max_q_len   = T;
+    b.max_ctx_len = T;
+    b.n_out       = 1;
+    b.out_ids     = out;
+    return b;
+}
+
+/* Rows issued, summed by op: a slice's n is its rows, a whole step's RAD_N_BATCH is T. */
+std::map<std::string, int64_t> rows_by_op(const RadBuilder& b, const RadCtx& c, int64_t T) {
+    std::map<std::string, int64_t> w;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        w[o ? o->op : "<null>"] += i.n < 0 ? T : i.n;
+    }
+    return w;
+}
+
+/* The n of each issue of one op, in issue order. */
+std::vector<int64_t> ns_of(const RadBuilder& b, const RadCtx& c, const char* op) {
+    std::vector<int64_t> v;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (o && o->op == op) v.push_back(i.n);
+    }
+    return v;
+}
+
+bool noted(const RadBuilder& b, const char* text) {
+    for (const auto& n : b.notes)
+        if (n.find(text) != std::string::npos) return true;
+    return false;
+}
+
+}  /* namespace */
+
+/* A PREFILL CHUNK IN TWO SLICES (arch/gemma4, trunk_overlap). What a recorder can check is the
+ * order and the work: every reduction rides lane 1 behind its producer and ahead of its consumer,
+ * nothing else does, the cut is a whole number of routed passes, and the slices issue exactly the
+ * rows the whole step issues -- the same routed passes, the drafter's taps -- which is what makes
+ * the output the whole step's. A chunk under two passes, and a decode step, run whole: their
+ * reductions on lane 0 and the dense arm on lane 1 beside the routed arm (trunk), with nothing
+ * unordered either. */
+TEST(a_gemma4_prefill_chunk_runs_as_two_slices_with_its_reductions_on_the_second_lane) {
+    const std::vector<const char*> keys = g4df_keys(), vals = g4df_vals();
+    const int64_t E = 2816, L = 6;
+    auto model = [&](RadBuilder& b, bool whole) {
+        RadModelMeta meta = gemma4_moe_meta();
+        meta.n_kv   = (int)keys.size();
+        meta.kv_key = keys.data();
+        meta.kv_val = vals.data();
+        RadBuildCtx ctx = build_ctx(0, 4);
+        ctx.max_tok  = 8192;
+        ctx.max_spec = 15;
+        /* The lossy wire runs every chunk whole: nothing shows a slice gets the bits the whole
+         * step gets on it. */
+        if (whole) ctx.tp_wire_lossy = 1;
+        return gemma4::declare(&b, &meta, &ctx);
+    };
+    auto run = [&](RadBuilder& b, RadCtx& c, RadBatch& batch) {
+        c.b = &b; c.rank = 0; c.world = 4; c.batch = &batch;
+        gemma4::step(&c, &batch);
+    };
+
+    struct Case { int64_t T, cut; };
+    for (const Case k : { Case{8192, 4096}, Case{6144, 4096}, Case{6143, 2048}, Case{4096, 2048},
+                          Case{4095, 0} }) {
+        const int32_t out[1] = { (int32_t)(k.T - 1) };
+        RadBuilder b;
+        CHECK_OK(model(b, false));
+        CHECK(noted(b, "prefill overlap: a chunk of two routed passes"));
+        CHECK_EQ((int)b.concurrent.size(), 5);
+        for (const char* name : { "o", "ff2", "h", "gate_up", "ffn" })
+            CHECK(std::count(b.concurrent.begin(), b.concurrent.end(),
+                             (rad_buf)buf_named(b, name)) == 1);
+        RadBatch batch = one_prompt(k.T, out);
+        RadCtx c;
+        run(b, c, batch);
+        CHECK(c.step_fail.empty());
+        CHECK_EQ(c.lane, 0);
+        CHECK_EQ(races(b, c), 0);
+
+        std::vector<int64_t> lane1;   /* the reductions on lane 1 */
+        int dense1 = 0;               /* and the dense arm's launches */
+        for (const auto& i : c.issues) {
+            if (i.lane != 1) continue;
+            const RecOp* o = b.op_of(i.op);
+            REQUIRE(o != nullptr);
+            if (o->op == "all_reduce") lane1.push_back(i.n);
+            else ++dense1;
+        }
+        if (k.cut == 0) {
+            CHECK(lane1.empty());
+            CHECK_EQ(dense1, 3 * (int)L);    /* gate_up, act_mul, down: beside the routed arm */
+        } else {
+            CHECK_EQ(dense1, 0);
+            REQUIRE(lane1.size() == (size_t)(4 * L));
+            for (int64_t l = 0; l < L; ++l) {
+                CHECK_EQ(lane1[4 * l + 0], k.cut * E);               /* attention, slice A */
+                CHECK_EQ(lane1[4 * l + 1], (k.T - k.cut) * E);       /* attention, slice B */
+                CHECK_EQ(lane1[4 * l + 2], 2 * k.cut * E);           /* both arms, slice A */
+                CHECK_EQ(lane1[4 * l + 3], 2 * (k.T - k.cut) * E);   /* both arms, slice B */
+            }
+        }
+
+        /* The whole step, on the lossy wire: the same rows by op, the same routed passes. Its
+         * reductions stay on lane 0 and only the dense arm takes the second. */
+        RadBuilder w;
+        CHECK_OK(model(w, true));
+        CHECK(noted(w, "prefill overlap: off (the lossy all-reduce wire)"));
+        CHECK(std::count(w.concurrent.begin(), w.concurrent.end(), (rad_buf)buf_named(w, "o")) == 0);
+        RadBatch wbatch = one_prompt(k.T, out);
+        RadCtx wc;
+        run(w, wc, wbatch);
+        CHECK(wc.step_fail.empty());
+        CHECK_EQ(races(w, wc), 0);
+        for (const auto& i : wc.issues) {
+            const RecOp* o = w.op_of(i.op);
+            if (i.lane == 1) CHECK(o == nullptr || o->op != "all_reduce");
+        }
+        CHECK(rows_by_op(b, c, k.T) == rows_by_op(w, wc, k.T));
+        CHECK(ns_of(b, c, "moe_gather") == ns_of(w, wc, "moe_gather"));
+        CHECK_EQ((int)ns_of(b, c, "cast").size(), k.cut ? 6 : 3);   /* three taps, a slice each */
+    }
+
+    /* A decode step: the reductions on lane 0, the dense arm on lane 1 joined in before the
+     * feed-forward's, nothing unordered. */
+    RadBuilder b;
+    CHECK_OK(model(b, false));
+    CHECK(noted(b, "the two arms: in a step that runs whole"));
+    RadBatch d = decode_batch();
+    RadCtx c;
+    run(b, c, d);
+    CHECK(c.step_fail.empty());
+    CHECK_EQ(c.lane, 0);
+    CHECK_EQ(races(b, c), 0);
+    int dense1 = 0;
+    for (const auto& i : c.issues) {
+        const RecOp* o = b.op_of(i.op);
+        REQUIRE(o != nullptr);
+        if (o->op == "all_reduce") CHECK_EQ(i.lane, 0);
+        if (i.lane == 1) {
+            ++dense1;
+            CHECK(o->op == "gemm_nt" || o->op == "act_mul");
+        }
+    }
+    CHECK_EQ(dense1, 3 * (int)L);
+    CHECK_EQ((int)c.joins.size(), 2 * (int)L);
+}
+
+/* WHERE NO LOADED LIBRARY DECLARES THE FUSED OPS -- a CPU-only build, a hierarchy without libr4d --
+ * asking for one would stop the engine, so the plugin asks first (rad_op_declared) and declares
+ * the chains: the rmsnorm / add joins, embed_lookup and mul for the expert scale, and q lifted for
+ * attn_paged. It never asks for an undeclared op. */
+TEST(gemma4_without_the_fused_ops_declares_the_chains_and_asks_for_no_undeclared_op) {
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", fp8 } };
+    for (const char* op : { "norm_add_norm", "norm_add_norm_route", "join_add_scale",
+                            "expert_scale", "attn_paged_qrow" })
+        b.undeclared.insert(op);
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx();
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+    CHECK(b.asked_undeclared.empty());
+    CHECK(noted(b, "sandwich joins: 0 of 12 fused"));
+    CHECK(noted(b, "routed inputs: 0 of 6"));
+    CHECK(noted(b, "sliding attention: q lifted"));
+
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+    RadBatch batch = decode_batch();
+    c.batch = &batch;
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    const std::vector<std::string> ops = issued_ops(b, c);
+    CHECK_EQ(count_issued(ops, "rmsnorm_quant_fp8"), 6);
+    CHECK_EQ(count_issued(ops, "cast"), 5);
+    CHECK(count_issued(ops, "add") > 0);
+}
+
+/* THE ATTENTION JOIN WRITES THE ROUTED ARM'S INPUTS on a layer whose gate_up is block fp8
+ * (norm_add_norm_route): the router's norm into moe_rn and the experts' codes into
+ * moe_hq / moe_hqs, so a step issues neither the router's rmsnorm nor rmsnorm_quant_fp8. Refused,
+ * norm_add_norm and the two launches. A tp-4 prefill through the overlap keeps every reduction
+ * ordered with the route form too. */
+TEST(gemma4_attention_join_writes_the_routed_inputs_on_fp8_experts) {
+    const RadEncoding fp8 = rad_enc_affine(RAD_F8E4M3, RAD_BF16, 128, 128);
+    std::map<std::string, int> issued[2];
+    for (int refuse = 0; refuse < 2; ++refuse) {
+        RadBuilder b;
+        b.encs = { { "ffn_gate_up_exps", fp8 } };
+        if (refuse) b.refuse.insert("norm_add_norm_route");
+        RadModelMeta meta = gemma4_moe_meta();
+        RadBuildCtx  ctx  = build_ctx();
+        CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+        CHECK_EQ(count_resolved(b, "norm_add_norm_route"), refuse ? 0 : 6);
+        CHECK_EQ(count_resolved(b, "norm_add_norm"), refuse ? 6 : 0);
+        CHECK(noted(b, refuse ? "routed inputs: 0 of 6" : "routed inputs: 6 of 6"));
+        if (!refuse) {
+            const RecOp* r = find_op(b, "norm_add_norm_route");
+            REQUIRE(r != nullptr);
+            for (const char* name : { "moe_rn", "moe_hq", "moe_hqs", "x", "h" })
+                CHECK(std::count(r->writes.begin(), r->writes.end(),
+                                 (rad_buf)buf_named(b, name)) == 1);
+        }
+
+        RadCtx c; c.b = &b; c.rank = 0; c.world = 1;
+        RadBatch batch = decode_batch();
+        c.batch = &batch;
+        gemma4::step(&c, &batch);
+        CHECK(c.step_fail.empty());
+        for (const auto& n : issued_ops(b, c)) ++issued[refuse][n];
+    }
+    CHECK_EQ(issued[0]["norm_add_norm_route"], 6);
+    CHECK_EQ(issued[0]["norm_add_norm"], 0);
+    CHECK_EQ(issued[0]["rmsnorm_quant_fp8"], 0);
+    CHECK_EQ(issued[1]["norm_add_norm_route"], 0);
+    CHECK_EQ(issued[1]["norm_add_norm"], 6);
+    CHECK_EQ(issued[1]["rmsnorm_quant_fp8"], 6);
+    CHECK_EQ(issued[1]["rmsnorm"] - issued[0]["rmsnorm"], 6);   /* the router's input norm */
+    CHECK_EQ(issued[0]["moe_gemm_q"], 6);
+
+    /* tp 4, an 8192-token chunk in two slices */
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", fp8 } };
+    RadModelMeta meta = gemma4_moe_meta();
+    RadBuildCtx  ctx  = build_ctx(0, 4);
+    ctx.max_tok = 8192;
+    CHECK_OK(gemma4::declare(&b, &meta, &ctx));
+    CHECK(noted(b, "prefill overlap: a chunk of two routed passes"));
+    const int32_t out[1] = { 8191 };
+    RadBatch batch = one_prompt(8192, out);
+    RadCtx c; c.b = &b; c.rank = 0; c.world = 4; c.batch = &batch;
+    gemma4::step(&c, &batch);
+    CHECK(c.step_fail.empty());
+    CHECK_EQ(races(b, c), 0);
+    CHECK_EQ(count_issued(issued_ops(b, c), "norm_add_norm_route"), 12);
+    CHECK_EQ(count_issued(issued_ops(b, c), "rmsnorm_quant_fp8"), 0);
 }

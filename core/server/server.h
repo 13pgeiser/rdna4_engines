@@ -189,8 +189,8 @@ private:
     struct StreamState;
 
     static UsageOut usage_of(const OaiRequest& r, const std::vector<Generation>& gens);
-    static TimingsOut timings_of(const Sink* const* sinks, size_t n);
-    static TimingsOut timings_of(const std::vector<Generation>& gens);
+    static TimingsOut timings_of(const Sink* const* sinks, size_t n, int64_t received_ns);
+    static TimingsOut timings_of(const std::vector<Generation>& gens, int64_t received_ns);
 
     void register_routes();
 

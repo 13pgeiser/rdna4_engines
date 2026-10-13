@@ -8,6 +8,7 @@
  */
 #include "rad_test.h"
 
+#include "mm/processor.h"
 #include "sched/scheduler.h"
 #include "sched/advance_impl.h"
 #include "sched/derive.h"
@@ -365,14 +366,8 @@ struct FakePC : IPrefixCache {
         }
     }
 
-    /* The requests whose context is still being read off disk. */
-    std::vector<uint64_t> reading;
     std::vector<uint64_t> restores;
-    Restore restore(const Request& r) override {
-        restores.push_back(r.id);
-        return std::find(reading.begin(), reading.end(), r.id) != reading.end() ? Restore::Wait
-                                                                                  : Restore::Done;
-    }
+    void restore(const Request& r) override { restores.push_back(r.id); }
 
     mutable int64_t lookups = 0;
     /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the
@@ -459,11 +454,7 @@ struct FakePC : IPrefixCache {
         return ((pos / interval) + 1) * interval;
     }
     std::vector<int64_t> committed;
-    std::vector<int64_t> resumed;                    /* the commits marked as resume points */
-    void commit_checkpoint(const Request&, int64_t pos, bool resume) override {
-        committed.push_back(pos);
-        if (resume) resumed.push_back(pos);
-    }
+    void commit_checkpoint(const Request&, int64_t pos) override { committed.push_back(pos); }
     int reserve_checkpoint(const Request&, int64_t, int32_t* slot_out) override {
         ++reserved;
         *slot_out = next_slot++;
@@ -624,6 +615,22 @@ struct Fixture {
         r->max_tokens = max_tokens;
         r->prompt.resize((size_t)n_prompt);
         for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
+        uint64_t id = r->id;
+        if (sch.add(std::move(r)) < 0) return 0;
+        return id;
+    }
+
+    /* One whose prompt carries a picture the encoder has not run yet: it waits in the queue until
+     * `*item` says it is encoded. */
+    uint64_t submit_unencoded(int n_prompt, int max_tokens, std::shared_ptr<mm::Item>* item) {
+        auto r = std::make_unique<Request>();
+        r->id = next_id++;
+        r->max_tokens = max_tokens;
+        r->prompt.resize((size_t)n_prompt);
+        for (int i = 0; i < n_prompt; ++i) r->prompt[(size_t)i] = 1000 + i;
+        *item = std::make_shared<mm::Item>();
+        r->media = std::make_shared<mm::PromptMedia>();
+        r->media->items.push_back(mm::Placed{*item, 0});
         uint64_t id = r->id;
         if (sch.add(std::move(r)) < 0) return 0;
         return id;
@@ -971,23 +978,6 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
 }
 
-/* THE DEEPEST CHECKPOINT A PROMPT GETS IS ITS RESUME POINT, and it alone is committed as one: it is
- * the state the next turn resumes from, and the tiers copy it off the card at once rather than
- * with the rest of the conversation at its publish. */
-TEST(only_a_prompt_s_deepest_checkpoint_is_its_resume_point) {
-    Fixture f;
-    f.build();
-    CHECK_OK(f.start());
-    const uint64_t a = f.submit(1000, 8);
-    for (int i = 0; i < 64 && f.sch.find(a)->n_computed < 1000; ++i) {
-        REQUIRE(f.sch.step() != nullptr);
-        f.commit_plain();
-    }
-    REQUIRE(f.pc.committed.size() >= 2u);
-    REQUIRE_EQ(f.pc.resumed.size(), 1u);
-    CHECK_EQ(f.pc.resumed[0], f.pc.committed.back());
-}
-
 /* A hit that skipped tokens with no snapshot to resume from is the corruption this whole mechanism
  * exists to prevent, so it is refused outright rather than served with a zeroed state. */
 TEST(a_hit_with_no_checkpoint_slot_reuses_nothing) {
@@ -1091,17 +1081,17 @@ TEST(a_hit_on_a_model_with_a_windowed_group_reuses_nothing) {
 }
 
 /* ================================================================== preemption */
-/* A REQUEST WHOSE CONTEXT IS STILL BEING READ OFF DISK WAITS, AND ONLY IT DOES. It is not admitted
- * short -- the hit length is what its prefill is shaped by -- and it does not hold up the queue:
- * the request behind it is asked and runs. Once the read is in, it is admitted where it stood. */
-TEST(a_request_waiting_on_a_disk_read_lets_the_queue_past_it) {
+/* A REQUEST WHOSE MEDIA IS NOT ENCODED YET WAITS, AND ONLY IT DOES. It is not admitted without
+ * its rows, and it does not hold up the queue: the request behind it is asked and runs. Once its
+ * items are encoded, it is admitted where it stood. */
+TEST(a_request_waiting_on_its_encoder_lets_the_queue_past_it) {
     Fixture f;
     f.build();
     CHECK_OK(f.start());
-    const uint64_t a = f.submit(160, 8);
+    std::shared_ptr<mm::Item> ia, ic;
+    const uint64_t a = f.submit_unencoded(160, 8, &ia);
     const uint64_t b = f.submit(160, 8);
-    const uint64_t c = f.submit(160, 8);
-    f.pc.reading = {a, c};
+    const uint64_t c = f.submit_unencoded(160, 8, &ic);
 
     const RadBatch* s1 = f.sch.step();
     CHECK(s1 != nullptr);
@@ -1117,18 +1107,16 @@ TEST(a_request_waiting_on_a_disk_read_lets_the_queue_past_it) {
     CHECK_EQ(q[1], c);
     f.commit_plain();
 
-    /* Asked again every step, and admitted the step its read is in. */
-    f.pc.reading = {c};
-    f.pc.restores.clear();
+    /* Asked again every step, and admitted the step its items are in. */
+    ia->encoded = true;
     const RadBatch* s2 = f.sch.step();
     CHECK(s2 != nullptr);
     CHECK_EQ(s2->n_seq, 2);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
     CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
-    CHECK(std::find(f.pc.restores.begin(), f.pc.restores.end(), c) != f.pc.restores.end());
     f.commit_plain();
 
-    f.pc.reading.clear();
+    ic->encoded = true;
     const RadBatch* s3 = f.sch.step();
     CHECK(s3 != nullptr);
     CHECK_EQ(s3->n_seq, 3);
@@ -1885,9 +1873,8 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
 }
 
-/* The share left for a request that then does not start (here its context is still being read
- * back from the host tier) goes back to the chunk that made room for it: the step is planned as
- * if nothing had waited. */
+/* The share left for a request that then does not start (here its media is not encoded yet) goes
+ * back to the chunk that made room for it: the step is planned as if nothing had waited. */
 TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
     Fixture f;
     share_fixture(f, -1);
@@ -1895,8 +1882,8 @@ TEST(auto_a_share_nobody_takes_goes_back_to_the_prefill) {
     uint64_t a = f.submit(3500, 64);
     CHECK(f.sch.step() != nullptr);
     f.commit_plain();
-    uint64_t b = f.submit(100, 64);
-    f.pc.reading.push_back(b);
+    std::shared_ptr<mm::Item> ib;
+    REQUIRE(f.submit_unencoded(100, 64, &ib) != 0);
     CHECK(f.sch.step() != nullptr);
     REQUIRE_EQ((int)f.sch.plan().e.size(), 1);
     CHECK_EQ(f.sch.plan().e[0].seq, a);
@@ -2271,10 +2258,10 @@ TEST(the_adaptive_window_chooses_the_head_depth_over_the_whole_batch) {
     CHECK_EQ(h.plan_step(hone, 0, 3), 2);
 }
 
-/* THE FLAG, AND ONLY FOR A SERIAL HEAD. --draft-window adaptive with a block drafter, with prompt
- * lookup alone, or with no speculation keeps the configured depth and says so at startup; the
- * proposal then reaches the step uncut. The default is the fixed window. */
-TEST(the_adaptive_window_is_a_flag_for_a_serial_drafter_and_said_when_it_is_not) {
+/* THE FLAG, FOR A DRAFTING HEAD -- SERIAL OR BLOCK. --draft-window adaptive with prompt lookup
+ * alone, or with no speculation, keeps the configured depth and says so at startup; the proposal
+ * then reaches the step uncut. The default is the fixed window. */
+TEST(the_adaptive_window_is_a_flag_for_a_drafting_head_and_said_when_there_is_none) {
     {
         Fixture f;
         adaptive_fixture(f, 4);
@@ -2293,18 +2280,50 @@ TEST(the_adaptive_window_is_a_flag_for_a_serial_drafter_and_said_when_it_is_not)
         Config d;
         CHECK(d.draft_window == kDraftWindowDefault);      /* the default */
     }
-    for (int kind : { (int)RAD_DRAFT_BLOCK, (int)RAD_DRAFT_NONE }) {
+    /* A BLOCK DRAFTER TAKES THE POLICY WITH ITS ROUNDS FIXED. It proposes its whole block in one
+     * pass, and each sequence verifies the first of it up to its own window: the whole block while
+     * its estimate is the prior, one draft once its drafts stop being taken. Startup says so. */
+    {
         Fixture f;
         adaptive_fixture(f, 4);
-        f.prog.drafter.kind = (decltype(f.prog.drafter.kind))kind;
-        if (kind == RAD_DRAFT_NONE) f.prog.drafter.depth = 0;
+        f.prog.drafter.kind = RAD_DRAFT_BLOCK;
+        int st = RAD_E_STATE;
+        const std::string log = stderr_of([&] { st = f.start(); });
+        CHECK_OK(st);
+        CHECK(f.sch.draft().adaptive());
+        CHECK(log.find("ADAPTIVE") != std::string::npos);
+        CHECK(log.find("with a block drafter") != std::string::npos);
+        CHECK(log.find("the window is fixed") == std::string::npos);
+
+        const uint64_t a = f.submit(160, 2000);
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        CHECK_EQ(f.sch.find(a)->n_draft, 4);
+        for (int t = 0; t < 64; ++t) {               /* no draft is ever taken */
+            REQUIRE(f.sch.step() != nullptr);
+            f.commit_plain(9);
+            CHECK_OK(f.sch.set_draft(a, draft, 4));
+        }
+        CHECK_EQ(f.sch.find(a)->n_draft, 1);
+        REQUIRE(f.sch.step() != nullptr);
+        for (const StepEntry& e : f.sch.plan().e) CHECK_EQ(e.n_spec, 1);
+        CHECK(f.sch.metrics().draft_adaptive);
+        CHECK(f.sch.metrics().draft_verify_depth[4] > 0);
+        CHECK(f.sch.metrics().draft_verify_depth[1] > 0);
+    }
+    {
+        Fixture f;
+        adaptive_fixture(f, 4);
+        f.prog.drafter.kind = RAD_DRAFT_NONE;
+        f.prog.drafter.depth = 0;
         int st = RAD_E_STATE;
         const std::string log = stderr_of([&] { st = f.start(); });
         CHECK_OK(st);
         CHECK(!f.sch.draft().adaptive());
         CHECK(log.find("--draft-window adaptive: the window is fixed at 4") != std::string::npos);
-        CHECK(log.find(kind == RAD_DRAFT_BLOCK ? "a block drafter" : "prompt lookup only") !=
-              std::string::npos);
+        CHECK(log.find("prompt lookup only") != std::string::npos);
 
         const uint64_t a = f.submit(160, 64);
         CHECK(f.sch.step() != nullptr);

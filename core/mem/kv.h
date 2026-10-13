@@ -350,7 +350,7 @@ public:
      * A BLOCK IS NOT LENT WHILE ANYTHING HOLDS IT, and a held block is a block a sequence owns OR
      * one the prefix cache still indexes. So a loan cannot evict anything: it is a claim on what
      * is free. Everything that makes a block free -- a sequence ending, an eviction, an idle-tier
-     * demotion to host memory or disk -- makes it lendable, and the min-heap free list is what
+     * demotion to host memory -- makes it lendable, and the min-heap free list is what
      * keeps the free blocks at the top, where a loan can reach them.
      *
      * THE BUFFER IS DERIVED AND NOT STATED. It is the free blocks the cache keeps in hand so that
@@ -456,8 +456,7 @@ public:
      * that resumes from it, each a few milliseconds on a 50-100 MiB snapshot.
      *
      * THE STORE IS SHARED BY EVERY RANK and owned by the engine: a slot holds every rank's shard
-     * of one snapshot, each at its own offset (`rank_off`), so the disk tier reads and writes a
-     * slot as one payload. The slot ids are rank 0's -- its manager hands them out and the others
+     * of one snapshot, each at its own offset (`rank_off`). The slot ids are rank 0's -- its manager hands them out and the others
      * address the id they are given. Without a store no slot is ever handed out and a hybrid
      * model's prefix hits replay their linear layers from zero. `checkpoint_bytes()` is THIS
      * rank's shard. */

@@ -74,8 +74,6 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     r.tp_wire_min_kb  = cfg_.tp_wire_min_kb;
     r.prefix_cache    = cfg_.prefix_cache;
     r.prefix_cache_off_why = prefix_off_why_;
-    r.prefix_host_mib = cfg_.prefix_cache_host_mib;
-    r.prefix_disk_mib = cfg_.prefix_cache_disk_mib;
     r.host_pool_mib   = cfg_.host_pool_mib;
     {
         int64_t pinned = 0, mapped = 0, n = 0;
@@ -85,11 +83,11 @@ diag::RunFacts Engine::run_facts(bool failed) const {
     }
     /* THE MOST ANY RANK READS FROM THE HOST: the ranks step together, so the one that streams most
      * is the one each step waits for. The embedding the placement flag put in host memory is read
-     * a few rows a step and is not what this counts. */
+     * a few rows a step, the encoder towers once an image, and neither is what this counts. */
     for (const auto& rk : ranks_) {
         const Plan& p = rk->plan;
         const int64_t host = p.totals.bytes[(int)Tier::HostPinned] +
-                             p.totals.bytes[(int)Tier::HostPageable] - p.embedding_host_used;
+                             p.totals.bytes[(int)Tier::HostPageable] - p.forced_host_used;
         r.host_weight_bytes = std::max(r.host_weight_bytes, std::max<int64_t>(host, 0));
         r.file_weight_bytes = std::max(r.file_weight_bytes, p.totals.bytes[(int)Tier::SSD]);
     }

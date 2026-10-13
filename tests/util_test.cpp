@@ -1,4 +1,5 @@
-/* util_test.cpp -- core/util/rad_util.cpp: the bedrock every other translation unit links against.
+/* util_test.cpp -- core/util/rad_util.cpp, the bedrock every other translation unit links against, and
+ * core/util/stallwatch.cpp, which reports where a phase that has gone quiet waits.
  *
  * WHY THIS FILE EXISTS. Nothing here is interesting on its own, and every one of these is small
  * enough to read and believe -- which is what leaves such code untested. The two that are not
@@ -13,8 +14,15 @@
 #include "rad_test.h"
 
 #include "rad_internal.h"
+#include "util/stallwatch.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <mutex>
+#include <unistd.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -435,6 +443,91 @@ TEST(constraint_why_names_the_key_the_bound_and_what_was_there) {
 
     const std::string miss = constraint_why(c_in("dtype", "bf16"), g);
     CHECK(miss.find("<absent>") != std::string::npos);
+}
+
+/* ================================================================== StallWatch */
+
+namespace {
+/* Everything written to stderr while `f` runs. */
+template <class F> std::string capture_stderr(F f) {
+    std::fflush(stderr);
+    char path[] = "/tmp/rad_util_test_XXXXXX";
+    const int fd = mkstemp(path);
+    const int saved = dup(2);
+    dup2(fd, 2);
+    f();
+    std::fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    std::string out;
+    if (FILE* r = std::fopen(path, "r")) {
+        char buf[4096];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, r)) > 0) out.append(buf, n);
+        std::fclose(r);
+    }
+    close(fd);
+    unlink(path);
+    return out;
+}
+}  // namespace
+
+TEST(a_syscall_line_names_the_call_and_a_kfd_ioctl_by_its_name) {
+    CHECK_EQ(stall_decode_syscall("running"), std::string("running"));
+    CHECK_EQ(stall_decode_syscall("-1 0x7ffd1000 0x7f0012345678"), std::string("not in a system call"));
+    CHECK(stall_decode_syscall("202 0x1 0x80 0x0 0x0 0x0 0x0 0x7ffd1000 0x0").rfind("futex", 0) == 0);
+    /* A file that will not open -- a FIFO with no writer, a hung network mount -- is named too. */
+    CHECK(stall_decode_syscall("257 0xffffff9c 0x5600 0x0 0x0 0x0 0x0 0x7ffd1000 0x0").rfind("openat", 0) == 0);
+    /* An ioctl names the file its descriptor is open on and, for the KFD, the request by name:
+     * _IOWR('K', 0x16, 40 bytes) is ALLOC_MEMORY_OF_GPU. */
+    const int fd = open("/dev/null", O_RDONLY);
+    CHECK(fd >= 0);
+    const unsigned long req = (3ul << 30) | (40ul << 16) | ((unsigned long)'K' << 8) | 0x16;
+    const std::string k = stall_decode_syscall(fmt("16 0x%x 0x%lx 0x0 0x0 0x0 0x0 0x0 0x0", fd, req));
+    CHECK(k.find("ioctl(/dev/null, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU)") != std::string::npos);
+    /* Another driver's request is spelt out rather than guessed at. */
+    const unsigned long drm = (3ul << 30) | (32ul << 16) | ((unsigned long)'d' << 8) | 0x40;
+    const std::string d = stall_decode_syscall(fmt("16 0x%x 0x%lx 0x0 0x0 0x0 0x0 0x0 0x0", fd, drm));
+    CHECK(d.find("type 'd' number 0x40") != std::string::npos);
+    close(fd);
+}
+
+/* Relative to the module's load base, the number addr2line takes, which is not the file offset
+ * where the linker placed a segment elsewhere than its file position. */
+TEST(an_address_is_named_by_its_module_and_its_offset_from_the_load_base) {
+    const uintptr_t a = (uintptr_t)&capture_stderr<void (*)()>;
+    Dl_info di{};
+    CHECK(dladdr((void*)a, &di) != 0);
+    CHECK_EQ(stall_module_offset(a), fmt("util_test+0x%lx", (unsigned long)(a - (uintptr_t)di.dli_fbase)));
+}
+
+/* A thread that waits on a lock with nothing logged is reported once the quiet has passed: what
+ * it is in, and its stack through this binary's frames. */
+TEST(a_quiet_phase_names_the_wait_and_the_stack_of_the_thread_in_it) {
+    const std::string out = capture_stderr([] {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::unique_lock<std::mutex> lk(mu);
+        StallWatch w("probe", 300);
+        cv.wait_for(lk, std::chrono::milliseconds(1600));
+    });
+    CHECK(out.find("probe: nothing has been logged for") != std::string::npos);
+    CHECK(out.find("futex") != std::string::npos);
+    CHECK(out.find("stack: ") != std::string::npos);
+    CHECK(out.find("util_test+0x") != std::string::npos);
+}
+
+/* A phase that keeps logging is not quiet, however long it runs. */
+TEST(a_phase_that_logs_is_never_reported) {
+    const std::string out = capture_stderr([] {
+        StallWatch w("probe", 400);
+        for (int i = 0; i < 12; ++i) {
+            RAD_INFO("probe: step %d", i);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+    });
+    CHECK(out.find("nothing has been logged") == std::string::npos);
+    CHECK(out.find("probe: step 11") != std::string::npos);
 }
 
 RAD_TEST_MAIN()

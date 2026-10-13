@@ -1108,24 +1108,25 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
     }
 
-    /* ---- A ROTATED 5-BIT (or plain asymmetric 4-bit) WEIGHT (ParoQuant int5; z-lab's int4): its input's bf16 plane rotated into this linear's
-     * own f16 planes, then the w5a16 GEMM. Two views of one stored weight: the codes, and the
-     * (scale, zero) pair as `b_scale`. */
+    /* ---- A ROTATED 5-BIT OR ASYMMETRIC 4-BIT WEIGHT (ParoQuant int5; z-lab's int4): its input's
+     * bf16 plane rotated into this linear's own f16 planes, then the w5a16 GEMM. Two views of one
+     * stored weight: the codes, and the (scale, zero) pair as `b_scale`. */
     paro5 = known && linear_is_paro_w5(enc);
     if (paro5) {
+        const int bits = enc.plane[0].dtype == RAD_U4 ? 4 : 5;
         if (!a.x) {
-            fprintf(stderr, "radiance: '%s' is a rotated 5-bit weight, rotated from its input's bf16 "
-                            "plane, and its input has none\n", wn);
+            fprintf(stderr, "radiance: '%s' is a rotated %d-bit weight, rotated from its input's "
+                            "bf16 plane, and its input has none\n", wn, bits);
             return RAD_E_DTYPE;
         }
         if (g.world > 1 || span_hi > 0) {
-            fprintf(stderr, "radiance: '%s' is a rotated 5-bit weight; its rotation is not cut by a "
-                            "tensor-parallel shard (world %d)\n", wn, g.world);
+            fprintf(stderr, "radiance: '%s' is a rotated %d-bit weight; its rotation is not cut by "
+                            "a tensor-parallel shard (world %d)\n", wn, bits, g.world);
             return RAD_E_UNSUPPORTED;
         }
         if (N % 16 || K % RAD_FP8_BLOCK) {
-            fprintf(stderr, "radiance: '%s' is %lldx%lld; a 5-bit weight takes rows in 16s and K in "
-                            "whole 128s\n", base, (long long)N, (long long)K);
+            fprintf(stderr, "radiance: '%s' is %lldx%lld; a %d-bit weight takes rows in 16s and K "
+                            "in whole 128s\n", base, (long long)N, (long long)K, bits);
             return RAD_E_INVAL;
         }
         std::vector<int64_t> cut;

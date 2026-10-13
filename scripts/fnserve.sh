@@ -45,33 +45,26 @@
 #     different order and a tie can land on a different token; each chunk size is stable on its
 #     own. Pin the chunk before recording anything to compare against later.
 #
-# THE PREFIX CACHE IS TIERED, AND THE ENGINE LEAVES THE TIERS OFF BY DEFAULT. Both
-# --prefix-cache-host-mib and --prefix-cache-disk-mib are zero unless asked for, so a server started
-# without them drops a conversation's context the moment the pool needs the blocks. This deployment
-# keeps finished turns in host memory and then on disk, where they cost the card nothing.
+# THE PREFIX CACHE IS TIERED, AND THE ENGINE LEAVES THE HOST TIER OFF BY DEFAULT.
+# --prefix-cache-mib is zero unless asked for, so a server started without it drops a conversation's
+# context the moment the pool needs the blocks. This deployment keeps finished turns in host memory,
+# where they cost the card nothing, for an hour of disuse (--prefix-cache-ttl's default).
 #
 # The ELASTIC half needs no flag and cannot be turned off: the pool holds the blocks it is using
 # plus a buffer derived from the chunk, and the expert slab takes the VRAM it releases. That leans
 # on --gpu-headroom-mib, which is why the 96 above matters -- startup names any shortfall and holds
 # it back on top of the reserve.
 #
-#   --prefix-cache-host-mib  finished conversations are copied here at once and their VRAM goes
-#                            to the expert slab; a return restores instead of re-prefilling. Part
-#                            of it is the linear-state snapshot store, sized in proportion to what
-#                            a session holds in snapshots against blocks; startup says how many
-#                            snapshots it holds. On this model a snapshot is 113 MiB and
-#                            --checkpoint-slots counts snapshots for the whole server, not per
-#                            sequence, so the snapshot store is the binding resource: without it
-#                            only the conversations whose snapshots are still in a device slot
-#                            resume without re-prefilling their whole transcript.
-#   --prefix-cache-disk-mib  every host copy is also written to disk under --prefix-cache-dir, so
-#                            a full host tier gives its oldest slots up for nothing. Costs no RAM
-#                            and no VRAM. It holds conversation content UNENCRYPTED.
+#   --prefix-cache-mib  finished conversations are copied here at once and their VRAM goes to the
+#                       expert slab; a return restores instead of re-prefilling, and a full tier
+#                       drops its least recently used. It holds attention blocks only: the
+#                       linear-state snapshots are in the --checkpoint-slots store, 113 MiB each on
+#                       this model and counted for the whole server, not per sequence.
 #
 # THE HOST NUMBER IS DELIBERATELY SMALL BECAUSE OF THE N-GRAM TABLE. The tier's arena is PINNED,
 # and the 47.68 GiB n-gram (PLE) table is read through the container's own mmap, so it lives in
 # the page cache -- and pinned bytes come out of the same host RAM. Taking too much here turns a
-# decode step's minor faults into major ones, a far worse trade than a smaller snapshot store.
+# decode step's minor faults into major ones, a far worse trade than a smaller host tier.
 # Watch /proc/<pid>/stat majflt across a prefill before raising it.
 #
 # THE CROSS-RANK WIRE IS THE ROTATED 6-BIT ONE (--tp-wire wht6). An all-reduce at or above
@@ -98,8 +91,7 @@ nohup ./bin/radiance --model "$M" \
     --max-num-seqs ${SEQS:-8} --max-model-len ${MLEN:-200000} \
     --tp ${TP:-2} --placement expert_tiered --host-pool-mib ${HOSTPOOL:-12288} \
     --gpu-headroom-mib ${HR:-96} --kv-cache-dtype ${KVD:-fp8} \
-    --prefix-cache-host-mib ${KVHOST:-4096} \
-    --prefix-cache-dir ${KVDIR:-$HOME/kvcache} --prefix-cache-disk-mib ${KVDISK:-131072} \
+    --prefix-cache-mib ${KVHOST:-4096} \
     --num-speculative-tokens ${NS:-3} \
     --max-num-batched-tokens ${MNBT:-2048} \
     --tp-wire ${WIRE:-wht6} \

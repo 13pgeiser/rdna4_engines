@@ -107,6 +107,7 @@ struct SchedMetrics {
      * mean the pool cannot hold the working set and turn-2 latency is about to collapse. */
     int64_t prefix_evictions = 0;
     int64_t prefix_ckpt_evictions = 0;
+    int64_t prefix_expired = 0, prefix_ckpt_expired = 0;   /* --prefix-cache-ttl */
     /* WHAT THE CACHE IS HOLDING ON ITS OWN NOW, in tokens of context: the part of the pool that
      * an eviction would actually free, because no live sequence is reading it. The pool figure
      * above counts a held block whoever holds it, and on a server serving conversations most of

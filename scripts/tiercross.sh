@@ -8,12 +8,14 @@
 # cache can have -- an entry holding reassigned block ids, a checkpoint slot freed by one session
 # and still named by another -- need two sessions in flight to show up at all.
 #
-# THE SCARCE RESOURCE IS THE CHECKPOINT SLOT, so run this with --checkpoint-slots low enough that
-# the two sessions fight over it. That is what makes the retention policy and the victim scan run,
-# which is what makes a snapshot get retired underneath a record that still names its slot:
+# A HOST TIER THE FILLER OVERFLOWS, so the arena's drops run as well as its restores:
 #
-#   --checkpoint-slots 2 --prefix-cache-host-mib 512 --prefix-cache-disk-mib 16384 \
-#   --prefix-cache-dir <dir>
+#   --prefix-cache-mib 512
+#
+# AND ENOUGH SNAPSHOT SLOTS FOR BOTH SESSIONS. On a hybrid model a hit is clamped to the deepest
+# snapshot it reaches, and a store too small for both makes each session retire the other's: every
+# arm then re-prefills from zero and restores nothing, so the device arm's reuse is checked below.
+# The default --checkpoint-slots holds both.
 #
 # EACH SESSION IS COMPARED ONLY TO ITSELF. A and B are different prompts and their answers differ
 # for ordinary reasons; what must hold is that A's restored answer is A's cold answer. Corrupt
@@ -23,7 +25,6 @@ set -e
 P=${P:-8100}
 H=${H:-127.0.0.1}
 TO_HOST=${TO_HOST:-10}
-TO_DISK=${TO_DISK:-180}
 FILL=${FILL:-1200}
 N=${N:-48}
 work=$(mktemp -d "${TMPDIR:-/tmp}/tiercross.XXXXXX")
@@ -108,12 +109,11 @@ cmp_arm() {                   # cmp_arm <label> <sha> <ref sha> <reuse> <ref reu
     fi
 }
 # ---- pushing a session out of host memory --------------------------------------------------------
-# NOTHING LEAVES HOST MEMORY ON A CLOCK. Every host copy is written on to disk as soon as it lands
-# and keeps its host slot until another entry needs one, so the way to put a session on disk is to
+# A FULL HOST TIER DROPS ITS LEAST RECENTLY USED ENTRIES, so the way to push the sessions out is to
 # give the arena something else to hold: a prompt that shares no prefix with anything here and is
 # bigger than the room the arena has left. The server must be started with a host tier FILL
-# sections of it overflow; --prefix-cache-host-mib 512 holds about 27K tokens on
-# Qwen3.8-Flash-Next, and the default FILL is about 30K.
+# sections of it overflow; --prefix-cache-mib 512 holds about 27K tokens on Qwen3.8-Flash-Next, and
+# the default FILL is about 30K.
 fill_arena() {
     : > "$work/fill.txt"
     i=0
@@ -127,19 +127,8 @@ fill_arena() {
     curl -sS --fail -X POST "http://$H:$P/v1/completions" -H 'Content-Type: application/json' \
          --data @"$work/fill.json" > /dev/null
 }
-# Until some blocks are on the disk tier, or TO_DISK seconds. The filler's copies are what take the
-# slots, and they land after its request finishes.
-wait_disk() {
-    t=0
-    while [ $t -lt "$TO_DISK" ]; do
-        curl -sS --fail "http://$H:$P/sessions" > "$work/w.json"
-        case "$(jq -r .blocks_sum_overlapping.disk < "$work/w.json")" in 0|null|"") ;; *) return 0 ;; esac
-        sleep 2; t=$((t + 2))
-    done
-    return 1
-}
 echo "tiercross: $H:$P, two sessions, ${TO_HOST}s for VRAM to go, $FILL filler sections"
-CKS=$(curl -sS --fail "http://$H:$P/sessions" | jq -r .snapshots_moved.bytes_each)
+CKS=$(curl -sS --fail "http://$H:$P/sessions" | jq -r .snapshot_store.bytes_each)
 [ "$CKS" = "0" ] && echo "  (no recurrent state in this model; the attention half is still tested)"
 
 A0=$(ask A a0); B0=$(ask B b0)
@@ -165,6 +154,11 @@ done
 AH=$(ask A ah); BH=$(ask B bh)
 echo "  device    A $AH  reuse $(hit ah)"
 echo "            B $BH  reuse $(hit bh)"
+# A DEVICE HIT THAT REUSED NOTHING TESTS NOTHING: every arm below would be a fresh prefill.
+for f in ah bh; do
+    case "$(hit $f)" in 0|null|"") echo "  FAIL  the $f arm reused nothing -- no hit, so no restore below can be tested
+        (a snapshot store too small for both sessions? --checkpoint-slots)"; fail=$((fail + 1)) ;; esac
+done
 if [ "$AH" != "$A0" ] || [ "$BH" != "$B0" ]; then
     echo "  note: a device hit does not reproduce the cold answer. That is not necessarily wrong --"
     echo "        the hit reuses $(hit ah)/$(hit bh) tokens where the cold run reused nothing -- but every"
@@ -181,25 +175,19 @@ cmp_arm "B restored from RAM is still B" "$B1" "$BH" "$(hit b1)" "$(hit bh)"
 
 echo "  filling host memory with $FILL sections of something else..."
 fill_arena
-wait_disk || echo "  note: nothing reached the disk tier within ${TO_DISK}s; the arm below may be a RAM restore"
 sleep $((TO_HOST + 8))
 A2=$(ask A a2); B2=$(ask B b2)
-echo "  from disk A $A2  reuse $(hit a2)"
+echo "  after a full host tier"
+echo "            A $A2  reuse $(hit a2)"
 echo "            B $B2  reuse $(hit b2)"
-cmp_arm "A restored from disk is still A" "$A2" "$AH" "$(hit a2)" "$(hit ah)"
-cmp_arm "B restored from disk is still B" "$B2" "$BH" "$(hit b2)" "$(hit bh)"
+cmp_arm "A after the arena's drops is still A" "$A2" "$AH" "$(hit a2)" "$(hit ah)"
+cmp_arm "B after the arena's drops is still B" "$B2" "$BH" "$(hit b2)" "$(hit bh)"
 
 curl -sS --fail "http://$H:$P/sessions" > "$work/s.json"
-echo "  moved: blocks to_host=$(jq -r .moved.to_host < "$work/s.json") to_disk=$(jq -r .moved.to_disk < "$work/s.json") promoted=$(jq -r .moved.promoted < "$work/s.json")"
-if [ "$CKS" != "0" ]; then
-    echo "  state: to_disk=$(jq -r .snapshots_moved.to_disk < "$work/s.json") fetched=$(jq -r .snapshots_moved.fetched < "$work/s.json") dropped=$(jq -r .snapshots_moved.drops < "$work/s.json")"
-    # A RUN WITH NO CONTENTION TESTED THE EASY CASE. Two stores have to run out for the paths this
-    # script exists for to execute, and they are sized by different flags: --checkpoint-slots is
-    # the DEVICE pool the retention policy spends, and a share of --prefix-cache-host-mib (startup
-    # says how many snapshots) is the snapshot store the tiers spend. `drops` counts the second.
-    [ "$(jq -r .snapshots_moved.drops < "$work/s.json")" = "0" ] && \
-        echo "  note: the snapshot store never overflowed -- lower --prefix-cache-host-mib to make the two sessions contend for it"
-fi
+echo "  moved: blocks to_host=$(jq -r .moved.to_host < "$work/s.json") promoted=$(jq -r .moved.promoted < "$work/s.json") host_drops=$(jq -r .moved.host_drops < "$work/s.json")"
+# A RUN WITH NO CONTENTION TESTED THE EASY CASE: the arena has to run out for its drop path to run.
+[ "$(jq -r .moved.host_drops < "$work/s.json")" = "0" ] && \
+    echo "  note: the host tier never overflowed -- lower --prefix-cache-mib or raise FILL"
 
 if [ "$fail" -ne 0 ]; then
     echo

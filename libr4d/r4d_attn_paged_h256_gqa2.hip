@@ -8,8 +8,8 @@
 // Both bands, now. The decode band (q_len * gqa <= 64, i.e. q_len <= 32 at gqa 2) is the
 // windowed decode kernel above. The prefill band (a query long enough to want the query-tiled
 // prefill kernel) is the windowed prefill kernel below -- the same r4d_attn_prefill_kernel the
-// h256/gqa6 and h512/gqa8 dispatches instantiate, with the window bit (template arg WIN) turned on,
-// the way the decode leg does. A trunk layer prefills, so it needs the prefill band on the device:
+// h256/gqa6 dispatch instantiates, with the window bit (template arg WIN) turned on, the way the
+// decode leg does. A trunk layer prefills, so it needs the prefill band on the device:
 // libref is an opt-in fallback the engine refuses by default (spec §17). The drafter leg is
 // decode-only because a drafter never prefills.
 #include "r4d.h"
@@ -128,8 +128,8 @@ extern "C" int r4d_attn_decode_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t s)
 
 // ---- prefill ---------------------------------------------------------------------------------
 // The h256/gqa6 prefill option set (P_OPT 3955211) is reused unchanged: at head_dim 256 the wide K
-// fetch (O_KWIDE) is valid -- it is written for 16 channels = head_dim 256 exactly -- so unlike the
-// h512 leg (which turns it off because 512 reads past the tile) this one keeps it. gqa 2 makes
+// fetch (O_KWIDE) is valid -- it is written for 16 channels = head_dim 256 exactly, and a wider head
+// would read past the tile -- so this leg keeps it. gqa 2 makes
 // BLOCK_Q (NWARPS*16/2 = 192) larger than gqa 6's 64, so a workgroup covers more query positions:
 // fewer grid.x blocks, the same KV tile. WIN is on (the last template arg); window <= 0 folds it
 // away to the full-attention form, so a windowless launch is safe.
@@ -157,8 +157,8 @@ extern "C" int r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t s
     return prefill_launch_h256_gqa2<1>(a, s);
 }
 
-/* The prefill RadArgs wrappers, defined here (not in the h256 dispatch) for the same reason the
- * h512 leg's live in theirs: an entry point appended to a textual inclusion compiles into nothing.
+/* The prefill RadArgs wrappers, defined here (not in the h256 dispatch): an entry point appended to
+ * a textual inclusion compiles into nothing.
  * Absent descales mean 1.0 (fill_paged leaves them null and the kernel reads 1.0). */
 extern "C" int r4d_rad_attn_prefill_h256_gqa2_fp8(const RadArgs* a, RadStream s) {
     R4DArgs r;

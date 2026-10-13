@@ -120,25 +120,34 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
 
     DraftController::Params dp;
     dp.max_depth = cfg.n_spec;
-    /* THE ADAPTIVE WINDOW IS THE SERIAL DRAFTER'S POLICY (draft.h): it prices a draft as one more
-     * round of the head. A block drafter proposes its block in one pass and prompt lookup runs no
-     * pass at all, so for either the window stays fixed -- decided here, once, before any step
-     * has counted an acceptance, and said, because a flag that changes nothing reads exactly
-     * like a flag that made no difference. */
+    /* THE ADAPTIVE WINDOW (draft.h) prices a draft by what the step it adds to costs, measured.
+     * For a serial head that is a round of the head and a verify row. For a BLOCK drafter the
+     * block is proposed in one pass whatever is verified, but each verified draft is still a
+     * verify row -- and on a model whose verify streams weights per row, a MoE that reads the
+     * experts every row routes to, a row is not free: sixteen rows read ten times the experts one
+     * does. So a block drafter takes the same policy with its rounds fixed: each sequence verifies
+     * the first min(D, its stop) of the block, its stop from its own measured acceptance, and D
+     * from the measured step times. Deep where the text is predictable (code, JSON, greedy), a few
+     * drafts where it is not (prose at temperature 1, where a point-mass draft survives a position
+     * with probability p(x) and a fifteen-token chain dies after one or two). Prompt lookup runs
+     * no pass and keeps the fixed window, decided here, once, and said, because a flag that
+     * changes nothing reads exactly like a flag that made no difference. */
     if (cfg.draft_window == DraftWindow::Adaptive) {
         const RadDrafterDecl& dd = prog.drafter;
         if (cfg.n_spec <= 0)
             RAD_WARN("--draft-window adaptive: this deployment does not speculate "
                      "(--num-speculative-tokens %d), so there is no window to adapt", cfg.n_spec);
-        else if (dd.kind != RAD_DRAFT_SERIAL || dd.depth <= 0)
-            RAD_WARN("--draft-window adaptive: the window is fixed at %d with %s -- the adaptive "
-                     "window prices the rounds of a serial draft head, which this deployment does "
-                     "not run", cfg.n_spec,
-                     dd.kind == RAD_DRAFT_BLOCK ? "a block drafter, which proposes its block in one "
-                                                  "pass"
-                                                : "prompt lookup only");
-        else
+        else if ((dd.kind != RAD_DRAFT_SERIAL && dd.kind != RAD_DRAFT_BLOCK) || dd.depth <= 0)
+            RAD_WARN("--draft-window adaptive: the window is fixed at %d with prompt lookup only "
+                     "-- the adaptive window prices draft passes and verify rows, and prompt "
+                     "lookup runs no pass", cfg.n_spec);
+        else {
             dp.adapt = true;
+            if (dd.kind == RAD_DRAFT_BLOCK)
+                RAD_INFO("--draft-window adaptive with a block drafter: the block of %d is "
+                         "proposed whole, and each sequence verifies the first min(D, its stop) "
+                         "of it", dd.depth);
+        }
     }
     RAD_TRY(draft_.configure(dp));
     draft_est_.clear();
@@ -796,17 +805,6 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
     return want;
 }
 
-/* THE DEEPEST CHECKPOINT A PROMPT OF `target` TOKENS GETS, asked of one at `pos`: no interval
- * boundary is left before the target and no tail checkpoint will follow (plan_chunk's rules). It
- * is the state the prompt's next turn resumes from. */
-bool Scheduler::last_checkpoint(int64_t pos, int64_t target) const {
-    if (!geo_.checkpoints()) return false;
-    const int64_t I = geo_.checkpoint_interval;
-    if (geo_.window_ckpt) { const int64_t t = tail_checkpoint(target); return t > 0 && t <= pos; }
-    if ((pos / I + 1) * I <= target) return false;
-    return tail_checkpoint(target) <= pos;
-}
-
 /* THE TAIL CHECKPOINT OF A PROMPT OF `target` TOKENS, or -1: its last quantum boundary, past the
  * first interval -- a shorter prompt is cheap to prefill again -- and only where it buys a quarter
  * of an interval or more over the interval checkpoint below it, which is worth the extra step. */
@@ -975,7 +973,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
          * honest shorter hit, but a shorter one. This is where a cold session gets its
          * context back instead of re-prefilling it: it costs a copy, and the alternative
          * costs a prefill. */
-        if (pc_->restore(r) == IPrefixCache::Restore::Wait) return kAdmitWait;
+        pc_->restore(r);
         HitCap cap;
         if (draft_refill_ > 0) {
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
@@ -1384,9 +1382,9 @@ const RadBatch* Scheduler::step() {
      * blocks, so it will refuse a new one, and the front of the queue is now the request we just
      * took them from. Probing would cost a lookup per step and admit nothing. */
     if (!preempted_here) {
-        /* `at` walks the queue and `took_` is what it admitted: a request waiting on a read off
-         * disk stays where it is and the one behind it is asked, so the queue is compacted after
-         * the walk rather than cut at its front. */
+        /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
+         * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
+         * after the walk rather than cut at its front. */
         took_.clear();
         size_t at = 0;
         while (at < waiting_.size() &&
@@ -1410,8 +1408,8 @@ const RadBatch* Scheduler::step() {
                 continue;
             }
             /* ITS MEDIA FIRST. A request whose items are not encoded keeps its place and the one
-             * behind it is asked, exactly as for a context still being read off disk; the engine
-             * runs the encoder before the next step (encodes_pending). */
+             * behind it is asked; the engine runs the encoder before the next step
+             * (encodes_pending). */
             if (s.req->media && !media_ready(s)) { ++at; continue; }
             /* One share left for the next request in the queue, when there is one and a slot
              * for it (busy_cap). The embed path takes a whole input or nothing, so it is not
@@ -1422,7 +1420,6 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             admit_full_ = 0;
             const int as = admit_one(s, budget, areserve);
-            if (as == kAdmitWait) { ++at; continue; }
             if (as < 0) break;                     /* head of line: do not admit behind it */
             if (admit_full_ > s.sched_tokens && capped_at < 0) {
                 capped_at = (int32_t)plan_.e.size();
@@ -1886,10 +1883,8 @@ int Scheduler::commit(const StepResult& res) {
          * still holding the previous tenant's state. Stream ordering does the rest -- a later
          * restore is enqueued on the same stream behind this save, so validity does not have to
          * wait on the copy landing, only on it being issued. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_) {
-            const int64_t pos = (int64_t)e.ctx_len + e.ckpt_tok + 1;
-            pc_->commit_checkpoint(r, pos, last_checkpoint(pos, s.seq_len()));
-        }
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
+            pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
 
         if (e.is_prefill) {
             r.n_computed += e.n_tokens;
@@ -2749,6 +2744,8 @@ SchedMetrics Scheduler::metrics_locked() const {
 
     if (pc_) { m.prefix_evictions = pc_->evictions();
                m.prefix_ckpt_evictions = pc_->ckpt_evictions();
+               m.prefix_expired = pc_->expired();
+               m.prefix_ckpt_expired = pc_->ckpt_expired();
                m.prefix_held_tokens = pc_->held_tokens(); }
     m.attn_hit_rate = m.prompt_tokens
         ? (float)((double)m.attn_cached_tokens / (double)m.prompt_tokens) : 0.0f;

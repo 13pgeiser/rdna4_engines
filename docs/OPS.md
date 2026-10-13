@@ -298,6 +298,60 @@ rounding.
   -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's torch expressions
   are, then rounded.
 
+### Gemma 4's fusions: the sandwich-norm joins, `expert_scale`, `attn_paged_qrow` — no reference row
+
+| op | params | operands |
+|---|---|---|
+| `norm_add_norm` | `M`(range) `n` `eps`:f64 `dtype` | `a`, `w_a`w, `x`:inout, `w_y`w → `y` |
+| `norm_add_norm_route` | `M`(range) `n` `eps`:f64 `dtype` `mult`:f64 `group` | `a`, `w_a`w, `x`:inout, `w_y`w → `y`; `w_r`w → `r`; `w_e`w → `q`, `qs` |
+| `join_add_scale` | `M`(range) `n` `eps`:f64 `dtype` | `d`, `w_d`w, `r`, `w_r`w, `w_j`w, `x`:inout, `s`w, `w_n`w? → `y`? |
+| `expert_scale` | `M`(range) `n_expert` `top_k` `dtype` | `ids`, `w_e`w, `ew`:inout |
+| `attn_paged_qrow` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
+
+Gemma's sandwich norms, each one kernel in place of a chain of `rmsnorm`, `add` and `mul_weight`.
+`norm_add_norm` is `t = rmsnorm(a) * w_a; x += t; y = rmsnorm(x) * w_y` -- a post-norm, the
+residual add, the next pre-norm. `join_add_scale` is `x = (x + rmsnorm(rmsnorm(d) * w_d +
+rmsnorm(r) * w_r) * w_j) * s` -- two arms' post-norms, their sum, its norm, the residual add and a
+one-element layer scalar (Gemma 4's MoE feed-forward) -- and, given `w_n` and `y` (both or
+neither), `y = rmsnorm(x) * w_n` over the `x` it writes: the next layer's input norm, or the final
+norm after the last layer, which would otherwise be a launch of its own reading that `x` back.
+Every value the chain stores is rounded to the activation dtype at the same point, so the two
+differ from the chain only in the order a sum of squares is added in: with the same order they are
+bit-identical to it, and against a chain summed in another block width a norm factor can differ in
+its last bit.
+
+`norm_add_norm_route` is `norm_add_norm` and, from the same norm of the `x` it writes, a MoE
+layer's two routed inputs: `r = rmsnorm(x) * w_r * mult` -- `rmsnorm`'s expression with `mult` --
+and `q`, `qs` = `rmsnorm_quant_fp8` of `x` under `w_e`: E4M3 codes of the bf16-rounded norm, an
+f32 scale per (row, `group` columns) of `amax / 448` (1 for an all-zero group), the value over it
+clamped to +-448. `n` is whole groups and `group` 128. In Gemma 4 it replaces the router's
+`rmsnorm` and the experts' `rmsnorm_quant_fp8`, two launches a layer that read back the `x` the
+join had just written.
+
+`expert_scale` is `ew[t, k] = ew[t, k] * w_e[ids[t, k]]` over `[M, top_k]`, `w_e` an `[n_expert]`
+table and an id outside it reading 0: Gemma 4's per_expert_scale on the renormalised routing
+weights, in place of an `embed_lookup` of the table by the ids and a `mul` into the weights. One
+product rounded once, so the pair's value bit for bit.
+
+`attn_paged_qrow` is `attn_paged` -- the same parameters, operands and values -- with `q` read at
+its own row pitch: a column slice of a wider row, the q part of a fused `[q|k|v]` projection, read
+where it lies instead of lifted into a dense block by a `cast` first. It is a name of its own
+because an `attn_paged` kernel may refuse a pitched `q` (libr4d's other attention kernels do, with
+`RAD_E_STRIDE`, at the first step), and under `attn_paged` whichever library is first in `--kernels` wins the op: an
+architecture handing it the slice would depend on an order it cannot see. Asked for by name, the op
+resolves to a library that reads the pitch or to nothing, and the architecture lifts `q` for
+`attn_paged` where it is nothing.
+
+**libref has no row for any of them, on purpose.** An architecture asks for a join and declares the
+chain where it does not resolve (`rad_op_resolved`), and a reference row would resolve it
+everywhere -- so a model loaded without the library that serves the join would resolve it to the
+reference and be refused at serve, instead of running the chain on libr4d or libavx. libr4d
+declares them, with device rows only, so the host backend runs the chains too. With no oracle, its
+kernels are held to a chain summed in their own block order, bit for bit, by `tests/r4d_emu`. No row
+declares `replaces`: rad-kbench's fusion oracle runs the replaced chain out of the fusing library's
+own rows and compares bytes, and libr4d's `rmsnorm` adds its sums of squares in another block
+order, which can move a norm factor's last bit.
+
 ## Quantisation and rotation
 
 | op | params | operands |
@@ -652,6 +706,7 @@ and adding 0.0f is exact, so a block sum over 8 wave partials and over 32 are th
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
+| `pair_argmax` | `M`(range) `n` `dtype` | `pairs` → `idx`, `val`? |
 | `logit_rerank` | `M`(range) `R` `n_vocab` `n_embd` `vocab_off`/opt `dtype` | `x`, `head`w, `idx_in` → `idx`, `val`, `pairs`? |
 
 `row_topk` and `row_topk_merge` are a pair, and the second only means anything with the first's
@@ -666,6 +721,14 @@ its own shard's top-R, and both stages break ties on the lower id, so the result
 over the unsharded plane element for element. A slot a shard could not fill carries id -1 in
 `pairs` and is dropped -- a sentinel rather than a -inf value, because a masked logit takes that
 value legitimately.
+
+`pair_argmax` is the merge at R = 1, for a vocab-sharded draft head that wants each position's
+winner as a proposal: `idx` gets the id of the largest value among a row's `n` gathered pairs,
+ties to the lower id, a negative id skipped, -1 (and -inf in `val`) when nothing is valid --
+written one element a row at the output's own pitch, which is what a block drafter's contiguous
+proposal needs. It is not `row_topk_merge` with R = 1 because a rank still sends R >= 2 pairs: a
+row-interleaved `all_gather` moves whole 16-byte words and one pair is 8 bytes, so `n` is
+`world_size * R` and the op takes the top-1 of all of them.
 
 `logit_rerank` is the second half of a COARSE top-R. A speculative step can afford a cheap draft
 head -- the target verifies every proposal, so a worse draft costs acceptance and never a token --

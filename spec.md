@@ -1127,34 +1127,19 @@ given up the moment something wants it — the expert slab's loan, or a request 
 otherwise serve. A restore keeps the host copy, so the next turn copies only what it added:
 
     published --(copy)--> clean in VRAM --(memory wanted)--> host
-    host copy --(copy)--> clean in host memory --(slot wanted)--> disk
 
-The disk tier is a copy for the same reason: every host copy is written on to disk in the
-background as soon as it lands, and keeps its host slot. Once the write has landed the slot is as
-free to give up as a clean entry's VRAM, and a copy or a restore that finds the arena full takes
-the oldest such slots — host entries first, then the host copies of clean VRAM entries, which stay
-clean through their disk copy. Moving an entry to disk only when its slot is wanted would put the
-write on the path of whatever wanted it, and a restore out of disk, which needs a host slot to read
-through, could find an arena full of host-only entries with nothing to give.
+Host memory is the last tier. `--prefix-cache-mib` sizes it, and defaults to zero: a tier of no
+bytes holds nothing, so the feature is off until an operator says how much memory it may have. A
+full host tier drops its least recently used entries, and the cache forgets them. A hit in host
+memory promotes straight back to the device. Nothing is written to a drive: a tier there wears it
+at the rate the server prefills -- every block and every snapshot a prompt produces -- to spare a
+re-prefill only for what outgrows VRAM and host memory together.
 
-`--prefix-cache-host-mib` and `--prefix-cache-disk-mib` size the two tiers, and `--prefix-cache-dir` says where
-the disk one lives. Both caps default to zero: a tier of no bytes holds nothing, so the feature is
-off until an operator says how much memory it may have. With no disk tier a full host tier drops
-its oldest entries; the disk store evicts its own oldest entries, and a restore that finds one gone
-drops it from the cache. A hit in host memory promotes straight back to the device.
-
-A hit on disk is read into host memory first, on the tiers' IO thread, and the request waits for it
-outside the step: the scheduler asks the next request in the queue instead, and admits this one on
-the step after its read has landed. The restore itself then copies host memory to the device and
-nothing else. Reading inside the restore would run the reads one block at a time on the thread that
-builds every step, so a conversation coming back off disk would stall every other conversation for
-as long as its reads took. The read is parallel -- many blocks in flight at once, each checked
-against the key it was asked for -- and the slots it fills are held for the restore that asked:
-neither the rest of its own chain nor anything else may take them back until that restore has run,
-or for ten seconds if it never does. The request is not admitted with a shorter hit while its read
-is out, because the hit length decides how its prefill is chunked, and a prompt must run the same
-shapes however far a read had got. A chain longer than the arena is read as far as the arena reaches
-and the rest re-prefilled.
+**Every entry expires.** One that no request has used for `--prefix-cache-ttl` seconds (an hour by
+default, `0` for never) leaves the cache from whichever tier holds it, and is not moved anywhere
+first. A hit or a publish stamps every block of the chain up to where it ends with one clock, so a
+conversation expires from its tip inwards and a system prompt several conversations share stays as
+long as any of them is used. A snapshot expires with the entry it is keyed by.
 
 The trade is worth making because the alternative is a re-prefill. Dropping a 200K-token prefix
 costs minutes; moving it costs a copy over PCIe.
@@ -1166,56 +1151,32 @@ packing an arbitrary set of them exactly `gather_rows` and restoring them exactl
 (docs/OPS.md): one launch per (group, layer) for a whole batch, however many blocks are moving.
 
 **On a hybrid model the blocks are only half of a session.** The other half is the recurrent state,
-which lives in a checkpoint slot — one contiguous `checkpoint_bytes()` extent, of which there are
-`--checkpoint-slots` for the whole server. Eight by default, against the six or seven a single 200K
-transcript retains under geometric backoff, so a snapshot is the scarcest thing in the pool.
-Tiering the blocks and leaving the snapshot behind gets the trade backwards: it frees the plentiful
-resource and holds the scarce one, and the session comes back with its attention hit intact, finds
-no checkpoint at any position its chain can reach, and replays every recurrent layer from token
-zero. So a snapshot moves with the blocks whose hash it is keyed by, and the checkpoint slot goes
-back to the pool for the duration. There is no gather on this path — the slot is already
-contiguous — so it is one copy each way per rank.
+which lives in a checkpoint slot of the snapshot store -- pinned host memory, `--checkpoint-slots`
+of them for the whole server. A snapshot is copied off the card after the step that produced it and
+back before the step that resumes from it, so it never holds VRAM and never moves between tiers.
 
 In this implementation the snapshot is not the smaller half — it decides whether there is a hit at
 all. The scheduler clamps a hybrid session's reuse to the last linear checkpoint it can reach,
 because `RadBatch` carries one query length for every KV group and the linear layers cannot be
 replayed over a longer range than the attention ones, so a session restored without a reachable
 snapshot reuses ZERO tokens and re-prefills its whole transcript. The two halves are still reported
-separately, because a snapshot whose copy failed is still correct in its device slot and costs
-nothing to leave there, while one that is dropped costs the session everything. A snapshot has no
-LRU of its own — it ages with the blocks it belongs to, because one key on two lists gives one entry
-two lifetimes that can disagree.
-
-The snapshot store's share of each tier is **derived from the session the operator sized the server
-for**, and carved out of the cap they already set rather than added to it. At `--max-model-len` M a
-session costs `(M / block_size) * slot_bytes` in blocks and `(log2(M / interval) + 1) * ck_bytes`
-in snapshots, and splitting the cap in that ratio makes both halves hold the same NUMBER OF
-SESSIONS — the only sense in which they can be balanced. The ratio is strongly length dependent,
-because the retained set grows logarithmically while the blocks grow linearly: snapshots want about
-a fifth of the tier at 200K and more than half at 32K, which is why a fixed fraction is the wrong
-shape. Two thirds is the ceiling, not because the arithmetic asks for one but because the clamp
-above is a property of this implementation rather than of the design. The startup line says how
-many slots it came to.
+separately, because a session whose blocks came back and whose snapshot did not costs the session
+everything while every block counter reads as working.
 
 **What can go wrong here is silent, so it is tested by byte comparison.** Corrupt KV does not read
 as babble — it reads as fluent, deterministic, plausible text that simply is not what the model
-would have produced. `scripts/tierident.sh` asks one prompt cold, again from VRAM, again after the
-session has reached RAM, and again after it has reached disk, and compares output hashes. The VRAM
+would have produced. `scripts/tierident.sh` asks one prompt cold, again from VRAM, and again after the
+session has reached RAM, and compares output hashes. The VRAM
 repeat is the control: without it a differing hash proves nothing, because a cache hit could have
 been legitimately tie-divergent. A run in which the session never left VRAM is a failure, not a
 pass.
 
 **Half of that test cannot be a hash, and this is the part that is easy to get wrong.** A lost
 snapshot *is not visible in the text*: the engine replays the linear layers from further back and
-produces exactly the same answer, slower. So the snapshot checks are counters — how many reached
-each tier, how many came back, and how many prompt tokens a lookup then *covered* with restored
-state. Those last two are different claims: a restore that puts the state somewhere the chain cannot
-reach scores perfectly on one and zero on the other.
+produces exactly the same answer, slower. So the snapshot check is a counter: how many prompt tokens
+a lookup *covered* with restored state.
 
-The disk tier holds conversation content unencrypted and says so at startup; it is fingerprinted on
-the container, layout, KV width and rank count, because a block read back under any other is a
-lossless function of somebody else's weights. `/sessions` reports what is stored, where, and what
-the tiers have actually done — a session table that cannot say "it tried and failed" looks the same
+`/sessions` reports what is stored, where, and what the tiers have actually done — a session table that cannot say "it tried and failed" looks the same
 whether the tiers are working, off, or failing every pass.
 
 ---

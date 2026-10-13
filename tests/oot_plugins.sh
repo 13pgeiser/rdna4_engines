@@ -15,10 +15,11 @@
 #      (rad-info --plugins), from the out-of-tree home alone;
 #   4. the installed rad-kbench replays the recorded fixture through the host libraries from that
 #      home, and every check passes;
-#   5. with HIP_COMPILER given, libr4d is built out of tree too, for HIP_TARGETS, and compiles to
-#      the tree's device code. A replay of a device library needs a card, and this test must not
-#      touch one a server is using; the same instructions mean the tree's own GPU suite
-#      (ctest -L gpu) has already checked what the out-of-tree build produced.
+#   5. with HIP_COMPILER given, the device library the tree built (libr4d) is built out of tree
+#      too, for HIP_TARGETS, and compiles to the tree's device code. A replay of a device library
+#      needs a card, and this test must not touch one a server is using; the same instructions mean
+#      the tree's own GPU suite (ctest -L gpu) has already checked what the out-of-tree build
+#      produced.
 set -eu
 B=$1; S=$2; W=$3
 HIPC=${4:-}; HIPT=${5:-}
@@ -45,13 +46,20 @@ dirs="libref libquant"
 for d in "$S"/arch/*/; do
   [ -f "$d/CMakeLists.txt" ] && dirs="$dirs arch/$(basename "$d")"
 done
-[ -n "$HIPC" ] && dirs="$dirs libr4d"
+# The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
+# comparison below without it.
+devlibs=""
+for d in libr4d; do
+  [ -f "$S/$d/CMakeLists.txt" ] && [ -f "$B/radiance_home/kernels/$d.so" ] && devlibs="$devlibs $d"
+done
+[ -n "$HIPC" ] && dirs="$dirs $devlibs"
+is_dev() { case " $devlibs " in *" $1 "*) return 0 ;; esac; return 1; }
 
 for d in $dirs; do
   n=$(basename "$d")
   say "building $d against the installed package"
   extra=""
-  [ "$n" = libr4d ] && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT"
+  is_dev "$n" && extra="-DCMAKE_HIP_COMPILER=$HIPC -DRAD_GPU_TARGETS=$HIPT"
   # shellcheck disable=SC2086
   run "$W/logs/$n.configure.log" cmake -S "$S/$d" -B "$W/b/$n" -G "$GEN" \
       -DCMAKE_PREFIX_PATH="$P" -DRAD_PLUGIN_INSTALL_HOME="$H" $extra
@@ -66,7 +74,9 @@ sets() {
   done | sort
 }
 want=$(sets "$B/radiance_home")
-[ -n "$HIPC" ] || want=$(printf '%s\n' "$want" | grep -v '^kernels/libr4d\.so$' || true)
+if [ -z "$HIPC" ]; then
+  for d in $devlibs; do want=$(printf '%s\n' "$want" | grep -v "^kernels/$d\.so\$" || true); done
+fi
 have=$(sets "$H")
 if [ "$want" != "$have" ]; then
   say "in-tree:"; say "$want"; say "out of tree:"; say "$have"
@@ -91,9 +101,11 @@ listing() {
     grep -v '^plugins on' | grep -v '^     /'
 }
 tree_list=$(listing "$B/radiance_home")
-[ -n "$HIPC" ] || tree_list=$(printf '%s\n' "$tree_list" | grep -v ' libr4d ' || true)
+if [ -z "$HIPC" ]; then
+  for d in $devlibs; do tree_list=$(printf '%s\n' "$tree_list" | grep -v " $d " || true); done
+fi
 oot_list=$(listing "$H")
-# The in-tree list numbers libr4d's position when it is left out above; compare without the order
+# The in-tree list numbers a device library's position when it is left out above; compare without the order
 # column and check the order separately by name.
 strip() { printf '%s\n' "$1" | sed 's/^ *[0-9]* //'; }
 if [ "$(strip "$tree_list")" != "$(strip "$oot_list")" ]; then
@@ -104,12 +116,12 @@ say "3. same registration:"
 say "$oot_list"
 
 # 4. The installed tools serve from the out-of-tree home. The replay runs every library its home
-# holds, so it is given the out-of-tree home less its device library, which has no card here.
+# holds, so it is given the out-of-tree home less its device libraries, which have no card here.
 HH="$W/hosthome"
 mkdir -p "$HH/kernels"
 for k in architectures quantizers; do [ -d "$H/$k" ] && ln -s "$H/$k" "$HH/$k"; done
 for so in "$H"/kernels/*.so; do
-  [ "$(basename "$so")" = libr4d.so ] || ln -s "$so" "$HH/kernels/"
+  is_dev "$(basename "$so" .so)" || ln -s "$so" "$HH/kernels/"
 done
 run "$W/logs/kbench.log" env HIP_VISIBLE_DEVICES=-1 RADIANCE_HOME="$HH" \
     "$P/bin/rad-kbench" --fixture "$P/share/radiance/kernels.rkb" --max-cases 1
@@ -134,8 +146,6 @@ if [ -n "$HIPC" ]; then
   for t in llvm-objcopy llvm-readelf clang-offload-bundler; do
     [ -x "$L/$t" ] || fail "no $t beside $HIPC"
   done
-  td="$B/libr4d/CMakeFiles/libr4d.dir"
-  od="$W/b/libr4d/CMakeFiles/libr4d.dir"
   mkdir -p "$W/co"
   fatbin() {   # fatbin OBJ -- its fat binary into $W/co/fb; false for a source with no kernels
     "$L/llvm-objcopy" --dump-section .hip_fatbin="$W/co/fb" "$1" /dev/null 2>/dev/null
@@ -169,22 +179,26 @@ if [ -n "$HIPC" ]; then
     descriptors "$W/co/co" "$W/co/.rodata" | cksum
     cksum < "$W/co/.rodata"
   }
-  [ "$(ls "$td"/*.hip.o | wc -l)" = "$(ls "$od"/*.hip.o | wc -l)" ] ||
-    fail "libr4d compiles a different set of HIP sources out of tree"
-  n=0
-  for o in "$td"/*.hip.o; do
-    f=$(basename "$o")
-    [ -f "$od/$f" ] || fail "libr4d's $f has no out-of-tree twin"
-    if ! fatbin "$o"; then
-      if fatbin "$od/$f"; then fail "libr4d's $f has device code out of tree only"; fi
-      continue
-    fi
-    for t in $("$L/clang-offload-bundler" --type=o --input="$W/co/fb" --list | grep -v '^host-'); do
-      [ "$(code "$o" "$t")" = "$(code "$od/$f" "$t")" ] ||
-        fail "libr4d's $f compiles to different device code for $t out of tree"
-      n=$((n + 1))
+  for lib in $devlibs; do
+    td="$B/$lib/CMakeFiles/$lib.dir"
+    od="$W/b/$lib/CMakeFiles/$lib.dir"
+    [ "$(ls "$td"/*.hip.o | wc -l)" = "$(ls "$od"/*.hip.o | wc -l)" ] ||
+      fail "$lib compiles a different set of HIP sources out of tree"
+    n=0
+    for o in "$td"/*.hip.o; do
+      f=$(basename "$o")
+      [ -f "$od/$f" ] || fail "$lib's $f has no out-of-tree twin"
+      if ! fatbin "$o"; then
+        if fatbin "$od/$f"; then fail "$lib's $f has device code out of tree only"; fi
+        continue
+      fi
+      for t in $("$L/clang-offload-bundler" --type=o --input="$W/co/fb" --list | grep -v '^host-'); do
+        [ "$(code "$o" "$t")" = "$(code "$od/$f" "$t")" ] ||
+          fail "$lib's $f compiles to different device code for $t out of tree"
+        n=$((n + 1))
+      done
     done
+    say "5. $lib's device code is the tree's: $n code objects, the same instructions and descriptors"
   done
-  say "5. libr4d's device code is the tree's: $n code objects, the same instructions and descriptors"
 fi
 say "PASS"

@@ -1,6 +1,7 @@
 /* rad_util.cpp -- logging, error strings, dtype arithmetic and tensor helpers. The bedrock every
  * other translation unit links against.
  */
+#include <atomic>
 #include <chrono>
 #include "../rad_internal.h"
 
@@ -73,6 +74,9 @@ void log_rank_tags(bool on) { g_rank_tags = on; }
 LogRank::LogRank(int rank) : prev_(g_log_rank) { g_log_rank = rank; }
 LogRank::~LogRank() { g_log_rank = prev_; }
 
+static std::atomic<uint64_t> g_last_line_ns{0};
+uint64_t log_last_line_ns() { return g_last_line_ns.load(std::memory_order_relaxed); }
+
 void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     const char* base = std::strrchr(file, '/');
     base = base ? base + 1 : file;
@@ -95,6 +99,7 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
         fprintf(stderr, "%s%s%s%s %s:%d  %s\n", col, level_tag(l), rank, rst, base, line, msg);
     else
         fprintf(stderr, "%s%s%s%s %s\n", col, level_tag(l), rank, rst, msg);
+    g_last_line_ns.store(rad_mono_ns(), std::memory_order_relaxed);
 }
 
 void fatal(const char* fmt, ...) {

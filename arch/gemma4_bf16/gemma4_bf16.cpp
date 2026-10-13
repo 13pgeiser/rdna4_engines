@@ -9,8 +9,7 @@
  * cap * tanh(x / cap).
  */
 #include <arch/rad_arch.h>
-
-#include "gemma4_chat_format.h"
+#include <arch/rad_gemma4_chat.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -1543,8 +1542,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 }
 
-/* The reply format: gemma4_chat_format.h. */
-const RadChatFormat* chat_format(const RadModelMeta*) { return chat_format_decl(); }
+/* The reply format: the model's, shared with arch/gemma4 (arch/rad_gemma4_chat.h). */
+const RadChatFormat* chat_format(const RadModelMeta*) { return gemma4_chat_format(); }
 
 /* WHAT THIS CONTAINER'S HEAD IS WORTH SPECULATING TO, for `--num-speculative-tokens auto`. A serial
  * head names an operating point, not a trained depth: one more round is one more pass of the head,

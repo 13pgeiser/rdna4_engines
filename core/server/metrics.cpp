@@ -185,6 +185,9 @@ void Metrics::sample(const SchedMetrics& m) {
     c_prefix_evict_.inc(std::max(0.0, (double)m.prefix_evictions - c_prefix_evict_.get()));
     c_prefix_ckpt_evict_.inc(std::max(0.0,
         (double)m.prefix_ckpt_evictions - c_prefix_ckpt_evict_.get()));
+    c_prefix_expired_.inc(std::max(0.0, (double)m.prefix_expired - c_prefix_expired_.get()));
+    c_prefix_ckpt_expired_.inc(std::max(0.0,
+        (double)m.prefix_ckpt_expired - c_prefix_ckpt_expired_.get()));
     g_linear_hit_.set(m.linear_hit_rate);
 }
 
@@ -394,6 +397,12 @@ std::string Metrics::render() const {
               "Prefix-cache entries evicted (attention blocks).", L, c_prefix_evict_.get());
     w.counter("radiance:prefix_cache_ckpt_evictions_total",
               "Prefix-cache linear-state checkpoints evicted.", L, c_prefix_ckpt_evict_.get());
+    w.counter("radiance:prefix_cache_expired_total",
+              "Prefix-cache entries no request used for --prefix-cache-ttl, taken out.", L,
+              c_prefix_expired_.get());
+    w.counter("radiance:prefix_cache_ckpt_expired_total",
+              "Prefix-cache linear-state checkpoints taken out by --prefix-cache-ttl.", L,
+              c_prefix_ckpt_expired_.get());
     w.gauge("radiance:draft_acceptance_ratio",
             "Fraction of speculative draft tokens accepted (spec 10).", L, g_draft_accept_.get());
     /* CONDITIONAL, per draft position: of the verifies that reached position j -- every earlier

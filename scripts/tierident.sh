@@ -28,19 +28,19 @@
 #
 #   scripts/tierident.sh                  # against a server already up on $P (default 8100)
 #
-# The server must be started with the tiers on, with a host tier small enough for the filler below
-# to overflow it (see fill_arena), and with few enough checkpoint slots that the filler's snapshots
-# push the session's out of the device pool -- a snapshot still in its device slot needs no
-# promotion, and the path that brings one back from disk then never runs:
-#   --prefix-cache-host-mib 512 --prefix-cache-disk-mib 8192 --prefix-cache-dir <dir> \
-#   --checkpoint-slots 2
+# The server must be started with the host tier on, small enough for the filler below to overflow
+# it (see fill_arena):
+#   --prefix-cache-mib 512
+# With TTL=<the server's --prefix-cache-ttl> set here as well, a last arm waits it out and checks
+# that the session is gone from every tier and that asking again recomputes the same answer; start
+# the server with a TTL long enough for the arms before it (a few minutes).
 set -e
 
 P=${P:-8100}
 H=${H:-127.0.0.1}
 TO_HOST=${TO_HOST:-10}
-TO_DISK=${TO_DISK:-180}
 FILL=${FILL:-1200}
+TTL=${TTL:-0}
 N=${N:-48}
 work=$(mktemp -d "${TMPDIR:-/tmp}/tierident.XXXXXX")
 trap 'rm -rf "$work"' EXIT INT TERM
@@ -64,7 +64,7 @@ while [ $i -lt 300 ]; do
     printf 'Section %d. The cache stores conversation prefixes as content-hashed blocks, and the identity of a block includes every token before it. ' "$i" >> "$work/p.txt"
     i=$((i + 1))
 done
-printf '\nUsing only the passage above, write three sentences about what a block identity includes and why it matters.\n\nAnswer: ' >> "$work/p.txt"
+printf '\nUsing only the passage above, write three sentences about it.\n\nAnswer: ' >> "$work/p.txt"
 # THE FILE IS THE PROMPT, READ VERBATIM, through jq's --rawfile. Escaping it by hand into a shell
 # variable doubles the backslash jq adds before every quote, and flattening its newlines welds the
 # question onto the passage ("...why it matters.Answer:" on one line), which this model answers
@@ -80,12 +80,11 @@ ask() {                       # ask <label> -> writes $work/<label>.txt, echoes 
     sha1sum < "$work/$1.txt" | cut -d' ' -f1
 }
 # ---- pushing a session out of host memory --------------------------------------------------------
-# NOTHING LEAVES HOST MEMORY ON A CLOCK. Every host copy is written on to disk as soon as it lands
-# and keeps its host slot until another entry needs one, so the way to put a session on disk is to
-# give the arena something else to hold: a prompt that shares no prefix with anything here and is
-# bigger than the room the arena has left. The server must be started with a host tier FILL
-# sections of it overflow; --prefix-cache-host-mib 512 holds about 27K tokens on
-# Qwen3.8-Flash-Next, and the default FILL is about 30K.
+# A FULL HOST TIER DROPS ITS LEAST RECENTLY USED ENTRIES, so the way to push a session out is to give
+# the arena something else to hold: a prompt that shares no prefix with anything here and is bigger
+# than the room the arena has left. The server must be started with a host tier FILL sections of it
+# overflow; --prefix-cache-mib 512 holds about 27K tokens on Qwen3.8-Flash-Next, and the default
+# FILL is about 30K.
 fill_arena() {
     : > "$work/fill.txt"
     i=0
@@ -99,17 +98,6 @@ fill_arena() {
     curl -sS --fail -X POST "http://$H:$P/v1/completions" -H 'Content-Type: application/json' \
          --data @"$work/fill.json" > /dev/null
 }
-# Until some blocks are on the disk tier, or TO_DISK seconds. The filler's copies are what take the
-# slots, and they land after its request finishes.
-wait_disk() {
-    t=0
-    while [ $t -lt "$TO_DISK" ]; do
-        curl -sS --fail "http://$H:$P/sessions" > "$work/w.json"
-        case "$(jq -r .blocks_sum_overlapping.disk < "$work/w.json")" in 0|null|"") ;; *) return 0 ;; esac
-        sleep 2; t=$((t + 2))
-    done
-    return 1
-}
 snap() { curl -sS --fail "http://$H:$P/sessions" > "$work/s.json"; }
 q()    { jq -r "$1" < "$work/s.json"; }
 # PROMPT TOKENS A LOOKUP COVERED WITH RECURRENT STATE. Moving a snapshot and moving it back proves
@@ -118,11 +106,11 @@ q()    { jq -r "$1" < "$work/s.json"; }
 # scores perfectly on the first and zero on this.
 lin()  { jq -r ".linear.cached_tokens" < "$work/s.json"; }
 
-where() {                     # where -> "vram=N ram=N disk=N [+ snapshots]" for the whole server
+where() {                     # where -> "vram=N ram=N [+ snapshots]" for the whole server
     snap
-    w="vram=$(q .blocks_sum_overlapping.device) ram=$(q .blocks_sum_overlapping.host) disk=$(q .blocks_sum_overlapping.disk)"
-    if [ "$(q .snapshots_moved.bytes_each)" != "0" ]; then
-        w="$w  state: ram=$(q .snapshots.host) disk=$(q .snapshots.disk)"
+    w="vram=$(q .blocks_sum_overlapping.device) ram=$(q .blocks_sum_overlapping.host)"
+    if [ "$(q .snapshot_store.bytes_each)" != "0" ]; then
+        w="$w  snapshots=$(q .snapshots_sum_overlapping)"
     fi
     echo "$w"
 }
@@ -141,11 +129,11 @@ echo "tierident: $H:$P, ${TO_HOST}s for VRAM to go, $FILL filler sections to pus
 # is named as one rather than skipped.
 snap
 HYBRID=0
-[ "$(q .snapshots_moved.bytes_each)" != "0" ] && HYBRID=1
+[ "$(q .snapshot_store.bytes_each)" != "0" ] && HYBRID=1
 if [ "$HYBRID" = 1 ]; then
-    echo "  hybrid: snapshots are $(q .snapshots_moved.bytes_each) bytes, $(q .snapshots_moved.host_slots) ram slot(s), $(q .snapshots_moved.disk_slots) disk slot(s)"
-    [ "$(q .snapshots_moved.host_slots)" = "0" ] && \
-        note "the snapshot store has no room; an idle session's linear state cannot leave VRAM"
+    echo "  hybrid: snapshots are $(q .snapshot_store.bytes_each) bytes, $(q .snapshot_store.slots) slot(s)"
+    [ "$(q .snapshot_store.slots)" = "0" ] && \
+        note "the snapshot store has no room; a session's linear state has nowhere to be kept"
 else
     echo "  this model has no recurrent state; the linear-state arms are not applicable"
 fi
@@ -185,35 +173,23 @@ snap
 # A MISSING FIELD IS THE SAME FAILURE AS A ZERO: if the /sessions layout changes, this guard reads
 # `null`, and treating that as a pass would pass vacuously.
 case "$(q .blocks_sum_overlapping.host)" in 0|null|"") false ;; *) true ;; esac || note "the session never left VRAM -- nothing below would test anything
-        (--prefix-cache-host-mib set? is the maintenance pass running?)"
+        (--prefix-cache-mib set? is the maintenance pass running?)"
 if [ "$HYBRID" = 1 ]; then
     snap
     # A SNAPSHOT IS IN HOST MEMORY FROM THE MOMENT IT IS SAVED (the checkpoint store), so the
-    # session's state must be there or on disk -- nowhere else is a place it can be.
-    case "$(q .snapshots.host)/$(q .snapshots.disk)" in 0/0|null/*|*/null) false ;; *) true ;; esac || \
-        note "the session holds no linear-state snapshot, so the restore below tests the blocks only
-        (dropped: $(q .snapshots_moved.drops))"
+    # session's state must be there -- nowhere else is a place it can be.
+    case "$(q .snapshots_sum_overlapping)" in 0|null|"") false ;; *) true ;; esac || \
+        note "the session holds no linear-state snapshot, so the restore below tests the blocks only"
 fi
 snap
-FET0=$([ "$HYBRID" = 1 ] && q .snapshots_moved.fetched || echo 0)
 LIN0=$([ "$HYBRID" = 1 ] && lin || echo 0)
-RAM0=$([ "$HYBRID" = 1 ] && q .snapshots.host || echo 0)
 FROMHOST=$(ask fromhost)
 echo "  restored from RAM          $FROMHOST   [$(where)]"
 check "a session restored from RAM reproduces the cold answer" "$FROMHOST" "$COLD"
 if [ "$HYBRID" = 1 ]; then
     snap
-    # A SNAPSHOT IN THE STORE NEEDS NO READ: it is restored straight out of its slot, and only
-    # the store's own pressure sends it to disk. Whether it was SERVED is the check below either
-    # way; this one only says which path served it.
-    if [ "$(q .snapshots_moved.fetched)" -gt "$FET0" ]; then
-        echo "  ok    its linear state was read back off disk  ($(( $(q .snapshots_moved.fetched) - FET0 )) snapshot(s))"
-    elif [ "$RAM0" -gt 0 ]; then
-        echo "  --    its linear state stayed in the snapshot store ($RAM0 there), so nothing was read"
-    else
-        note "the blocks came back and the linear state did not -- the answer is right and the
-        session will replay every recurrent layer from an older checkpoint to produce it"
-    fi
+    # A SNAPSHOT NEEDS NO READ: it is restored straight out of its slot in the store. Whether it was
+    # SERVED is the check.
     if [ "$(lin)" -gt "$LIN0" ]; then
         echo "  ok    and the restored state was SERVED  ($(( $(lin) - LIN0 )) prompt tokens covered by it)"
     else
@@ -222,50 +198,47 @@ if [ "$HYBRID" = 1 ]; then
     fi
 fi
 
-# ---- disk --------------------------------------------------------------------------------------
+# ---- a full host tier ---------------------------------------------------------------------------
+# THE FILLER OVERFLOWS THE ARENA, and the arena drops its least recently used entries -- this
+# session's -- to make room. What comes back then is a recompute, or a restore of what survived; the
+# answer is the cold one either way, and an entry the arena dropped that the cache went on serving
+# would show here as another conversation's context.
 echo "  filling host memory with $FILL sections of something else..."
+snap
+DROP0=$(q .moved.host_drops)
 fill_arena
-wait_disk || true
 echo "  and waiting $((TO_HOST + 8))s for VRAM to go..."
 sleep $((TO_HOST + 8))
 W=$(where)
 echo "  after the filler           [$W]"
 snap
-case "$(q .blocks_sum_overlapping.disk)" in 0|null|"") false ;; *) true ;; esac || note "the session never reached disk -- the arm below tests nothing
-        (--prefix-cache-disk-mib and --prefix-cache-dir set? a host tier FILL=$FILL sections overflow?)"
-if [ "$HYBRID" = 1 ]; then
+[ "$(q .moved.host_drops)" -gt "$DROP0" ] || note "the host tier dropped nothing -- the arm below tests nothing
+        (a host tier FILL=$FILL sections overflow?)"
+AFTER=$(ask afterfill)
+echo "  after a full host tier     $AFTER   [$(where)]"
+check "a session the full host tier dropped from reproduces the cold answer" "$AFTER" "$COLD"
+
+# ---- expiry ------------------------------------------------------------------------------------
+if [ "$TTL" -gt 0 ]; then
+    echo "  waiting $((TTL + 5))s for --prefix-cache-ttl to take everything..."
+    sleep $((TTL + 5))
     snap
-    [ "$(q .snapshots_moved.to_disk)" = "0" ] && \
-        note "no linear-state snapshot reached disk
-        (disk snapshot slots: $(q .snapshots_moved.disk_slots))"
-fi
-snap
-FET1=$([ "$HYBRID" = 1 ] && q .snapshots_moved.fetched || echo 0)
-LIN1=$([ "$HYBRID" = 1 ] && lin || echo 0)
-FROMDISK=$(ask fromdisk)
-echo "  restored from disk         $FROMDISK   [$(where)]"
-check "a session restored from disk reproduces the cold answer" "$FROMDISK" "$COLD"
-if [ "$HYBRID" = 1 ]; then
-    snap
-    if [ "$(q .snapshots_moved.fetched)" -gt "$FET1" ]; then
-        echo "  ok    its linear state came back from disk too"
-    else
-        note "no snapshot was read off disk -- the filler's snapshots did not push the session's
-        out of the snapshot store (--checkpoint-slots 2?), so the disk path never ran"
-    fi
-    if [ "$(lin)" -gt "$LIN1" ]; then
-        echo "  ok    and the state restored from disk was SERVED  ($(( $(lin) - LIN1 )) prompt tokens)"
-    else
-        note "a snapshot came back from disk and no lookup used it"
-    fi
-    echo "  snapshots: to_disk=$(q .snapshots_moved.to_disk) fetched=$(q .snapshots_moved.fetched) dropped=$(q .snapshots_moved.drops)"
+    echo "  after the ttl              [$(where)]  expired: $(q .expired.entries) entries, $(q .expired.snapshots) snapshots"
+    case "$(q '.sessions | length')/$(q .blocks_sum_overlapping.host)/$(q .occupancy.host_bytes)" in
+        0/0/0) echo "  ok    nothing is left in any tier" ;;
+        *) note "the ttl left something behind: $(q '.sessions | length') sessions, host bytes $(q .occupancy.host_bytes)" ;;
+    esac
+    [ "$(q .expired.entries)" -gt 0 ] || note "no entry was counted as expired"
+    EXPIRED=$(ask expired)
+    echo "  after expiry               $EXPIRED   [$(where)]"
+    check "a session asked again after it expired reproduces the cold answer" "$EXPIRED" "$COLD"
 fi
 
 # ---- and the text itself, so a failure says WHERE ----------------------------------------------
 if [ "$fail" -ne 0 ]; then
     echo
     echo "The first differing line, cold vs the failing arm:"
-    for arm in fromhost fromdisk; do
+    for arm in fromhost afterfill expired; do
         [ -f "$work/$arm.txt" ] || continue
         if ! cmp -s "$work/cold.txt" "$work/$arm.txt"; then
             echo "--- $arm"
@@ -280,6 +253,6 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo
-[ "$fail" -eq 0 ] && echo "tierident: PASS -- a session survives VRAM -> RAM -> disk byte for byte, state included"
+[ "$fail" -eq 0 ] && echo "tierident: PASS -- a session survives VRAM -> RAM byte for byte, state included"
 [ "$fail" -ne 0 ] && { echo "tierident: $fail FAILURE(S)"; exit 1; }
 exit 0

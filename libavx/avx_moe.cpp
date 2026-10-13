@@ -740,3 +740,37 @@ AVX_KERNEL(row_topk_merge) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ pair_argmax */
+/* row_topk_merge at R = 1, one id a row at the output's own pitch: the vocab-sharded draft head's
+ * proposal. Same pads, same tie rule, -1 and -inf for a row with nothing valid; `val` optional.
+ *
+ * LEFT SCALAR for the merge's reason, more so: `n` is world_size * R -- sixteen pairs at TP8 and
+ * R 2 -- and the whole op is one pass over them a row. */
+AVX_KERNEL(pair_argmax) {
+    if (!rad_args_have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *p = &a->t[0], *idx = &a->t[1];
+    const RadTensor* val = rad_arg_in(a, 2);
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (p->dtype != RAD_F32) return RAD_E_DTYPE;   /* the id is carried by bit pattern */
+    const int64_t M = numel(p) / (n * 2);
+    if (M <= 0 || numel(idx) < M || (val && numel(val) < M)) return RAD_E_SHAPE;
+    const float* const pf = (const float*)p->data;
+
+    AVX_PARALLEL_FOR_IF(M * n >= 4096)
+    for (int64_t m = 0; m < M; ++m) {
+        int32_t bid = -1;
+        float   bv  = -INFINITY;
+        for (int64_t j = 0; j < n; ++j) {
+            int32_t id;
+            std::memcpy(&id, pf + offlin(p, (m * n + j) * 2), sizeof id);
+            if (id < 0) continue;                          /* a pad, not a candidate */
+            const float v = pf[offlin(p, (m * n + j) * 2 + 1)];
+            if (bid < 0 || v > bv || (v == bv && id < bid)) { bid = id; bv = v; }
+        }
+        st_int_dt(idx->dtype, idx->data, offlin(idx, m), bid);
+        if (val) stt(val, offlin(val, m), bv);
+    }
+    return RAD_OK;
+}

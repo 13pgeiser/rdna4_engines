@@ -111,21 +111,12 @@ long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
  // The Gemma 4 dense sliding-window geometry: head_dim 256, 2 queries per KV head, sliding window.
  // Both bands: the decode band (q_len*gqa <= 64, i.e. q_len <= 32) and the windowed prefill band
  // (a prefill-length query, WIN on). The prefill leg is the same r4d_attn_prefill_kernel the
- // h256/gqa6 and h512/gqa8 dispatches instantiate, with the window bit turned on.
+ // h256/gqa6 dispatch instantiates, with the window bit turned on.
  int  r4d_attn_prefill_h256_gqa2_fp8kv (const R4DArgs* a, hipStream_t stream);
  int  r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
  int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgs* a, hipStream_t stream);
  int  r4d_attn_decode_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
  long r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgs* a);
-// The Gemma 4 dense global geometry: head_dim 512, 8 queries per KV head, full attention (window 0).
-// The one head_dim the library had not compiled -- a stand-alone instantiation, not the gqa8
-// parameterised body (whose prefill tile of 48 does not fit 512-channel tiles in LDS). Both legs
-// spill ~384 VGPRs at this head; a 3b tuning question, not a 3a one.
-int  r4d_attn_prefill_h512_gqa8_fp8kv (const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_prefill_h512_gqa8_bf16kv(const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_decode_h512_gqa8_fp8kv  (const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_decode_h512_gqa8_bf16kv (const R4DArgs* a, hipStream_t stream);
-long r4d_attn_decode_h512_gqa8_scratch_bytes(const R4DArgs* a);
 // The geometry the attention kernels above are compiled for, so a caller can test a model against
 // it instead of discovering the mismatch at the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -422,8 +413,12 @@ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 // Shards are as even as the word count allows (the first n16 % ws take one more word), so a
 // message need not divide by the rank count -- at three it almost never does. Regions A and B sit
 // at 0 and the longest shard, so the slot stride must hold twice that. Above this bound the caller
-// falls back:
-enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
+// falls back to the one-shot. The bound guards the kernel's int word offsets (the message, the
+// slot stride) and nothing else: 2^28 elements is 2^26 words at fp32. It was 20971520 -- a
+// 4096-token chunk of a 5120-wide residual -- which handed every larger prefill chunk back to the
+// one-shot and its (ws-1)*N send: an 8192-token chunk at Gemma 4's 2816 is 23M elements at the
+// attention's reduce and 46M at the feed-forward's, which carries both branches.
+enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456 };
 void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
                                 long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,

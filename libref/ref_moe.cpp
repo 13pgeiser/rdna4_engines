@@ -488,6 +488,47 @@ int ref_row_topk_merge(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ pair_argmax */
+/* row_topk_merge at R = 1, for a caller that wants the winner's id as a PROPOSAL rather than as
+ * a candidate list: one element a row, at the output's own pitch, so a block drafter's per-position
+ * picks land contiguous in the token buffer it verifies. `pairs` is the same gathered plane --
+ * `n` (int32 id, f32 value) pairs a row, a negative id a pad -- and the rule is the same: the
+ * largest value, ties to the LOWER id, so the pick equals an argmax over the unsharded row.
+ *
+ * Its own op rather than row_topk_merge with R = 1 because the shapes differ where it matters:
+ * row_topk_merge's `gathered` is world_size * R pairs a row, and a rank that sends R = 1 sends 8
+ * bytes, which a row-interleaved all_gather moving whole 16-byte words cannot carry. So a rank
+ * sends R >= 2 and this takes the top-1 of all of them, whatever `n` that makes. A row with no
+ * valid pair writes -1 and -inf, as the merge does for a slot it cannot fill. `val` is optional. */
+int ref_pair_argmax(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *p = &a->t[0], *idx = &a->t[1];
+    const RadTensor* val = t_in(a, 2);
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (p->dtype != RAD_F32) return RAD_E_DTYPE;   /* the id is carried by bit pattern */
+    /* The rows are the operand's, as on row_topk_merge: `M` is a band ceiling. */
+    const int64_t M = numel(p) / (n * 2);
+    if (M <= 0 || numel(idx) < M || (val && numel(val) < M)) return RAD_E_SHAPE;
+    const float* const pf = (const float*)p->data;
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t m = 0; m < M; ++m) {
+        int32_t bid = -1;
+        float   bv  = -INFINITY;
+        for (int64_t j = 0; j < n; ++j) {
+            int32_t id;
+            std::memcpy(&id, pf + offlin(p, (m * n + j) * 2), sizeof id);
+            if (id < 0) continue;                          /* a pad, not a candidate */
+            const float v = pf[offlin(p, (m * n + j) * 2 + 1)];
+            if (bid < 0 || v > bv || (v == bv && id < bid)) { bid = id; bv = v; }
+        }
+        st_int(idx->dtype, idx->data, offlin(idx, m), bid);
+        if (val) stt(val, offlin(val, m), bv);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ logit_rerank */
 /* EXACTLY RESCORE R CANDIDATES A ROW AGAINST THE FULL-PRECISION HEAD.
  *

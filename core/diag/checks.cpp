@@ -302,7 +302,7 @@ void check_memory(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
             "the page cache is what a container read in place and the n-gram rows read from disk "
             "come through; with it starved every step waits on the drive, and the kernel starts "
             "reclaiming and swapping",
-            "lower --host-pool-mib or --prefix-cache-host-mib, or stop what else holds memory");
+            "lower --host-pool-mib or --prefix-cache-mib, or stop what else holds memory");
     if (h.swap_total > 0 && h.swap_free >= 0 && h.swap_total - h.swap_free > 256 * kMiB)
         add(out, Finding::Note, "swap-in-use",
             fmt("%s of swap is in use", humanb(h.swap_total - h.swap_free).c_str()),

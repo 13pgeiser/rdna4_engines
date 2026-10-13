@@ -393,6 +393,7 @@ static void cross_check(const Plugin& pl) {
 
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
+    int p_g2dec = -1, p_g2pre = -1, p_g2win = -1;
     for (int k = 0; k < nk; ++k) {
         const RadKernelInfo* r = pl.kernel_at(k);
         if (!std::strcmp(r->name, "ar_twoshot_4rank_exact")) p_ts = r->priority;
@@ -402,12 +403,17 @@ static void cross_check(const Plugin& pl) {
         if (!std::strcmp(r->name, "gemm_bf16_nt_m16")) p_m16 = r->priority;
         if (!std::strcmp(r->name, "gemm_bf16_nt_m64")) p_m64 = r->priority;
         if (!std::strcmp(r->name, "gemm_bf16_nt_tiled")) p_bt = r->priority;
+        if (!std::strcmp(r->name, "attn_decode_h256_gqa2_fp8kv"))  p_g2dec = r->priority;
+        if (!std::strcmp(r->name, "attn_prefill_h256_gqa2_fp8kv")) p_g2pre = r->priority;
+        if (!std::strcmp(r->name, "attn_window_h256_gqa2_fp8kv"))  p_g2win = r->priority;
     }
     ok("two-shot all-reduce outranks one-shot (libr4d row order)", p_ts > p_os && p_ts > 0);
     ok("paged decode outranks paged prefill in the shared band", p_dec > p_pre && p_dec > 0);
     ok("gemm_bf16_nt_m16 outranks _m64 (libr4d row order, see the ladder)", p_m16 > p_m64);
     ok("gemm_bf16_nt_tiled outranks _m64 and not _m16 (M > 64 is its band)",
        p_bt > p_m64 && p_bt < p_m16);
+    ok("the h256/gqa2 legs outrank the windowed kernel in both their bands",
+       p_g2win > 0 && p_g2dec > p_g2win && p_g2pre > p_g2win);
     std::printf("\n");
 }
 
@@ -12010,7 +12016,7 @@ static void ar_three_rank(const Plugin& pl, const std::vector<int>& devs, const 
  * sums correctly. This one gives every element its own value, so a word reduced by the wrong
  * owner, gathered from the wrong slot or dropped at a short shard's end is a wrong number at a
  * known index. The sizes walk the uneven split: words % 3 of 0, 1 and 2, from a 16-word message
- * to the row's 20971520-element ceiling, in place (how every block issues it) and once out of
+ * to past the old 20971520 ceiling, in place (how every block issues it) and once out of
  * place, back to back on ONE instance so the slot parity and the changing block count are
  * exercised the way a step's mixed messages exercise them. The oracle is the fold the kernel
  * claims -- fp32 in ascending rank order, rounded once -- so it is bit for bit, and so it is also
@@ -12089,8 +12095,9 @@ static void ar_three_rank_pattern(const Plugin& pl, const std::vector<int>& devs
     struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
     const std::vector<Run> runs = {
         /* bf16, the residual: words = numel / 8. 2048 x 2048 rows is words % 3 == 2, x 2049 is
-         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the ceiling (1). */
-        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 4194304 }, 2 },
+         * 0, x 2050 is 1; 128 is 16 words (1), 24008 is 3001 (1); 20971520 the old ceiling (1);
+         * 46137344, Gemma 4's feed-forward reduce at an 8192-token chunk, past it (1). */
+        { "bf16", { 4194304, 128, 4196352, 24008, 4198400, 20971520, 46137344, 4194304 }, 2 },
         /* fp32: words = numel / 4. 8196 -> 2049 (0), 4100 -> 1025 (2), 1048580 -> 262145 (2). */
         { "fp32", { 8196, 4100, 1048580 }, 0 },
     };
@@ -12579,19 +12586,19 @@ static void device_phase(const Plugin& pl) {
      * context and the launch is the full-attention form. */
     attn_case(pl, "attn_prefill_h256_gqa2_fp8kv",  256, 2, 32, "fp8_e4m3", 1, 1024);
     attn_case(pl, "attn_prefill_h256_gqa2_bf16kv", 256, 2, 32, "bf16",     1, 1024);
-    /* Gemma 4 dense global: head_dim 512, full attention. Launch-only cases at prefill q_len 32 and
-     * decode 1, mirroring the gqa6 leg's pair; the numeric check of the same rows follows. */
-    attn_case(pl, "attn_prefill_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 1);
-    attn_case(pl, "attn_prefill_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     1);
-    attn_case(pl, "attn_decode_h512_gqa8_fp8kv",   512, 8,  1, "fp8_e4m3", 0);
-    attn_case(pl, "attn_decode_h512_gqa8_bf16kv",  512, 8,  1, "bf16",     0);
+    /* Gemma 4 dense global: head_dim 512, full attention, on the windowed kernel -- one row for
+     * every q_len, so a prefill-shaped launch (q_len 32) and a decode one (1) of the same row; the
+     * numeric check of both follows. */
+    attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     1);
+    attn_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
+    attn_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
     /* The numeric attention check: the same rows, but with random data and a comparison
-     * against the inline oracle, plus a negative control. h512 is prefill + decode; h256/gqa2 is
-     * decode-only (the windowed sliding-window leg, window 1024). */
-    attn_numeric_case(pl, "attn_prefill_h512_gqa8_fp8kv",   512, 8, 32, "fp8_e4m3", 0);
-    attn_numeric_case(pl, "attn_prefill_h512_gqa8_bf16kv",  512, 8, 32, "bf16",     0);
-    attn_numeric_case(pl, "attn_decode_h512_gqa8_fp8kv",    512, 8,  1, "fp8_e4m3", 0);
-    attn_numeric_case(pl, "attn_decode_h512_gqa8_bf16kv",   512, 8,  1, "bf16",     0);
+     * against the inline oracle, plus a negative control. */
+    attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8, 32, "fp8_e4m3", 0);
+    attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8, 32, "bf16",     0);
+    attn_numeric_case(pl, "attn_window_h512_gqa8_fp8kv",  512, 8,  1, "fp8_e4m3", 0);
+    attn_numeric_case(pl, "attn_window_h512_gqa8_bf16kv", 512, 8,  1, "bf16",     0);
     /* The h256/gqa2 PREFILL numeric check. Unlike the decode leg (ctx 64 < window, so the window
      * clamps to the context), ctx here is 2048 > window 1024, so the window actually bites: for
      * query row 0, pos = 2048-64 = 1984 and the visible keys are [961..1984], so the kernel's

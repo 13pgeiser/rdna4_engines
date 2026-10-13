@@ -1,0 +1,13 @@
+# Qwen3.8-27B ParoQuant int4 (z-lab's release: AWQ int4, group 128, with the learned Givens
+# rotations it was trained in) and its DFlash2 block-diffusion drafter, on one card. The int5 and
+# MXFP4 containers serve from this file too: point --model at them.
+name: radiance-qwen3.8-27b-paro
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen3.8-27b-paro
+    command: >
+      --model /models/qwen3.8-27b-paro-int4.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8
+      --max-num-batched-tokens 2048 --embedding-placement ram --host-pool-mib 3072

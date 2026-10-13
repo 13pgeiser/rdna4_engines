@@ -41,7 +41,6 @@
 
 namespace rad {
 
-class SSDTier;
 class Kld;
 struct TierPump;
 struct TierJob;
@@ -92,18 +91,7 @@ private:
      * shared BY POINTER rather than broadcast (spec §1). */
     struct Rank;
     std::vector<std::unique_ptr<Rank>> ranks_;
-    /* THE DISK HALF OF THE IDLE TIERS. One store for the engine, not one per rank: it is
-     * keyed by a chained hash of TOKENS, which every rank computes identically, and a
-     * per-rank store would write the same key several times over. Off unless
-     * --prefix-cache-disk-mib and a directory are both given; it holds conversation content
-     * unencrypted and says so at startup.
-     *
-     * unique_ptr because engine.h is included by main.cpp and the tools, and SSDTier
-     * drags in the O_DIRECT device layer that none of them want to compile against. */
-    std::unique_ptr<SSDTier> kv_disk_;
-    /* THE TIERS' WORK IN FLIGHT: the copy to host memory the transfer streams are running and the
-     * disk batch the IO thread is writing. Declared after kv_disk_ so it goes first -- the thread
-     * writes into that store. */
+    /* THE TIERS' WORK IN FLIGHT: the copy to host memory the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     std::vector<std::thread>           rank_threads_;
 
@@ -146,10 +134,11 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
-    /* --embedding-placement and --ngram-placement, resolved into Config before the card is split
-     * (engine_bringup.cpp says how auto chooses). */
+    /* --embedding-placement, --vision-tower-placement and --ngram-placement, resolved into Config
+     * before the card is split (engine_bringup.cpp says how auto chooses). */
     int resolve_table_placement(const std::vector<VramFacts>& facts,
-                                const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                const std::vector<int64_t>& emb_bytes,
+                                const std::vector<int64_t>& tower_bytes, int64_t kv_floor,
                                 int64_t ngram_bytes, bool ngram_device, bool ngram_host);
     /* --ngram-placement ram: the copy of the container's [src, src + n), file offset `foff`, made
      * once and shared by every rank -- locked for the host gather, or pinned for a device kernel
@@ -352,20 +341,15 @@ private:
     /* The terminal ids drain_completed() took, reused so a steady state allocates nothing. */
     std::vector<uint64_t> done_;
     /* THE TIERS' SIDE OF THE LOOP, every iteration: collect a copy that has landed, hand the next
-     * one out, collect and hand out the disk work. Nothing in it waits on the device or on a file,
-     * and the scheduler's lock is held only around the bookkeeping. */
+     * one out, and make room in a full arena. Nothing in it waits on the device, and the
+     * scheduler's lock is held only around the bookkeeping. */
     void tier_tick();
-    bool submit_fetch(uint64_t tag, std::vector<TierJob>&& jobs);
-    /* A MARK ON EVERY RANK'S STREAMS, for the disk thread to wait on before it touches a slot:
-     * the transfer streams' when `transfer`, the compute streams' when `compute`, in that order,
-     * one a rank each; `st` is the first failure to make one. destroy_fences gives them back on
-     * their own cards. */
-    std::vector<RadEvent> rank_fences(bool transfer, bool compute, int* st = nullptr);
-    void destroy_fences(std::vector<RadEvent>& f);
+    /* --prefix-cache-ttl, once a second, with or without the tiers (PrefixCache::expire). */
+    void expire_tick(uint64_t now_ns);
+    uint64_t expire_last_ns_ = 0;
     /* Every host copy that is waiting, issued and landed now. Under the scheduler's lock, from an
      * eviction that would otherwise erase what the copies cover. True when any landed. */
     bool flush_copies();
-    uint64_t tier_last_ns_ = 0;
     /* THE LOAN: what the KV cache is not using, lent to every rank's expert slab at the addresses
      * the cache already owns (KVManager, the loan block). Here rather than inside the scheduler
      * because it spans both sides -- rank 0's cache decides how much, and every rank's mover

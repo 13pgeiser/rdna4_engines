@@ -3,6 +3,7 @@
  */
 #include "engine.h"
 #include "hf_model.h"
+#include "util/stallwatch.h"
 
 int main(int argc, char** argv) {
     rad::Config cfg;
@@ -14,7 +15,12 @@ int main(int argc, char** argv) {
 
     rad::Engine engine(std::move(cfg));
 
-    s = engine.start();
+    {
+        /* A startup that stops printing says where it waits (util/stallwatch.h). Two minutes:
+         * the slowest normal step, a container read from a slow disk, logs well inside that. */
+        rad::StallWatch watch("startup", 120000);
+        s = engine.start();
+    }
     if (s < 0) {
         /* start() already said what and why; the report adds what it was running on and what it
          * had decided by then, which is what a log of a server that never came up is read for. */

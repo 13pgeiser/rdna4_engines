@@ -170,6 +170,26 @@ TEST(the_pool_size_flags_are_gone_and_say_what_replaced_them) {
     CHECK_EQ(parse({ "--vram-kv-mib", "6144" }, &k), RAD_E_INVAL);
 }
 
+TEST(the_prefix_cache_disk_flags_are_gone_and_the_host_size_was_renamed) {
+    /* The prefix cache keeps nothing on a drive. A launch line still naming the disk tier, or the
+     * host tier's old name, is refused rather than served without what it asked for. */
+    for (const char* f : { "--prefix-cache-host-mib", "--prefix-cache-disk-mib", "--prefix-cache-dir" }) {
+        Config c;
+        CHECK_EQ(parse({ f, "4096" }, &c), RAD_E_INVAL);
+    }
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.prefix_cache_mib, 0ll);
+    CHECK_EQ(d.prefix_cache_ttl, 3600ll);              /* an hour */
+    Config z;
+    CHECK_EQ(parse({ "--prefix-cache-ttl", "0" }, &z), RAD_OK);
+    CHECK_EQ(z.prefix_cache_ttl, 0ll);                 /* never */
+    Config n;
+    CHECK_EQ(parse({ "--prefix-cache-ttl", "-1" }, &n), RAD_E_INVAL);
+    Config h;
+    CHECK_EQ(parse({ "--prefix-cache-ttl", "1h" }, &h), RAD_E_INVAL);
+}
+
 TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     Config c;
     CHECK_EQ(parse({ "--tp", "2",
@@ -177,8 +197,8 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
                      "--max-num-seqs", "8",
                      "--max-model-len", "200000",
                      "--host-pool-mib", "12288",
-                     "--prefix-cache-host-mib", "4096",
-                     "--prefix-cache-disk-mib", "65536",
+                     "--prefix-cache-mib", "4096",
+                     "--prefix-cache-ttl", "600",
                      "--checkpoint-interval", "2048",
                      "--checkpoint-slots", "8",
                      "--tp-wire-min-kb", "64",
@@ -188,8 +208,8 @@ TEST(the_sizes_and_counts_reach_the_fields_they_name) {
     CHECK_EQ(c.max_seqs, 8ll);
     CHECK_EQ(c.max_ctx, 200000ll);
     CHECK_EQ(c.host_pool_mib, 12288ll);
-    CHECK_EQ(c.prefix_cache_host_mib, 4096ll);
-    CHECK_EQ(c.prefix_cache_disk_mib, 65536ll);
+    CHECK_EQ(c.prefix_cache_mib, 4096ll);
+    CHECK_EQ(c.prefix_cache_ttl, 600ll);
     CHECK_EQ(c.checkpoint_interval, 2048ll);
     CHECK_EQ(c.checkpoint_slots, 8ll);
     CHECK_EQ(c.tp_wire_min_kb, 64ll);
@@ -206,7 +226,6 @@ TEST(the_paths_and_names_reach_their_fields) {
     Config c;
     CHECK_EQ(parse({ "--radiance-home", "/rh",
                      "--weights-disk-tier",
-                     "--prefix-cache-dir", "/kvdir",
                      "--placement", "expert_tiered",
                      "--host", "0.0.0.0",
                      "--generation-config", "/g.json",
@@ -215,7 +234,6 @@ TEST(the_paths_and_names_reach_their_fields) {
                      "--override-chat-template", "/t.jinja" }, &c), RAD_OK);
     CHECK_EQ(c.radiance_home, std::string("/rh"));
     CHECK(c.weights_disk_tier);
-    CHECK_EQ(c.prefix_cache_dir, std::string("/kvdir"));
     CHECK_EQ(c.placement, std::string("expert_tiered"));
     CHECK_EQ(c.host, std::string("0.0.0.0"));
     CHECK_EQ(c.generation_config, std::string("/g.json"));
@@ -860,7 +878,8 @@ TEST(usage_names_every_flag_it_documents) {
     CHECK(text.find(std::string("Default ") + draft_window_name(kDraftWindowDefault)) !=
           std::string::npos);
     CHECK(text.find("--checkpoint-policy") != std::string::npos);
-    CHECK(text.find("--prefix-cache-host-mib") != std::string::npos);
+    CHECK(text.find("--prefix-cache-mib") != std::string::npos);
+    CHECK(text.find("--prefix-cache-ttl") != std::string::npos);
     CHECK(text.find("--tp-wire") != std::string::npos);
     CHECK(text.find("--embedding-placement") != std::string::npos);
     CHECK(text.find("--ngram-placement") != std::string::npos);

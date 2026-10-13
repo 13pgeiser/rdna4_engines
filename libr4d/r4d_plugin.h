@@ -36,6 +36,14 @@ enum {
      * caller selecting an entry point by hand would make. */
     R4D_PRIO_ATTN_DECODE  = 70,
     R4D_PRIO_ATTN_PREFILL = 60,
+    /* The windowed kernels (r4d_attn_paged_window.hip) serve every q_len, so where their geometry
+     * meets another leg's -- h256 at gqa 2 -- they match in both of that leg's bands, and rank
+     * below both: timed by rad-kbench on two R9700s at the 31B's shapes (window 1024, fp8 cache),
+     * the h256/gqa2 decode kernel takes 0.26-0.71 of the windowed kernel's time at q_len 1..32 and
+     * its prefill kernel 0.43-0.67 at 33..512, a bf16 cache the same order. The windowed rows keep
+     * that geometry's non-causal band past q_len 32, and attn_paged_qrow, which no other kernel
+     * serves. */
+    R4D_PRIO_ATTN_WINDOW  = 50,
 
     /* At M<=16 with K%256==0 both bf16 skinny rows match and the m16 (dot2) kernel is taken.
      * The m64 WMMA kernel is faster on every shape measured, so a caller that wants it at low M
@@ -97,6 +105,37 @@ int64_t r4d_rad_attn_decode_h128_scratch(const RadArgs*);
  int     r4d_rad_attn_decode_h256_gqa2_fp8  (const RadArgs*, RadStream);
  int     r4d_rad_attn_decode_h256_gqa2_bf16 (const RadArgs*, RadStream);
  int64_t r4d_rad_attn_decode_h256_gqa2_scratch(const RadArgs*);
+/* Paged attention at head_dim 256 and 512, 1/2/4/8 queries per KV head, any window, causal or not
+ * (r4d_attn_paged_window.hip): one entry point a geometry and cache dtype, serving every q_len and
+ * reading q at any row pitch, so the same entry points serve attn_paged and attn_paged_qrow. */
+int     r4d_rad_attn_window_h256_gqa1_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa1_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa2_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa2_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa4_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa4_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa8_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h256_gqa8_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa1_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa1_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa2_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa2_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa4_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa4_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa8_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_window_h512_gqa8_fp8 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_window_h256_scratch(const RadArgs*);
+int64_t r4d_rad_attn_window_h512_scratch(const RadArgs*);
+/* The top-1 of a row of all-gathered (id, value) pairs, written one id a row: the vocab-sharded
+ * draft head's merge (r4d_pair_argmax_f32.hip). */
+int     r4d_rad_pair_argmax_f32(const RadArgs*, RadStream);
+/* Gemma 4's two sandwich-norm joins, each one kernel for a chain of rmsnorm / add / mul_weight
+ * launches (r4d_norm_join_bf16.hip), and expert_scale, the embed_lookup + mul pair that scales
+ * each routing weight by its expert's scale (r4d_expert_scale_bf16.hip). */
+int     r4d_rad_norm_add_norm_bf16      (const RadArgs*, RadStream);
+int     r4d_rad_norm_add_norm_route_bf16(const RadArgs*, RadStream);
+int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
+int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
 /* Eight queries per KV head (r4d_attn_paged_gqa8.hip): the routed 35B-A3B at head_dim 256
@@ -122,15 +161,6 @@ int64_t r4d_rad_attn_decode_h256_gqa4_scratch(const RadArgs*);
 /* ...and its head_dim 64 prefill leg, LFM2's geometry, which serves every query length. */
 int     r4d_rad_attn_prefill_h64_gqa4_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h64_gqa4_bf16(const RadArgs*, RadStream);
-/* Eight queries per KV head at head_dim 512, full attention -- the Gemma 4 dense GLOBAL layers.
- * Its own instantiation, not the gqa8 body above: that one's prefill tile is 48, which 512-channel
- * tiles do not fit in LDS, so head_dim 512 is a stand-alone dispatch
- * (r4d_attn_paged_h512_gqa8.hip). The verify width is the gqa bound, 64/8 = 8. */
-int     r4d_rad_attn_prefill_h512_gqa8_fp8 (const RadArgs*, RadStream);
-int     r4d_rad_attn_prefill_h512_gqa8_bf16(const RadArgs*, RadStream);
-int     r4d_rad_attn_decode_h512_gqa8_fp8  (const RadArgs*, RadStream);
-int     r4d_rad_attn_decode_h512_gqa8_bf16 (const RadArgs*, RadStream);
-int64_t r4d_rad_attn_decode_h512_gqa8_scratch(const RadArgs*);
 /* Twelve queries a KV head, head_dim 256 only -- Qwen3.8-Flash-Next's QSA layers. Same body,
  * different instantiation; r4d_attn_paged_h256_gqa12.hip is four lines. */
 int     r4d_rad_attn_prefill_h256_gqa12_fp8 (const RadArgs*, RadStream);
@@ -600,6 +630,7 @@ int r4d_shape_moe_gather     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale_rows     (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_scale          (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_row_topk_merge (const RadParam*, int, int operand, RadOpdDesc*);
+int r4d_shape_pair_argmax    (const RadParam*, int, int operand, RadOpdDesc*);
 
 int r4d_shape_quant_act_i8       (const RadParam*, int, int operand, RadOpdDesc*);
 int r4d_shape_had_quant_act_i8   (const RadParam*, int, int operand, RadOpdDesc*);

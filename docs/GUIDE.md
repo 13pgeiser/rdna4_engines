@@ -335,6 +335,11 @@ rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
     --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2 --recipe data/recipes/q38-27b-fp8block-df2.recipe \
     --set quantization_config.quant_method=fp8 --set quantization_config.fmt=e4m3 \
     --set "quantization_config.weight_block_size=128 128" --set quantization_config.activation_scheme=dynamic
+
+# gemma-4-26B-A4B-it with z-lab's DFlash drafter, the routed experts' gate_up as block fp8 (served by
+# arch/gemma4; docs/ARCHITECTURES.md says why down stays bf16 unless the experts were padded to 768)
+rad-convert ~/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-df.rad \
+    --draft-model ~/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -574,6 +579,7 @@ Related flags:
 --host-pool-mib 8192       # pinned host tier for weights
 --embedding-placement vram  # keep the token embedding on the card (below)
 --ngram-placement ram       # an n-gram table in RAM instead of read from disk (below)
+--vision-tower-placement ram  # the encoder towers in host memory, their VRAM to the KV cache (below)
 --weights-disk-tier       # stream what fits neither from the container; needs O_DIRECT
 ```
 
@@ -603,6 +609,21 @@ container cannot write them.
 
 ```sh
 radiance --model m.rad --tp 2 --embedding-placement vram   # the table on the cards
+```
+
+**The encoder towers** -- a vision tower, and an audio encoder where a model has one -- are read
+once an image, a clip or a recording, never on a text step. On the card (`vram`, the default) they
+are weights like any other and the KV pool is carved from what is left: Qwen3.8-27B's vision tower
+is 0.86 GiB a card, about 24,000 tokens of fp8 context. `--vision-tower-placement ram` pins them in
+host memory of their own, every rank a whole tower, on top of `--host-pool-mib`, and their kernels
+read the weights over the link in place: that VRAM goes to the KV cache, and every image costs one
+read of the tower over the link (about 55 ms for 0.86 GiB on PCIe 4.0 x16). Text-only requests do
+not touch it. A tower is every weight the model's architecture declares read once per request.
+`ram` is refused, naming the reason, where the model has no tower, where `--mm-max-patches 0`
+declared none, or where the host cannot pin it.
+
+```sh
+radiance --model qwen3.8-27b-fp8.rad --tp 1 --vision-tower-placement ram
 ```
 
 **An n-gram table** (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token, which is why it
@@ -925,26 +946,25 @@ serve. A conversation that comes back before that resumes from VRAM; one that co
 restored from host memory and keeps its host copy, so its next turn copies only what that turn
 added. There is no idle threshold on the way out of VRAM.
 
-With a disk tier the same happens one level down: every host copy is written on to disk in the
-background and keeps its host slot, and once the write has landed the slot can be given up for
-nothing. A full host tier gives up its oldest slots when a new copy or a restore needs one, so a
-conversation that no longer fits in host memory is on disk already rather than lost.
+A full host tier drops its least recently used conversations to make room. Nothing is written to a
+drive: the prefix cache lives in VRAM and host memory only.
+
+**Every stored conversation expires.** One that no request has used for `--prefix-cache-ttl`
+seconds (an hour by default) is taken out of whichever tier holds it — its VRAM blocks go back to
+the pool, its host slot back to the arena, its snapshots back to the store. It is not moved
+anywhere first. A conversation in use stays: a hit or a new turn counts as a use, and a system
+prompt that several conversations share stays for as long as any of them is used.
 
 ```sh
-radiance --model m.rad \
-    --prefix-cache-host-mib 8192 \
-    --prefix-cache-disk-mib 65536 --prefix-cache-dir /var/cache/radiance
+radiance --model m.rad --prefix-cache-mib 8192 --prefix-cache-ttl 3600
 ```
 
-- `--prefix-cache-host-mib N` — **this is the switch.** Without a size, nothing is copied. It holds
+- `--prefix-cache-mib N` — **this is the switch.** Without a size, nothing is copied. It holds
   attention blocks only; a hybrid model's linear-state snapshots are in host memory already, in the
   `--checkpoint-slots` store. Size it for the conversations you expect to come back: one that does
-  not fit comes back from disk instead.
-- `--prefix-cache-disk-mib N` — the disk tier's size. Everything that reaches host memory is
-  written here too, snapshots included, so a full snapshot store detaches its least recently used
-  snapshot instead of losing it.
-- `--prefix-cache-dir DIR` — where the disk tier lives. **Not `--weights-disk-tier`**, which is about
-  *weights*. The disk tier holds conversation content unencrypted.
+  not fit is prefilled again.
+- `--prefix-cache-ttl S` — seconds an unused conversation is kept (default 3600). `0` keeps
+  everything until the memory is wanted.
 - Recovering a 200K-token turn costs a copy over PCIe; recomputing it costs minutes.
 
 On a hybrid model the recurrent state matters as much as the attention blocks — restoring the
@@ -1092,15 +1112,15 @@ one line naming each one the command line moved.
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card. See §4.3 |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container. See §4.3 |
+| `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image. See §4.3 |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
 **Idle session tiers**
 
 | flag | default | |
 |---|---|---|
-| `--prefix-cache-host-mib N` | 0 (off) | copy finished conversations' KV to host memory |
-| `--prefix-cache-disk-mib N` | 0 (off) | and copy them on to disk |
-| `--prefix-cache-dir DIR` | — | where the disk tier keeps them |
+| `--prefix-cache-mib N` | 0 (off) | copy finished conversations' KV to host memory |
+| `--prefix-cache-ttl S` | 3600 | seconds an unused conversation is kept, in VRAM or host memory; `0` never expires |
 
 **Placement and state**
 
@@ -1109,7 +1129,7 @@ one line naming each one the command line moved.
 | `--placement MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
-| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. With a disk tier a full store detaches its least recently used snapshot to disk instead of losing it |
+| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, **in total**, not per sequence. They live in pinned host memory, not VRAM: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`), allocated at startup. A snapshot is copied off the card after the step that produced it and back before the step that resumes from it. A full store retires its least recently used snapshot |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--no-prefix-cache` | — | disable prefix caching |
 
@@ -1617,7 +1637,8 @@ view, for one) reads it unchanged:
   "prompt_per_token_ms": 4.0, "prompt_per_second": 250.0,
   "predicted_n": 64, "predicted_ms": 711.0,
   "predicted_per_token_ms": 11.29, "predicted_per_second": 88.6,
-  "draft_n": 78, "draft_n_accepted": 37
+  "draft_n": 78, "draft_n_accepted": 37,
+  "ttft_ms": 297.5, "total_ms": 1008.5
 }
 ```
 
@@ -1631,6 +1652,8 @@ view, for one) reads it unchanged:
 | `predicted_ms` | from the first generated token to the last |
 | `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms`. The first token is the prefill's product. It is the same figure as `/metrics`' time per output token, and with speculative decoding it counts every token a step accepts |
 | `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as llama.cpp does |
+| `ttft_ms` | the server's time to first token: from the moment it had the whole request body to the first generated token. It holds parsing the request, rendering the chat template, tokenising, the wait for admission and the prefill. The time the body took to reach the server is not in it, so a client on a slow link can tell the server's share of the time it measured from the network's. Not a llama.cpp field |
+| `total_ms` | from the same moment to the last generated token: `ttft_ms + predicted_ms`. Not a llama.cpp field |
 
 Milliseconds are wall-clock milliseconds, and the rates are tokens per second. A rate whose count
 or time is zero is `null`. A request with several choices (`n`, or a batch of prompts) sums the
@@ -1825,6 +1848,7 @@ lists the efforts the chat template takes, or is `null` when it takes any. `serv
 | `attn_cached_tokens_total`, `linear_cached_tokens_total` | prefix reuse, both halves |
 | `linear_checkpoints_written_total`, `linear_prefix_cache_hit_rate` | |
 | `prefix_cache_evictions_total`, `prefix_cache_ckpt_evictions_total` | |
+| `prefix_cache_expired_total`, `prefix_cache_ckpt_expired_total` | what `--prefix-cache-ttl` took (§4.8) |
 | `num_requests_preempted` | |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
@@ -1892,8 +1916,6 @@ TLS-terminating reverse proxy in front:
 radiance --model m.rad --host 127.0.0.1 --port 8000 --api-key "$KEY"
 ```
 
-Also note `--prefix-cache-disk-mib` writes **conversation content unencrypted** under `--prefix-cache-dir`.
-
 ### 6.7 Restarting and stopping
 
 Nothing here is a daemon; run it under systemd, a supervisor or `nohup`. `scripts/fnstop.sh` stops
@@ -1935,7 +1957,7 @@ of a log to paste into an issue.
   fix. Every warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.4.0
+I STARTUP REPORT -- radiance 1.5.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -1976,9 +1998,9 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
 | Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can do without: a larger `--host-pool-mib` (RAM permitting), `--kv-cache-dtype fp8`, or fewer/shorter sessions. See §4.3 |
 | The server dies with no log line, on a request it had been serving fine | A kernel whose code object had never been loaded could not be: the card has no room left. HIP faults inside the launch rather than returning an error, so there is nothing to print | A card left with too little room for a first launch — see §4.3. Set `--gpu-headroom-mib` to the value the startup warning names. `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
-| KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-host-mib N` |
+| KV in VRAM stays high with one session and nothing moves | The idle tiers are **off** — they are sized, and with no size nothing is copied | Pass `--prefix-cache-mib N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi`; stop the other process. The budget is stated before allocation, so the log says what it asked for |
-| `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps pinned memory system-wide at `ttm.pages_limit`, half of RAM by default | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under the cap the refusal names, or raise it with the kernel parameter `ttm.pages_limit` |
+| `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates. A card that refuses its weights pool lost that memory to another process in between (the line below the refusal says how much is free now). A refused `host_pool` is pinned memory: **every rank pins its own `--host-pool-mib`**, so `--tp 2` pins it twice, and the amdgpu driver caps what every process together pins at RAM less 1/64 and 1.5 GiB. The pool is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode was seen to refuse any single pin above about 2.5 GiB; a piece failing means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through but on that host also removed peer access between the cards, which moves every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
 | `a synchronisation has waited 5 s` naming a kernel, then `no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue. The kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps is moved under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits for a queue a serve never lets drain. A voltage offset or other clock instability is the other cause seen on R9700s. If the stall line says the queues **advanced**, the wait was long rather than stuck, and nothing is wrong | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset puts the power cap, fan curve and voltage offset back to firmware defaults, so re-apply them before every start rather than once at boot. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`; a reboot loses it. `docker inspect` shows exit code 0 for a container Docker has already restarted, which says nothing about how the old process ended |
 | `--draft-model is not implemented` | This engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |

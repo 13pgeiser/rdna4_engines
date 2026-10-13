@@ -635,8 +635,9 @@ UsageOut Server::usage_of(const OaiRequest& r, const std::vector<Generation>& ge
 
 /* WHERE THE REQUEST'S TIME WENT, from its sinks: one for a choice's final chunk, all of them for
  * the request. Every time is moved onto one clock first -- each sink counts from its own
- * construction. See TimingsOut for what each field means. */
-TimingsOut Server::timings_of(const Sink* const* sinks, size_t n) {
+ * construction, and `received_ns` (the body's arrival, -1 when unknown) is on that clock already.
+ * See TimingsOut for what each field means. */
+TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t received_ns) {
     TimingsOut t;
     int64_t admit = INT64_MAX, first_lo = INT64_MAX, first_hi = INT64_MIN, last = INT64_MIN;
     bool admitted = true;
@@ -662,14 +663,18 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n) {
     if (!t.valid) return t;
     if (admitted) t.prompt_ms = (double)(first_hi - admit) * 1e-6;
     t.predicted_ms = (double)(last - first_lo) * 1e-6;
+    if (received_ns >= 0) {
+        t.ttft_ms  = (double)(first_lo - received_ns) * 1e-6;
+        t.total_ms = (double)(last - received_ns) * 1e-6;
+    }
     return t;
 }
 
-TimingsOut Server::timings_of(const std::vector<Generation>& gens) {
+TimingsOut Server::timings_of(const std::vector<Generation>& gens, int64_t received_ns) {
     std::vector<const Sink*> v;
     v.reserve(gens.size());
     for (const auto& g : gens) v.push_back(g.sink.get());
-    return timings_of(v.data(), v.size());
+    return timings_of(v.data(), v.size(), received_ns);
 }
 
 /* ------------------------------------------------------------------ metrics bookkeeping */
@@ -722,7 +727,7 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     /* THE OTHER HALF OF THE REQUEST LOG. The same figures /metrics aggregates, for this one
      * request: how it ended, what the prefix cache spared, the reasoning share when the parser
      * knows it, time to first token, the decode rate after it, and the whole. */
-    const TimingsOut t = timings_of(gens);
+    const TimingsOut t = timings_of(gens, r.t_received_ns);
     const UsageOut u = usage_of(r, gens);
     const double rate = (decode > 0.0 && n_gen > 1) ? (double)(n_gen - 1) / decode : -1.0;
     char reason[32] = "";
@@ -740,6 +745,7 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
 /* ------------------------------------------------------------------ non-streaming */
 
 HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) {
+    r.t_received_ns = req.t_received_ns;
     std::vector<Generation> gens;
     ApiError err;
     if (submit_all(r, &gens, &err) < 0) {
@@ -846,7 +852,7 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     retire(gens);
     release(r.n_choices());
 
-    const TimingsOut timings = timings_of(gens);
+    const TimingsOut timings = timings_of(gens, r.t_received_ns);
     if (r.shape == ApiShape::LlamaNative) {
         /* llama-server answers one result, and an array of them for several prompts. */
         json res = json::array();
@@ -918,7 +924,7 @@ static const char* native_stop_type(Finish f) {
  * in the chunks before it. */
 json Server::native_result(const OaiRequest& r, const Generation& g, const std::string& content) {
     const Sink* one = g.sink.get();
-    const TimingsOut t = timings_of(&one, 1);
+    const TimingsOut t = timings_of(&one, 1, r.t_received_ns);
     const int64_t n_prompt = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
     nlohmann::ordered_json o;
     o["index"]   = g.index;
@@ -1014,6 +1020,7 @@ static std::string progress_chunk(const OaiRequest& r, int index, const Sink& s)
 }
 
 HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r) {
+    r.t_received_ns = req.t_received_ns;
     auto st = std::make_shared<StreamState>();
     st->r = r;
     st->peer_closed = req.closed;
@@ -1121,7 +1128,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
             TimingsOut now;
             if (st->r.timings_per_token) {
                 const Sink* one = g.sink.get();
-                now = timings_of(&one, 1);
+                now = timings_of(&one, 1, st->r.t_received_ns);
                 if (g.delta) g.delta->set_timings(now);
             }
             if (st->r.endpoint == Endpoint::Chat) {
@@ -1172,7 +1179,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                 /* EACH CHOICE'S OWN TIMINGS ON ITS FINAL CHUNK, so a client that asked for no
                  * usage chunk still has them, as llama.cpp sends them. */
                 const Sink* one = g.sink.get();
-                const TimingsOut gt = timings_of(&one, 1);
+                const TimingsOut gt = timings_of(&one, 1, st->r.t_received_ns);
                 /* A failed generation cannot become a non-200 -- the headers left long ago -- so
                  * it travels as an error event in the stream. Silence would look like a normal
                  * end of stream and the client would use a truncated answer. */
@@ -1212,7 +1219,7 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
              * prompt and one total, so emitting it per generation would count the prompt n times
              * and interleave usage between the choices' final chunks. */
             if (st->r.include_usage) {
-                const TimingsOut t = timings_of(st->gens);
+                const TimingsOut t = timings_of(st->gens, st->r.t_received_ns);
                 out += st->r.endpoint == Endpoint::Chat ? chat_usage_chunk(st->r, u, t)
                                                         : text_usage_chunk(st->r, u, t);
             }

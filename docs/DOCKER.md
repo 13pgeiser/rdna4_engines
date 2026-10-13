@@ -128,16 +128,18 @@ the cards the engine runs on.
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
+| `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower; the int5 and MXFP4 containers serve from it too |
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
+| `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
 | `minicpm5-2b-bf16.yaml` | `minicpm5-2b-bf16.rad` | MiniCPM5-2B in bf16 with its DSpark drafter |
+| `embeddinggemma2.yaml` | `embeddinggemma2-bf16.rad` | EmbeddingGemma 2 in bf16: text, image, video and audio embeddings on one card |
 
 The container names are the files the README's model table downloads or converts.
 
 Copy the directory to the serving host and fill in `.env` from `.env.example`. It sets the image,
-the models directory (mounted read-only at `/models`), a writable state directory (`/data`, where
-the prefix cache's disk tier lives), the API key, the port, and the user and GPU groups the server
-runs as. The models directory has to be on a local filesystem that does direct I/O, such as ext4,
+the models directory (mounted read-only at `/models`), the API key, the port, and the user and GPU
+groups the server runs as. The models directory has to be on a local filesystem that does direct I/O, such as ext4,
 XFS or btrfs: Qwen3.8-Flash-Next reads its n-gram table from the container that way. On btrfs with
 compression on, the extents it stored compressed are read through the page cache instead, which
 works but loses what the direct reads are for; a container copied into a directory set `chattr +C`
@@ -150,6 +152,5 @@ docker compose -f flashnext.yaml down       # stop
 ```
 
 Each model takes both cards and the same port, so run one at a time: `down` one before `up` on
-another. The server runs as the host user given in `.env`, so the files it writes under `/data`
-belong to that user. `/health`, `/ping` and the dashboard page answer without the API key, and the
+another. The server runs as the host user given in `.env`. `/health`, `/ping` and the dashboard page answer without the API key, and the
 health check fetches `/health` with busybox's `wget`.

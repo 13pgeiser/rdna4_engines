@@ -189,6 +189,56 @@ if(TARGET libavx AND TARGET rad-avx-check)
   set_tests_properties(avx_check PROPERTIES TIMEOUT 600)
 endif()
 
+# ================================================================== libr4d's kernels, on the host
+#
+# libr4d builds for gfx12 only, and some of its ops (the sandwich-norm joins, expert_scale) have no
+# libref oracle by design (docs/OPS.md), so neither rad-kbench nor a no-card machine would ever run
+# those kernels. r4d_emu runs the SOURCE of four of libr4d's units on the host instead -- the
+# windowed paged attention, pair_argmax, the joins and expert_scale, the units written against
+# r4d_launch.h: emu/hip/hip_runtime.h supplies the HIP names, every GPU thread is a fiber,
+# __syncthreads and every cross-lane op a barrier (one not reached uniformly is reported as a
+# deadlock), and the units' launch macro is pointed at the emulator. Checked against a port of
+# libref's ref_attn_paged, against the host arithmetic in ref_host.cpp, and -- for the joins --
+# against the unfused chain, bit for bit.
+#
+# CLANG AND x86-64: the kernels use clang's ext_vector_type, and the fiber switch is x86-64 SysV
+# inline assembly. Under a clang C++ compiler they are ordinary targets here, the .hip files
+# compiled as C++ (`-x c++`, which is what makes them host code; the property is per directory, so
+# libr4d's own HIP build is untouched). Under g++ -- the docker image's -- a build with a card
+# still has a clang: its HIP compiler, ROCm's own clang++, and r4d_emu/run.sh builds and runs the
+# same tests with that. So wherever libr4d is built, this runs.
+set(R4D_DIR ${CMAKE_SOURCE_DIR}/libr4d)
+set(R4D_EMU ${CMAKE_CURRENT_SOURCE_DIR}/r4d_emu)
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  # no fiber switch for this ISA: nothing to register
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_f32.hip
+                  ${R4D_DIR}/r4d_norm_join_bf16.hip ${R4D_DIR}/r4d_expert_scale_bf16.hip)
+  set_source_files_properties(${R4D_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
+  add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp)
+  target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR})
+  target_link_libraries(r4d_emu_kernels PUBLIC rad_abi)
+  # As libr4d compiles every unit: the joins are held to the chain bit for bit, and a contracted
+  # multiply-add is a different rounding.
+  target_compile_options(r4d_emu_kernels PRIVATE -ffp-contract=off -Wno-psabi)
+  foreach(t attn pick norm escale)
+    add_executable(r4d_emu_${t} ${R4D_EMU}/test_${t}.cpp)
+    target_link_libraries(r4d_emu_${t} PRIVATE r4d_emu_kernels)
+    target_compile_options(r4d_emu_${t} PRIVATE -ffp-contract=off -Wno-psabi)
+    set_target_properties(r4d_emu_${t} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME r4d_emu_${t} COMMAND r4d_emu_${t})
+  endforeach()
+  # The random sweep at a size the inner loop can afford; `r4d_emu_attn sweep 200` is the long one.
+  add_test(NAME r4d_emu_attn_sweep COMMAND r4d_emu_attn sweep 40)
+  set_tests_properties(r4d_emu_attn r4d_emu_pick r4d_emu_norm r4d_emu_escale r4d_emu_attn_sweep
+                       PROPERTIES LABELS "r4d_emu" TIMEOUT 600)
+elseif(RAD_HIP_FOUND AND CMAKE_HIP_COMPILER_ID MATCHES "Clang")
+  add_test(NAME r4d_emu
+           COMMAND sh ${R4D_EMU}/run.sh ${CMAKE_HIP_COMPILER} ${CMAKE_SOURCE_DIR}/abi ${R4D_DIR}
+                      ${CMAKE_CURRENT_BINARY_DIR}/r4d_emu 40)
+  set_tests_properties(r4d_emu PROPERTIES LABELS "r4d_emu" TIMEOUT 900)
+endif()
+
 # ================================================================== the document as a test
 #
 # docs/OPS.md calls its resolved table "THE AUTHORITY FOR THE OPS IN IT" and says of itself that
@@ -224,8 +274,8 @@ set_tests_properties(ops_doc PROPERTIES SKIP_RETURN_CODE 77)
 # (tests/oot_plugins.sh). A first-party plugin that quietly depended on being built in the tree
 # fails here; so does an installed package a third party could not build against.
 #
-# libr4d is included where the tree built it: the same HIP compiler, its own targets. Labelled
-# `oot` because it rebuilds every plugin, which is minutes, not seconds.
+# The device library (libr4d) is included where the tree built it: the same HIP compiler, libr4d's
+# targets. Labelled `oot` because it rebuilds every plugin, which is minutes, not seconds.
 set(RAD_OOT_HIP "")
 if(RAD_HIP_FOUND AND TARGET libr4d)
   get_target_property(RAD_OOT_R4D_ARCH libr4d HIP_ARCHITECTURES)

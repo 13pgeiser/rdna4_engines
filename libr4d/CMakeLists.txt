@@ -57,13 +57,9 @@ set(RAD_W4_GROUP 128 CACHE STRING "libr4d quantised-weight group size (must matc
 set(R4D_UNITS
   "r4d_attn_paged_h256_gqa6|"
   "r4d_attn_paged_h128_gqa4|"
-  # Gemma 4 dense sliding window: head_dim 256, 2 queries per KV head, windowed decode only
-  # (prefill falls to the caller's libref path). The windowed twin of the drafter leg above.
+  # Gemma 4 dense sliding window: head_dim 256, 2 queries per KV head, windowed decode and
+  # prefill. The windowed twin of the drafter leg above.
   "r4d_attn_paged_h256_gqa2|"
-  # Gemma 4 dense global layers: head_dim 512, 8 queries per KV head, full attention (window 0).
-  # The head_dim the library had not compiled before -- the prefill KV tile drops to 16 to fit 64
-  # KiB of LDS, and the decode combine takes the head-generic merge (DPL 16 breaks the vector form).
-  "r4d_attn_paged_h512_gqa8|"
   # Eight queries per KV head, at both head widths: the routed 35B-A3B is 16 over 2 at 256
   # and MiniCPM5-2B is 16 over 2 at 128. Same device code, different instantiations.
   "r4d_attn_paged_gqa8|"
@@ -76,6 +72,10 @@ set(R4D_UNITS
   # Six, head_dim 256 and the same 4-token page: the same QSA layers at four ranks, where each KV
   # head is replicated across a rank pair. Again four lines that set the ratio and include the body.
   "r4d_attn_paged_h256_gqa6_bs4|"
+  # head_dim 256 and 512 at 1, 2, 4 or 8 queries per KV head with ANY window: Gemma 4's sliding
+  # (h256/gqa2, window 1024) and full (h512, gqa 8 at TP1/TP2) layers. One kernel a geometry for
+  # every q_len, reading q at any row pitch, which is what attn_paged_qrow is.
+  "r4d_attn_paged_window|"
   "r4d_attn_vit_h72_bf16|"
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
@@ -156,6 +156,12 @@ set(R4D_UNITS
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
   "r4d_rowtopk_bf16|"
+  # The vocab-sharded draft head's cross-rank top-1, one id a row.
+  "r4d_pair_argmax_f32|"
+  # Gemma 4's two sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
+  # expert_scale: each one kernel for a chain of small ones.
+  "r4d_norm_join_bf16|"
+  "r4d_expert_scale_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
   # The routed mixture of experts: router, scatter, the grouped block-scaled fp8 GEMM and

@@ -547,7 +547,7 @@ need nothing but `curl` and `jq`. Scripts resolve each other by `$(dirname "$0")
 it is on. `oracle.sh` starts its own server and stops whatever listens on its port (`P`, default
 8302). Everything else — `cstep2.sh`, `ident.sh`, `tierident.sh`, `tiercross.sh`, `mctools.sh`,
 `mcstream.sh`, `hfget.sh`, `convfn.sh`, `convdspark.sh`, `fnpf.sh`, `fnconc.sh`, `fndrop.sh`,
-`apikeys.sh`, `diskstall.py`, `cardclock.py` — leaves a live serve alone.
+`apikeys.sh`, `cardclock.py` — leaves a live serve alone.
 `fndrop.sh` is the one to read the description of first: it leaves the PROCESS alone and
 deliberately disconnects clients from it, which is not the same promise.
 
@@ -583,7 +583,6 @@ deployment. `P` selects the port.
 | `apikeys.sh` | whether the server does what oai.cpp says about request keys: every rejected one refused by name, every inert one accepted, every accepted one honoured | `P` |
 | `cstep2.sh` | steady-state decode ms/step at concurrency | `P` `LEVELS` `MT` `WIN` |
 | `ident.sh` | run-to-run reproducibility at a fixed configuration: one hash per (temperature, question) | `P` |
-| `diskstall.py` | what restoring a conversation from the disk tier costs: the returning request's time to first token, and the longest stall it puts on a stream decoding beside it | `--port` `--session` `--fill` |
 | `cardclock.py` | what holds each card's clock under a sustained load (power limit, temperature or current limit, or the top of the voltage/frequency curve) and which card the tensor-parallel step waits for, with the engine's step counters per window beside it. Drives its own greedy load; `--watch` only samples while real traffic drives the server. Never writes to a card | `--port` `--conc` `--gen` `--seconds` `--window` `--seed` `--watch` `--json` `--compare` |
 
 `fndrop.sh` exists because a disconnect reaps a request at an arbitrary point in the step loop, and
@@ -639,7 +638,7 @@ model's output.
 
 | | |
 |---|---|
-| `tierident.sh` | does a session that left VRAM come back byte for byte, both halves? `P` `H` `N` `TO_HOST` `TO_DISK` `FILL` |
+| `tierident.sh` | does a session that left VRAM come back byte for byte, both halves, after a full host tier, and (with `TTL`) after it expired? `P` `H` `N` `TO_HOST` `FILL` `TTL` |
 | `tiercross.sh` | the same with **two** sessions in flight — the only way to see one being served the other's context |
 | `mctools.sh` | the tool-call shapes hardest to parse — an array argument, two calls in one reply, prose before a call, plain chat with tools available. Asserts `finish_reason` and that no `<function`/`<param`/CDATA marker reaches content |
 | `mcstream.sh` | tool-call replies **streamed**, asserting on raw SSE fragments. Content cannot be retracted once sent, so a repair applied at the end is not a fix — this is the check that sees the difference |

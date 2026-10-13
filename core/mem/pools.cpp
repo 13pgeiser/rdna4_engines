@@ -199,7 +199,7 @@ int Pools::configure(const Config& cfg, int64_t vram_capacity,
     const int64_t MiB = 1024 * 1024;
     const int64_t w  = cfg.vram_weights_mib  * MiB;
     const int64_t kv = cfg.vram_kv_mib       * MiB;
-    const int64_t hp = (cfg.host_pool_mib + cfg.embedding_host_mib) * MiB;
+    const int64_t hp = cfg.host_pool_total_mib() * MiB;
 
     /* THE BUDGETS ARE RESOLVED BEFORE THIS RUNS AND THIS DOES NOT RE-DECIDE THEM.
      * core/mem/vram_budget.cpp derived them from the card, the measured driver residency and the

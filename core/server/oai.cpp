@@ -245,7 +245,11 @@ const char* kAcceptedChat[] = {
     "functions", "function_call",
 };
 
-const char* kAcceptedCompletion[] = { "prompt", "echo" };
+/* `preserved_tokens` is llama-server's: control tokens a raw completion's text keeps. On chat the
+ * reply format decides them (the guarded entry below); a raw completion has no format, and a
+ * client that renders its own template and parses its own reply -- a tool-call sidecar -- has no
+ * other way to see a format built of control tokens. */
+const char* kAcceptedCompletion[] = { "prompt", "echo", "preserved_tokens" };
 
 const char* kAcceptedEmbedding[] = { "model", "input", "messages", "encoding_format",
                                       "dimensions", "image_tokens", "prompt_name" };
@@ -1233,6 +1237,15 @@ static int json_text_depth(const std::string& s) {
     return most;
 }
 
+/* A STRING THAT PARSES INTO A TREE DEEPER THAN THE BOUND. Only valid JSON becomes a tree: text
+ * that is not JSON never becomes one (a tool result that does not parse is rendered as the
+ * string it is), so its brackets are not nesting, however they count. The count
+ * runs first and the validation (json::accept, which builds nothing and does not recurse) only
+ * when it is over. */
+static bool json_text_too_deep(const std::string& s) {
+    return json_text_depth(s) > kJsonMaxDepth && json::accept(s);
+}
+
 /* STRINGS THE CHAT TEMPLATE PARSES AS JSON are bounded like the body is (parse_json_bounded). An
  * assistant message's tool-call arguments and a tool message's content arrive as strings, one
  * level deep in the request, and the template layer parses them into trees and serialises those
@@ -1248,7 +1261,7 @@ static int check_template_json(const json& msg, const std::string& role, ApiErro
                 if (fn == tc.end() || !fn->is_object()) continue;
                 auto args = fn->find("arguments");
                 if (args != fn->end() && args->is_string() &&
-                    json_text_depth(args->get_ref<const std::string&>()) > kJsonMaxDepth) {
+                    json_text_too_deep(args->get_ref<const std::string&>())) {
                     *err = err_bad("messages[].tool_calls[].function.arguments",
                                    "nests more than " + std::to_string(kJsonMaxDepth) +
                                        " levels deep");
@@ -1260,7 +1273,7 @@ static int check_template_json(const json& msg, const std::string& role, ApiErro
     if (role == "tool") {
         auto c = msg.find("content");
         if (c != msg.end() && c->is_string() &&
-            json_text_depth(c->get_ref<const std::string&>()) > kJsonMaxDepth) {
+            json_text_too_deep(c->get_ref<const std::string&>())) {
             *err = err_bad("messages[].content", "a tool result nests more than " +
                                                      std::to_string(kJsonMaxDepth) +
                                                      " levels deep");
@@ -1613,9 +1626,18 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
         if (!render.think_open.empty()) o = d.tok->encode(render.think_open, false, true);
         n_close = c.size();
         n_open  = o.size();
-        if (c.size() == 1 && (render.think_starts_open || o.size() == 1)) {
+        /* AN OPENER THAT IS ONE CONTROL TOKEN AND THEN TEXT -- Gemma 4's `<|channel>thought` --
+         * is found by that first token: it is what a reply opening its own block writes first,
+         * and no text can be. The text after it counts as reasoning, as the markers do. An opener
+         * with a second control token in it (a channel and a message marker) is not read this
+         * way, since its first token may open something other than the reasoning. */
+        bool open_first = o.size() > 1 && d.tok->reply_bytes(o[0]).empty() &&
+                          !d.tok->token_bytes(o[0]).empty();
+        for (size_t i = 1; open_first && i < o.size(); ++i)
+            if (d.tok->reply_bytes(o[i]).empty()) open_first = false;
+        if (c.size() == 1 && (render.think_starts_open || o.size() == 1 || open_first)) {
             span.close       = c[0];
-            span.open        = o.size() == 1 ? o[0] : -1;
+            span.open        = (o.size() == 1 || open_first) ? o[0] : -1;
             span.starts_open = render.think_starts_open;
         }
     }
@@ -1654,8 +1676,8 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
                   "as one token";
         else
             why = "this reply has to open its own reasoning block, and the opener `" +
-                  render.think_open + "` is " + std::to_string(n_open) + " tokens, so the block "
-                  "cannot be found by token";
+                  render.think_open + "` is " + std::to_string(n_open) + " tokens and does not "
+                  "start with a lone control token, so the block cannot be found by token";
         *err = err_unsupported(named, why);
         return RAD_E_UNSUPPORTED;
     }
@@ -2135,6 +2157,29 @@ int parse_completion_request(const std::string& body, const OaiDeps& d, const Oa
 
     if (!get_bool(b, "echo", &out->echo, err)) return RAD_E_INVAL;
 
+    /* The control tokens this completion's text keeps (llama-server's field): each string is
+     * tokenised by the decoder and every control token in it is rendered rather than dropped.
+     * Bounded as the stop strings are, since the decoder looks each one up per token. */
+    {
+        auto pt = b.find("preserved_tokens");
+        if (pt != b.end() && !pt->is_null()) {
+            if (!pt->is_array() || pt->size() > (size_t)lim.max_stops) {
+                *err = err_bad("preserved_tokens", "expected an array of at most " +
+                                                       std::to_string(lim.max_stops) + " strings");
+                return RAD_E_INVAL;
+            }
+            for (const auto& s : *pt) {
+                if (!s.is_string() || s.get<std::string>().size() > (size_t)lim.max_stop_bytes) {
+                    *err = err_bad("preserved_tokens", "expected strings of at most " +
+                                                           std::to_string(lim.max_stop_bytes) +
+                                                           " bytes");
+                    return RAD_E_INVAL;
+                }
+                out->preserved_tokens.push_back(s.get<std::string>());
+            }
+        }
+    }
+
     RAD_TRY(parse_logprobs(b, lim, Endpoint::Completion, out, err));
     /* `echo` with logprobs asks for the PROMPT's logprobs too, which are not computed: a prompt
      * position's distribution never leaves the card. */
@@ -2569,6 +2614,8 @@ json timings_json(const TimingsOut& t) {
     o["predicted_ms"]           = t.predicted_ms;
     o["predicted_per_token_ms"] = per(t.decode_n, t.predicted_ms);
     o["predicted_per_second"]   = rate(t.decode_n, t.predicted_ms);
+    o["ttft_ms"]                = t.ttft_ms >= 0.0 ? json(t.ttft_ms) : json(nullptr);
+    o["total_ms"]               = t.total_ms >= 0.0 ? json(t.total_ms) : json(nullptr);
     if (t.draft_n > 0) {
         o["draft_n"]          = t.draft_n;
         o["draft_n_accepted"] = t.draft_n_accepted;

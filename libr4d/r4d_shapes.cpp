@@ -1519,6 +1519,21 @@ extern "C" int r4d_shape_row_topk_merge(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+/* pair_argmax (r4d_pair_argmax_f32.hip): row_topk_merge at R = 1 over `n` gathered pairs, so the
+ * same f32 plane and the same reading of it -- the value lane draws proper floats, the id lane
+ * their bit patterns, a negative one a pad and a positive one a legal id -- and one id and one
+ * value a row out. */
+extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, M, n, 2),
+        opd((uint32_t)RAD_I32, M),
+        opd((uint32_t)RAD_F32, M),
+    };
+    R4D_PICK(l);
+}
+
 /* ==========================================================================================
  * Quantisation, the norms and the fusions (shims in r4d_quant.cpp and r4d_fp8.cpp).
  *

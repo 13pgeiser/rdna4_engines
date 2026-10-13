@@ -220,9 +220,11 @@ static int usable_devices(std::vector<int>* out, std::string* inventory, std::st
  *
  * A card refusing its weights pool after its budget was measured had that memory taken in
  * between, and another process on the card is the usual taker -- the budget is measured once,
- * before any rank allocates. A host pool is PINNED memory, and the amdgpu driver caps what the
- * whole system may pin (ttm.pages_limit, half of RAM unless raised); every rank pins its own
- * --host-pool-mib, so a second rank asks for the same amount again. */
+ * before any rank allocates. A host pool is PINNED memory, and every rank pins its own
+ * --host-pool-mib, so a second rank asks for the same amount again. The pool is locked user memory,
+ * which the amdgpu driver counts against one system-wide cap: RAM less 1/64 and 1.5 GiB (half of
+ * RAM less 1/64 below 3 GiB), unless amdgpu.no_system_mem_limit lifts it. ttm.pages_limit bounds
+ * the driver's own allocations and not these. */
 static void report_pool_refusal(int rank, int device, const Pools& pools, const Config& cfg) {
     bool card = false, host = false;
     for (const Shortfall& f : pools.shortfalls()) (f.pool == "host_pool" ? host : card) = true;
@@ -238,46 +240,54 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
         int64_t pinned = 0, mapped = 0;
         rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-        int64_t cap = -1, avail = -1;
-        {
-            std::ifstream f("/sys/module/ttm/parameters/pages_limit");
-            long long pages = 0;
-            if (f >> pages && pages > 0) cap = (int64_t)pages * (int64_t)sysconf(_SC_PAGESIZE);
-        }
+        int64_t total = -1, avail = -1;
         {
             std::ifstream f("/proc/meminfo");
             std::string line;
             while (std::getline(f, line)) {
                 long long kb = 0;
-                if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) {
-                    avail = (int64_t)kb * 1024;
-                    break;
-                }
+                if (std::sscanf(line.c_str(), "MemTotal: %lld kB", &kb) == 1) total = (int64_t)kb * 1024;
+                if (std::sscanf(line.c_str(), "MemAvailable: %lld kB", &kb) == 1) avail = (int64_t)kb * 1024;
             }
+        }
+        bool lifted = false;
+        {
+            std::ifstream f("/sys/module/amdgpu/parameters/no_system_mem_limit");
+            std::string v;
+            lifted = (f >> v) && (v == "Y" || v == "1");
+        }
+        const int64_t reserve = (int64_t)3 << 29;
+        int64_t cap = -1;
+        if (total > 0 && !lifted) {
+            cap = total - (total >> 6);
+            cap = cap < 2 * reserve ? cap >> 1 : cap - reserve;
         }
         /* A refusal with room under both is not a capacity one, and advice to shrink the pool
          * would send the reader after the wrong cause: the device's reason above is the answer. */
-        const int64_t pool = (cfg.host_pool_mib + cfg.embedding_host_mib) * 1024 * 1024;
+        const int64_t pool = cfg.host_pool_total_mib() * 1024 * 1024;
+        std::string tables, advice = "Lower --host-pool-mib";
+        if (cfg.embedding_host_mib) {
+            tables += fmt(" and the token embedding's %lld MiB", (long long)cfg.embedding_host_mib);
+            advice += ", keep the embedding on the card with --embedding-placement vram";
+        }
+        if (cfg.tower_host_mib) {
+            tables += fmt(" and the encoder towers' %lld MiB", (long long)cfg.tower_host_mib);
+            advice += ", keep the encoder towers on the card with --vision-tower-placement vram";
+        }
         const int64_t want = (int64_t)cfg.tp * pool + pinned + mapped;
-        const bool fits = cap > 0 && avail >= 0 && want <= cap && want <= avail;
+        const bool fits = avail >= 0 && want <= avail && (lifted || (cap > 0 && want <= cap));
         RAD_ERR("host: --host-pool-mib %lld%s is pinned once per rank, so %d rank(s) pin %s; this "
                 "process had taken %s of pinned host memory before rank %d's pool. The amdgpu "
-                "driver caps pinned memory system-wide at %s (ttm.pages_limit, half of RAM unless "
-                "raised), and %s of RAM is available. %s",
-                (long long)cfg.host_pool_mib,
-                cfg.embedding_host_mib
-                    ? fmt(" and the token embedding's %lld MiB", (long long)cfg.embedding_host_mib).c_str()
-                    : "",
-                cfg.tp, humanb((int64_t)cfg.tp * pool).c_str(),
+                "driver caps what every process together pins at %s, and %s of RAM is available. %s",
+                (long long)cfg.host_pool_mib, tables.c_str(), cfg.tp, humanb((int64_t)cfg.tp * pool).c_str(),
                 humanb(pinned + mapped).c_str(), rank,
-                cap > 0 ? humanb(cap).c_str() : "an unreadable limit",
+                lifted    ? "no limit (amdgpu.no_system_mem_limit)"
+                : cap > 0 ? fmt("%s (RAM less 1/64 and 1.5 GiB)", humanb(cap).c_str()).c_str()
+                          : "an unknown limit (MemTotal unreadable)",
                 avail >= 0 ? humanb(avail).c_str() : "an unknown amount",
                 fits ? "The pools fit under both, so the refusal is not one of size; the reason "
                        "the device gave is above"
-                     : cfg.embedding_host_mib
-                         ? "Lower --host-pool-mib, keep the embedding on the card with "
-                           "--embedding-placement vram, or raise the cap"
-                         : "Lower --host-pool-mib, or raise the cap");
+                     : advice.c_str());
     }
 }
 
@@ -472,6 +482,9 @@ bool Engine::ngram_gather_to_host() {
  * lookup writes the activations a card reads, which a host kernel reading the container cannot
  * reach -- an architecture declares a buffer's domain, and the token embedding's is the device.
  *
+ * THE ENCODER TOWERS: Vram by default; Ram, when named, pins them beside the pool as the embedding
+ * is (Config::tower_host_mib), read over the link once an image.
+ *
  * THE N-GRAM TABLE: Vram where a device kernel gathers it and the card holds it; Ram as a copy,
  * pinned for that kernel to read over the link or locked for the host gather; Disk in the
  * container, read by the host gather. Each tier is refused where no kernel reads it there. Auto
@@ -480,7 +493,8 @@ bool Engine::ngram_gather_to_host() {
  * the memory and every cgroup after the pools still to be allocated, and the memlock limit for a
  * locked copy. */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
-                                    const std::vector<int64_t>& emb_bytes, int64_t kv_floor,
+                                    const std::vector<int64_t>& emb_bytes,
+                                    const std::vector<int64_t>& tower_bytes, int64_t kv_floor,
                                     int64_t ngram_bytes, bool ngram_device, bool ngram_host) {
     const int64_t MiB = (int64_t)1 << 20;
     int64_t emb_max = 0;
@@ -494,7 +508,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
      * which a pin the cards read is not charged to. */
     const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
-                                cfg_.prefix_cache_host_mib * MiB;
+                                cfg_.prefix_cache_mib * MiB;
     std::string emb_room_why;
     auto emb_room = [&]() { return lockable_room(emb_pin, pools_still, false, &emb_room_why); };
     if (emb_max == 0) {
@@ -528,6 +542,36 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     cfg_.embedding_resolved = emb;
     cfg_.embedding_host_mib = emb == TablePlacement::Ram ? align_up(emb_max, MiB) / MiB : 0;
 
+    /* THE ENCODER TOWERS: on the card unless ram was named, and then pinned beside the pool or the
+     * server stops -- the flag has no default to give way to. Every rank pins a whole tower: an
+     * encoder is not sharded. Decided before the n-gram table, whose card test needs the statics
+     * as they will be and whose RAM test the pools still to be allocated. */
+    int64_t tower_max = 0;
+    for (int64_t b : tower_bytes) tower_max = std::max(tower_max, b);
+    const TablePlacement tw = cfg_.tower_placement;
+    if (tw == TablePlacement::Ram) {
+        if (tower_max == 0) {
+            if (cfg_.mm_max_patches == 0)
+                RAD_ERR("--vision-tower-placement ram: --mm-max-patches 0 asked for no media, so "
+                        "this server declares no encoder tower to place");
+            else
+                RAD_ERR("--vision-tower-placement ram: this model has no encoder tower (no weight "
+                        "its architecture reads once per request)");
+            return RAD_E_INVAL;
+        }
+        std::string why;
+        const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
+        if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
+                           false, &why)) {
+            RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
+                    "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
+                    why.c_str());
+            return RAD_E_NOMEM;
+        }
+    }
+    cfg_.tower_resolved = tw;
+    cfg_.tower_host_mib = tw == TablePlacement::Ram ? align_up(tower_max, MiB) / MiB : 0;
+
     TablePlacement ng = cfg_.ngram_placement;
     std::string ng_why;
     /* THE FASTEST TIER WITH THE ROOM, the card first: the table on the card, every rank holding
@@ -535,8 +579,8 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
      * --max-model-len sequence beside it; then a copy in RAM -- pinned
      * for a device kernel to read over the link, or locked for the host gather; then the
      * container, which only the host gather reads. Each is open only where a kernel reads it. */
-    const int64_t still = (int64_t)cfg_.tp * (cfg_.host_pool_mib + cfg_.embedding_host_mib) * MiB +
-                          cfg_.prefix_cache_host_mib * MiB;
+    const int64_t still = (int64_t)cfg_.tp * cfg_.host_pool_total_mib() * MiB +
+                          cfg_.prefix_cache_mib * MiB;
     const int64_t need = align_up(ngram_bytes, (int64_t)2 << 20);
     const char* copy = ngram_device ? "a pinned copy the card reads" : "a locked copy";
     auto card_holds = [&](std::string* why) {
@@ -546,6 +590,7 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
             VramFacts& f = with[i];
             f.statics += ngram_bytes;
             if (emb == TablePlacement::Ram) f.statics -= emb_bytes[i];
+            if (tw == TablePlacement::Ram) f.statics -= tower_bytes[i];
             fixed = std::max(fixed, f.statics);
         }
         /* `fixed` and not the trial's own statics: the split clamps those to what the card can give
@@ -645,6 +690,15 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     decide("--embedding-placement", table_placement_name(emb),
            emb_max > 0 ? fmt("the table is %s a rank: %s", humanb(emb_max).c_str(), emb_why.c_str())
                        : emb_why);
+    if (tower_max > 0)
+        RAD_INFO("placement: encoder towers (%s a rank) %s%s", humanb(tower_max).c_str(),
+                 table_placement_name(tw),
+                 tw == TablePlacement::Ram ? ": pinned in host memory, read over the link once an "
+                                             "image, their VRAM the KV cache's"
+                                           : " (default)");
+    decide("--vision-tower-placement", tower_max > 0 ? table_placement_name(tw) : "n/a",
+           tower_max > 0 ? fmt("the towers are %s a rank", humanb(tower_max).c_str())
+                         : std::string("this server declares no encoder tower"));
     has_ngram_ = ngram_bytes > 0;
     decide("--ngram-placement", ngram_bytes > 0 ? table_placement_name(ng) : "n/a",
            ngram_bytes > 0 ? fmt("the table is %s: %s", humanb(ngram_bytes).c_str(), ng_why.c_str())
@@ -1223,7 +1277,7 @@ int Engine::plan() {
         late_step_bytes_ = late_lazy_bytes_ = 0;
         /* The placement flags' tables, per rank where they are sharded (the embedding) and once
          * where they are not (the n-gram table every rank reads from the one mapping). */
-        std::vector<int64_t> emb_bytes;
+        std::vector<int64_t> emb_bytes, tower_bytes;
         std::vector<WeightFootprint> wfs;
         int64_t ngram_bytes = 0, kv_floor = 0;
         bool ngram_device = false, ngram_host = false;
@@ -1288,6 +1342,7 @@ int Engine::plan() {
             f.lends = VMem::supported() && !cfg_.deterministic &&
                       (cfg_.placement == "auto" || cfg_.placement == "expert_tiered");
             emb_bytes.push_back(wf.embedding);
+            tower_bytes.push_back(wf.tower);
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
@@ -1333,7 +1388,7 @@ int Engine::plan() {
             /* AND THE KV TIERS' COPY STAGING, which TierExec::device_init builds on the first
              * copy out. Which groups the prefix cache indexes is settled after this split, so
              * every paged group is counted: the entry it sizes can only be smaller. */
-            if (cfg_.prefix_cache_host_mib > 0 || cfg_.prefix_cache_disk_mib > 0) {
+            if (cfg_.prefix_cache_mib > 0) {
                 int64_t entry = 0, bs = 0;
                 int ng = 0;
                 for (size_t g = 0; g < r->program.kv_groups.size(); ++g) {
@@ -1359,13 +1414,15 @@ int Engine::plan() {
                 room -= file_stage_reserve(wfs[i].layer_unit_max, wfs[i].routed);
             facts[i].expert_floor = expert_vram_floor(wfs[i], std::max<int64_t>(room, 0));
         }
-        RAD_TRY(resolve_table_placement(facts, emb_bytes, kv_floor, ngram_bytes, ngram_device,
-                                        ngram_host));
+        RAD_TRY(resolve_table_placement(facts, emb_bytes, tower_bytes, kv_floor, ngram_bytes,
+                                        ngram_device, ngram_host));
         /* The n-gram table was counted off the card; on it, it is every rank's whole table. */
         if (cfg_.ngram_resolved == TablePlacement::Vram)
             for (VramFacts& f : facts) f.statics += ngram_bytes;
         if (cfg_.embedding_resolved == TablePlacement::Ram)
             for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= emb_bytes[i];
+        if (cfg_.tower_resolved == TablePlacement::Ram)
+            for (size_t i = 0; i < facts.size(); ++i) facts[i].statics -= tower_bytes[i];
         VramBudget vb;
         RAD_TRY(vram_budget_resolve(cfg_, facts, &vb));
         if (!vb.report.empty()) RAD_INFO("%s", vb.report.c_str());
@@ -1535,9 +1592,10 @@ int Engine::plan() {
                        humanb(r->plan.totals.bytes[(int)Tier::VRAM]).c_str(), humanb(host).c_str(),
                        humanb(r->plan.totals.bytes[(int)Tier::SSD]).c_str(),
                        humanb(r->plan.totals.bytes[(int)Tier::Mapped]).c_str()),
-                   r->plan.embedding_host_used > 0
-                       ? fmt("the host pool holds the token embedding's %s beside the weights "
-                             "placed there", humanb(r->plan.embedding_host_used).c_str())
+                   r->plan.forced_host_used > 0
+                       ? fmt("the host pool holds the %s the placement flags put there (the token "
+                             "embedding, the encoder towers) beside the weights placed in it",
+                             humanb(r->plan.forced_host_used).c_str())
                        : std::string());
         }
         /* --host-pool-mib IS ONE NUMBER FOR EVERY RANK, allocated whole by Pools::configure, so a
@@ -2933,17 +2991,16 @@ int Engine::configure_kv() {
 
     /* ---------------- the idle session tiers (spec §7.3) ---------------- */
     /* AFTER the prefix cache, because the tiers are sized in units of ONE CACHE ENTRY and only the
-     * configured cache knows which groups an entry covers. No memory is committed unless an
-     * operator gave a tier a size: a tier of zero bytes holds nothing, so the two inactivity
-     * thresholds are ordinary defaults rather than a commitment of memory nobody asked to spend.
+     * configured cache knows which groups an entry covers. No memory is committed unless the
+     * operator gave the host tier a size.
      *
      * CONFIGURED EVEN SO, because this object is also where a stored conversation is RECORDED,
-     * and that is not a tiering fact. A server with no --prefix-cache-host-mib holds its whole prefix
+     * and that is not a tiering fact. A server with no --prefix-cache-mib holds its whole prefix
      * cache in VRAM and holds it for exactly as long; skipping the configure would leave the
      * sessions view reading an unconfigured object and reporting an empty server, on every
      * deployment that has not opted into demotion. What the flags gate is the MOVER, below. */
     {
-        const bool tier_asked = cfg_.prefix_cache_host_mib > 0 || cfg_.prefix_cache_disk_mib > 0;
+        const bool tier_asked = cfg_.prefix_cache_mib > 0;
         const std::vector<int32_t>& cg = ranks_[0]->prefix.cached_groups();
         /* ONE SLOT HOLDS EVERY RANK'S SHARD. An entry under tensor parallelism is n_ranks
          * pieces of KV that are not interchangeable, so the unit the tiers store and budget
@@ -2967,138 +3024,36 @@ int Engine::configure_kv() {
             entry_bytes = std::max(entry_bytes, rank_entry[i]);
         }
 
-        /* ---- how the disk tier is split between the two halves of a session ----
-         *
-         * ON THIS BUILD A RESTORED HYBRID SESSION WITH NO SNAPSHOT REUSES NOTHING AT ALL. The
-         * scheduler clamps its reuse to the last reachable checkpoint and says why: RadBatch
-         * carries one query length for every KV group, so the linear layers cannot be replayed
-         * over a longer range than the attention layers, and the correct answer is to recompute
-         * from the checkpoint (core/sched/scheduler.cpp, admit_one). A session whose blocks came
-         * back and whose state did not therefore gets a hit of ZERO -- the blocks are not a
-         * partial win, they are unusable -- and the snapshot store is not a nice-to-have beside
-         * the block store, it is the thing that decides whether any of this works.
-         *
-         * So the split is DERIVED, from the session the operator sized the server for. At
-         * --max-model-len M a session costs
-         *
-         *     blocks     (M / block_size) * slot_bytes
-         *     snapshots  (log2(M / interval) + 1) * ck_slot_bytes     [geometric backoff]
-         *
-         * and splitting the cap in that ratio makes both halves hold the same NUMBER OF SESSIONS,
-         * which is the only sense in which they can be balanced. The ratio is strongly length
-         * dependent -- snapshots want 22% of the tier at 200K and more than half at 32K, because
-         * the retained set grows logarithmically while the blocks grow linearly -- which is
-         * exactly why a single fixed fraction is the wrong shape.
-         *
-         * Two thirds is the ceiling. Not because the arithmetic asks for one, but because the
-         * clamp above is a property of THIS build rather than of the design, and a tier with
-         * almost no room for blocks would be badly sized the day it is lifted.
-         *
-         * THE HOST TIER IS NOT SPLIT: snapshots live in the checkpoint store, which
-         * --checkpoint-slots sizes, and --prefix-cache-host-mib is the blocks' alone. */
+        /* THE SNAPSHOTS ARE NOT IN THE HOST TIER: they live in the checkpoint store, which
+         * --checkpoint-slots sizes, and --prefix-cache-mib is the blocks' alone. */
         const int64_t ck_slot_bytes = ck_store_.enabled() ? ck_store_.slot_bytes() : 0;
-        int64_t ck_disk_slots = 0;
-        if (ck_slot_bytes > 0) {
-            const int64_t bs = ranks_[0]->prefix.block_size();
-            const int64_t iv = ranks_[0]->prefix.checkpoint_interval();
-            /* The session the server was sized for: --max-model-len, or the training context
-             * when it is unset -- the same reading the declare and the KV pool take. */
-            const int64_t mlen = std::max<int64_t>(
-                1, cfg_.max_ctx > 0 ? cfg_.max_ctx : meta_.n_ctx_train);
-            int64_t retained = 1;
-            for (int64_t n = (iv > 0 ? mlen / iv : 0); n > 1; n >>= 1) ++retained;
-            const int64_t sess_blocks = bs > 0 ? (mlen / bs) * slot_bytes : slot_bytes;
-            const int64_t sess_snaps  = retained * ck_slot_bytes;
-            const int64_t denom = sess_blocks + sess_snaps;
-            const int64_t disk_cap = cfg_.prefix_cache_disk_mib << 20;
-            const int64_t disk_ck  = std::min(disk_cap * 2 / 3, denom > 0 ? disk_cap / denom * sess_snaps
-                                                                            + disk_cap % denom * sess_snaps / denom
-                                                                          : 0);
-            ck_disk_slots = disk_ck / ck_slot_bytes;
-            /* One where there is room for one at all: a tier that holds a session's blocks and not
-             * one snapshot holds nothing usable. */
-            if (ck_disk_slots == 0 && disk_cap >= ck_slot_bytes * 2) ck_disk_slots = 1;
-        }
         if (cg.empty() || entry_bytes <= 0) {
             /* Said only to an operator who asked for a tier. With no flag there is nothing to
              * report: a cache that indexes no paged group stores no blocks to begin with. */
             if (tier_asked)
                 RAD_WARN("kv tiers: the prefix cache indexes no paged group, so there is nothing "
-                         "to move. --prefix-cache-host-mib and --prefix-cache-disk-mib do nothing here.");
+                         "to move. --prefix-cache-mib does nothing here.");
         } else {
-            if (cfg_.prefix_cache_disk_mib > 0) {
-                if (cfg_.prefix_cache_dir.empty()) {
-                    RAD_WARN("kv tiers: --prefix-cache-disk-mib needs --prefix-cache-dir to say WHERE. "
-                             "The disk tier is off.");
-                } else {
-                    SSDTierConfig sc;
-                    sc.dir = cfg_.prefix_cache_dir;
-                    sc.block_payload = slot_bytes;
-                    sc.block_tokens  = ranks_[0]->prefix.block_size();
-                    sc.ckpt_payload  = ck_slot_bytes;
-                    sc.n_ckpt_slots  = ck_disk_slots;
-                    sc.n_block_slots = ((cfg_.prefix_cache_disk_mib << 20)
-                                        - ck_disk_slots * ck_slot_bytes) / slot_bytes;
-                    /* THE FINGERPRINT IS WHAT MAKES A PERSISTED STORE SAFE, and it is built from
-                     * everything a cached block's bytes actually depend on. Read back under a
-                     * different container, layout, KV width or rotary, a block is a lossless
-                     * function of somebody else's weights -- fluent, confident and wrong. There is
-                     * no cheaper check than refusing the whole store, because a block carries no
-                     * evidence of what produced it beyond the tokens it was keyed by.
-                     *
-                     * The rotary is the RESOLVED one, target and drafter, after --rope-scaling
-                     * (rope_identity): a YaRN container converted from the same checkpoint has the
-                     * same name and shapes as the stock one, and every cached key and QSA block key
-                     * is rotated differently under it. */
-                    {
-                        char theta[32];
-                        std::snprintf(theta, sizeof theta, "%.9g", (double)meta_.rope_theta);
-                        const std::string id =
-                            std::string(meta_.name ? meta_.name : "") + "|" +
-                            std::string(meta_.arch_id ? meta_.arch_id : "") + "|" +
-                            std::to_string(meta_.n_layers) + "|" +
-                            std::to_string(ranks_[0]->prefix.block_size()) + "|" +
-                            std::to_string(slot_bytes) + "|" + std::to_string(ck_slot_bytes) + "|" +
-                            cfg_.kv_cache_dtype + "|" +
-                            std::to_string((long long)ranks_.size()) + "|" + RAD_VERSION +
-                            "|theta=" + theta + "|" + rope_identity(meta_kv_k_, meta_kv_v_);
-                        uint64_t h = 1469598103934665603ull;
-                        for (char c : id) { h ^= (unsigned char)c; h *= 1099511628211ull; }
-                        sc.fingerprint = h;
-                    }
-                    sc.persistent  = true;
-                    kv_disk_ = std::make_unique<SSDTier>();
-                    RAD_INFO("%s", SSDTier::disclosure(sc.dir).c_str());
-                    if (kv_disk_->open(sc) != RAD_OK) {
-                        RAD_WARN("kv tiers: the disk tier at %s would not open; it is off.",
-                                 sc.dir.c_str());
-                        kv_disk_.reset();
-                    }
-                }
-            }
             IdleTiers::Config tc;
-            tc.host_cap_bytes  = cfg_.prefix_cache_host_mib << 20;
-            tc.disk_cap_bytes  = kv_disk_ ? (cfg_.prefix_cache_disk_mib << 20) : 0;
+            tc.host_cap_bytes  = cfg_.prefix_cache_mib << 20;
             tc.entry_bytes     = slot_bytes;
             tc.ckpt_bytes      = ck_slot_bytes;
             tc.ckpt_slots      = ck_store_.capacity();
-            tc.ckpt_disk_slots = kv_disk_ ? ck_disk_slots : 0;
 
             /* THE POLICY IS RANK 0'S AND THE TRANSFER IS EVERY RANK'S. A session is not sharded --
              * it is a conversation -- so one decision is taken about it; but each rank holds its
              * own shard of every block and gathers out of its own pool, so each rank moves its own
              * bytes when that decision is taken. */
             IdleTiers& T = ranks_[0]->tiers;
-            RAD_TRY(T.configure(tc, kv_disk_.get()));
+            RAD_TRY(T.configure(tc));
             T.set_model(meta_.name && meta_.name[0] ? meta_.name : "(unnamed)");
             if (T.any_on()) {
                 /* HOW MUCH A PASS MOVES, SIZED IN BYTES AND NOT IN ENTRIES. A cache entry is one
                  * block per cached group, and that is 29 KiB on a 4-token-block hybrid and four
                  * times more on a 16-token one -- so a fixed entry count means a fixed batch on
                  * one model and a quarter of one on another. At a fixed 64 entries a 200K session
-                 * on a 4-token-block hybrid takes about thirteen minutes to leave VRAM, which is
-                 * most of the way to the disk threshold: a tier that works and is too slow to be
-                 * worth having.
+                 * on a 4-token-block hybrid takes about thirteen minutes to leave VRAM: a tier that
+                 * works and is too slow to be worth having.
                  *
                  * 16 MiB of device staging a rank, which is about a millisecond of PCIe a pass
                  * and 0.02 ms a step of the VRAM it costs. The batch is one gather per (group,
@@ -3129,12 +3084,11 @@ int Engine::configure_kv() {
                      * AND THE STREAM IS THE MOVER'S. See Mover::transfer_stream -- a fourth
                      * hardware queue costs an RDNA4 card 65% of its decode step. */
                     RAD_TRY(rad_dev_set(r->device));
-                    if (r->tierx.configure(&rad_tools_registry(), &r->kv, &T, kv_disk_.get(), cg,
+                    if (r->tierx.configure(&rad_tools_registry(), &r->kv, &T, cg,
                                            max_batch, max_copy, max_chain,
                                            /*leader=*/&r == &ranks_[0],
                                            r->device,
                                            entry_off[(size_t)(&r - &ranks_[0])],
-                                           &ck_store_,
                                            /*shared=*/r->mover.transfer_stream())
                             != RAD_OK) {
                         all = false;
@@ -3148,10 +3102,8 @@ int Engine::configure_kv() {
                      * reported size is computed from, so the object is re-configured for the
                      * caps it can still honour -- none. */
                     T.close();
-                    kv_disk_.reset();
-                    tc.host_cap_bytes = tc.disk_cap_bytes = 0;
-                    tc.ckpt_disk_slots = 0;
-                    RAD_TRY(T.configure(tc, nullptr));
+                    tc.host_cap_bytes = 0;
+                    RAD_TRY(T.configure(tc));
                 } else {
                     /* The tiers can lose an entry without the cache asking: a capacity drop, or a
                      * promotion that failed. The cache has to hear about it or it will go on
@@ -3159,21 +3111,11 @@ int Engine::configure_kv() {
                     T.set_drop_sink([this](const BlockHash& h) {
                         ranks_[0]->prefix.drop_offdevice(h);
                     });
-                    /* And the linear half on its own: a snapshot whose only copy was on disk and
-                     * that the disk store let go of. An index entry left behind would be a
-                     * checkpoint the cache goes on offering whose bytes nobody holds, which is the
-                     * recurrent-state form of the same corruption. */
-                    T.set_snapshot_drop_sink([this](const BlockHash& h) {
-                        ranks_[0]->prefix.drop_snapshot(h);
-                    });
-                    /* THE DISK HALF GETS A THREAD, and a plan holds about 512 MiB of it -- a
-                     * fraction of a second of the store's write rate, so the disk copies keep up
-                     * with the host copies in a handful of plans rather than one entry a second. */
+                    /* A capacity plan drops up to 512 MiB of the oldest host-only entries. */
                     pump_ = std::make_unique<TierPump>();
                     pump_->max_copy = max_copy;
                     pump_->slow_budget = (int)std::min<int64_t>(
                         1 << 20, std::max<int64_t>(64, (512ll << 20) / std::max<int64_t>(1, slot_bytes)));
-                    if (kv_disk_) pump_->io.start(&ranks_[0]->tierx);
                     RAD_INFO("%s", ranks_[0]->tierx.report().c_str());
                 }
             }

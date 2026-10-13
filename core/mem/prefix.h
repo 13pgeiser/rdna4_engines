@@ -266,11 +266,8 @@ public:
      * It is a separate call rather than something lookup does because lookup is const and has no
      * device: a promotion allocates blocks and runs a scatter, which is the engine's to do
      * between steps and not something a cache query may trigger under the caller. */
-    /* `chain`, when given, receives every key the walk matched, wherever it is -- what the tiers
-     * need to see whether any of it is still being read off disk (IdleTiers::plan_fetch). */
     std::vector<BlockHash> restorable_from(const std::vector<int32_t>& tokens,
-                                           const std::vector<MMContentKey>& mm,
-                                           std::vector<BlockHash>* chain = nullptr) const;
+                                           const std::vector<MMContentKey>& mm) const;
 
     /* THE TIERS LOST THE BYTES. Erase the entry WITHOUT releasing blocks: an off-device entry
      * owns none -- demotion released them -- and its recorded ids belong to whoever the pool gave
@@ -297,25 +294,10 @@ public:
      * and re-prefills its whole transcript.
      *
      * A snapshot never needs to follow its blocks: it is restored straight out of its slot into
-     * the new sequence's state, wherever the blocks are. The only tier below the store is disk,
-     * and a snapshot the disk holds can give its slot up and stay in the index (DETACHED) until a
-     * read brings it back. */
+     * the new sequence's state, wherever the blocks are. There is no tier below the store: a
+     * snapshot the store retires is gone, and a session that needed it replays its recurrent
+     * layers from an older one. */
 
-    /* Its bytes are only on disk now: give the slot back and stop offering it. The index entry
-     * STAYS, because that is what a read off disk puts the snapshot back into, and an entry whose
-     * state is not in the store is exactly the `valid` flag's existing meaning -- lookup already
-     * walks past one and falls back to an older position. */
-    int  detach_snapshot(const BlockHash& key);
-    /* And back again, into a slot the caller has already filled. */
-    int  reattach_snapshot(const BlockHash& key, int32_t slot);
-    /* A STORE SLOT FOR A READ OFF DISK. The store is --checkpoint-slots deep for the whole server,
-     * and it is full whenever as many sessions have run since; a session whose snapshot is only on
-     * disk would then replay every recurrent layer from an older point, because its state has
-     * nowhere to land. One slot is freed by detaching the least recently used snapshot the disk
-     * also holds -- which the next restore of THAT session reads back -- and never one whose only
-     * copy is the slot, and never one a lookup has handed out since the step began: that request's
-     * restore reads the slot ahead of its step. True when a slot was freed. */
-    bool free_checkpoint_for_restore();
     /* KEEP A WAITING REQUEST'S CHAIN ON THE CARD. An admission that restored a chain and was then
      * refused -- no free sequence, no room in the pool -- gives its hit back, and its entries are
      * clean: drop_clean would let them go at the next pass and the next attempt would restore the
@@ -329,13 +311,22 @@ public:
     /* A step's admissions begin. The snapshots the last step's lookups handed out have been read
      * by its forward, which committed before this step was planned. Until then a handed snapshot
      * keeps its slot through every path that would give one up: retention, the eviction in
-     * reserve_checkpoint, and free_checkpoint_for_restore. */
+     * reserve_checkpoint, and the expiry. */
     void begin_step() { handed_.clear(); }
-    /* The tiers lost it -- the disk store let it go, a failed read, or an entry they were told to
-     * forget. Erase the index entry and give back the slot, if it still has one. */
-    void drop_snapshot(const BlockHash& key);
-    /* How many snapshots the index holds whose bytes are only on disk. */
-    int64_t snapshots_detached() const;
+
+    /* ---------------- expiry ----------------
+     *
+     * TAKE OUT EVERYTHING NO REQUEST HAS USED FOR `ttl_ns`: entries in VRAM (their blocks go back
+     * to the pool), entries only the host holds (their slots go back to the arena), and snapshots
+     * (their store slots go back). An entry is used when a lookup hits it or a request publishes
+     * it, and a snapshot when its prefix entry is or when a lookup hands it out. Nothing is moved
+     * anywhere first: an expired conversation is one the operator has said is not coming back.
+     *
+     * A PREFIX IS NEVER OLDER THAN WHAT FOLLOWS IT. A hit or a publish stamps every block of the
+     * chain up to where it ends with one clock, so a conversation expires from its tip inwards and
+     * a shared system prompt outlives every conversation that still reads it. Returns how many
+     * entries went. */
+    int64_t expire(uint64_t now_ns, uint64_t ttl_ns);
     /* ---------------- linear checkpoints ---------------- */
     /* The next position strictly after `pos` at which the scheduler must split a chunk so that a
      * checkpoint lands on a boundary (spec §7.1, §7.3). */
@@ -350,9 +341,8 @@ public:
     int  reserve_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
                             int32_t* slot_out);
     /* The state named by `prefix` is now IN its slot. Until this is called the reservation is only
-     * a promise and lookup() will not offer it -- see Ckpt::valid. A `resume` point is copied off
-     * the card at once (IdleTiers::note_snapshot). */
-    void commit_checkpoint(const BlockHash& prefix, bool resume = false);
+     * a promise and lookup() will not offer it -- see Ckpt::valid. */
+    void commit_checkpoint(const BlockHash& prefix);
     /* Every checkpoint of a session, ascending. */
     std::vector<int64_t> checkpoints(uint64_t session) const;
     /* Apply the retention policy to one session now. Returns how many snapshots were released.
@@ -373,6 +363,9 @@ public:
          * was lost, and a counter that mixed the two would read a working tier as a thrashing
          * cache. */
         int64_t drops = 0;
+        /* Entries and snapshots --prefix-cache-ttl took, from whichever tier held them. Not
+         * evictions either: nothing wanted the memory. */
+        int64_t expired = 0, ckpt_expired = 0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -386,6 +379,10 @@ private:
          * valid only while this is set. */
         bool in_lru = false;
         bool drop_wait = false;         /* in drop_wait_: clean, but a sequence still reads it */
+        /* LAST USE, on the monotonic clock: a hit or a publish. The LRU list is in this order --
+         * every path that puts an entry at its back stamps it -- which is what lets the expiry
+         * stop at the first entry it keeps. */
+        uint64_t used_ns = 0;
         std::list<BlockHash>::iterator lru;
     };
     struct Ckpt {
@@ -394,30 +391,26 @@ private:
         BlockHash prefix;
         int32_t   slot = -1;
         uint64_t  used = 0;
+        uint64_t  used_ns = 0;          /* reserved, or handed out by a lookup */
         /* HAS THE STATE ACTUALLY BEEN WRITTEN INTO THE SLOT YET. reserve_checkpoint runs when the
          * scheduler PLANS the chunk; the copy happens after the step that computes the state. A
          * lookup between those two points would hand out a slot holding the previous tenant's
          * history, which is the exact failure this whole mechanism exists to prevent. */
         bool      valid = false;
-        /* ARE THE BYTES ONLY ON DISK. A detached snapshot gave its store slot up because the disk
-         * holds it, and `slot` is -1 until a read brings it back. Kept as its own flag rather than
-         * inferred from the slot so that the two reasons a snapshot cannot be served -- not written
-         * yet, and not here -- stay distinguishable in a debugger and in a report. */
-        bool      detached = false;
     };
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
-    void touch(const BlockHash& h) const;
+    void touch(const BlockHash& h, uint64_t now_ns) const;
     /* Does a live sequence hold any of this entry's blocks as well? Then releasing the cache's
      * reference frees nothing. */
     bool shared_with_live(const Entry& e) const;
-    /* Retire one snapshot whatever tier holds its bytes: a slot goes back to the store, and a disk
-     * copy goes back to the tiers. One place, because three call sites that each remembered to
-     * check `detached` would be three places to forget. The session index is the caller's, since
-     * every caller is already rebuilding or erasing it. */
+    /* Retire one snapshot: its slot goes back to the store and the tiers stop naming it. The
+     * session index is the caller's, since every caller is already rebuilding or erasing it. */
     void retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it);
+    /* Take one key out of a session's index entry, and the entry when it empties. */
+    void unindex_ckpt(uint64_t session, const BlockHash& key);
 
     KVManager*  kv_ = nullptr;
     IdleTiers*  tiers_ = nullptr;

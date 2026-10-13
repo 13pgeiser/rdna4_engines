@@ -404,6 +404,13 @@ int rad_kv_group_zero(RadBuilder* b, rad_kvgroup g);
  * becomes one only if the plugin issues it. */
 int rad_op_resolved(RadBuilder* b, rad_op h);
 
+/* Does a loaded kernel library declare op `op` -- is it in the vocabulary at all? Declaring an op
+ * nobody declares is an error, because that is what a misspelt name looks like; an op that is
+ * declared and only resolved to no kernel is not (rad_op_resolved). A plugin asks this first for a
+ * fused op that only an optional library defines, and emits the chain when the answer is 0.
+ * Additive export. */
+int rad_op_declared(RadBuilder* b, const char* op);
+
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
  * convert-time fusions -- q/k/v into a single qkv, gate and up into gate_up. It is the only

@@ -3,7 +3,8 @@
  * Two stores are built from it: the KV tiers' block arena (core/mem/kvtier.h), where one slot is
  * one cache entry, and the linear-state snapshot store (KVManager::set_checkpoint_store), where
  * one slot is one snapshot. Under tensor parallelism a slot holds EVERY rank's shard of its
- * object, each rank at its own offset, so the disk store can read and write it as one payload.
+ * object, each rank at its own offset, so one slot id -- rank 0's to hand out -- names the object
+ * on every rank.
  *
  * Pinned, because every byte of it is a PCIe transfer endpoint and a pageable one collapses: the
  * driver stages an async copy to pageable memory through its own buffer and, on some paths,

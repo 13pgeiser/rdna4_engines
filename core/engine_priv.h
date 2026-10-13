@@ -17,7 +17,6 @@
 #include "mem/kv.h"
 #include "mem/prefix.h"
 #include "mem/kvtier.h"
-#include "mem/sstier.h"
 #include "runtime/tierexec.h"
 #include "build/rad_build.h"
 #include "place/heat.h"
@@ -66,9 +65,8 @@ struct Engine::Rank {
     /* THE IDLE SESSION TIERS (spec 7.3). Rank 0 owns the policy and the session index,
      * because they describe CONVERSATIONS and a conversation is not sharded -- but the
      * transfer is per rank, since each rank holds its own shard of every KV block and
-     * has its own pool to gather out of. The disk store is rank 0's alone for the same
-     * reason the policy is: one store, keyed by a hash of tokens every rank agrees on.
-     * Both are inert unless the operator gave a tier a size. */
+     * has its own pool to gather out of. Both are inert unless --prefix-cache-mib gave the
+     * host tier a size. */
     IdleTiers tiers;
     TierExec  tierx;
     /* The activation arena's smaller levels, smallest step first (Engine::probe_arena_levels). */
@@ -101,16 +99,12 @@ struct Engine::Rank {
 
 /* THE TIERS' WORK IN FLIGHT (Engine::tier_tick). One copy batch out on every rank's transfer
  * stream at a time, with each rank's answer kept until all of them have one -- a rank that has
- * landed must not be asked again and forget it failed -- and one disk batch out on the IO thread. */
+ * landed must not be asked again and forget it failed. */
 struct TierPump {
     std::vector<TierJob> copy;
     std::vector<int>     copy_st;    /* per rank: 0 in flight, 1 landed, negative failed */
-    TierIO               io;
     int64_t              max_copy = 0;
-    int                  slow_budget = 0;
-    /* The requests a read off disk is out for (IdleTiers::plan_fetch). Asked again while their
-     * read is out, they wait without walking their prompt; the read's collection lets them go. */
-    std::vector<uint64_t> waiting;
+    int                  slow_budget = 0;   /* capacity drops one plan may make */
 };
 
 /* THE BUFFER PROBE (engine_probe.cpp). Declared here because three files call it: the step

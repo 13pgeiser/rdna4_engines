@@ -463,8 +463,7 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* plan_chunk's checkpoint rules, asked after the fact (see the definitions). */
-    bool    last_checkpoint(int64_t pos, int64_t target) const;
+    /* plan_chunk's tail-checkpoint rule (see the definition). */
     int64_t tail_checkpoint(int64_t target) const;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
@@ -759,13 +758,11 @@ private:
     void preempt_back();
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
-    /* RAD_OK, a negative status when the request cannot be admitted now -- nothing behind it is
-     * either -- or kAdmitWait when its context is still being read off disk and the next request
-     * may go ahead of it. */
+    /* RAD_OK, or a negative status when the request cannot be admitted now -- nothing behind it is
+     * either. */
     /* `reserve`: tokens of the step to leave for the requests queued behind this one
      * (--busy-prefill-chunk; busy_cap). 0 plans the chunk on the whole budget, as before. */
     int  admit_one(SchedReq& s, int64_t budget, int64_t reserve = 0);
-    static constexpr int kAdmitWait = 1;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
 

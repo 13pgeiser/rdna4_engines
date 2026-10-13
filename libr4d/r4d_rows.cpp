@@ -71,7 +71,7 @@
 
 /* libr4d's R4D_AR_TWOSHOT_WIDE_MAX_ELEMS, restated because this file must not include r4d.h.
  * r4d_ar_entry.hip static_asserts the two against each other. */
-#define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 20971520
+#define R4D_AR_TWOSHOT_WIDE_MAX_ELEMS 268435456
 
 /* The largest message, in elements, a 4- or 8-rank exact all-reduce keeps on the one-shot; above it
  * the two-shot rows take it. 1 MiB of a 16-bit payload. The one-shot sends (ws-1)*N bytes a rank
@@ -2110,6 +2110,80 @@ static const RadOperandSpec oMergeTopk[] = {
     { "cand_val", RAD_OPD_OUT, 0 },
 };
 
+/* ------------------------------------------------------- pair_argmax, the joins, expert_scale
+ *
+ * pair_argmax is libref's schema restated field for field. The other four ops are this library's
+ * own, and attn_paged_qrow, whose schema is attn_paged's above: libref has no row for any of them
+ * ON PURPOSE. A reference row would resolve them wherever this library is not loaded -- a CPU-only
+ * build, a --kernels list without it -- and the architecture's fallback to the chain each one
+ * replaces would never be taken. docs/OPS.md carries all six, which is what the ops_doc test holds
+ * them to. */
+static const RadParamSpec pPairArgmax[] = {
+    P_INT("M"),
+    P_INT("n"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oPairArgmax[] = {
+    { "pairs", RAD_OPD_IN,  0 },
+    { "idx",   RAD_OPD_OUT, 0 },
+    { "val",   RAD_OPD_OUT, 1 },
+};
+static const RadParamSpec pNormJoin[] = {
+    P_INT("M"),
+    P_INT("n"),
+    P_F64("eps"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oNormAddNorm[] = {
+    { "a",   RAD_OPD_IN,     0 },
+    { "w_a", RAD_OPD_WEIGHT, 0 },
+    { "x",   RAD_OPD_INOUT,  0 },
+    { "w_y", RAD_OPD_WEIGHT, 0 },
+    { "y",   RAD_OPD_OUT,    0 },
+};
+static const RadParamSpec pNormAddNormRoute[] = {
+    P_INT("M"),
+    P_INT("n"),
+    P_F64("eps"),
+    P_STR("dtype"),
+    P_F64("mult"),
+    P_INT("group"),
+};
+static const RadOperandSpec oNormAddNormRoute[] = {
+    { "a",   RAD_OPD_IN,     0 },
+    { "w_a", RAD_OPD_WEIGHT, 0 },
+    { "x",   RAD_OPD_INOUT,  0 },
+    { "w_y", RAD_OPD_WEIGHT, 0 },
+    { "y",   RAD_OPD_OUT,    0 },
+    { "w_r", RAD_OPD_WEIGHT, 0 },
+    { "r",   RAD_OPD_OUT,    0 },
+    { "w_e", RAD_OPD_WEIGHT, 0 },
+    { "q",   RAD_OPD_OUT,    0 },
+    { "qs",  RAD_OPD_OUT,    0 },
+};
+static const RadOperandSpec oJoinAddScale[] = {
+    { "d",   RAD_OPD_IN,     0 },
+    { "w_d", RAD_OPD_WEIGHT, 0 },
+    { "r",   RAD_OPD_IN,     0 },
+    { "w_r", RAD_OPD_WEIGHT, 0 },
+    { "w_j", RAD_OPD_WEIGHT, 0 },
+    { "x",   RAD_OPD_INOUT,  0 },
+    { "s",   RAD_OPD_WEIGHT, 0 },
+    { "w_n", RAD_OPD_WEIGHT, 1 },
+    { "y",   RAD_OPD_OUT,    1 },
+};
+static const RadParamSpec pExpertScale[] = {
+    P_INT("M"),
+    P_INT("n_expert"),
+    P_INT("top_k"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oExpertScale[] = {
+    { "ids", RAD_OPD_IN,     0 },
+    { "w_e", RAD_OPD_WEIGHT, 0 },
+    { "ew",  RAD_OPD_INOUT,  0 },
+};
+
 #define SCHEMA(op, p, o, doc) { (op), ROW(p), ROW(o), (doc) }
 
 static const RadOpSchema kSchemas[] = {
@@ -2302,6 +2376,17 @@ static const RadOpSchema kSchemas[] = {
            "paged causal attention, varlen. The ranged parameter is q_len, not M: one query row "
            "at decode, up to 64/gqa at a speculative verify, thousands in a prefill chunk, and "
            "libr4d has a different kernel for each band."),
+    /* attn_paged under a name of its own, for a q read at its own row pitch. The windowed kernels
+     * (r4d_attn_paged_window.hip) read q where a fused [q|k|v] projection left it; the other
+     * attn_paged kernels, this library's included, read q dense and refuse the slice
+     * (RAD_E_STRIDE), which stops the engine at the first step. Under attn_paged, whichever row
+     * resolved would decide whether the slice works; under this name the op resolves to a kernel
+     * that takes it or to nothing, and the architecture lifts q into a dense block for attn_paged
+     * where it is nothing. */
+    SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
+           "attn_paged, parameter for parameter and value for value, with q read at its own row "
+           "pitch: a column slice of a wider row -- the q part of a fused [q|k|v] projection -- read "
+           "where it lies rather than lifted into a dense block first."),
     SCHEMA("attn_paged_gate_quant", pAttnPagedGq, oAttnPagedGq,
            "attn_paged followed by gate_quant_fp8 over its output, in the split-KV merge: each "
            "merged (token, head) row is gated, rounded, written to `out` and quantised to E4M3 "
@@ -2607,6 +2692,32 @@ static const RadOpSchema kSchemas[] = {
            "token order (with the shared arm folded when present) ARE the all-reduce's message, "
            "and the gated residual's write follows the reduction. Both wires at two ranks, the "
            "exact one at four."),
+    SCHEMA("pair_argmax", pPairArgmax, oPairArgmax,
+           "idx[m] = the id of the largest value among pairs[m, 0..n), each pair an int32 id in "
+           "the first f32 slot and its value in the second (row_topk's `pairs`, all-gathered): ties "
+           "to the lower id, a negative id skipped, -1 and -inf where nothing is valid. "
+           "row_topk_merge at R = 1, written one element a row at the output's own pitch."),
+    SCHEMA("norm_add_norm", pNormJoin, oNormAddNorm,
+           "t = rmsnorm(a) * w_a; x = x + t; y = rmsnorm(x) * w_y, over [M, n] rows; every value "
+           "the unfused rmsnorm, add, rmsnorm chain stores is rounded to the activation dtype at "
+           "the same point. A post-norm, the residual add and the next pre-norm (Gemma's "
+           "sandwich)."),
+    SCHEMA("norm_add_norm_route", pNormAddNormRoute, oNormAddNormRoute,
+           "norm_add_norm, then from the same rmsnorm of the x it writes r = rmsnorm(x) * w_r * "
+           "mult and the E4M3 codes q of rmsnorm(x) * w_e with an f32 scale qs per (row, `group` "
+           "columns): rmsnorm_quant_fp8's codes, taken over the bf16-rounded norm. A MoE layer's "
+           "router input and its experts' fp8 input, written by the attention join that already "
+           "holds the norm."),
+    SCHEMA("join_add_scale", pNormJoin, oJoinAddScale,
+           "x = (x + rmsnorm(rmsnorm(d) * w_d + rmsnorm(r) * w_r) * w_j) * s, over [M, n] rows, s "
+           "one element; and with w_n and y, y = rmsnorm(x) * w_n over the x written. Rounding "
+           "where the unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual "
+           "add, a per-layer scalar and the next layer's input norm (Gemma 4's feed-forward "
+           "join)."),
+    SCHEMA("expert_scale", pExpertScale, oExpertScale,
+           "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
+           "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
+           "bit for bit. Gemma 4's per_expert_scale on the renormalised routing weights."),
 };
 
 /* ================================================================================ constraints
@@ -2726,25 +2837,31 @@ static const RadConstraint cAttnPrefillH64G4Bf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 64), C_EQ("gqa", 4), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
 };
-/* Gemma 4 dense GLOBAL layers: head_dim 512, 8 queries per KV head, full attention
- * (r4d_attn_paged_h512_gqa8.hip). The `q_len <= 8` bound is the gqa verify width again; window
- * stays 0, which is what separates this from the sliding leg and why it needs no windowed form. */
-static const RadConstraint cAttnPrefillH512G8Fp8[] = {
-    C_EQ("window", 0), C_EQ("head_dim", 512), C_EQ("gqa", 8), C_EQ("block_size", 16),
-    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
-};
-static const RadConstraint cAttnPrefillH512G8Bf16[] = {
-    C_EQ("window", 0), C_EQ("head_dim", 512), C_EQ("gqa", 8), C_EQ("block_size", 16),
-    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
-};
-static const RadConstraint cAttnDecodeH512G8Fp8[] = {
-    C_EQ("window", 0), C_EQ("head_dim", 512), C_EQ("gqa", 8), C_EQ("block_size", 16),
-    C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
-};
-static const RadConstraint cAttnDecodeH512G8Bf16[] = {
-    C_EQ("window", 0), C_EQ("head_dim", 512), C_EQ("gqa", 8), C_EQ("block_size", 16),
-    C_GE("causal", 0), C_LE("q_len", 8), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
-};
+/* THE WINDOWED KERNELS (r4d_attn_paged_window.hip): head_dim 256 and 512, 1/2/4/8 queries per KV
+ * head, ANY window, causal or not -- Gemma 4's sliding layers are h256/gqa2 with a 1024-token
+ * window, its full layers h512 at gqa 8 (TP1/TP2), 4 (TP4) or 2 (TP8). One kernel serves every
+ * q_len -- decode, verify and prefill, splitting the key range where there are too few tiles to
+ * fill the card -- so `q_len` carries no constraint and cuts no band. `causal` and `window` are
+ * runtime fields of the kernel; block_size is the kernel's (RAD_DERIVED): 16.
+ *
+ * h256 AT gqa 4 AND 8 TAKE A WINDOW ONLY (C_GE 1): their window-0 band is the gqa4 / gqa8 legs'
+ * above (Qwen3.5-0.8B, the routed 35B-A3B), which these rows leave to them. At h256/gqa2 the
+ * rows overlap the sliding leg's two bands and rank below it (R4D_PRIO_ATTN_WINDOW says why);
+ * every other geometry here is these rows' alone. */
+#define R4D_WIN_C(NAME, HD, G, KV, WMIN)                                                           \
+    static const RadConstraint NAME[] = {                                                          \
+        C_EQ("head_dim", HD), C_EQ("gqa", G), C_EQ("block_size", 16), C_GE("causal", 0),           \
+        C_GE("window", WMIN), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", KV),                       \
+    };
+R4D_WIN_C(cWinH256G1Bf16, 256, 1, "bf16", 0) R4D_WIN_C(cWinH256G1Fp8, 256, 1, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH256G2Bf16, 256, 2, "bf16", 0) R4D_WIN_C(cWinH256G2Fp8, 256, 2, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH256G4Bf16, 256, 4, "bf16", 1) R4D_WIN_C(cWinH256G4Fp8, 256, 4, "fp8_e4m3", 1)
+R4D_WIN_C(cWinH256G8Bf16, 256, 8, "bf16", 1) R4D_WIN_C(cWinH256G8Fp8, 256, 8, "fp8_e4m3", 1)
+R4D_WIN_C(cWinH512G1Bf16, 512, 1, "bf16", 0) R4D_WIN_C(cWinH512G1Fp8, 512, 1, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH512G2Bf16, 512, 2, "bf16", 0) R4D_WIN_C(cWinH512G2Fp8, 512, 2, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH512G4Bf16, 512, 4, "bf16", 0) R4D_WIN_C(cWinH512G4Fp8, 512, 4, "fp8_e4m3", 0)
+R4D_WIN_C(cWinH512G8Bf16, 512, 8, "bf16", 0) R4D_WIN_C(cWinH512G8Fp8, 512, 8, "fp8_e4m3", 0)
+#undef R4D_WIN_C
 /* TWELVE QUERIES PER KV HEAD, head_dim 256 (r4d_attn_paged_h256_gqa12.hip) -- Qwen3.8-Flash-Next's
  * QSA layers, 24 query heads over 2. `q_len <= 5` is the same `q_len * gqa <= 64` bound the two
  * ratios above state, and it is TIGHTER than the legal speculation depths: a verify of depth 7 is
@@ -3022,6 +3139,21 @@ static const RadConstraint cDflashConv[] = {
 static const RadConstraint cDflashSelect[] = {
     C_GE("steps", 1), C_GE("top_k", 1), C_LE("top_k", 32),
     C_DIV("rank", 32), C_LE("rank", 512), C_IN("dtype", "bf16"),
+};
+/* The sandwich-norm joins hold 24 elements a thread over a 256-thread block (n <= 6144), and the
+ * route form quantises in whole 128-column groups. pair_argmax takes any row; expert_scale's top_k
+ * is the router's, at most 64. */
+static const RadConstraint cNormJoin[] = {
+    C_GE("n", 1), C_LE("n", 6144), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cNormJoinRoute[] = {
+    C_GE("n", 128), C_LE("n", 6144), C_DIV("n", 128), C_EQ("group", 128), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cPairArgmax[] = {
+    C_GE("n", 1), C_IN("dtype", "f32 fp32"),
+};
+static const RadConstraint cExpertScale[] = {
+    C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
 };
 
 /* ---- the routed mixture of experts ----------------------------------------------------------
@@ -4084,7 +4216,7 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_unary },
 
 { "logit_softcap_bf16", "logit_softcap", "elem",
-   "cap * tanh(x / cap), the final-logit softcap, grid-strided over the whole extent",
+   "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
    "any extent; contiguous in and out",
    "bf16 in and out, fp32 arithmetic",
    RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -4093,7 +4225,7 @@ static const RadKernelInfo kKernels[] = {
    r4d_shape_unary },
 
 { "logit_softcap_f32", "logit_softcap", "elem",
-   "cap * tanh(x / cap), the final-logit softcap, grid-strided over the whole extent",
+   "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
    "any extent; contiguous in and out",
    "f32 in and out — the 1.3.0 sampling chain carries the logits as f32 from the gemm",
    RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -4537,43 +4669,37 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_prefill_h64_gqa4_bf16, nullptr, nullptr, nullptr,
   r4d_shape_attn_paged },
 
-{ "attn_prefill_h512_gqa8_fp8kv", "attn_paged", "attn",
-  "paged causal attention, query-tiled (prefill / chunked prefill)",
-  "head_dim 512, 8 queries per kv head, paged block 16, varlen",
-  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
-  ROW(cAttnPrefillH512G8Fp8), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h512_gqa8_fp8, nullptr, nullptr, nullptr,
-  r4d_shape_attn_paged },
-
-{ "attn_prefill_h512_gqa8_bf16kv", "attn_paged", "attn",
-  "paged causal attention, query-tiled (prefill / chunked prefill)",
-  "head_dim 512, 8 queries per kv head, paged block 16, varlen",
-  "bf16 query, bf16 kv cache, bf16 out",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
-  ROW(cAttnPrefillH512G8Bf16), NOTUNE,
-  nullptr, nullptr, r4d_rad_attn_prefill_h512_gqa8_bf16, nullptr, nullptr, nullptr,
-  r4d_shape_attn_paged },
-
-{ "attn_decode_h512_gqa8_fp8kv", "attn_paged", "attn",
-  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
-  "head_dim 512, 8 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
-  "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
-  ROW(cAttnDecodeH512G8Fp8), ROW(tAttnSplit), nullptr,
-  nullptr, nullptr, r4d_rad_attn_decode_h512_gqa8_fp8, r4d_rad_attn_decode_h512_gqa8_scratch,
-  nullptr, nullptr,
-  r4d_shape_attn_paged },
-
-{ "attn_decode_h512_gqa8_bf16kv", "attn_paged", "attn",
-  "paged attention, causal or not, split-KV (decode / speculative verify / draft block)",
-  "head_dim 512, 8 queries per kv head, paged block 16, q_len*gqa <= 64, no window",
-  "bf16 query, bf16 kv cache, bf16 out, f16 partials",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
-  ROW(cAttnDecodeH512G8Bf16), ROW(tAttnSplit), nullptr,
-  nullptr, nullptr, r4d_rad_attn_decode_h512_gqa8_bf16, r4d_rad_attn_decode_h512_gqa8_scratch,
-  nullptr, nullptr,
-  r4d_shape_attn_paged },
+/* The windowed kernels (r4d_attn_paged_window.hip), under attn_paged and, the same launches with
+ * the same constraints, under attn_paged_qrow. The qrow rows carry no opd_shape: libref has no row
+ * for that op, so there is no oracle to run them against, and tests/r4d_emu's attention cases
+ * already take q as a pitched slice of a wider row. */
+#define R4D_WIN_ROW(HD, G, KVN, KVS, C, KVDOC)                                                    \
+{ "attn_window_h" #HD "_gqa" #G "_" #KVN, "attn_paged", "attn",                                   \
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",        \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query, " KVDOC " kv cache, bf16 out, f32 partials",                                        \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_WINDOW,                                                         \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_h##HD##_gqa##G##_##KVS,                                   \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr,                                                                                \
+  r4d_shape_attn_paged },                                                                          \
+{ "attn_qrow_h" #HD "_gqa" #G "_" #KVN, "attn_paged_qrow", "attn",                                \
+  "paged attention reading q at its own row pitch, any window, causal or not",                    \
+  "head_dim " #HD ", " #G " queries per kv head, paged block 16, any q_len, varlen",              \
+  "bf16 query (any row pitch), " KVDOC " kv cache, bf16 out, f32 partials",                        \
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,                                                                \
+  ROW(C), NOTUNE,                                                                                  \
+  nullptr, nullptr, r4d_rad_attn_window_h##HD##_gqa##G##_##KVS,                                   \
+  r4d_rad_attn_window_h##HD##_scratch,                                                             \
+  nullptr, nullptr, nullptr },
+#define R4D_WIN_PAIR(HD, GQ)                                                                       \
+    R4D_WIN_ROW(HD, GQ, bf16kv, bf16, cWinH##HD##G##GQ##Bf16, "bf16")                              \
+    R4D_WIN_ROW(HD, GQ, fp8kv, fp8, cWinH##HD##G##GQ##Fp8, "fp8-e4m3 (per-(seq,head) descales)")
+R4D_WIN_PAIR(256, 1) R4D_WIN_PAIR(256, 2) R4D_WIN_PAIR(256, 4) R4D_WIN_PAIR(256, 8)
+R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512, 8)
+#undef R4D_WIN_PAIR
+#undef R4D_WIN_ROW
 
 { "attn_prefill_h256_gqa12_fp8kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
@@ -6150,6 +6276,55 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dflash_select, nullptr, nullptr, nullptr,
   r4d_shape_dflash_select },
 
+/* pair_argmax, the sandwich-norm joins and expert_scale. NO opd_shape on the joins and
+ * expert_scale: libref has no row for them (see their schemas), so there is no oracle to run them
+ * against; tests/r4d_emu runs these kernels' source on the host and holds them to the chain they
+ * replace, bit for bit. pair_argmax is described as libref describes it, so rad-kbench runs it
+ * against the oracle. */
+{ "pair_argmax_f32", "pair_argmax", "select",
+  "the top-1 of a row of (id, value) pairs, ties to the lower id, negative ids skipped",
+  "any M and n; one wave a row; the outputs one element a row at their own pitch",
+  "f32 pairs (int32 id bits, f32 value), i32 idx, f32 val",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPairArgmax), NOTUNE,
+  nullptr, nullptr, r4d_rad_pair_argmax_f32, nullptr, nullptr, nullptr,
+  r4d_shape_pair_argmax },
+
+{ "norm_add_norm_bf16", "norm_add_norm", "norm",
+  "post-norm, residual add, next pre-norm: one block a row, rounding where the chain rounds",
+  "n <= 6144, any M, row pitches honoured",
+  "bf16 activations, f32 gains",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cNormJoin), NOTUNE,
+  nullptr, nullptr, r4d_rad_norm_add_norm_bf16, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "norm_add_norm_route_bf16", "norm_add_norm_route", "norm",
+  "norm_add_norm, and the routed arm's router input and fp8 expert input from the same norm",
+  "n <= 6144 in whole 128-column groups, any M, row pitches honoured",
+  "bf16 activations, f32 gains; E4M3 codes with an f32 scale a 128 columns",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cNormJoinRoute), NOTUNE,
+  nullptr, nullptr, r4d_rad_norm_add_norm_route_bf16, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "join_add_scale_bf16", "join_add_scale", "norm",
+  "two arms' post-norms, sum, norm, residual add, layer scalar: one block a row",
+  "n <= 6144, any M, row pitches honoured",
+  "bf16 activations, f32 gains, bf16 scalar",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cNormJoin), NOTUNE,
+  nullptr, nullptr, r4d_rad_join_add_scale_bf16, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "expert_scale_bf16", "expert_scale", "moe",
+  "routing weight times its expert's scale, in place: one thread an element",
+  "any M, top_k <= 64, row pitches honoured",
+  "i32 ids, bf16 table and weights",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cExpertScale), NOTUNE,
+  nullptr, nullptr, r4d_rad_expert_scale_bf16, nullptr, nullptr, nullptr,
+  nullptr },
 };
 
 /* ================================================================================== the exports */

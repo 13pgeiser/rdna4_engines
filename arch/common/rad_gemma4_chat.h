@@ -1,4 +1,4 @@
-/* gemma4_chat_format.h -- how Gemma 4 spells a turn: its reasoning and its tool calls, as data.
+/* rad_gemma4_chat.h -- how Gemma 4 spells a turn: its reasoning and its tool calls, as data.
  *
  * The chat template is one llama.cpp reads with a hand-written handler, so the template analysis
  * finds nothing in it, and the engine would serve the model with no reasoning split and refuse
@@ -16,14 +16,17 @@
  * the answer, and a lone <channel|>. `reasoning_anywhere` reads the first as reasoning and drops
  * the second, so neither reaches the content.
  *
- * Kept in a header of its own so the reply-format tests read the declaration the plugin exports
- * rather than a copy of it. */
+ * Here rather than in one plugin because two plugins serve Gemma 4 -- arch/gemma4 (bf16 and fp8
+ * experts) and arch/gemma4_bf16 (the CT-INT4 dense release) -- and the format is the model's, not
+ * the weights'. One declaration, so the two cannot drift apart, and so the reply-format tests read
+ * the declaration the plugins export rather than a copy of it. */
 #pragma once
 #include "rad_builder.h"
 
-namespace gemma4_bf16 {
+namespace rad {
+namespace arch {
 
-inline const RadChatFormat* chat_format_decl() {
+inline const RadChatFormat* gemma4_chat_format() {
     static const char* const kBreaks[]   = { "<|tool_call>" };
     static const char* const kTriggers[] = { "<|tool_call>" };
     static const RadChatFormat f = [] {
@@ -57,4 +60,5 @@ inline const RadChatFormat* chat_format_decl() {
     return &f;
 }
 
-}  /* namespace gemma4_bf16 */
+}  /* namespace arch */
+}  /* namespace rad */

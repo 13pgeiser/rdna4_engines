@@ -1955,6 +1955,81 @@ TEST(a_budgeted_victim_takes_a_lent_units_host_copy_and_a_recall_moves_the_donor
     CHECK_EQ(bad, 0);
 }
 
+/* THE CARD BEHIND THE HOST: the compute stream held behind a long copy on a stream of its own, so
+ * anything recorded on it from here -- a quarantine barrier -- stays pending until the copy is
+ * done. */
+struct ComputeHold {
+    static constexpr int64_t kBytes = 64ll << 20;
+    void* a = nullptr;
+    void* b = nullptr;
+    RadStream s = nullptr;
+    RadEvent e = nullptr;
+
+    int hold(RadStream compute, int rounds) {
+        a = rad_dev_alloc(kBytes, RAD_MEM_DEVICE);
+        b = rad_dev_alloc(kBytes, RAD_MEM_DEVICE);
+        if (!a || !b) return RAD_E_NOMEM;
+        RAD_TRY(rad_stream_create(&s, 0));
+        RAD_TRY(rad_event_create(&e));
+        for (int i = 0; i < rounds; ++i) RAD_TRY(rad_memcpy_async(a, b, kBytes, s));
+        RAD_TRY(rad_event_record(e, s));
+        return rad_event_wait(compute, e);
+    }
+    ~ComputeHold() {
+        if (s) { rad_stream_sync(s); rad_stream_destroy(s); }
+        if (e) rad_event_destroy(e);
+        if (a) rad_dev_free(a, RAD_MEM_DEVICE);
+        if (b) rad_dev_free(b, RAD_MEM_DEVICE);
+    }
+};
+
+/* A RECALL RIGHT AFTER A DONATION, with the card behind: the swap's copies have landed but the slots
+ * they gave up -- the victim's budgeted slot, the promoted unit's pool slot -- are still in
+ * quarantine behind the compute stream. Those are the slots the donor is owed (donor_slot), so the
+ * recall drains the stream before it looks for one, and the donor moves; looked for first, it
+ * found none, the recall stopped, and the slots it had already taken from other units were held by
+ * nothing for good (a KV cache stuck at 39% until restart, Qwen3.8-Flash-Next at one card). */
+TEST(a_recall_moves_a_donor_whose_slots_are_still_in_quarantine) {
+    LoanRig r(24);
+    r.turnover = 2;
+    CHECK_OK(r.build());
+    CHECK_OK(stamp_units(r, false, nullptr));
+    CHECK_OK(r.m.set_loan(Mover::kLendKV, Loan::kAll));
+    for (Deadline dl; (r.m.flex_used_bytes() == 0 || any_busy(r.h, r.hf.plan)) && !dl.passed();)
+        CHECK_OK(r.dispatch());
+    int32_t hot = -1, cold = -1;
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u) {
+        if (!r.hf.plan.units[(size_t)u].movable) continue;
+        if (hot < 0 && r.h.tier(u) != Tier::VRAM) hot = u;
+        if (cold < 0 && r.h.tier(u) == Tier::VRAM && !r.loan.inside(r.addr(u))) cold = u;
+    }
+    CHECK(hot >= 0 && cold >= 0);
+    if (hot < 0 || cold < 0) return;
+
+    CHECK_OK(r.m.begin_dispatch(r.d++, &r.h));
+    r.work.run(r.compute);
+    Swap sw;
+    sw.promote = hot;
+    sw.demote = cold;
+    r.h.set_busy(hot, true);
+    r.h.set_busy(cold, true);
+    CHECK_OK(r.m.issue(sw, &r.h));
+    CHECK_EQ(r.m.stats().donated, (uint64_t)1);
+    ComputeHold hold;
+    CHECK_OK(hold.hold(r.compute, 48));
+    CHECK_EQ(rad_event_query(hold.e), 0);           /* the card is still behind at the recall */
+
+    CHECK_OK(r.m.reclaim(Mover::kLendKV, 0, &r.h));
+    CHECK_EQ(r.m.stats().relocated, (uint64_t)1);
+    CHECK_EQ(r.m.stats().stranded, (uint64_t)0);
+    CHECK_EQ(r.m.loan_held(Mover::kLendKV), (int64_t)0);
+    for (int32_t u = 0; u < (int32_t)r.hf.plan.units.size(); ++u)
+        CHECK(!r.loan.inside(r.addr(u)));
+    int bad = 0;
+    CHECK_OK(stamp_units(r, true, &bad));
+    CHECK_EQ(bad, 0);
+}
+
 /* NO DONATION WHILE THE TURNOVER SLOTS ARE HELD -- through a prompt and the steps right after it:
  * the demotion is starved as it was before donation, and the budgeted victim stays. */
 TEST(a_held_turnover_takes_no_host_copy) {
@@ -3128,6 +3203,105 @@ TEST(embedding_ram_brings_its_own_room_beside_the_host_pool) {
     CHECK_EQ(plan2.host_budget, 3 * MiB);  /* --host-pool-mib, whole */
 }
 
+/* An encoder tower as the architectures declare one: a stem and a merger at model level and a
+ * layer unit a block, numbered past the text layers, every weight read once per request. */
+void add_tower(Fixture& f, int first_layer, int blocks, int64_t per_block) {
+    const rad_weight s = f.weight("v.patch_embd.weight", 1 * MiB, RAD_ACCESS_PER_REQUEST, -1, -1);
+    f.op("vit_gemm", {s}, false);
+    for (int b = 0; b < blocks; ++b) {
+        const rad_weight w = f.weight("v.blk." + std::to_string(b) + ".attn_qkv.weight", per_block,
+                                      RAD_ACCESS_PER_REQUEST, first_layer + b, -1);
+        f.op("vit_gemm", {w}, false);
+    }
+    const rad_weight m = f.weight("v.merger.weight", 1 * MiB, RAD_ACCESS_PER_REQUEST, -1, -1);
+    f.op("vit_gemm", {m}, false);
+}
+
+/* THE TOWER IS FOUND BY ITS ACCESS CLASS, at every level it spans: the footprint counts every unit
+ * whose weights are all read once per request, model-level and per-block alike, inside the
+ * statics the resolver takes it back out of. */
+TEST(the_footprint_counts_an_encoder_tower_at_every_level) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    add_tower(f, /*first_layer=*/2, /*blocks=*/3, /*per_block=*/2 * MiB);
+    WeightFootprint fp;
+    weight_footprint(f.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.tower, 1 * MiB + 3 * 2 * MiB + 1 * MiB);
+    CHECK_EQ(fp.statics, 2 * 4 * MiB + 2 * MiB + fp.tower);
+
+    Fixture t;
+    build_dense_lookup(t, /*layers=*/2, /*per_layer=*/4 * MiB);
+    weight_footprint(t.prog, &fp, TablePlacement::Vram, TablePlacement::Disk, false, true);
+    CHECK_EQ(fp.tower, 0ll);
+}
+
+/* --vision-tower-placement ram: EVERY TOWER UNIT goes to the pinned pool, read in place, before
+ * any strategy ran -- so a weights budget that holds only the text model plans, and the text model
+ * stays on the card. Vram leaves the tower with the other weights. */
+TEST(tower_ram_pins_every_tower_unit_in_the_pool_and_costs_no_vram) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    const size_t first_tower = f.prog.weights.size();
+    add_tower(f, /*first_layer=*/2, /*blocks=*/3, /*per_block=*/2 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.vram_weights_mib = 10;          /* the text model exactly: layers, embedding and head */
+    cfg.host_pool_mib = 0;
+    cfg.tower_resolved = TablePlacement::Ram;
+    cfg.tower_host_mib = 8;             /* the resolver's room beside the pool */
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_OK(Planner(in).plan(&plan));
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w) {
+        if ((size_t)w < first_tower) {
+            CHECK(plan.weight[w].tier == Tier::VRAM);
+            continue;
+        }
+        CHECK(plan.weight[w].tier == Tier::HostPinned);
+        CHECK(plan.weight[w].site == Site::DeviceZeroCopy);
+        const MoveUnit& mu = plan.units[(size_t)plan.weight[w].unit];
+        CHECK(!mu.movable);
+        CHECK(mu.preplaced());
+    }
+    CHECK_EQ(plan.tower_host_bytes, 8 * MiB);
+    CHECK_EQ(plan.forced_host_used, 8 * MiB);
+    CHECK_EQ(plan.host_budget, 0ll);
+    CHECK(plan.report(f.prog).find("--vision-tower-placement ram") != std::string::npos);
+
+    cfg.tower_resolved = TablePlacement::Vram;
+    cfg.tower_host_mib = 0;
+    cfg.vram_weights_mib = 18;
+    Plan plan2;
+    CHECK_OK(Planner(in).plan(&plan2));
+    for (rad_weight w = 1; (size_t)w < f.prog.weights.size(); ++w)
+        CHECK(plan2.weight[w].tier == Tier::VRAM);
+    CHECK_EQ(plan2.tower_host_bytes, 0ll);
+}
+
+/* A tower the pool cannot hold is refused by name, and so is ram where the program has no tower:
+ * the resolver only resolves Ram where the footprint found one, so that is a wiring fault. */
+TEST(tower_ram_refuses_a_pool_too_small_and_a_program_with_no_tower) {
+    Fixture f;
+    build_dense_lookup(f, /*layers=*/2, /*per_layer=*/4 * MiB);
+    add_tower(f, /*first_layer=*/2, /*blocks=*/3, /*per_block=*/2 * MiB);
+    Config cfg = base_config();
+    cfg.placement = "all_vram";
+    cfg.vram_weights_mib = 10;
+    cfg.host_pool_mib = 0;
+    cfg.tower_resolved = TablePlacement::Ram;
+    cfg.tower_host_mib = 7;
+    Plan plan;
+    PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_EQ(Planner(in).plan(&plan), RAD_E_NOMEM);
+
+    Fixture t;
+    build_dense_lookup(t, /*layers=*/2, /*per_layer=*/4 * MiB);
+    cfg.tower_host_mib = 8;
+    Plan plan2;
+    PlannerInput tin{&t.prog, &cfg, 0, 1, nullptr, 0};
+    CHECK_EQ(Planner(tin).plan(&plan2), RAD_E_STATE);
+}
+
 /* A TABLE THAT IS NOT A WHOLE NUMBER OF PAGES still leaves the report's pinned total at what the
  * pooled units use: the pool slot is charged rounded up and the tier total counts weight bytes, so
  * the report subtracts the same weight bytes it added. */
@@ -3141,8 +3315,8 @@ TEST(the_report_counts_a_hosted_embedding_once_in_one_unit) {
     Plan plan;
     PlannerInput in{&f.prog, &cfg, 0, 1, nullptr, 0};
     CHECK_OK(Planner(in).plan(&plan));
-    CHECK_EQ(plan.embedding_host_used, 3 * MiB + 100);
-    CHECK(plan.embedding_host_bytes >= plan.embedding_host_used);
+    CHECK_EQ(plan.forced_host_used, 3 * MiB + 100);
+    CHECK(plan.embedding_host_bytes >= plan.forced_host_used);
     const std::string r = plan.report(f.prog);
     const size_t at = r.find("host pinned");
     CHECK(at != std::string::npos);

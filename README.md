@@ -23,6 +23,7 @@ If you wish to support the developement of the radiance engine you can do so [he
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
@@ -43,6 +44,13 @@ with a scale search, bf16 lm_head); see [Convert a checkpoint](#convert-a-checkp
 that container decodes at 103 tok/s on prose and 141 on code, against 112 and 150 for keptn42's,
 and its drafts are accepted a little less often (0.46 against 0.50 of them on prose).
 
+The ParoQuant containers keep the trunk exactly as the ParoQuant releases ship it, with the learned
+Givens rotations it was trained in. Convert int4 from `z-lab/Qwen3.8-27B-PARO`, int5 from
+`Launch80/Qwen3.8-27B-PARO-int5` and MXFP4 from `MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2`, each with
+`data/recipes/q38-27b-paro-mxfp4-df2.recipe` and the DFlash2 drafter. A ParoQuant container made
+before 1.5.0 is refused at startup. Convert it again and pass the old one as `--reuse` to copy every
+tensor that did not change.
+
 ## Run with Docker
 
 The host needs Docker and an `amdgpu` driver that supports ROCm 10.1; it does not need ROCm. The
@@ -55,7 +63,7 @@ model from one of them:
 docker pull stilldeadcode/radiance
 git clone https://codeberg.org/StillDeadcode/radiance.git
 cp -r radiance/deploy/compose ~/radiance-compose && cd ~/radiance-compose
-cp .env.example .env                         # set RADIANCE_MODELS, RADIANCE_STATE, RADIANCE_API_KEY, the GIDs
+cp .env.example .env                         # set RADIANCE_MODELS, RADIANCE_API_KEY, the GIDs
 docker compose -f minicpm5-2b.yaml up -d     # or any file from the table
 docker compose -f minicpm5-2b.yaml logs -f
 docker compose -f minicpm5-2b.yaml down
@@ -133,9 +141,10 @@ odd block alternates with the parity, so every rank's share is whole blocks and 
 exactly one owner — and the resident expert bytes per rank are smaller, so the elastic window is a
 different shape: read the boot log's `elastic` line and re-derive `--host-pool-mib` before
 trusting it. **`--host-pool-mib` is pinned on every card**, so the row
-above pins 4 × 12 GiB = 48 GiB, and the amdgpu driver caps pinned memory at `ttm.pages_limit`, half
-of RAM by default: that row needs 96 GiB of RAM or a raised limit
-([`docs/GUIDE.md`](docs/GUIDE.md) §7).
+above pins 4 × 12 GiB = 48 GiB of RAM that nothing else can use and the kernel cannot swap out. The
+amdgpu driver caps what every process together pins at the machine's RAM less 1/64 and 1.5 GiB; the
+pool is locked user memory, which `ttm.pages_limit` does not count. A 64 GiB machine serves
+`flashnext-tp1.yaml` with 49 GiB pinned ([`docs/GUIDE.md`](docs/GUIDE.md) §7).
 
 Add `--api-key KEY` to require `Authorization: Bearer KEY` (or `X-Api-Key: KEY`). Add `--debug-graph` to print every op
 and the kernel it resolved to, then exit without serving. Then:
@@ -161,6 +170,9 @@ build/bin/rad-convert ~/models/google/gemma-4-31B-it -o gemma4-31b-w4a8.rad \
     --recipe data/recipes/gemma4-31b-dense-bf16-w4a8.recipe \
     --set quantization_config.quant_method=compressed-tensors \
     --draft-model ~/models/google/gemma-4-31B-it-assistant
+build/bin/rad-convert ~/models/z-lab/Qwen3.8-27B-PARO -o qwen3.8-27b-paro-int4.rad \
+    --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe \
+    --draft-model ~/models/z-lab/Qwen3.8-27B-DFlash2
 ```
 
 With Docker, use `docker run --rm -v ~/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`. In

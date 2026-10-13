@@ -50,7 +50,7 @@ public:
      * behind it still compiles. Every rank declares the same chain against the same hierarchy, so
      * whether a stage resolved is not a per-rank fact and asking one of them is asking all. */
     /* `tiers` is rank 0's IdleTiers, and it is given whether or not a tier can move anything:
-     * the object holds the session table either way, and a server with no --prefix-cache-host-mib is
+     * the object holds the session table either way, and a server with no --prefix-cache-mib is
      * one whose every stored session is in VRAM rather than one with no sessions. Null only when
      * there is no engine behind this at all. */
     explicit SchedulerBridge(Scheduler* s, const Sampler* sampler = nullptr,
@@ -111,19 +111,14 @@ public:
         TierCounters c;
         if (!tiers_) return c;
         const IdleTiers::Stats& s = tiers_->stats();
-        c.to_host = s.to_host; c.dropped = s.dropped; c.to_disk = s.to_disk;
-        c.promoted = s.promoted;
-        c.host_freed = s.host_freed; c.host_drops = s.host_drops; c.failures = s.failures;
-        c.fetched = s.fetched; c.ck_fetched = s.ck_fetched;
-        c.host_bytes = s.host_bytes; c.disk_bytes = s.disk_bytes;
-        c.ck_to_disk = s.ck_to_disk; c.ck_drops = s.ck_drops;
+        c.to_host = s.to_host; c.dropped = s.dropped; c.promoted = s.promoted;
+        c.host_drops = s.host_drops; c.failures = s.failures;
+        c.host_bytes = s.host_bytes;
         c.restores = s.restores; c.restore_ns = s.restore_ns;
         c.flushes = s.flushes; c.flush_ns = s.flush_ns;
         c.ck_bytes = tiers_->ckpt_bytes();
-        c.ck_host_slots = tiers_->ckpt_slots();
-        c.ck_disk_slots = tiers_->ckpt_disk_slots();
+        c.ck_slots = tiers_->ckpt_slots();
         c.host_on = tiers_->host_on();
-        c.disk_on = tiers_->disk_on();
         return c;
     }
 
@@ -133,8 +128,8 @@ public:
         IdleTiers::Occupancy held;
         const std::vector<IdleTiers::SessionInfo> v = tiers_->sessions(occ ? &held : nullptr);
         if (occ) {
-            occ->host_bytes = held.host_bytes;         occ->disk_bytes = held.disk_bytes;
-            occ->host_cap_bytes = held.host_cap_bytes; occ->disk_cap_bytes = held.disk_cap_bytes;
+            occ->host_bytes = held.host_bytes;
+            occ->host_cap_bytes = held.host_cap_bytes;
         }
         const uint64_t now = rad_mono_ns();
         out->reserve(v.size());
@@ -149,11 +144,8 @@ public:
             o.age_s     = now > s.first_seen_ns ? (double)(now - s.first_seen_ns) / 1e9 : 0.0;
             o.on_device = s.on_device;
             o.on_host   = s.on_host;
-            o.on_disk   = s.on_disk;
             o.moving    = s.moving;
             o.snapshots   = s.snapshots;
-            o.snap_host   = s.snap_host;
-            o.snap_disk   = s.snap_disk;
             o.snap_bytes  = s.snap_bytes;
             o.resume_tokens = s.resume_tokens;
             out->push_back(std::move(o));
@@ -263,6 +255,8 @@ public:
          * figure above the used one would draw a negative live share. */
         o.kv_tokens_cached = std::min(m.prefix_held_tokens, o.kv_tokens_used);
         o.prefix_ckpt_evictions = m.prefix_ckpt_evictions;
+        o.prefix_expired = m.prefix_expired;
+        o.prefix_ckpt_expired = m.prefix_ckpt_expired;
 
         o.prefill_tps = m.prefill_tps;
         o.decode_tps = m.decode_tps;

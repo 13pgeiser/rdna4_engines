@@ -1115,9 +1115,10 @@ int Mover::drop(int32_t unit, HeatEngine* heat) {
  * slot or back across the link (reclaim), and a loan that shrinks under it moves it the same way
  * (balance). There is always somewhere for it to go -- each donor's copy went to a unit
  * whose budgeted slot it left free, so the free budgeted slots and the free pool slots together
- * number at least the donors. The donors are bounded by the turnover slots, and they come out of
- * the KV cache's loan only: the arena takes its loan back at every prompt's first chunk, and that
- * recall stays a change of address.
+ * number at least the donors once the quarantine has emptied (a recall drains it first). The
+ * donors are bounded by the turnover slots, and they come out of the KV cache's loan only: the
+ * arena takes its loan back at every prompt's first chunk, and that recall stays a change of
+ * address.
  *
  * THE HOTTEST UNIT GIVES ITS COPY -- of the victim's layer, when pool_slot_for asks for one --
  * because a donor the engine later demotes needs a pool slot of its own where it would have been a
@@ -1458,13 +1459,28 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     RAD_TRY(flush_moves());
     RAD_TRY(rad_stream_sync(mover_));
     RAD_TRY(retire(heat));
+    /* AND NO SLOT IS STILL IN QUARANTINE. The slots the donors below are owed come back through
+     * it: a donation's victim leaves its budgeted slot that way, and a promotion that refilled the
+     * slot leaves its pool slot that way (donor_slot). Looked for before the compute stream has
+     * passed their barriers, the slots of the last few dispatches' swaps are not free yet, and a
+     * donor finds nowhere to go. Nothing goes on the compute stream from this drain to the end of
+     * the recall, which issues only the mover's own copies. */
+    RAD_TRY(rad_stream_sync(compute_));
+    RAD_TRY(retire(heat));
 
     /* EVERY UNIT PAST THE LOAN GOES BACK TO ITS HOST COPY, which is a change of address -- or,
      * for a donor (donor_slot), which has none, it moves: into a free budgeted slot, a copy inside
      * the card, or else back across the link into a free pool slot. One of the two is free for
-     * every donor (donor_slot says why). Nothing is published until the copies have landed. */
+     * every donor once the quarantine is empty (donor_slot says why). Nothing is published until
+     * the copies have landed.
+     *
+     * A DONOR WITH NOWHERE TO GO STAYS WHERE IT IS, and the recall still finishes: every other
+     * slot is given back and every moved donor published, so the loan stops short only by that
+     * unit's slot, and a later recall or balance() moves it. Stopping at it instead would leave
+     * the slots already taken off their units held by nothing, for the life of the process. */
     std::vector<std::pair<size_t, int64_t>> freed;
     std::vector<int32_t> moved;
+    int stuck = 0;
     for (int32_t u = 0; u < (int32_t)unit_.size(); ++u) {
         UnitState& us = unit_[(size_t)u];
         if (us.klass < 0 || us.slab_slot < 0) continue;
@@ -1477,16 +1493,11 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                 cp.slab.add_free(to);
                 to = -1;
             }
+            const int64_t g = to < 0 ? cp.pool.take() : -1;
             if (to >= 0) {
                 RAD_TRY(rad_memcpy_async(cp.slot_ptr(to), cp.slot_ptr(from), us.bytes, mover_));
                 us.slab_slot = to;
-            } else {
-                const int64_t g = cp.pool.take();
-                if (g < 0) {
-                    RAD_ERR("mover: unit %d gave its host copy away and neither a budgeted slot nor "
-                            "a pool slot is free to move it to", (int)u);
-                    return RAD_E_STATE;
-                }
+            } else if (g >= 0) {
                 RAD_TRY(rad_memcpy_async((char*)cp.pool_base + g * cp.stride, cp.slot_ptr(from),
                                          us.bytes, mover_));
                 us.pool_slot = g;
@@ -1499,6 +1510,9 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
                     heat->set_tier(u, Tier::HostPinned);
                     heat->set_busy(u, false);
                 }
+            } else {
+                ++stuck;
+                continue;
             }
             --cp.n_donated;
             ++stats_.relocated;
@@ -1525,9 +1539,9 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
     }
 
     /* AND NO KERNEL STILL NAMES ONE. The compute stream is the only reader of the slab -- the
-     * quarantine barrier rests on the same fact -- so once it has drained, nothing already issued
-     * can reach a slot past the loan, and everything issued from here reads the host copies. */
-    RAD_TRY(rad_stream_sync(compute_));
+     * quarantine barrier rests on the same fact -- and it drained above with nothing issued since,
+     * so nothing can reach a slot past the loan, and everything issued from here reads the host
+     * copies. */
     for (const auto& f : freed) pools_[f.first].slab.add_free(f.second);
 
     /* EVERY RECORD WAITING ON ONE OF THOSE SLOTS IS DONE WAITING: its barrier is behind the
@@ -1550,6 +1564,14 @@ int Mover::reclaim(int lender, int64_t amount, HeatEngine* heat) {
         m.slab_slot = m.pool_slot = m.to_slot = -1;
     }
     count_flex();
+    if (stuck > 0) {
+        stats_.stranded += (uint64_t)stuck;
+        RAD_ERR("mover: %d unit(s) that gave their host copy away found no free slot to move to; "
+                "the %s loan stops at %lld instead of %lld until they move", stuck,
+                lender == kLendKV ? "KV" : "arena", (long long)loan_held(lender),
+                (long long)loan_[lender]);
+        return RAD_E_FULL;
+    }
     if (loan_held(lender) > loan_[lender]) {
         RAD_ERR("mover: recalled the %s loan to %lld and a slot at %lld is still held",
                 lender == kLendKV ? "KV" : "arena", (long long)loan_[lender],
@@ -1719,8 +1741,9 @@ std::string Mover::report() const {
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
     if (stats_.donated)
         s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
-                 "by a recall\n",
-                 (unsigned long long)stats_.donated, (unsigned long long)stats_.relocated);
+                 "by a recall, %llu left past one with no free slot\n",
+                 (unsigned long long)stats_.donated, (unsigned long long)stats_.relocated,
+                 (unsigned long long)stats_.stranded);
     if (stats_.ssd_reads)
         s += fmt("  file tier: %llu demand reads (%.2f GiB), each a blocking pread in the middle "
                  "of a dispatch. Raise --host-pool-mib.\n",

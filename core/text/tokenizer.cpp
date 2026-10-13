@@ -605,16 +605,34 @@ int Vocab::load(VocabBuild b) {
     if (b_.eos >= 0) eog_.push_back(b_.eos);
     if (b_.eot >= 0 && b_.eot != b_.eos) eog_.push_back(b_.eot);
     {
+        /* Gemma 4 ends a turn on `<turn|>` and a tool-calling turn on `<|tool_response>` -- the
+         * opener of the result the CALLER supplies, which the model writes after its last
+         * `<tool_call|>` -- and declares neither: its eos is `<eos>`. llama.cpp's loader lists
+         * both for it, and both are control tokens nothing else spells. */
         static const char* const kEogNames[] = {
             "<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>",
             "<|end|>", "<|EOT|>", "<|eom_id|>", "<|return|>", "<eos>", "</s>",
+            "<turn|>", "<|tool_response>",
         };
+        /* `</s>` IS A DOCUMENT'S END, NOT A TURN'S. A vocabulary with a turn marker of its own
+         * ends a reply on that marker, and there `</s>` -- where it is a control token at all
+         * and not the declared eos -- is text a reply may write: Gemma 4 spells the HTML tag with
+         * it. So it joins the set only in a vocabulary that has no turn marker. */
+        static const char* const kTurnEnds[] = {
+            "<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|end|>", "<|EOT|>", "<turn|>",
+        };
+        bool has_turn_end = false;
+        for (int32_t id : special_) {
+            if (b_.types[id] != RAD_TT_CONTROL) continue;
+            for (const char* n : kTurnEnds) if (b_.tokens[id] == n) has_turn_end = true;
+        }
         std::string added;
         for (int32_t id : special_) {
             if (b_.types[id] != RAD_TT_CONTROL) continue;
             if (std::find(eog_.begin(), eog_.end(), id) != eog_.end()) continue;
             bool known = false;
             for (const char* n : kEogNames) if (b_.tokens[id] == n) { known = true; break; }
+            if (has_turn_end && b_.tokens[id] == "</s>") known = false;
             if (!known) continue;
             eog_.push_back(id);
             added += (added.empty() ? "" : " ") + b_.tokens[id] + "=" + std::to_string(id);

@@ -66,9 +66,6 @@ Engine::~Engine() {
     for (float* p : kld_host_) if (p) rad_dev_free(p, RAD_MEM_HOST_PINNED);
     if (pooled_host_) rad_dev_free(pooled_host_, RAD_MEM_HOST_PINNED);
     for (auto& r : ranks_) if (r->score_host) rad_dev_free(r->score_host, RAD_MEM_HOST_PINNED);
-    /* The disk thread first: it reads the host arena and writes the store, both of which go with
-     * the ranks and kv_disk_ below. */
-    if (pump_) pump_->io.stop();
     /* WHAT THE TIERING ACTUALLY DID, and it is printed here for the same reason: this is the last
      * moment the plan the rows name is still alive. Only when the plan was dynamic -- a static
      * one has nothing to say and a banner saying nothing is a banner people learn to skip. The
@@ -503,6 +500,7 @@ int Engine::step_loop() {
                 sched_.release_deferred();
             }
             tier_tick();
+            expire_tick(rad_mono_ns());
             loan_tick(/*idle=*/true);
             /* RADIANCE_DEBUG_IDLE_SCRUB -- a DIAGNOSTIC, not a fix, and the one question it
              * answers is whether request N+1 differs from request N because of bytes request N
@@ -948,7 +946,9 @@ int Engine::step_loop() {
         sched_.step_finished();
         tier_tick();
         loan_tick(/*idle=*/false);
-        arena_tick(rad_mono_ns());
+        const uint64_t now = rad_mono_ns();
+        arena_tick(now);
+        expire_tick(now);
         drain_completed();
         sched_.publish(/*idle=*/false);
 
@@ -1305,9 +1305,8 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
 /* EVERY ITERATION, ON BOTH PATHS. A copy to host memory is asynchronous and reported when its
  * event has signalled, so the tick that collects it is simply the first one after it landed; the
  * next copy is handed out on the same tick. Tying either to a slower clock would only delay the
- * moment a finished conversation's VRAM can be given up. The disk half runs once a second -- its
- * thresholds are measured in minutes -- and at once when the host tier has refused a copy for
- * want of room, since that copy is waiting on it.
+ * moment a finished conversation's VRAM can be given up. Room in a full arena is made at once
+ * when the host tier has refused a copy for want of it, since that copy is waiting on it.
  *
  * THE SCHEDULER'S LOCK IS HELD FOR THE BOOKKEEPING ONLY. Planning a batch and reporting one touch
  * rank 0's manager, the prefix cache and -- through the tiers' drop sinks -- the index an HTTP
@@ -1486,42 +1485,6 @@ void Engine::tier_tick() {
         }
     }
 
-    /* ---- reads off disk that have landed --------------------------------------------------- */
-    /* THEIR REQUESTS GO NEXT STEP: the records are host records now, held for them, and the
-     * admission that asks again restores them out of host memory. */
-    {
-        TierIO::Fetch f;
-        while (P.io.take_fetch(&f)) {
-            destroy_fences(f.fences);
-            const auto lk = sched_.hold();
-            lead.tierx.report_pass(f.jobs, f.ok, now);
-            /* A SNAPSHOT READ BACK INTO ITS SLOT goes to the cache's index entry, which the lookup
-             * then serves. One whose entry went while the read was out has nothing to land in, and
-             * the record must not go on naming a slot the store will hand to somebody else. */
-            for (const TierJob& j : f.jobs) {
-                if (!j.ck_want || j.ck_slot < 0 || !lead.tiers.snapshot_in_slot(j.key, j.ck_slot))
-                    continue;
-                if (lead.prefix.reattach_snapshot(j.key, j.ck_slot) != RAD_OK) {
-                    lead.tiers.snapshot_detached(j.key);
-                    lead.kv.free_checkpoint(j.ck_slot);
-                }
-            }
-            P.waiting.erase(std::remove(P.waiting.begin(), P.waiting.end(), f.tag), P.waiting.end());
-        }
-    }
-
-    /* ---- the disk batch the thread finished ------------------------------------------------ */
-    {
-        std::vector<TierJob> jobs;
-        std::vector<char> ok;
-        std::vector<RadEvent> fences;
-        if (P.io.take(&jobs, &ok, &fences)) {
-            destroy_fences(fences);
-            const auto lk = sched_.hold();
-            lead.tierx.report_pass(jobs, ok, now);
-        }
-    }
-
     /* ---- the next copy ---------------------------------------------------------------------- */
     if (P.copy.empty() && lead.tiers.writeback_waiting()) {
         {
@@ -1554,68 +1517,27 @@ void Engine::tier_tick() {
         if (lead.kv.loan_tokens() < ceiling) (void)lead.prefix.drop_clean();
     }
 
-    /* ---- the slow half ---------------------------------------------------------------------- */
-    /* AS SOON AS A DISK COPY IS WAITING, not on the clock: until it lands, the entry's host slot
-     * cannot be given up for nothing, and a full arena is then a restore that cannot read through
-     * it. The thread takes one batch at a time, so this is also as fast as the disk takes them. */
-    if (!P.io.busy() && (lead.tiers.disk_waiting() || lead.tiers.starved() ||
-                         now - tier_last_ns_ >= 1000000000ull)) {
-        tier_last_ns_ = now;
+    /* ---- capacity ---------------------------------------------------------------------------- */
+    /* WHEN THE ARENA HAS REFUSED A COPY: the oldest host-only entries make room for it. The drops
+     * move no bytes, so the plan is reported as soon as it is made. */
+    if (lead.tiers.starved()) {
         std::vector<TierJob> jobs;
         lead.tiers.plan(P.slow_budget, &jobs);
-        /* A SNAPSHOT'S SLOT IS FILLED BY A COPY ON THE COMPUTE STREAM, issued after the step that
-         * produced the state and before the cache was told of it; the write waits for that copy to
-         * land, and every one of its kind is behind this mark. */
-        bool snaps = false;
-        for (const TierJob& j : jobs) snaps = snaps || j.ck_slot >= 0;
-        int fst = RAD_OK;
-        std::vector<RadEvent> fences = snaps ? rank_fences(false, true, &fst)
-                                             : std::vector<RadEvent>{};
-        /* A mark that could not be made leaves nothing to order the write by: the batch is
-         * reported failed, and every record keeps what it had. */
-        if (fst != RAD_OK) {
-            destroy_fences(fences);
-            const std::vector<char> ok(jobs.size(), 0);
-            const auto lk = sched_.hold();
-            lead.tierx.report_pass(jobs, ok, now);
-            return;
-        }
-        if (!jobs.empty() && !P.io.submit(std::move(jobs), std::move(fences))) {
-            destroy_fences(fences);
-            /* The thread is not running -- no disk tier -- and a plan without one holds only drops,
-             * which move nothing. They are reported here. */
-            std::vector<char> ok(jobs.size(), 1);
+        if (!jobs.empty()) {
+            const std::vector<char> ok(jobs.size(), 1);
             const auto lk = sched_.hold();
             lead.tierx.report_pass(jobs, ok, now);
         }
     }
 }
 
-std::vector<RadEvent> Engine::rank_fences(bool transfer, bool compute, int* st) {
-    std::vector<RadEvent> out;
-    int rc = RAD_OK;
-    for (int pass = 0; pass < 2; ++pass) {
-        if ((pass == 0 && !transfer) || (pass == 1 && !compute)) continue;
-        for (auto& r : ranks_) {
-            RadEvent e = nullptr;
-            const int s = r->tierx.fence(&e, pass == 1 ? r->ctx.stream() : nullptr);
-            if (s != RAD_OK && rc == RAD_OK) rc = s;
-            out.push_back(e);
-        }
-    }
-    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
-    if (st) *st = rc;
-    return out;
-}
-
-void Engine::destroy_fences(std::vector<RadEvent>& f) {
-    for (size_t i = 0; i < f.size(); ++i) {
-        if (!f[i]) continue;
-        (void)rad_dev_set(ranks_[i % ranks_.size()]->device);
-        rad_event_destroy(f[i]);
-    }
-    f.clear();
-    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+void Engine::expire_tick(uint64_t now_ns) {
+    if (cfg_.prefix_cache_ttl <= 0 || now_ns - expire_last_ns_ < 1000000000ull) return;
+    expire_last_ns_ = now_ns;
+    PrefixCache& pc = ranks_[0]->prefix;
+    if (!pc.enabled()) return;
+    const auto lk = sched_.hold();
+    (void)pc.expire(now_ns, (uint64_t)cfg_.prefix_cache_ttl * 1000000000ull);
 }
 
 bool Engine::flush_copies() {
@@ -1657,34 +1579,6 @@ bool Engine::flush_copies() {
         if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
     }
     return landed;
-}
-
-/* HAND A READ OFF DISK TO THE IO THREAD, fenced on every rank's transfer stream: the slots it
- * writes may have been given up by entries a restore is still copying out of. False when it could
- * not be handed over, and then the reads are reported unstarted -- the records stay on disk and the
- * request is admitted with what the host tier holds. */
-bool Engine::submit_fetch(uint64_t tag, std::vector<TierJob>&& jobs) {
-    TierPump& P = *pump_;
-    TierIO::Fetch f;
-    f.tag = tag;
-    f.jobs = std::move(jobs);
-    /* THE TRANSFER STREAMS, for the restores that read block slots, and THE COMPUTE STREAMS when a
-     * snapshot comes in: its store slot may have been given up by a snapshot a restore on that
-     * stream is still copying out of. */
-    bool snap = false;
-    for (const TierJob& j : f.jobs) snap = snap || (j.ck_want && j.ck_slot >= 0);
-    int st = RAD_OK;
-    f.fences = rank_fences(true, snap, &st);
-    if (st == RAD_OK && P.io.submit_fetch(std::move(f))) {
-        P.waiting.push_back(tag);
-        return true;
-    }
-    RAD_ERR("kv tiers: a read off disk could not be handed to the IO thread (%s); the request is "
-            "admitted with what host memory holds", st < 0 ? rad_strerror(st) : "not running");
-    destroy_fences(f.fences);
-    const std::vector<char> ok(f.jobs.size(), 0);
-    ranks_[0]->tierx.report_pass(f.jobs, ok, rad_mono_ns());
-    return false;
 }
 
 void Engine::drain_completed() {
@@ -1788,42 +1682,13 @@ int Engine::serve() {
         /* CALLED FROM INSIDE Scheduler::step(), UNDER ITS LOCK -- which is what makes it safe to
          * touch the cache and rank 0's manager here, and why nothing below may call back into the
          * scheduler. */
-        b->restore_fn = [this](const Request& req) -> IPrefixCache::Restore {
-            using R = IPrefixCache::Restore;
+        b->restore_fn = [this](const Request& req) {
             const uint64_t t0 = rad_mono_ns();
             PrefixCache& pc = ranks_[0]->prefix;
-            TierPump& P = *pump_;
-            if (std::find(P.waiting.begin(), P.waiting.end(), req.id) != P.waiting.end())
-                return R::Wait;
-            std::vector<BlockHash> chain;
             std::vector<MMContentKey> mk;
             media_keys(req, &mk);
-            const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk, &chain);
-            /* THE DISK PART IS READ FIRST, ON THE IO THREAD, while this request waits and every
-             * other one runs; the restore below then copies host memory and nothing else. Asked
-             * on every attempt, because a chain wholly in VRAM can still want a read: its deepest
-             * snapshot may have given its store slot up and be on disk alone.
-             *
-             * THAT SNAPSHOT NEEDS A STORE SLOT TO LAND IN, and the store's free list is rank 0's
-             * manager's: one is taken here -- making room by detaching a snapshot the disk also
-             * holds, which is the cache's choice -- and handed to the plan, which gives it back
-             * when it does not read the snapshot after all. */
-            {
-                std::vector<TierJob> reads;
-                int32_t ck = -1;
-                if (ranks_[0]->tiers.snapshot_fetch_wanted(chain) &&
-                    ranks_[0]->kv.alloc_checkpoint(&ck) != RAD_OK) {
-                    ck = -1;
-                    if (pc.free_checkpoint_for_restore() &&
-                        ranks_[0]->kv.alloc_checkpoint(&ck) != RAD_OK)
-                        ck = -1;
-                }
-                const bool wait = ranks_[0]->tiers.plan_fetch(chain, &reads, rad_mono_ns(), &ck);
-                if (ck >= 0) ranks_[0]->kv.free_checkpoint(ck);
-                if (wait && (reads.empty() || submit_fetch(req.id, std::move(reads))))
-                    return R::Wait;
-            }
-            if (want.empty()) return R::Done;
+            const std::vector<BlockHash> want = pc.restorable_from(req.prompt, mk);
+            if (want.empty()) return;
             /* THE WHOLE CHAIN IN ONE RESTORE. A 4-token block makes a long conversation tens of
              * thousands of entries, and one transfer an entry is tens of thousands of host round
              * trips before the turn can start; as one restore it is a launch per (group, layer)
@@ -1835,7 +1700,7 @@ int Engine::serve() {
                 if (!ranks_[0]->tierx.plan_promote(h, &j)) break;
                 jobs.push_back(std::move(j));
             }
-            if (jobs.empty()) return R::Done;
+            if (jobs.empty()) return;
             std::vector<char> ok(jobs.size(), 1);
             for (auto& r : ranks_) {
                 std::vector<char> mine;
@@ -1867,7 +1732,6 @@ int Engine::serve() {
                 }
             }
             ranks_[0]->tiers.note_restore((int64_t)(rad_mono_ns() - t0));
-            return R::Done;
         };
         /* AN EVICTION THAT WOULD LOSE AN ENTRY WAITS FOR ITS COPY INSTEAD. Called by the
          * prefix cache binding under the scheduler's lock, on this thread, when dropping the
@@ -1992,6 +1856,8 @@ std::string Engine::engine_info() const {
                                     { "resolved", table_placement_name(cfg_.embedding_resolved) } };
     e["ngram_placement"]        = { { "asked", table_placement_name(cfg_.ngram_placement) },
                                     { "resolved", table_placement_name(cfg_.ngram_resolved) } };
+    e["vision_tower_placement"] = { { "asked", table_placement_name(cfg_.tower_placement) },
+                                    { "resolved", table_placement_name(cfg_.tower_resolved) } };
     e["prefix_cache"]           = cfg_.prefix_cache;
     e["checkpoint_slots"]       = cfg_.checkpoint_slots;
     e["deterministic"]          = cfg_.deterministic;

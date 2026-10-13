@@ -25,6 +25,9 @@ void log_set_level(Log l);
 Log  log_level();
 void log_emit(Log l, const char* file, int line, const char* fmt, ...)
      __attribute__((format(printf, 4, 5)));
+/* When the last line was written (rad_mono_ns), whatever its level: what StallWatch reads as
+ * progress. 0 before the first. */
+uint64_t log_last_line_ns();
 
 /* WHICH RANK IS SPEAKING.
  *

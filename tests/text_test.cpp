@@ -977,6 +977,32 @@ TEST(vocab_ends_a_generation_on_every_id_the_checkpoint_names) {
     CHECK_EQ(v->eog().size(), (size_t)2);
 }
 
+/* The names the loader completes the set from, for a container that declares one eos and no list:
+ * Gemma 4's turn end and its tool-response opener end a generation; `</s>` does not where the
+ * vocabulary has a turn marker of its own, and does where it has none. */
+TEST(vocab_completes_the_end_set_from_known_control_names_and_keeps_a_turn_vocabularys_s_tag_as_text) {
+    VocabBuild vb;
+    vb.kind   = RAD_TOK_BPE;
+    vb.tokens = { "a", "<eos>", "<turn|>", "<|tool_response>", "</s>" };
+    vb.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    vb.eos = 1;
+    auto v = std::make_shared<Vocab>();
+    CHECK_OK(v->load(std::move(vb)));
+    CHECK(v->is_eog(1));
+    CHECK(v->is_eog(2));
+    CHECK(v->is_eog(3));
+    CHECK(!v->is_eog(4));
+
+    VocabBuild plain;
+    plain.kind   = RAD_TOK_BPE;
+    plain.tokens = { "a", "<eos>", "</s>" };
+    plain.types  = { RAD_TT_NORMAL, RAD_TT_CONTROL, RAD_TT_CONTROL };
+    plain.eos = 1;
+    auto w = std::make_shared<Vocab>();
+    CHECK_OK(w->load(std::move(plain)));
+    CHECK(w->is_eog(2));
+}
+
 /* ================================================================== chain steps */
 
 TEST(step_chain_units) {
