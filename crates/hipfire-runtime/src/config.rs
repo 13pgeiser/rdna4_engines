@@ -24,12 +24,15 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 
 /// Automatic retained-Redline admission for a loaded model.
 ///
-/// MQ4R keeps its existing cross-model policy with one temporary carve-out:
-/// Muse Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
+/// MQ4R keeps its existing cross-model policy with two carve-outs. Muse
+/// Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
 /// Redline PM4 yet, so automatic admission is withheld until that lowering
 /// lands — the extension-only policy would otherwise route Glimmer onto a
 /// dispatch path that cannot yet execute it. Delete this carve-out together
-/// with the lowering. DeepSeek4 MQ2R is narrower still: only the certified
+/// with the lowering. Gemma 4 (arch 13, every variant) is never admitted
+/// automatically: its retained tape is not validated (the E4B PM4 shadow is
+/// not exact), so a Gemma 4 `.mq4r` stays on the HIP graph unless Redline is
+/// selected explicitly. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
 /// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
@@ -57,7 +60,8 @@ pub fn retained_redline_default(
     if ep != 1 {
         return false;
     }
-    if model_arch.eq_ignore_ascii_case("muse_glimmer") {
+    if model_arch.eq_ignore_ascii_case("muse_glimmer") || model_arch.eq_ignore_ascii_case("gemma4")
+    {
         return false;
     }
     if is_qwen35_family(model_arch) && cpu_offload_configured() {
@@ -500,6 +504,39 @@ mod tests {
                 "qwen MQ4R keeps auto-Redline on {gpu_arch}"
             );
         }
+    }
+
+    #[test]
+    fn gemma4_never_takes_the_retained_redline_default() {
+        // Gemma 4's retained tape is unvalidated, so no Gemma 4 load replays
+        // by default: not an MQ4R name, not on the gfx1201 dense route, with
+        // or without the EAGLE drafter, on any arch.
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            for path in [
+                "/models/gemma4-12b-it.mq4r",
+                "/models/GEMMA4-E4B-IT.MQ4R",
+                "/models/gemma-4-26b-a4b-it.mq4r",
+                "/models/gemma4-12b-it.mq4",
+                "/models/gemma4-e4b-it.q8.hfq",
+            ] {
+                for has_drafter in [false, true] {
+                    assert!(
+                        !retained_redline_default(gpu_arch, "gemma4", path, 1, 1, has_drafter),
+                        "gemma4 {path} must stay on HIP by default on {gpu_arch}"
+                    );
+                }
+            }
+        }
+        // The carve-out is Gemma-scoped: the same MQ4R name on another
+        // family keeps its default.
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_6_moe",
+            "/models/gemma4-12b-it.mq4r",
+            1,
+            1,
+            false,
+        ));
     }
 
     #[test]
