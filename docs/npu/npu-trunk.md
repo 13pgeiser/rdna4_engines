@@ -671,7 +671,7 @@ count) and `zab_source=stock-MQ6-DtoH-before-overlay|stock-MQ6-DtoH`, alongside
 `download_ms`, `pack_ms`, resident weight bytes and runtime status.
 `off` does no download, packing, allocation or new logging; its existing mode
 read moves before overlay application, whose payloads and native route are
-unchanged. `on` and admitted `auto` open two fixed 8192-row row-major G80 programs,
+unchanged. `on` and admitted `auto` open two 8192-row row-major G80 programs (smaller banks add row-adaptive ones, below),
 resident 13/11-panel chains, and two banks each with registered A plus separate
 GDN/QSA C arenas. Hardware open errors fail forced on loads; auto frees partial
 resources, logs one refusal and remains GPU-only.
@@ -846,9 +846,20 @@ The exact live readers (pitch/col0 in BF16 elements) are:
 No reader includes GDN padding 16480..16640 or QSA padding 13952..14080.
 Attention/index selection read transformed F32 scratch, never raw C.
 
-Both NPU programs retain the fixed 8192-row extent. For a partial B, the
-producer explicitly zeros every padded A row; kick records B's live count
-without patching the program, and all arena readers use only those live rows.
+The NPU programs are row-adaptive (0.4.2). A bank of fewer than 8192 rows runs
+the G80 program of its own wave count: the cores' wave loop count is part of the
+PDI, so the relay builds that PDI/TXN on its thread the first time the count is
+kicked, gives it its own hardware context and caches it per (class, padded rows)
+(`railgun::npu::trunk::TxnBuilder`, `chain_rows`). The producer packs the A
+stream for the same padded rows (whole 256-row waves) and explicitly zeros every
+padded row; kick records the live count, and all arena readers use only the
+live rows. Without this a 4,672-row bank paid the full 8192-row chain (55.7 ms
+for a GDN layer against a ≈ 35 ms GPU window), which made the rebalanced 9.3K
+pair 13 % slower than `off` (Halo H2b); with it the chain scales with rows
+(34 ms at 4,672, Halo H4). The relay holds at most `MAX_ADAPTIVE_CONTEXTS` (4)
+row-adaptive contexts per load; the request plan admits the wave counts of its
+pairs in first-use order (`admitted_plan`, every mode, so `on` and `emulate`
+agree) and a pair that would need a fifth count runs GPU-native instead.
 All GPU layer operations, router views, PLE staging, capture/MTP rows and
 head work use the bank's real row count. Bank B's output offsets remain
 8192, not its own row count.
