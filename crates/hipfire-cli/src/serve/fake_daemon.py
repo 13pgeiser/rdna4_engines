@@ -6,7 +6,6 @@ generate_count = 0
 LAST_SCENARIO = ""
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.log")
 MODEL_PATH = ""
-LOADED_MAX_SEQ = 0
 
 def log_req(req):
     try:
@@ -560,9 +559,6 @@ for line in sys.stdin:
             out({"type": "error", "message": "load failed: fixture", "class": "validation",
                  "retryable": False, "rolled_back": False})
             continue
-        requested_max_seq = (req.get("params") or {}).get("max_seq")
-        if isinstance(requested_max_seq, (int, float)):
-            LOADED_MAX_SEQ = int(requested_max_seq)
         out({
             "type": "loaded",
             "arch": "fake",
@@ -653,17 +649,8 @@ for line in sys.stdin:
             out({"type": "decided", "id": req.get("id"),
                  "error": {"status": 422, "message": "state/messages/questions invalid"}})
             continue
-        # Task 8 review round 1: exercise the serve-side required_max_seq
-        # reload-and-retry. Refuses until a `load` has raised this session's
-        # max_seq to (or past) the threshold, which the default config never
-        # reaches on its own (memory.max_seq defaults to 32768).
-        if state == "t-needs-ctx" and LOADED_MAX_SEQ < 40000:
-            out({"type": "decided", "id": req.get("id"),
-                 "error": {"status": 422, "message": "prompt needs 40000 tokens",
-                           "required_max_seq": 40000}})
-            continue
-        # A required_max_seq past serve's reload ceiling (MAX_SEQ_CEILING):
-        # serve must return this 422 as-is without reloading.
+        # A prompt past the loaded max_seq: serve must return this 422 as-is,
+        # required_max_seq included, without reloading.
         if state == "t-needs-huge-ctx":
             out({"type": "decided", "id": req.get("id"),
                  "error": {"status": 422, "message": "prompt needs 10000000 tokens",

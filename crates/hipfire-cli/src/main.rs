@@ -15395,54 +15395,12 @@ mod tests {
         );
     }
 
-    /// A daemon `required_max_seq` hint on a 422 triggers exactly one
-    /// `ensure_model` reload with a bumped `max_seq`, then a transparent
-    /// retry that succeeds. The fake daemon's `t-needs-ctx` sentinel refuses
-    /// until a `load` has raised its tracked max_seq to >= 40000 — comfortably
-    /// above the default `memory.max_seq` config of 32768, so this only
-    /// passes if a real second `load` round trip actually happened.
+    /// A daemon 422 with `required_max_seq` is returned to the client as-is,
+    /// `required_max_seq` included, without any reload: serve never grows
+    /// `max_seq` on a request's behalf.
     #[cfg(unix)]
     #[test]
-    fn systemone_required_max_seq_reloads_then_retries() {
-        let harness = Task11HttpHarness::spawn("systemone-reload");
-        let (status, _, body) = post_systemone(
-            harness.port(),
-            &serde_json::json!({
-                "model": harness.model(), "state": "t-needs-ctx",
-                "questions": {"q": {"type": "noul", "instructions": "i"}}
-            }),
-        );
-        assert_eq!(status, 200, "{body}");
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["answers"]["q"]["type"], "noul");
-
-        let log = harness.read_requests_log();
-        let loads = Task11HttpHarness::ops_of_type(&log, "load");
-        assert!(
-            loads.len() >= 2,
-            "expected an initial load plus a required_max_seq reload; log={log:?}"
-        );
-        let reloaded_max_seq = loads
-            .iter()
-            .filter_map(|l| {
-                l.get("params")
-                    .and_then(|p| p.get("max_seq"))
-                    .and_then(|v| v.as_u64())
-            })
-            .max()
-            .expect("at least one load carries params.max_seq");
-        assert!(
-            reloaded_max_seq >= 40_000,
-            "expected a reload with max_seq >= 40000, got {reloaded_max_seq}; loads={loads:?}"
-        );
-    }
-
-    /// A `required_max_seq` above `MAX_SEQ_CEILING` (the ceiling chat's own
-    /// context growth stops at) is returned to the client as the daemon's
-    /// 422, `required_max_seq` included, without any reload.
-    #[cfg(unix)]
-    #[test]
-    fn systemone_required_max_seq_above_ceiling_returns_422_without_reload() {
+    fn systemone_required_max_seq_returns_422_without_reload() {
         let harness = Task11HttpHarness::spawn("systemone-huge-ctx");
         let (status, _, body) = post_systemone(
             harness.port(),
@@ -15454,16 +15412,12 @@ mod tests {
         assert_eq!(status, 422, "{body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["error"]["required_max_seq"], 10_000_000u64, "{body}");
-        assert!(
-            10_000_000 > crate::serve::complete::MAX_SEQ_CEILING,
-            "fixture must exceed the ceiling"
-        );
         let log = harness.read_requests_log();
         let loads = Task11HttpHarness::ops_of_type(&log, "load");
         assert_eq!(
             loads.len(),
             1,
-            "only the initial load; no reload past the ceiling; log={log:?}"
+            "only the initial load; no reload; log={log:?}"
         );
         assert_eq!(
             Task11HttpHarness::ops_of_type(&log, "decide").len(),

@@ -1746,10 +1746,6 @@ pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
 
 /// Largest `max_tokens` a chat request may ask for.
 pub(crate) const MAX_TOKENS_CEILING: u64 = 393_216;
-/// Largest `max_seq` serve will reload a model with on a request's behalf:
-/// chat's `required_max_seq = max_tokens + 1024` at `MAX_TOKENS_CEILING`.
-/// Decide's `required_max_seq` reload-and-retry is capped at the same value.
-pub(crate) const MAX_SEQ_CEILING: u64 = MAX_TOKENS_CEILING + 1024;
 
 /// Project the HTTP body into the typed request contract. `multi_slot` is the
 /// route: the multi-slot engine adds its field refusals and sampling-range

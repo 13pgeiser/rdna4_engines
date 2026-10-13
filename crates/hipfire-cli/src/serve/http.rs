@@ -1201,16 +1201,16 @@ async fn handle_request(
             // CancellationToken lets a client disconnect while queued abort
             // the wait promptly; once acquired, `guard` moves into
             // `handle_decide`'s spawn_blocking and is held until the daemon
-            // call(s) finish, not merely until this future is dropped.
+            // call finishes, not merely until this future is dropped.
             let mut cancel_guard = CancelOnDrop::new();
             let cancel = cancel_guard.token();
-            let cancelled = cancel_guard.cancelled();
             let guard = match shared.admission.acquire_async(cancel.clone()).await {
                 Ok(g) => g,
-                Err(e) => return admission_error_response(&e),
+                Err(e) => {
+                    return admission_error_response(WireApi::ChatCompletions, &shared.metrics, &e)
+                }
             };
-            let response =
-                crate::serve::decide::handle_decide(shared, body_val, guard, cancelled).await;
+            let response = crate::serve::decide::handle_decide(shared, body_val, guard).await;
             cancel_guard.disarm();
             response
         }

@@ -6,14 +6,10 @@
 //! validation authority; this layer selects the model, serialises against
 //! chat traffic, and shapes Jev's response. Spec §6.
 
-use super::complete::MAX_SEQ_CEILING;
 use super::http::{json_response, openai_error, request_id, BoxBody};
 use super::{AdmissionGuard, ServeShared};
 use hyper::{header, Response};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 fn is_local_model(runtime: &super::ServeRuntime, model: &str) -> bool {
     crate::registry_entry_for_path(&runtime.paths, &runtime.registry, model).is_some()
@@ -114,10 +110,12 @@ fn calibration_message(
     Ok((!identity).then_some(serde_json::Value::Object(out)))
 }
 
-/// The whole decide attempt loop, synchronous end to end: model resolution,
-/// `ensure_model` (which can block on a GPU load), the daemon round trip via
-/// `Engine::request` (a blocking `mpsc::Receiver::recv`), and the one-shot
-/// `required_max_seq` reload-and-retry (only up to `MAX_SEQ_CEILING`). Must
+/// The whole decide request, synchronous end to end: model resolution,
+/// `ensure_model` (which can block on a GPU load) and the daemon round trip
+/// via `Engine::request` (a blocking `mpsc::Receiver::recv`). A daemon 422
+/// with `required_max_seq` is returned as-is: serve never reloads to grow
+/// `max_seq` on a request's behalf (the chat route fits or refuses the same
+/// way). Must
 /// run entirely off the tokio executor (inside `spawn_blocking`) and must
 /// own `guard` for its whole
 /// duration: the admission slot has to stay held until the daemon call(s)
@@ -127,7 +125,6 @@ fn run_decide(
     shared: &ServeShared,
     body: serde_json::Value,
     _guard: AdmissionGuard,
-    cancelled: &AtomicBool,
 ) -> DecideOutcome {
     let requested = body
         .get("model")
@@ -142,188 +139,151 @@ fn run_decide(
         };
     }
 
-    for attempt in 0..2 {
-        let (engine, model_echo, session, calibration) = {
-            let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-            let target = if !requested.is_empty() && is_local_model(&runtime, &requested) {
-                requested.clone()
-            } else {
-                match runtime.current_path.as_ref() {
-                    Some(p) => p.display().to_string(),
-                    None => {
-                        return DecideOutcome::Err {
-                            status: 503,
-                            message: "no model loaded: name a local hipfire model in `model`, \
+    let (engine, model_echo, session, calibration) = {
+        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let (target, origin) = if !requested.is_empty() && is_local_model(&runtime, &requested) {
+            (requested.clone(), super::ModelOrigin::Request)
+        } else {
+            match runtime.current_path.as_ref() {
+                Some(p) => (p.display().to_string(), super::ModelOrigin::Operator),
+                None => {
+                    return DecideOutcome::Err {
+                        status: 503,
+                        message: "no model loaded: name a local hipfire model in `model`, \
                                       or load one first"
-                                .to_string(),
-                            required_max_seq: None,
-                        }
-                    }
-                }
-            };
-            let resolved = match runtime.ensure_model(&target, &shared.meta, None) {
-                Ok(r) => r,
-                Err(e) => {
-                    return DecideOutcome::Err {
-                        status: 500,
-                        message: format!("{e:#}"),
+                            .to_string(),
                         required_max_seq: None,
                     }
                 }
-            };
-            // Session mode (spec §12.6): project `messages` / `tools` /
-            // `tool_choice` exactly as a chat request is projected, so the
-            // daemon renders the conversation the chat path cached.
-            let session = match body.get("messages") {
-                None => None,
-                Some(_) => match super::complete::project_request_contract(
-                    &body,
-                    &resolved,
-                    super::complete::include_reasoning_content(runtime.current_arch.as_deref()),
-                ) {
-                    Ok(c) => Some((c.messages, c.forwarded_tools)),
-                    Err(e) => {
-                        return DecideOutcome::Err {
-                            status: 422,
-                            message: format!("{e:#}"),
-                            required_max_seq: None,
-                        }
-                    }
-                },
-            };
-            let calibration = match calibration_message(&resolved) {
-                Ok(c) => c,
-                Err(e) => {
-                    return DecideOutcome::Err {
-                        status: 500,
-                        message: format!("decide calibration config: {e:#}"),
-                        required_max_seq: None,
-                    }
-                }
-            };
-            // Echo the model the way chat and `/health` report it (the tag
-            // when one was requested); the filesystem path only as fallback.
-            let echo = shared
-                .meta
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .current_model
-                .clone()
-                .or_else(|| {
-                    runtime
-                        .current_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                })
-                .unwrap_or(target);
-            (runtime.engine.clone(), echo, session, calibration)
+            }
         };
-
-        let id = request_id();
-        let mut msg = serde_json::json!({"type": "decide", "id": id});
-        // `_debug_no_snapshot` is deliberately not forwarded: it is a daemon-
-        // level gate knob (gates.py talks to the daemon directly), not API.
-        // messages / tools are forwarded projected (below), never raw.
-        for key in ["state", "questions"] {
-            if let Some(v) = body.get(key) {
-                msg[key] = v.clone();
-            }
-        }
-        if let Some((messages, tools)) = &session {
-            msg["messages"] = messages.clone();
-            if let Some(tools) = tools {
-                msg["tools"] = tools.clone();
-            }
-        }
-        if let Some(c) = &calibration {
-            msg["calibration"] = c.clone();
-        }
-        let reply = match engine.request(&msg) {
-            Ok(v) => v,
+        let resolved = match runtime.ensure_model(&target, &shared.meta, origin) {
+            Ok(r) => r,
             Err(e) => {
                 return DecideOutcome::Err {
                     status: 500,
-                    message: format!("daemon: {e}"),
+                    message: format!("{e:#}"),
                     required_max_seq: None,
                 }
             }
         };
-        if reply.get("type").and_then(|v| v.as_str()) != Some("decided") {
-            return DecideOutcome::Err {
-                status: 500,
-                message: format!("unexpected daemon reply: {reply}"),
-                required_max_seq: None,
-            };
-        }
-
-        // Keep the model warm: this decide reached the daemon and got a
-        // `decided` reply — success or embedded error — so the idle-eviction
-        // clock resets just like a completed chat generate does
-        // (complete.rs's `meta.last_activity = Instant::now()` after a
-        // successful `engine_clone.generate`).
-        {
-            let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-            meta.requests_served = meta.requests_served.saturating_add(1);
-            meta.last_activity = std::time::Instant::now();
-        }
-
-        if let Some(err) = reply.get("error") {
-            let status = err.get("status").and_then(|v| v.as_u64()).unwrap_or(500) as u16;
-            let message = err
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("decide failed")
-                .to_string();
-            let required_max_seq = err.get("required_max_seq").and_then(|v| v.as_u64());
-
-            // Above the context ceiling chat also stops at, return the
-            // daemon's 422 (with its required_max_seq) as-is, no reload.
-            if attempt == 0 && !cancelled.load(Ordering::Relaxed) {
-                if let Some(n) = required_max_seq.filter(|&n| n <= MAX_SEQ_CEILING) {
-                    let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-                    let target = runtime
-                        .current_path
-                        .as_ref()
-                        .map(|p| p.display().to_string());
-                    if let Some(target) = target {
-                        match runtime.ensure_model(&target, &shared.meta, Some(n)) {
-                            Ok(_) => {
-                                drop(runtime);
-                                continue;
-                            }
-                            Err(reload_err) => {
-                                drop(runtime);
-                                return DecideOutcome::Err {
-                                    status: 500,
-                                    message: format!(
-                                        "decide: reload for required_max_seq={n} failed: \
-                                         {reload_err:#}"
-                                    ),
-                                    required_max_seq: None,
-                                };
-                            }
-                        }
+        // Session mode (spec §12.6): project `messages` / `tools` /
+        // `tool_choice` exactly as a chat request is projected, so the
+        // daemon renders the conversation the chat path cached.
+        let session = match body.get("messages") {
+            None => None,
+            Some(_) => match super::complete::project_request_contract(
+                &body,
+                &resolved,
+                super::complete::include_reasoning_content(runtime.current_arch.as_deref()),
+                false,
+            ) {
+                Ok(c) => Some((c.messages, c.forwarded_tools)),
+                Err(e) => {
+                    return DecideOutcome::Err {
+                        status: 422,
+                        message: format!("{e:#}"),
+                        required_max_seq: None,
                     }
                 }
+            },
+        };
+        let calibration = match calibration_message(&resolved) {
+            Ok(c) => c,
+            Err(e) => {
+                return DecideOutcome::Err {
+                    status: 500,
+                    message: format!("decide calibration config: {e:#}"),
+                    required_max_seq: None,
+                }
             }
-            return DecideOutcome::Err {
-                status,
-                message,
-                required_max_seq,
-            };
-        }
+        };
+        // Echo the model the way chat and `/health` report it (the tag
+        // when one was requested); the filesystem path only as fallback.
+        let echo = shared
+            .meta
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current_model
+            .clone()
+            .or_else(|| {
+                runtime
+                    .current_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+            })
+            .unwrap_or(target);
+        (runtime.engine.clone(), echo, session, calibration)
+    };
 
-        return DecideOutcome::Ok {
-            model: model_echo,
-            answers: reply["answers"].clone(),
-            usage: reply["usage"].clone(),
-            timing: reply["timing"].clone(),
+    let id = request_id();
+    let mut msg = serde_json::json!({"type": "decide", "id": id});
+    // `_debug_no_snapshot` is deliberately not forwarded: it is a daemon-
+    // level gate knob (gates.py talks to the daemon directly), not API.
+    // messages / tools are forwarded projected (below), never raw.
+    for key in ["state", "questions"] {
+        if let Some(v) = body.get(key) {
+            msg[key] = v.clone();
+        }
+    }
+    if let Some((messages, tools)) = &session {
+        msg["messages"] = messages.clone();
+        if let Some(tools) = tools {
+            msg["tools"] = tools.clone();
+        }
+    }
+    if let Some(c) = &calibration {
+        msg["calibration"] = c.clone();
+    }
+    let reply = match engine.request(&msg) {
+        Ok(v) => v,
+        Err(e) => {
+            return DecideOutcome::Err {
+                status: 500,
+                message: format!("daemon: {e}"),
+                required_max_seq: None,
+            }
+        }
+    };
+    if reply.get("type").and_then(|v| v.as_str()) != Some("decided") {
+        return DecideOutcome::Err {
+            status: 500,
+            message: format!("unexpected daemon reply: {reply}"),
+            required_max_seq: None,
         };
     }
-    DecideOutcome::Err {
-        status: 500,
-        message: "decide: context growth retry exhausted".to_string(),
-        required_max_seq: None,
+
+    // Keep the model warm: this decide reached the daemon and got a
+    // `decided` reply — success or embedded error — so the idle-eviction
+    // clock resets just like a completed chat generate does
+    // (complete.rs's `meta.last_activity = Instant::now()` after a
+    // successful `engine_clone.generate`).
+    {
+        let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.requests_served = meta.requests_served.saturating_add(1);
+        meta.last_activity = std::time::Instant::now();
+    }
+
+    if let Some(err) = reply.get("error") {
+        let status = err.get("status").and_then(|v| v.as_u64()).unwrap_or(500) as u16;
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("decide failed")
+            .to_string();
+        let required_max_seq = err.get("required_max_seq").and_then(|v| v.as_u64());
+        return DecideOutcome::Err {
+            status,
+            message,
+            required_max_seq,
+        };
+    }
+
+    DecideOutcome::Ok {
+        model: model_echo,
+        answers: reply["answers"].clone(),
+        usage: reply["usage"].clone(),
+        timing: reply["timing"].clone(),
     }
 }
 
@@ -331,11 +291,10 @@ pub(crate) async fn handle_decide(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
     guard: AdmissionGuard,
-    cancelled: Arc<AtomicBool>,
 ) -> Response<BoxBody> {
     let (tx, rx) = tokio::sync::oneshot::channel::<DecideOutcome>();
     tokio::task::spawn_blocking(move || {
-        let outcome = run_decide(&shared, body, guard, &cancelled);
+        let outcome = run_decide(&shared, body, guard);
         let _ = tx.send(outcome);
     });
     // `rx.await` merely observes completion; dropping this future (hyper
