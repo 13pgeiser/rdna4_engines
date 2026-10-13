@@ -1150,6 +1150,8 @@ fn routed_rows_grouped(
         false,
         false,
         false,
+        // Gemma 4 experts are device-resident: no host-mapped coalesced read.
+        false,
     )?;
     gpu.moe_gate_up_unscatter_k8(
         b.gate_up_grouped,

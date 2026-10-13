@@ -254,34 +254,10 @@ impl AttentionFamily {
     /// Attend-only twin of [`Self::run_attention`]: identical `ShapeInfo`
     /// derivation and attend dispatch, but the KV-cache write is SKIPPED.
     /// Used by the gfx1100 FA-prep KV-fold path, where the write already
-    /// happened as an epilogue of the prep kernel. The caller is responsible
-    /// for guaranteeing the write actually ran (right cache layout, right
-    /// position) before calling this.
-    pub fn run_attend_only(
-        &self,
-        ctx: &DispatchCtx,
-        gpu: &mut Gpu,
-        plan: &crate::families::kv_tier::KvTierPlan,
-        io: &AttnParams,
-    ) -> Result<(), DispatchError> {
-        let shape = ShapeInfo {
-            batch_size: plan.batch_size,
-            head_dim: io.head_dim,
-            m: if plan.batch_size > 1 {
-                io.max_ctx_len
-            } else {
-                io.pos + 1
-            },
-            is_tree: io.tree_bias.is_some(),
-        };
-        let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
-        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
-            DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
-        })
-    }
-
-    /// Attend against an already-populated cache without writing the current
-    /// row: KV-shared layers and draft heads read another layer's cache.
+    /// happened as an epilogue of the prep kernel, and by Gemma 4 KV-shared
+    /// layers and draft heads, which read another layer's cache. The caller
+    /// is responsible for guaranteeing the write actually ran (right cache
+    /// layout, right position) before calling this.
     pub fn run_attend_only(
         &self,
         ctx: &DispatchCtx,
