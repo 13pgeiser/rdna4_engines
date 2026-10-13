@@ -1085,17 +1085,13 @@ impl Qwen4Bundle {
         if let Some(forward)=&mut self.execution { forward.begin_npu_trunk_request(); }
     }
 
-    pub(crate) fn note_npu_trunk_pair(&mut self, rows: [usize; 2], position: usize) {
-        if let Some(forward)=&mut self.execution {forward.note_npu_trunk_pair(rows,position);}
-    }
-
     /// The first still-pending snapshot boundary strictly after `position`.
     pub(crate) fn session_boundary_after(&self, position: usize) -> Option<usize> {
         self.session.as_ref()?.next_boundary_after(position)
     }
 
-    /// Banks and snapshot cut of the planned pair starting at `position` (the
-    /// executor and the numerical twin both chunk from this shape).
+    /// Banks and snapshot cut of the planned pair starting at `position`, the
+    /// geometry both the pair executor and the MTP head appends follow.
     pub(crate) fn npu_trunk_pair_shape(&self, position: usize, remaining: usize, chunk: usize) -> Option<crate::gpu_forward::PairShape> {
         let banks = self.execution.as_ref()?.npu_trunk_pair(position, remaining, chunk)?;
         Some(crate::gpu_forward::PairShape::new(banks, position, self.session_next_boundary()))
@@ -1108,28 +1104,12 @@ impl Qwen4Bundle {
             after: next.and_then(|next| self.session_boundary_after(next)),
         };
         let planned = self.execution.as_ref().is_some_and(|f| f.npu_trunk_pair(position, end - position, chunk).is_some());
-        let cuts = self.execution.as_ref().is_some_and(|f| f.npu_trunk_cuts_admitted());
-        crate::gpu_forward::qwen4_prefill_segment_rows(position, end, chunk, boundaries, planned, cuts)
+        crate::gpu_forward::qwen4_prefill_segment_rows(position, end, chunk, boundaries, planned)
     }
 
     fn spec_prefill_capacity(&self, chunk: usize) -> usize {
         if self.npu_trunk_pipelined() {chunk*2}else{chunk}
     }
-
-    /// Scope a selected GPU-twin bank, restoring even when its forward fails.
-    pub(crate) fn with_npu_trunk_coverage<R>(
-        &mut self, covered: bool, run: impl FnOnce(&mut Self)->R,
-    ) -> R {
-        let prior=self.execution.as_mut().map(|f| {
-            let prior=f.npu_covered_scope; f.npu_covered_scope=covered; prior
-        });
-        let result=run(self);
-        if let (Some(prior),Some(f))=(prior,self.execution.as_mut()) {
-            f.npu_covered_scope=prior;
-        }
-        result
-    }
-
     /// The `<|im_end|>` token message-end snapshots split after, when active.
     fn turn_end_token_active(&self) -> Option<u32> {
         self.turn_end_token.filter(|_| self.turn_snapshots)

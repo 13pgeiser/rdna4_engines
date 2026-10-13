@@ -494,8 +494,8 @@ Auto derives n* once at load. Each request's uncached prompt segment runs
 rebanked ranges are projected to ordinary GPU chunks, never force-paired. The
 logged executable projection reflects those restrictions; a second snapshot row
 inside a pair may additionally shorten a candidate group. Rebalanced pairs and
-in-bank snapshot cuts need the invariant prefill profile (launch routing that
-does not depend on a launch's rows); without it only natural pairs run.
+in-bank snapshot cuts run in the default profile too: partial Core windows route as
+their bank (`with_bank_routing`), and banks need at least 512 rows.
 
 For the historical stock-v2/overlay-v2 planner records, executable pair starts/lengths are:
 8000: none; 9000: `(0,9000)` (4544+4456); 9319: `(0,9319)` (4672+4647);
@@ -581,7 +581,7 @@ resources, logs one refusal and remains GPU-only.
 
 Both `on` and `emulate` use the same deterministic, segment-local pair plan.
 Only paired banks use BF16-direct numerics: `on`/`auto` consume NPU results, while
-`emulate` executes the exact IU8 twin sequentially, one bank at a time.
+`emulate` computes them with the exact IU8 twin on the GPU inside the same pair executor.
 Unpaired chunks/tails, rows below 512, decode and uncovered paths retain the
 incumbent GPU projections in **both** modes: z/a/b take the same A4/IU4 overlay
 route as `off` wherever that native route applies. No paired input projection
@@ -594,7 +594,10 @@ Under `on` the GPU packs A, then the mixer core directly reads read-only BF16
 `Bf16Arena` views of fused C; **there is no consume/retile pass**. Explicit
 `GdnTrunkArenas`/`QsaTrunkArenas` arguments select arena launchers only for
 `Core`; omitted views retain the incumbent native scratch path. `emulate`
-keeps the IU8 twin and its native projection scratch. Out-projections and
+runs the same layer-major pair executor: its `prepare` runs the IU8 twin
+projection into scratch where `on` packs and kicks, and its Core reads that
+scratch. Bank B therefore owns private copies of the in-projection outputs
+(`NpuBankKind::Emulated`, about 1.1 GiB more than `on`). Out-projections and
 GPU recurrence/attention/HC/MoE remain native.
 
 Each arena family is `Option<Bf16Arena>`: GDN's fused convolution/parameter
@@ -689,8 +692,7 @@ planner's rebalanced last pair (two banks of about equal rows, 64-row aligned
 split, each at least `max(512, min_bank_rows)`, e.g. 9,319 as 4672+4647 or the
 57K tail 8404 as 4224+4180) runs the same executor: both banks bind their live
 rows (`bind_bank_rows`; bank A's full extents are restored after the pair) and
-bank B's state view advances by A's rows. The GPU numerical twin uses exactly
-the same bank boundaries. A shorter unpaired chunk remains sequential. For
+bank B's state view advances by A's rows. `emulate` runs the same banks. A shorter unpaired chunk remains sequential. For
 example, 16200 rows are one 8192+8008 pair, 20000 are a full pair plus 3616
 sequential rows, and 40000 are two full pairs plus 7232 sequential rows. For
 each layer:
@@ -785,8 +787,8 @@ chat requests both dispatch through these same generate routes.
 `on` and admitted `auto` double `spec_hidden` to 16384 rows; verify windows and MTP append
 scratch keep their original capacities. MTP head append still runs separate
 A/B subchunks with the original fill-row boundaries and prompt-ID uploads:
-bank B reads hidden rows starting at 8192 under `on`/`auto`, or 0 after its separate
-target forward under `emulate`. Pending hidden names the last row of B.
+bank B reads hidden rows starting at its bank offset in every mode.
+Pending hidden names the last row of B.
 Only the final bank of a prompt-ending pair runs the target pick; other pairs
 capture silently. Forced modes log their first scheduled pair once:
 `npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt.
@@ -801,12 +803,15 @@ the second launch starts from `next_lengths_after(r)`; the PLE grouped depthwise
 step of that bank splits at the same row. The staged copies (GDN recurrent +
 conv state, QSA selected indices, PLE conv state) are taken after the first
 launch and never after the second; the layer's input projections, output
-projection, HC and MoE stay bank-wide. A second interior snapshot row (or any
-interior row without the invariant prefill profile) ends the group at the
-first boundary as an ordinary sequential bank. The numerical twin cuts at the
-same rows (`PairShape::pieces`: the banks, further split at the cut), so
-`on == emulate` holds by construction; the Halo comparison must retain the
-default cache and exercise a later prefix hit at 8192 after a rebalanced pair.
+projection, HC and MoE stay bank-wide. A second interior snapshot row ends the
+group at the first boundary as an ordinary sequential bank. `emulate` runs the
+very same `pair_scoped` (same banks, same Core windows, same staging and
+publishing: `launch_geometry` is the single source), with its GPU twin
+projection in place of pack + kick, so `on == emulate` holds by construction;
+the Halo comparison must retain the default cache and exercise a later prefix
+hit at 8192 after a rebalanced pair. Partial windows launch under the routing
+of a canonical whole chunk (`with_bank_routing`), so no invariant-profile
+setting is needed and banks must have at least 512 rows.
 See the staging layout and cost details below.
 Generic resumed target advances whose pending snapshot cursor is already behind
 their position remain native until that snapshot is reported by its owner.
@@ -947,8 +952,8 @@ append-only row deltas above the parent and pins that parent. A staged snapshot
 therefore supplies A's lengths over the still-valid live prefixes, plus staged
 fixed bytes. Publication uses the unchanged `SessionCache::at_boundary`:
 after the pair and A's MTP head append, before B's head append; AR publishes
-after the pair. `emulate` publishes from ordinary sequential live owners after
-A, without staging. The next B-end snapshot is ordinary in both arms.
+inside `pair()` at the snapshot row. `emulate` runs the same pair executor and
+publishes the same way. The next B-end snapshot is ordinary in all modes.
 
 Additional device memory is the sum of trunk fixed-part byte sizes, independent
 of prompt length; no KV mirror and no extra MTP mirror are allocated. At pinned

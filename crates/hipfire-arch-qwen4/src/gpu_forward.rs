@@ -2561,6 +2561,30 @@ impl NpuBankLifetime {
     }
 }
 
+/// Which pair executor owns bank B. Under `Npu` the in-projection outputs live
+/// in the per-bank NPU C arenas across the switch; under `Emulated` the GPU
+/// twin projection writes them into scratch one layer ahead of their Core, so
+/// bank B keeps its own copies instead of sharing bank A's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NpuBankKind {
+    Npu,
+    Emulated,
+}
+
+impl NpuBankKind {
+    /// Whether bank B owns `field` (rather than borrowing bank A's).
+    fn owns(self, field: ScratchField) -> bool {
+        use ScratchField as F;
+        field.npu_bank_lifetime().private()
+            || (self == Self::Emulated
+                && matches!(
+                    field,
+                    F::Projection | F::GdnA | F::GdnB | F::GdnZ
+                        | F::QsaIndex | F::QsaQgate | F::QsaK | F::QsaV
+                ))
+    }
+}
+
 /// One field of a scratch plan.
 ///
 /// `owner == None`: the field owns a device allocation of `elements` of
@@ -2640,8 +2664,10 @@ pub struct Qwen4GpuForwardScratch {
     /// The plan this scratch was built from, in [`ScratchField`] order.
     pub(crate) slots: Vec<ScratchSlot>,
     /// NPU bank B borrows every layer-local field from bank A; only the
-    /// bank-private lifetimes are owned here. Bank A outlives this view.
-    bank_a_borrowed: bool,
+    /// bank-private lifetimes (and, under `emulate`, the in-projection outputs
+    /// its twin projection writes ahead of the consuming Core) are owned here.
+    /// Bank A outlives this view.
+    bank_kind: Option<NpuBankKind>,
     pub token_ids: GpuTensor,
     pub embedding_rot: GpuTensor,
     pub embeddings: GpuTensor,
@@ -3062,11 +3088,13 @@ impl Qwen4GpuForwardScratch {
         gpu: &mut Gpu,
         config: &Qwen4Config,
         bank_a: &Self,
+        emulated: bool,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
         if bank_a.mode != Qwen4ForwardScratchMode::Full {
             return Err(invalid("NPU shared bank requires full scratch"));
         }
-        Self::allocate(gpu, config, bank_a.max_chunk, bank_a.mode, Some(bank_a))
+        let kind = if emulated { NpuBankKind::Emulated } else { NpuBankKind::Npu };
+        Self::allocate(gpu, config, bank_a.max_chunk, bank_a.mode, Some((bank_a, kind)))
     }
 
     #[cfg(test)]
@@ -3075,13 +3103,14 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
     ) -> Result<u64, Qwen4GpuForwardError> {
         let (slots, _) = Self::plan(config, max_chunk, Qwen4ForwardScratchMode::Full)?;
-        Self::npu_bank_plan_bytes(&slots)
+        Self::npu_bank_plan_bytes(&slots, false)
     }
 
-    fn npu_bank_plan_bytes(slots: &[ScratchSlot]) -> Result<u64, Qwen4GpuForwardError> {
+    fn npu_bank_plan_bytes(slots: &[ScratchSlot], emulated: bool) -> Result<u64, Qwen4GpuForwardError> {
+        let kind = if emulated { NpuBankKind::Emulated } else { NpuBankKind::Npu };
         slots.iter().enumerate().try_fold(0u64, |total, (index, slot)| {
             // The exhaustive field table is shared by allocation and freeing.
-            let private = ScratchField::ALL[index].npu_bank_lifetime().private();
+            let private = kind.owns(ScratchField::ALL[index]);
             total.checked_add(if private { slot.bytes()? as u64 } else { 0 })
                 .ok_or_else(|| invalid("NPU bank device bytes overflow"))
         })
@@ -3092,14 +3121,16 @@ impl Qwen4GpuForwardScratch {
         config: &Qwen4Config,
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
-        bank_a: Option<&Self>,
+        bank: Option<(&Self, NpuBankKind)>,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        let bank_a = bank.map(|(bank_a, _)| bank_a);
+        let bank_kind = bank.map(|(_, kind)| kind);
         let (slots, max_ple_bytes) = Self::plan(config, max_chunk, mode)?;
         // Owners first; a view needs its owner's pointer.
         let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
         for (index, slot) in slots.iter().enumerate() {
             if slot.owner.is_some()
-                || (bank_a.is_some() && !ScratchField::ALL[index].npu_bank_lifetime().private())
+                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
             {
                 tensors.push(None);
                 continue;
@@ -3127,7 +3158,7 @@ impl Qwen4GpuForwardScratch {
         if let Some(bank_a) = bank_a {
             for (index, slot) in slots.iter().enumerate() {
                 let field = ScratchField::ALL[index];
-                if !field.npu_bank_lifetime().private() {
+                if !bank_kind.expect("a borrowed bank has a kind").owns(field) {
                     tensors[index] = Some(bank_a.field_tensor(field).sub_offset(0, slot.elements));
                 }
             }
@@ -3141,7 +3172,7 @@ impl Qwen4GpuForwardScratch {
         let scratch = Self {
             max_chunk,
             mode,
-            bank_a_borrowed: bank_a.is_some(),
+            bank_kind,
             token_ids: take(F::TokenIds),
             embedding_rot: take(F::EmbeddingRot),
             embeddings: take(F::Embeddings),
@@ -3311,7 +3342,7 @@ impl Qwen4GpuForwardScratch {
     /// freed once, through its owner.
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let slots = self.slots;
-        let bank_a_borrowed = self.bank_a_borrowed;
+        let bank_kind = self.bank_kind;
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -3376,7 +3407,7 @@ impl Qwen4GpuForwardScratch {
         let mut first = None;
         for (index, (tensor, slot)) in tensors.into_iter().zip(slots).enumerate() {
             if slot.owner.is_some()
-                || (bank_a_borrowed && !ScratchField::ALL[index].npu_bank_lifetime().private())
+                || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
             {
                 continue;
             }
@@ -3513,8 +3544,6 @@ pub struct Qwen4GpuForward {
     /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
-    /// Only GPU-twin banks selected by the same pair plan may use IU8.
-    pub(crate) npu_covered_scope: bool,
     #[cfg(target_os = "linux")]
     npu_trunk: Option<npu_forward::NpuForward>,
 }
@@ -3947,12 +3976,14 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             lane_scope: false,
             prefill_scope: false,
-            npu_covered_scope: false,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
     }
 
+    /// Whether planned pairs run layer-major through the pair executor (`on`,
+    /// `auto`, and `emulate` with a bank-B scratch): the capture capacity covers
+    /// both banks of a group.
     pub(crate) fn npu_trunk_pipelined(&self) -> bool {
         #[cfg(target_os = "linux")]
         { self.npu_trunk.as_ref().is_some_and(|n|n.pipelined()) }
@@ -3985,16 +4016,6 @@ impl Qwen4GpuForward {
         { self.npu_trunk.as_ref().and_then(|n| n.selected_pair(position, remaining, chunk)) }
         #[cfg(not(target_os = "linux"))]
         { let _ = (position, remaining, chunk); None }
-    }
-
-    /// Whether pairs may run an in-bank Core sub-launch at a session snapshot
-    /// row or split into banks other than 8192 + B. Both need the invariant
-    /// prefill profile, whose routing does not depend on a launch's rows.
-    pub(crate) fn npu_trunk_cuts_admitted(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        { self.npu_trunk.is_some() && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() }
-        #[cfg(not(target_os = "linux"))]
-        { false }
     }
 
     pub(crate) fn note_npu_trunk_pair(&mut self, rows: [usize; 2], position: usize) {
@@ -4644,36 +4665,23 @@ impl Qwen4GpuForward {
         )?;
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         let mut offset = 0usize;
-        let mut covered_until=0;
-        // The numerical twin's chunks of a covered group: the pair's banks split
-        // at an interior session snapshot row (absolute offsets in `tokens`).
-        let mut twin_chunks: Vec<std::ops::Range<usize>> = Vec::new();
         while offset < tokens.len() {
+            // A planned pair (`on`, `auto` and `emulate` alike) runs layer-major
+            // through the pair executor; everything else is an ordinary tile.
             #[cfg(target_os = "linux")]
-            if offset>=covered_until {
-                if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
-                {
-                    let shape=PairShape::new(banks,bundle.state.position,bundle.session_next_boundary());
-                    let rows=shape.total();
-                    self.note_npu_trunk_pair(banks,bundle.state.position);
-                    if self.npu_trunk_pipelined() {
-                        let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
-                        let output=if output_rows==Qwen4OutputRows::All || final_pair {
-                            Qwen4OutputPolicy::Rows(output_rows)
-                        } else { Qwen4OutputPolicy::None };
-                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,Some(logits),top1,wide_hidden_capture,output)?;
-                        offset+=rows;
-                        continue;
-                    }
-                    covered_until=offset+rows;
-                    twin_chunks=shape.pieces().into_iter().map(|piece|offset+piece.start..offset+piece.end).collect();
-                }
+            if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
+            {
+                let rows=banks[0]+banks[1];
+                self.note_npu_trunk_pair(banks,bundle.state.position);
+                let final_pair=self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                let output=if output_rows==Qwen4OutputRows::All || final_pair {
+                    Qwen4OutputPolicy::Rows(output_rows)
+                } else { Qwen4OutputPolicy::None };
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,Some(logits),top1,wide_hidden_capture,output)?;
+                offset+=rows;
+                continue;
             }
-            let rows = if offset<covered_until {
-                twin_chunks.iter().find(|piece|piece.start==offset).map_or_else(
-                    ||Err(invalid("npu-trunk: twin chunk does not start at the offset")),
-                    |piece|Ok(piece.len()))?
-            } else { (tokens.len() - offset).min(max_chunk) };
+            let rows = (tokens.len() - offset).min(max_chunk);
             // The caller's lookahead belongs to the final tile; earlier tiles
             // look ahead to the next tile.
             let final_chunk =
@@ -4719,9 +4727,7 @@ impl Qwen4GpuForward {
             } else {
                 Qwen4OutputPolicy::None
             };
-            let prior_covered=self.npu_covered_scope;
-            self.npu_covered_scope |= offset<covered_until;
-            let result=self.forward_chunk_inner(
+            self.forward_chunk_inner(
                 bundle,
                 gpu,
                 &tokens[offset..offset + rows],
@@ -4730,12 +4736,7 @@ impl Qwen4GpuForward {
                 top1_chunk.as_ref(),
                 capture_chunk.as_ref(),
                 output_policy,
-            );
-            self.npu_covered_scope=prior_covered;
-            result?;
-            if offset < covered_until && bundle.pair_boundary_is_ar() {
-                bundle.publish_pair_session_boundary(gpu, bundle.state.position).map_err(|e| invalid(e.to_string()))?;
-            }
+            )?;
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -4776,31 +4777,18 @@ impl Qwen4GpuForward {
         self.prefetch_first_tile_ple(bundle, tokens);
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
-        let mut covered_until=0;
-        let mut twin_chunks: Vec<std::ops::Range<usize>> = Vec::new();
         while offset < tokens.len() {
             #[cfg(target_os = "linux")]
-            if offset>=covered_until {
-                if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
-                {
-                    let shape=PairShape::new(banks,bundle.state.position,bundle.session_next_boundary());
-                    let rows=shape.total();
-                    self.note_npu_trunk_pair(banks,bundle.state.position);
-                    if self.npu_trunk_pipelined() {
-                        self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
-                        npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
-                        offset+=rows;
-                        continue;
-                    }
-                    covered_until=offset+rows;
-                    twin_chunks=shape.pieces().into_iter().map(|piece|offset+piece.start..offset+piece.end).collect();
-                }
+            if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
+            {
+                let rows=banks[0]+banks[1];
+                self.note_npu_trunk_pair(banks,bundle.state.position);
+                self.set_tile_ple_lookahead(tokens,offset,rows,&mut caller_lookahead);
+                npu_forward::run_pair_request(self,bundle,gpu,&tokens[offset..offset+rows],offset,banks,None,None,wide_hidden_capture,Qwen4OutputPolicy::None)?;
+                offset+=rows;
+                continue;
             }
-            let rows = if offset<covered_until {
-                twin_chunks.iter().find(|piece|piece.start==offset).map_or_else(
-                    ||Err(invalid("npu-trunk: twin chunk does not start at the offset")),
-                    |piece|Ok(piece.len()))?
-            } else { (tokens.len() - offset).min(max_chunk) };
+            let rows = (tokens.len() - offset).min(max_chunk);
             self.set_tile_ple_lookahead(tokens, offset, rows, &mut caller_lookahead);
             let capture_chunk = wide_hidden_capture
                 .zip(capture_width)
@@ -4814,9 +4802,7 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
-            let prior_covered=self.npu_covered_scope;
-            self.npu_covered_scope |= offset<covered_until;
-            let result=self.forward_chunk_inner(
+            self.forward_chunk_inner(
                 bundle,
                 gpu,
                 &tokens[offset..offset + rows],
@@ -4825,12 +4811,7 @@ impl Qwen4GpuForward {
                 None,
                 capture_chunk.as_ref(),
                 Qwen4OutputPolicy::None,
-            );
-            self.npu_covered_scope=prior_covered;
-            result?;
-            if offset < covered_until && bundle.pair_boundary_is_ar() {
-                bundle.publish_pair_session_boundary(gpu, bundle.state.position).map_err(|e| invalid(e.to_string()))?;
-            }
+            )?;
             offset = offset
                 .checked_add(rows)
                 .ok_or_else(|| invalid("Qwen4 chunk offset overflows"))?;
@@ -5220,14 +5201,7 @@ impl Qwen4GpuForward {
         // parity observer keeps its historical unsplit transport. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
         // stream and its failure recovery synchronizes the device.
-        let npu_armed = {
-            #[cfg(target_os = "linux")]
-            { self.npu_covered_scope && n>=512
-                && self.npu_trunk.as_ref().is_some_and(|n|!n.pipelined()) }
-            #[cfg(not(target_os = "linux"))]
-            { false }
-        };
-        let expert_stage = match self.expert_stage.as_ref().filter(|_| !npu_armed) {
+        let expert_stage = match self.expert_stage.as_ref() {
             Some(stage)
                 if n >= stage.min_rows
                     && (stage.capture || wide_hidden_capture.is_none())
@@ -6023,21 +5997,7 @@ impl Qwen4GpuForward {
                         ))
                     })
                 };
-                if npu_armed {
-                    #[cfg(target_os = "linux")]
-                    {
-                        let npu = self.npu_trunk.as_ref().expect("armed");
-                        match ple_split {
-                            Some(split) => {
-                                let layer = steps[..split].iter().filter(|s| matches!(s, Step::GatedDeltaNet(_) | Step::IndexedAttention(_))).count();
-                                npu.execute_emulate(gpu, &ctx, &mut steps[..split], 0)?;
-                                stage_ple(gpu)?;
-                                npu.execute_emulate(gpu, &ctx, &mut steps[split..], layer)?;
-                            }
-                            None => npu.execute_emulate(gpu, &ctx, &mut steps, 0)?,
-                        }
-                    }
-                } else if let Some(tap) = self.qsa_tap.as_mut() {
+                if let Some(tap) = self.qsa_tap.as_mut() {
                     // Parity tap: run up to and including each QSA step, then
                     // let the observer read that layer's scratch and state.
                     let mut start = 0;
@@ -7274,12 +7234,12 @@ pub(crate) struct SessionBoundaries {
 }
 
 /// A shared deterministic singleton/MTP schedule. A planned pair covers
-/// `min(remaining, 2 * chunk)` rows. With `cuts` one interior session boundary
-/// rides the in-bank Core sub-launch; a second interior boundary (or `cuts`
-/// off) ends the group at the first one, as an ordinary sequential bank.
+/// `min(remaining, 2 * chunk)` rows. One interior session boundary rides the
+/// in-bank Core sub-launch; a second interior boundary ends the group at the
+/// first one, as an ordinary sequential bank.
 pub(crate) fn qwen4_prefill_segment_rows(
     position: usize, prompt_end: usize, chunk: usize,
-    boundaries: SessionBoundaries, planned: bool, cuts: bool,
+    boundaries: SessionBoundaries, planned: bool,
 ) -> usize {
     let remaining = prompt_end.saturating_sub(position);
     let pair = planned && chunk == 8192 && remaining > chunk;
@@ -7287,19 +7247,12 @@ pub(crate) fn qwen4_prefill_segment_rows(
     let Some(boundary) = boundaries.next else { return rows; };
     if boundary <= position { return remaining.min(chunk); }
     let distance = boundary - position;
-    if pair && cuts {
+    if pair {
         if distance < rows && boundaries.after.is_some_and(|next| next < position + rows) {
             return distance.min(chunk);
         }
         return rows;
     }
-    if pair && distance == chunk {
-        // Another boundary inside B would need a sub-launch.
-        return if boundaries.after.is_some_and(|next| next < position + rows) { chunk } else { rows };
-    }
-    // Without sub-launches an interior B boundary must leave A as an ordinary
-    // sequential bank.
-    if pair && distance > chunk && distance < rows { return chunk; }
     rows.min(distance)
 }
 

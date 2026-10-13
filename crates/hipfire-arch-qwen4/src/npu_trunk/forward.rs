@@ -358,13 +358,17 @@ impl NpuForward {
                     [registered_c_view(rt, 1, Shape::GdnIn, families)?, registered_c_view(rt, 1, Shape::QsaIn, families)?],
                 ])
             }).transpose()?;
-            let (bank_b,host_tokens,host_ple) = if physical {
-                let (scratch,ids,ple)=Qwen4GpuForwardScratch::new_npu_bank(gpu,&bundle.config,scratch)?;
+            // `emulate` runs the same pair executor as `on` (twin projection
+            // instead of pack + kick), so it needs bank B too; its in-projection
+            // outputs land in scratch, so bank B keeps private copies of them.
+            let pairable = physical || (rows == 8192 && scratch_mode == Qwen4ForwardScratchMode::Full && bundle.weights.ep_placement().is_none());
+            let (bank_b,host_tokens,host_ple) = if pairable {
+                let (scratch,ids,ple)=Qwen4GpuForwardScratch::new_npu_bank(gpu,&bundle.config,scratch,!physical)?;
                 (Some(scratch),ids,ple)
             } else { (None,Vec::new(),Vec::new()) };
             let zab_source = if pre_overlay { "stock-MQ6-DtoH-before-overlay" } else { "stock-MQ6-DtoH" };
             let bank_b_bytes = match bank_b.as_ref() {
-                Some(bank) => Qwen4GpuForwardScratch::npu_bank_plan_bytes(&bank.slots)?,
+                Some(bank) => Qwen4GpuForwardScratch::npu_bank_plan_bytes(&bank.slots, !physical)?,
                 None => 0,
             };
             if let (Some(cal), Some(key)) = (&calibration, &cal_key) {
@@ -379,7 +383,9 @@ impl NpuForward {
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
     }
-    pub(super) fn pipelined(&self) -> bool { self.mode != NpuTrunkMode::Emulate }
+    /// Pairs run layer-major through the pair executor: `on`/`auto` on the NPU,
+    /// `emulate` with the GPU twin projection in its place.
+    pub(super) fn pipelined(&self) -> bool { self.bank_b.is_some() }
     pub(super) fn begin_request(&mut self) { self.pair_logged=false; self.request_plan=None; }
     pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
         if self.request_plan.is_some() || self.mode != NpuTrunkMode::Auto { return; }
@@ -390,13 +396,15 @@ impl NpuForward {
         self.request_origin = position;
         self.request_plan = Some(executable);
     }
-    /// Rows of banks A and B of the pair starting at `position`. Banks other
-    /// than 8192 + B need the invariant prefill profile (rows-independent routing).
+    /// Rows of banks A and B of the pair starting at `position`: the plan's
+    /// split (or the natural 8192 + B in forced modes). `None` without a bank-B
+    /// scratch (an `emulate` load that cannot hold one runs every chunk native).
     pub(super) fn selected_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
+        self.bank_b.as_ref()?;
         if self.mode != NpuTrunkMode::Auto { return pair_rows(remaining, chunk).map(|rows| [chunk, rows - chunk]); }
         if chunk != trunk::CHUNK { return None; }
         let (a, b) = trunk::planned_pair(self.request_plan.as_ref()?, position.checked_sub(self.request_origin)?)?;
-        (a + b <= remaining && (a == chunk || rdna_compute::prefill_invariant::prefill_pm_invariant_enabled())).then_some([a, b])
+        (a + b <= remaining).then_some([a, b])
     }
     pub(super) fn note_pair(&mut self, rows: [usize; 2], position: usize) {
         if !self.pair_logged && self.mode != NpuTrunkMode::Auto {
@@ -490,36 +498,6 @@ fn execute(gpu: &mut Gpu, ctx: &DispatchCtx, steps: &[Step<'_>]) -> Result<(), Q
 fn phase(step: &mut Step<'_>, value: MixerPhase) {
     match step { Step::GatedDeltaNet(op) => op.phase=value, Step::IndexedAttention(op) => op.phase=value, _=>unreachable!() }
 }
-impl NpuForward {
-    pub(super) fn execute_emulate(&self, gpu: &mut Gpu, ctx: &DispatchCtx, steps: &mut [Step<'_>], mut layer: usize) -> Result<(), Qwen4GpuForwardError> {
-        let mut start = 0;
-        for index in 0..steps.len() {
-            if !matches!(steps[index],Step::GatedDeltaNet(_) | Step::IndexedAttention(_)) { continue; }
-            execute(gpu,ctx,&steps[start..index])?;
-            let covered = self.layers[layer].map.panel_count() != 0;
-            if covered {
-                self.emulate(gpu,layer,&steps[index])?;
-                self.uncovered(gpu,&steps[index])?;
-                phase(&mut steps[index],MixerPhase::Core);
-                execute(gpu,ctx,&steps[index..=index])?;
-                phase(&mut steps[index],MixerPhase::OutProj);
-            }
-            // Use the same layer boundaries as the pipelined route, preserving
-            // output/HC/MoE fusions but never fusing across a bank boundary.
-            let next=(index+1..steps.len()).find(|&j|matches!(steps[j],Step::GatedDeltaNet(_) | Step::IndexedAttention(_)));
-            let end=next.map_or(steps.len(),|j| {
-                let read=j-1;
-                if read>0 && matches!(steps[read-1],Step::GroupedDepthwise(_)) {read-1}else{read}
-            });
-            if covered { execute(gpu,ctx,&steps[index..end])?; }
-            else { execute_validated_steps(gpu,ctx,&steps[index..end]).map_err(fail)?; }
-            phase(&mut steps[index],MixerPhase::Whole);
-            start=end;
-            layer+=1;
-        }
-        execute(gpu,ctx,&steps[start..])
-    }
-}
 
 #[path = "layers.rs"]
 mod layers;
@@ -563,11 +541,36 @@ fn commit_qsa(bundle: &mut Qwen4Bundle, commits: &[(usize,usize,usize,usize,usiz
     }
 }
 
-/// The session snapshot staged inside a pair, and where its row falls.
+/// What one bank launches in a pair group: its place in the group, where its
+/// Core and PLE step split at the session snapshot row (`cut`, bank-local), or
+/// whether its whole-bank state is staged after it (`stage_after`: the cut is
+/// the A/B split). The single source of the launch geometry for every NPU mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BankLaunch {
+    offset: usize,
+    rows: usize,
+    cut: Option<usize>,
+    stage_after: bool,
+}
+
+fn launch_geometry(shape: PairShape) -> [BankLaunch; 2] {
+    let site = shape.site();
+    std::array::from_fn(|bank| BankLaunch {
+        offset: if bank == 0 { 0 } else { shape.rows[0] },
+        rows: shape.rows[bank],
+        cut: match site {
+            CutSite::Bank { bank: cut_bank, row } if cut_bank == bank => Some(row),
+            _ => None,
+        },
+        stage_after: bank == 0 && site == CutSite::Split,
+    })
+}
+
+/// The session snapshot staged inside a pair, and the launch geometry it follows.
 #[derive(Clone, Copy)]
 struct Snapshot<'a> {
     stage: &'a crate::bundle::PairSessionStage,
-    site: CutSite,
+    geometry: [BankLaunch; 2],
 }
 
 /// A bank whose Core splits at its local `row`: the snapshot's mixer state is
@@ -606,15 +609,17 @@ impl NpuForward {
     /// layer's projections came from the NPU.
     fn core_launch(&self, gpu: &mut Gpu, layer: usize, bank: usize, step: &Step<'_>, covered: bool, window: CoreWindow) -> Result<(),Qwen4GpuForwardError> {
         let shape = self.layers[layer].shape;
-        let tensor = covered.then(|| self.arenas.as_ref().expect("on arena views")[bank][shape.index()].as_ref().expect("selected shape arena"));
+        // Fused arenas exist only under the NPU runtime; `emulate` Core reads scratch.
+        let arenas = covered && self.arenas.is_some();
+        let tensor = arenas.then(|| self.arenas.as_ref().expect("on arena views")[bank][shape.index()].as_ref().expect("selected shape arena"));
         let map = &self.layers[layer].map;
         let family = |family| tensor.and_then(|tensor| family_view(map, tensor, family));
         match step {
-            Step::GatedDeltaNet(op) => execute_gated_delta_net_core_rows(gpu, op, covered.then(|| GdnTrunkArenas {
+            Step::GatedDeltaNet(op) => execute_gated_delta_net_core_rows(gpu, op, arenas.then(|| GdnTrunkArenas {
                 qkv: family(Family::GdnQkv), z: family(Family::GdnZ),
                 a: family(Family::GdnA), b: family(Family::GdnB),
             }), window).map_err(fail),
-            Step::IndexedAttention(op) => execute_indexed_attention_core_rows(gpu, op, covered.then(|| QsaTrunkArenas {
+            Step::IndexedAttention(op) => execute_indexed_attention_core_rows(gpu, op, arenas.then(|| QsaTrunkArenas {
                 q: family(Family::QsaQ), k: family(Family::QsaK),
                 v: family(Family::QsaV), idx: family(Family::QsaIdx),
             }), window).map_err(fail),
@@ -623,12 +628,12 @@ impl NpuForward {
     }
     fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow], snapshot: Option<Snapshot<'_>>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
-        let rt=self.runtime.as_ref().expect("on runtime");
+        let rt=self.runtime.as_ref();
         let covered = self.layers[layer].map.panel_count() != 0;
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.prep_begin, gpu.active_stream.as_ref())?;
         }
-        if covered {
+        if let (true,Some(rt)) = (covered,rt) {
             unsafe { rt.prepare_bank(bank,stream(gpu)).map_err(fail)?; }
             if let Some(r) = records.iter_mut().take(layer*2).rev().find(|r| r.bank == bank && r.seq != 0 && r.done_ns == 0) {
                 let completion=rt.wait_host(Seq { bank, value:r.seq }).map_err(fail)?;
@@ -638,10 +643,13 @@ impl NpuForward {
         // Includes PLE (when present) and the attention HC read. Neither reads
         // recurrent/QSA state; bank B's input can be prepared ahead of bank A.
         let pre = &program.steps[program.ranges[layer].start..index];
-        let ple_cut = snapshot.and_then(|snapshot| match snapshot.site {
-            CutSite::Split if bank == 0 => Some((snapshot.stage, None)),
-            CutSite::Bank { bank: cut_bank, row } if cut_bank == bank => Some((snapshot.stage, Some(row))),
-            _ => None,
+        let ple_cut = snapshot.and_then(|snapshot| {
+            let launch = snapshot.geometry[bank];
+            match (launch.cut, launch.stage_after) {
+                (Some(row), _) => Some((snapshot.stage, Some(row))),
+                (None, true) => Some((snapshot.stage, None)),
+                _ => None,
+            }
         });
         match ple_cut {
             None => execute(gpu,ctx,pre)?,
@@ -677,6 +685,12 @@ impl NpuForward {
             }
             return Ok(None);
         }
+        let Some(rt)=rt else {
+            // `emulate`: the GPU twin projection fills the bank's scratch where
+            // `on` packs and kicks; its Core then reads that scratch.
+            self.emulate(gpu,layer,&program.steps[index])?;
+            return Ok(None);
+        };
         let pack_issue_ns=self.pack(gpu,&program.steps[index],bank,true,prep_end)?;
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.pack_end, gpu.active_stream.as_ref())?;
@@ -691,11 +705,12 @@ impl NpuForward {
     }
     fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Option<Seq>, cut: Option<CoreCut<'_>>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
-        let rt=self.runtime.as_ref().expect("on runtime");
+        let rt=self.runtime.as_ref();
+        let covered = self.layers[layer].map.panel_count() != 0;
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.wait_begin, gpu.active_stream.as_ref())?;
         }
-        if let Some(seq) = seq { unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; } }
+        if let (Some(rt),Some(seq)) = (rt,seq) { unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; } }
         let wait_enqueue_ns=monotonic_ns();
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
@@ -705,7 +720,7 @@ impl NpuForward {
         }
         let rows=program.rows;
         let cut_row=cut.as_ref().map(|cut| cut.row);
-        if seq.is_none() {
+        if !covered {
             let end=program.ranges[layer].end;
             match &cut {
                 None => execute_validated_steps(gpu,ctx,&program.steps[index..end]).map_err(fail)?,
@@ -741,7 +756,8 @@ impl NpuForward {
         // cache/index appends). OutProj and the remaining layer read only scratch.
         // prepare_bank waits this event before packing A; kick records ready
         // after that wait/pack, and the relay waits ready before its next C write.
-        unsafe { rt.retire_bank(seq.expect("covered bank sequence"),stream(gpu)).map_err(fail)?; }
+        // `emulate` has no relay to retire.
+        if let (Some(rt),Some(seq))=(rt,seq) { unsafe { rt.retire_bank(seq,stream(gpu)).map_err(fail)?; } }
         phase(&mut program.steps[index],MixerPhase::OutProj);
         execute(gpu,ctx,&program.steps[index..program.ranges[layer].end])?;
         if !records.is_empty() { gpu.hip.event_record(&records[layer*2+bank].end,gpu.active_stream.as_ref())?; }
@@ -752,8 +768,10 @@ impl NpuForward {
         if banks[0]+banks[1]!=tokens.len() || !(1..=chunk).contains(&banks[0]) || !(1..=chunk).contains(&banks[1]) {
             return Err(fail("pair requires two banks of 1..=8192 live rows covering the tokens"));
         }
-        if banks[0]!=chunk && !rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() {
-            return Err(fail("a rebalanced pair requires the invariant prefill profile"));
+        // Every bank must be large enough that the Core routes of a (sub-)launch
+        // are those the bank's input projections were stored for.
+        if banks.iter().any(|&bank| bank < rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS) {
+            return Err(fail("pair banks need at least 512 live rows"));
         }
         let old_scope=std::mem::replace(&mut gpu.qwen4_scope,true);
         let invariant=owner.prefill_scope && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled();
@@ -784,7 +802,8 @@ impl NpuForward {
             }
         }
         let site=shape.site();
-        let offsets=[0,rows[0]];
+        let geometry=launch_geometry(shape);
+        let offsets=[geometry[0].offset,geometry[1].offset];
         bundle.release_session_for_growth(gpu,end);
         bundle.state.ensure_mapped_capacity(gpu,end).map_err(fail)?;
         if let Some(qsa)=bundle.state.qsa.first().filter(|q|q.f16_arena.is_none()) {
@@ -833,7 +852,7 @@ impl NpuForward {
         let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]>=programs[1].steps.iter().filter_map(|step|match step {
             Step::IndexedAttention(op)=>Some(op.next_lengths().map_err(fail)), _=>None,
         }).collect::<Result<_,_>>()?;
-        let anchor=if self.trace.is_some() { Some(gpu.hip.event_create()?) } else { None };
+        let anchor=if self.trace.is_some() && self.runtime.is_some() { Some(gpu.hip.event_create()?) } else { None };
         let mut anchor_ns=0;
         let mut anchor_uncertainty_ns=0;
         let mut records=Vec::new();
@@ -856,7 +875,7 @@ impl NpuForward {
         let mut host_tokens=std::mem::take(&mut self.host_tokens);
         let mut host_ple=std::mem::take(&mut self.host_ple);
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
-            let snapshot = stage.as_ref().map(|stage| Snapshot { stage, site });
+            let snapshot = stage.as_ref().map(|stage| Snapshot { stage, geometry });
             let mut seq=[self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,snapshot)?, None];
             // Same stream: prepare(0, A) is enqueued before bank B's
             // initialization overwrites the shared init buffers (Footprint table).
@@ -869,14 +888,14 @@ impl NpuForward {
             let mut slots = [(0usize, 0usize); 2];
             let gdn_total = bundle.state.gdn.len();
             for (layer,bank) in bank_visits(bundle.config.num_hidden_layers) {
-                let cut = match (site, &stage) {
-                    (CutSite::Bank { bank: cut_bank, row }, Some(stage)) if cut_bank == bank =>
+                let cut = match (geometry[bank].cut, &stage) {
+                    (Some(row), Some(stage)) =>
                         Some(CoreCut { stage, row, gdn_total, gdn_slot: slots[bank].0, qsa_slot: slots[bank].1 }),
                     _ => None,
                 };
                 self.run_bank(gpu,&ctx,&mut programs[bank],layer,bank,seq[bank],cut,&mut records)?;
                 let mixer = &programs[bank].steps[mixer_index(&programs[bank], layer)];
-                if bank == 0 && site == CutSite::Split {
+                if geometry[bank].stage_after {
                     if let Some(stage) = &stage {
                         copy_mixer_state(gpu, stage, mixer, gdn_total, slots[0].0, slots[0].1)?;
                     }
@@ -894,16 +913,17 @@ impl NpuForward {
             // Only already-enqueued chains are checked here. Failed terminal
             // signals may have admitted speculative fragment work, but no pair
             // output/head/capture or request state is published on that path.
-            let rt=self.runtime.as_ref().expect("on runtime");
-            for bank in 0..2 {
-                if let Some(seq) = last_seq[bank] {
-                    let completion=rt.wait_host(seq).map_err(fail)?;
-                    if let Some(r) = records.iter_mut().rev().find(|r| r.bank == bank && r.seq == seq.value) {
-                        r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns; r.signal_write_ns=completion.signal_write_ns;
+            if let Some(rt)=self.runtime.as_ref() {
+                for bank in 0..2 {
+                    if let Some(seq) = last_seq[bank] {
+                        let completion=rt.wait_host(seq).map_err(fail)?;
+                        if let Some(r) = records.iter_mut().rev().find(|r| r.bank == bank && r.seq == seq.value) {
+                            r.submit_ns=completion.submit_ns; r.done_ns=completion.done_ns; r.signal_write_ns=completion.signal_write_ns;
+                        }
                     }
                 }
+                rt.check_error().map_err(fail)?;
             }
-            rt.check_error().map_err(fail)?;
             // Both trunks finish before prompt-end head/capture work.
             finish_bank(gpu,bundle,&owner.scratch,logits,top1,capture,0,0,rows[0],output)?;
             finish_bank(gpu,bundle,b,logits,top1,capture,1,rows[0],rows[1],output)?;
@@ -1010,7 +1030,7 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
 /// The natural pair: 8192 + B (B in 512..=8192); bank B may be partial.
 pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
     if remaining < chunk + 512 { return None; }
-    let rows=qwen4_prefill_segment_rows(0,remaining,chunk,SessionBoundaries::default(),true,true);
+    let rows=qwen4_prefill_segment_rows(0,remaining,chunk,SessionBoundaries::default(),true);
     (rows>chunk).then_some(rows)
 }
 
@@ -1163,14 +1183,14 @@ mod tests {
     /// The prefill loop over a request of `end` rows from 0: `(start, rows, bank A rows, cut)`.
     /// `planned` makes every group with a partner chunk a natural pair; the plan
     /// form takes the planner's pairs.
-    fn schedule_with(end: usize, boundaries: &[usize], cuts: bool, pair_at: &dyn Fn(usize) -> Option<[usize; 2]>) -> Vec<(usize, usize, Option<usize>, Option<usize>)> {
+    fn schedule_with(end: usize, boundaries: &[usize], pair_at: &dyn Fn(usize) -> Option<[usize; 2]>) -> Vec<(usize, usize, Option<usize>, Option<usize>)> {
         let mut pos = 0;
         let mut groups = Vec::new();
         while pos < end {
             let next = boundaries.iter().copied().find(|&b| b > pos);
             let after = next.and_then(|next| boundaries.iter().copied().find(|&b| b > next));
             let pair = pair_at(pos);
-            let rows = qwen4_prefill_segment_rows(pos, end, 8192, SessionBoundaries { next, after }, pair.is_some(), cuts);
+            let rows = qwen4_prefill_segment_rows(pos, end, 8192, SessionBoundaries { next, after }, pair.is_some());
             assert!(rows > 0);
             let shape = pair.filter(|banks| banks[0] + banks[1] == rows).map(|banks| PairShape::new(banks, pos, next));
             groups.push((pos, rows, shape.map(|s| s.rows[0]), shape.and_then(|s| s.cut)));
@@ -1182,32 +1202,27 @@ mod tests {
         move |pos| pair_rows(end - pos, 8192).map(|rows| [8192, rows - 8192])
     }
     #[test] fn segments_preserve_snapshots_and_native_tails() {
-        let ranges = |end: usize, boundaries: &[usize], cuts: bool| -> Vec<std::ops::Range<usize>> {
-            schedule_with(end, boundaries, cuts, &natural_pair(end)).into_iter().map(|(start, rows, ..)| start..start + rows).collect()
+        let ranges = |end: usize, boundaries: &[usize]| -> Vec<std::ops::Range<usize>> {
+            schedule_with(end, boundaries, &natural_pair(end)).into_iter().map(|(start, rows, ..)| start..start + rows).collect()
         };
-        // Without sub-launches only the A/B split may be an interior boundary.
-        assert_eq!(ranges(16343, &[], false), vec![0..16343]);
-        assert_eq!(ranges(8703, &[], false), vec![0..8192, 8192..8703]);
-        assert_eq!(ranges(16343, &[8192, 16343], false), vec![0..16343]);
-        assert_eq!(ranges(16384, &[8192, 16384], false), vec![0..16384]);
-        assert_eq!(ranges(16384, &[8192, 10000, 16384], false), vec![0..8192, 8192..10000, 10000..16384]);
-        assert_eq!(ranges(20000, &[12000, 20000], false), vec![0..8192, 8192..12000, 12000..20000]);
-        assert_eq!(ranges(20000, &[4000, 13000, 20000], false), vec![0..4000, 4000..12192, 12192..13000, 13000..20000]);
-        // With them one interior snapshot row rides the bank's Core sub-launch;
-        // a second interior row ends the group at the first.
-        assert_eq!(ranges(16343, &[8192, 16343], true), vec![0..16343]);
-        assert_eq!(ranges(16384, &[8192, 10000, 16384], true), vec![0..8192, 8192..10000, 10000..16384]);
-        assert_eq!(ranges(20000, &[12000, 20000], true), vec![0..16384, 16384..20000]);
-        assert_eq!(ranges(20000, &[4000, 13000, 20000], true), vec![0..4000, 4000..20000]);
-        let cut = |end: usize, boundaries: &[usize]| schedule_with(end, boundaries, true, &natural_pair(end)).into_iter().map(|g| g.3).collect::<Vec<_>>();
+        assert_eq!(ranges(16343, &[]), vec![0..16343]);
+        assert_eq!(ranges(8703, &[]), vec![0..8192, 8192..8703]);
+        // One interior snapshot row rides the bank's Core sub-launch; a second
+        // interior row ends the group at the first.
+        assert_eq!(ranges(16343, &[8192, 16343]), vec![0..16343]);
+        assert_eq!(ranges(16384, &[8192, 16384]), vec![0..16384]);
+        assert_eq!(ranges(16384, &[8192, 10000, 16384]), vec![0..8192, 8192..10000, 10000..16384]);
+        assert_eq!(ranges(20000, &[12000, 20000]), vec![0..16384, 16384..20000]);
+        assert_eq!(ranges(20000, &[4000, 13000, 20000]), vec![0..4000, 4000..20000]);
+        let cut = |end: usize, boundaries: &[usize]| schedule_with(end, boundaries, &natural_pair(end)).into_iter().map(|g| g.3).collect::<Vec<_>>();
         assert_eq!(cut(20000, &[12000, 20000]), vec![Some(12000), None]);
         assert_eq!(cut(20000, &[4000, 13000, 20000]), vec![None, Some(9000)]);
-        assert_eq!(qwen4_prefill_segment_rows(8192,40000,8192,SessionBoundaries { next: Some(8192), after: None },true,true),8192);
-        assert!(schedule_with(40000, &[], true, &|_| None).iter().all(|g| g.2.is_none()));
-        // The numerical twin chunks every group at the banks and the cut.
+        assert_eq!(qwen4_prefill_segment_rows(8192,40000,8192,SessionBoundaries { next: Some(8192), after: None },true),8192);
+        assert!(schedule_with(40000, &[], &|_| None).iter().all(|g| g.2.is_none()));
+        // Every group's pieces tile it: banks of at most a chunk, cut once.
         for end in [16343, 20000, 40000] {
             for boundaries in [&[][..], &[8192, 16384, 24576, 32768, 40000][..]] {
-                let groups = schedule_with(end, boundaries, true, &natural_pair(end));
+                let groups = schedule_with(end, boundaries, &natural_pair(end));
                 let mut at = 0;
                 for (start, rows, split, cut) in groups {
                     assert_eq!(start, at);
@@ -1262,24 +1277,18 @@ mod tests {
             }
         }
     }
-    #[test] fn twin_chunks_mirror_executor_banks_and_sub_launches() {
+    #[test] fn launch_geometry_matches_pair_pieces_at_boundary_rows() {
         // The executor's launches (bank by bank, each bank's Core split at its
-        // cut row) in group-local rows must be the twin's chunks.
+        // cut row) in group-local rows are the pair's pieces, at every cut class.
         for banks in [[8192, 8163], [4672, 4647], [4224, 4180], [6144, 6144], [8192, 1127]] {
             let total = banks[0] + banks[1];
             let mut cuts = vec![None, Some(1), Some(64), Some(4096), Some(banks[0]), Some(banks[0] + 1), Some(total - 1)];
             cuts.extend([Some(banks[0] - 1), Some(banks[0] + 4096.min(banks[1] - 1))]);
             for cut in cuts {
                 let shape = PairShape { rows: banks, cut };
-                let mut launches = Vec::new();
-                for bank in 0..2 {
-                    let row0 = if bank == 0 { 0 } else { banks[0] };
-                    let in_bank = match shape.site() {
-                        CutSite::Bank { bank: b, row } if b == bank => Some(row),
-                        _ => None,
-                    };
-                    for w in core_windows(banks[bank], in_bank) { launches.push(row0 + w.lo..row0 + w.lo + w.rows); }
-                }
+                let launches: Vec<_> = launch_geometry(shape).iter().flat_map(|bank| {
+                    core_windows(bank.rows, bank.cut).into_iter().map(move |w| bank.offset + w.lo..bank.offset + w.lo + w.rows)
+                }).collect();
                 assert_eq!(launches, shape.pieces(), "{banks:?} cut {cut:?}");
             }
         }
@@ -1293,7 +1302,7 @@ mod tests {
         let schedule = |rows: usize, cache: bool| {
             let exec = trunk::executable_plan(&cal, &trunk::plan(&cal, FamilyMask::ALL, rows), rows, star);
             let boundaries: Vec<usize> = if cache { (1..=rows / 8192).map(|k| k * 8192).collect() } else { Vec::new() };
-            schedule_with(rows, &boundaries, true, &|pos| trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b]))
+            schedule_with(rows, &boundaries, &|pos| trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b]))
         };
         // 9,319: 4672 + 4647; the 8192 snapshot is bank B's local row 3520.
         assert_eq!(schedule(9319, false), vec![(0, 9319, Some(4672), None)]);
@@ -1309,6 +1318,44 @@ mod tests {
         assert_eq!(tail(true), (49152, 8404, Some(4224), Some(8192)));
         assert_eq!(schedule(57556, true).len(), 4);
         assert_eq!(PairShape::new([4224, 4180], 49152, Some(57344)).site(), CutSite::Bank { bank: 1, row: 3968 });
+    }
+    #[test] fn emulate_and_on_share_the_pair_launch_geometry() {
+        // Both modes run `pair_scoped`, whose launches follow `launch_geometry`
+        // alone: banks at the plan's rows, each bank's Core split only at its
+        // own snapshot row, state staged after the first launch (or after bank A
+        // when the row is the A/B split). Pin it for the C1 sizes, cache on/off.
+        let cal = fixture_calibration("g80bf16-overlay-v2.json");
+        let star = trunk::crossover(&cal, FamilyMask::ALL);
+        for (rows, cache, expected) in [
+            (9319usize, false, vec![[(0, 4672, None, false), (4672, 4647, None, false)]]),
+            (9319, true, vec![[(0, 4672, None, false), (4672, 4647, Some(3520), false)]]),
+            (16355, false, vec![[(0, 8192, None, false), (8192, 8163, None, false)]]),
+            (16355, true, vec![[(0, 8192, None, true), (8192, 8163, None, false)]]),
+            (57556, false, vec![
+                [(0, 8192, None, false), (8192, 8192, None, false)], [(0, 8192, None, false), (8192, 8192, None, false)],
+                [(0, 8192, None, false), (8192, 8192, None, false)], [(0, 4224, None, false), (4224, 4180, None, false)]]),
+            (57556, true, vec![
+                [(0, 8192, None, true), (8192, 8192, None, false)], [(0, 8192, None, true), (8192, 8192, None, false)],
+                [(0, 8192, None, true), (8192, 8192, None, false)], [(0, 4224, None, false), (4224, 4180, Some(3968), false)]]),
+        ] {
+            let exec = trunk::executable_plan(&cal, &trunk::plan(&cal, FamilyMask::ALL, rows), rows, star);
+            let boundaries: Vec<usize> = if cache { (1..=rows / 8192).map(|k| k * 8192).collect() } else { Vec::new() };
+            let groups = schedule_with(rows, &boundaries, &|pos| trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b]));
+            let geometries: Vec<_> = groups.iter().filter_map(|&(start, total, split, _)| {
+                let a = split?;
+                let boundary = boundaries.iter().copied().find(|&b| b > start);
+                let shape = PairShape::new([a, total - a], start, boundary);
+                let geometry = launch_geometry(shape);
+                // The launches of that geometry, group-local, are the shape's pieces.
+                let launches: Vec<_> = geometry.iter().flat_map(|bank| {
+                    core_windows(bank.rows, bank.cut).into_iter().map(move |w| bank.offset + w.lo..bank.offset + w.lo + w.rows)
+                }).collect();
+                assert_eq!(launches, shape.pieces(), "{rows} cache {cache} at {start}");
+                assert_eq!(geometry.iter().filter(|bank| bank.cut.is_some() || bank.stage_after).count(), usize::from(shape.cut.is_some()));
+                Some(geometry.map(|bank| (bank.offset, bank.rows, bank.cut, bank.stage_after)))
+            }).collect();
+            assert_eq!(geometries, expected, "{rows} cache {cache}");
+        }
     }
     #[test] fn executable_plan_and_schedule_match_python_goldens() {
         let vectors: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/npu_trunk/golden-exec.json"))).unwrap();
@@ -1334,8 +1381,8 @@ mod tests {
                     assert!((value - expected).abs() <= expected.abs() * 1e-6, "{file} {rows} {key}: {value} != {expected}");
                 }
                 let cache: Vec<usize> = (1..=rows / 8192).map(|k| k * 8192).collect();
-                for (key, boundaries, cuts) in [("groups_off", &[][..], true), ("groups_on", &cache[..], true), ("groups_on_nocuts", &cache[..], false)] {
-                    let actual = schedule_with(rows, boundaries, cuts, &|pos| trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b]));
+                for (key, boundaries) in [("groups_off", &[][..]), ("groups_on", &cache[..])] {
+                    let actual = schedule_with(rows, boundaries, &|pos| trunk::planned_pair(&exec, pos).map(|(a, b)| [a, b]));
                     let expected: Vec<_> = case[key].as_array().unwrap().iter()
                         .map(|g| (num(&g[0]), num(&g[1]), opt(&g[2]), opt(&g[3]))).collect();
                     assert_eq!(actual, expected, "{file} rows={rows} {key}");

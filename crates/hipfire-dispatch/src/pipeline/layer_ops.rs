@@ -1866,6 +1866,22 @@ impl ShiftedArena {
     }
 }
 
+/// Run a partial-bank launch with the routing of a canonical whole-chunk
+/// prefill (`Gpu::route_rows` constant): the window's rows are fewer than its
+/// bank's, but the bank-wide input projections were stored, and the Core
+/// kernels' chunk routes must be chosen, for a full chunk (banks are at least
+/// `QWEN4_F16_WMMA_MIN_TOKENS` rows, so this is the routing the bank itself
+/// gets). Restores the scope on every path.
+fn with_bank_routing<T>(
+    gpu: &mut Gpu,
+    f: impl FnOnce(&mut Gpu) -> Result<T, DispatchError>,
+) -> Result<T, DispatchError> {
+    let prior = std::mem::replace(&mut gpu.prefill_invariant_scope, true);
+    let result = f(gpu);
+    gpu.prefill_invariant_scope = prior;
+    result
+}
+
 /// Core of `window`'s rows only; the input projections ran bank-wide into the
 /// op's scratch (`arenas` is `None` when the native route projected them).
 pub fn execute_gated_delta_net_core_rows(
@@ -1889,7 +1905,12 @@ pub fn execute_gated_delta_net_core_rows(
         a: s[2].as_ref().map(ShiftedArena::arena), b: s[3].as_ref().map(ShiftedArena::arena),
     });
     let whole = window.lo == 0 && window.rows == op.rows;
-    execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, view_arenas, None, (!whole).then_some(window))
+    if whole {
+        return execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, view_arenas, None, None);
+    }
+    with_bank_routing(gpu, |gpu| {
+        execute_gated_delta_net_hc_impl(gpu, op, None, &mut false, view_arenas, None, Some(window))
+    })
 }
 
 /// QSA Core of `window`'s rows: the same op over a row sub-range whose cache
@@ -1987,7 +2008,10 @@ pub fn execute_indexed_attention_core_rows(
         q: s[0].as_ref().map(ShiftedArena::arena), k: s[1].as_ref().map(ShiftedArena::arena),
         v: s[2].as_ref().map(ShiftedArena::arena), idx: s[3].as_ref().map(ShiftedArena::arena),
     });
-    execute_indexed_attention_hc_impl(gpu, &sub, None, &mut false, view_arenas, None)
+    if window.lo == 0 && window.rows == op.rows {
+        return execute_indexed_attention_hc_impl(gpu, &sub, None, &mut false, view_arenas, None);
+    }
+    with_bank_routing(gpu, |gpu| execute_indexed_attention_hc_impl(gpu, &sub, None, &mut false, view_arenas, None))
 }
 
 /// The PLE grouped depthwise step over `window`'s rows (state carries across
@@ -2032,7 +2056,10 @@ pub fn execute_grouped_depthwise_rows(
         epsilon: op.epsilon,
         rotation: op.rotation,
     };
-    execute_grouped_depthwise(gpu, &sub)
+    if window.lo == 0 && window.rows == op.rows {
+        return execute_grouped_depthwise(gpu, &sub);
+    }
+    with_bank_routing(gpu, |gpu| execute_grouped_depthwise(gpu, &sub))
 }
 
 /// Native input projections only, skipping qkv/a/b/z covered by the trunk.
