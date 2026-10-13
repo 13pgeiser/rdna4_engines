@@ -10828,7 +10828,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens4",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens4"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -10846,16 +10845,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens4",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         // V: standard Q8_0
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
@@ -11012,7 +11019,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens3",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens3"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -11030,16 +11036,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens3",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
@@ -11228,7 +11242,6 @@ impl Gpu {
             kernels::KV_CACHE_WRITE_FWHT256_2BIT_SRC,
             "kv_cache_write_fwht256_2bit",
         )?;
-        let func = &self.functions["kv_cache_write_fwht256_2bit"];
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
@@ -11246,16 +11259,24 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_kv_heads as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
+        self.launch_maybe_blob(
+            "kv_cache_write_fwht256_2bit",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )?;
         Ok(())
     }
 
@@ -11335,7 +11356,6 @@ impl Gpu {
             kernels::KV_CACHE_WRITE_FWHT256_4BIT_SRC,
             "kv_cache_write_fwht256_4bit",
         )?;
-        let func = &self.functions["kv_cache_write_fwht256_4bit"];
         let mut kdp = dst.buf.as_ptr();
         let mut ksp = src.buf.as_ptr();
         let mut pp = pos_buf.as_ptr();
@@ -11353,16 +11373,24 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let shared_mem = ((head_dim + 32) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_kv_heads as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
+        self.launch_maybe_blob(
+            "kv_cache_write_fwht256_4bit",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp);
+                b.push_ptr(ksp);
+                b.push_ptr(pp);
+                b.push_ptr(s1p);
+                b.push_ptr(s2p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        )?;
         Ok(())
     }
 
@@ -14239,7 +14267,6 @@ impl Gpu {
             "kv_cache_write_asym_k_givens2",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens2"];
             let mut kdp = k_dst.buf.as_ptr();
             let mut ksp = k_src.buf.as_ptr();
             let mut pp = pos_buf.as_ptr();
@@ -14257,16 +14284,24 @@ impl Gpu {
                 &mut hd as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens2",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            )?;
         }
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
@@ -24282,5 +24317,50 @@ mod kv_slot_desc_port_tests {
                 && bf16_body.contains("kv_offset_for_v(desc, t, per_pos_bytes)"),
             "bf16 scalar kernel must translate K and V rows through the descriptor"
         );
+    }
+}
+
+/// Decode KV writers reachable from a retained Redline / HipGraph forward must
+/// launch through `launch_maybe_blob`: a raw `hip.launch_kernel` is invisible
+/// to the recorder, so the replayed tape silently drops the cache write (the
+/// 2026-10-13 gfx1100 MQ4R `--kv-v lloyd2` page fault: 623 vs 633 launches).
+#[cfg(test)]
+mod recorded_kv_writer_tests {
+    fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src
+            .find(&format!("pub fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .into_iter()
+            .chain(rest[1..].find("\n    fn "))
+            .chain(rest[1..].find("\n    #["))
+            .min()
+            .map_or(rest.len(), |e| e + 1);
+        &rest[..end]
+    }
+
+    #[test]
+    fn decode_kv_writers_route_through_the_recorder() {
+        let attention = include_str!("attention.rs");
+        let gemma4 = include_str!("gemma4_ext.rs");
+        let cases: &[(&str, &str)] = &[
+            (attention, "kv_cache_write_v256_2bit_vec"),
+            (attention, "kv_cache_write_v256_4bit_vec"),
+            (attention, "kv_cache_write_fwht3_vec"),
+            (attention, "kv_cache_write_asym2_fused"),
+            (attention, "kv_cache_write_asym3_fused"),
+            (attention, "kv_cache_write_asym4_fused"),
+            (gemma4, "kv_cache_write_fwht3_hd512"),
+        ];
+        for &(src, name) in cases {
+            let body = fn_body(src, name);
+            assert!(
+                !body.contains(".launch_kernel("),
+                "{name} launches raw; the Redline recorder cannot see it"
+            );
+            assert!(body.contains("launch_maybe_blob("), "{name} lost its recorded launch");
+        }
     }
 }
