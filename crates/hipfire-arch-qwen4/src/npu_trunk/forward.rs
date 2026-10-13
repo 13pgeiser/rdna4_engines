@@ -699,14 +699,11 @@ impl NpuForward {
             layers::build_program(owner,b,bundle,gpu,&ctx,&sb,1,rows[1])?,
         ];
         let mut history=bundle.state.ple_history;
-        let mut boundary_history = history;
-        for bank in 0..2 {
-            let scratch=if bank==0 { &owner.scratch } else { b };
-            let bank_tokens=&tokens[bank*8192..bank*8192+rows[bank]];
-            initialize(gpu,bundle,scratch,bank_tokens,&history,programs[bank].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
-            for &token in bank_tokens { history.push(token); }
-            if bank == 0 { boundary_history = history; }
-        }
+        // Bank A only: bank B initializes after kick(0, A) (L1 fill reorder),
+        // so NPU(0, A) does not wait behind bank B's embedding/PLE staging.
+        initialize(gpu,bundle,&owner.scratch,&tokens[..rows[0]],&history,programs[0].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
+        for &token in &tokens[..rows[0]] { history.push(token); }
+        let boundary_history = history;
         if let Some(stage) = &mut stage {
             let commits: SmallVec<[_; QWEN4_QSA_INLINE_CAPACITY]> = programs[0].steps.iter().filter_map(|step| match step {
                 Step::IndexedAttention(op) => Some(op.next_lengths().map_err(fail)), _ => None,
@@ -734,11 +731,18 @@ impl NpuForward {
                 records.push(TraceRow { layer,bank,position:position+bank*8192,rows:rows[bank],seq:0,pack_issue_ns:0,kick_ns:0,submit_ns:0,done_ns:0,signal_write_ns:0,wait_enqueue_ns:0,consume_issue_ns:0,prep_begin:gpu.hip.event_create()?,prep_end:gpu.hip.event_create()?,pack_end:gpu.hip.event_create()?,wait_begin:gpu.hip.event_create()?,wait_end:gpu.hip.event_create()?,start:gpu.hip.event_create()?,end:gpu.hip.event_create()? });
             }}
         }
+        // The closure borrows `self` for prepare/run_bank; bank B's
+        // initialization borrows the host upload buffers, so they move out.
+        let mut host_tokens=std::mem::take(&mut self.host_tokens);
+        let mut host_ple=std::mem::take(&mut self.host_ple);
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
-            let mut seq=[
-                self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,stage.as_ref())?,
-                self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,None)?,
-            ];
+            let mut seq=[self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,stage.as_ref())?, None];
+            // Same stream: prepare(0, A) is enqueued before bank B's
+            // initialization overwrites the shared init buffers (Footprint table).
+            let bank_b_tokens=&tokens[8192..8192+rows[1]];
+            initialize(gpu,bundle,b,bank_b_tokens,&history,programs[1].ple_rows_f16,&mut host_tokens,&mut host_ple)?;
+            for &token in bank_b_tokens { history.push(token); }
+            seq[1]=self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,None)?;
             let mut last_seq = seq;
             let mut gdn_slot = 0;
             let mut qsa_slot = 0;
@@ -782,6 +786,8 @@ impl NpuForward {
             finish_bank(gpu,bundle,b,logits,top1,capture,1,rows[1],output)?;
             Ok(())
         })();
+        self.host_tokens=host_tokens;
+        self.host_ple=host_ple;
         drop(programs);
         let attempt = attempt.and_then(|_| {
             if let (Some(out),Some(anchor))=(&mut self.trace,&anchor) {
