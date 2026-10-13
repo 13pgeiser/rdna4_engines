@@ -9702,14 +9702,14 @@ pub const EP_GATHER_ROWS_BY_OWNER_SRC: &str =
     include_str!("../../../kernels/src/ep_gather_rows_by_owner.hip");
 
 /// Flash-Next expert-parallel row all-gather with explicit slot owners
-/// (balanced ownership, `HIPFIRE_EP_BALANCED_OWNERS=1`): same copy as
+/// (balanced ownership, default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): same copy as
 /// [`EP_GATHER_ROWS_BY_OWNER_SRC`] but the owner of slot `s` is
 /// `slot_owner[s]`. Its own module so the modulo kernel's bytes are unchanged.
 pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
     include_str!("../../../kernels/src/ep_gather_rows_by_slot_owner.hip");
 
 /// Certified builder (PeaceMaker) module of the Flash-Next expert-parallel
-/// balanced ownership (`HIPFIRE_EP_BALANCED_OWNERS=1`), gfx1201 only
+/// balanced ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables), gfx1201 only
 /// (`hipfire-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201`, M7
 /// obligation-free, native bundle with the shipped
 /// `host-x86_64-unknown-linux-gnu-` host entry): one 512-thread workgroup that

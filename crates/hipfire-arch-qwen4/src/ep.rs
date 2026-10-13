@@ -707,8 +707,9 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// Buffer index of this rank's previous invocation. The transport's hazard
     /// rule forbids the same buffer on two consecutive invocations.
     last_buffer: AtomicUsize,
-    /// Balanced-ownership layers (`HIPFIRE_EP_BALANCED_OWNERS=1`), installed
-    /// once after the forward attached its live tables. Never set when off.
+    /// Balanced-ownership layers (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0`
+    /// disables), installed once after the forward attached its live tables.
+    /// Never set when disabled.
     balanced: OnceLock<BalancedOwners>,
 }
 
@@ -1245,7 +1246,8 @@ impl Qwen4Bundle {
                 .attach_ep(gpu, bundle, &sources, installed)
                 .map_err(|error| format!("attach EP tables: {error}"))
                 .and_then(|()| match forward.balanced_plan() {
-                    // `HIPFIRE_EP_BALANCED_OWNERS=1` with a host-mapped layer.
+                    // Default on (`HIPFIRE_EP_BALANCED_OWNERS=0` disables) with a
+                    // host-mapped layer.
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
                 });

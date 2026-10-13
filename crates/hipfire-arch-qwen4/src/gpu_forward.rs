@@ -1307,14 +1307,14 @@ pub(crate) struct MtpEpGather<'a> {
     pub(crate) buffers: [&'a GpuTensor; QWEN4_EP_GATHER_BUFFERS],
 }
 
-/// `HIPFIRE_EP_BALANCED_OWNERS=1` (default off): per-call balanced expert
-/// ownership on the host-mapped trunk MoE layers of an EP rank. Anything but
-/// the exact value `1` is off, and off builds nothing (no tables, no buffer, no
-/// stage, no kernel load).
+/// `HIPFIRE_EP_BALANCED_OWNERS` (default on under EP; `=0` disables): per-call
+/// balanced expert ownership on the host-mapped trunk MoE layers of an EP rank.
+/// Only the exact value `0` is off (unset or any other value is on), and off
+/// builds nothing (no tables, no buffer, no stage, no kernel load).
 pub const QWEN4_EP_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_BALANCED_OWNERS";
 
 fn qwen4_ep_balanced_owners_enabled() -> bool {
-    hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() == Ok("1")
+    hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
 /// One host-mapped trunk MoE layer under balanced ownership: the rank's *live*
@@ -1351,7 +1351,7 @@ struct Qwen4ForwardEp {
     /// Row gather the one-row and few-row forwards install, once attached.
     gather: Option<Arc<dyn MoeRowGather + Send + Sync>>,
     /// Balanced-ownership state per MoE ordinal (`Some` for every host-mapped
-    /// trunk layer); empty unless `HIPFIRE_EP_BALANCED_OWNERS=1` at
+    /// trunk layer); empty when `HIPFIRE_EP_BALANCED_OWNERS=0` at
     /// [`Qwen4GpuForward::attach_ep`].
     balanced: Vec<Option<Qwen4BalancedLayer>>,
     /// The rank's `QWEN4_EP_GATHER_MAX_ROWS * k` i32 slot owners, shared by the
@@ -4111,9 +4111,9 @@ impl Qwen4GpuForward {
     }
 
     /// What the rank's row-gather hook needs to run balanced ownership: `None`
-    /// unless `HIPFIRE_EP_BALANCED_OWNERS=1` was set at [`Self::attach_ep`] and
-    /// some trunk MoE layer is host-mapped. The `slot_owner` view is
-    /// non-owning; this forward frees the buffer.
+    /// when `HIPFIRE_EP_BALANCED_OWNERS=0` was set at [`Self::attach_ep`]
+    /// (default on under EP) or no trunk MoE layer is host-mapped. The
+    /// `slot_owner` view is non-owning; this forward frees the buffer.
     pub(crate) fn balanced_plan(&self) -> Option<Qwen4BalancedPlan> {
         let ep = self.ep.as_ref()?;
         let owners = ep.slot_owner.as_ref()?;
@@ -4240,7 +4240,7 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            // Balanced ownership (`HIPFIRE_EP_BALANCED_OWNERS=1`): every
+            // Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): every
             // host-mapped trunk layer gets a live runtime of the same full
             // addressing, whose tables the per-call owner assignment
             // rewrites. Nothing is built, allocated or loaded when off.

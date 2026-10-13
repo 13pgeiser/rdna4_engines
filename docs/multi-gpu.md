@@ -233,7 +233,7 @@ HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
 EP does not honor a non-default `--kv-mode` the same way single-GPU load does
 today — the CLI warns when both are set. Reload without a DFlash draft for EP.
 
-### Flash-Next EP: balanced expert ownership (`HIPFIRE_EP_BALANCED_OWNERS=1`)
+### Flash-Next EP: balanced expert ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
 
 Under Flash-Next (Qwen4) expert parallelism rank `r` owns routed expert `e`
 when `e % ranks == r`. On the trunk layers whose experts live in pinned host
@@ -241,7 +241,7 @@ memory (the host-mapped layers, read zero-copy over PCIe) the number of routed
 experts a token draws from each rank differs call to call, so the rank with
 fewer host experts finishes early and waits for the other at every such layer.
 
-`HIPFIRE_EP_BALANCED_OWNERS=1` (default off; any other value or unset keeps
+Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` keeps
 the static split) balances that per call. After the router wrote the call's
 routed ids, one small device kernel deals the distinct routed experts to the
 ranks alternately in ascending expert id, identically on every rank, and
@@ -256,10 +256,10 @@ output is byte-identical to the static split and to one card.
 
 Scope: host-mapped trunk MoE layers on one-row decode and few-row forwards
 (verify, replay and takeover, 2 to 8 rows). VRAM-resident layers, chunk
-forwards (more than 8 rows) and the MTP head keep the static split. With the
-variable unset, no table, buffer, stage or kernel module is added. Each rank
-logs `qwen4 EP rank r/n: balanced ownership on N host-mapped MoE layers` at
-attach when it is on.
+forwards (more than 8 rows) and the MTP head keep the static split. With
+`HIPFIRE_EP_BALANCED_OWNERS=0`, no table, buffer, stage or kernel module is
+added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
+MoE layers` at attach when it is on.
 
 ### Environment (operator-facing)
 
