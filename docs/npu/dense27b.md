@@ -1,10 +1,20 @@
 # Dense Qwen3.8-27B (MQ4XTS) IU4 prefill on Strix Halo: NPU co-op study
 
-NpuDense27b, 2026-10-02/03, branch `npu/dense27b`.
+> **Lifecycle: historical study (2026-10-02/03, hipfire 0.4.1 beta), verdict KILL; not a
+> shipped path.** The int32-partials (`I32` epilogue, per-epoch `C_e`) route and the
+> IEF fold candidate studied here were killed and never wired; no GPU fold of NPU
+> partials exists in any serving route. Every number is a dated, fixture-bound measurement
+> or labelled estimate for the dense-27B pp8192 step on one Halo host, not current
+> performance or an admission. The 0.4.2 Flash-Next gfx1151 NPU trunk is a different route:
+> input projections only, calibration schema 4, BF16-direct only (no I32 contract),
+> out-projection unwired. See [`npu-trunk.md`](npu-trunk.md) for the current route and
+> schema.
+
+Dated 2026-10-02/03 (workspace branch `npu/dense27b`, not in this repository).
 
 Sources (read-only):
-- hipfire `/home/kaden/ClaudeCode/warpfront/wt-land-041m` (beta f7960b4e8; written `W:` below);
-- the Halo trace `/home/kaden/qcal/release-0.4.1/iu4-roofline` (written `R:`);
+- hipfire 0.4.1 beta source snapshot, commit f7960b4e8 (written `W:` below);
+- the Halo kernel-trace study, workspace-local (written `R:`);
 - the fixture `qwen3.8-27b.mq4-xts` (JSON header, `HFQMC`).
 
 Every number is labelled **measured** (with its log) or **estimate**.
@@ -129,7 +139,7 @@ Lanes outside a fast path are flagged to a scalar fallback, and the fallback res
 
 The GEMM itself costs **0.331 cycles per output-epoch** per core (measured 1357 cycles per 128×64×64 chunk). The exact fold therefore costs **4.2–5.5×** the GEMM with the float-assisted path, ~3.7× with a perfect Mv/Vec rebalance, and ≥ 23× integer-only. None reaches ≤ 3×.
 
-The float-assisted path also **assumes** the fp32-accumulator add is IEEE RNE on silicon, which is unverified. The probe is not run, pending a declaration to Main.
+The float-assisted path also **assumes** the fp32-accumulator add is IEEE RNE on silicon, which is unverified. The probe is not run, pending a project decision.
 
 NPU core rate with the fold (ESTIMATE) = 32 · 1.8 GHz · 256 / cycles: **8.1 / 10.7 / 12.0 TOPS** (16-lane / 32-lane / balanced).
 
@@ -170,7 +180,7 @@ The raw (not drift-corrected) α curve shifts every row by ≤ 0.3 %. Break-even
 
 ## 8. Verdict
 
-**KILL the end-to-end co-op prototype under the current bit-exact contract** (accepted by Main 2026-10-03).
+**KILL the end-to-end co-op prototype under the current bit-exact contract** (accepted 2026-10-03).
 - Parity holds only for the int32 partials. They are measured-exact on silicon but write-bound at 3.3 TOPS, and the GPU cannot afford to read them.
 - An exact NPU-side fold costs 4–5.5× the GEMM (≥ 23× without fp hardware) and rests on an unverified fp32-accumulator RNE assumption.
 - The best modelled exact gain is +1 to +3 % of a pp8192 step. Getting it would require:
@@ -180,7 +190,7 @@ The raw (not drift-corrected) α curve shifts every row by ≤ 0.3 %. Break-even
   - a split SiLU pass,
   - GPU-driven sync.
 
-The fp32-accumulator probe and a Flash-Next small-M window were dropped (Main; NpuLevers measured those shapes in its w5).
+The fp32-accumulator probe and a Flash-Next small-M window were dropped (project decision; the levers study measured those shapes in its w5, see `report.md`).
 
 ## 9. What a fold-contract change would have to look like (design note; no hipfire edit)
 
@@ -214,7 +224,7 @@ With the NPU at 19–22 TOPS, the §7 model gives **step 6311–6490 ms, 1262–
 3. **Parity.** CPU model of IEF, then the NPU kernel on the exact simulator, bit-exact vs the GPU on captured real tiles of every GEMM type including the ADD and split epilogues. Then one ≤ 90 s silicon window comparing NPU bytes with GPU bytes.
 4. **Co-op prototype** (relay sync first), with the derate re-measured. §6 is drift-flagged, so it needs a thermally stable protocol: interleaved alone/concurrent pairs and a cool-down. GO if the measured step gain is ≥ 3 % net of every extra pass.
 
-IEF changes the GPU numerics of a shipped route, so it needs user approval before any hipfire work. Main is taking it to the user.
+IEF changes the GPU numerics of a shipped route, so it needs user approval before any hipfire work. Escalated for a user decision.
 
 ## 10. Files
 
@@ -224,4 +234,4 @@ IEF changes the GPU numerics of a shipped route, so it needs user approval befor
 - `crates/peacemaker-npu/tests/iu4_epochs.rs`.
 - `npu-gemm`: `--iu4-epochs`, `--gap-us`.
 - `tools/npu/npu-dense27b-w1.sh`, `tools/npu/npu-dense27b-m4.sh`.
-- Logs: `logs/dense27b/`.
+- Logs: `logs/dense27b/` (workspace-local, not in this repository).

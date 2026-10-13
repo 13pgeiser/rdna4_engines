@@ -8,6 +8,51 @@ Neither preparation path opens hardware or schedules prefill.
 `HIPFIRE_QWEN4_NPU_TRUNK`: `off`, `auto` (default), `on`, or `emulate`.
 At load, auto resolves silently to off on every arch except gfx1151.
 
+## Serving status (0.4.2)
+
+This guide is the chronological design and bring-up record of the route. This
+section summarizes what ships; the root `CHANGELOG.md` entry for the 0.4.2
+Flash-Next NPU trunk is the authority for measured numbers, and
+[`docs/env-vars.md`](../env-vars.md) and [`docs/CONFIG.md`](../CONFIG.md) own the
+knob tables. Sections marked **historical** record design-time simulator work
+(including int8/I32 comparisons) that the BF16-direct route superseded; they are
+kept for provenance and are not current recommendations.
+
+* **Route.** Flash-Next (Qwen4) family B, K=2560, stock MQ6 shapes, single
+  device without EP. The GDN (`GdnIn`) and QSA (`QsaIn`) trunk **input
+  projections** run on the XDNA2 NPU in a two-bank, layer-major pipeline against
+  the GPU. Mixer cores, output projections, HC, MoE and decode stay on the GPU.
+* **Mode.** `HIPFIRE_QWEN4_NPU_TRUNK` / `fusions.npu_trunk` is
+  `off`, `auto`, `on` or `emulate`; the default is `auto`. Auto arms on gfx1151
+  only, with an open NPU and a matching keyed calibration; every other arch is
+  effectively `off` with no NPU I/O or allocation. Any auto load refusal logs one
+  reason and runs GPU-only. `off` is the kill switch.
+* **Calibration.** `fusions.npu_trunk_calibration` /
+  `HIPFIRE_QWEN4_NPU_TRUNK_CAL` defaults to `<hipfire home>/npu-trunk/calibration.json`.
+  A file there wins; only an absent file falls back to the compiled-in measured
+  Halo records, which cover the reference key and never arbitrary devices. The
+  schema is **4**, BF16-direct only: there is no int32 contract
+  (`glue.fold_ms_per_col_8192` is gone and `epilogue` must be `bf16`), and a
+  schema-3 record is rejected.
+* **Trace.** `HIPFIRE_QWEN4_NPU_TRUNK_TRACE` is unset by default; set it to a
+  path to append per-(layer, bank) JSONL.
+* **Pairs and chains.** Natural 8192+B pairs, the planner's rebalanced last pair
+  (two banks of about equal rows) and one interior session-snapshot row per pair
+  execute. NPU chains are row-adaptive in 256-row waves: a bank below 8192 rows
+  runs the G80 program of its own wave count, built on first use. At most four
+  wave counts are admitted per load; a pair that would need a fifth runs
+  GPU-native.
+* **Not shipped.** The K = 6144 out-projection program exists (see below) but is
+  **not wired** into the route. QSA `o_proj` (`qsa.o`) and GDN `out_proj`
+  (`gdn.out`) stay on the GPU, and the planner's out families are
+  `selectable: false`.
+
+Measured TTFT, exactness and quality results for this route are recorded, with
+their fixtures and methods, in the 0.4.2 Flash-Next entry of the root
+[`CHANGELOG.md`](../../CHANGELOG.md); they are not repeated here. Other figures
+in this guide are design-time estimates or earlier-round measurements and are
+labeled as such.
+
 ## Shapes and masks
 
 | Shape | Fused family order and output columns | Full padded columns / panels |
@@ -62,7 +107,6 @@ C base by `2*panel*1280` bytes.
 
 ```sh
 ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 \
-CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
 nice -n 19 cargo test --release -p hipfire-arch-qwen4 -j 12 --test npu_trunk_packing --test npu_trunk_programs --test npu_trunk_simulation
 ```
 
@@ -74,7 +118,13 @@ and pack time for layer 0 GDN qkv and layer 3 QSA q from the pinned
 Set `HIPFIRE_NPU_TRUNK_TEST_MODEL` to override its default model path and run
 `cargo test --release -p hipfire-arch-qwen4 --test npu_trunk_model_sanity -- --ignored --nocapture`.
 
-## G80 direct BF16 (simulator only)
+## G80 direct BF16 (design record, simulator only; historical)
+
+> **Historical.** This section through "Fused row-major BF16 drain" is the
+> design-time simulator record. Throughput figures are estimates scaled from a
+> measured int8 wave, and the int8/I32 comparisons describe alternatives that
+> BF16-direct superseded (schema 4 has no int32 contract). Hardware results for
+> the shipped route are in the root changelog and the serving status above.
 
 The epilogue uses no floating operations: 16x16 multiplies construct
 `J=I*Sm*Dm` in acc64 by Horner limbs, then an IEF15-derived highest-bit ladder,
@@ -108,11 +158,13 @@ Repeating sidecars is the explicit traffic tradeoff for retaining the existing
 input ring machinery; pair-stage serialization makes the resident panel fit.
 
 `npu-gemm M 1280 K --variant G80 --epi bf16` supplies deterministic grid
-scales and compares checked outputs to `peacemaker-npu::kernels::w8a8_epi::bf16_direct`.
-No silicon claim: new arithmetic, DMA layout and simulator timings require
-hardware validation before enabling serving. The int8/I32 PDI/TXN hashes for
-M256/M8192, N1280, K2560, Fast/Slow are pinned in `golden_bytes.rs` to the
-pre-BF16 images.
+scales and compares checked outputs to `pm-npu::kernels::w8a8_epi::bf16_direct`.
+At design time this arithmetic, DMA layout and the simulator timings carried no
+silicon claim; the shipped route has since been validated on hardware (see
+Serving status). The legacy int8/I32 PDI/TXN hashes for M256/M8192, N1280,
+K2560, Fast/Slow remain pinned in `pm-npu`'s `golden_bytes.rs`
+(`g80_legacy_bytes_match_golden`) as records of the pre-BF16 images; no trunk
+serving path uses them.
 
 At one M256 wave, K2560 (functional simulator, Fast), the executed PDI/TXN
 models **113,393 / 140,888 / 209,386 cycles** for int8 / I32 / BF16.
@@ -181,8 +233,8 @@ C ops (72.2% fewer); SYNCs/tasks fall from 32 to 5 pairs (84.4% fewer)
 and descriptor block writes from 1024 to 112 (89.1% fewer).
 At W=256: **4890 vs 20992** C ops, 37 vs 256 SYNC/task pairs.
 TXN bytes/counts change; the PDI, native BF16 TXN and int8/I32 golden bytes
-remain unchanged. Expected firmware overhead is substantially reduced, but
-recovery of the measured 9% throughput loss is a silicon gate, not a claim.
+remain unchanged. Design-time expectation: firmware overhead is substantially
+reduced, but recovery of the then-measured 9% throughput loss was a silicon gate, not a claim.
 Firmware command overhead is not covered by the phase-sum cycle estimate.
 
 Build one design with col0=0 per pitch/row bound. All 11 QsaIn / 13 GdnIn
@@ -198,7 +250,7 @@ outside-window poison and exact shim bytes. Tests compare TXN op counts with
 the previous per-wave drain and native tiles; functional ticks are modelled
 timings, not firmware latency or silicon measurements.
 
-Silicon commands (not run by this change; repeat at pitch 14080):
+Design-time silicon commands (not run by that change; repeat at pitch 14080):
 
 ```sh
 # Every live value, padded zero and outside-window poison checked.
@@ -210,11 +262,19 @@ target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 \
 target/release/npu-gemm 8192 1280 2560 --variant G80 --epi bf16 --loop 15
 ```
 
-The previous per-wave row-major drain measured 15.05 TOPS on Halo versus
-16.48 TOPS native; the batched drain needs fresh silicon exactness/performance
-validation and the serving cutover still requires the parent-run gates below.
+Historical Halo measurement of the superseded per-wave row-major drain: 15.05
+TOPS versus 16.48 TOPS native. The batched drain was validated afterwards on
+silicon as part of the shipped route (root changelog); these figures are not
+current performance claims.
 
-## G80 N512 out-projection program (K = 6144, simulator only)
+## G80 N512 out-projection program (K = 6144; built, not wired into serving)
+
+Status (0.4.2): the program, its packing, a second-PDI relay hardware context
+and a transport oracle exist, but no serving route requests them. QSA `o_proj`
+(`qsa.o`) and GDN `out_proj` (`gdn.out`) are **not shipped** on the NPU and stay
+on the GPU. Silicon results and the measured, unshipped QSA out-projection
+wiring attempt are in the root changelog. The design description and
+Gate K0 below are historical simulator records.
 
 `peacemaker-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
 `build_panel_program_out(rows_max, pitch, col0)`) is the program of the QSA `o_proj` / GDN
@@ -245,7 +305,7 @@ arg1 = B, 8 segments of `kc*4352` B (3,342,336 B), arg2 = C row-major `rows*pitc
 panel `p` at `col0 = 512*p`, `append_run_body` / `append_lean_run_body` with `arena_base[2] =
 2*512*p`) or native 16,384 B tiles. `pack_a_bf16` / `pack_b_bf16` dispatch on the design.
 
-### Gate K0 (design round verdict section 2), simulator ticks, never silicon
+### Gate K0 (design round verdict section 2), simulator ticks, never silicon (historical)
 
 `cargo test --release -p peacemaker-npu --test g80 g80_n512 -- --nocapture` (golden bytes: complete padded
 arena equal to the `bf16_direct` twin over the limb x sign x tie fixture at K = 6144, 1 / 2 / 16
@@ -301,11 +361,14 @@ and one LDS barrier to coalesce native 8x8 byte tiles into 128-bit stores.
 The scale and RNE quantizer DAG is unchanged. Other K/architectures retain the
 scalar producer, also exposed as a lab-only old/new oracle. At 8192 rows the
 single-read traffic is 65.57 MB including replicated scales and sidecars;
-180 GB/s implies **0.364 ms** before arithmetic/LDS/launch overhead, an estimate
-pending Halo event timing (not a measured speedup).
+180 GB/s implies **0.364 ms** before arithmetic/LDS/launch overhead: a design-time
+bandwidth estimate. The measured pack time after this coalescing is in the root
+changelog.
 
-`npu_trunk_emulate_bf16` reads exactly that packed A and row-major S1 W8 codes,
-uses caller-owned I32 `[rows,n]` scratch, then applies the lab's all-integer
+`npu_trunk_emulate_bf16` is the `emulate` GPU twin: it reads exactly that packed A
+and row-major S1 W8 codes, uses a caller-owned int32 `[rows,n]` accumulator (lab
+scratch private to the twin; no int32 value is an NPU output or a serving
+contract), then applies the lab's all-integer
 single-rounding BF16 epilogue into native outputs. The consumer reads panel-major
 G80 BF16 tiles without rounding; F32 stores are exact `bits << 16`. The producer
 requires finite F16 inputs, as does the screened lab contract. Geometry may be
@@ -314,13 +377,13 @@ larger than the live token count; it must equal the submitted NPU program.
 The signed-IU8 WMMA GEMM and BF16/F32 scatter are certified PM gfx1151 kernels
 (`peacemaker-isa emit --kernel npu_trunk`, committed image and M7 receipt).
 Activation grid `ceilf` and epilogue unsigned CLZ currently use hipcc, with the
-two missing ISA-table operations logged in release-0.4.2/PM-GAPS.md. This is an
-opt-in primitive API only: no scheduler, forward hook or NPU device open.
+two missing ISA-table operations logged in the PeaceMaker gap ledger. This section
+is the primitive API layer: it has no scheduler, forward hook or NPU device open
+of its own; the serving route above drives it.
 
 Halo GPU byte oracle (do not hide the GPU for this command):
 
 ```sh
-CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-pack/target \
 nice -n 19 cargo run --release -p rdna-compute --features lab -j 12 \
   --example npu_trunk_glue_check
 ```
@@ -356,7 +419,7 @@ Runtime `CalKey` derives:
   `calibrate-npu-trunk`; no git SHA and no binary hashing.
 * `kernel.uname_release`: trimmed `uname -r`. The recorded PerfOpt arming
   signal is `AMD-Vi: PerfOpt armed` in privileged dmesg, not a readable
-  sysfs/proc ABI. Schema 3+ therefore drops `perfopt_armed`, rather than inventing
+  sysfs/proc ABI. Schema 3 and later (including 4) therefore drop `perfopt_armed`, rather than inventing
   a boolean from a kernel name. Recollect if boot arming changes under the same
   release: this key cannot distinguish that case.
 * `model_index_sha256`: HFQ bytes `[0,data_offset)`, using
@@ -429,7 +492,7 @@ changing the stored record.
 
 `load_log_line` takes a `LoadLogKey { current, mode, families }`, crossover,
 and plans at 16384/65536. It checks the key, hashes canonical serialized
-calibration JSON, and logs the INTERFACES.md §4 fields, with times as
+calibration JSON, and logs the load-line fields (mode, families, key/hash, crossover, predicted times), with times as
 pipe/GPU milliseconds. `request_log_line(rows, &plan)` prints e.g.
 `npu-trunk: rows=16384 plan=[pipe 0..8192+8192..16384] predicted=-14.7%`.
 The key/hash plus stored calibration identify every deterministic model input.
@@ -467,9 +530,9 @@ The measurements schema is the same as the schema-version-4 output record:
 * `contention.alpha_overlap` (>=1) and `model`: fitted/measured overlap
   slowdown and the provenance/fit description. The planner consumes the alpha;
   it does not reinterpret the descriptive model string. Optional
-  `contention.ms_per_gb` (v5): contention per NPU DRAM GB of the overlapped family
+  `contention.ms_per_gb` (planner refit, schema 4): contention per NPU DRAM GB of the overlapped family
   chains (`bytes_per_kop * kops` per chain, plus the out family's own bytes/kop).
-* Optional (v5, absent in v4 records, which load unchanged): `glue.visit_ms_8192`
+* Optional planner-refit fields (schema 4; records without them load unchanged): `glue.visit_ms_8192`
   (GPU overhead per 8192 rows of a bank visit that moves families),
   `npu.tops_alone` (in-proj alone rate the co-run rate is measured against),
   `families.gdn.out` / `families.qsa.o` (an `out` block: `k`, `panel_cols`,
@@ -480,7 +543,7 @@ The measurements schema is the same as the schema-version-4 output record:
   `C_A C_B P_A P_B`; required with `qsa.o`).
 
 Collect once per exact device/build/kernel/PerfOpt/model/epilogue/trunk-route tuple.
-The lab procedure is in `/home/kaden/qcal/release-0.4.2/npu-trunk/`:
+The collection procedure lives in the maintainers' NPU lab workspace, not in this repository:
 `ptrace.sh` attributes GPU kernel costs by layer/family; `contend.sh` measures
 co-run throughput and the contention fit; `tax.sh` measures the extra boundary
 tax; `g80bf16.sh` measures the direct-BF16 NPU rate/traffic. Measure GPU glue
@@ -505,15 +568,15 @@ baseline, plus 40 exact-range plans. `golden-exec.json` pins the executable
 projection (`executable_plan`: natural and rebalanced pairs) and the prefill group
 schedule (`schedule`: banks and the in-bank snapshot cut, cache off / on / on
 without sub-launches) for 8000..65536 rows on the stock/overlay records.
-`golden-v5.json` (fixture `g80bf16-overlay-v5.json`) pins the refit model: the 63-subset
+`golden-v5.json` (fixture `g80bf16-overlay-v5.json`, a schema-4 record; `v5` names the planner refit) pins the refit model: the 63-subset
 selection table (the 15 in-proj subsets compared in Rust, out-family subsets `selectable: false`),
 per-set bank segments (in-proj/out chains, NPU bytes), pair times (stall, contention, fill)
 and plans including the out families. The same
 tests run in the library and the `npu_trunk_plan` integration target (the
 schedule golden runs in the library, where the scheduler is visible).
-**All goldens are generated** by
-`python3 /home/kaden/qcal/release-0.4.2/npu-trunk/gen_goldens.py
-crates/hipfire-arch-qwen4/tests/fixtures/npu_trunk` from `crossover_model.py`
+**All goldens are generated** by the lab's `gen_goldens.py` (maintainers' NPU lab
+workspace, not in this repository) into
+`crates/hipfire-arch-qwen4/tests/fixtures/npu_trunk` from `crossover_model.py`
 and the fixture calibrations (a pure function; no hardware), never edited by hand.
 The migrated lab `g80bf16-{stock,overlay}-v2.json` records preserve measured
 costs and add Halo j110 consume rates: BF16 `2.85/16480`, F32 `4.60/16480`
@@ -524,7 +587,6 @@ Run offline:
 
 ```sh
 ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 \
-CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
 nice -n 19 cargo test -p hipfire-arch-qwen4 --lib npu_trunk -j 12
 ```
 
@@ -545,7 +607,7 @@ Only an absent file falls back to compiled-in measured Halo schema-4 records:
 keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
 Invalid/unreadable files never fall back. Both sources require identical key
 checks; successful arming logs `cal_source=file|builtin`. The reference key is
-gfx1151 / `0000:c0:00.0`, firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
+gfx1151, the reference unit's PCI bus ID (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
 model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
 BF16 and the matching stock/overlay route; the builtin does not admit other keys.
 
@@ -566,11 +628,13 @@ Every auto refusal on gfx1151 logs exactly one `npu-trunk: off (<reason>)` line;
 it never fails a load. After admission, sticky runtime errors still fail the
 request closed; GPU fallback must not publish partial NPU results.
 
-The default-on decision uses Halo default serve config with the zab overlay,
-three fresh processes per arm: p16k 7,878 → 7,173 ms (−8.9%),
-p56k 30,052 → 27,867 ms (−7.3%). Greedy `on` and `emulate` bytes match;
-flag-off `serve_harness` battery and chain match beta. Kaden accepted S11 j103
-BF16-direct family B: ΔKLD WT2 −0.0005 / code24 +0.0052 (cap +0.015).
+The first default-on measurement used the Halo default serve config with the zab
+overlay, three fresh processes per arm, before rebalanced pairs and row-adaptive
+chains (fixture-bound; superseded by the figures in Serving status): p16k
+7,878 → 7,173 ms (−8.9%), p56k 30,052 → 27,867 ms (−7.3%). Greedy `on` and
+`emulate` bytes match; flag-off `serve_harness` battery and chain match beta.
+Quality accepted: S11 j103 BF16-direct family B, ΔKLD WT2 −0.0005 / code24
++0.0052 (cap +0.015).
 
 | Mode | Calibration unavailable/invalid/key mismatch | Match: all selected | Match: subset/none |
 | --- | --- | --- | --- |
@@ -600,59 +664,62 @@ For the historical stock-v2/overlay-v2 planner records, executable pair starts/l
 `(0,16384),(16384,16384),(32768,16384),(49152,8392)` (4224+4168 tail);
 65536: four `16384` pairs. n* is 6848 stock / 8256 overlay. The Python mapping is
 `crossover_model.py executable_plan`/`schedule`; Rust is checked against
-`golden-exec.json` generated by `gen_goldens.py` (see Fixtures).
+`golden-exec.json` generated by `gen_goldens.py` (see Offline golden parity).
 
-### Installing and testing auto on hipx (parent hardware gate)
+### Installing and testing auto on a Strix Halo host (maintainer hardware gate)
 
-After CPU acceptance, install the **same** release CLI/daemon and matching
-schema-3 overlay calibration. These commands are for the parent, not the CPU worker:
+After CPU acceptance, install the **same** release CLI/daemon on the Halo host.
+The built-in calibration covers the reference key, so no calibration file is
+needed there. A file at `<hipfire home>/npu-trunk/calibration.json` is needed
+only to override it, and must be a schema-4 BF16-direct record whose key matches
+this device exactly (schema-3 and I32 records are refused). These commands are
+for the maintainer running the gate, not the CPU worker:
 
 ```sh
-ssh hipx 'mkdir -p /home/kaden/pm-wave/npu-trunk/bin-auto ~/.hipfire/npu-trunk'
-scp target/release/hipfire hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire
-scp target/release/hipfire-daemon hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire-daemon
-scp /home/kaden/qcal/release-0.4.2/npu-trunk/cal/g80bf16-overlay-v2.json \
-  hipx:/home/kaden/.hipfire/npu-trunk/calibration.json
-scp /home/kaden/qcal/release-0.4.2/npu-trunk/serve_ttft.py \
-  hipx:/home/kaden/pm-wave/npu-trunk/bin-auto/serve_ttft.py
+GATE=<gate directory on the Halo host>
+ssh <halo-host> "mkdir -p $GATE/bin"
+scp target/release/hipfire target/release/hipfire-daemon <halo-host>:$GATE/bin/
+# Optional override only (schema 4, key must match this device):
+# scp <schema-4 calibration.json> <halo-host>:<hipfire home>/npu-trunk/calibration.json
 ```
 
-On hipx, verify `uname -r` is `7.3.0-rc7-perfopt+`, GPU BDF is
-`0000:c0:00.0`, and `cat /sys/class/accel/accel0/device/fw_version` matches the
-record. Do not rewrite a measured device/kernel key to hide a mismatch.
-Use the verified overlay-bound model; for stock instead install the stock
-record and set `HIPFIRE_QWEN4_TRUNK_OVERLAY=off`.
-Do **not** inherit the CPU gate's visibility masks (`-1`); use the Halo device
-selection from the existing hipx campaign. Keep the default session cache.
+On the Halo host, verify `uname -r` is `7.3.0-rc7-perfopt+`, the GPU PCI bus ID
+equals the record's `device.pci_bdf`, and
+`cat /sys/class/accel/accel0/device/fw_version` matches the record (for the
+built-in reference key, the values in the built-in record). Do not rewrite a
+measured device/kernel key to hide a mismatch. The default route uses the
+verified overlay-bound model; for the stock route instead set
+`HIPFIRE_QWEN4_TRUNK_OVERLAY=0` (the built-in stock record then applies). Do
+**not** inherit the CPU gate's visibility masks (`-1`); use the Halo device
+selection. Keep the default session cache.
 
 ```sh
-export HIPFIRE_DAEMON_BIN=/home/kaden/pm-wave/npu-trunk/bin-auto/hipfire-daemon
-export HIPFIRE_QWEN4_NPU_TRUNK_CAL=/home/kaden/.hipfire/npu-trunk/calibration.json
-export MODEL=/home/kaden/pm-wave/npu-trunk/models-ov/qwen3.8-flash-next-gptq3.mq4
-export ROCR_VISIBLE_DEVICES=1  # recorded Halo campaign ordinal; require gfx1151/c0:00.0
+export HIPFIRE_DAEMON_BIN="$GATE/bin/hipfire-daemon"
+export MODEL=<pinned Flash-Next MQ6 family-B overlay-bound artifact>
+export PROMPT=<prompt file with at least 16K tokens>
+# ROCR_VISIBLE_DEVICES: ordinal of the gfx1151 GPU (require gfx1151)
 unset HIP_VISIBLE_DEVICES
-HIPFIRE_QWEN4_NPU_TRUNK=auto /home/kaden/pm-wave/npu-trunk/bin-auto/hipfire \
-  bench "$MODEL" --ttft --prompt-file /home/kaden/pm-wave/halofn/p16k.txt --runs 3
 for mode in auto off; do
-  for run in 1 2 3; do
-    HIPFIRE_QWEN4_NPU_TRUNK="$mode" python3 /home/kaden/pm-wave/npu-trunk/bin-auto/serve_ttft.py \
-      --hipfire /home/kaden/pm-wave/npu-trunk/bin-auto/hipfire --model "$MODEL" \
-      --prompt /home/kaden/pm-wave/halofn/p16k.txt --measured 1 --greedy \
-      --tag "$mode-$run" --out "/tmp/npu-auto-$mode-$run.json"
-  done
+  HIPFIRE_QWEN4_NPU_TRUNK="$mode" "$GATE/bin/hipfire" \
+    bench "$MODEL" --ttft --prompt-file "$PROMPT" --runs 3
 done
 ```
 
-Require load `mode=auto`, matching `cal_key`, all families and n*=8256,
-not an off/mismatch reason. Require the actual prompt row count and one request
-plan line; 16343 rows must select one 8192+8151 pair. Repeat fresh processes
-for `auto` and `off` at 16K/57K, and a greedy prefix-sharing second request
-through `serve_ttft.py --greedy` with the same model and default cache.
-Confirm sub-8256-row prompts (8000) stay GPU-only; 9319 must plan one rebalanced
-4672+4647 pair and 57556 must plan 4224+4180 as its final pair, each with
-`on == emulate` greedy output including a prefix hit at the 8192 snapshot taken
-inside bank B's Core sub-launch (C1 gate). The previously documented
-snapshot and quality/TTFT gates still apply; CPU acceptance is not a silicon claim.
+The changelog measurements used cold, nonce-prefixed requests to fresh serve
+processes (3 per arm) through a lab serve harness that is not in this tree; the
+serve flow in the Halo hardware gate below exercises the same HTTP route.
+
+Require load `mode=auto`, matching `cal_key`, all families and (for the reference
+overlay record, fixture-bound) n*=8256, not an off/mismatch reason. Require the
+actual prompt row count and one request plan line; 16343 rows must select one
+8192+8151 pair. Repeat fresh processes for `auto` and `off` at 16K/57K, and a
+greedy prefix-sharing second request through the serve flow below with the same
+model and default cache. Confirm sub-8256-row prompts (8000) stay GPU-only; 9319
+must plan one rebalanced 4672+4647 pair and 57556 must plan 4224+4180 as its
+final pair, each with `on == emulate` greedy output including a prefix hit at the
+8192 snapshot taken inside bank B's Core sub-launch (C1 gate). The previously
+documented snapshot and quality/TTFT gates still apply; CPU acceptance is not a
+silicon claim.
 
 
 The route requires Flash-Next K=2560 and stock MQ6G256V2 for all eight
@@ -694,7 +761,7 @@ Under `on` the GPU packs A, then the mixer core directly reads read-only BF16
 runs the same layer-major pair executor: its `prepare` runs the IU8 twin
 projection into scratch where `on` packs and kicks, and its Core reads that
 scratch. Bank B therefore owns private copies of the in-projection outputs
-(`NpuBankKind::Emulated`, about 1.1 GiB more than `on`). Out-projections and
+(`NpuBankKind::Emulated`; the load log's `bank_b_bytes` shows the extra bytes versus `on`). Out-projections and
 GPU recurrence/attention/HC/MoE remain native.
 
 Each arena family is `Option<Bf16Arena>`: GDN's fused convolution/parameter
@@ -738,7 +805,7 @@ bank-private A arena, never the shared GPU layer intermediates.
 Capture/MTP copies each bank's private `streams` into its own output row range
 after both trunks finish. GDN recurrence/convolution, QSA KV/index caches and
 PLE convolution state remain shared model state: B observes A's ordered updates.
-Opt-in execution uses mapped experts, not donor-layer staging.
+NPU-pair execution uses mapped experts, not donor-layer staging.
 The private NPU owner closes the runtime and frees bank B before bank A;
 borrowed fields are never freed by B. None of railgun's internal HIP Rc
 resources escapes the exclusive owner.
@@ -746,7 +813,8 @@ resources escapes the exclusive owner.
 ### Load footprint
 
 Only `emulate` uploads the row-major W8 twin and its weight Sm/Se scales,
-or allocates its packed-A and I32 `sums` buffers. Physical `on`/admitted `auto`
+or allocates its packed-A and int32 accumulator (`sums`) buffers: lab scratch
+private to the GPU twin (no int32 partial exists in the physical route). Physical `on`/admitted `auto`
 retain NPU panels instead; tails, unpaired chunks and uncovered projections
 use the native GPU route. Two compact activation sidecar buffers (32 KiB
 each at 8192 rows) remain required by the GPU A-pack producer in both modes;
@@ -754,21 +822,24 @@ they are not the twin's weight scales.
 The load log reports `resident_bytes=npu_panels_bytes+gpu_twin_bytes` for
 resident weights, plus `bank_b_bytes` for the new private scratch allocation.
 
-The Flash-Next **full-family baseline**, at 8192 rows (36 GDN, 12 QSA), saves:
+Allocation-plan comparison at 8192 rows (36 GDN, 12 QSA), all families: physical
+`on`/`auto` against an `emulate`-style layout (GPU twin, unshared bank B). The twin
+rows, including the int32 accumulator, exist only in that layout; `on`/`auto`
+allocate none of them:
 
 | Removed allocation | Bytes |
 | --- | ---: |
 | Bank-B layer-local scratch (`Full` plan 8,957,998,980 minus private 503,316,480) | 8,454,682,500 |
 | GPU W8 twin (`(36*16640+12*14080)*2560`) | 1,966,080,000 |
 | Twin weight Sm/Se (`(36*16640+12*14080)*4`) | 3,072,000 |
-| Twin I32 sums (`8192*16640*4`) | 545,259,520 |
+| Twin int32 accumulator, `emulate` only (`8192*16640*4`) | 545,259,520 |
 | Twin packed A (`4*32*40*4608`) | 23,592,960 |
 | **Total** | **10,992,686,980 (10.237738 GiB)** |
 
 The twin-only subtotal is 2,538,004,480 bytes (2.363701 GiB); bank-B sharing
 saves 7.874037 GiB and leaves 480 MiB private. Subset panel/twin savings are
 additional and mask-dependent; the log reflects the actual selected mask.
-These are allocation-plan bytes, not a fresh measurement of GTT residency.
+These are allocation-plan bytes, not a GTT residency measurement (the changelog's measured peak GTT delta is +0.8 GiB at 56K).
 CPU tests `npu_bank_sharing_covers_every_field_and_never_crosses_a_bank_switch`
 and `npu_private_bank_bytes_are_pinned_at_full_and_partial_rows` enumerate all
 58 fields, check produced-value lifetimes against the actual A/B event order,
@@ -781,7 +852,7 @@ Such a change must update the exhaustive lifetime table and private set.
 Partial B changes its view metadata only; A's tensor extents and capacities
 stay intact. Numerical operations/order and external capture offsets are
 unchanged, but full-model `on`/`emulate` byte parity and GTT savings still
-require the parent's Halo hardware gate.
+require the Halo hardware gate.
 
 With an 8192-row chunk cap, a natural pair is 8192+B whenever at least 8192+512
 rows remain: bank A has 8192 live rows and B has `min(remaining-8192,8192)`. The
@@ -853,7 +924,7 @@ kicked, gives it its own hardware context and caches it per (class, padded rows)
 (`railgun::npu::trunk::TxnBuilder`, `chain_rows`). The producer packs the A
 stream for the same padded rows (whole 256-row waves) and explicitly zeros every
 padded row; kick records the live count, and all arena readers use only the
-live rows. Without this a 4,672-row bank paid the full 8192-row chain (55.7 ms
+live rows. Without this (before the row-adaptive programs; Halo measurements) a 4,672-row bank paid the full 8192-row chain (55.7 ms
 for a GDN layer against a ≈ 35 ms GPU window), which made the rebalanced 9.3K
 pair 13 % slower than `off` (Halo H2b); with it the chain scales with rows
 (34 ms at 4,672, Halo H4). The relay holds at most `MAX_ADAPTIVE_CONTEXTS` (4)
@@ -956,7 +1027,7 @@ asserts enqueue-before-done on every exact round and prints NPU-done→GPU-resum
 event latency with clock-anchor uncertainty, plus a forced-watchdog release test.
 No trace records are emitted for GPU-only tails or `emulate`.
 
-### Parent's Halo gate
+### Halo hardware gate (maintainer-run)
 
 No full-model hardware parity or speed claim is established by CPU builds.
 Use the same MQ6 family-B model, prompt and greedy settings in fresh daemons;
@@ -967,7 +1038,7 @@ Do not inherit the build-only `ROCR_VISIBLE_DEVICES=-1`/`HIP_VISIBLE_DEVICES=-1`
 Run transport before either serving arm, with devices visible:
 
 ```sh
-target/release/npu-trunk-transport --pci 0000:c0:00.0
+target/release/npu-trunk-transport --pci <gfx1151 GPU PCI bus ID>
 ```
 
 ```sh
@@ -1026,14 +1097,14 @@ cmp /tmp/npu-trunk-on.txt /tmp/npu-trunk-emulate.txt
 ```
 
 Continuous-batch/lane `prefill_wave` is not paired; its tiles retain the native
-GPU route in both arms. A singleton pair may cross a snapshot boundary only
-when it is exactly the A/B split. An interior A or B boundary still splits the
-schedule; message-end cadence and cache scope are unchanged. EP, compact scratch,
-calibrated `auto` and variable-size NPU programs remain outside first light.
+GPU route in both arms. A pair carries at most one interior session snapshot row
+(see above); a second interior boundary ends the group at the first and runs as
+an ordinary sequential bank. Message-end cadence and cache scope are unchanged.
+EP and compact scratch are outside the route (auto refuses them at admission).
 CPU scheduling/capture/retirement tests live under
 `gpu_forward::npu_forward::tests`; existing MTP tests cover head append IDs
 and pick boundaries. Full-model greedy comparison and trace overlap
-inspection remain the parent-run silicon acceptance gate.
+inspection remain the maintainer-run silicon acceptance gate.
 
 ### Default-cache snapshot staging
 
@@ -1136,15 +1207,13 @@ and the lab's exact old-path materialization. Its three certified gfx1151
 exports cover BF16→F32 (`bits << 16`), BF16→BF16 and F32→F32. The committed
 `npu_trunk_arena_pm_gfx1151.{s,co,hxaco,proof.json,m7.json}` carry M7 byte-exact
 lifts, empty obligations and zero ambiguous delays; the embedded image is
-SHA256-pinned. Hipcc exceptions have one entry per kernel in
-`/home/kaden/qcal/release-0.4.2/PM-GAPS.md`.
+SHA256-pinned. Hipcc exceptions have one entry per kernel in the PeaceMaker
+gap ledger.
 
-### Parent's Halo consumer oracle
+### Halo consumer oracle (maintainer-run)
 
 ```sh
-cd /home/kaden/ClaudeCode/warpfront/wt-npu-trunk
 HIPFIRE_QWEN4_GDN_PREFILL=wy HIPFIRE_QWEN4_F16_WMMA=1 \
-CARGO_TARGET_DIR=/home/kaden/ClaudeCode/warpfront/wt-npu-trunk/target \
 nice -n 19 cargo run --release -p rdna-compute --features lab \
   --example npu_trunk_consumers_check -j 12
 ```
@@ -1158,7 +1227,7 @@ QSA gates/index tails, complete K/V caches and raw index keys with untouched
 prefix/suffix guards. It verifies the materializer independently against CPU
 bit widening, prints old timings including materialization versus direct reads,
 checks immutable arena bytes, and exits 1 on any mismatch. GPU parity/timings
-are parent-run silicon evidence, not implied by CPU build/test success.
+are maintainer-run silicon evidence, not implied by CPU build/test success.
 
 The mixed oracle additionally uses a compact qkv-only pitch of 10240 with
 native F32 z/a/b carrying nonzero low mantissa bits. It compares fused

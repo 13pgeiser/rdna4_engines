@@ -1,7 +1,17 @@
 # IEF15 N0: NPU pair core for the mixed contract (dense Qwen3.8-27B)
 
-NpuIef15N0, 2026-10-03, branch `npu/ief15-n0`. Design under review; nothing below is a hardware result until the
-declared silicon window (§7). Sources: `docs/fold-contract.md` §3/§8, CPU oracle `tools/npu/fold-model/src/lib.rs::{grid,
+> **Lifecycle: historical dark research record (2026-10-03); the contract it implements is
+> not a shipped path.** The IEF15 mixed-contract co-op was never wired into any serving route
+> (see [`fold-contract.md`](fold-contract.md): full IEF15 killed, mixed plan unimplemented).
+> The kernel exists only as dark `pm-npu` code and a lab `npu-gemm --fold-contract ief15`
+> probe. It is unrelated to the 0.4.2 Flash-Next NPU trunk, which is BF16-direct only
+> (calibration schema 4, input projections only, out-projection unwired; no I32/IEF15
+> contract); see [`npu-trunk.md`](npu-trunk.md). Text written before §8 ("nothing below is a
+> hardware result", "declared window") describes the state before the window; §8 holds the
+> dated fixture-bound silicon results, which are not current performance or an admission.
+
+Workspace branch `npu/ief15-n0` (not in this repository), 2026-10-03. Design under review when written; nothing in §§1–7 is a hardware result until the
+declared silicon window (§7, results in §8). Sources: `docs/npu/fold-contract.md` §3/§8, CPU oracle `tools/npu/fold-model/src/lib.rs::{grid,
 round_scaled, fixed}`, llvm-aie intrinsic headers `lib/clang/22/include/aie2p/*.h` of the oracle wheel (semantic source
 for every new instruction), `crates/peacemaker-npu/src/isa/gen.rs` (encodings), `crates/peacemaker-npu/src/isa/sched.rs` (itineraries).
 
@@ -129,7 +139,7 @@ Per 32 lanes, with `X = clamp(a_r + b_t, ±300)` (host rejects |a|, |b| > 16383 
   lane model). Window command: `npu-gemm --ief15-probe --dump <prefix>` (one fresh-context submit; per-case MATCH/MISMATCH
   table, exit 1 on any mismatch or a non-completed wait; `--expected-only` runs the simulator side only).
 
-## 8. Window 1 results (2026-10-03, hipx, `tools/npu/npu-ief15-w1.sh` @ a2bf975, npu-gemm md5 ce658da6b8044adc390c7ef9f342e208)
+## 8. Window 1 results (2026-10-03, Halo test host, `tools/npu/npu-ief15-w1.sh` @ a2bf975, npu-gemm md5 ce658da6b8044adc390c7ef9f342e208)
 
 * Probe: 437/437 MATCH (all families: VSRS 132, VMAC 44, VADDMAC 36, VUPS 30, VSHUFFLE/VGE/VLT/VMAX/VMIN 16 each, VMUL 15,
   VLDB 13, VUNPACK 10, VADD/VSUB/VEQZ 8, ADD/AND/OR/LSHL/VBCST/VSEL 6, EQZ/NEZ 4, VBAND/VBOR 3, VNEG 2, VST 1);

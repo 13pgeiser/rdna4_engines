@@ -1,5 +1,17 @@
 # railgun for the NPU (XDNA2 / AIE2P, Strix Halo NPU5)
 
+> **Lifecycle (0.4.2): design note for the dark `railgun::npu` runtime; §7 describes
+> the transport under the Flash-Next trunk route.** §§0–6 (prepared commands, lean TXN,
+> persistent ring, grouped experts, tape) are research designs that no serving path
+> calls. §7 is the transport that the default-`auto` Flash-Next gfx1151 NPU trunk uses
+> for its **input projections** (`GdnIn` / `QsaIn`, calibration schema 4, BF16-direct
+> only; there is no I32 contract). The out-projection shapes (`GdnOut` / `QsaO`)
+> exist in the runtime and in the CPU packers and programs, but **no serving route
+> submits them**; they are not shipped, and `qsa.o` / GDN o-proj are not offloaded.
+> For the current route, schema and environment see [`npu-trunk.md`](npu-trunk.md)
+> and the root `CHANGELOG.md`. Timings in this file are fixture-bound or historical
+> measurements from the dates stated, not current performance claims.
+
 Retained, certified, low-overhead dispatch for our own amdxdna runtime (`railgun::npu`, DRM ioctls only), plus the
 CPU-free GPU→NPU work ring that GPU+NPU co-op needs. Everything here is Rust; no driver or firmware change.
 
@@ -79,7 +91,7 @@ Within a retained persistent command of S runs started at `seq0`, run j has `seq
 2. DRAIN: one `WRITE32` flips P's `next` to the finite sentinel BD SENT; `MASKPOLL X == 0xFFFFFFFF` (in-order
    stream ⇒ every poll word has landed, nothing stray reaches the GEMM's B channel).
 3. BODY: the V9 GEMM TXN with shim DDR patches advanced by the slot's fixed arena offsets; ends with both C SYNCs
-   (all 16 C channels joined by the firmware, Astra gate 2). `persistent_v9_lean`: run 0 of a command takes the full
+   (all 16 C channels joined by the firmware; design gate 2). `persistent_v9_lean`: run 0 of a command takes the full
    body, runs 1.. the lean body (§2) plus a forced reset/requeue of memtile(0) S2MM4 and MM2S0, the two channels POLL
    and DONE borrow (136 KB vs 416 KB of TXN per 8 slots).
 4. DONE: reset+release memtile(0) MM2S0 (strictly after the C SYNC); 16 `WRITE32` stage {seq, s, 'DONE'} at memtile
@@ -170,19 +182,22 @@ Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 | ring overrun | producer guard `producer_may_publish` (done[s] must equal seq − nslots) | guard refuses; forced in the simulator ⇒ MASKPOLL deadlock reported |
 | AIE2P control rules | `crates/peacemaker-npu/src/isa/rules.rs` in `Program::finish` (unchanged core programs) | its own unit tests |
 
-## 7. Opt-in trunk BF16 transport (0.4.2)
+## 7. Trunk BF16 transport (0.4.2)
 
 `railgun::npu::trunk::NpuTrunkRuntime::open(Vec<PanelProgram>, Vec<LayerPanels>, banks, rows_max, pci)`
 accepts one `build_panel_program_rowmajor(rows_max, shape.pitch(), 0)` PDI/TXN
 per shape and resident `pack_b_bf16` panels including Sm/Se. The shape programs
 share the same G80 PDI/context but retain distinct pitch-specific instruction BOs.
 The out shapes (`Shape::GdnOut` / `Shape::QsaO`, K=6144, five 512-column panels,
-`build_panel_program_out(rows_max, 2560, 0)`) run a different PDI: the relay creates one
+`build_panel_program_out(rows_max, 2560, 0)`) are supported by the runtime but are
+**not requested by the 0.4.2 serving route** (out-projection is unwired; see the
+lifecycle note at the top). They run a different PDI: the relay creates one
 `HwCtx` + `config_cu` per distinct PDI (input shapes share one, both out shapes share one),
 submits serially from its single thread, and routes each chain to its shape's context. Each
-bank additionally owns `a_out` (`rows*6912` B, `a_out_arena(bank)`) and BF16 out C arenas
+bank additionally reserves `a_out` (`rows*6912` B, `a_out_arena(bank)`) and BF16 out C arenas
 (`rows*2560*2` B); padding for out shapes is 512-row waves. Whether two contexts coexist and
-what a context switch costs is measured by `npu-trunk-transport --coexist`.
+what a context switch costs is measured by `npu-trunk-transport --coexist` (an
+investigation probe, not a serving gate).
 GdnIn/QsaIn use 13/11 START_CUs in a retained chain per (layer, shape, bank).
 The program declares its padded row extent; rows never patch the program.
 The caller zeros all padding codes/scales. A is one `pack_a_bf16` stream, not
@@ -223,7 +238,7 @@ event then orders the next NPU submit. Callers that do not prepare still need
 completed retirement before kick. `Completion::{submit_ns,done_ns}` are relay
 CLOCK_MONOTONIC timestamps (submit issue and completed timeline observation).
 Serving records retirement after mixer Core (all direct arena readers), before
-OutProj. `prepare` waits retirement on the producer stream, A production follows,
+the out projection (which stays on the GPU in 0.4.2). `prepare` waits retirement on the producer stream, A production follows,
 and kick's ready event follows both; the relay must observe ready before submit.
 This orders **all old C reads before the next C DMA write**, not merely A reuse.
 `close()` first cancels outstanding generations and releases all their GPU waits,
@@ -269,7 +284,7 @@ submit and C after completion, before publishing the terminal word. The
 transport gate uses this option and compares both CPU arena aliases against the
 GPU-produced/downloaded bytes. Production `open` defaults to device-only access.
 
-Hardware gate (parent runs on Halo): `target/release/npu-trunk-transport --pci 0000:c0:00.0`.
+Hardware gate (run on a Halo host): `target/release/npu-trunk-transport --pci <npu-bdf>`, where `<npu-bdf>` is the NPU's PCI address on that host (the flag has a built-in default for one reference host's enumeration).
 It uses default shim AXI, two production-size banks, GPU shader copies of CPU-packed A,
 and both row-major shapes (13 GDN / 11 QSA panels), 20 alternating rounds each.
 Every live BF16 value at `2*(row*pitch+panel*1280+col)` is compared against CPU
@@ -284,7 +299,7 @@ The deterministic missing-wait negative then reads
 fresh poison without submitting a replacement job; a racing ungated read could legitimately
 finish after NPU completion and is not a reliable negative. A deliberately unsubmitted host
 Seq must error immediately in process (no DRM wait or relay request). The former impossible
-DRM timeline probe was removed after the parent-reported j107 receive timeout hid all rounds.
+DRM timeline probe was removed after a reported receive timeout hid all rounds.
 Every exact round asserts `gpu_wait_enqueue_ns < npu_done_ns`. A timing event
 immediately after the terminal wait/system acquire measures NPU done to GPU
 resume; the `RESUME` p50/p99/max summary includes the host/HIP clock-anchor
@@ -299,8 +314,8 @@ and `PASS shape=GdnIn|QsaIn rounds=20 negatives=3 consumer_padding_bounds=checke
 Busy is the host submit-to-timeline
 envelope, not an AIE hardware counter; wall includes CPU verification. Any mismatch/error
 exits 1 and identifies `stage=... round=...` (`round=none` for setup/negatives/teardown).
-The first-light transport route passed on Halo; enqueue-ahead ordering, forced
-watchdog release and resume latency in this updated gate remain **unmeasured
-until the parent runs it**. No hardware is opened by the CPU unit tests:
+The first-light transport route passed on Halo; the enqueue-ahead ordering, forced
+watchdog release and resume-latency numbers of this updated gate are not recorded in this
+document (see the root `CHANGELOG.md` for the recorded 0.4.2 exactness results). No hardware is opened by the CPU unit tests:
 `cargo test -p railgun --features npu --lib` and
 `cargo test -p npu-tools --bin npu-trunk-transport`.
