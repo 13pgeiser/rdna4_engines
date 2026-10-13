@@ -608,6 +608,11 @@ code24 `heldout-code24.gptqsym.kldref.bin` (sha256
 `43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
 A change that claims to be bit-exact must reproduce its arch's `.kldseq`
 byte for byte. A change that moves a pin on purpose re-pins it here.
+A re-pin must record, in the same commit: the evaluator build commit,
+the evaluator binary md5, and the receipt path. The public references and
+one-command reproduction live in `kld/VERIFY.md` on the model's Hugging Face
+repo (`hipfire-models/qwen3.8-27b`, `hipfire-models/qwen3.8-flash-next`);
+update it with the pin.
 
 Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
 code object v6). Each pin is reproduced in two fresh processes with separate
