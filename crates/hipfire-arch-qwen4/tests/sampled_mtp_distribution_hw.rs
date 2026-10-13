@@ -8,6 +8,12 @@
 //! `qwen3.8-flash-next-gptq3.mq4` artifact named by
 //! `HIPFIRE_MTP_IDENTITY_MODEL`.
 //!
+//! Loading uses the shared production expert-residency policy:
+//! `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=auto` or `N` places discrete-GPU
+//! expert spill in pinned host RAM; auto reserves native MTP and QSA gather
+//! workspace. Product code and sampled coverage, identity and law assertions
+//! are unchanged.
+//!
 //! The serve battery's prose prompt (thinking off, rendered as `hipfire
 //! serve` renders one user message) is decoded from a cold state
 //! `HIPFIRE_SAMPLED_MTP_TRIALS` times (default 2000) per arm, each trial with
@@ -169,6 +175,7 @@
 //! config-verified shard and runs only the missing ranges.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{qwen4_ngram_mod_config, Qwen4MtpDrafter};
 use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend};
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -760,6 +767,18 @@ fn load(model: &Path) -> Result<Loaded, String> {
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
+    if let Some(devices) = hipfire_config::devices::startup_devices() {
+        let archs = devices
+            .iter()
+            .map(|device| device.arch.as_str())
+            .collect::<Vec<_>>();
+        if residency::keeps_host_memory_out_of_reclaim(hipfire_arch_qwen4::ARCH_ID, &archs) {
+            hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+                "Qwen4 model on {}",
+                archs.join(",")
+            ));
+        }
+    }
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
@@ -770,27 +789,6 @@ fn load(model: &Path) -> Result<Loaded, String> {
         &receipt.manifest,
     )
     .map_err(|e| e.to_string())?;
-    if gpu.is_uma() {
-        hfq.drop_mmap();
-    }
-    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
-    let expected = WeightOrigin::for_single(&mesh, &gpu);
-    let source = HfqModelSource::from_hfq(hfq);
-    let transaction = fulfill_manifest_from_payloads(
-        &receipt.manifest.weights,
-        &mesh,
-        receipt.config.num_hidden_layers,
-        &mut gpu,
-        expected,
-        |entry| {
-            source
-                .tensor_range(&entry.name)
-                .map_err(|e| e.to_string())?
-                .map(SourcePayload::Range)
-                .ok_or_else(|| format!("missing tensor '{}'", entry.name))
-        },
-    )
-    .map_err(|e| e.to_string())?;
     let state_format = hipfire_arch_qwen4::resolve_state_format(
         &hipfire_runtime::config::get().kv_mode,
         "",
@@ -798,6 +796,146 @@ fn load(model: &Path) -> Result<Loaded, String> {
         &receipt.config,
     )?;
     let backend = Qwen4KvBackend::automatic(&gpu);
+    let use_ranges = gpu.is_uma();
+    let mut weights = receipt.manifest.weights.clone();
+    let explicit = residency::expert_vram_layers_from_env()?;
+    if use_ranges {
+        if explicit.is_some() {
+            return Err(format!(
+                "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                residency::EXPERT_VRAM_LAYERS_ENV
+            ));
+        }
+    } else {
+        let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+            hfq.tensor_data(&entry.name)
+                .map(|(_, bytes)| bytes.len() as u64)
+        };
+        let (non_expert, layer_experts) = residency::resident_split(&weights, bytes_of)?;
+        let experts = residency::routed_expert_bytes(&weights, bytes_of)?;
+        let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
+        let free = free as u64;
+        let chunk =
+            hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, MAX_SEQ);
+        let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
+            backend,
+            gpu.is_uma(),
+            MAX_SEQ,
+            chunk,
+            gpu.vmm_recommended_granularity().unwrap_or(1),
+        );
+        // Every oracle arm reserves the same native MTP footprint.
+        let head = residency::language_head_dtype(&weights)
+            .ok_or("qwen4: manifest has no language head")?;
+        let row_capture =
+            hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(&gpu, &receipt.config)
+                .then_some(state_format.gdn);
+        let mtp = hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+            &receipt.config,
+            &context,
+            chunk,
+            MTP_K,
+            head,
+            row_capture,
+            hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(&gpu),
+        )
+        .ok_or("qwen4: native MTP device bytes overflow")?;
+        let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            &gpu,
+            state_format.qsa,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                receipt.config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| {
+                (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64)
+            })
+            .ok_or("qwen4: QSA gather scratch size overflows")
+        })
+        .transpose()?;
+        let reserve = residency::auto_vram_reserve(
+            &receipt.config,
+            &context,
+            chunk,
+            scratch_mode,
+            state_format.layout(),
+            Some(mtp),
+            gather,
+        )?;
+        let placement = residency::resolve_expert_vram_layers(explicit, || {
+            Ok(residency::fits_fully_resident(free, non_expert, experts, reserve))
+        })?;
+        if let Some(policy) = placement {
+            let vram_layers = match policy {
+                residency::ExpertVramLayers::Layers(layers) => layers,
+                residency::ExpertVramLayers::Auto => {
+                    let needed = non_expert
+                        .checked_add(reserve)
+                        .ok_or("qwen4: non-expert weights plus reserve overflow")?;
+                    if free < needed {
+                        return Err(format!(
+                            "qwen4: {free} free VRAM bytes cannot hold {non_expert} non-expert weight bytes plus {reserve} reserve bytes even with every routed expert in host RAM"
+                        ));
+                    }
+                    residency::auto_vram_layers(
+                        free,
+                        non_expert,
+                        layer_experts,
+                        receipt.config.num_hidden_layers,
+                        reserve,
+                    )
+                }
+            };
+            let moved = residency::place_routed_experts(&mut weights, vram_layers);
+            let host = residency::host_mapped_bytes(&weights, bytes_of)?;
+            residency::check_host_ram(
+                host,
+                rdna_compute::kv_slots::mem_available_bytes(),
+                residency::ttm_pool_estimate(),
+            )?;
+            residency::check_gtt_cap(host, residency::gtt_budget())?;
+            eprintln!(
+                "qwen4 routed experts: layers 0..{} in VRAM, {moved} tensors ({host} bytes) in pinned host RAM",
+                vram_layers.min(receipt.config.num_hidden_layers)
+            );
+        } else {
+            eprintln!(
+                "qwen4 routed experts: {} MoE layers fully resident, 0 host-mapped bytes",
+                residency::moe_layer_count(&receipt.config)
+            );
+        }
+    }
+    // Placement has finished reading payloads before UMA releases the mmap.
+    if use_ranges {
+        hfq.drop_mmap();
+    }
+    let mesh = DeviceMesh::single().map_err(|e| e.to_string())?;
+    let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let source = HfqModelSource::from_hfq(hfq);
+    let transaction = fulfill_manifest_from_payloads(
+        &weights,
+        &mesh,
+        receipt.config.num_hidden_layers,
+        &mut gpu,
+        expected,
+        |entry| {
+            if use_ranges || entry.residency.is_external() {
+                return source
+                    .tensor_range(&entry.name)
+                    .map_err(|e| e.to_string())?
+                    .map(SourcePayload::Range)
+                    .ok_or_else(|| format!("missing tensor '{}'", entry.name));
+            }
+            let (info, bytes) = source
+                .tensor_data(&entry.name)
+                .ok_or_else(|| format!("missing tensor '{}'", entry.name))?;
+            Ok(SourcePayload::Borrowed { info, bytes })
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
         &receipt.manifest.identity.recipe,
