@@ -4634,17 +4634,16 @@ fn dense_tp_allreduce_add(
     count: usize,
     partial_slot: usize,
 ) -> HipResult<()> {
-    let partials: Vec<_> = scratches
+    let partial_refs: Vec<_> = scratches
         .iter()
         .map(|scratch| {
             if partial_slot == 0 {
-                &scratch.o
+                &scratch.o.buf
             } else {
-                &scratch.ffn_out
+                &scratch.ffn_out.buf
             }
         })
         .collect();
-    let partial_refs: Vec<_> = partials.iter().map(|tensor| &tensor.buf).collect();
     if gpus.peer_access_enabled {
         let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
         return gpus.all_reduce_sum_f32_peer_add_routed(
@@ -4655,7 +4654,12 @@ fn dense_tp_allreduce_add(
         );
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
-    for (rank, (scratch, partial)) in scratches.iter().zip(&partials).enumerate() {
+    for (rank, scratch) in scratches.iter().enumerate() {
+        let partial = if partial_slot == 0 {
+            &scratch.o
+        } else {
+            &scratch.ffn_out
+        };
         gpus.devices[rank].bind_thread()?;
         gpus.devices[rank].add_f32(&scratch.x, partial, &scratch.x)?;
     }

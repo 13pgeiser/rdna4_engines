@@ -207,7 +207,44 @@ fn tp_full_graph_requested() -> bool {
 /// Unset follows [`tp_full_graph_requested`]: off by default, on whenever
 /// the whole-token graph is requested.
 fn tp_peer_alternating_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_TP_PEER_ALTERNATING", tp_full_graph_requested())
+    tp_peer_alternating_requested(
+        hipfire_config::developer_var("HIPFIRE_TP_PEER_ALTERNATING")
+            .ok()
+            .as_deref(),
+        tp_full_graph_requested(),
+    )
+}
+
+fn tp_peer_alternating_requested(raw: Option<&str>, full_graph: bool) -> bool {
+    match raw {
+        Some("1") => true,
+        Some("0") => false,
+        _ => full_graph,
+    }
+}
+
+fn tp2_gfx1100_topology<'a>(mut arches: impl ExactSizeIterator<Item = &'a str>) -> bool {
+    arches.len() == 2 && arches.all(|arch| arch == "gfx1100")
+}
+
+// Defer snapshot reads until earlier opt-ins pass, just like the decode gate.
+fn tp2_whole_token_graph_admitted<'a>(
+    full_graph: bool,
+    peer_direct: impl FnOnce() -> bool,
+    peer_alternating: impl FnOnce() -> bool,
+    arches: impl ExactSizeIterator<Item = &'a str>,
+) -> bool {
+    full_graph && peer_direct() && peer_alternating() && tp2_gfx1100_topology(arches)
+}
+
+fn tp_graph_payload_layout(bytes: usize) -> Option<(usize, usize)> {
+    // Two consuming ranks, each with two slots; segment bases are float4-aligned.
+    let segment = bytes.checked_next_multiple_of(256)?;
+    Some((segment, segment.checked_mul(4)?))
+}
+
+fn tp_graph_payload_offset(segment: usize, rank: usize, slot: usize) -> usize {
+    (rank * 2 + slot) * segment
 }
 
 /// What [`Gpus::tp2_whole_token_graph_forward`] did for one token.
@@ -1134,7 +1171,7 @@ impl Gpus {
     /// gfx1100. Two slots match the alternating partial protocol, so a
     /// segment is never overwritten while the peer may still read it.
     pub fn prepare_tp_graph_peer_shadows(&mut self, bytes: usize) -> HipResult<()> {
-        if self.devices.len() != 2 || !self.devices.iter().all(|device| device.arch == "gfx1100") {
+        if !tp2_gfx1100_topology(self.devices.iter().map(|device| device.arch.as_str())) {
             return Err(HipError::new(
                 0,
                 "prepare_tp_graph_peer_shadows requires gfx1100 TP2",
@@ -1159,12 +1196,7 @@ impl Gpus {
             };
         }
 
-        // 256-byte segments keep every segment base float4-aligned.
-        let segment = bytes
-            .checked_next_multiple_of(256)
-            .ok_or_else(|| HipError::new(0, "TP graph payload size overflow"))?;
-        let total_bytes = segment
-            .checked_mul(self.devices.len() * 2)
+        let (segment, total_bytes) = tp_graph_payload_layout(bytes)
             .ok_or_else(|| HipError::new(0, "TP graph payload size overflow"))?;
         self.devices[0].bind_thread()?;
         let host = self.devices[0]
@@ -1234,11 +1266,12 @@ impl Gpus {
     }
 
     fn tp2_whole_token_graph_requested(&self) -> bool {
-        tp_full_graph_requested()
-            && tp_peer_direct_enabled()
-            && tp_peer_alternating_enabled()
-            && self.devices.len() == 2
-            && self.devices.iter().all(|device| device.arch == "gfx1100")
+        tp2_whole_token_graph_admitted(
+            tp_full_graph_requested(),
+            tp_peer_direct_enabled,
+            tp_peer_alternating_enabled,
+            self.devices.iter().map(|device| device.arch.as_str()),
+        )
     }
 
     /// Load-time half of the opt-in gfx1100 TP2 whole-token decode graph
@@ -2631,9 +2664,8 @@ impl Gpus {
             return self.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count);
         }
         match partial_slot {
-            Some(slot) if tp_peer_alternating_enabled() => {
-                self.all_reduce_sum_f32_peer_direct_add_alternating(partials, residuals, count, slot)
-            }
+            Some(slot) if tp_peer_alternating_enabled() => self
+                .all_reduce_sum_f32_peer_direct_add_alternating(partials, residuals, count, slot),
             _ => self.all_reduce_sum_f32_peer_direct_add(partials, residuals, count),
         }
     }
@@ -2723,9 +2755,9 @@ impl Gpus {
         // system-scope barrier + rank-ordered reduce kernel into each rank
         // graph. Fail closed if capture reached this route without the
         // exact-gated signal tape and payload exchange prepared at load.
-        if let Some(slot) = alternating_slot.filter(|_| {
-            self.devices.iter().all(|device| device.graphs.capture_mode)
-        }) {
+        if let Some(slot) = alternating_slot
+            .filter(|_| self.devices.iter().all(|device| device.graphs.capture_mode))
+        {
             if self.tp_graph_signals.len() != n || !self.tp_graph_signal_topology_supported() {
                 return Err(HipError::new(
                     0,
@@ -2758,9 +2790,14 @@ impl Gpus {
                 // the next slot's barrier, which the peer reaches only after
                 // finishing its read of that segment (same argument as the
                 // alternating partial buffers).
-                let peer_shadow = unsafe { base.add(((1 - rank) * 2 + slot) * segment).cast::<c_void>() };
-                let local_shadow =
-                    unsafe { base.add((rank * 2 + slot) * segment).cast::<c_void>() as *const c_void };
+                let peer_shadow = unsafe {
+                    base.add(tp_graph_payload_offset(segment, 1 - rank, slot))
+                        .cast::<c_void>()
+                };
+                let local_shadow = unsafe {
+                    base.add(tp_graph_payload_offset(segment, rank, slot))
+                        .cast::<c_void>() as *const c_void
+                };
                 self.devices[rank].tp_graph_signal_reduce_gfx1100(
                     &self.tp_graph_signals[rank],
                     &self.tp_graph_signals[1 - rank],
@@ -3456,6 +3493,142 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tp2_whole_token_graph_requires_all_opt_ins() {
+        for full_graph in [false, true] {
+            for peer_direct in [false, true] {
+                for peer_alternating in [false, true] {
+                    assert_eq!(
+                        tp2_whole_token_graph_admitted(
+                            full_graph,
+                            || peer_direct,
+                            || peer_alternating,
+                            ["gfx1100", "gfx1100"].into_iter(),
+                        ),
+                        full_graph && peer_direct && peer_alternating,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tp2_whole_token_graph_short_circuits_disabled_opt_ins() {
+        assert!(!tp2_whole_token_graph_admitted(
+            false,
+            || panic!("direct flag must not be read when full graph is off"),
+            || panic!("alternating flag must not be read when full graph is off"),
+            ["gfx1100", "gfx1100"].into_iter(),
+        ));
+        assert!(!tp2_whole_token_graph_admitted(
+            true,
+            || false,
+            || panic!("alternating flag must not be read when direct peer is off"),
+            ["gfx1100", "gfx1100"].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn tp2_whole_token_graph_requires_exact_gfx1100_tp2() {
+        for arches in [
+            &[][..],
+            &["gfx1100"][..],
+            &["gfx1100", "gfx1100", "gfx1100"][..],
+            &["gfx1100", "gfx1100", "gfx1100", "gfx1100"][..],
+            &["gfx1101", "gfx1101"][..],
+            &["gfx1100", "gfx1101"][..],
+            &["gfx1101", "gfx1100"][..],
+            &["gfx1201", "gfx1201"][..],
+        ] {
+            assert!(
+                !tp2_whole_token_graph_admitted(true, || true, || true, arches.iter().copied()),
+                "must reject {arches:?}",
+            );
+        }
+        assert!(tp2_whole_token_graph_admitted(
+            true,
+            || true,
+            || true,
+            ["gfx1100", "gfx1100"].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn tp_peer_alternating_inherits_graph_unless_explicitly_set() {
+        for full_graph in [false, true] {
+            for raw in [None, Some(""), Some("true"), Some("false"), Some(" 1")] {
+                assert_eq!(tp_peer_alternating_requested(raw, full_graph), full_graph);
+            }
+            assert!(tp_peer_alternating_requested(Some("1"), full_graph));
+            assert!(!tp_peer_alternating_requested(Some("0"), full_graph));
+        }
+        assert!(!tp_peer_alternating_requested(None, false));
+        assert!(!tp2_whole_token_graph_admitted(
+            true,
+            || true,
+            || tp_peer_alternating_requested(Some("0"), true),
+            ["gfx1100", "gfx1100"].into_iter(),
+        ));
+    }
+
+    #[test]
+    fn tp_graph_payload_layout_rounds_segment_stride() {
+        for (bytes, expected_segment) in [
+            (1, 256),
+            (4, 256),
+            (255, 256),
+            (256, 256),
+            (257, 512),
+            (511, 512),
+            (512, 512),
+            (513, 768),
+            (4097, 4352),
+        ] {
+            let (segment, total) = tp_graph_payload_layout(bytes).unwrap();
+            assert_eq!(segment, expected_segment);
+            assert_eq!(segment % 256, 0);
+            assert_eq!(segment % std::mem::size_of::<[f32; 4]>(), 0);
+            assert!(segment >= bytes);
+            assert_eq!(total, segment * 4);
+        }
+    }
+
+    #[test]
+    fn tp_graph_payload_layout_rejects_rounding_and_total_overflow() {
+        assert!(tp_graph_payload_layout(usize::MAX).is_none());
+        let aligned_max = usize::MAX - usize::MAX % 256;
+        assert!(tp_graph_payload_layout(aligned_max).is_none());
+        let max_segment = (usize::MAX / 4) / 256 * 256;
+        assert_eq!(
+            tp_graph_payload_layout(max_segment),
+            Some((max_segment, max_segment * 4)),
+        );
+        assert!(tp_graph_payload_layout(max_segment + 1).is_none());
+    }
+
+    #[test]
+    fn tp_graph_payload_segments_are_disjoint_across_ranks_and_slots() {
+        let max_segment = (usize::MAX / 4) / 256 * 256;
+        for bytes in [1, 256, 257, 4097, max_segment] {
+            let (segment, total) = tp_graph_payload_layout(bytes).unwrap();
+            let mut ends = [0; 4];
+            for rank in 0..2 {
+                for slot in 0..2 {
+                    let index = rank * 2 + slot;
+                    let offset = tp_graph_payload_offset(segment, rank, slot);
+                    assert_eq!(offset, index * segment);
+                    assert_eq!(offset % 256, 0);
+                    assert!(offset + bytes <= total);
+                    if index > 0 {
+                        assert!(ends[index - 1] <= offset);
+                    }
+                    ends[index] = offset + segment;
+                }
+            }
+            assert_eq!(ends[3], total);
+        }
+    }
 
     #[test]
     fn uniform_split_basic() {

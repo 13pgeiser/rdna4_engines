@@ -19507,7 +19507,7 @@ impl Gpu {
 
         let local_ptr = local_signal.as_ptr();
         let peer_ptr = peer_signal.as_ptr();
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params: [*mut c_void; 2] = [
             &local_ptr as *const _ as *mut c_void,
             &peer_ptr as *const _ as *mut c_void,
         ];
@@ -19565,7 +19565,7 @@ impl Gpu {
         let local_is_first_arg = i32::from(local_is_first);
         let count_arg = i32::try_from(count)
             .map_err(|_| hip_bridge::HipError::new(0, "TP2 graph reduce count exceeds i32"))?;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params: [*mut c_void; 8] = [
             &local_ptr as *const _ as *mut c_void,
             &peer_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
