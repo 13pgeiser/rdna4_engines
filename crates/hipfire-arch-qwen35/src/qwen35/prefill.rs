@@ -5946,6 +5946,9 @@ fn mq_f16_projection_fast_route(gpu: &Gpu, fusion: DflashFusionCtx, n: usize, di
         && n <= 16
         && dim % 256 == 0
         && recording_supported
+        // IU4 verify (gfx1201): every projection takes the A4 producer + IU4
+        // GEMM at every row count; an F16 projection there is a mixed route.
+        && !gpu.iu4_verify_scope
 }
 
 #[allow(clippy::too_many_arguments)]

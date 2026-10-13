@@ -417,6 +417,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_norm_mq_rotate_f16", crate::mq_f16_residual_producers::GATED_NORM_F16_SRC, ["gated_norm_mq_rotate_awq_f16_batched_gfx1100", "gated_norm_mq_rotate_f16_batched_gfx1100"]);
         add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
         add!("sigmoid_mul_mq_rotate_f16", crate::mq_f16_residual_producers::SIGMOID_MUL_F16_SRC, ["sigmoid_mul_mq_rotate_awq_f16_batched_gfx1100", "sigmoid_mul_mq_rotate_f16_batched_gfx1100"]);
+        add!("fused_rmsnorm_mq_rotate_awq_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
+        add!("fused_rmsnorm_mq_rotate_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
+        add!("dflash_gdn_pre_gfx1100", crate::dflash_gdn_pre::DFLASH_GDN_PRE_GFX1100_SRC, ["dflash_gdn_pre_capture_gfx1100", "dflash_gdn_pre_replay_gfx1100"]);
+        add!("qwen35_fa_prep_batched_gfx1100", crate::qwen35_fa_batch::FA_PREP_BATCHED_SRC, ["qwen35_fa_prep_batched_gfx1100"]);
+        add!("kv_cache_write_q8_0_pair_batched_gfx1100", crate::qwen35_fa_batch::KV_PAIR_BATCHED_SRC, ["kv_cache_write_q8_0_pair_batched_gfx1100"]);
         add!("dflash_gdn_replay_pre_ml_from", crate::dflash_gdn_replay::DFLASH_GDN_REPLAY_PRE_ML_FROM_SRC, ["dflash_gdn_replay_pre_ml_from"]);
         add!("gated_delta_net_q8_fast_ml_from", crate::dflash_gdn_replay::GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC, ["gated_delta_net_q8_fast_ml_from"]);
         add!("attention_verify_gqa_gfx1201", kernels::ATTENTION_VERIFY_GQA_GFX1201_SRC, ["attention_verify_gqa_q8_gfx1201", "attention_verify_gqa_fp8_gfx1201", "attention_verify_reduce_gfx1201"]);
@@ -457,6 +462,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("dynamic_conv_residual_gfx1100", crate::dflash_draft_fusion::COLLAPSE_SRC, ["dynamic_conv_residual_gfx1100", "gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100", "gemm_ksplit_det_overwrite_finalize_dflash_gfx1100", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4", "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8", "mq_rotate_x_f16_dflash_gfx1100", "rmsnorm_residual_dual_gfx1100"]);
         add!("fused_rmsnorm_mq_rotate_awq_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
         add!("fused_rmsnorm_mq_rotate_awq_i4_b8", kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC, ["fused_rmsnorm_mq_rotate_awq_i4_b8"]);
+        add!("fused_rmsnorm_mq_rotate_f16", crate::mq_f16_producers::FUSED_RMSNORM_MQ_ROTATE_F16_SRC, ["fused_rmsnorm_mq_rotate_awq_f16", "fused_rmsnorm_mq_rotate_f16"]);
         add!("fused_silu_mul_mq_rotate_f16", crate::mq_f16_residual_producers::FUSED_SILU_F16_SRC, ["fused_silu_mul_mq_rotate_awq_f16_batched_gfx1100", "fused_silu_mul_mq_rotate_f16_batched_gfx1100"]);
         add!("gated_delta_net_q8_compact3_b2", kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC, ["gated_delta_net_q8_compact3_b2", "gated_delta_net_q8_fast_independent_masked"]);
         add!("gated_norm_mq_rotate_awq_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC, ["gated_norm_mq_rotate_awq_i4_gfx1100_v2"]);
@@ -1844,18 +1850,18 @@ mod tests {
         // (tests/fixtures/kernel-trace-qwen4-flash-next.tsv, including the
         // 8K-128K prefill, MTP and serve rows), the 32 Qwen3.5-MoE modules
         // (tests/fixtures/kernel-trace-qwen35.tsv) and the Qwen4 penalty
-        // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
+        // prepass `logit_penalty_table`, plus thirteen dense 27B DFlash cold
         // helpers, the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
         // modules, the Flash-Next expert-parallel row gather
         // `ep_gather_rows_by_owner` and its balanced-ownership copy
         // `ep_gather_rows_by_slot_owner` (the ownership assignment kernel is a
         // builder module, not a hipcc entry), and the 27B AR route's plain q8
         // Q-resident v2 attention and `_gil_` slab sigmoid producer (ragged
-        // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 140 keys plus the
+        // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 145 keys plus the
         // opt-in exact-K5120 gate/up twin and the Gemma 4 decode twins
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 143, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 148, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
@@ -1994,6 +2000,11 @@ mod tests {
             "gated_norm_mq_rotate_f16",
             "fused_silu_mul_mq_rotate_f16",
             "sigmoid_mul_mq_rotate_f16",
+            "fused_rmsnorm_mq_rotate_awq_f16",
+            "fused_rmsnorm_mq_rotate_f16",
+            "dflash_gdn_pre_gfx1100",
+            "qwen35_fa_prep_batched_gfx1100",
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
         ];
         for module in cross_admitted {
             let entry = lookup("gfx1201", module, "").unwrap();
