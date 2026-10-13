@@ -134,6 +134,7 @@ pub struct Gfx1100SplitVerifyModel<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Gfx1100SplitVerifyRoute<'a> {
     pub model: Gfx1100SplitVerifyModel<'a>,
+    /// Both K and V use exact plain Q8, not merely a Q8 K cache.
     pub quant_q8: bool,
     /// The KV cache is a VMM owner. The route is admitted on VMM KV only;
     /// a legacy cache is refused, never served by this route.

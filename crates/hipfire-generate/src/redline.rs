@@ -3097,7 +3097,8 @@ pub fn redline_shadow_dflash_verify_pm4(
             qwen35::prefill::gfx1100_split_verify_admitted(
                 gpu,
                 &slot.config,
-                slot.kv_cache.quant_q8,
+                slot.kv_cache.quant_q8
+                    && matches!(slot.kv_cache.v_mode, hipfire_runtime::llama::VMode::Q8),
                 slot.kv_cache.uses_vmm_backend(),
                 batch,
                 threshold.saturating_add(1),

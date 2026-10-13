@@ -9779,6 +9779,8 @@ pub fn gfx1100_split_verify_min_ctx(gpu: &Gpu, config: &Qwen35Config) -> Option<
     dispatch_gfx1100_split_verify_min_ctx(&gfx1100_split_verify_model(gpu, config))
 }
 
+/// `quant_q8`: both K and V use exact plain Q8; the K-only cache flag
+/// must also be paired with `matches!(kv_cache.v_mode, llama::VMode::Q8)`.
 /// `kv_vmm`: the target KV cache is a VMM owner
 /// ([`llama::KvCache::uses_vmm_backend`]). Legacy KV is never admitted.
 #[doc(hidden)]
@@ -10149,7 +10151,7 @@ fn batch_chunk_fa_attend(
             gfx1100_split_verify_admitted(
                 gpu,
                 config,
-                kv_cache.quant_q8,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
                 kv_cache.uses_vmm_backend(),
                 n,
                 start_pos + n,
@@ -13594,7 +13596,7 @@ fn forward_prefill_chunk_pair(
             gfx1100_split_verify_admitted(
                 gpu,
                 config,
-                kv_cache.quant_q8,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
                 kv_cache.uses_vmm_backend(),
                 n,
                 max_ctx,
@@ -14299,7 +14301,7 @@ pub(crate) fn forward_batch_chunk_impl(
         gfx1100_split_verify_admitted(
             gpu,
             config,
-            kv_cache.quant_q8,
+            kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
             kv_cache.uses_vmm_backend(),
             n,
             start_pos + n,

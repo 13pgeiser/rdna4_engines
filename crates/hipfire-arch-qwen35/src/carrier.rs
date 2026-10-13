@@ -860,7 +860,8 @@ fn validate_adaptive_cask_handoff(
 /// H24/KV4/D256, parent `kernel.verify_attn` on) and the cache is plain Q8,
 /// a legacy backend is refused before any upload rather than serving the
 /// split route from a legacy cache or silently dropping the opt-in.
-fn validate_gfx1100_split_verify_kv(
+#[doc(hidden)]
+pub fn validate_gfx1100_split_verify_kv(
     split_envelope: bool,
     plain_q8: bool,
     backend: KvBackend,

@@ -26,6 +26,7 @@ ep-fault-inject = []
 rdna-compute = { path = "../rdna-compute" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.
@@ -52,7 +53,6 @@ serde_json.workspace = true
 # fn_ep_oracle (lab example) only: the MoE dump context hook, SHA-256 and the
 # Qwen4 lab head-state digest (`lab_resident_head_items`).
 [dev-dependencies]
-hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
 sha2.workspace = true
 

@@ -9899,6 +9899,9 @@ impl Gpu {
     /// causal extent. Capture/retained callers must use
     /// [`Self::attention_flash_q8_0_rows_masked_logical`] so an oversized
     /// fixed KV allocation cannot satisfy a live-context crossover gate.
+    /// This entry cannot prove the model/VMM contract, so it retains incumbent
+    /// routes only. Product split callers must pass explicit admission to the
+    /// logical entry.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_q8_0_rows_masked(
         &mut self,
@@ -9927,7 +9930,7 @@ impl Gpu {
             max_ctx_len,
             batch_size,
             partials,
-            true,
+            false,
         )
     }
 

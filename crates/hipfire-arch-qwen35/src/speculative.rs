@@ -5830,7 +5830,7 @@ fn verify_dflash_block_inner_body(
         if qwen35::prefill::gfx1100_split_verify_admitted(
             gpu,
             &target.config,
-            target.kv_cache.quant_q8,
+            target.kv_cache.quant_q8 && matches!(target.kv_cache.v_mode, llama::VMode::Q8),
             target.kv_cache.uses_vmm_backend(),
             b,
             required_tokens,

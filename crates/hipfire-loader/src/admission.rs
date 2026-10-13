@@ -1848,6 +1848,39 @@ pub fn admit_source_with_options(
             hints.qwen_default_q8,
         )
         .map_err(|e| format!("Qwen KV admission: {e}"))?;
+        if let Some(cfg) = qwen_cfg.as_ref() {
+            use hipfire_dispatch::families::attention::{
+                gfx1100_split_verify_min_ctx, Gfx1100SplitVerifyModel,
+            };
+            let flags = rdna_compute::FeatureFlags::from_active_config(gpu_arch);
+            let min_ctx = hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4_096);
+            let split_envelope = gfx1100_split_verify_min_ctx(&Gfx1100SplitVerifyModel {
+                arch: gpu_arch,
+                verify_attn: flags.verify_attn,
+                split_verify: flags.gfx1100_fa2_split_verify,
+                num_experts: cfg.num_experts,
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                head_dim: cfg.head_dim,
+                resolved_min_ctx: (min_ctx > 0).then_some(min_ctx),
+            })
+            .is_some();
+            // All source/topology owners pass this boundary, including PP,
+            // dense TP and directory sources that bypass the HFQ carrier.
+            hipfire_arch_qwen35::carrier::validate_gfx1100_split_verify_kv(
+                split_envelope,
+                !adaptive
+                    && matches!(
+                        pair,
+                        kv_mode::KvPair::Native(KvMode::Q8)
+                            | kv_mode::KvPair::Split(KvMode::Q8, kv_mode::VMode::Q8)
+                    ),
+                kv_backend,
+            )?;
+        }
         let k = pair.k();
         if (pp > 1 || tp > 1) && pair.v().is_some_and(|v| v != kv_mode::VMode::Q8) {
             return Err(format!(
