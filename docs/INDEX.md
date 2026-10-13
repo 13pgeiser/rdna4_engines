@@ -94,8 +94,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Golden Redline fixture reproduction and client setup | [`docs/GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed measured fixtures; does not create admission. |
 | Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | shipped / ref-pinned | Must not fork policy from `REDLINE.md`. |
 | Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
-| Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Inventory snapshot; verify in source before product claims. |
-| Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated fixture/tables report. |
+| Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. Capability is not admission or a performance floor; verify in source before product claims. |
+| Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 fixture/tables report; not current validation. |
 | Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
 | Dependency adoption log | [`docs/dependency-adoption-log.md`](dependency-adoption-log.md) | historical | |
@@ -119,7 +119,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Named subsystems and attribution pointers | [`docs/GLOSSARY.md`](GLOSSARY.md) | shipped / ref-pinned | Origination records live in `PRIOR-ART.md`, `NOTICE`, `CREDITS.md`, not here. |
 | Per-crate maps (`crates/<name>/map.md`) | [`docs/crate-maps.md`](crate-maps.md) | shipped / ref-pinned | Convention and generator markers; checked by `scripts/check-crate-maps.py`. |
 | VL quantization design specs | [`docs/qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md), [`docs/lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) | historical | Design specs retained for provenance; not current procedure or product authority. |
-| Unclassified top-level pages: [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md), [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md), [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md), [`SCS-SUITE.md`](SCS-SUITE.md), [`jit-g0-inventory.md`](jit-g0-inventory.md) | — | **unknown** | Listed for discovery only; not audited. Treat none as authority, floor, default or admission. |
+| Historical GEMMA4 E-series validation records | [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md), [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md), [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md) | historical | Dated provenance records; not current policy, default, or admission. Current env and config semantics stay in [`env-vars.md`](env-vars.md) and [`CONFIG.md`](CONFIG.md). |
+| Unclassified top-level pages: [`SCS-SUITE.md`](SCS-SUITE.md), [`jit-g0-inventory.md`](jit-g0-inventory.md) | — | **unknown** | Listed for discovery only; not audited. Treat none as authority, floor, default or admission. |
 | Unclassified collections: [`npu/`](npu/README.md), [`pm-union/`](pm-union/OWNERS.md) | — | **unknown** | Listed for discovery only; not audited. The product NPU trunk route is a `CONFIG.md` concern (`fusions.npu_trunk`), not defined by `npu/`. |
 | Universal replacement gate for all GPU changes | — | **BLOCKED** | No universal gate. Route per [`VALIDATION.md`](VALIDATION.md). |
 | Inferred model/route admissions without registry rows | — | **BLOCKED** | [`admissions.yml`](admissions.yml) schema v2 forbids inferred/wildcard rows; only the exact earned record is admitted. |
@@ -153,17 +154,17 @@ Every current top-level page, exactly once.
 | [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
 | [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
-| [`speculation-support-inventory.md`](speculation-support-inventory.md) | historical | Speculation inventory snapshot. |
-| [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | measured | Dated durability fixture/tables. |
+| [`speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. |
+| [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 durability fixture/tables report. |
 | [`dependency-adoption-log.md`](dependency-adoption-log.md) | historical | Dependency log. |
 | [`upstream-merge-journal.md`](upstream-merge-journal.md) | historical | Merge journal. |
 | [`deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | PR body archive. |
 | [`multi-gpu-bringup-lessons.md`](multi-gpu-bringup-lessons.md) | historical | Bring-up narrative. |
 | [`GLOSSARY.md`](GLOSSARY.md) | shipped / ref-pinned | Named subsystems. |
 | [`crate-maps.md`](crate-maps.md) | shipped / ref-pinned | Crate-map convention. |
-| [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md) | unknown | Not classified. |
-| [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md) | unknown | Not classified. |
-| [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md) | unknown | Not classified. |
+| [`GEMMA4_ESERIES_GFX1100_PREFILL.md`](GEMMA4_ESERIES_GFX1100_PREFILL.md) | historical | Dated gfx1100 prefill validation record. |
+| [`GEMMA4_ESERIES_GFX1201_VALIDATION.md`](GEMMA4_ESERIES_GFX1201_VALIDATION.md) | historical | Dated gfx1201 validation record. |
+| [`GEMMA4_ESERIES_LOGIT_STABILITY.md`](GEMMA4_ESERIES_LOGIT_STABILITY.md) | historical | Dated logit-stability record. |
 | [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md) | historical | Qwen3.5-VL design spec. |
 | [`lfm2-vl-mq4v2-spec.md`](lfm2-vl-mq4v2-spec.md) | historical | LFM2.5-VL design spec. |
 | [`SCS-SUITE.md`](SCS-SUITE.md) | unknown | Not classified. |

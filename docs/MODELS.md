@@ -374,7 +374,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 
 `hipfire-arch-lfm2moe` is a **non-optional** dependency of `hipfire-loader` / daemon load paths on this tree (see crate `Cargo.toml` graphs). Feature flags on `hipfire-runtime` default set do not list a separate `arch-lfm2moe` toggle the way some other arches do — loader always links the crate.
 
-Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Spec inventory history: [`speculation-support-inventory.md`](speculation-support-inventory.md) (historical). Product claims need source + [`admissions.yml`](admissions.yml).
+Capability features (DFlash, PP, MTP, batched prefill, n-gram) are **per-path and often narrower than “model loads”**. Speculation capability inventory: [`speculation-support-inventory.md`](speculation-support-inventory.md) (current inventory; capability is not admission). Product claims need source + [`admissions.yml`](admissions.yml).
 
 ### LFM optimized prefill — branch-only, not in this tree
 
