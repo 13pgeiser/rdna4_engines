@@ -154,11 +154,7 @@ pub const GFX12_QUERY16_MAX_CTX: usize = 32_768;
 #[derive(Clone, Copy)]
 enum QresidentOut<'a> {
     F32(&'a GpuTensor),
-    A4Slab {
-        qgate: &'a GpuTensor,
-        awq: &'a GpuTensor,
-        x_i4: &'a GpuTensor,
-    },
+    A4Slab { qgate: &'a GpuTensor, awq: &'a GpuTensor, x_i4: &'a GpuTensor },
 }
 
 const V_MODE_Q8: i32 = 8;
@@ -601,10 +597,7 @@ const VERIFY_WMMA_GFX1151: VerifyWmmaKernels = VerifyWmmaKernels {
     module: "attention_verify_wmma_gfx1151",
     src: kernels::ATTENTION_VERIFY_WMMA_GFX1151_SRC,
     qk: "attention_verify_wmma_qk_gfx1151",
-    pv: [
-        "attention_verify_wmma_pv1s_d4_gfx1151",
-        "attention_verify_wmma_pv2_d2_gfx1151",
-    ],
+    pv: ["attention_verify_wmma_pv1s_d4_gfx1151", "attention_verify_wmma_pv2_d2_gfx1151"],
 };
 
 fn verify_wmma_kernels(gpu: &Gpu) -> Option<&'static VerifyWmmaKernels> {
@@ -665,11 +658,7 @@ pub struct VerifyWmmaGeometry {
 
 impl Default for VerifyWmmaGeometry {
     fn default() -> Self {
-        Self {
-            packed: true,
-            qk_waves: 160,
-            pv: None,
-        }
+        Self { packed: true, qk_waves: 160, pv: None }
     }
 }
 
@@ -5048,11 +5037,7 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC, false)
                 }
             );
-            let module = if multi_slot {
-                format!("{module}_paged")
-            } else {
-                module
-            };
+            let module = if multi_slot { format!("{module}_paged") } else { module };
             self.ensure_kernel(&module, &src, func)?;
         }
 
@@ -5248,11 +5233,8 @@ impl Gpu {
     /// would synchronize, free and malloc mid-capture). A cold capture keeps
     /// the incumbent route instead of failing the capture.
     fn gfx12_q8_fa2_capture_ready(&self, batch_size: usize) -> bool {
-        self.functions
-            .contains_key("attention_q8_0_fa2_gqa_gfx1201")
-            && self
-                .functions
-                .contains_key("attention_fa2_q_preconvert_gfx1201")
+        self.functions.contains_key("attention_q8_0_fa2_gqa_gfx1201")
+            && self.functions.contains_key("attention_fa2_q_preconvert_gfx1201")
             && !crate::scratch::scratch_will_grow(
                 self.scratch.fa2_q16_scratch_bytes,
                 self.scratch.fa2_q16_scratch.is_some(),
@@ -5536,11 +5518,7 @@ impl Gpu {
                     kernels::kv_slot_desc_source(kernel_src, false)
                 }
             );
-            let module = if multi_slot {
-                format!("{module}_paged")
-            } else {
-                module
-            };
+            let module = if multi_slot { format!("{module}_paged") } else { module };
             self.ensure_kernel(&module, &src, func)?;
         }
         const M_TILE: usize = 16;
@@ -6689,11 +6667,10 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "Q8 resident attention requires Raw codes and scales",
-            ));
+        if q.dtype != crate::DType::Raw
+            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
+        {
+            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
         }
         self.ensure_mq_signs()?;
         self.qresident_launch(
@@ -7600,20 +7577,11 @@ impl Gpu {
             && self.arch == "gfx1151"
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
         let (module, preconvert) = if r3 {
-            (
-                "attention_q8_0_fa2_gqa_gfx1100",
-                "attention_fa2_q_preconvert_gfx1100",
-            )
+            ("attention_q8_0_fa2_gqa_gfx1100", "attention_fa2_q_preconvert_gfx1100")
         } else if twin {
-            (
-                "attention_q8_0_fa2_gqa_gfx1151",
-                "attention_fa2_q_preconvert_gfx1151",
-            )
+            ("attention_q8_0_fa2_gqa_gfx1151", "attention_fa2_q_preconvert_gfx1151")
         } else {
-            (
-                "attention_q8_0_fa2_gqa_gfx11",
-                "attention_fa2_q_preconvert_gfx11",
-            )
+            ("attention_q8_0_fa2_gqa_gfx11", "attention_fa2_q_preconvert_gfx11")
         };
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
@@ -8980,15 +8948,8 @@ impl Gpu {
         let nf = (6 * pack).div_ceil(VERIFY_WMMA_ROWS);
         // The S launch stages K with at least 4 waves (kernel VW_QK_MIN_WAVES).
         let qk_block = (32 * nf.max(4)) as u32;
-        let qk_splits = geom
-            .qk_waves
-            .div_ceil(row_groups * n_kv_heads * nf)
-            .clamp(1, t_stride);
-        let pv = geom.pv.unwrap_or(if nf >= 4 {
-            VerifyWmmaPv::Chunk2Whole2
-        } else {
-            VerifyWmmaPv::Chunk1Split4
-        });
+        let qk_splits = geom.qk_waves.div_ceil(row_groups * n_kv_heads * nf).clamp(1, t_stride);
+        let pv = geom.pv.unwrap_or(if nf >= 4 { VerifyWmmaPv::Chunk2Whole2 } else { VerifyWmmaPv::Chunk1Split4 });
         let pv_chunks = pv.chunks();
         // One 8-dim V chunk per P.V thread: at least `pv_chunks` waves.
         let pv_block = (32 * nf.max(pv_chunks)) as u32;
@@ -10329,11 +10290,7 @@ impl Gpu {
                 ),
             ));
         }
-        self.ensure_kernel(
-            TILE,
-            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
-            TILE,
-        )?;
+        self.ensure_kernel(TILE, kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC, TILE)?;
         self.ensure_kernel(
             REDUCE,
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -16073,6 +16030,7 @@ impl Gpu {
             row_slot,
         )
     }
+
 
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
@@ -23578,6 +23536,7 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b.push_f32(scale);
     b
 }
+
 
 /// `*_paged` symbol of a descriptor-aware kernel launched through the
 /// givens4/turbo assembler, or `None` when the kernel has no paged variant.
