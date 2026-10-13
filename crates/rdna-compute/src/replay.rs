@@ -1081,6 +1081,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(32),
             write(40),
         ]),
+        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous scratch.
+        "fused_rmsnorm_mq_rotate_awq_wavegrid" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+        ]),
         "rmsnorm_reduce_gfx1100" => Some(vec![read(0), write(8)]),
         "compressor_add_ape_f32_buf" => Some(vec![write(0), read(8), read(16)]),
         "compressor_overlap_concat_f32" => Some(vec![read(0), write(8)]),
@@ -1810,10 +1820,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
+        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
-        // 10 pointers + eps + freq_base.
-        "qwen35_fa_prep_kvwrite_gfx1100" => Some(88),
+        // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(96),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -8243,6 +8254,7 @@ mod tests {
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
         "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
         "fused_rmsnorm_mq_rotate_wavegrid",
+        "fused_rmsnorm_mq_rotate_awq_wavegrid",
         "rmsnorm_reduce_gfx1100",
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
@@ -9015,6 +9027,52 @@ mod tests {
                 "{reduce}"
             );
         }
+    }
+
+    #[test]
+    fn gfx1100_campaign_fusions_keep_padded_replay_contract() {
+        use RecordedAccessMode::{Read, Write};
+        let prep = "qwen35_fa_prep_kvwrite_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..10 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_f32(0.0);
+        blob.push_f32(0.0);
+        assert_eq!(blob.len(), 88);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(prep), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(prep)
+            .expect("folded FA prep contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read), (8, Write), (16, Write), (24, Write), (32, Read),
+                (40, Write), (48, Write), (56, Read), (64, Read), (72, Read),
+            ]
+        );
+
+        let awq = "fused_rmsnorm_mq_rotate_awq_wavegrid";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(awq)
+            .expect("AWQ wavegrid contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
+        );
     }
 
     #[test]

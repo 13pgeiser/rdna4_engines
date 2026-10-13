@@ -7569,6 +7569,17 @@ impl Drop for Gpu {
         if let Err(err) = self.release_registered_host_mapped() {
             eprintln!("[rdna-compute] failed to release host-mapped tensor during Gpu drop: {err}");
         }
+        if self.scratch.mq_rmsnorm_awq_wavegrid_scratch.is_some() {
+            // Persistent wavegrid state can still be in use by queued launches.
+            // A failed sync must retain the allocation rather than free it live.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize AWQ wavegrid scratch during Gpu drop: {err}");
+            } else if let Some(scratch) = self.scratch.mq_rmsnorm_awq_wavegrid_scratch.take() {
+                if let Err(err) = self.hip.free(scratch) {
+                    eprintln!("[rdna-compute] failed to release AWQ wavegrid scratch during Gpu drop: {err}");
+                }
+            }
+        }
     }
 }
 

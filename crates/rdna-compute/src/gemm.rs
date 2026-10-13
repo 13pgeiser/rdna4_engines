@@ -48824,6 +48824,55 @@ mod lds_epi_tests {
 mod route_selector_tests {
     use super::*;
 
+    #[test]
+    fn mq3_lloyd_mb4_gfx1100_bands_and_row_boundary() {
+        for (batch, small_rows, large_rows) in [
+            (63, false, false),
+            (64, false, true),
+            (127, false, true),
+            (128, true, true),
+            (191, true, true),
+            (192, false, true),
+            (256, false, true),
+            (4096, false, true),
+        ] {
+            for rows in [2_560, 4_095] {
+                assert_eq!(
+                    mq3_lloyd_mb4_default("gfx1100", true, batch, rows),
+                    small_rows, "batch={batch} rows={rows}",
+                );
+            }
+            for rows in [4_096, 4_097] {
+                assert_eq!(
+                    mq3_lloyd_mb4_default("gfx1100", true, batch, rows),
+                    large_rows, "batch={batch} rows={rows}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mq3_lloyd_mb4_other_arches_and_unsupported_keep_original_floor() {
+        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
+            for batch in [63, 64, 127, 128, 191, 192, 4096] {
+                for rows in [2_560, 4_095, 4_096, 4_097] {
+                    assert_eq!(
+                        mq3_lloyd_mb4_default(arch, true, batch, rows),
+                        batch >= 128 && rows >= 4096,
+                        "{arch} batch={batch} rows={rows}",
+                    );
+                }
+            }
+        }
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+            for batch in [64, 128, 191, 192, 4096] {
+                for rows in [4_095, 4_096] {
+                    assert!(!mq3_lloyd_mb4_default(arch, false, batch, rows));
+                }
+            }
+        }
+    }
+
     /// The PM launchers' output guard (`pm_check_output_extent`, called by the plain / BF16
     /// / regions / HC-write entries) refuses extents at or past 2^31 bytes.
     #[test]

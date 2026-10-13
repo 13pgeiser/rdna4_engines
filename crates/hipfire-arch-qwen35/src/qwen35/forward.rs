@@ -4226,6 +4226,12 @@ fn qwen35_fa_epilogue_route_supported(
     q8_route || fp8_route || (!is_gfx1201 && asym3_route)
 }
 
+fn qwen35_fa_kvwrite_fold_route_supported(plan: &KvTierPlan) -> bool {
+    plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0
+        && plan.batch_size == 1
+}
+
 /// KV cache write + attention dispatch. Inline from original.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kv_cache_attention_dispatch(
@@ -4294,7 +4300,9 @@ pub(crate) fn kv_cache_attention_dispatch(
         // The prep kernel's folded epilogue already wrote the Q8_0 K/V cache
         // rows for this token; dispatch attention only. The fold gate
         // guarantees the q8 write/attend route and a single decode token.
-        debug_assert!(q8_route && plan.batch_size == 1);
+        if !qwen35_fa_kvwrite_fold_route_supported(&plan) {
+            return Err(HipError::new(0, "folded FA prep requires single-token Q8_0 flash KV"));
+        }
         use hipfire_dispatch::families::attention::AttentionFamily;
         static ATTENTION: std::sync::OnceLock<AttentionFamily> = std::sync::OnceLock::new();
         let res = ATTENTION
@@ -6505,9 +6513,21 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 // route: pos_buf must hold the physical position when the
                 // folded writer reads it, and the pair-writer restore below
                 // would race nothing but change what the fold sees.
-                let kvwrite_fold = fused_prep
+                let kvwrite_fold = if fused_prep
                     && self.kv_cache.compact_offset == 0
-                    && qwen35_fa_kvwrite_fold_enabled(gpu, config);
+                    && qwen35_fa_kvwrite_fold_enabled(gpu, config)
+                {
+                    let plan = KvTierPlan::derive(KvTierInputs {
+                        pos: self.pos,
+                        flash_mode: s.flash_mode as usize,
+                        capture_mode: gpu.graphs.capture_mode,
+                        ..self.kv_cache.tier_inputs()
+                    })
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    qwen35_fa_kvwrite_fold_route_supported(&plan)
+                } else {
+                    false
+                };
                 if !fused_prep {
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
@@ -7122,6 +7142,28 @@ fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
         && config.linear_value_head_dim == 128
 }
 
+/// The campaign adds defaults only for the measured Qwen3.5-4B geometry.
+/// Existing A3B/27B admissions and the gfx1101 experiment are separate gates.
+fn gfx1100_qwen35_4b_campaign_shape(
+    arch: &str,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+) -> bool {
+    arch == "gfx1100"
+        && config.dim == 2_560
+        && config.n_heads == 16
+        && config.n_kv_heads == 4
+        && config.head_dim == 256
+        && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64
+        && config.linear_num_key_heads == 16
+        && config.linear_key_head_dim == 128
+        && config.linear_num_value_heads == 32
+        && n_v_heads == 32
+        && config.linear_value_head_dim == 128
+        && config.conv_kernel_dim == 4
+        && config.num_experts == 0
+}
+
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
 /// Q8-state, and 2:1-head gates keep every other configuration isolated; the
@@ -7208,11 +7250,10 @@ pub(crate) fn gated_norm_mq_rotate_enabled(
         || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
-        // Qwen3.5-4B (gfx1100): same DeltaNet head geometry (32 v-heads x
-        // 128), dim 2560. The kernel is grid-agnostic in n_heads (2 heads per
-        // 64-thread block); the dim term only scopes certification.
-        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
-        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu)) && config.dim == 2_560 && n_v_heads == 32)
+        // New gfx1100 default: only the measured 4B geometry.
+        || gfx1100_qwen35_4b_campaign_shape(gpu.arch_caps.arch(), config, n_v_heads)
+        // Preserve the separately opted-in gfx1101 experiment.
+        || (gfx1101_campaign_gates_enabled(gpu) && config.dim == 2_560 && n_v_heads == 32)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
             && super::config::qwen36_27b_dense_shape(config, n_v_heads));
     enabled
@@ -7267,10 +7308,10 @@ pub(crate) fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
-        // Qwen3.5-4B (gfx1100): 16Q/4K, head_dim 256, n_rot 64. The kernel
-        // derives K workgroups from the grid (head_slot - NQ) and the host
-        // launches NQ + n_kv workgroups, so 4 K heads need no kernel change.
-        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
+        || gfx1100_qwen35_4b_campaign_shape(
+            gpu.arch_caps.arch(), config, config.linear_num_value_heads,
+        )
+        || (gfx1101_campaign_gates_enabled(gpu)
             && config.n_heads == 16
             && config.n_kv_heads == 4)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions_enabled(gpu))
@@ -7302,11 +7343,10 @@ pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &
         && config.n_heads == 16
         && config.n_kv_heads == 2)
         || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
-        // Qwen3.5-4B (gfx1100): 16Q/4K. The reduce kernel is per-Q-head
-        // (grid = n_heads) and the tile pass is shared with the non-gated
-        // flash path 4B already runs, so 4 K heads need no kernel change.
-        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
-        || ((gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
+        || gfx1100_qwen35_4b_campaign_shape(
+            gpu.arch_caps.arch(), config, config.linear_num_value_heads,
+        )
+        || (gfx1101_campaign_gates_enabled(gpu)
             && config.n_heads == 16
             && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
@@ -7327,6 +7367,26 @@ pub(crate) fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &
 /// the PR's local symbol for selectors that historically lived in the same file.
 fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
     super::config::qwen36_27b_dense_shape(config, n_v_heads)
+}
+
+fn conv_scalar_prep_requested(
+    arch: &str,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    mode: Option<&str>,
+    gfx1101_campaign: bool,
+) -> bool {
+    if arch != "gfx1100" && !(arch == "gfx1101" && gfx1101_campaign) {
+        return false;
+    }
+    match mode {
+        Some("0") => false,
+        Some("1") => true,
+        _ => qwen36_27b_dense_shape(config, n_v_heads)
+            || gfx1100_qwen35_4b_campaign_shape(arch, config, n_v_heads)
+            // The gfx1101 gate remains experimental; no default arch admission.
+            || (arch == "gfx1101" && gfx1101_campaign),
+    }
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into
@@ -7377,22 +7437,12 @@ pub(crate) fn conv_scalar_prep_enabled(
 ) -> bool {
     static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let mode = MODE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_CONV_SCALAR_PREP").ok());
-    let enabled = match mode.as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => {
-            // Qwen3.6-27B dense on W7900/gfx1100: 512-token graph-on
-            // A/B/B/A measured 35.376->35.657 tok/s (+0.79%) and
-            // 28.105->27.891 ms p50 (-0.76%). The fused route deletes
-            // 48 dispatches/token and stayed exact for 1,025 greedy tokens.
-            // 2026-08-21: default extended to every gfx1100 shape passing
-            // the structural checks below — the kernel is fully
-            // shape-parameterized (runtime k_dim/v_dim/heads, adaptive
-            // grid). Qwen3.5-4B certified: greedy text parity (500/600 tok)
-            // + 3 fresh-process E2E pairs.
-            true
-        }
-    };
+    // Keep beta's exact 27B default and add only the measured gfx1100 4B
+    // geometry. Explicit value 1 retains the structurally supported experiment.
+    let enabled = conv_scalar_prep_requested(
+        gpu.arch_caps.arch(), config, n_v_heads, mode.as_deref(),
+        gfx1101_campaign_gates_enabled(gpu),
+    );
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
         && (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
@@ -7631,6 +7681,148 @@ pub fn forward_with_embedding(
 mod tests {
     use super::*;
     use hipfire_dispatch::pipeline::superop::SuperOpKind;
+
+    fn campaign_4b_config() -> Qwen35Config {
+        Qwen35Config {
+            dim: 2_560,
+            n_layers: 32,
+            i_gpu_start: 0,
+            vocab_size: 248_320,
+            norm_eps: 1e-6,
+            eos_token: 248_044,
+            n_heads: 16,
+            n_kv_heads: 4,
+            head_dim: 256,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0; 3],
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 32,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            conv_kernel_dim: 4,
+            hidden_dim: 9_216,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_shared_expert: false,
+            norm_topk_prob: true,
+            layer_types: Vec::new(),
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+            reap_keep: None,
+        }
+    }
+
+    #[test]
+    fn gfx1100_campaign_default_is_exact_4b_geometry() {
+        let cfg = campaign_4b_config();
+        assert!(gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg, 32));
+        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
+            assert!(!gfx1100_qwen35_4b_campaign_shape(arch, &cfg, 32), "{arch}");
+            assert!(!conv_scalar_prep_requested(arch, &cfg, 32, None, false), "{arch}");
+        }
+        assert!(!gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg, 31));
+        let mutations: [fn(&mut Qwen35Config); 13] = [
+            |c| c.dim = 4_096, // 9B: same 16Q/4K is not evidence.
+            |c| { // 0.8B fixture geometry
+                c.dim = 1_024;
+                c.n_layers = 24;
+                c.n_heads = 8;
+                c.n_kv_heads = 2;
+                c.linear_num_value_heads = 16;
+            },
+            |c| { // 2B fixture geometry (existing A3B gates stay separate).
+                c.dim = 2_048;
+                c.n_layers = 24;
+                c.n_heads = 8;
+                c.n_kv_heads = 2;
+                c.linear_num_value_heads = 16;
+            },
+            |c| c.n_heads = 8,
+            |c| c.n_kv_heads = 2,
+            |c| c.head_dim = 128,
+            |c| c.partial_rotary_factor = 0.5,
+            |c| c.linear_num_key_heads = 8,
+            |c| c.linear_key_head_dim = 64,
+            |c| c.linear_num_value_heads = 16,
+            |c| c.linear_value_head_dim = 64,
+            |c| c.conv_kernel_dim = 3,
+            |c| c.num_experts = 8,
+        ];
+        for mutate in mutations {
+            let mut other = cfg.clone();
+            mutate(&mut other);
+            assert!(!gfx1100_qwen35_4b_campaign_shape(
+                "gfx1100", &other, other.linear_num_value_heads,
+            ));
+            assert!(!conv_scalar_prep_requested(
+                "gfx1100", &other, other.linear_num_value_heads, None, false,
+            ));
+        }
+    }
+
+    #[test]
+    fn conv_scalar_prep_keeps_27b_and_explicit_experiments() {
+        let cfg = campaign_4b_config();
+        for mode in [None, Some("unrecognized"), Some("1")] {
+            assert!(conv_scalar_prep_requested("gfx1100", &cfg, 32, mode, false));
+        }
+        assert!(!conv_scalar_prep_requested("gfx1100", &cfg, 32, Some("0"), false));
+        let mut cfg27 = cfg.clone();
+        cfg27.dim = 5_120;
+        cfg27.n_layers = 64;
+        cfg27.n_heads = 24;
+        cfg27.linear_num_value_heads = 48;
+        assert!(conv_scalar_prep_requested("gfx1100", &cfg27, 48, None, false));
+        assert!(!gfx1100_qwen35_4b_campaign_shape("gfx1100", &cfg27, 48));
+        let mut cfg9 = cfg;
+        cfg9.dim = 4_096;
+        assert!(!conv_scalar_prep_requested("gfx1100", &cfg9, 32, None, false));
+        assert!(conv_scalar_prep_requested("gfx1100", &cfg9, 32, Some("1"), false));
+        for arch in ["gfx1101", "gfx1151", "gfx1201"] {
+            assert!(!conv_scalar_prep_requested(arch, &cfg27, 48, None, false));
+            assert!(!conv_scalar_prep_requested(arch, &cfg9, 32, Some("1"), false));
+        }
+        assert!(conv_scalar_prep_requested("gfx1101", &cfg9, 32, None, true));
+        assert!(conv_scalar_prep_requested("gfx1101", &cfg9, 32, Some("1"), true));
+        assert!(!conv_scalar_prep_requested("gfx1101", &cfg9, 32, Some("0"), true));
+    }
+
+    #[test]
+    fn fa_kvwrite_fold_requires_single_token_q8_flash_plan() {
+        use hipfire_dispatch::types::KernelKey;
+        let plan = KvTierPlan {
+            write_key: KernelKey::KvWriteQ8_0,
+            attend_key: KernelKey::AttnFlashQ8_0,
+            v_mode_bits: 8,
+            uses_givens: false,
+            batch_size: 1,
+            window: 0,
+        };
+        assert!(qwen35_fa_kvwrite_fold_route_supported(&plan));
+        assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
+            batch_size: 2, ..plan
+        }));
+        for (write_key, attend_key) in [
+            (KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv),
+            (KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0Windowed),
+            (KernelKey::KvWriteBf16, KernelKey::AttnFlashBf16),
+            (KernelKey::KvWriteF32, KernelKey::AttnFlash),
+            (KernelKey::KvWriteFp8E4m3, KernelKey::AttnFlashFp8E4m3),
+            (KernelKey::KvWriteAsym3Fwht, KernelKey::AttnFlashAsym3Fwht),
+            (KernelKey::KvWriteQ8_0Batched, KernelKey::AttnQ8_0KvBatchedMasked),
+            (KernelKey::KvWriteBf16, KernelKey::AttnFlashQ8_0),
+            (KernelKey::KvWriteQ8_0, KernelKey::AttnFlashBf16),
+        ] {
+            assert!(!qwen35_fa_kvwrite_fold_route_supported(&KvTierPlan {
+                write_key, attend_key, ..plan
+            }), "{write_key:?}/{attend_key:?}");
+        }
+    }
 
     #[test]
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {

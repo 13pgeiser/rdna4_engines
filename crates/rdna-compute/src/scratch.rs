@@ -1321,7 +1321,10 @@ impl ScratchState {
         crate::graph::bind_thread(hip, device_id)?;
         if self.mq_rmsnorm_awq_wavegrid_scratch.is_none() {
             let scratch = hip.malloc(2048)?;
-            hip.memset(&scratch, 0, 2048)?;
+            if let Err(err) = hip.memset(&scratch, 0, 2048) {
+                let _ = hip.free(scratch);
+                return Err(err);
+            }
             self.mq_rmsnorm_awq_wavegrid_scratch = Some(scratch);
         }
         Ok(())

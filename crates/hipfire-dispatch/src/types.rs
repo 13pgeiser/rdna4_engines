@@ -653,7 +653,7 @@ pub enum ArchPredicate {
     /// fp8 cache fails closed at dispatch outside the admitted target.
     IsGfx1201,
     HasSdot4,
-    /// HFQ3-G256 plain GEMV admission: CDNA/older archs via the sdot4 generic
+    /// HFQ3-G256 plain GEMV admission: RDNA1.1/RDNA2 via the sdot4 generic
     /// kernel, plus gfx1100/1101/1102 where `gemv_hfq3g256_for_arch` selects
     /// the RDNA3 wave32 scalar variant (`gemv_hfq3g256_rdna3`, the MQ3
     /// production path). gfx110x has no sdot4 but does have the rdna3 kernel.

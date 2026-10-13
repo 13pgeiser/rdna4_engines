@@ -1319,8 +1319,8 @@ impl Gpu {
     /// Exact gfx1100 Qwen3.6 full-attention preparation. Replaces the
     /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
     /// dispatches with one head-local launch. Admission is enforced by the
-    /// architecture layer; this launcher exposes only the fixed 16Q/2K and
-    /// 24Q/4K, head_dim=256, n_rot=64 shapes.
+    /// architecture layer; this launcher exposes only the fixed 16Q/2K,
+    /// 16Q/4K, and 24Q/4K, head_dim=256, n_rot=64 shapes.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_fa_prep_gfx1100(
@@ -1341,7 +1341,7 @@ impl Gpu {
         if !matches!((n_heads, n_kv_heads), (16, 2) | (16, 4) | (24, 4)) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused FA prep requires 16Q/2K or 24Q/4K heads",
+                "fused FA prep requires 16Q/2K, 16Q/4K, or 24Q/4K heads",
             ));
         }
         let (module, src, kernel) = if n_heads == 24 {
