@@ -946,6 +946,17 @@ impl GenerationRoute {
         )
     }
 
+    /// Routes whose fall-through into `generate`'s generic AR body must take
+    /// the Qwen3.5 branch (cumulative KV + DeltaNet state on a
+    /// `Qwen35Bundle`). Both Qwen routes get there: `QwenAr`, and
+    /// `QwenDflash` when `generate_dflash` declines the request (prompt +
+    /// max_tokens over the drafter's ctx capacity) and falls back to AR. Only
+    /// the Qwen3.5 carrier (arch 5|6) declares Qwen DFlash caps, so no other
+    /// arch reaches these routes.
+    pub const fn runs_qwen35_ar_body(self) -> bool {
+        matches!(self, Self::QwenAr | Self::QwenDflash)
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::QwenAr => "qwen_ar",
@@ -4398,9 +4409,10 @@ pub fn generate(
     // Qwen35 — arch 17, the qwen3.5 multi-vector embedding encoder — so using
     // it as a proxy for "the state is a `Qwen35Bundle`" made this branch
     // downcast the wrong type and panic the daemon on a `generate` request.
-    // `GenerationRoute::QwenAr` is produced for exactly arch 5|6
-    // (`select_generation_route`), which is the bundle this branch needs.
-    if matches!(selected_route, GenerationRoute::QwenAr) {
+    // `GenerationRoute::runs_qwen35_ar_body` names the routes that land here
+    // with that bundle: `QwenAr`, and `QwenDflash` when the speculative arm
+    // declines the request and falls back to AR.
+    if selected_route.runs_qwen35_ar_body() {
         let b = m
             .state
             .as_mut()
