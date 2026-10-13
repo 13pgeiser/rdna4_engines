@@ -511,6 +511,7 @@ mod tests {
             is_vl: true,
             vl_path: None,
             mtp_k: 0,
+            mtp_mode: hipfire_config::MtpMode::Off,
             kv_mode_raw: String::new(),
             kv_backend: "legacy".into(),
             prefix_cache: false,
