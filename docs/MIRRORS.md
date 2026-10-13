@@ -22,9 +22,9 @@ LICENSE-MIT and LICENSE-LLVM-EXCEPTION and to hipfire's canonical governance
 documents. NOTICE is preserved.
 
 `radiowave` is self-contained and included for the ISA `toolchain` feature.
-The cross-layer `dflash_accept_emu` integration test lives in
-`rdna-compute/tests`, not the ISA crate; the ISA crate has no dev dependency
-on `rdna-compute`, so the mirror does not pull in hipfire's runtime.
+The cross-layer `dflash_accept_emu` and `qwen4_ep_owner_assign_pm` integration
+tests live in `rdna-compute/tests`, not the ISA crate; the ISA crate has no dev
+dependency on `rdna-compute`, so the mirror does not pull in hipfire's runtime.
 The shared ROCm helper and emitted kernel fixtures are retained for tests.
 hipfire does not contain the full LLVM exception text; the mirror generates
 LICENSE-LLVM-EXCEPTION from the standard LLVM Project exception.
@@ -61,8 +61,8 @@ gh secret set PEACEMAKER_MIRROR_KEY --repo warpfront/hipfire \
 # Inside the dedicated chore/peacemaker-split worktree:
 git fetch origin
 git rebase origin/beta
-# Resolve newly merged NPU imports/manifests to peacemaker_npu/peacemaker-npu;
-# preserve the merged NPU implementation. Regenerate its maps if needed.
+# Resolve newly merged references to peacemaker-npu/isa/rip while preserving
+# the merged implementations; regenerate any affected maps.
 cargo check --workspace --locked
 cargo test -p peacemaker-isa -p peacemaker-rip --no-run --locked
 scripts/mirror-split.sh peacemaker "$CUT_ROOT/mirror-cut/peacemaker"

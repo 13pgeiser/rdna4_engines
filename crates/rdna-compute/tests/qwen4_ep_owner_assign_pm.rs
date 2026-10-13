@@ -13,7 +13,7 @@ use peacemaker_ir::emu::{Emulator, Launch, Memory};
 use rdna_compute::moe::{qwen4_ep_owner_map, QWEN4_EP_OWNER_EXPERTS};
 use std::sync::LazyLock;
 #[macro_use]
-#[path = "support/rocm.rs"]
+#[path = "../../peacemaker-isa/tests/support/rocm.rs"]
 mod rocm;
 
 const ARCH: Arch = Arch::Gfx1201;
@@ -272,7 +272,6 @@ fn interpreter_covers_the_module() {
     assert!(missing.is_empty(), "no interpreter semantics: {missing:?}");
 }
 
-#[cfg(feature = "toolchain")]
 mod toolchain {
     use super::*;
     use peacemaker_isa::{ledger_replay, pm_check, toolchain::{build, certify, Toolchain}};
@@ -298,7 +297,7 @@ mod toolchain {
         let symbol = owners::symbol(ARCH);
         let m7 = pm_check::m7(&build.elf, ARCH.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
         assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}: {m7}");
-        let path = format!("{}/kernels/qwen4_ep_owner_assign_pm.{}.contract.json", env!("CARGO_MANIFEST_DIR"), ARCH.name());
+        let path = format!("{}/../peacemaker-isa/kernels/qwen4_ep_owner_assign_pm.{}.contract.json", env!("CARGO_MANIFEST_DIR"), ARCH.name());
         let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(json, owners::contract(ARCH, &emitted[0]), "{path} is stale");
