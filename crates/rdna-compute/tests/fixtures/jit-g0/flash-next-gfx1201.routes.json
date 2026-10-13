@@ -638,7 +638,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "40a4bf6bb9000870141564bec776fda2c993c4a6267a4c5a08a2b344f65a0d74",
+      "sha256": "75492642300fefdcf12b4c72ecaa750a4611988ccd09689deac261418a7ac24c",
       "symbols": [
         "qwen4_wmma_lds_128_128_32_64_k64",
         "qwen4_wmma_lds_128_256_32_64_k64",
@@ -3161,7 +3161,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "40a4bf6bb9000870141564bec776fda2c993c4a6267a4c5a08a2b344f65a0d74",
+          "sha256": "75492642300fefdcf12b4c72ecaa750a4611988ccd09689deac261418a7ac24c",
           "symbols": [
             "qwen4_wmma_lds_128_128_32_64_k64",
             "qwen4_wmma_lds_128_256_32_64_k64",
