@@ -559,7 +559,7 @@ fn argmax(p: &[f64]) -> usize {
 /// question type's calibration temperature (spec §13.3; 1 = raw).
 /// Probabilities are not rounded.
 pub fn assemble_answer(q: &Question, label_logits: &[f32], t: f64) -> Value {
-    debug_assert!(
+    assert!(
         label_logits.len() >= 2,
         "assemble_answer: need at least 2 labels"
     );
@@ -615,7 +615,7 @@ pub fn assemble_answers(
 /// Additive accounting observed for Jev: shared prefix once, each suffix once.
 /// Precondition: every `seq_lens[i] >= prefix_len`.
 pub fn usage_json(prefix_len: usize, seq_lens: &[usize]) -> Value {
-    debug_assert!(
+    assert!(
         seq_lens.iter().all(|&l| l >= prefix_len),
         "usage_json: sequence shorter than prefix_len"
     );
