@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 3;
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 4;
 /// Change the contract suffix when serving numerics/transport change.
 pub fn calibration_build_identity() -> String {
     format!("hipfire-{}:npu-trunk-bf16-rowmajor-v1", env!("CARGO_PKG_VERSION"))
@@ -32,7 +32,7 @@ pub struct CalKey {
     pub kernel: KernelKey,
     /// SHA256 of HFQ bytes [0, data_offset), as in trunk-overlay binding.
     pub model_index_sha256: String,
-    /// `i32` or `bf16`, matching NpuCalibration::epilogue.
+    /// Always `bf16` (BF16-direct), matching NpuCalibration::epilogue.
     pub epilogue: String,
     /// GPU-native trunk identity: `stock` or `overlay:<artifact marker>`.
     pub trunk_route: String,
@@ -56,7 +56,6 @@ pub struct FamilyCalibration { pub layer: String, pub cols: usize, pub out_dtype
 #[serde(deny_unknown_fields)]
 pub struct GlueCalibration {
     pub pack_ms_8192: f64,
-    pub fold_ms_per_col_8192: f64,
     pub sync_ms: f64,
     pub consume_mode: String,
     pub consume_ms_per_col_8192: BTreeMap<String, f64>,
@@ -130,7 +129,7 @@ impl Calibration {
         if self.schema_version != CALIBRATION_SCHEMA_VERSION { return Err("unsupported calibration schema_version".into()); }
         if !self.margin.is_finite() || !(0.0..1.0).contains(&self.margin) { return Err("margin must be finite and in [0,1)".into()); }
         if self.npu.panel_cols == 0 || self.gpu.min_bank_rows == 0 { return Err("panel_cols and min_bank_rows must be positive".into()); }
-        if self.npu.epilogue != "i32" && self.npu.epilogue != "bf16" { return Err("npu.epilogue must be i32 or bf16".into()); }
+        if self.npu.epilogue != "bf16" { return Err("npu.epilogue must be bf16".into()); }
         if self.key.epilogue != self.npu.epilogue { return Err("key.epilogue differs from npu.epilogue".into()); }
         if self.key.trunk_route != "stock" && !self.key.trunk_route.strip_prefix("overlay:").is_some_and(|marker| !marker.trim().is_empty()) {
             return Err("key.trunk_route must be stock or overlay:<marker>".into());
@@ -163,7 +162,7 @@ impl Calibration {
             ("uniform_per_layer_ms", self.gpu.uniform_per_layer_ms), ("gdn_core_per_layer_ms", self.gpu.gdn_core_per_layer_ms),
             ("qsa_per_layer_ms", self.gpu.qsa_per_layer_ms), ("qsa_growth_per_layer_ms_per_8192_prefix", self.gpu.qsa_growth_per_layer_ms_per_8192_prefix),
             ("fixed_per_chunk_ms", self.gpu.fixed_per_chunk_ms), ("boundary_tax_ms", self.gpu.boundary_tax_ms),
-            ("pack_ms_8192", self.glue.pack_ms_8192), ("fold_ms_per_col_8192", self.glue.fold_ms_per_col_8192),
+            ("pack_ms_8192", self.glue.pack_ms_8192),
             ("sync_ms", self.glue.sync_ms), ("bytes_per_kop", self.npu.bytes_per_kop),
         ] { if !value.is_finite() || value < 0.0 { return Err(format!("{name} must be finite and nonnegative")); } }
         if !self.npu.tops_corun.is_finite() || self.npu.tops_corun <= 0.0 { return Err("tops_corun must be finite and positive".into()); }

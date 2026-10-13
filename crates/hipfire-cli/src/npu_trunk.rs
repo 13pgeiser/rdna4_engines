@@ -70,10 +70,10 @@ mod tests {
     #[test]
     fn npu_trunk_measurements_reject_missing_fields() {
         assert!(serde_json::from_str::<Measurements>("{}").is_err());
-        assert!(serde_json::from_str::<Measurements>(r#"{"schema_version":3,"margin":0}"#).is_err());
+        assert!(serde_json::from_str::<Measurements>(r#"{"schema_version":4,"margin":0}"#).is_err());
     }
     #[test]
-    fn npu_trunk_measurements_accept_schema_v3_stock_and_overlay() {
+    fn npu_trunk_measurements_accept_schema_v4_stock_and_overlay() {
         for source in [
             include_str!("../../hipfire-arch-qwen4/tests/fixtures/npu_trunk/g80bf16-stock-v2.json"),
             include_str!("../../hipfire-arch-qwen4/tests/fixtures/npu_trunk/g80bf16-overlay-v2.json"),
@@ -81,7 +81,7 @@ mod tests {
             let input: Measurements = serde_json::from_str(source).unwrap();
             let release = input.key.kernel.uname_release.clone();
             let cal = input.assemble(&release).unwrap();
-            assert_eq!(cal.schema_version, 3);
+            assert_eq!(cal.schema_version, 4);
             assert_eq!(cal.families["qkv"].out_dtype, "bf16");
             assert_eq!(cal.families["zab"].out_dtype, "f32");
             assert_eq!(cal.glue.consume_mode, "retile");

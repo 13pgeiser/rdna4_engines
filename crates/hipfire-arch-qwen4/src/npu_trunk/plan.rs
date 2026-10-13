@@ -63,7 +63,6 @@ pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefi
             }
         } else { kept[kind] += chunk.trunk[i]; }
     }
-    let fold = if cal.npu.epilogue == "i32" { cal.glue.fold_ms_per_col_8192 * f } else { 0.0 };
     let mut gpu = [chunk.gdn_rest + kept[0] / 36.0, chunk.qsa_rest + kept[1] / 12.0];
     let mut npu = [0.0; 2];
     for k in 0..2 {
@@ -71,7 +70,7 @@ pub fn bank_segments(cal: &Calibration, families: FamilyMask, rows: usize, prefi
             gpu[k] += cal.glue.pack_ms_8192 * f;
             npu[k] = npu_ms(cal, rows, cols[k]) + cal.glue.sync_ms;
         }
-        gpu[k] += (fold * cols[k] as f64) + consume[k] * f;
+        gpu[k] += consume[k] * f;
     }
     BankSegments { gpu, npu, chunk }
 }

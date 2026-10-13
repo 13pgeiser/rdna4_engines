@@ -51,7 +51,7 @@ fn golden(names: &str) {
             count += 1;
         }
     }
-    assert_eq!(count, 45);
+    assert_eq!(count, 27);
 }
 #[test] fn npu_trunk_golden_family_a() { golden("qkv,q,kvidx"); }
 #[test] fn npu_trunk_golden_family_b() { golden("qkv,zab,q,kvidx"); }
@@ -217,7 +217,7 @@ fn npu_trunk_v2_rejects_missing_invalid_fields() {
     invalid.glue.consume_ms_per_col_8192.insert("f16".into(), 0.0);
     assert!(invalid.validate().is_err());
     let mut key = c.key.clone();
-    key.epilogue = "i32".into();
+    key.epilogue = "other".into();
     key.trunk_route = "overlay:gfx1151-zab-v1".into();
     assert_eq!(c.key_matches(&key), Err("calibration key mismatch: epilogue".into()));
     key.epilogue = c.key.epilogue.clone();
