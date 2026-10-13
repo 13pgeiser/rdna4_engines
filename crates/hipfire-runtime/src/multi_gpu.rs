@@ -170,19 +170,56 @@ pub struct Gpus {
     /// the two event pools as independent producer-ready generations, one per
     /// partial-buffer slot. The two protocols are never active concurrently.
     rank_done_events: Vec<Event>,
-    /// One 8-byte system-visible epoch per rank for the exact-gated gfx1201
-    /// TP3/TP4 graph route. Each captured barrier advances the epoch.
+    /// One 8-byte system-visible epoch per rank for the exact-gated graph
+    /// routes (gfx1100 TP2 whole-token, gfx1201 TP3/TP4). Each captured
+    /// barrier advances the epoch.
     tp_graph_signals: Vec<DeviceBuffer>,
-    /// System-visible payload exchange for gfx1100 TP2 whole-token graphs.
-    /// Ordinary peer VRAM can remain stale across captured graph replays.
+    /// System-visible payload exchange for gfx1100 TP2 whole-token graphs:
+    /// one rank-local alias per rank of a single host-mapped allocation of
+    /// `2 ranks x 2 slots` segments. Ordinary peer VRAM can remain stale
+    /// across captured graph replays.
     tp_graph_payloads: Vec<DeviceBuffer>,
     tp_graph_payload_host: Option<usize>,
+    /// Segment stride in bytes (256-byte aligned).
     tp_graph_payload_bytes: usize,
     tp_graph_barrier_count: usize,
     tp_graph_capture_epoch: usize,
 }
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
+
+/// Kill switch for the symmetric direct-peer-read TP allreduce:
+/// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
+/// Default on for the n == 2 peer-access fast path.
+fn tp_peer_direct_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_TP_PEER_DIRECT", true)
+}
+
+/// Opt-in gfx1100 TP2 whole-token decode graph (`HIPFIRE_TP_FULL_GRAPH=1`).
+fn tp_full_graph_requested() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_TP_FULL_GRAPH", false)
+}
+
+/// Alternating-partial producer-only synchronization for the TP2
+/// direct-peer reduction ([`Gpus::all_reduce_sum_f32_peer_direct_add_alternating`]).
+/// `HIPFIRE_TP_PEER_ALTERNATING=1` enables it and `0` disables it (and with
+/// it the whole-token graph, whose captured reduction is this protocol).
+/// Unset follows [`tp_full_graph_requested`]: off by default, on whenever
+/// the whole-token graph is requested.
+fn tp_peer_alternating_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_TP_PEER_ALTERNATING", tp_full_graph_requested())
+}
+
+/// What [`Gpus::tp2_whole_token_graph_forward`] did for one token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TpGraphStep {
+    /// Direct warmup token; no graph was captured or replayed.
+    Direct,
+    /// Captured one graph per rank, then launched them.
+    Captured,
+    /// Replayed the existing rank graphs.
+    Replayed,
+}
 
 /// Validate lease identity and reduction geometry without touching GPU state.
 /// The returned byte count is zero for the existing singleton lease identity
@@ -1089,9 +1126,13 @@ impl Gpus {
         Ok(())
     }
 
-    /// Reserve one peer-owned payload shadow per rank before whole-token graph
-    /// capture. gfx1100 graph replay publishes into the peer's shadow and then
-    /// consumes only local VRAM, avoiding stale remote payload reads.
+    /// Reserve the gfx1100 TP2 whole-token graph payload exchange before
+    /// capture: one host-mapped, system-coherent segment of `bytes` per
+    /// (consuming rank, partial slot). Graph replay publishes each rank's
+    /// partial into its peer's segment, then reads only its own segment and
+    /// local VRAM; captured peer-VRAM reads can observe stale partials on
+    /// gfx1100. Two slots match the alternating partial protocol, so a
+    /// segment is never overwritten while the peer may still read it.
     pub fn prepare_tp_graph_peer_shadows(&mut self, bytes: usize) -> HipResult<()> {
         if self.devices.len() != 2 || !self.devices.iter().all(|device| device.arch == "gfx1100") {
             return Err(HipError::new(
@@ -1118,8 +1159,12 @@ impl Gpus {
             };
         }
 
-        let total_bytes = bytes
-            .checked_mul(self.devices.len())
+        // 256-byte segments keep every segment base float4-aligned.
+        let segment = bytes
+            .checked_next_multiple_of(256)
+            .ok_or_else(|| HipError::new(0, "TP graph payload size overflow"))?;
+        let total_bytes = segment
+            .checked_mul(self.devices.len() * 2)
             .ok_or_else(|| HipError::new(0, "TP graph payload size overflow"))?;
         self.devices[0].bind_thread()?;
         let host = self.devices[0]
@@ -1150,7 +1195,7 @@ impl Gpus {
         }
         self.tp_graph_payloads = payloads;
         self.tp_graph_payload_host = Some(host as usize);
-        self.tp_graph_payload_bytes = bytes;
+        self.tp_graph_payload_bytes = segment;
         Ok(())
     }
 
@@ -1186,6 +1231,199 @@ impl Gpus {
         self.tp_graph_signals.len() == self.devices.len()
             && self.tp_graph_signal_topology_supported()
             && self.tp_graph_barrier_count == barriers
+    }
+
+    fn tp2_whole_token_graph_requested(&self) -> bool {
+        tp_full_graph_requested()
+            && tp_peer_direct_enabled()
+            && tp_peer_alternating_enabled()
+            && self.devices.len() == 2
+            && self.devices.iter().all(|device| device.arch == "gfx1100")
+    }
+
+    /// Load-time half of the opt-in gfx1100 TP2 whole-token decode graph
+    /// (`HIPFIRE_TP_FULL_GRAPH=1`). Call before [`Self::enable_peer_all`], as
+    /// for the gfx1201 signal tape. Returns `Ok(false)` and touches nothing
+    /// unless the graph is requested, both the direct-peer and alternating
+    /// protocols are enabled, and the mesh is exactly two gfx1100 ranks.
+    /// Otherwise prepares `barriers` signal generations (resolving the signal
+    /// kernels now, since JIT is not capture-safe) and the coherent payload
+    /// exchange for `payload_bytes` per rank and slot.
+    pub fn prepare_tp2_whole_token_graph(
+        &mut self,
+        barriers: usize,
+        payload_bytes: usize,
+    ) -> HipResult<bool> {
+        if !self.tp2_whole_token_graph_requested() {
+            return Ok(false);
+        }
+        self.prepare_tp_graph_signals(barriers)?;
+        self.prepare_tp_graph_peer_shadows(payload_bytes)?;
+        Ok(true)
+    }
+
+    /// Decode-time admission of the gfx1100 TP2 whole-token graph: the load
+    /// half prepared `barriers` generations and the payload exchange, the
+    /// request still holds, and peer access is enabled.
+    pub fn tp2_whole_token_graph_ready(&self, barriers: usize) -> bool {
+        self.tp2_whole_token_graph_requested()
+            && self.peer_access_enabled
+            && self.tp_graph_signals_ready(barriers)
+            && self.tp_graph_payloads.len() == self.devices.len()
+    }
+
+    /// Run one dense-TP decode token on the gfx1100 TP2 whole-token graph.
+    ///
+    /// `forward` enqueues the whole token on every rank stream and reduces
+    /// through [`Self::all_reduce_sum_f32_peer_add_routed`] with alternating
+    /// slots, `barriers` reductions per token. A rank with dirty kernels runs
+    /// one direct token and discards any earlier capture, keeping lazy JIT
+    /// and allocation outside capture. The next token captures one graph per
+    /// rank; later tokens replay them. Cross-rank dependencies inside the
+    /// graphs are device-resident signal generations, and rank streams stay
+    /// FIFO, so replay needs no host drain or signal reset between tokens.
+    pub fn tp2_whole_token_graph_forward(
+        &mut self,
+        barriers: usize,
+        forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
+    ) -> HipResult<TpGraphStep> {
+        if self
+            .devices
+            .iter()
+            .any(|gpu| gpu.graphs.ar_forward_kernel_dirty)
+        {
+            self.drop_rank_graphs(false);
+            forward(self)?;
+            for gpu in &mut self.devices {
+                gpu.graphs.ar_forward_kernel_dirty = false;
+                gpu.graphs.ar_forward_replay_enabled = false;
+            }
+            return Ok(TpGraphStep::Direct);
+        }
+
+        let n = self.devices.len();
+        let captured = self
+            .devices
+            .iter()
+            .filter(|gpu| gpu.graphs.graph_exec.is_some())
+            .count();
+        if captured != 0 && captured != n {
+            self.drop_rank_graphs(true);
+            return Err(HipError::new(
+                0,
+                &format!("TP2 whole-token graph state is partial: {captured}/{n}"),
+            ));
+        }
+        let step = if captured == 0 {
+            self.capture_tp2_whole_token_graph(barriers, forward)?;
+            TpGraphStep::Captured
+        } else {
+            TpGraphStep::Replayed
+        };
+        for (rank, gpu) in self.devices.iter().enumerate() {
+            let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!("TP2 whole-token graph rank {rank} has no active stream"),
+                )
+            })?;
+            gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, stream)?;
+        }
+        Ok(step)
+    }
+
+    fn capture_tp2_whole_token_graph(
+        &mut self,
+        barriers: usize,
+        forward: impl FnOnce(&mut Gpus) -> HipResult<()>,
+    ) -> HipResult<()> {
+        let no_stream = |rank: usize| {
+            HipError::new(
+                0,
+                &format!("TP2 whole-token graph rank {rank} has no active stream"),
+            )
+        };
+        self.drop_rank_graphs(false);
+        self.begin_tp_graph_signal_capture()?;
+        for rank in 0..self.devices.len() {
+            let begin = {
+                let gpu = &mut self.devices[rank];
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => {
+                        gpu.graphs
+                            .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream)
+                    }
+                    None => Err(no_stream(rank)),
+                }
+            };
+            if let Err(error) = begin {
+                self.abort_rank_graph_captures();
+                return Err(error);
+            }
+        }
+        if let Err(error) = forward(self) {
+            self.abort_rank_graph_captures();
+            return Err(error);
+        }
+        let recorded = self.tp_graph_captured_signal_count();
+        if recorded != barriers {
+            self.abort_rank_graph_captures();
+            return Err(HipError::new(
+                0,
+                &format!("TP2 whole-token graph captured {recorded} barriers, expected {barriers}"),
+            ));
+        }
+        for rank in 0..self.devices.len() {
+            let end = {
+                let gpu = &mut self.devices[rank];
+                match gpu.active_stream.as_ref() {
+                    Some(stream) => gpu
+                        .graphs
+                        .end_graph_capture(&gpu.hip, gpu.device_id, stream),
+                    None => Err(no_stream(rank)),
+                }
+            };
+            if let Err(error) = end {
+                self.abort_rank_graph_captures();
+                return Err(error);
+            }
+        }
+        for gpu in &mut self.devices {
+            gpu.graphs.ar_forward_replay_enabled = true;
+        }
+        Ok(())
+    }
+
+    /// Discard every rank's captured AR graph and graph segments and leave
+    /// capture mode. `mark_dirty` forces one direct token before the next
+    /// capture.
+    pub fn drop_rank_graphs(&mut self, mark_dirty: bool) {
+        for gpu in &mut self.devices {
+            gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+            gpu.graphs.capture_mode = false;
+            gpu.graphs.capture_blobs.clear();
+            gpu.graphs.ar_forward_replay_enabled = false;
+            if mark_dirty {
+                gpu.graphs.ar_forward_kernel_dirty = true;
+            }
+        }
+    }
+
+    /// End any rank captures that started, discard every captured graph and
+    /// segment, and force one direct token before another capture attempt.
+    pub fn abort_rank_graph_captures(&mut self) {
+        for gpu in &mut self.devices {
+            if gpu.graphs.capture_mode {
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.graphs
+                        .abort_graph_capture(&gpu.hip, gpu.device_id, stream);
+                } else {
+                    gpu.graphs.capture_mode = false;
+                    gpu.graphs.capture_blobs.clear();
+                }
+            }
+        }
+        self.drop_rank_graphs(true);
     }
 
     /// Free the exact-gated TP4 signal tape after every captured rank graph has
@@ -2368,6 +2606,38 @@ impl Gpus {
         self.all_reduce_sum_f32_peer_direct_add_impl(partials, residuals, count, Some(partial_slot))
     }
 
+    /// Row-parallel TP residual reduction over peer access:
+    /// `residual[r] += partial[0] + partial[1] + ...` in rank order on every
+    /// rank.
+    ///
+    /// Two ranks take the symmetric direct-peer read
+    /// ([`Self::all_reduce_sum_f32_peer_direct_add`]; kill switch
+    /// `HIPFIRE_TP_PEER_DIRECT=0`); any other rank count uses the rooted
+    /// gather/fold/broadcast. `partial_slot` is `Some(0 | 1)` only when the
+    /// caller alternates two distinct partial buffers on consecutive calls;
+    /// with the alternating protocol enabled (`HIPFIRE_TP_PEER_ALTERNATING`)
+    /// such calls take [`Self::all_reduce_sum_f32_peer_direct_add_alternating`],
+    /// which is also the only reduction the gfx1100 TP2 whole-token graph can
+    /// capture. `None`, or the protocol disabled, keeps the ordinary
+    /// protocol. Every route computes the same rank-ordered sum.
+    pub fn all_reduce_sum_f32_peer_add_routed(
+        &mut self,
+        partials: &[&DeviceBuffer],
+        residuals: &[&DeviceBuffer],
+        count: usize,
+        partial_slot: Option<usize>,
+    ) -> HipResult<()> {
+        if self.devices.len() != 2 || !self.peer_access_enabled || !tp_peer_direct_enabled() {
+            return self.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count);
+        }
+        match partial_slot {
+            Some(slot) if tp_peer_alternating_enabled() => {
+                self.all_reduce_sum_f32_peer_direct_add_alternating(partials, residuals, count, slot)
+            }
+            _ => self.all_reduce_sum_f32_peer_direct_add(partials, residuals, count),
+        }
+    }
+
     fn all_reduce_sum_f32_peer_direct_add_impl(
         &mut self,
         partials: &[&DeviceBuffer],
@@ -2449,13 +2719,13 @@ impl Gpus {
         }
 
         // A whole-token per-rank graph cannot contain cross-device HIP event
-        // waits. The alternating-buffer caller instead inserts one captured
-        // system-scope producer barrier, then records the same peer-read add
-        // kernel into each rank graph. Fail closed if capture reached this
-        // route without the exact-gated signal tape prepared at model load.
-        if alternating_slot.is_some()
-            && self.devices.iter().all(|device| device.graphs.capture_mode)
-        {
+        // waits. The alternating-buffer caller instead records one fused
+        // system-scope barrier + rank-ordered reduce kernel into each rank
+        // graph. Fail closed if capture reached this route without the
+        // exact-gated signal tape and payload exchange prepared at load.
+        if let Some(slot) = alternating_slot.filter(|_| {
+            self.devices.iter().all(|device| device.graphs.capture_mode)
+        }) {
             if self.tp_graph_signals.len() != n || !self.tp_graph_signal_topology_supported() {
                 return Err(HipError::new(
                     0,
@@ -2478,19 +2748,19 @@ impl Gpus {
                     &format!("{operation}: TP graph peer shadows were not prepared before capture"),
                 ));
             }
+            let segment = self.tp_graph_payload_bytes;
             for rank in 0..n {
                 let base = self.tp_graph_payloads[rank].as_ptr().cast::<u8>();
-                // Each rank writes into the segment consumed by its peer and
-                // reads the segment addressed to itself, using the alias
-                // resolved in its own HIP context.
-                let peer_shadow = unsafe {
-                    base.add((1 - rank) * self.tp_graph_payload_bytes)
-                        .cast::<c_void>()
-                };
-                let local_shadow = unsafe {
-                    base.add(rank * self.tp_graph_payload_bytes)
-                        .cast::<c_void>() as *const c_void
-                };
+                // Segment `consumer * 2 + slot`: each rank writes the segment
+                // its peer consumes for this slot and reads its own, through
+                // the alias resolved in its own HIP context. One segment per
+                // slot means a rank can only overwrite a segment after passing
+                // the next slot's barrier, which the peer reaches only after
+                // finishing its read of that segment (same argument as the
+                // alternating partial buffers).
+                let peer_shadow = unsafe { base.add(((1 - rank) * 2 + slot) * segment).cast::<c_void>() };
+                let local_shadow =
+                    unsafe { base.add((rank * 2 + slot) * segment).cast::<c_void>() as *const c_void };
                 self.devices[rank].tp_graph_signal_reduce_gfx1100(
                     &self.tp_graph_signals[rank],
                     &self.tp_graph_signals[1 - rank],

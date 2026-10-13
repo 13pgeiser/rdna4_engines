@@ -32,6 +32,15 @@ __device__ __forceinline__ void tp_store_nontemporal_f32x4(float4 *ptr, float4 v
     __builtin_nontemporal_store(bits.u64[1], (global_u64_ptr)(p64 + 1));
 }
 
+// The generations never reset, so they wrap after 2^32 barriers (~33M
+// Qwen-27B tokens). Ranks differ by at most one generation, so a signed
+// difference orders them across the wrap where `peer < epoch` would not.
+__device__ __forceinline__ bool tp_peer_behind(const unsigned int *peer_signal,
+                                               unsigned int epoch) {
+    return static_cast<int>(__hip_atomic_load(
+               peer_signal, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - epoch) < 0;
+}
+
 // Reusable graph-resident two-rank producer barrier for gfx1100 TP. Each rank
 // is the sole writer of its local signal and advances it once per barrier.
 // The peer waits for the same generation. The generation lives on device, so
@@ -50,8 +59,7 @@ extern "C" __global__ void tp_graph_signal_barrier_gfx1100(
     __hip_atomic_exchange(
         local_signal, epoch, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 
-    while (__hip_atomic_load(
-               peer_signal, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch) {
+    while (tp_peer_behind(peer_signal, epoch)) {
         __builtin_amdgcn_s_sleep(1);
     }
 }
@@ -77,10 +85,11 @@ extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
     const int stride = blockDim.x;
 
     // gfx1100 graph replay can retain stale peer reads even after a system-
-    // scope signal acquire. Push this rank's 20 KiB partial into memory owned
-    // by the peer instead: after the barrier every consumer reads only local
-    // VRAM. Each writer lane publishes its remote stores before thread 0
-    // advances the peer-visible epoch.
+    // scope signal acquire. Push this rank's 20 KiB partial into the peer's
+    // segment of the host-mapped coherent exchange instead: after the barrier
+    // every consumer reads only its own segment and local VRAM. Each writer
+    // lane publishes its remote stores before thread 0 advances the
+    // peer-visible epoch.
     const float4 *__restrict__ localv = reinterpret_cast<const float4 *>(local_partial);
     float4 *__restrict__ peerv = reinterpret_cast<float4 *>(peer_shadow);
     for (int i = tid; i < vec; i += stride) {
@@ -101,8 +110,7 @@ extern "C" __global__ void tp_graph_signal_reduce_gfx1100(
     }
     __syncthreads();
 
-    while (__hip_atomic_load(
-               peer_signal, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < epoch) {
+    while (tp_peer_behind(peer_signal, epoch)) {
         __builtin_amdgcn_s_sleep(1);
     }
 

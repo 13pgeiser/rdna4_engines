@@ -4545,29 +4545,16 @@ fn load_model_tp_qwen35_dense(
         .can_access_peer_all()
         .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
     if peer {
-        let full_graph_requested = hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let full_graph_admitted = full_graph_requested
-            && tp == 2
-            && staging
-                .gpus_mut()
-                .devices
-                .iter()
-                .all(|device| device.arch == "gfx1100");
-        if full_graph_admitted {
-            staging
-                .gpus_mut()
-                .prepare_tp_graph_signals(config.n_layers * 2)
-                .map_err(|e| format!("prepare gfx1100 TP2 graph signals: {e:?}"))?;
-            staging
-                .gpus_mut()
-                .prepare_tp_graph_peer_shadows(config.dim * std::mem::size_of::<f32>())
-                .map_err(|e| format!("prepare gfx1100 TP2 graph peer shadows: {e:?}"))?;
+        // Opt-in gfx1100 TP2 whole-token decode graph: the runtime admits it
+        // and prepares its signal tape before peer access is enabled.
+        let barriers = config.n_layers * 2;
+        let whole_token_graph = staging
+            .gpus_mut()
+            .prepare_tp2_whole_token_graph(barriers, config.dim * std::mem::size_of::<f32>())
+            .map_err(|e| format!("prepare gfx1100 TP2 whole-token graph: {e:?}"))?;
+        if whole_token_graph {
             eprintln!(
-                "[loader] dense qwen gfx1100 TP2 whole-token graph signal tape: {} barriers",
-                config.n_layers * 2
+                "[loader] dense qwen gfx1100 TP2 whole-token graph signal tape: {barriers} barriers"
             );
         }
         let enabled = staging

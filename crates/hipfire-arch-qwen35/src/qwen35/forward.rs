@@ -59,6 +59,7 @@ use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::multi_gpu::TpGraphStep;
 use hipfire_runtime::sealed_moe::repartition_expert_execution_plan;
 use hipfire_runtime::sealed_moe::ExpertExecutionPlan;
 use hipfire_runtime::tp_shard::ExpertAssign;
@@ -4623,48 +4624,17 @@ fn dense_tp_all_reduce_sum_f32(
     }
 }
 
-/// Kill switch for the symmetric direct-peer-read TP allreduce:
-/// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
-/// Default ON for the n == 2 peer-access fast path.
-fn tp_peer_direct_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_TP_PEER_DIRECT")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
-/// Kill switch for the alternating-partial producer-only synchronization.
-/// `0` restores the ordinary direct-peer protocol while keeping every other
-/// dense TP dispatch and buffer choice identical for route A/B.
-fn tp_peer_alternating_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_TP_PEER_ALTERNATING")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
-/// Dense TP allreduce routing: symmetric direct peer-read when exactly two
-/// ranks share peer access (and the kill switch is off), else the rooted path.
-fn dense_tp_allreduce_add_route(
-    gpus: &mut Gpus,
-    partials: &[&hip_bridge::DeviceBuffer],
-    residuals: &[&hip_bridge::DeviceBuffer],
-    count: usize,
-) -> HipResult<()> {
-    if gpus.devices.len() == 2 && gpus.peer_access_enabled && tp_peer_direct_enabled() {
-        gpus.all_reduce_sum_f32_peer_direct_add(partials, residuals, count)
-    } else {
-        gpus.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count)
-    }
-}
-
+/// Residual reduction after a row-parallel stage. The attention partial
+/// (slot 0) lives in `o` and the FFN partial (slot 1) in `ffn_out`, so
+/// consecutive reductions alternate partial buffers as the slotted route of
+/// [`Gpus::all_reduce_sum_f32_peer_add_routed`] requires.
 fn dense_tp_allreduce_add(
     gpus: &mut Gpus,
     scratches: &[Qwen35Scratch],
     count: usize,
     partial_slot: usize,
 ) -> HipResult<()> {
-    let partial_tensors: Vec<_> = scratches
+    let partials: Vec<_> = scratches
         .iter()
         .map(|scratch| {
             if partial_slot == 0 {
@@ -4674,28 +4644,22 @@ fn dense_tp_allreduce_add(
             }
         })
         .collect();
+    let partial_refs: Vec<_> = partials.iter().map(|tensor| &tensor.buf).collect();
     if gpus.peer_access_enabled {
-        let partials: Vec<_> = partial_tensors.iter().map(|tensor| &tensor.buf).collect();
         let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
-        if gpus.devices.len() == 2 && tp_peer_direct_enabled() && tp_peer_alternating_enabled() {
-            gpus.all_reduce_sum_f32_peer_direct_add_alternating(
-                &partials,
-                &residuals,
-                count,
-                partial_slot,
-            )
-        } else {
-            dense_tp_allreduce_add_route(gpus, &partials, &residuals, count)
-        }
-    } else {
-        let partials: Vec<_> = partial_tensors.iter().map(|tensor| &tensor.buf).collect();
-        dense_tp_all_reduce_sum_f32(gpus, &partials, count)?;
-        for (rank, (scratch, partial)) in scratches.iter().zip(partial_tensors.iter()).enumerate() {
-            gpus.devices[rank].bind_thread()?;
-            gpus.devices[rank].add_f32(&scratch.x, partial, &scratch.x)?;
-        }
-        Ok(())
+        return gpus.all_reduce_sum_f32_peer_add_routed(
+            &partial_refs,
+            &residuals,
+            count,
+            Some(partial_slot),
+        );
     }
+    dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
+    for (rank, (scratch, partial)) in scratches.iter().zip(&partials).enumerate() {
+        gpus.devices[rank].bind_thread()?;
+        gpus.devices[rank].add_f32(&scratch.x, partial, &scratch.x)?;
+    }
+    Ok(())
 }
 
 fn dense_tp_allreduce_batched(
@@ -4715,7 +4679,7 @@ fn dense_tp_allreduce_batched(
             .map(|pbs| pbs.x_batch.sub_offset(0, count))
             .collect();
         let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
-        return dense_tp_allreduce_add_route(gpus, &partial_refs, &residual_refs, count);
+        return gpus.all_reduce_sum_f32_peer_add_routed(&partial_refs, &residual_refs, count, None);
     }
     dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
     for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
@@ -4866,158 +4830,6 @@ fn dense_tp_graph_enabled(gpus: &Gpus, kv_caches: &[llama::KvCache]) -> bool {
         })
 }
 
-fn dense_tp_full_graph_enabled(gpus: &Gpus, n_layers: usize) -> bool {
-    hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH")
-        .ok()
-        .as_deref()
-        == Some("1")
-        && tp_peer_direct_enabled()
-        && tp_peer_alternating_enabled()
-        && gpus.peer_access_enabled
-        && gpus.devices.len() == 2
-        && gpus.devices.iter().all(|gpu| gpu.arch == "gfx1100")
-        && gpus.tp_graph_signals_ready(n_layers * 2)
-}
-
-fn dense_tp_drop_graphs(gpus: &mut Gpus, mark_dirty: bool) {
-    for gpu in &mut gpus.devices {
-        gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
-        gpu.graphs.capture_mode = false;
-        gpu.graphs.capture_blobs.clear();
-        gpu.graphs.ar_forward_replay_enabled = false;
-        if mark_dirty {
-            gpu.graphs.ar_forward_kernel_dirty = true;
-        }
-    }
-}
-
-/// End any captures that started, discard every completed segment, and force
-/// one direct warmup before another capture attempt.
-fn dense_tp_abort_captures(gpus: &mut Gpus) {
-    for gpu in &mut gpus.devices {
-        if gpu.graphs.capture_mode {
-            if let Some(stream) = gpu.active_stream.as_ref() {
-                gpu.graphs
-                    .abort_graph_capture(&gpu.hip, gpu.device_id, stream);
-            } else {
-                gpu.graphs.capture_mode = false;
-                gpu.graphs.capture_blobs.clear();
-            }
-        }
-    }
-    dense_tp_drop_graphs(gpus, true);
-}
-
-/// Capture/replay one whole-token graph per gfx1100 TP2 rank. Cross-rank
-/// producer dependencies are graph-resident system-scope signal kernels; the
-/// peer residual add remains the existing rank-ordered arithmetic.
-#[allow(clippy::too_many_arguments)]
-fn forward_scratch_dense_tp_full_graph(
-    gpus: &mut Gpus,
-    weights: &[Qwen35Weights],
-    configs: &[Qwen35Config],
-    pos: usize,
-    kv_caches: &mut [llama::KvCache],
-    dn_states: &mut [DeltaNetState],
-    scratches: &[Qwen35Scratch],
-) -> HipResult<()> {
-    let n = gpus.devices.len();
-    let captured = gpus
-        .devices
-        .iter()
-        .filter(|gpu| gpu.graphs.graph_exec.is_some())
-        .count();
-    if captured != 0 && captured != n {
-        dense_tp_drop_graphs(gpus, true);
-        return Err(HipError::new(
-            0,
-            &format!("dense TP whole-token graph state is partial: {captured}/{n}"),
-        ));
-    }
-
-    if captured == 0 {
-        dense_tp_drop_graphs(gpus, false);
-        gpus.begin_tp_graph_signal_capture()?;
-        for rank in 0..n {
-            let begin = {
-                let gpu = &mut gpus.devices[rank];
-                match gpu.active_stream.as_ref() {
-                    Some(stream) => {
-                        gpu.graphs
-                            .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream)
-                    }
-                    None => Err(HipError::new(
-                        0,
-                        &format!("dense TP whole-token graph rank {rank} has no active stream"),
-                    )),
-                }
-            };
-            if let Err(error) = begin {
-                dense_tp_abort_captures(gpus);
-                return Err(error);
-            }
-        }
-
-        if let Err(error) = forward_scratch_dense_tp_layers(
-            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
-        ) {
-            dense_tp_abort_captures(gpus);
-            return Err(error);
-        }
-        let expected_barriers = configs[0].n_layers * 2;
-        if gpus.tp_graph_captured_signal_count() != expected_barriers {
-            dense_tp_abort_captures(gpus);
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "dense TP whole-token graph captured {} barriers, expected {expected_barriers}",
-                    gpus.tp_graph_captured_signal_count()
-                ),
-            ));
-        }
-
-        for rank in 0..n {
-            let end = {
-                let gpu = &mut gpus.devices[rank];
-                match gpu.active_stream.as_ref() {
-                    Some(stream) => gpu
-                        .graphs
-                        .end_graph_capture(&gpu.hip, gpu.device_id, stream),
-                    None => Err(HipError::new(
-                        0,
-                        &format!("dense TP whole-token graph rank {rank} has no active stream"),
-                    )),
-                }
-            };
-            if let Err(error) = end {
-                dense_tp_abort_captures(gpus);
-                return Err(error);
-            }
-        }
-        for gpu in &mut gpus.devices {
-            gpu.graphs.ar_forward_replay_enabled = true;
-        }
-        if ar_graph_trace_enabled() {
-            eprintln!(
-                "[qwen-dense-tp-graph] captured whole-token tp=2 barriers={expected_barriers} pos={pos}"
-            );
-        }
-    }
-
-    // The gfx1100 TP2 barrier advances a device-resident generation on every
-    // replay. Rank streams remain FIFO-ordered, so neither a host drain nor a
-    // signal reset is required between token graphs.
-    for rank in 0..n {
-        let gpu = &gpus.devices[rank];
-        gpu.graphs.graph_launch(
-            &gpu.hip,
-            gpu.device_id,
-            gpu.active_stream.as_ref().expect("validated active stream"),
-        )?;
-    }
-    Ok(())
-}
-
 /// Launch one rank-local segment on every device. Segments contain no RCCL,
 /// but all rank launches are still attempted before surfacing an error so the
 /// device streams remain at the same stage boundary.
@@ -5036,7 +4848,7 @@ fn dense_tp_launch_segment(gpus: &mut Gpus, segment: usize) -> HipResult<()> {
         }
     }
     if let Some(error) = first_error {
-        dense_tp_drop_graphs(gpus, true);
+        gpus.drop_rank_graphs(true);
         return Err(error);
     }
     Ok(())
@@ -5062,26 +4874,26 @@ fn dense_tp_capture_and_launch_segment(
             }
         };
         if let Err(error) = begin {
-            dense_tp_abort_captures(gpus);
+            gpus.abort_rank_graph_captures();
             return Err(error);
         }
     }
     if let Err(error) = enqueue(gpus) {
-        dense_tp_abort_captures(gpus);
+        gpus.abort_rank_graph_captures();
         return Err(error);
     }
     for rank in 0..gpus.devices.len() {
         let end = {
             let gpu = &mut gpus.devices[rank];
             let Some(stream) = gpu.active_stream.as_ref() else {
-                dense_tp_abort_captures(gpus);
+                gpus.abort_rank_graph_captures();
                 return Err(HipError::new(0, "dense TP graph rank has no active stream"));
             };
             gpu.graphs
                 .end_graph_capture_segment(&gpu.hip, gpu.device_id, stream)
         };
         if let Err(error) = end {
-            dense_tp_abort_captures(gpus);
+            gpus.abort_rank_graph_captures();
             return Err(error);
         }
     }
@@ -5095,7 +4907,7 @@ fn dense_tp_capture_and_launch_segment(
         .iter()
         .any(|gpu| gpu.graphs.graph_segment_count() != segment + 1)
     {
-        dense_tp_drop_graphs(gpus, true);
+        gpus.drop_rank_graphs(true);
         return Err(HipError::new(
             0,
             "dense TP graph ranks captured different segment counts",
@@ -5119,7 +4931,7 @@ fn dense_tp_launch_root_segment(gpus: &mut Gpus, segment: usize) -> HipResult<()
         }
     };
     if let Err(error) = result {
-        dense_tp_drop_graphs(gpus, true);
+        gpus.drop_rank_graphs(true);
         return Err(error);
     }
     Ok(())
@@ -5142,17 +4954,17 @@ fn dense_tp_capture_and_launch_root_segment(
         }
     };
     if let Err(error) = begin {
-        dense_tp_abort_captures(gpus);
+        gpus.abort_rank_graph_captures();
         return Err(error);
     }
     if let Err(error) = enqueue(gpus) {
-        dense_tp_abort_captures(gpus);
+        gpus.abort_rank_graph_captures();
         return Err(error);
     }
     let end = {
         let gpu = &mut gpus.devices[0];
         let Some(stream) = gpu.active_stream.as_ref() else {
-            dense_tp_abort_captures(gpus);
+            gpus.abort_rank_graph_captures();
             return Err(HipError::new(
                 0,
                 "dense TP graph rank 0 has no active stream",
@@ -5162,7 +4974,7 @@ fn dense_tp_capture_and_launch_root_segment(
             .end_graph_capture_segment(&gpu.hip, gpu.device_id, stream)
     };
     if let Err(error) = end {
-        dense_tp_abort_captures(gpus);
+        gpus.abort_rank_graph_captures();
         return Err(error);
     }
     let segment = gpus.devices[0]
@@ -5299,31 +5111,28 @@ pub fn forward_scratch_dense_tp(
                 || gpu.graphs.graph_segment_count() != 0
                 || gpu.graphs.capture_mode
         }) {
-            dense_tp_drop_graphs(gpus, true);
+            gpus.drop_rank_graphs(true);
         }
         return forward_scratch_dense_tp_layers(
             gpus, weights, configs, pos, kv_caches, dn_states, scratches,
         );
     }
 
-    if dense_tp_full_graph_enabled(gpus, n_layers) {
-        if gpus
-            .devices
-            .iter()
-            .any(|gpu| gpu.graphs.ar_forward_kernel_dirty)
-        {
+    // Opt-in gfx1100 TP2 whole-token graph (`HIPFIRE_TP_FULL_GRAPH=1`); the
+    // runtime owns capture/replay and the cross-rank signal protocol.
+    let barriers = n_layers * 2;
+    if gpus.tp2_whole_token_graph_ready(barriers) {
+        let step = gpus.tp2_whole_token_graph_forward(barriers, |gpus| {
             forward_scratch_dense_tp_layers(
                 gpus, weights, configs, pos, kv_caches, dn_states, scratches,
-            )?;
-            for gpu in &mut gpus.devices {
-                gpu.graphs.ar_forward_kernel_dirty = false;
-                gpu.graphs.ar_forward_replay_enabled = false;
-            }
-            return Ok(());
+            )
+        })?;
+        if step == TpGraphStep::Captured && ar_graph_trace_enabled() {
+            eprintln!(
+                "[qwen-dense-tp-graph] captured whole-token tp=2 barriers={barriers} pos={pos}"
+            );
         }
-        return forward_scratch_dense_tp_full_graph(
-            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
-        );
+        return Ok(());
     }
 
     let expected_segments = n_layers * 2;
@@ -5336,7 +5145,7 @@ pub fn forward_scratch_dense_tp(
             gpus, weights, configs, pos, kv_caches, dn_states, scratches, false,
         );
         if result.is_err() {
-            dense_tp_drop_graphs(gpus, true);
+            gpus.drop_rank_graphs(true);
         }
         if ar_graph_trace_enabled() {
             eprintln!(
@@ -5362,18 +5171,18 @@ pub fn forward_scratch_dense_tp(
         return Ok(());
     }
 
-    dense_tp_drop_graphs(gpus, false);
+    gpus.drop_rank_graphs(false);
     if let Err(error) = forward_scratch_dense_tp_segmented(
         gpus, weights, configs, pos, kv_caches, dn_states, scratches, true,
     ) {
-        dense_tp_drop_graphs(gpus, true);
+        gpus.drop_rank_graphs(true);
         return Err(error);
     }
     if gpus.devices.iter().enumerate().any(|(rank, gpu)| {
         let expected = expected_segments + usize::from(rank == 0);
         gpu.graphs.graph_segment_count() != expected
     }) {
-        dense_tp_drop_graphs(gpus, true);
+        gpus.drop_rank_graphs(true);
         return Err(HipError::new(
             0,
             "dense TP graph capture produced an incomplete segment set",

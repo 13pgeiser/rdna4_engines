@@ -365,6 +365,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_EMULATE_GPUS` | **Developer-only logical GPU emulation.** A successfully parsed integer `>=2` enables; missing, malformed, `0`, and `1` disable. Requested logical IDs are aliased modulo the loaded physical count; this switch does not choose the EP rank count and is not a product admission. |
 | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` | Explicit peer all-reduce selector for logical EP decode proofs; do not set it to `0`. |
 | `HIPFIRE_EP_PEER_ALLREDUCE=1` | Explicit peer all-reduce selector for logical EP batched prefill/tick proofs; do not set it to `0`. |
+| `HIPFIRE_TP_PEER_DIRECT` / `HIPFIRE_TP_PEER_ALTERNATING` / `HIPFIRE_TP_FULL_GRAPH` | Developer-only dense-TP2 residual reduction controls; every route computes the same rank-ordered `x + (p0 + p1)`. `HIPFIRE_TP_PEER_DIRECT=0` replaces the default symmetric direct-peer read with the rooted fold. `HIPFIRE_TP_PEER_ALTERNATING=1` (default off) uses the fact that the attention and FFN partials live in different buffers: each reduction waits only on the peer's producer event, without the consumer-complete reverse wait. `=0` also disables the whole-token graph. `HIPFIRE_TP_FULL_GRAPH=1` (default off; exact gfx1100, TP=2, peer access, AR decode) captures each rank's whole decode token as one hipGraph, with device-resident signal barriers and a host-mapped coherent payload exchange; it turns on the alternating protocol unless that is set to `0`. See [multi-gpu.md](multi-gpu.md#dense-tp2-reduction-protocol-developer). |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Uniform init tolerance |
@@ -653,7 +654,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1582
+**Count:** 1585
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1092,7 +1093,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FAULT_MTP_FULL_REJECT` | crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | harness |
 | `HIPFIRE_FAULT_PREFIX_PUBLISH` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | developer |
 | `HIPFIRE_FA_BATCH_FUSE_OFF` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_FA_KVWRITE_FOLD` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
+| `HIPFIRE_FA_KVWRITE_FOLD` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_FA_RAGGED_PACKET` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_FIXED_TIER` | crates/hipfire-quantize/src/model_filter.rs, crates/hipfire-quantize/src/pipeline.rs | developer |
@@ -2154,15 +2155,18 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TOPK_FIXUP_MARKED` | crates/rdna-compute/src/select_regrid.rs | developer |
 | `HIPFIRE_TOPOLOGY_EP` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
+| `HIPFIRE_TP2_GRAPH_REPLAYS` | crates/hipfire-runtime/examples/tp2_cross_device_graph_reduce.rs | harness |
 | `HIPFIRE_TP4_GRAPH_REPLAYS` | crates/hipfire-runtime/examples/tp4_cross_device_graph_barrier.rs | harness |
 | `HIPFIRE_TP_BENCH_ITERS` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_BENCH_N` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_BENCH_WARMUP` | crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
+| `HIPFIRE_TP_FULL_GRAPH` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/src/multi_gpu.rs | developer |
 | `HIPFIRE_TP_GRAPH_RANKS` | crates/hipfire-runtime/examples/tp4_cross_device_graph_barrier.rs | harness |
 | `HIPFIRE_TP_PARITY_PROMPT_FILE` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP_PARITY_STEPS` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP_PARITY_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
-| `HIPFIRE_TP_PEER_DIRECT` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
+| `HIPFIRE_TP_PEER_ALTERNATING` | crates/hipfire-runtime/src/multi_gpu.rs | developer |
+| `HIPFIRE_TP_PEER_DIRECT` | crates/hipfire-runtime/src/multi_gpu.rs | developer |
 | `HIPFIRE_TP_USE_RCCL` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
 | `HIPFIRE_TQ2G128_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_TQ2G128_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |

@@ -479,6 +479,36 @@ verification runs a multi-row trunk geometry, whereas AR advances one token at
 a time. The H2 greedy gate observed different output in some workloads, so a
 throughput improvement alone does not qualify this route for automatic use.
 
+### Dense TP2 reduction protocol (developer)
+
+Dense Qwen3.5/3.6 TP decode reduces each layer's attention and FFN partials
+into the residual through `Gpus::all_reduce_sum_f32_peer_add_routed`
+(`hipfire-runtime`). Every route evaluates the same rank-ordered
+`x + (p0 + p1)`, so the output is the same bytes on each route. With two
+peer-access ranks the default is a symmetric direct-peer read; each reduction
+waits on the peer's producer event and, before the next layer overwrites a
+partial, on the peer's consumer-complete event.
+
+Two developer controls, both default off, change only the synchronization:
+
+- `HIPFIRE_TP_PEER_ALTERNATING=1`: the attention partial and the FFN partial
+  live in different buffers. Once a peer has produced the next partial, it
+  has finished reading the previous one, so the reverse wait is dropped.
+- `HIPFIRE_TP_FULL_GRAPH=1`: exact gfx1100, TP=2, peer access, plain AR
+  decode. Each rank's whole decode token is captured as one hipGraph. Every
+  reduction becomes one graph-resident kernel: a device-resident signal
+  barrier plus the residual add, which reads the peer's partial through a
+  host-mapped, system-coherent exchange. Captured peer-VRAM reads can be stale
+  on gfx1100. The loader prepares the signal tape and the exchange (about
+  80 KiB for Qwen3.8-27B). This control implies the alternating protocol
+  unless `HIPFIRE_TP_PEER_ALTERNATING=0`.
+
+Neither control is a product default. The whole-token graph needs two gfx1100
+cards, and its evidence so far is the author's 2x W7900 measurement in #830.
+Validate it with the lab oracle `tp2_cross_device_graph_reduce`
+(`--features lab`, `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript
+identity against the default route.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
