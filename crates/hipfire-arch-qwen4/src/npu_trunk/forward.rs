@@ -388,24 +388,24 @@ impl NpuForward {
     /// `emulate` with the GPU twin projection in its place.
     pub(super) fn pipelined(&self) -> bool { self.bank_b.is_some() }
     pub(super) fn begin_request(&mut self) { self.pair_logged=false; self.request_plan=None; }
+    /// With a matched calibration every mode (`auto`, `on`, `emulate`) executes the planner's pairs, including the
+    /// rebalanced last pair; `auto` logs the plan. Without one the forced modes keep the natural 8192 + B pairing.
     pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
-        if self.request_plan.is_some() || self.mode != NpuTrunkMode::Auto { return; }
-        let cal = self.calibration.as_ref().expect("auto requires matched calibration");
-        let planned = trunk::plan(cal, self.families, rows);
-        let executable = trunk::executable_plan(cal, &planned, rows, self.n_star);
-        eprintln!("{}", trunk::request_log_line(rows, &executable));
+        let Some(cal) = self.calibration.as_ref() else { return };
+        if self.request_plan.is_some() { return; }
+        let executable = request_plan(cal, self.mode, self.families, self.n_star, rows);
+        if self.mode == NpuTrunkMode::Auto { eprintln!("{}", trunk::request_log_line(rows, &executable)); }
         self.request_origin = position;
         self.request_plan = Some(executable);
     }
     /// Rows of banks A and B of the pair starting at `position`: the plan's
-    /// split (or the natural 8192 + B in forced modes). `None` without a bank-B
-    /// scratch (an `emulate` load that cannot hold one runs every chunk native).
+    /// split, or (forced modes without a matched calibration) the natural
+    /// 8192 + B. `None` without a bank-B scratch (an `emulate` load that cannot
+    /// hold one runs every chunk native).
     pub(super) fn selected_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
         self.bank_b.as_ref()?;
-        if self.mode != NpuTrunkMode::Auto { return pair_rows(remaining, chunk).map(|rows| [chunk, rows - chunk]); }
-        if chunk != trunk::CHUNK { return None; }
-        let (a, b) = trunk::planned_pair(self.request_plan.as_ref()?, position.checked_sub(self.request_origin)?)?;
-        (a + b <= remaining).then_some([a, b])
+        if self.calibration.is_none() { return pair_rows(remaining, chunk).map(|rows| [chunk, rows - chunk]); }
+        planned_banks(self.request_plan.as_ref()?, self.request_origin, position, remaining, chunk)
     }
     pub(super) fn note_pair(&mut self, rows: [usize; 2], position: usize) {
         if !self.pair_logged && self.mode != NpuTrunkMode::Auto {
@@ -1028,6 +1028,19 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
     Ok(())
 }
 
+/// The request's executable plan. `auto` arms it from the crossover `n_star`; the forced modes (`on`, `emulate`)
+/// take the planner's pairs from the first row.
+fn request_plan(cal: &trunk::Calibration, mode: NpuTrunkMode, families: FamilyMask, n_star: Option<usize>, rows: usize) -> trunk::Plan {
+    let planned = trunk::plan(cal, families, rows);
+    trunk::executable_plan(cal, &planned, rows, if mode == NpuTrunkMode::Auto { n_star } else { Some(0) })
+}
+/// Rows of the planned pair starting at `position` (the request began at `origin`) when it fits the remaining rows.
+fn planned_banks(plan: &trunk::Plan, origin: usize, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
+    if chunk != trunk::CHUNK { return None; }
+    let (a, b) = trunk::planned_pair(plan, position.checked_sub(origin)?)?;
+    (a + b <= remaining).then_some([a, b])
+}
+
 /// The natural pair: 8192 + B (B in 512..=8192); bank B may be partial.
 pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
     if remaining < chunk + 512 { return None; }
@@ -1296,6 +1309,32 @@ mod tests {
     }
     fn fixture_calibration(file: &str) -> Calibration {
         Calibration::load(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npu_trunk").join(file)).unwrap()
+    }
+    #[test] fn forced_modes_with_a_matched_calibration_run_the_planned_pairs() {
+        // The built-in v4 overlay calibration: on and emulate take the planner's pairs
+        // (rebalanced last pair included), exactly as auto does once armed.
+        let (cal, _) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", "overlay:gfx1151-zab-v1").unwrap();
+        let families = trunk::select_families(&cal).0;
+        let star = trunk::crossover(&cal, families);
+        let pairs = |mode: NpuTrunkMode, rows: usize| {
+            let plan = request_plan(&cal, mode, families, star, rows);
+            let mut at = 0;
+            let mut out = Vec::new();
+            while at < rows {
+                match planned_banks(&plan, 0, at, rows - at, trunk::CHUNK) {
+                    Some(banks) => { out.push((at, banks)); at += banks[0] + banks[1]; }
+                    None => at = (at + trunk::CHUNK).min(rows),
+                }
+            }
+            out
+        };
+        for mode in [NpuTrunkMode::On, NpuTrunkMode::Emulate, NpuTrunkMode::Auto] {
+            assert_eq!(pairs(mode, 9319), vec![(0, [4672, 4647])], "{mode:?}");
+            assert_eq!(pairs(mode, 57556).last(), Some(&(49152, [4224, 4180])), "{mode:?}");
+        }
+        // The forced modes pair from the first row, auto only from the crossover.
+        assert!(pairs(NpuTrunkMode::Auto, 4096).is_empty());
+        assert_eq!(planned_banks(&request_plan(&cal, NpuTrunkMode::On, families, star, 9319), 0, 0, 9319, 4096), None);
     }
     #[test] fn rebalanced_pairs_schedule_with_and_without_the_session_cache() {
         let cal = fixture_calibration("g80bf16-overlay-v2.json");
