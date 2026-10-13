@@ -21,6 +21,79 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
+/// Refuse the author-disclosed native-MTP verify corruption, not AR or graded MQ4/MQ6.
+/// Call only after a native head resolves and higher-priority drafters decline.
+pub fn native_mtp_refusal(
+    layers: &[LayerWeights],
+    arch: &str,
+    fp16_disabled: bool,
+) -> Option<&'static str> {
+    let dtypes = layers.iter().filter_map(|layer| match layer {
+        LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
+        LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
+        _ => None,
+    }).flat_map(|ffn| {
+        // Prefer the loaded tensors. Paged/EP layers retain full-model dtype
+        // metadata in their immutable execution plan even without local tensors.
+        ffn.experts.iter()
+            .filter(move |_| ffn.global_expert_dtypes.is_none())
+            .map(|expert| (expert.gate_up.gpu_dtype, expert.down.gpu_dtype))
+            .chain(ffn.expert_execution_plan.experts().iter()
+                .filter(move |_| ffn.experts.is_empty() || ffn.global_expert_dtypes.is_some())
+                .map(|expert| (expert.gate.dtype, expert.down.dtype)))
+    });
+    native_mtp_uniform_mq6_refused(arch, fp16_disabled, dtypes).then_some(
+        "native MTP refused: uniform MQ6/qt15 routed experts with gfx12 FP16 WMMA \
+         corrupt verify windows; use --spec off / speculation.mtp=off or HIPFIRE_FP16=0",
+    )
+}
+
+fn native_mtp_uniform_mq6_refused(
+    arch: &str,
+    fp16_disabled: bool,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+) -> bool {
+    if fp16_disabled || !matches!(arch, "gfx1200" | "gfx1201") {
+        return false;
+    }
+    let mut nonempty = false;
+    for (gate_up, down) in experts {
+        nonempty = true;
+        if gate_up != DType::MQ6G256 || down != DType::MQ6G256 {
+            return false;
+        }
+    }
+    nonempty
+}
+
+#[cfg(test)]
+mod native_mtp_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_uniform_mq6_truth_table() {
+        let mq6 = (DType::MQ6G256, DType::MQ6G256);
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(native_mtp_uniform_mq6_refused(arch, false, [mq6; 2]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, true, [mq6]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, []));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [mq6, (DType::MQ4G256, DType::MQ6G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256, DType::MQ4G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256V2, DType::MQ6G256V2)],
+            ));
+            assert!(native_mtp_refusal(&[], arch, false).is_none());
+        }
+        for arch in ["gfx1151", "gfx1100", "gfx942"] {
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, [mq6]));
+        }
+    }
+}
+
 // ─── Weight structs ─────────────────────────────────────────────────────
 
 /// Weights for a DeltaNet (linear attention) layer.

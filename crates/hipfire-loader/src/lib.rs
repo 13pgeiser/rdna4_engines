@@ -2382,6 +2382,23 @@ fn finish_qwen35_load(
         }
         resolved
     };
+    if mtp.is_some() {
+        if let Some(reason) = hipfire_arch_qwen35::qwen35::weights::native_mtp_refusal(
+            &bundle.weights.layers,
+            &ctx.gpu.arch,
+            ctx.gpu.flags.fp16_disabled,
+        ) {
+            if let Some((head, _)) = mtp {
+                head.free_gpu(ctx.gpu);
+            }
+            return Err(rollback_unfinished_qwen35(
+                reason.to_string(),
+                bundle,
+                vision_weights,
+                ctx.gpu,
+            ));
+        }
+    }
     let mtp_present = mtp.is_some();
     let (mtp, mtp_source) = match mtp {
         Some((head, source)) => (Some(head), Some(source)),

@@ -2831,7 +2831,7 @@ mod tests {
                 SpillSupport::Supported
             );
             assert_eq!(
-                effective_offload_budgets(false),
+                effective_offload_budgets(),
                 (OffloadBudget::Full, OffloadBudget::Full)
             );
         }

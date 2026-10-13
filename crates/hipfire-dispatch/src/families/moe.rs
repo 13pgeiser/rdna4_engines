@@ -2064,6 +2064,222 @@ mod tests {
         assert!(!r.use_gpu_topk);
     }
 
+    fn uniform_prefill_dtypes(dtype: DType) -> MoeDtypes<'static> {
+        let mut d = uniform_mq4();
+        d.routed_gate_up = dtype;
+        d.routed_down = dtype;
+        d.experts_all_gate_up_mq4 = dtype == DType::MQ4G256;
+        d.has_paro_shared = dtype == DType::ParoQ4G128;
+        let shared_dtype = match dtype {
+            DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8 => DType::Q8_0,
+            _ => dtype,
+        };
+        d.shared = Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: shared_dtype,
+            up: shared_dtype,
+            down: shared_dtype,
+        });
+        d
+    }
+
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 6] {
+        // Exhaustive destructuring makes a new resolution field require an
+        // explicit comparison here, without changing the production API.
+        let MoePrefillResolution {
+            use_path2,
+            down_path0,
+            use_paro_i8,
+            use_paro_i8_k8,
+            paro_mode,
+            force_mq4_grouped_fp16,
+        } = r;
+        [
+            *use_path2,
+            *down_path0,
+            *use_paro_i8,
+            *use_paro_i8_k8,
+            *paro_mode,
+            *force_mq4_grouped_fp16,
+        ]
+    }
+
+    fn assert_resident_verify_matches_legacy(d: &MoeDtypes<'_>) {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942"] {
+            for flag_case in 0..4 {
+                let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
+                match flag_case {
+                    1 => flags.moe_grouped_gemm = false,
+                    2 => flags.moe_grouped_i8 = Some(true),
+                    3 => {
+                        flags.moe_paro_i8 = Some(false);
+                        flags.moe_paro_i8_k8 = Some(false);
+                    }
+                    _ => {}
+                }
+                let flags = std::sync::Arc::new(flags);
+                let arch = rdna_compute::arch_caps::ArchCaps::new(arch_name, flags.clone());
+                let legacy = MoePrefillResolution::resolve(d, &arch, &flags);
+                // Unknown width, decode, every narrow verify width, and the
+                // first wide verify all retain the resident legacy route.
+                for batch in 0..=NARROW_VERIFY_MAX_ROWS + 1 {
+                    let resident = MoePrefillResolution::resolve_with_batch_ctx(
+                        d, &arch, &flags, batch, true, false,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&resident),
+                        prefill_resolution_fields(&legacy),
+                        "{arch_name}, {:?}/{:?}, mixed={}, flags={flag_case}, batch={batch}",
+                        d.routed_gate_up, d.routed_down, d.routed_has_mixed_experts,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_resident_verify_uniform_matches_legacy_all_fields() {
+        for dtype in [
+            DType::MQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256,
+            DType::MFP4G32E8,
+            DType::MFP3G32E8,
+            DType::MFP2G32E8,
+            DType::ParoQ4G128,
+        ] {
+            assert_resident_verify_matches_legacy(&uniform_prefill_dtypes(dtype));
+        }
+    }
+
+    #[test]
+    fn prefill_resident_verify_mixed_experts_matches_legacy_all_fields() {
+        for representative in [DType::MQ4G256, DType::MQ6G256, DType::MQ6G256V2, DType::MQ5G256] {
+            let mut d = uniform_prefill_dtypes(representative);
+            d.routed_has_mixed_experts = true;
+            d.experts_all_gate_up_mq4 = false;
+            d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ6G256V2]);
+            d.per_expert_down = Some(&[DType::MQ6G256, DType::MQ4G256V2]);
+            assert_resident_verify_matches_legacy(&d);
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_uniform_mq4_gfx1201_narrow_readmits_path2() {
+        let ctx = crate::context::DispatchCtx::for_test("gfx1201");
+        for dtype in [DType::MQ4G256, DType::MQ4G256V2] {
+            let d = uniform_prefill_dtypes(dtype);
+            let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert!(legacy.use_path2);
+            for batch in 2..=NARROW_VERIFY_MAX_ROWS {
+                let host = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &ctx.flags, batch, true, true,
+                );
+                assert!(host.use_path2, "{dtype:?}, batch={batch}");
+                assert_eq!(
+                    prefill_resolution_fields(&host),
+                    prefill_resolution_fields(&legacy),
+                    "{dtype:?}, batch={batch}",
+                );
+            }
+            let decode = MoePrefillResolution::resolve_with_batch_ctx(
+                &d, &ctx.arch, &ctx.flags, 1, true, true,
+            );
+            assert!(!decode.use_path2, "one row must not take the Path 2 re-admit");
+
+            let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
+            flags.moe_grouped_gemm = false;
+            for batch in 2..=NARROW_VERIFY_MAX_ROWS {
+                let disabled = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &flags, batch, true, true,
+                );
+                assert!(!disabled.use_path2, "re-admit must respect grouped-GEMM opt-out");
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_narrow_verify_keeps_indexed_policy() {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            for dtype in [
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ6G256,
+                DType::MQ6G256V2,
+                DType::MQ5G256,
+                DType::MFP4G32E8,
+                DType::MFP3G32E8,
+                DType::MFP2G32E8,
+                DType::ParoQ4G128,
+            ] {
+                let d = uniform_prefill_dtypes(dtype);
+                let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+                for batch in 1..=NARROW_VERIFY_MAX_ROWS {
+                    if arch_name == "gfx1201"
+                        && matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2)
+                        && batch >= 2
+                    {
+                        continue; // Covered by the uniform MQ4 re-admit test.
+                    }
+                    let host = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, true, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&host),
+                        [false, false, false, false, dtype == DType::ParoQ4G128, false],
+                        "{arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+                for batch in [0, NARROW_VERIFY_MAX_ROWS + 1] {
+                    let host = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, true, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&host),
+                        prefill_resolution_fields(&legacy),
+                        "unknown/wide host verify: {arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+                for batch in 0..=NARROW_VERIFY_MAX_ROWS + 1 {
+                    let prompt = MoePrefillResolution::resolve_with_batch_ctx(
+                        &d, &ctx.arch, &ctx.flags, batch, false, true,
+                    );
+                    assert_eq!(
+                        prefill_resolution_fields(&prompt),
+                        prefill_resolution_fields(&legacy),
+                        "host prompt: {arch_name}, {dtype:?}, batch={batch}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_host_spill_mixed_narrow_verify_keeps_grouped_route() {
+        for arch_name in ["gfx1201", "gfx1200", "gfx1151", "gfx1100"] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            let mut d = uniform_prefill_dtypes(DType::MQ6G256);
+            d.routed_has_mixed_experts = true;
+            d.per_expert_gate_up = Some(&[DType::MQ4G256, DType::MQ6G256]);
+            d.per_expert_down = Some(&[DType::MQ4G256, DType::MQ6G256]);
+            let legacy = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert!(legacy.use_path2);
+            for batch in 1..=NARROW_VERIFY_MAX_ROWS {
+                let host = MoePrefillResolution::resolve_with_batch_ctx(
+                    &d, &ctx.arch, &ctx.flags, batch, true, true,
+                );
+                assert_eq!(
+                    prefill_resolution_fields(&host),
+                    prefill_resolution_fields(&legacy),
+                    "{arch_name}, mixed host verify, batch={batch}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn narrow_window_extent_lower_bound_is_two() {
         // The shared narrow-window extent: bumping it is a deliberate edit.

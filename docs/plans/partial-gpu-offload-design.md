@@ -16,6 +16,26 @@ below is the *design-time* plan; read the as-shipped note first before implement
 > §6.1 "Implementation decisions settled during bring-up" **before** implementing anything from
 > §5/§6.1's option list; it records the mechanism measurement, the reader seam, and the
 > fail-closed rules as built.
+>
+> **Current behavior (PR858).** The design-time scope and historical measurements below do not
+> define today's defaults. Unset/null `memory.gpu_layer_budget` and `memory.moe_expert_budget`
+> keep weights device-resident on every model; explicit `auto`/`-1` opts into fit-capacity
+> placement, routed experts before whole layers, and manual `N` remains a hard resident budget.
+> `memory.offload_exec` still defaults to `pcie`. Native Qwen35 MTP `auto` declines to AR
+> after placement resolves a host-mapped routed-expert spill on either execution seam;
+> `--spec mtp` / `speculation.mtp=on` opts in subject to the safety refusal below.
+> Uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled is
+> refused before serving/generation whenever a native MTP head would attach, including
+> resident `auto`. The guard uses tensor metadata, not filenames. `--spec off` /
+> `speculation.mtp=off` and auto-declined spills remain AR; `HIPFIRE_FP16=0` permits
+> explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense remain allowed.
+> Other resident attachment is unchanged; this admission guard does not fix the root WMMA defect.
+> `speculation.dflash=on` still refuses without a DFlash draft, never aliases to MTP.
+> Resident narrow `SpeculativeVerify` retains beta's legacy grouped route; narrow Path1 is
+> restricted to host-mapped routed projections, and the coalesced gfx1201 host-weight narrow
+> kernel remains available. `GPU_MAX_HW_QUEUES` is never set by hipfire; operators may set
+> `1` for reported RDNA4 MTP/PCIe-spill slowdown. Historical performance checkpoints remain
+> author-reported measurements, not validation of these changes.
 
 > **Review ask.** This is a capability that does not currently exist in hipfire. The plan is
 > correctness-first: get models that do not fit in VRAM to *run*, then optimize. Speed is a

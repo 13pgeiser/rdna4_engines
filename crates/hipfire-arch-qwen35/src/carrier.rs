@@ -159,12 +159,9 @@ pub(crate) fn resolve_mtp_head_file(trunk: &std::path::Path) -> Option<MtpHeadLo
 
 /// Resolve partial GPU offload before the first allocation.
 ///
-/// Returns `None` only when the resolved budgets are `Full`/`Full` — an unset
-/// **dense** load, which stays byte-identical to the pre-offload loader: no
-/// measured capacity, no admission, no refusal. A **MoE** resolves to `Auto`
-/// regardless of the knobs ([`effective_offload_budgets`]), so an over-fit MoE
-/// spills instead of OOMing mid-upload; a MoE that already fits is untouched
-/// (every layer resident).
+/// Returns `None` when both budgets are `Full` — the unset default on every
+/// model, including MoE. It stays byte-identical to the pre-offload loader:
+/// no measured capacity, no admission, no refusal.
 ///
 /// With a knob set, the capacity is `free VRAM − KV reservation − prefill floor −
 /// 128 MiB`, the same KV footprint the post-weight path computes, so the
@@ -173,12 +170,10 @@ pub(crate) fn resolve_mtp_head_file(trunk: &std::path::Path) -> Option<MtpHeadLo
 /// Eligibility is `hipfire_config::memory::spill_support` over this load's own
 /// facts (arch 5|6, `ctx.pp`, EP never on this route, the trunk tower-tensor
 /// probe, `config.paged_experts`, `config.reap_keep`) — the same call the
-/// slots twin makes, so the two cannot disagree. An unspillable path with a
-/// *configured* spill was already refused at admission
-/// (`partial_offload_refusal`); here an unspillable path whose effective
-/// budgets are `Auto` only through the MoE unset-default still fails closed
-/// when the model does not fit — `plan` with pinned `Full`/`Full` proves it —
-/// and stays resident when it does.
+/// slots twin makes, so the two cannot disagree. A configured spill on an
+/// unspillable path was already refused at admission (`partial_offload_refusal`).
+/// The defensive unsupported-path arm below permits only a fully resident
+/// placement that fits, otherwise refusing before allocation.
 fn resolve_partial_offload(
     hfq: &HfqFile,
     config: &Qwen35Config,
@@ -198,26 +193,14 @@ fn resolve_partial_offload(
         spill_facts.reap_keep,
         spill_facts.is_vl,
     );
-    let budgets = if support.is_supported() {
-        // A Qwen MoE defaults to auto-fit (its experts usually do not fit);
-        // dense stays opt-in, where unset means all-resident.
-        effective_offload_budgets(config.num_experts != 0)
-    } else {
-        (
-            hipfire_config::memory::gpu_layer_budget(),
-            hipfire_config::memory::moe_expert_budget(),
-        )
-    };
+    let budgets = effective_offload_budgets();
     if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
         return Ok(None);
     }
-    // A spill resolved on a path that cannot honour it: a configured spill
-    // was already refused at admission, so this is the MoE unset-default
-    // (`Auto` only because no key was pinned) on an unspillable path. Fail
-    // closed iff the model does not fit — a pinned `Full`/`Full` plan proves
-    // residency — and stay resident exactly as today when it does. Either
-    // way no second fit search: this reuses `offload::plan` against the same
-    // capacity the placement below would spend.
+    // A configured spill on an unsupported path should already have been
+    // refused at admission. Defensively allow only a pinned Full/Full plan
+    // that fits; otherwise refuse before allocation. This reuses offload::plan
+    // against the same capacity the placement below would spend.
     if let SpillSupport::Refused(refusal) = support {
         return fail_closed_or_resident(hfq, config, ctx, plan, refusal);
     }
@@ -371,13 +354,10 @@ fn placement_capacity_inputs(
     Ok(PlacementCapacity { layer_bytes, inputs })
 }
 
-/// The fail-closed arm for an unspillable path whose effective budgets
-/// resolved off `Full`/`Full` (the MoE unset-default — a configured spill was
-/// already refused at admission). Runs the *pinned* `Full`/`Full` plan
-/// against the same capacity the placement would spend: it fits → stay
-/// resident (`None`, exactly today's load); it does not → refuse, naming the
-/// path that cannot spill, the reason, and the knob. Never a mid-load OOM,
-/// never a refusal of a load that fits.
+/// Defensive arm for a configured spill on an unspillable path. Admission
+/// normally refuses it before reaching this loader. Runs the pinned `Full`/`Full`
+/// plan against the same capacity the placement would spend: if it fits, stay
+/// resident; otherwise refuse, naming the unsupported path and the knob.
 fn fail_closed_or_resident(
     hfq: &HfqFile,
     config: &Qwen35Config,

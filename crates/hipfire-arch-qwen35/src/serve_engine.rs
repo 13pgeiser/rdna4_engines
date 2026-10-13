@@ -646,11 +646,10 @@ impl Rig {
     /// makes, over this route's own facts (arch 5|6, tp/pp 1 by the slot
     /// capability gate, EP never, `cfg.is_vl` / `cfg.vl_path` for the tower,
     /// `config.paged_experts`, `config.reap_keep`) — the two twins share one
-    /// truth table including the VL term, so VL no longer auto-fits here.
+    /// truth table including the VL term. Unset budgets stay fully resident.
     /// A configured spill on an unspillable path was already refused at
-    /// admission; an unspillable MoE unset-default that does not fit fails
-    /// closed through the shared `carrier::unspillable_no_fit_refusal`
-    /// sentence instead of OOMing mid-load, and stays resident when it fits.
+    /// admission; the defensive arm below permits only a fully resident
+    /// placement that fits, otherwise refusing before allocation.
     fn resolve_slot_offload(
         layer_bytes: &hipfire_runtime::offload::LayerBytes,
         config: &crate::qwen35::Qwen35Config,
@@ -678,26 +677,16 @@ impl Rig {
             config.reap_keep.is_some(),
             is_vl,
         );
-        let budgets = if support.is_supported() {
-            // A Qwen MoE defaults to auto-fit; dense stays opt-in (all-resident).
-            effective_offload_budgets(config.num_experts != 0)
-        } else {
-            (
-                hipfire_config::memory::gpu_layer_budget(),
-                hipfire_config::memory::moe_expert_budget(),
-            )
-        };
+        let budgets = effective_offload_budgets();
         if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
             return Ok(offload::Placement::all_device(config.n_layers));
         }
         if let hipfire_config::memory::SpillSupport::Refused(refusal) = support {
-            // Same fail-closed arm as the sequential twin: the MoE
-            // unset-default on an unspillable path (a configured spill was
-            // already refused at admission). The slots capacity is this
-            // route's own KV footprint plus the shared prefill floor, draft
-            // reserve and slack; a pinned `Full`/`Full` plan that fits stays
-            // resident, one that does not refuses with the named reason —
-            // reusing `offload::plan`, never a second fit search.
+            // Same defensive arm as the sequential twin: admission should have
+            // refused a configured spill on this unsupported path. The slots
+            // capacity includes this route's KV footprint, shared prefill floor,
+            // draft reserve and slack. A pinned Full/Full plan that fits stays
+            // resident; otherwise refuse, reusing offload::plan.
             let pbs_reservation =
                 crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &gpu.arch);
             let mtp_head: Option<crate::carrier::MtpHeadLocation> = if cfg.mtp_k > 0 {
@@ -1289,6 +1278,24 @@ impl Rig {
             },
             None => None,
         };
+        // DFlash has precedence; only refuse a head that would actually serve
+        // native MTP. A spill auto-decline or missing head remains AR.
+        if mtp_head.is_some() && dflash.is_none() {
+            if let Some(reason) = crate::qwen35::weights::native_mtp_refusal(
+                &weights.layers,
+                &gpu.arch,
+                gpu.flags.fp16_disabled,
+            ) {
+                if let Some(head) = mtp_head {
+                    head.free_gpu(&mut gpu);
+                }
+                if let Some(vw) = vision_weights {
+                    vw.free_gpu(&mut gpu);
+                }
+                weights.free_gpu(&mut gpu);
+                return Err(reason.to_string());
+            }
+        }
 
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
