@@ -134,6 +134,24 @@ fn qwen35_gfx11_vmm_supported(
         && matches!(v, VMode::Q8 | VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4)
 }
 
+/// An FWHT K override of the Q8/default mode has no certified gfx1151 VMM path.
+fn qwen35_gfx1151_fwht_k_override(
+    gpu_arch: &str,
+    arch_id: u32,
+    mode_raw: &str,
+    k_raw: Option<&str>,
+) -> bool {
+    gpu_arch == "gfx1151"
+        && matches!(arch_id, 5 | 6)
+        && matches!(mode_raw.trim(), "" | "auto" | "q8")
+        && k_raw.is_some_and(|raw| {
+            matches!(
+                hipfire_runtime::kv_mode::parse_qwen_k_name(raw),
+                Ok(KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            )
+        })
+}
+
 #[derive(Clone, Copy)]
 pub struct KvBackendHints<'a> {
     pub kv_mode: Option<&'a str>,
@@ -1422,6 +1440,24 @@ pub fn admit_source_with_options(
     };
     let is_dir = source.is_dir();
 
+    // Refuse before backend selection or sequence budgeting, even without VMM
+    // runtime/platform support; only an explicit legacy request opts out.
+    if request != KvBackendRequest::Explicit(KvBackend::Legacy)
+        && qwen35_gfx1151_fwht_k_override(
+            gpu_arch,
+            arch_id,
+            hints
+                .kv_mode
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.as_str()),
+            hints.kv_k,
+        )
+    {
+        return Err(
+            "Qwen KV admission: no certified gfx1151 VMM FWHT path for the kv_k override; use --kv-backend legacy"
+                .into(),
+        );
+    }
+
     // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
     // gfx11 WMMA intrinsic hipcc rejects on gfx12). Refuse here — before the
     // topology branch and any allocation — so the prior model stays loaded.
@@ -1973,6 +2009,42 @@ mod tests {
         assert!(qwen35_gfx11_vmm_supported(
             "gfx1100", 5, 1, "fwht4", None, None
         ));
+    }
+
+    #[test]
+    fn gfx1151_fwht_k_override_predicate_is_scoped() {
+        let refuses = qwen35_gfx1151_fwht_k_override;
+        for mode in ["", "auto", "q8", " q8 "] {
+            for k in [
+                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2",
+                "turbo3", "turbo4", "turbo", " fwht3 ",
+            ] {
+                for arch_id in [5, 6] {
+                    assert!(refuses("gfx1151", arch_id, mode, Some(k)));
+                    for arch in ["gfx1100", "gfx1201", "gfx1030"] {
+                        assert!(!refuses(arch, arch_id, mode, Some(k)));
+                    }
+                }
+                assert!(!refuses("gfx1151", 9, mode, Some(k)));
+            }
+            for k in [
+                None,
+                Some(""),
+                Some(" "),
+                Some("q8"),
+                Some("legacy-asym2"),
+                Some("legacy-asym3"),
+                Some("legacy-asym4"),
+                Some("fwht5"),
+            ] {
+                for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+                    assert!(!refuses(arch, 5, mode, k));
+                }
+            }
+        }
+        for mode in ["fwht2", "fwht3", "fwht4", "legacy-asym3", "fp8", "bf16"] {
+            assert!(!refuses("gfx1151", 5, mode, Some("fwht3")));
+        }
     }
     fn admit_source(
         path: &str,
@@ -2797,6 +2869,86 @@ mod tests {
             // touched — not first discovered by the carrier.
             let err = admit("q8", Some("lloyd3")).unwrap_err();
             assert!(err.contains("Lloyd V"), "{err}");
+            cleanup(&trunk);
+        }
+        /// gfx1151 FWHT K overrides refuse without silently falling back.
+        /// Explicit legacy and mode-only FWHT fallback remain available.
+        #[test]
+        fn gfx1151_fwht_k_override_refuses_instead_of_legacy_fallback() {
+            let trunk = write_hfq("kv-axis-refusal", 5, false);
+            let path = trunk.to_str().unwrap();
+            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available| {
+                super::super::admit_source(
+                    path,
+                    1,
+                    1,
+                    request,
+                    None,
+                    arch,
+                    None,
+                    "auto",
+                    None,
+                    4096,
+                    KvBackendHints {
+                        kv_mode,
+                        kv_k,
+                        kv_v: None,
+                        qwen_default_q8: true,
+                        kv_adaptive: None,
+                        cask: None,
+                        deepseek4_heterogeneous: false,
+                        vmm_runtime_available,
+                        free_vram_bytes: None,
+                    },
+                )
+            };
+            let auto = KvBackendRequest::Automatic;
+            for k in ["fwht2", "fwht3", "fwht4"] {
+                for mode in [None, Some("auto"), Some("q8")] {
+                    for runtime_available in [true, false] {
+                        for request in [auto, KvBackendRequest::Explicit(KvBackend::Vmm)] {
+                            let err = admit(request, "gfx1151", mode, Some(k), runtime_available)
+                                .map(|_| ())
+                                .unwrap_err();
+                            assert!(
+                                err.contains("no certified gfx1151 VMM FWHT path")
+                                    && err.contains("--kv-backend legacy"),
+                                "{err}"
+                            );
+                        }
+                        let legacy = admit(
+                            KvBackendRequest::Explicit(KvBackend::Legacy),
+                            "gfx1151",
+                            mode,
+                            Some(k),
+                            runtime_available,
+                        )
+                        .unwrap();
+                        assert_eq!(legacy.kv_backend, KvBackend::Legacy);
+                        assert!(legacy.kv_backend_reason.is_none());
+                    }
+                }
+                let gfx1100 = admit(auto, "gfx1100", Some("q8"), Some(k), true).unwrap();
+                assert_eq!(gfx1100.kv_backend, KvBackend::Vmm);
+                assert!(gfx1100.kv_backend_reason.is_none());
+            }
+            let mode_spelling = admit(auto, "gfx1151", Some("fwht3"), None, true).unwrap();
+            assert_eq!(mode_spelling.kv_backend, KvBackend::Legacy);
+            assert!(mode_spelling
+                .kv_backend_reason
+                .unwrap()
+                .contains("no certified VMM KV path"));
+            let default = admit(auto, "gfx1151", Some("q8"), None, true).unwrap();
+            assert_eq!(default.kv_backend, KvBackend::Vmm);
+            let unavailable = admit(auto, "gfx1151", Some("q8"), None, false).unwrap();
+            assert_eq!(unavailable.kv_backend, KvBackend::Legacy);
+            assert!(unavailable
+                .kv_backend_reason
+                .unwrap()
+                .contains("HIP VMM symbols/granularity unavailable"));
+            let gfx1201 = admit(auto, "gfx1201", Some("q8"), Some("fwht3"), true).unwrap();
+            assert_eq!(gfx1201.kv_backend, KvBackend::Vmm);
+            assert!(gfx1201.kv_backend_reason.is_none());
             cleanup(&trunk);
         }
         #[test]

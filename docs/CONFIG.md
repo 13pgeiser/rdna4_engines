@@ -472,8 +472,17 @@ modes, adaptive, and native `fp8`/`bf16`. Otherwise it falls back to
 Absolute HFQ/safetensors paths and registry tags resolve identically for
 the same source/mode/topology; registry cards set neither backend nor
 `memory.max_seq`, but may still set `generation.max_tokens`. On
-gfx1100/gfx1151 the certified Qwen VMM route is q8 only; unvalidated modes
-retain the existing legacy fallback.
+gfx1100/gfx1151 the certified Qwen3.5-family VMM KV pairs are Q8/Q8 and, on
+exact gfx1100 TP1 only, FWHT2/3/4 K with Q8 or Lloyd2/3/4 V. Existing
+pipeline-parallel VMM restrictions still apply. Unsupported combinations
+retain the existing legacy fallback,
+except on gfx1151 Qwen3.5-family loads (arch 5/6): a nonempty `kv_k` override
+selecting FWHT2/3/4 (including typed aliases) with an unset/`auto`/`q8` mode
+is refused unless `--kv-backend legacy` is explicit. There is no certified
+gfx1151 VMM FWHT path, so this refusal also applies when VMM runtime or
+platform support is unavailable. `kv_mode = "fwht3"` without a K override
+retains the ordinary automatic legacy fallback; gfx1100 TP/Givens fallback,
+gfx1201 selection and defaults are unchanged.
 
 Qwen4 (Flash-Next, arch 16) owns its own QSA context layout. Automatic
 selects **vmm** exactly on gfx1151 or gfx1201 with a certified platform (not Windows,
