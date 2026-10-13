@@ -463,8 +463,10 @@ impl SlotBackend {
         // registered in hipfire-config as serve.max_queue /
         // serve.max_queue_bytes / serve.queue_timeout_ms with env
         // HIPFIRE_SERVE_MAX_QUEUE / HIPFIRE_SERVE_MAX_QUEUE_BYTES /
-        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults 64 / 256 MiB / 30000 ms
-        // (the registered config defaults). The CLI startup guard rejects
+        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults are the registered
+        // `DefaultValue::Integer` entries in hipfire-config's field table:
+        // serve.max_queue = 64, serve.max_queue_bytes = 268435456 (256 MiB),
+        // serve.queue_timeout_ms = 600000 (10 min). The CLI startup guard rejects
         // serve.max_queue=0 for multi-slot; Rig::build also refuses
         // WaitQueue::new(0, _) as a backstop.
         let wait_max_count = hipfire_config::active_or_local_process_config()
