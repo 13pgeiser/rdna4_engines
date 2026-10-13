@@ -2882,9 +2882,18 @@ impl Gpu {
             &[grouped_rows, m, if bf16_out { 2 } else { 4 }],
             "gemm_mq4g128v2_moe_grouped_wmma_gfx1151 grouped rows",
         )?;
-        // gfx1151: eight row tiles per workgroup share X through LDS (bitwise
-        // the per-wave kernel); M % 128 == 0 on this route's shapes.
-        let x8 = bf16_out && self.arch_caps.is_gfx1151() && m.is_multiple_of(128);
+        // gfx1151 (`HIPFIRE_QWEN4_MOE_X_LDS`, default `auto`): eight row
+        // tiles per workgroup share X through LDS (bitwise the per-wave
+        // kernel); M % 128 == 0 on this route's shapes. This launcher is the
+        // F16 WMMA MoE route's down GEMM: the Qwen4 prefill dispatch reaches it
+        // only when the layer's symmetric IU4 arm is not selected.
+        let x8 = bf16_out
+            && crate::gemm::qwen4_moe_x_lds_armed(
+                *crate::gemm::QWEN4_MOE_X_LDS,
+                self.arch_caps.is_gfx1151(),
+                false,
+            )
+            && m.is_multiple_of(128);
         let func = match (x8, bf16_out) {
             (true, _) => "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out",
             (false, true) => "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out",

@@ -189,6 +189,44 @@ pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
+/// `HIPFIRE_QWEN4_MOE_X_LDS` (`auto` | `1` | `0`, default `auto`): on exact
+/// gfx1151 the F16 WMMA grouped MoE gate/up SiLU and down GEMMs take the
+/// entries whose row-tile waves share each expert run's X through LDS
+/// (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4`,
+/// `gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out`), bitwise the
+/// per-wave entries. See [`qwen4_moe_x_lds_armed`].  Read once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4MoeXLds {
+    /// Unset, `auto` or any other value: armed where the F16 WMMA MoE route runs.
+    Auto,
+    /// `1`: forced wherever admissible (exact gfx1151, F16 WMMA MoE route).
+    On,
+    /// `0`: the kill switch; the per-wave entries everywhere.
+    Off,
+}
+
+impl Qwen4MoeXLds {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("1") => Self::On,
+            Some("0") => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
+pub(crate) static QWEN4_MOE_X_LDS: std::sync::LazyLock<Qwen4MoeXLds> = std::sync::LazyLock::new(|| {
+    Qwen4MoeXLds::parse(hipfire_config::process_value("HIPFIRE_QWEN4_MOE_X_LDS").as_deref())
+});
+
+/// Whether a Qwen4 grouped MoE GEMM takes the X-LDS entry. The entries exist
+/// for the F16 WMMA MoE route on exact gfx1151 only, so `auto` and `1` arm
+/// exactly when that route runs: a layer whose symmetric IU4 arm is selected
+/// (`HIPFIRE_QWEN4_MOE_SYM_IU4`, verified-symmetric experts) never reaches
+/// them, and other architectures keep the per-wave entries.
+pub(crate) fn qwen4_moe_x_lds_armed(mode: Qwen4MoeXLds, exact_gfx1151: bool, sym_iu4_selected: bool) -> bool {
+    mode != Qwen4MoeXLds::Off && exact_gfx1151 && !sym_iu4_selected
+}
 /// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
 static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_DOWN_EPI", false)
@@ -46549,9 +46587,14 @@ impl Gpu {
             ));
         }
         crate::moe::require_span(y_grouped, &[grouped_rows, m / 2, 2], "gemm_mq4g256v2_moe_grouped_top10_silu_bf16out grouped rows")?;
-        // gfx1151: four row tiles per workgroup share each multi-tile run's X
-        // through LDS (bitwise the per-wave entry).
-        let x4 = self.arch_caps.is_gfx1151() && m.is_multiple_of(64) && k.is_multiple_of(256);
+        // gfx1151 (`HIPFIRE_QWEN4_MOE_X_LDS`, default `auto`): four row tiles
+        // per workgroup share each multi-tile run's X through LDS (bitwise the
+        // per-wave entry). This launcher is the F16 WMMA MoE route's gate/up:
+        // the Qwen4 prefill dispatch reaches it only when the layer's
+        // symmetric IU4 arm is not selected.
+        let x4 = qwen4_moe_x_lds_armed(*QWEN4_MOE_X_LDS, self.arch_caps.is_gfx1151(), false)
+            && m.is_multiple_of(64)
+            && k.is_multiple_of(256);
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -47754,6 +47797,33 @@ mod tests {
             registered.source(),
             kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
         );
+    }
+
+    #[test]
+    fn qwen4_moe_x_lds_parses_auto_on_off() {
+        assert_eq!(Qwen4MoeXLds::parse(None), Qwen4MoeXLds::Auto);
+        assert_eq!(Qwen4MoeXLds::parse(Some("auto")), Qwen4MoeXLds::Auto);
+        assert_eq!(Qwen4MoeXLds::parse(Some("1")), Qwen4MoeXLds::On);
+        assert_eq!(Qwen4MoeXLds::parse(Some("0")), Qwen4MoeXLds::Off);
+    }
+
+    #[test]
+    fn qwen4_moe_x_lds_auto_arms_only_on_the_gfx1151_f16_route() {
+        use Qwen4MoeXLds::{Auto, Off, On};
+        // IU4 selected (the GPTQ3 default on gfx1151): off.
+        assert!(!qwen4_moe_x_lds_armed(Auto, true, true));
+        // IU4 not selected (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, asymmetric experts) on gfx1151: on.
+        assert!(qwen4_moe_x_lds_armed(Auto, true, false));
+        // Any other arch: off, IU4 or not.
+        assert!(!qwen4_moe_x_lds_armed(Auto, false, false));
+        assert!(!qwen4_moe_x_lds_armed(Auto, false, true));
+        // `0` is the kill switch.
+        assert!(!qwen4_moe_x_lds_armed(Off, true, false));
+        assert!(!qwen4_moe_x_lds_armed(Off, true, true));
+        // `1` forces it where admissible, and only there.
+        assert!(qwen4_moe_x_lds_armed(On, true, false));
+        assert!(!qwen4_moe_x_lds_armed(On, true, true));
+        assert!(!qwen4_moe_x_lds_armed(On, false, false));
     }
 
     #[test]

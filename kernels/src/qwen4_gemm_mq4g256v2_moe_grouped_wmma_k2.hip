@@ -138,11 +138,6 @@ static __device__ __forceinline__ float moe_bf16_round_trip(float v) {
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
 }
 
-template <int NT, bool OUT_BF16, bool SILU>
-__device__ __forceinline__ void moe_grouped_wmma_k2_store(
-    const float8_t* acc, void* __restrict__ Y_grouped, int M, int m_total, int tid,
-    int row_start, int slot_start, int nlive);
-
 template <int NT, bool OUT_BF16, bool SILU = false>
 __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
     const char* __restrict__ A, const int* __restrict__ sorted_slot_index,
@@ -203,18 +198,10 @@ __device__ __forceinline__ void moe_grouped_wmma_k2_tiles(
             asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
         }
     }
-    moe_grouped_wmma_k2_store<NT, OUT_BF16, SILU>(acc, Y_grouped, M, m_total, tid, row_start, slot_start, nlive);
-}
-
-// Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
-// cross-half swap gives the low lane rows 0..7 and the high lane rows 8..15
-// of its column, stored as one 16-byte BF16 run (or two 16-byte F32 runs)
-// instead of eight scattered 2-byte stores.  `tid` is the lane in the wave.
-template <int NT, bool OUT_BF16, bool SILU>
-__device__ __forceinline__ void moe_grouped_wmma_k2_store(
-    const float8_t* acc, void* __restrict__ Y_grouped, int M, int m_total, int tid,
-    int row_start, int slot_start, int nlive) {
-    const int lane = tid & 15;
+    // Lane l < 16 holds rows 2j of column l, lane l + 16 rows 2j + 1.  One
+    // cross-half swap gives the low lane rows 0..7 and the high lane rows
+    // 8..15 of its column, stored as one 16-byte BF16 run (or two 16-byte
+    // F32 runs) instead of eight scattered 2-byte stores.
     const int hi = tid >> 4;
 #pragma unroll
     for (int t = 0; t < NT; t++) {
@@ -450,6 +437,80 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out(MOE_W
 #undef MOE_WMMA_ARGS
 
 #if defined(__gfx1151__)
+// The per-wave store of moe_grouped_wmma_k2_tiles (a copy, so the per-wave
+// entries' code is unchanged on every arch: sharing one helper changed their
+// ISA on gfx1100 and gfx1151; examples/qwen4_moe_f16_lds_oracle.rs checks the
+// two bytewise).  Lane l < 16 holds rows 2j of column l, lane l + 16 rows
+// 2j + 1; one cross-half swap gives the low lane rows 0..7 and the high lane
+// rows 8..15 of its column.  `tid` is the lane in the wave.
+template <int NT, bool OUT_BF16, bool SILU>
+__device__ __forceinline__ void moe_grouped_wmma_k2_store(
+    const float8_t* acc, void* __restrict__ Y_grouped, int M, int m_total, int tid,
+    int row_start, int slot_start, int nlive) {
+    const int lane = tid & 15;
+    const int hi = tid >> 4;
+#pragma unroll
+    for (int t = 0; t < NT; t++) {
+        float r[8];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const float give = hi ? acc[t][i] : acc[t][4 + i];
+            const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+            const float own = hi ? acc[t][4 + i] : acc[t][i];
+            r[2 * i] = hi ? got : own;
+            r[2 * i + 1] = hi ? own : got;
+        }
+        const int out_col = slot_start + 16 * t + lane;
+        if (SILU) {
+            // Low lane: gate columns 0..7 of the block; high lane: up.  One
+            // more swap gives each half four (gate, up) pairs.
+            float h[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const float give = hi ? r[i] : r[4 + i];
+                const float got = __int_as_float(__builtin_amdgcn_permlanex16(
+                    __float_as_int(give), __float_as_int(give), 0x76543210u, 0xfedcba98u, false, false));
+                const float g = hi ? got : r[i];
+                const float u = hi ? r[4 + i] : got;
+                const float v = __uint_as_float((unsigned int)moe_bf16_bits(g) << 16);
+                const float w = __uint_as_float((unsigned int)moe_bf16_bits(u) << 16);
+                h[i] = moe_bf16_round_trip((v / (1.0f + expf(-v))) * w);
+            }
+            if (t >= nlive || out_col >= m_total) continue;
+            uint2 o;
+            o.x = (__float_as_uint(h[0]) >> 16) | (__float_as_uint(h[1]) & 0xFFFF0000u);
+            o.y = (__float_as_uint(h[2]) >> 16) | (__float_as_uint(h[3]) & 0xFFFF0000u);
+            *(uint2*)((unsigned short*)Y_grouped + (long long)out_col * (M / 2) + row_start / 2 + 4 * hi) = o;
+            continue;
+        }
+        if (t >= nlive) continue;
+        const int row0 = row_start + 8 * hi;
+        if (out_col >= m_total || row0 >= M) continue;
+        const long long o = (long long)out_col * M + row0;
+        if (row0 + 8 > M) {
+            for (int i = 0; row0 + i < M; i++) {
+                if (OUT_BF16)
+                    ((unsigned short*)Y_grouped)[o + i] = moe_bf16_bits(r[i]);
+                else
+                    ((float*)Y_grouped)[o + i] = r[i];
+            }
+        } else {
+            if (OUT_BF16) {
+                uint4 w;
+                w.x = moe_bf16_bits(r[0]) | ((unsigned)moe_bf16_bits(r[1]) << 16);
+                w.y = moe_bf16_bits(r[2]) | ((unsigned)moe_bf16_bits(r[3]) << 16);
+                w.z = moe_bf16_bits(r[4]) | ((unsigned)moe_bf16_bits(r[5]) << 16);
+                w.w = moe_bf16_bits(r[6]) | ((unsigned)moe_bf16_bits(r[7]) << 16);
+                *(uint4*)((unsigned short*)Y_grouped + o) = w;
+            } else {
+                *(float4*)((float*)Y_grouped + o) = make_float4(r[0], r[1], r[2], r[3]);
+                *(float4*)((float*)Y_grouped + o + 4) = make_float4(r[4], r[5], r[6], r[7]);
+            }
+        }
+    }
+}
+
 // Four row-tile waves (64 A rows) of one expert run share its X through
 // LDS, 64 K at a time: the per-wave entries re-read every tile's X from L2 in
 // each of M/16 waves.  Each wave stages its own 16 rows' current group
