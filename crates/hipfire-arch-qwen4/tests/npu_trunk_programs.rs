@@ -107,7 +107,7 @@ fn bf16_direct_builds_with_sidecar_byte_totals() {
             let p = progs.get(shape);
             let sizes = [4 * waves * 40 * 4608, 8 * 40 * 2 * 5504, 8 * waves * 4 * 20480];
             assert_eq!(p.arg_bytes, sizes);
-            assert_eq!(p.design.epilogue(), Some(pm_npu::kernels::gemm_core::Epilogue::Bf16));
+            assert_eq!(p.design.epilogue(), Some(peacemaker_npu::kernels::gemm_core::Epilogue::Bf16));
             assert_eq!(p.host_bytes_read, (sizes[0] + sizes[1]) as u64);
             assert_eq!(p.host_bytes_written, sizes[2] as u64);
         }
@@ -190,7 +190,7 @@ fn out_programs_are_k6144_n512_with_their_own_pdi() {
             assert_eq!((p.shape, p.panel_count, p.padded_cols), (shape, 5, OUT_COLS));
             assert_eq!(p.arg_bytes, args, "rows {rows} {shape}");
             assert_eq!((p.host_bytes_read, p.host_bytes_written), ((args[0] + args[1]) as u64, (waves * 512 * OUT_PANEL_COLS * 2) as u64)); // one panel's BF16 columns per submit
-            assert_eq!(p.design.epilogue(), Some(pm_npu::kernels::gemm_core::Epilogue::Bf16));
+            assert_eq!(p.design.epilogue(), Some(peacemaker_npu::kernels::gemm_core::Epilogue::Bf16));
             assert_eq!(p.design.waves(), waves);
         }
         assert_eq!(progs.get(Shape::GdnOut).design.pdi, progs.get(Shape::QsaO).design.pdi);

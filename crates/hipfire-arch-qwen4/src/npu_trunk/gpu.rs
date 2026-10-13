@@ -31,7 +31,7 @@ impl ColumnMap {
 mod tests {
     use super::*;
     use crate::npu_trunk::{Shape,FamilyMask};
-    use pm_npu::kernels::{gemm_g80::{bf16_output_offset,design_g80},gemm_core::{Epilogue,Control}};
+    use peacemaker_npu::kernels::{gemm_g80::{bf16_output_offset,design_g80},gemm_core::{Epilogue,Control}};
     #[test]
     fn bf16_tile_offset_matches_native_unpack_and_is_bijective(){
         for p in [256usize,512,768] {

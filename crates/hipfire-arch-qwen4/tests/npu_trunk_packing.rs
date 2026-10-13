@@ -15,7 +15,7 @@
 //! decoder (field `j` = bits `6j..6j+6` of the little-endian 192 B payload), so the oracle is not tied
 //! to the shift/mask layout the packer under test may share with the lab code.
 //!
-//! The panel byte layout is owned by `pm-npu` `Geometry::pack_b` and is not re-derived here; panel
+//! The panel byte layout is owned by `peacemaker-npu` `Geometry::pack_b` and is not re-derived here; panel
 //! tests check structure, determinism and the `ws` vector only.
 
 
@@ -518,7 +518,7 @@ fn parts_of(map: &hipfire_arch_qwen4::npu_trunk::ColumnMap) -> Vec<(u32, u32)> {
 
 /// Oracle W8 row scale rounded up to the direct-BF16 grid15 scale `Sm * 2^Se` (what the packer stores in `ws`).
 fn grid_ws(raw: f32) -> f32 {
-    let (sm, se) = pm_npu::kernels::w8a8_epi::grid15_up(raw);
+    let (sm, se) = peacemaker_npu::kernels::w8a8_epi::grid15_up(raw);
     (f64::from(sm) * 2f64.powi(i32::from(se))) as f32
 }
 
@@ -574,7 +574,7 @@ fn pack_shape_full_mask_matches_oracle_ws_and_structure() {
         assert_eq!(direct.scales.len(), map.padded_cols());
         for (&rounded, &(sm, se)) in direct.ws.iter().zip(&direct.scales) {
             assert_eq!(rounded, (f64::from(sm) * 2f64.powi(i32::from(se))) as f32);
-            assert_eq!((sm, se), pm_npu::kernels::w8a8_epi::grid15_up(rounded));
+            assert_eq!((sm, se), peacemaker_npu::kernels::w8a8_epi::grid15_up(rounded));
         }
     }
 }

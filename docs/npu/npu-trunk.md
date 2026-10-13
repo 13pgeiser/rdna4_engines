@@ -1,7 +1,7 @@
 # Flash-Next NPU trunk: CPU preparation
 
 The Qwen4 `npu_trunk` module owns CPU-only model preparation for hipfire 0.4.2;
-`pm-npu` owns the numerical reference, panel layout and deployment builder.
+`peacemaker-npu` owns the numerical reference, panel layout and deployment builder.
 Neither preparation path opens hardware or schedules prefill.
 
 `NpuTrunkMode::from_env()` borrows the central process snapshot for
@@ -38,14 +38,14 @@ directly. `PackedB::ws` contains the padded fused scales.
 
 The only contract is `EpilogueContract::Bf16Direct` (`as_str` "bf16_direct"; the `I32Fold` contract and its
 GPU fold were removed: no int32 partial, combine or fold exists in the product route). The ordinary pack
-functions use it: `Bf16Direct` rounds each raw weight scale upward with `pm-npu`'s public `grid15_up`,
+functions use it: `Bf16Direct` rounds each raw weight scale upward with `peacemaker-npu`'s public `grid15_up`,
 quantizes with that exact grid scale, and returns padded `(Sm,Se)` sidecars in `PackedB::scales` as well
 as embedding them in each packed panel; `PackedB::ws` holds the grid scale as f32.
 
 ## Programs
 
 `build_programs(contract, rows_max)` selects one G80 direct-BF16/Fast
-design per shape, via `pm-npu::kernels::gemm_g80::build_panel_program`.
+design per shape, via `peacemaker-npu::kernels::gemm_g80::build_panel_program`.
 M is rounded up to 256, N=1280, K=2560; `rows_max` must be 1..=65536.
 `build_programs_for_families` uses the same compacted maps as weight packing.
 Each shape record reports panel count, padded width, per-submit A/B/C argument
@@ -108,7 +108,7 @@ Repeating sidecars is the explicit traffic tradeoff for retaining the existing
 input ring machinery; pair-stage serialization makes the resident panel fit.
 
 `npu-gemm M 1280 K --variant G80 --epi bf16` supplies deterministic grid
-scales and compares checked outputs to `pm-npu::kernels::w8a8_epi::bf16_direct`.
+scales and compares checked outputs to `peacemaker-npu::kernels::w8a8_epi::bf16_direct`.
 No silicon claim: new arithmetic, DMA layout and simulator timings require
 hardware validation before enabling serving. The int8/I32 PDI/TXN hashes for
 M256/M8192, N1280, K2560, Fast/Slow are pinned in `golden_bytes.rs` to the

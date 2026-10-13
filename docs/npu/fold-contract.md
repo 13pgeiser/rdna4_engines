@@ -81,7 +81,7 @@ Full requested tables [`numeric-tables.md`](../tools/fold-model/numeric-tables.m
 
 ## 6. Candidate AIE/GPU costs
 
-Slot lower bounds are **estimates/instruction census**, not NPU IEF measurements.16-lane issue model `crates/pm-npu/src/kernels/iu4_fold_model.rs:7-46`; measured GEMM.331cycles/output/epoch (`docs/dense27b.md:90-100`), nativeVMACfloor.25. Vecslot competes with GEMM; apparent.081slack is not automatically free.
+Slot lower bounds are **estimates/instruction census**, not NPU IEF measurements.16-lane issue model `crates/peacemaker-npu/src/kernels/iu4_fold_model.rs:7-46`; measured GEMM.331cycles/output/epoch (`docs/dense27b.md:90-100`), nativeVMACfloor.25. Vecslot competes with GEMM; apparent.081slack is not automatically free.
 
 | Contract | AIE2P additional work per16outputs/epoch | GPU gfx1151 / gfx1201 cost | Rank |
 |---|---|---|---|
@@ -132,7 +132,7 @@ Main orchestrates; reviewers own final admission. OriginalG0/G1 are killed. No p
 
 ### M0 — cheapest NPU arithmetic/rate kill gate
 
-Owner:NPUfoldcomposer. New `crates/pm-npu/src/kernels/iu4_ief15.rs`, module registration, new scoped `crates/pm-npu/tests/iu4_ief15.rs`, `npu-gemm` explicitIEFprobe. Reuse QT44/72BA4decoders `crates/pm-npu/src/kernels/iu4.rs:36-110`, schedule/emitter `gemm_core.rs:74-115,393-437,785-820`, slotmodel `iu4_fold_model.rs:7-46`. IncumbentV8/V9/G80 untouched.
+Owner:NPUfoldcomposer. New `crates/peacemaker-npu/src/kernels/iu4_ief15.rs`, module registration, new scoped `crates/peacemaker-npu/tests/iu4_ief15.rs`, `npu-gemm` explicitIEFprobe. Reuse QT44/72BA4decoders `crates/peacemaker-npu/src/kernels/iu4.rs:36-110`, schedule/emitter `gemm_core.rs:74-115,393-437,785-820`, slotmodel `iu4_fold_model.rs:7-46`. IncumbentV8/V9/G80 untouched.
 
 Frozen API: `Ief15Gemm::new(tokens:usize,features:usize,k:usize,ctl:Control)->Result<Self,String>`; `pack_in(&self,w:&Weights<'_>,x:&Acts<'_>,s:&[u16],a:&[i16],d:&[u16],b:&[i16])->Result<[Vec<u8>;2],String>`; `reference` samearguments->`Vec<u8>` LEf32. OwnedArrayDesignuses existing `append_run_body`/`append_lean_run_body` transactionAPI (`docs/npu/railgun-npu.md:107-108`); exportnewwavegeometry, neverassumeV9. Kernelfold:twoK64GEMMchunks ->C32;VMULS15D15->acc64,VSRS0->signedP32,VMAC32×signedC16->I64. Cconversion is lossless [-7168,8192], not saturating. Finalvariable normalization is compare/select plus fixedshifts; AIE has novectorclz/lanevariableshift. C scratch becomes finalf32output onlyafterallreadsretire.
 

@@ -6,10 +6,10 @@
 //! A shape needs `panel_count` submits per row block; the program is independent of the panel (B is an argument).
 //! Row-major programs differ only in their fused C row pitch; native-tile programs share a design.
 
-use pm_npu::kernels::gemm_array::ArrayDesign;
-use pm_npu::kernels::gemm_core::Epilogue;
-use pm_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
-use pm_npu::kernels::gemm_g80_n512::build_panel_program_out;
+use peacemaker_npu::kernels::gemm_array::ArrayDesign;
+use peacemaker_npu::kernels::gemm_core::Epilogue;
+use peacemaker_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
+use peacemaker_npu::kernels::gemm_g80_n512::build_panel_program_out;
 
 use super::shapes::{EpilogueContract, FamilyMask, Shape, OUT_COLS};
 

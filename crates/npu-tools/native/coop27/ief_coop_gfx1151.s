@@ -3,7 +3,7 @@
 ; Wave32. Host pages shared with the NPU (userptr BO + hipHostRegister) are stored glc slc dlc and loaded glc dlc.
 ;
 ; ief_db    kernarg 32 B: xq u64 @0, dc u64 @8, bc u64 @16, T u32 @24, E u32 @28. Block 256, grid T/256 (E % 4 == 0).
-;           IEF15 activation sidecars of fold-contract §3 / pm_npu iu4_ief15::encode_act_scales, one lane per token t:
+;           IEF15 activation sidecars of fold-contract §3 / peacemaker_npu iu4_ief15::encode_act_scales, one lane per token t:
 ;           max = max_e |d(t,e)| (bit compare), b = smallest exponent with RNE(max * 2^-b) <= 32767 (exponent bits, no
 ;           log2), D(e,t) = RNE(d(t,e) * 2^-b) (v_ldexp + v_rndne: exact, the product is < 2^15 or rounds to 0).
 ;           dc: u16 [E][T]; bc: i16 [T]. All-zero tokens: b = 0, D = 0.

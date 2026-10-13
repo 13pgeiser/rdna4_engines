@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
 use npu_tools::coop_gpu;
-use pm_npu::kernels::{gemm_g80, gemm_g80_n512, w8a8_epi::bf16_direct};
+use peacemaker_npu::kernels::{gemm_g80, gemm_g80_n512, w8a8_epi::bf16_direct};
 use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, OpenOptions, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG, OUT_PANEL_K, OUT_PANEL_N, PANEL_K, PANEL_N}, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 const ROWS: usize = 8192;
@@ -290,7 +290,7 @@ fn class_reference(kdim: usize, panel: usize, round: usize) -> Vec<u16> {
 struct Side<'d> { ctx: HwCtx<'d>, _pdi: Bo, insts: Bo, bos: Vec<Bo>, cmd: Bo, rows: usize, pitch: usize, pn: usize, kdim: usize }
 
 /// Create + configure one context for `design` (K-deep periodic operands, panel 0): `(side, create_ms, config_cu_ms)`.
-fn side<'d>(dev: &'d Device, design: &pm_npu::kernels::gemm_array::ArrayDesign, kdim: usize, pn: usize, pitch: usize, rows: usize)
+fn side<'d>(dev: &'d Device, design: &peacemaker_npu::kernels::gemm_array::ArrayDesign, kdim: usize, pn: usize, pitch: usize, rows: usize)
     -> Result<(Side<'d>, f64, f64), String>
 {
     let t = Instant::now();

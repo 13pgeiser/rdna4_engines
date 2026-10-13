@@ -1,6 +1,6 @@
 # Signed int8 GEMM on AIE2P
 
-The Rust kernel is `pm_npu::kernels::gemm_i8`. It emits `isa::Program`
+The Rust kernel is `peacemaker_npu::kernels::gemm_i8`. It emits `isa::Program`
 bytes directly; neither build nor execution invokes a vendor compiler. This
 slice is offline. NpuProbe owns the subsequent Halo execution gate.
 
@@ -135,13 +135,13 @@ concurrent-GPU performance has been measured by this slice.
 
 ## Offline gates
 
-- `cargo test -p pm-npu gemm_i8 -- --nocapture`: independent oracle bytes,
+- `cargo test -p peacemaker-npu gemm_i8 -- --nocapture`: independent oracle bytes,
   signed packing/reference, and labelled peak-model output.
-- `cargo test -p pm-npu-sim gemm_i8_27_shapes_dma_cpu_exact -- --nocapture`:
+- `cargo test -p peacemaker-npu-sim gemm_i8_27_shapes_dma_cpu_exact -- --nocapture`:
   all27 combinations M,N,K in{64,128,256}, executing encoded core programs,
   semaphore locks, cyclic tile DMA, bounded stream FIFOs, and shim transfers;
   every output word is compared bit-exactly with the CPU reference.
-- `cargo run -p pm-npu-sim -- gemm 64` and `-- gemm 256`: actual CLI
+- `cargo run -p peacemaker-npu-sim -- gemm 64` and `-- gemm 256`: actual CLI
   smokes of3 jobs each, including odd-job and cross-job ping/pong transitions.
 
 Additional offline smoke exercised `pack_columns` through all 32 cores'
@@ -238,7 +238,7 @@ Local kernel citations below are relative to
   mapping already pins (`amdxdna_gem.c:869-870`). Our
   `crates/railgun/src/npu/mod.rs`, `HwCtx::submit`, embeds each `Bo::dev_addr()` into
   firmware bo0..bo4 and separately passes argument handles. V8's shim DDR
-  patches use arg0=A (`crates/pm-npu/src/kernels/gemm_array.rs:50-58,80-83`).
+  patches use arg0=A (`crates/peacemaker-npu/src/kernels/gemm_array.rs:50-58,80-83`).
 - The NPU is non-cache-coherent; SYNC_BO flushes an imported SG table
   (`amdxdna_gem.c:977-982,1007-1012`). The probe flushes the imported CPU
   mapping but never writes it. Explicit HIP synchronization is required;

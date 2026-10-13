@@ -44,7 +44,7 @@ outlier channels/heads — and those are static per tensor. The correction is `Y
 `C_lo,e = Σ_j W'[n][128e+j]·q_lo[t][128e+j]` over a **static block set S** (|S| ≈ 20 % of K), with `q_lo` the int4
 re-quant of `r'` (second plane, `d_lo = max|r'|/7`, emitted by the GPU producer: +1 nibble plane for S only). This is
 exactly hipfire's two-plane A8 integer identity restricted to S (`R:fn-wmo/w4a8-moe.md:60-71,95-102` **M design**),
-and the NPU core holds it exactly (`npu/pm-npu/src/kernels/iu4.rs:1-25,121` — silicon-exact partials,
+and the NPU core holds it exactly (`npu/peacemaker-npu/src/kernels/iu4.rs:1-25,121` — silicon-exact partials,
 `dense27b.md:69-77` **M**).
 
 **Numerics.** The correction is a *new* term: it needs **determinism, not parity with the GPU fold**. Fold it on the
@@ -217,7 +217,7 @@ The vision tower (27 layers, hidden 1152, intermediate 4304, 16 heads; `release-
 `vision_config` **M**) ≈ 411 M params (E); per 1024-patch image ≈ 1 TOP → NPU int8 ≈ 40 ms + attention/LN/GELU on
 the vector unit (unmeasured) vs GPU ≈ 20–25 ms (E at 40–57 F16 TOPS). It frees ≈ 1 decode token of GPU time per
 image and couples to nothing on the token chain; same shape of argument for a 100–300 M-param embedder (10–20 ms
-per query, E). Cost: a second inference stack on pm-npu (bf16 attention, norms, GELU, int8 GEMMs with deterministic
+per query, E). Cost: a second inference stack on peacemaker-npu (bf16 attention, norms, GELU, int8 GEMMs with deterministic
 folds) — the largest build in this list. Quality: int8 ViT/embedder is standard deployment practice, but OCR fidelity
 needs its own gate. **Unsized**: measure the tower's GPU ms/image on gfx1151 first; if < 25 ms it is not worth a stack.
 

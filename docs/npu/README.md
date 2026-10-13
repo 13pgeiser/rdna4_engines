@@ -10,7 +10,7 @@ default hipfire build and runtime path are unchanged.
 
 | Piece | Where | What |
 |---|---|---|
-| `pm-npu` | `crates/pm-npu` | AIE2P emitter: VLIW encoder/scheduler (`isa`, tables generated from llvm-aie TableGen), CDO/PDI writer, DPU transaction writer, DMA/route/registers, kernel designs (`kernels`: int8 GEMM, whole-array V8–V10/G80, IU4/IEF15, ring, experts, bw probe), and the offline simulator (`sim`). Bins `pm-npu-objdump`, `pm-npu-sim`. |
+| `peacemaker-npu` | `crates/peacemaker-npu` | AIE2P emitter: VLIW encoder/scheduler (`isa`, tables generated from llvm-aie TableGen), CDO/PDI writer, DPU transaction writer, DMA/route/registers, kernel designs (`kernels`: int8 GEMM, whole-array V8–V10/G80, IU4/IEF15, ring, experts, bw probe), and the offline simulator (`sim`). Bins `peacemaker-npu-objdump`, `peacemaker-npu-sim`. |
 | `railgun::npu` | `crates/railgun/src/npu` (feature `npu`, default off) | Runtime: device query, DEV_HEAP, hardware context, CONFIG_CU, BOs, eager/prepared/chained submit, persistent ring, `tape`, FCLK guard (`fclk`), dlopen'd HIP interop (`hip_runtime`). |
 | `npu-tools` | `crates/npu-tools` | Every binary: `npu-tools` (`aie-status`, `txn-dump`, `soc-metrics`, `m4`, `tblgen2rs`, `gpu-bw`, `fclk`), `npu-gemm`, `npu-hello`, `npu-experts`, `npu-ring`, `npu-railgun`, `npu-bw`, `npu-coop`, and `coop27` (`--features lab`). |
 | Scripts | `tools/npu/` | Silicon-window harnesses (`npu-window.sh` pins FCLK and takes the timing lock), batch/bisect drivers, the `a4-ec` and `fold-model` offline analyses (standalone cargo projects). |
@@ -23,7 +23,7 @@ default hipfire build and runtime path are unchanged.
 session, one ERT packet, opt-in gfx1151 spillover experiments driven by
 `HIPFIRE_XDNA_*`). It stays as is. `railgun::npu` is a separate, broader
 runtime (prepared/chained submit, ring, tape, HIP dma-buf interop) built for the
-PM-npu designs; the two share no code and neither is on the product path.
+peacemaker-npu designs; the two share no code and neither is on the product path.
 Converging them is future work, not part of this fold.
 
 ## Building and testing
@@ -31,11 +31,11 @@ Converging them is future work, not part of this fold.
 ```sh
 cargo build -p railgun --features npu      # runtime (CI builds this)
 cargo build -p npu-tools --features lab    # all binaries incl. coop27 (CI builds this)
-cargo test  -p pm-npu --release            # emitter + simulator suites, pure CPU
+cargo test  -p peacemaker-npu --release            # emitter + simulator suites, pure CPU
 cargo test  -p railgun --features npu --lib
 ```
 
-All `pm-npu` tests are pure CPU (`golden_bytes`, `lean`, `ring`, `experts`,
+All `peacemaker-npu` tests are pure CPU (`golden_bytes`, `lean`, `ring`, `experts`,
 `g80`, `iu4_ief15`, …); `array` and `g80` take minutes in debug. Vendor
 byte-oracle cross-checks run only with `AIE2P_VENDOR_CORPUS` set (they skip
 otherwise); `isa_decode::vendor_decode_oracle_roundtrip` is `#[ignore]`d

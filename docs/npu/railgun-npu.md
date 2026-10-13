@@ -35,7 +35,7 @@ retained ERT_START_CU command BO (17 words) plus its retained EXEC_CMD handle ar
 handle array is rebuilt only when a sub-command's handle changed). `HwCtx::submit_prepared` / `submit_chain`
 issue one EXEC_CMD with no encoding; one syncobj wait per chain.
 
-## 2. Lean TXN (`crates/pm-npu/src/kernels/gemm_array_lean.rs`, `ArrayDesign::lean_insts`)
+## 2. Lean TXN (`crates/peacemaker-npu/src/kernels/gemm_array_lean.rs`, `ArrayDesign::lean_insts`)
 The vendor-style dynamic TXN of the V8/V9/V10 pair designs re-initialises the whole array every submit (core
 reset, 176 channel resets, all memtile descriptors, 512 core + 512 memtile lock writes, ring tasks; ≈ 51 KB,
 1746 ops). Measured on silicon that costs ≈ 150 µs per GEMM of firmware time. The lean TXN keeps the array
@@ -54,7 +54,7 @@ hwctx may run on the partition in between). The first submit after `config_cu` i
 | V10 down | 48,560 B | 7,984 B | cores + shim + requeue the finite B fill |
 | V10 `--b-prefix` down / 160×2560×640 | 49,136 / 48,944 B | 8,816 / 15,824 B | cores + shim + requeue the finite fill / guarded-replay groups in order (+ BD 36 when MW > 1), clear their iteration `current` |
 
-## 3. Persistent work ring P1 (`crates/pm-npu/src/kernels/ring.rs`)
+## 3. Persistent work ring P1 (`crates/peacemaker-npu/src/kernels/ring.rs`)
 One START_CU whose TXN runs S slot-runs back to back with no CPU in between. The NPU-side "controller" is the
 firmware's TXN interpreter itself: the shim DMA cannot branch on data, so a self-looping shim BD mirrors the slot's
 `seq` word from DDR into memtile memory and the TXN `MASKPOLL`s it.
@@ -100,7 +100,7 @@ The CPU never sits between a producer write and the NPU start, or between the NP
 re-arms the queue: per round it `patch_seq`s the retained insts BO (the declared words only) and submits the same
 cmd BO; rounds can be queued ahead (the driver keeps them in order), so re-arming never synchronises with the GPU.
 
-### 3.4 Grouped expert launch (`crates/pm-npu/src/kernels/experts.rs`, `grouped_v9`)
+### 3.4 Grouped expert launch (`crates/peacemaker-npu/src/kernels/experts.rs`, `grouped_v9`)
 One START_CU (optionally one ring slot) runs E experts of one projection back to back: one PDI / ConfigKey for every
 expert with M ≤ 512 (one 512-row wave), expert 0 the full body, experts 1..E−1 the lean body, each with its own
 A rows / B (expert weights) / C arena patches. No per-expert full TXN, no per-expert submit. Experts are serialized
@@ -168,7 +168,7 @@ Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 | patch inventory | snapshot every retained BO, patch, diff: changed words ⊆ declared sites, result == fresh encode | stale patch (skip one arg patch): caught by the fresh-encode diff and by the output check |
 | ring done protocol | per-slot done lines, equality waits | skipped done word (`Neg::SkipDone`): the missing done line is reported; stale seq patch: 0 of 16 words patched and no new done lines |
 | ring overrun | producer guard `producer_may_publish` (done[s] must equal seq − nslots) | guard refuses; forced in the simulator ⇒ MASKPOLL deadlock reported |
-| AIE2P control rules | `crates/pm-npu/src/isa/rules.rs` in `Program::finish` (unchanged core programs) | its own unit tests |
+| AIE2P control rules | `crates/peacemaker-npu/src/isa/rules.rs` in `Program::finish` (unchanged core programs) | its own unit tests |
 
 ## 7. Opt-in trunk BF16 transport (0.4.2)
 

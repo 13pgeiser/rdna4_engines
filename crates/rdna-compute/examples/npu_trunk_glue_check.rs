@@ -2,7 +2,7 @@
 //! Halo-only byte oracle. Run: cargo run --release -p rdna-compute --features lab --example npu_trunk_glue_check
 //! Compares complete old/new packed arenas and sidecars, then reports pack/consume event timings.
 use half::f16;
-use pm_npu::kernels::{gemm_g80::{self,bf16_output_offset},gemm_core::{Epilogue,Control},w8a8_epi::{grid15_up,bf16_direct}};
+use peacemaker_npu::kernels::{gemm_g80::{self,bf16_output_offset},gemm_core::{Epilogue,Control},w8a8_epi::{grid15_up,bf16_direct}};
 use rdna_compute::{Gpu,GpuTensor,DType,npu_trunk::{NpuBf16Layout,NpuTrunkOutput}};
 const K:usize=2560;
 const AP:usize=32;

@@ -55,16 +55,16 @@ Sources: `W:kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip:14-33,146-157,
    - gate_up stores `h = g/(1+expf(-g))*u` with hipcc's `expf`/`fdiv` DAG (`iu4_v2b.rs:753-759`). Its input `g` is a full f32, so no lookup table can reproduce it.
    - z+β+α splits rows 6144..6239 into β/α and drops the 160 padding rows.
 
-CPU reference of 1–4 (Rust): `crates/pm-npu/src/kernels/iu4.rs`, with `partials` and `fold_set`, operand decoders, the exact f16 widening, and tests including a case that separates single-rounded fma from multiply-then-add.
+CPU reference of 1–4 (Rust): `crates/peacemaker-npu/src/kernels/iu4.rs`, with `partials` and `fold_set`, operand decoders, the exact f16 widening, and tests including a case that separates single-rounded fma from multiply-then-add.
 
 ## 3. NPU kernel: native IU4 operands → bit-exact per-epoch int32 partials
 
-`iu4::EpochGemm` (`crates/pm-npu/src/kernels/iu4.rs`) is the silicon-proven **V8 i32** whole-array design run as an **epoch-batched GEMM**. Wave rows `e*Mpad + t` carry activation epoch `e`, and every wave of epoch `e` streams weight epoch `e` as its B tile (`gemm_array::ArrayDesign::pack_in_per_mw`, a host-layout-only extension). Core programs, routes, descriptors and TXN are unchanged. The output is `C_e[e][t][feature]` int32.
+`iu4::EpochGemm` (`crates/peacemaker-npu/src/kernels/iu4.rs`) is the silicon-proven **V8 i32** whole-array design run as an **epoch-batched GEMM**. Wave rows `e*Mpad + t` carry activation epoch `e`, and every wave of epoch `e` streams weight epoch `e` as its B tile (`gemm_array::ArrayDesign::pack_in_per_mw`, a host-layout-only extension). Core programs, routes, descriptors and TXN are unchanged. The output is `C_e[e][t][feature]` int32.
 
 - The inputs are the hipfire-native buffers. The host packer expands nibbles to the int8 the V8 core consumes, applying the rebias, so the integers are identical and nothing about precision changes. Core-side int4 unpack (`VLDB.UNPACK` exists) would save 64 KiB of the 1.125 MiB moved per wave, which is not the binding resource (see §4).
 - CLI: `npu-gemm TOKENS FEATURES K --variant V8 --epi i32 --iu4-epochs`. Every checked submit compares all partials with `iu4::partials`.
 
-**Simulator** (exact PDI/TXN interpreter, `crates/pm-npu/tests/iu4_epochs.rs`, log `logs/dense27b/sim-iu4-epochs.log`): exact for 512²×256 (Fast and Slow control), 300×700×512 (token/feature padding), 1024³ (32 waves, two token blocks per epoch), and 3 submits with different operands on one context. All runs include the extreme partials +8192 and −7168. The CPU fold of the NPU partials is bit-identical to the fold of the CPU partials.
+**Simulator** (exact PDI/TXN interpreter, `crates/peacemaker-npu/tests/iu4_epochs.rs`, log `logs/dense27b/sim-iu4-epochs.log`): exact for 512²×256 (Fast and Slow control), 300×700×512 (token/feature padding), 1024³ (32 waves, two token blocks per epoch), and 3 submits with different operands on one context. All runs include the extreme partials +8192 and −7168. The CPU fold of the NPU partials is bit-identical to the fold of the CPU partials.
 
 **Silicon** (measured, window w1, `logs/dense27b/w1-be0be55.log`, 2026-10-02 23:39 UTC, fclk pinned, kernel log clean): 0 mismatches in every checked submit.
 
@@ -106,9 +106,9 @@ Constraints hit: V9 (`K ≤ 3456`) and V10 (`kc·(2+NW) ≤ 112`) admit no 27B s
 
 ## 5. Can the NPU do the f32 fold exactly? Lane-level models
 
-`crates/pm-npu/src/kernels/iu4_fold_model.rs`, log `logs/dense27b/fold-model.log`.
+`crates/peacemaker-npu/src/kernels/iu4_fold_model.rs`, log `logs/dense27b/fold-model.log`.
 
-Both models compute `t = RN(sc·d)` then `fma(t, C, s)` from AIE2P lane primitives only, and charge each primitive to its VLIW slot (`crates/pm-npu/src/isa/gen.rs`):
+Both models compute `t = RN(sc·d)` then `fma(t, C, s)` from AIE2P lane primitives only, and charge each primitive to its VLIW slot (`crates/peacemaker-npu/src/isa/gen.rs`):
 - **Mv**: `vadd/vsub.32`, `vband`, `vbor`, `vlt/vge/veqz`, `vsel`, `vabs`, `vmov`, `vups`; 16 i32 lanes, one per bundle.
 - **St**: `vsrs` with a scalar shift and conv-even rounding.
 - **Vec**: `vmul` 32×16 into 64-bit lanes, accumulator `vadd/vsub`, fp32-accumulator `vadd.f/vsub.f/vmul.f` (bf16 inputs only). This slot is shared with the GEMM's VMAC.
@@ -218,10 +218,10 @@ IEF changes the GPU numerics of a shipped route, so it needs user approval befor
 
 ## 10. Files
 
-- `crates/pm-npu/src/kernels/iu4.rs`: contract, CPU reference, `EpochGemm`.
-- `crates/pm-npu/src/kernels/iu4_fold_model.rs`: fold lane models.
-- `crates/pm-npu/src/kernels/gemm_array.rs`: `pack_in_per_mw`, `wave_m`.
-- `crates/pm-npu/tests/iu4_epochs.rs`.
+- `crates/peacemaker-npu/src/kernels/iu4.rs`: contract, CPU reference, `EpochGemm`.
+- `crates/peacemaker-npu/src/kernels/iu4_fold_model.rs`: fold lane models.
+- `crates/peacemaker-npu/src/kernels/gemm_array.rs`: `pack_in_per_mw`, `wave_m`.
+- `crates/peacemaker-npu/tests/iu4_epochs.rs`.
 - `npu-gemm`: `--iu4-epochs`, `--gap-us`.
 - `tools/npu/npu-dense27b-w1.sh`, `tools/npu/npu-dense27b-m4.sh`.
 - Logs: `logs/dense27b/`.

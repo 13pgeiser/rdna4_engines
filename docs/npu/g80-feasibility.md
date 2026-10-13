@@ -22,8 +22,8 @@ emitter in `/home/kaden/qcal/npu-agents/levers-paper/emitter/cand.rs` and its ca
 The +3.5% normalized bank-model regression remains a risk, not a veto; the measured-baseline extrapolation still
 fails the 50-TOPS budget (§7). Smaller TM32/TM64 waves remain paper-only candidates, not implemented replacements.
 
-Source abbreviations: **C** = `crates/pm-npu/src/kernels/gemm_core.rs`; **G** = `crates/pm-npu/src/kernels/gemm_array.rs`;
-**D** = `crates/pm-npu/src/dma.rs`; **R** = `crates/pm-npu/src/route.rs`; **J** =
+Source abbreviations: **C** = `crates/peacemaker-npu/src/kernels/gemm_core.rs`; **G** = `crates/peacemaker-npu/src/kernels/gemm_array.rs`;
+**D** = `crates/peacemaker-npu/src/dma.rs`; **R** = `crates/peacemaker-npu/src/route.rs`; **J** =
 `/home/kaden/qcal/npu/docs/levers-joint.md`; **F** = `/home/kaden/qcal/npu/docs/levers-fable.md`.
 All byte counts use signed int8 inputs and int8 SRS output, not the GPU's int4 storage or BF16 epilogue.
 MiB/KiB mean powers of two. Geometry comes from J:121-145 and F:58-63, and expert dimensions from `report.md:79-80`.
@@ -170,7 +170,7 @@ Each B MM2S queues 2 tasks, B S2MM 1 task, within the four-task queue; repeat 40
 An abstract asymmetric-consumer readiness model exercised kc=1/2/40, waves=1/2/3/16 and three seeds
 (36 cases): no read of an unfilled chunk, no premature immutable replay, final ready credits zero.
 This is **not** a full DMA simulator gate. The specific two-BD finite-chain repeat/iteration interaction
-and context reuse must still be exercised in `pm-npu-sim` before any real design is accepted.
+and context reuse must still be exercised in `peacemaker-npu-sim` before any real design is accepted.
 
 Shim contracts at gate_up: B MM2S0 in each of 8 columns reads 409600 B; A MM2S1 in columns 0..3 reads
 `16*40*4096 = 2621440` B each, and is absent in columns 4..7. Each C S2MM0/1 reads two row tiles per wave:
@@ -364,9 +364,9 @@ per wave, ≈4.6 % of the 55 640 kc=40 chunk issue cycles), whereas the baseline
 * Silicon behaviour (no hardware).
 * DMA channel execution, same-context reset and numeric whole-array correctness remain untested.
 * Gate 7 below evaluates the cycle budget; the size/rules proof alone does not authorize Phase 2.
-* Source citations used: `crates/pm-npu/src/kernels/gemm_core.rs` — Assembler `242-333`, `wavefront 413-471`, `chunk 483-517`,
+* Source citations used: `crates/peacemaker-npu/src/kernels/gemm_core.rs` — Assembler `242-333`, `wavefront 413-471`, `chunk 483-517`,
   `epilogue_wavefront/epilogue 801-847`, `program_pair 855-896`, `PAIR_CHUNK_CYCLES 702`, `PAIR_EPILOGUE_CYCLES 705`,
-  `MODIFIERS 397`; `crates/pm-npu/src/isa.rs:224-234` (`Program::try_finish/finish`); `crates/pm-npu/src/isa/rules.rs` (rules table,
+  `MODIFIERS 397`; `crates/peacemaker-npu/src/isa.rs:224-234` (`Program::try_finish/finish`); `crates/peacemaker-npu/src/isa/rules.rs` (rules table,
   `check`); `report.md:514-535,614-616` (lever 2 stall attribution).
 
 ## Gate 6 — two-stream prefix startup: paper passes; latency is estimated
@@ -705,7 +705,7 @@ not a physical DRAM measurement and not hardware evidence): reads `24248320` B (
 submit), writes `41943040` B (I32 C, 4 B per output), useful ops `2*8192*1280*2560 = 53687091200`. That is
 `66191360 / 53687091.2 kop = 1.23291015625` B/kop (about 1.233), the figure the 1.26 B/kop gate above is measured against.
 
-Exercised (CPU simulator only, no hardware): `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo test -p pm-npu --release --test g80
+Exercised (CPU simulator only, no hardware): `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo test -p peacemaker-npu --release --test g80
 --test golden_bytes --test lean --test ring -- --nocapture` passed: g80 84 tests (95.56 s), golden_bytes 1 (0.72 s),
 lean 27 (122.04 s), ring 15 (13.99 s). `ROCR_VISIBLE_DEVICES=-1 nice -n19 cargo build -p npu-tools --release --bin npu-gemm`
 passed (0.04 s). The all-bin build was blocked by the separately in-flight FP probe's missing module registration,
@@ -729,10 +729,10 @@ G80 down, M257, invalid design, wrong N and `--b-prefix` were rejected with exit
 (its then-rejected i32 request is superseded by the section "I32 epilogue (simulator-only)").
 
 Compatibility gates passed: golden_bytes 1, levers3 10, lean 27, ring 11 and experts 14 tests.
-`cargo test --release -p pm-npu -- --skip vendor_decode_oracle_roundtrip` passed 105 tests
+`cargo test --release -p peacemaker-npu -- --skip vendor_decode_oracle_roundtrip` passed 105 tests
 (the known missing-LLVM oracle was skipped); `cargo build --release -p npu-gemm` passed.
 
-`cargo test --release -p pm-npu-sim --test g80 -- --nocapture` passed all 51 tests in 44.54 s.
+`cargo test --release -p peacemaker-npu-sim --test g80 -- --nocapture` passed all 51 tests in 44.54 s.
 Every requested shape was CPU-exact with unchanged inputs and exact per-channel shim byte totals.
 The suite also covers padded M200/M513, signed extrema with floor/shift/saturation, three changing seeds at odd/even
 `kc*waves`, full/lean interleaves, forced ring-channel repair, and equal retained state snapshots versus fresh full runs.

@@ -12,7 +12,7 @@ Important inconsistency: `gemm_array.rs:1511-1527` and `bw_probe.rs:17-24` model
 
 ## 2. Exact traffic algebra at the two expert shapes
 
-Source geometry: a core computes 128×64, K chunks are 64, and 32 cores cover 512×512 per wave (`crates/pm-npu/src/kernels/gemm_core.rs:77-82`; `gemm_array.rs:38-85,513-549`). Let `MW=ceil(M/512)`, `NW=ceil(N/512)`, `kc=K/64`, `W=MW*NW`, `Q=W*kc`. V9 executes N-wave outer and replays B across all M-waves (`gemm_array.rs:87-126,525-536,953-974`).
+Source geometry: a core computes 128×64, K chunks are 64, and 32 cores cover 512×512 per wave (`crates/peacemaker-npu/src/kernels/gemm_core.rs:77-82`; `gemm_array.rs:38-85,513-549`). Let `MW=ceil(M/512)`, `NW=ceil(N/512)`, `kc=K/64`, `W=MW*NW`, `Q=W*kc`. V9 executes N-wave outer and replays B across all M-waves (`gemm_array.rs:87-126,525-536,953-974`).
 
 Exact bytes per submit:
 
@@ -152,7 +152,7 @@ Common interface stays `design_v9(m,n,k,epi,ctl) -> ArrayDesign`, arguments `[pa
 
 **Submit/restart is part of every DMA change:** after prior completed submit, halt/reset cores, reset persistent core/memtile channels (not shim), rewrite every stateful resident descriptor because BD iteration `current` survives channel reset, initialize all locks/indices, set PC0, queue rings then finite shim tasks, enable cores last, wait for **both C channels across all eight columns**. Sources: `gemm_array.rs:176-191,1337-1408`. No token may acknowledge a still-writing C stream. No residual stream words may be allowed to prefix the next submit (`bw_probe.rs:32-48`). A timeout requires quarantine/teardown, not assuming completion or rewriting live storage.
 
-Simulator gates reuse `crates/pm-npu/tests/array.rs::{v9_shape,v9_reuses_context_with_odd_and_even_kc_times_waves,v10_shape,v10_reuses_context_with_odd_and_even_kc_times_waves}` (`194-252,266-315`), plus the pair tests and existing ISA rule gate. Extend only behaviorally meaningful scenarios: modulo-three boundaries, backpressure, changed input each submit, poisoned outputs, signed extrema, shift/floor/saturation, non-divisible M/N, max memory/BD constraints. Functional simulation proves exactness and ownership, not silicon speed. Reviewers own veto; caller owns any shared validation after integration.
+Simulator gates reuse `crates/peacemaker-npu/tests/array.rs::{v9_shape,v9_reuses_context_with_odd_and_even_kc_times_waves,v10_shape,v10_reuses_context_with_odd_and_even_kc_times_waves}` (`194-252,266-315`), plus the pair tests and existing ISA rule gate. Extend only behaviorally meaningful scenarios: modulo-three boundaries, backpressure, changed input each submit, poisoned outputs, signed extrema, shift/floor/saturation, non-divisible M/N, max memory/BD constraints. Functional simulation proves exactness and ownership, not silicon speed. Reviewers own veto; caller owns any shared validation after integration.
 
 ## 6. Architecture scope and explicit non-goals
 

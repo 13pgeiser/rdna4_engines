@@ -173,7 +173,7 @@ mod tests {
     }
     #[test]
     fn fast_uint4_lds_reorder_matches_g80_byte_offsets() {
-        use pm_npu::kernels::gemm_g80::bf16_output_offset;
+        use peacemaker_npu::kernels::gemm_g80::bf16_output_offset;
         for padded_rows in [4864usize,8192] {
             let waves=padded_rows/256;
             for panel in [0usize,1,12] {for tn in 0..16 {

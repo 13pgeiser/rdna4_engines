@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Weight preparation, program selection and thin GPU glue for the opt-in
-//! Flash-Next NPU trunk. References live in pm-npu; no device opens here.
+//! Flash-Next NPU trunk. References live in peacemaker-npu; no device opens here.
 
 pub(crate) mod admission;
 pub(crate) use calibration::{npu_firmware, runtime_key_with_firmware};

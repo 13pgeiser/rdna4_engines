@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
-//! npu-gemm: run `pm_npu::kernels::gemm_i8::design` (single core) or, with `--array`/`--variant`,
-//! `pm_npu::kernels::gemm_array::design_variant_core` (whole 8x4 array or a bisect variant, selectable core
+//! npu-gemm: run `peacemaker_npu::kernels::gemm_i8::design` (single core) or, with `--array`/`--variant`,
+//! `peacemaker_npu::kernels::gemm_array::design_variant_core` (whole 8x4 array or a bisect variant, selectable core
 //! program) on the NPU via railgun::npu.
 //!
 //! usage: npu-gemm M N K [--iters I] [--col C0] [--timeout-ms T] [--dump-status]
@@ -94,10 +94,10 @@
 //! explicitly for that program.
 //! `--iu4-epochs` (with `--variant V8 --epi i32`, core Fast or FastSlowCtl): M = tokens, N = weight rows, K a multiple
 //! of 256. Deterministic native hipfire IU4 operands (symmetric MQ4G256V2 weights x `block_i4_128` activations,
-//! `pm_npu::kernels::iu4`) run on `iu4::EpochGemm` (V8 i32, K = 128 per wave, one M-wave block per K128 epoch), and every
+//! `peacemaker_npu::kernels::iu4`) run on `iu4::EpochGemm` (V8 i32, K = 128 per wave, one M-wave block per K128 epoch), and every
 //! verified submit is compared with the CPU reference of the GPU's per-epoch int32 partials `C_e` (all `[e][t][r]`).
 //! Useful ops are the real 2·M·N·K; `epochs * ceil(M/512) * ceil(N/512) <= 256` waves per submit.
-//! `--fold-contract ief15` (`pm_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3 / §8 M0; AxQOS 0 and the vendor BD
+//! `--fold-contract ief15` (`peacemaker_npu::kernels::iu4_ief15::Ief15Gemm`, fold-contract §3 / §8 M0; AxQOS 0 and the vendor BD
 //! word 5 defaults, so `--burst/--axcache/--axqos/--memory/--a-from-hip/--variant/--array/--core/--epi/--shift/--ctl-probe/
 //! --iu4-epochs` exit 2): TOKENS x FEATURES x K, deterministic native QT44 / A4 operands (`iu4::random_operands`, extremes
 //! on) with the production sidecar encoders (`encode_weight_scales`, `encode_act_scales`), packed with `pack_in` and checked
@@ -113,11 +113,11 @@
 //! (a lean TXN is only valid directly after a completed submit of the same design). Useful ops are the real 2*T*F*K; busy
 //! TOPS is useful ops over summed submit -> completion time, wall TOPS over the wall clock including host verification.
 use railgun::npu::hip_runtime::{HipDmabufA, HipMemoryKind};
-use pm_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v8, design_v9, design_variant_probe, Variant};
-use pm_npu::kernels::gemm_core::{clock_probe_cycles_per_iter, Control, CoreVariant, Epilogue, Probe};
-use pm_npu::kernels::gemm_i8::{cpu_reference, design, ArgKind};
-use pm_npu::kernels::iu4::{self, EpochGemm};
-use pm_npu::kernels::iu4_ief15::{self, Ief15Gemm};
+use peacemaker_npu::kernels::gemm_array::{design_v10, design_v10_prefix, design_v8, design_v9, design_variant_probe, Variant};
+use peacemaker_npu::kernels::gemm_core::{clock_probe_cycles_per_iter, Control, CoreVariant, Epilogue, Probe};
+use peacemaker_npu::kernels::gemm_i8::{cpu_reference, design, ArgKind};
+use peacemaker_npu::kernels::iu4::{self, EpochGemm};
+use peacemaker_npu::kernels::iu4_ief15::{self, Ief15Gemm};
 use railgun::npu::{Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::ops::Range;
 use npu_tools::util::{lcg};
@@ -508,7 +508,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             eprintln!("row-major needs G80 BF16, even pitch/col0, col0+{wave_n} <= pitch <= {}, and a representable arena", 2 << 20);
             std::process::exit(2)
         }
-        pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }
+        peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }
     });
     if rowmajor.is_none() && opt_str(args, "--rowmajor-col0").is_some() {
         eprintln!("--rowmajor-col0 requires --rowmajor-pitch"); std::process::exit(2)
@@ -539,8 +539,8 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         std::process::exit(2)
     }
     if g80 {
-        let (max_k, wave_n) = if n512 { (pm_npu::kernels::gemm_g80_n512::MAX_KC * 64, 512) }
-            else { (pm_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1) };
+        let (max_k, wave_n) = if n512 { (peacemaker_npu::kernels::gemm_g80_n512::MAX_KC * 64, 512) }
+            else { (peacemaker_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1) };
         if n != wave_n || k % 64 != 0 || k == 0 || k > max_k {
             eprintln!("--variant G80{} needs N = {wave_n} and K a multiple of 64 in 64..={max_k}, got N={n} K={k}", if n512 { " --n512" } else { "" });
             std::process::exit(2)
@@ -618,22 +618,22 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             iu4_io = Some((g.padded(&partials), g.pack_in(&w, &x), g.useful_ops()));
             g.design
         }
-        Some(epi) if g80 && n512 => pm_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
-        Some(epi) if g80 => pm_npu::kernels::gemm_g80::design_g80_bf16_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
+        Some(epi) if g80 && n512 => peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
+        Some(epi) if g80 => peacemaker_npu::kernels::gemm_g80::design_g80_bf16_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
         Some(epi) if v10 && b_prefix => design_v10_prefix(m, n, k, epi, control),
         Some(epi) if v10 => design_v10(m, n, k, epi, control),
         Some(epi) if v9 => design_v9(m, n, k, epi, control),
         Some(epi) => design_v8(m, n, k, epi, control),
         None => design_variant_probe(m, n, k, variant.unwrap_or(Variant::V6), core, probe_iters),
     };
-    let defaults = pm_npu::dma::ShimAxi::default();
+    let defaults = peacemaker_npu::dma::ShimAxi::default();
     let field = |name: &str, default: u32, max: u32| {
         opt_str(args, name).map_or(default, |s| match s.parse::<u32>() {
             Ok(v) if v <= max => v,
             _ => { eprintln!("{name} must be 0..={max}"); std::process::exit(2) }
         })
     };
-    let axi = pm_npu::dma::ShimAxi {
+    let axi = peacemaker_npu::dma::ShimAxi {
         burst: field("--burst", defaults.burst, 3),
         cache: field("--axcache", defaults.cache, 15),
         qos: field("--axqos", defaults.qos, 15),
@@ -659,7 +659,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         let a: Vec<i8> = (0..m * k).map(|_| lcg(&mut seed)).collect();
         let b: Vec<i8> = (0..k * n).map(|_| lcg(&mut seed)).collect();
         if epi == Some(Epilogue::Bf16) {
-            use pm_npu::kernels::{gemm_g80::{pack_a_bf16, pack_b_bf16}, w8a8_epi::bf16_direct};
+            use peacemaker_npu::kernels::{gemm_g80::{pack_a_bf16, pack_b_bf16}, w8a8_epi::bf16_direct};
             let mut scale = || {
                 let mantissa = 16384 + (u16::from(lcg(&mut seed) as u8) << 6);
                 let exponent = -20 + i16::from(lcg(&mut seed) as u8 % 7);
@@ -667,7 +667,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             };
             let ds: Vec<_> = (0..m).map(|_| scale()).collect();
             let ss: Vec<_> = (0..n).map(|_| scale()).collect();
-            let want = pm_npu::kernels::gemm_i8::cpu_reference(&a, &b, m, n, k).into_iter().enumerate()
+            let want = peacemaker_npu::kernels::gemm_i8::cpu_reference(&a, &b, m, n, k).into_iter().enumerate()
                 .map(|(at, i)| { let (sm, se) = ss[at % n]; let (dm, de) = ds[at / n];
                     i32::from(bf16_direct(i, sm, se, dm, de)) }).collect();
             (want, [pack_a_bf16(&d, &a, &ds), pack_b_bf16(&d, &b, &ss)], d.useful_ops())
@@ -780,13 +780,13 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         if got.len() != want.len() {
             return (usize::MAX, got.first().map_or(0, |v| *v).to_string());
         }
-        let outside_bad = if let Some(pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+        let outside_bad = if let Some(peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
             bos[out_idx].as_slice().chunks_exact(2).enumerate().filter(|(at, bytes)| {
                 let col = at % pitch;
                 (col < col0 || col >= col0 + n) && bytes.iter().any(|&b| b != 0xA5)
             }).count()
         } else { 0 };
-        let padding_bad = if let Some(pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
+        let padding_bad = if let Some(peacemaker_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
             (m..d.waves() * d.wave_m()).flat_map(|row| (0..n).map(move |col| 2 * (row * pitch + col0 + col)))
                 .filter(|&off| bos[out_idx].as_slice()[off..off + 2] != [0, 0]).count()
         } else { 0 };
@@ -1262,15 +1262,15 @@ fn run_ief15(args: &[String], tokens: usize, features: usize, k: usize) -> bool 
 }
 
 /// `--ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--expected-only]`: the IEF15 N0 single-core semantics probe
-/// (`pm_npu::kernels::iu4_ief15_probe`, design doc `docs/ief15-n0.md` section 7 step 1). The expected bytes are the output of
-/// the exact probe PDI + TXN run in `pm_npu::sim::config::Config`; the same PDI + TXN is then submitted once on a fresh
+/// (`peacemaker_npu::kernels::iu4_ief15_probe`, design doc `docs/ief15-n0.md` section 7 step 1). The expected bytes are the output of
+/// the exact probe PDI + TXN run in `peacemaker_npu::sim::config::Config`; the same PDI + TXN is then submitted once on a fresh
 /// hardware context (shim BD word 5 and AxQoS are the vendor defaults) and compared byte for byte. Prints one
 /// MATCH/MISMATCH line per case (case id, encoding, operands, output byte range; a mismatch also the first differing
 /// lane, expected vs got) and returns false on any mismatch or a non-completed wait. `--dump PATH` writes the expected
 /// bytes to `PATH.expected` and the hardware bytes to `PATH.got`; `--expected-only` stops after the simulator run (no
 /// hardware access): it prints the expected blob's size and FNV-1a/64 and returns true.
 fn run_ief15_probe(args: &[String]) -> bool {
-    use pm_npu::kernels::iu4_ief15_probe::{self as probe, SemanticsProbe};
+    use peacemaker_npu::kernels::iu4_ief15_probe::{self as probe, SemanticsProbe};
     fn bad_flag(msg: String) -> ! { eprintln!("{msg}"); std::process::exit(2) }
     for f in ["--array", "--variant", "--core", "--epi", "--shift", "--ctl-probe", "--a-from-hip", "--memory", "--burst", "--axcache",
         "--axqos", "--b-prefix", "--probe-iters", "--iu4-epochs", "--gap-us", "--fold-contract", "--loop", "--reuse-ctx", "--iters"] {
@@ -1286,7 +1286,7 @@ fn run_ief15_probe(args: &[String]) -> bool {
         cases.len(), d.program_bytes, d.args[0].bytes, d.args[1].bytes, d.pdi.len(), d.insts.len());
     // Expected bytes: the exact PDI + TXN in the simulator.
     let mut sim_args = vec![input.clone(), vec![0xA5u8; d.args[1].bytes]];
-    let mut sim = pm_npu::sim::config::Config::from_pdi(&d.pdi).expect("simulator: probe PDI");
+    let mut sim = peacemaker_npu::sim::config::Config::from_pdi(&d.pdi).expect("simulator: probe PDI");
     sim.tick_limit = 50_000_000;
     if let Err(e) = sim.submit(&d.insts, &mut sim_args) { println!("simulator run of the probe failed: {e:?}"); return false; }
     let expected = sim_args.remove(1);

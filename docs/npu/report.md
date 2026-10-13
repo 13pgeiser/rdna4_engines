@@ -1,4 +1,4 @@
-# NPU (XDNA2 / AIE2P) on Strix Halo — railgun::npu + PM-npu bring-up
+# NPU (XDNA2 / AIE2P) on Strix Halo — railgun::npu + peacemaker-npu bring-up
 
 Owner: NpuOwner2 (from NpuProbe, 2026-10-02 09:00 UTC). Repo: hiptrx `/home/kaden/qcal/npu` (git `main`); hipx
 runs from clean git worktrees `~/qcal/npu-wt/<sha>` cloned from hiptrx (no rsync). Logs: hipx `~/qcal/npu-logs/`,
@@ -220,16 +220,16 @@ NpuOwner3.ASplitPlan → `local://npu-asplit-plan.md`), plus a second memtile→
 3. The token-route requirement wasn't stated in anything we read; it was found on hardware.
 4. Exec bit lost on scp cost two windows (fixed with chmod + preflight).
 5. The whole-array deployment (and every bisect variant) does not complete on hardware: cores finish but C-full is never seen by the core DMA (M3); root cause unproven, kernel log silent.
-6. `pm-npu` test `vendor_decode_oracle_roundtrip` cannot run here: the oracle `/tmp/aie2p-llvm-objdump` lost
-   `libLLVM.so` (environment, oracle only); all other pm-npu / pm-npu-sim gates pass.
+6. `peacemaker-npu` test `vendor_decode_oracle_roundtrip` cannot run here: the oracle `/tmp/aie2p-llvm-objdump` lost
+   `libLLVM.so` (environment, oracle only); all other peacemaker-npu / peacemaker-npu-sim gates pass.
 
 Host changes: **none** (no driver, firmware, IOMMU, kernel-parameter or persistent limit change; no reboot).
 
 ## Handoff for M3 (multi-core int8 GEMM at expert shapes) and M4 (GPU+NPU concurrency)
 
-**State.** npu repo `main` (hiptrx `/home/kaden/qcal/npu`) holds railgun::npu, pm-npu (encoder, decoder,
+**State.** npu repo `main` (hiptrx `/home/kaden/qcal/npu`) holds railgun::npu, peacemaker-npu (encoder, decoder,
 VLIW packer, CDO/PDI/TXN, DMA/route, `kernels/gemm_i8.rs` incl. single-core `design()` and the 8×4
-`ArrayPlan` staging), pm-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
+`ArrayPlan` staging), peacemaker-npu-sim, npu-hello, npu-gemm, `tools/npu/npu-window.sh`, `tools/npu/npu-batch.sh`.
 Folded since: NpuSched (`d3c3cc1`), NpuSim exact-PDI/TXN + whole-array sim (`00a7d86`, `c5ca1dd`), gemm_core v2
 (`646a1fb`), gemm_array + bisect variants (`9232c8a`). Open branches: `npu/m3-kernel` e96b835 (Serial/LockOnly
 core variants, gated), `npu/m3-array` 7e83786 (bisect2 READY, merged e96b835 + main 5f05360: `--core Fast|Serial|LockOnly`, `--dump-status` on success and failure incl. single-core, Rust status decoder, V1 same-lane fix, `tools/npu/npu-bisect2.sh`; not yet merged to main or run on hardware). Vendor corpus:
@@ -422,7 +422,7 @@ B (0x4000..), so every B load and C load collided. Four maps were tried on silic
 The wavefront issues 1070 cycles per chunk; ~290 stall cycles remain (both pair cores read the same A banks; DMA writes
 share banks with core reads).
 
-**AIE2P rule gate (`crates/pm-npu/src/isa/rules.rs`, asked by Main).** `Program::finish` now rejects, with the rule and pc:
+**AIE2P rule gate (`crates/peacemaker-npu/src/isa/rules.rs`, asked by Main).** `Program::finish` now rejects, with the rule and pc:
 unaligned branch targets (unless the 16-byte line before the target is whole NOP bundles — the form FastSlowCtl and
 the single-core `gemm_i8` ran exact with), any `ls`/`le`/`lc` write (hardware ZOL never looped on silicon), lock requests
 < 4 bundles apart, and branches/DONE/locks or landing targets inside the 5 delay slots. One violating unit test per rule;
@@ -534,7 +534,7 @@ Verdict: slope ≥ 1330 with swap and no exact wall win beyond same-window varia
 the 1067-cycle issue schedule are **not** same-cycle peer-A bank collisions, contrary to the bank model's attribution.
 
 ## 2026-10-02 23:36 UTC — Lever 3: memtile A ring depth KILLED, V10 prefix-ready B kept dark (npu levers df94050)
-Simulator first (`crates/pm-npu/tests/levers3.rs`, 19 tests: exact C, unchanged inputs, exact per-channel traffic, Fast and
+Simulator first (`crates/peacemaker-npu/tests/levers3.rs`, 19 tests: exact C, unchanged inputs, exact per-channel traffic, Fast and
 Slow, three-seed same-context runs with odd/even `kc*waves` and non-multiple-of-D chunk counts, 88-chunk prefix boundary);
 default V9/V10 bytes pinned by the new `golden_bytes.rs` (38 rows generated before the edit, green after). One hold, 42 s,
 all 50 checked submits exact (first + final of every loop), log hipx `~/qcal/npu-logs/levers-w3-df94050.log`.
@@ -594,8 +594,8 @@ the shipped expert shapes. Dense 27B: every shape has K ≥ 5120 (kc ≥ 80), ou
 slices (its log `npu-agents/dense27b/logs/dense27b/w1-be0be55.log`).
 
 ## 2026-10-02 23:20–23:57 UTC — railgun for the NPU: prepared / chained submit, lean TXN, persistent work ring (npu railgun 3dcfe06…4cdc078)
-Design note: `docs/npu/railgun-npu.md`. Code: `railgun::npu` (`Prepared`, `Chain`, `tape`), `crates/pm-npu/src/kernels/gemm_array_lean.rs`
-(lean TXN), `crates/pm-npu/src/kernels/ring.rs` (persistent ring P1), benches `npu-railgun` / `npu-ring`. Every silicon window
+Design note: `docs/npu/railgun-npu.md`. Code: `railgun::npu` (`Prepared`, `Chain`, `tape`), `crates/peacemaker-npu/src/kernels/gemm_array_lean.rs`
+(lean TXN), `crates/peacemaker-npu/src/kernels/ring.rs` (persistent ring P1), benches `npu-railgun` / `npu-ring`. Every silicon window
 below was followed by a clean V9 health window (exact, 24.9–25.7 TOPS, empty kernel log). All results exact.
 
 **Per-submit overhead split** (no-op = TXN with one WRITE32, same hwctx and arg BOs; `railgun-small-3dcfe06.log`): a
@@ -634,10 +634,10 @@ patch caught by the fresh-encode diff AND by the output check; ring skipped done
 reported, other 7 present); stale seq patch (0/16 words patched, no new done lines); ring overrun refused by the host
 guard (and deadlocks the MASKPOLL in the simulator); tape stale key (cache miss + `check_replay` mismatch, nothing
 submitted); hash collision (unit test). Simulator gates: `ring` 11, `lean` 8, `array` 59, `golden_bytes`, `levers3`,
-pm-npu 97 + oracle, railgun::npu 18.
+peacemaker-npu 97 + oracle, railgun::npu 18.
 
 ## 2026-10-03 00:15–00:16 UTC — railgun grouped expert launch: one TXN per E experts (npu railgun 9b3ec13 / 8058f2c)
-`crates/pm-npu/src/kernels/experts.rs` (`grouped_v9`): one START_CU whose TXN runs E experts of one projection back to back on
+`crates/peacemaker-npu/src/kernels/experts.rs` (`grouped_v9`): one START_CU whose TXN runs E experts of one projection back to back on
 one V9 PDI (one ConfigKey: every M ≤ 512 is one 512-row wave, so the design is identical for all experts): expert 0 the
 full body, experts 1..E−1 the lean body, each with its own A/B/C arena patches (distinct weights per expert). Optional
 single ring poll/done around the whole group (sim-proven; silicon runs below are ring=off). Simulator: 14 `experts` gates
@@ -672,7 +672,7 @@ GEMM of every step poisoned and verified (96/96 and 1600/1600 per run):
 | **V10 `--b-prefix`** | 511 → **412** | **32.56** | 239 → 131 | 8,816 / 15,824 B |
 
 ## 2026-10-03 01:02 UTC — Lever 4 (G80, 256×1280 wave, 128×80 core tile): EXACT, faster at every gate_up shape (npu levers 60c2648)
-Paper gates `docs/g80-feasibility.md`; simulator `crates/pm-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
+Paper gates `docs/g80-feasibility.md`; simulator `crates/peacemaker-npu/tests/g80.rs` 51/51 (gate_up 4096×1280×2560, expert M 64/160/200/513,
 odd/even resubmits, full/lean interleaves, grouped E=3), golden_bytes / levers3 / lean / ring green. Declared risky, approved by
 Main, run alone: 34 s, all 36 checked submits exact (first + final of every loop), V9 health check after (25.39 / 25.04, exact),
 rc=0, accel0 present. Log hipx `~/qcal/npu-logs/levers-w6-60c2648.log`. Single GEMM per submit, busy / wall TOPS (µs/submit):

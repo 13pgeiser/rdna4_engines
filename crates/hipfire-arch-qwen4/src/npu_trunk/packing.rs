@@ -17,7 +17,7 @@
 //!
 //! # Layout
 //!
-//! pm-npu's canonical G80 `pack_b` takes a row-major `B[k][n]` of one 1280-column panel.
+//! peacemaker-npu's canonical G80 `pack_b` takes a row-major `B[k][n]` of one 1280-column panel.
 //! Each selected W8 row (one fused column) is decoded once and transposed straight into one
 //! reused `K × 1280` panel scratch (zeroed per panel, so ragged final panels are zero
 //! padded); the full fused W8 matrix is never materialised. Panel preparation
@@ -25,11 +25,11 @@
 
 use rayon::prelude::*;
 
-use pm_npu::kernels::gemm_array::ArrayDesign;
-use pm_npu::kernels::gemm_core::{Control, Epilogue};
-use pm_npu::kernels::gemm_g80::design_g80;
-use pm_npu::kernels::gemm_g80_n512::design_g80_n512;
-use pm_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
+use peacemaker_npu::kernels::gemm_array::ArrayDesign;
+use peacemaker_npu::kernels::gemm_core::{Control, Epilogue};
+use peacemaker_npu::kernels::gemm_g80::design_g80;
+use peacemaker_npu::kernels::gemm_g80_n512::design_g80_n512;
+use peacemaker_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
 
 use super::shapes::{
     ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
@@ -59,7 +59,7 @@ pub struct LayerTrunkRefs<'a> {
 /// One layer's fused `B`: the G80-packed panels, the padded per-column scales and the column map.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackedB {
-    /// `map.panel_count()` panels, each in pm-npu G80 `pack_b` layout for `K = 2560`, `N = 1280`.
+    /// `map.panel_count()` panels, each in peacemaker-npu G80 `pack_b` layout for `K = 2560`, `N = 1280`.
     pub panels: Vec<Vec<u8>>,
     /// Per fused column row scale `ws_n`, zero padded to `map.padded_cols()`.
     pub ws: Vec<f32>,

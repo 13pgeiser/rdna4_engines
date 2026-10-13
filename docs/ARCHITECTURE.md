@@ -42,7 +42,7 @@ crates/
 ├── redline/                 # experimental direct-KMD / bare-libdrm research
 ├── redline-dispatch/        # retained-tape record/replay + plan selection
 ├── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
-├── pm-npu/                  # XDNA2/AIE2P program builder + CPU simulator — experimental, dark
+├── peacemaker-npu/          # XDNA2/AIE2P program builder + CPU simulator — experimental, dark
 └── npu-tools/               # XDNA2 NPU binaries (railgun --features npu) — experimental, dark
 ```
 
@@ -67,7 +67,7 @@ operator runtime.
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline path (see below) |
 | Direct-KMD research | `redline`, `saddle-lab`, `hipfire-pflash` | Not the serving transport |
-| NPU research (dark) | `pm-npu`, `railgun` feature `npu`, `npu-tools` | XDNA2/AIE2P emitter, simulator, direct-amdxdna runtime and probes; no daemon/engine path calls them ([`npu/README.md`](npu/README.md)) |
+| NPU research (dark) | `peacemaker-npu`, `railgun` feature `npu`, `npu-tools` | XDNA2/AIE2P emitter, simulator, direct-amdxdna runtime and probes; no daemon/engine path calls them ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
 
