@@ -8,9 +8,9 @@ Bring-up narrative is historical:
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-19 |
-| Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
-| Page state | **shipped / ref-pinned** for source-wired multi-device behavior (see [`INDEX.md`](INDEX.md)); performance tables in the appendix are **historical** only |
+| Inventory date | 2026-10-13 |
+| Audited source ref | `c7a732ad5b921706519cdba30fdb43a7e62aa2d4` (`origin/beta`) |
+| Page state | **shipped / ref-pinned** for source-wired multi-device behavior (see [`INDEX.md`](INDEX.md)); the [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13) tables are **measured** (fixture-bound, dated, not promises); the appendix tables are **historical** only |
 | Orchestration | `crates/hipfire-runtime/src/multi_gpu.rs` |
 | PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
 | Daemon load / refusals | `crates/hipfire-daemon/src/main.rs` |
@@ -19,20 +19,25 @@ Bring-up narrative is historical:
 
 ## Modes
 
-Two multi-device modes exist. They are **mutually exclusive** at load
-(`tp > 1 && pp > 1` → error).
+Three multi-device routes exist. PP and `tp` are **mutually exclusive** at load
+(`tp > 1 && pp > 1` → error); Flash-Next expert parallelism (`topology.ep`)
+cannot be combined with either (`pp` or `tp` ≠ 1 is refused when `ep > 1`).
 
 | Mode | Load knob | What it does | Source-wired runtime surface (audited ref) |
 |---|---|---|---|
 | **Pipeline parallel (PP)** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; residual stream crosses bands via `boundary_copy` | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
 | **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `hipfire serve --tp N` → `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
+| **Flash-Next expert parallel (EP2 / EP4)** | config `topology.ep` (`hipfire config set topology.ep N`; env `HIPFIRE_TOPOLOGY_EP`; default `1`, allowed `1`/`2`/`4`; `HIPFIRE_QWEN4_EP=0` forces `1`). **Not `--tp`.** | Routed experts shard by id (`e % N`); every rank holds the whole trunk and runs the unchanged single-device program on its own worker thread; a copy-only owner exchange feeds the unchanged slot-order combine. **Opt-in, experimental.** | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on exact **gfx1201** only, 2 or 4 ranks, every directed card pair peer-accessible (Qwen4 carrier, `load_qwen4_rank`; admission in `crates/hipfire-loader/src/admission.rs`) |
 
-`pp = 1` and `tp = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
+`pp = 1`, `tp = 1` and `ep = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
 
 **None of the listed PP/EP routes is an admission or product default.**
 [`admissions.yml`](admissions.yml) has no multi-GPU records at schema v2 (the sole earned row is single-GPU `pp=tp=1`).
 Source-wired means the load path exists in runtime at the audited ref — not that
-it is promoted.
+it is promoted. Flash-Next EP is opt-in (`topology.ep` defaults to `1`) and
+carries the `experimental` lifecycle status in [`CONFIG.md`](CONFIG.md); the
+defaults listed in [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status)
+apply only once `topology.ep` is set to `2` or `4`.
 
 **PP is not tensor-parallel serving.** It does not give multi-user throughput.
 It is a **capacity** tool: fit larger context / larger HFQ weights by splitting
@@ -40,8 +45,20 @@ layers. **No speedup is promised** for models that already fit on one card;
 current historical measurements on one 2× gfx1100 station were slower under
 sequential PP=2 (see [Appendix A](#appendix-a-historical-pp-evidence-immutable)).
 
+## Which mode for which model
+
+| Model / situation | Cards | Use | Why |
+|---|---|---|---|
+| Qwen3.8 Flash-Next (Qwen4) | 2 or 4 gfx1201 | **EP** (`topology.ep` = 2 or 4) | Experts are what does not fit one card: EP2 keeps 30 of 49 routed layers in VRAM per rank (19 host-mapped), EP4 keeps all 49, and EP2 prefill is measured faster than one card ([Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)). EP4 prefill has no owner-routed path yet (see status). |
+| MiniMax-M2, DeepSeek V4 Flash | 2+ | **EP via `--tp N`** | The `load_model_ep` route above; no admission, no measured numbers on this page. |
+| Dense Qwen 27B-class that fits one card (registry weights: 11.78 GB for `qwen3.8:27b-mq3-xt`, [`MODELS.md`](MODELS.md); the historical probe in Appendix A shows about 15.5 GB for the mq4 27B proxy) | 2+ | **One model per card** (one daemon per card, each pinned by `hardware.devices`; the per-card lock makes two daemons asking for `gfx1201` get different cards) or **batched serving** on one card ([`SERVE.md`](SERVE.md) continuous batching) rather than splitting | Splitting a model that already fits adds cross-card traffic and, under PP, a sequential decode penalty; it does not buy multi-user throughput. |
+| Qwen3.5 / 3.6 HFQ that does not fit one card at the wanted context | 2+ | **PP** (`params.pp`) | PP is a **capacity** tool, not a speedup: historical PP=2 decode measured about two thirds of single-card decode on short prompts (Appendix A). |
+
 **CLI note:** the shipped CLI forwards **`tp`** (`HIPFIRE_TP` / `--tp`) on serve
-load messages. **`params.pp` is not a first-class CLI flag today** — set it on a
+load messages; that is the knob for MiniMax-M2 / DeepSeek V4 Flash. **Do not
+pass `--tp` for Flash-Next:** with `topology.ep > 1` a load with `tp` ≠ 1 is
+refused (`cannot combine with pipeline/tensor parallelism`); use
+`topology.ep`. **`params.pp` is not a first-class CLI flag today** — set it on a
 raw daemon JSONL `load` (or any client that builds that message). Examples and
 `scripts/pp-gate.sh` do this directly.
 
@@ -223,7 +240,7 @@ cargo run --release -p hipfire-daemon
 # then send the load JSON above on stdin
 ```
 
-### EP load (CLI)
+### EP load (CLI): MiniMax-M2 / DeepSeek V4 Flash (`--tp`)
 
 ```sh
 HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
@@ -232,6 +249,59 @@ HIPFIRE_DEVICES=gfx1201,gfx1201 hipfire serve <minimax-or-deepseek4-tag> --tp 2
 
 EP does not honor a non-default `--kv-mode` the same way single-GPU load does
 today — the CLI warns when both are set. Reload without a DFlash draft for EP.
+
+### Flash-Next EP: enabling and status
+
+Flash-Next (Qwen3.8 Flash-Next, Qwen4, registry tag `qwen3.8:flash-next`) uses
+`topology.ep`, not `--tp`:
+
+```sh
+# two (or four) distinct gfx1201 cards, in logical order
+hipfire config set hardware.devices gfx1201,gfx1201     # or HIPFIRE_DEVICES=…
+hipfire config set topology.ep 2                         # or HIPFIRE_TOPOLOGY_EP=2; 4 for EP4
+hipfire serve qwen3.8:flash-next
+# optional: native MTP under EP is opt-in, `auto` stays AR
+hipfire serve qwen3.8:flash-next --spec mtp
+```
+
+`HIPFIRE_QWEN4_EP=0` forces `topology.ep = 1` whatever the config says. The
+first `ep` visible gfx1201 cards become the ranks. The load is refused (naming
+`topology.ep`) when `pp` or `tp` is not `1`, when device 0 is not gfx1201, when
+fewer than `ep` devices are visible, or when a directed card pair is not
+peer-accessible; EP also refuses DFlash, DSpark, n-gram drafting, DDTree,
+adaptive KV, drafters, CASK, PFlash, lane batching and the retained Redline
+default, and `HIPFIRE_MTP_SAMPLED_MODE=naive`. EP decode is eager (no graph
+capture).
+
+| | EP2 | EP4 |
+|---|---|---|
+| Load / decode / verify / native MTP (`--spec mtp`) | Supported (opt-in, experimental) | Supported (opt-in, experimental) |
+| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0` | On by default under EP (same switch); the decode numbers on this page are EP2 |
+| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` | **Refused at admission** with `EP4 owner-routed prefill not yet gated` until its hardware cells have run; EP4 keeps the full-table chunk route (replicated prefill, peer experts read over P2P) |
+| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (needs S1) |
+| Routed layers resident per rank at 32K context | 30 of 49 (19 host-mapped), +0.34 GiB headroom | 49 of 49, +3.77 GiB headroom |
+
+For the three levers, exactly `0` is off and unset or any other value is on
+(they follow one rule, `ep_lever_on`). Single-card (`ep = 1`) behavior is
+unchanged by all of them. The per-rank load log states what ran (`qwen4 EP
+rank r/n: balanced ownership on N host-mapped MoE layers`; `owner-routed
+prefill on …` or `owner-routed prefill not admitted (reason)`).
+
+**Exactness.** Under EP the output is bit-identical to the same build on one
+card, not merely close. Evidence (`fn_ep_oracle` and the serve harnesses, 2×/4×
+R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`; fixture-bound):
+
+- EP2 and EP4 AR decode: logits and per-request state match one card at every
+  step over 256 greedy tokens (ctx 512, 8192, 32768).
+- Native MTP: greedy tokens, per-window results and trunk/head/drafter state
+  match one card on EP2 (34/34 compared) and EP4 (52/52); greedy MTP equals AR.
+- Sampled MTP (T 0.6, top-p 0.95, top-k 20, seed 7, two fresh processes) on
+  EP2 with the defaults above: tokens, windows and state identical to one card,
+  and per-seed stable. **No sampled-MTP oracle was run on EP4**, and no EP4
+  hardware cell exists for S1/S2 (it is refused).
+- S1 + S2 on EP2: 25 of 25 compares against one card pass (greedy AR and MTP at
+  p8k and p16k, a 4,396-token prompt whose last chunk is 300 rows, bitwise chunk
+  digests at layers 0/2/3/31/47); flag-off EP2 equals the previous EP2.
 
 ### Flash-Next EP: balanced expert ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
 
@@ -261,7 +331,7 @@ forwards (more than 8 rows) and the MTP head keep the static split. With
 added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
-### Flash-Next EP2/EP4: owner-routed prefill chunks (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`)
+### Flash-Next EP2/EP4: owner-routed prefill chunks (default on under EP2; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
@@ -356,6 +426,11 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
 | `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
+| `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1`/`2`/`4`); **not** `--tp` |
+| `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
+| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers; on under EP, exact `0` disables |
+| `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP2: owner-routed prefill chunks; on under EP2, exact `0` disables; EP4 refused at admission |
+| `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP2: long-prefill expert staging; on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
 | `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
@@ -384,6 +459,10 @@ string or a blanket “always refuse at load.”
 | `bench_prefill` / multi-GPU EP | Daemon refuses bench_prefill when `pp>1` or EP is active |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
+Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, non-gfx1201, too few
+devices, missing peer access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
+`HIPFIRE_MTP_SAMPLED_MODE=naive`; EP4 owner-routed prefill): see
+[Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
 Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
 `speculation = "mtp"` (`speculation.mtp = on`, `--spec mtp`) takes the spec route.
@@ -436,6 +515,75 @@ PP KV policy for Qwen3.5 multi-GPU defaults through `QWEN35_PP_POLICY` (see
 PP and dense TP / MoE EP have no native constructor, so `auto` is `q8/q8` on
 every arch there (gfx1201 included), and PP accepts only `q8`, `fwht2`,
 `fwht3` and legacy `legacy-asym3` K.
+
+## Measured: Flash-Next EP on 2× R9700 (2026-10-13)
+
+> **Truth state: measured, fixture-bound** ([`INDEX.md`](INDEX.md)). These are
+> observations on the named fixture, binaries and date below — **not** promises,
+> floors, defaults or admissions. They were taken on the pre-merge branch build
+> that became the Flash-Next S1/S2 entries of the 0.4.2 changelog, not re-run on
+> the audited ref, and become **historical** the moment the code, the fixture
+> or the cards change. Any other model, prompt length or card pair is
+> unmeasured here.
+
+| Field | Value |
+|---|---|
+| Date | 2026-10-13 |
+| Hardware | 2× Radeon R9700 (gfx1201), EP2, peer access on |
+| Model | Qwen3.8 Flash-Next MQ4 XTS, sha256 prefix `8b15b6fe` |
+| Binaries (md5 prefixes) | prefill: `ade91299` daemon, `83c40bb1` CLI (S1+S2 build, flags forced on); default-on re-run: `6eeeed5f` daemon, `ac01b942` CLI; decode no-trade: `f7970c02` daemon, `2a9a2091` CLI |
+| Single-card arm | same binary, `topology.ep = 1` |
+| EP2 arm | S1 + S2 + balanced owners on (S1/S2 default on in the default-on re-run) |
+
+### Prefill (`hipfire bench --spec off`)
+
+Method: committed prompts (p8k 9,319 tokens, md5 prefix `c3ccdc43`; p16k 16,343
+tokens, md5 prefix `68b768d0`), warm (`--runs 1 --warmups 1` per process), **3
+fresh processes per arm**, arms interleaved, median of the three, prefill
+tok/s.
+
+| Prompt | Single card (3 runs) | Median | EP2 (3 runs) | Median | EP2 / single |
+|---|---|---|---|---|---|
+| p8k | 3030.1 / 3034.0 / 3032.5 | 3032.5 | 3942.3 / 3946.4 / 3942.6 | 3942.6 | 1.300 |
+| p16k | 3754.7 / 3752.1 / 3753.9 | 3753.9 | 4301.6 / 4307.6 / 4308.4 | 4307.6 | 1.147 |
+
+Every EP2 run was above the single-card median at both lengths. A
+default-flags re-run at p8k (no `HIPFIRE_EP_*` set, three fresh processes per
+arm, interleaved) gave single 3039.8 / 3037.4 / 3035.2 (median 3037.4) and EP2
+3948.1 / 3941.6 / 3936.7 (median 3941.6), ratio 1.298. **EP4 prefill was not
+measured** (S1 is refused on EP4); the changelog's earlier EP4 run measured a
+42-token prompt at 408 ms to first token against 286 ms on one card.
+
+### Decode: no trade for the prefill levers (EP2)
+
+Method: `hipfire bench --runs 3 --warmups 2 --max-tokens 256`, greedy, 3 fresh
+processes per arm, one round, EP2 with balanced owners only ("W1 only") against
+S1 + S2 on ("combined"). Short outputs; decode tok/s, not end-to-end.
+
+| Workload | W1 only (3 runs) | Median | Combined (3 runs) | Median | Change |
+|---|---|---|---|---|---|
+| MTP code | 84.0 / 84.0 / 85.3 | 84.0 | 85.1 / 84.1 / 83.6 | 84.1 | +0.1 % |
+| MTP prose | 61.7 / 62.2 / 65.6 | 62.2 | 61.4 / 65.9 / 65.9 | 65.9 | +5.9 % (noise: the W1-only arm itself spans 61.7–65.6) |
+| AR code | 50.4 / 50.4 / 50.5 | 50.4 | 50.2 / 50.3 / 50.3 | 50.3 | −0.2 % |
+
+Resident routed layers per rank are identical in both arms (29 of 49 under MTP,
+30 of 49 under AR). Read this as "S1/S2 did not slow decode on this fixture",
+not as a speedup.
+
+### Decode against one card (changelog-reported, EP work window 2026-10-11 to 2026-10-13)
+
+Same pinned model, R9700s, greedy, committed prompts, 3 fresh processes per
+arm, `hipfire bench`; the per-run receipts are held by the maintainers.
+
+| Workload | One card | EP2 | EP4 |
+|---|---|---|---|
+| MTP code (`humaneval_0`, 134 tokens), tok/s | 44.4 | 81.7 | 121.6 |
+| MTP prose (`fiction_lighthouse`, 44 tokens), tok/s | 34.5 | 63.4 | 87.1 |
+| AR decode, tg128 `--spec off`, tok/s | 36.1 | — | 61.2 |
+
+These are short outputs and decode tok/s, not end-to-end. The changelog line
+does not record which `HIPFIRE_EP_*` defaults were in force for the EP2 rows,
+and the AR row is one card against EP4 only.
 
 ## Validation routes
 
@@ -510,6 +658,14 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 > above supersede any stronger claim language inside the retained body
 > (including “measured”, “Status: v1 feature-complete”, absolute speedup
 > wording, and gate-as-acceptance framing).
+>
+> **What the appendix tables are.** The July 2026 tables below (PP=2 VRAM
+> probe and PP=2 throughput baseline) were taken on 2× Radeon RX 7900 XTX
+> (gfx1100) for Qwen3.5-family models, with **short prompts only** (15 to 322
+> tokens), before expert parallelism for Flash-Next existed. They are
+> **historical**, not evidence for any current route, and are superseded for
+> Flash-Next by the dated [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)
+> section, which is a different model, different cards and 8k to 16k prompts.
 
 # Multi-GPU Pipeline-Parallel
 
