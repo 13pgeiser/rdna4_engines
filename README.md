@@ -6,13 +6,13 @@
 
 <p align="center">
   <strong>Fast, AMD-native LLM inference — RDNA-first, CDNA-supported.</strong><br />
-  Rust + HIP + Redline. No Python in the hot path. Ollama-style UX.
+  Rust + HIP + Redline. No Python in the hot path. Simple pull, serve, and chat UX.
 </p>
 
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.1" src="https://img.shields.io/badge/stable-v0.4.1-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.1-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="89 curated registry entries" src="https://img.shields.io/badge/registry-89%20curated%20entries-ff8a1f?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="90 curated registry entries" src="https://img.shields.io/badge/registry-90%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -33,12 +33,17 @@ hipfire chat qwen3.8:27b-mq4-xts
 That pulls about 15 GB and wants a 24 GB+ card or Strix Halo. On smaller cards,
 start with `qwen3.5:4b` (or `qwen3.5:9b`) in the same commands.
 
-Qwen3.8 Flash-Next (MoE, up to 262K context on one R9700 or Strix Halo):
+Qwen3.8 Flash-Next (MoE; about 125 GB of base weights, plus sidecars):
 
 ```bash
 hipfire pull qwen3.8:flash-next
 hipfire serve qwen3.8:flash-next -d
 ```
+
+Flash-Next needs a large memory budget, not just a 32 GB card: use a
+128 GB Strix Halo system or an R9700 with sufficient host RAM for mapped
+experts. Up to 262K native context is supported on these routes subject to
+available memory; see [GPU-tier recommendations](docs/PICK-A-MODEL.md).
 
 One-shot inference uses the same model registry and serving stack:
 
@@ -50,7 +55,7 @@ Image generation (first release; RDNA3/3.5 measured):
 
 ```bash
 hipfire pull flux.schnell:1
-hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
+hipfire img --out x.png flux.schnell:1 "a red cube on a wooden table"
 ```
 
 The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
@@ -75,39 +80,32 @@ Not sure which model fits your card? See
 
 Current stable release: **[v0.4.1](https://github.com/warpfront/hipfire/releases/tag/v0.4.1)**.
 
-**Qwen3.8 Flash-Next `qwen3.8:flash-next` on Strix Halo (gfx1151).** Single
-stream, median of 3 fresh processes:
+## Coming in 0.4.2 (beta)
 
-- **Decode:** 58.7 tok/s greedy with native MTP; 56.98 tok/s sampled with a
-  presence penalty.
-- **Prefill:** 2,072.9 tok/s at pp8192 and 1,776.5 tok/s on a 32K prompt.
-- **Decode holds at depth:** 51.6 / 58.9 / 52.6 tok/s at 8K / 32K / 128K
-  (Ciru prompt files).
-- **Tool use:** the 15 hard tool-calling tasks (TC70–84) score 23/30 in
-  162.9 s (median of 3 seeds); HermesAgent-20 scores 95 / 96.
+- **Flash-Next EP2:** owner-routed prefill and expert staging default on
+  when admitted on two R9700s (gfx1201). EP4 owner-routed prefill remains
+  refused; this is not a refusal of every EP4 route. See
+  [multi-GPU serving](docs/multi-gpu.md).
+- **Flash-Next NPU route:** `fusions.npu_trunk = "auto"` defaults on for
+  eligible Strix Halo (gfx1151) systems with an open XDNA2 NPU and matching
+  calibration. Refused or unsupported systems use GPU-only execution.
+  Set `HIPFIRE_QWEN4_NPU_TRUNK=off` to disable it. See
+  [configuration](docs/CONFIG.md).
+- **Engine YaRN:** checkpoint YaRN RoPE scaling and the
+  `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR` override make extended
+  context available where the model and memory budget admit it. See
+  [configuration](docs/CONFIG.md).
+- **Halo sidecars:** `hipfire pull` fetches the Flash-Next zab trunk
+  overlay, applied automatically on gfx1151; q4 PLE also defaults on
+  there when its sidecar is present.
+- **Qwen3.8-27B paired DFlash:** defaults on when the registry-paired draft
+  is installed; without it, MTP stays `auto`. See the
+  [model-scoped default and kill switch](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
 
-**Qwen3.8-27B `qwen3.8:27b-mq4-xts`** (MQ4 XTS) on 7900 XTX / R9700 / Strix Halo,
-median of 3:
-
-| | 7900 XTX | R9700 | Strix Halo |
-|---|---:|---:|---:|
-| pp8192, prompt tok/s | 3,021.5 | 5,166.1 | 1,192.7 |
-| Native MTP decode, tok/s (greedy, 8 mixed prompts) | 87.5 | 68.0 | 27.5 |
-| DFlash decode (opt-in), tok/s (greedy, 8 mixed prompts) | 131.7 | 123.3 | 43.2 |
-
-In 0.4.2, Qwen3.8-27B defaults to DFlash when its registry-paired draft is
-installed; without it, MTP stays `auto`. See the
-[model-scoped default and kill switch](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
-
-On code prompts, DFlash on the R9700 reaches a median of 238.7 tok/s.
-
-Also in v0.4.1: an engine-owned **session cache** for Flash-Next prompt reuse
-(building on @fivetide's #825 / #826), **exact tokenization** matching Hugging
-Face byte-BPE whitespace handling, and **PeaceMaker** kernels for Flash-Next.
-Numbers are self-measured; fixtures and methods are in the release notes. See
-[CHANGELOG.md](CHANGELOG.md), the
-[v0.4.1 GitHub release](https://github.com/warpfront/hipfire/releases/tag/v0.4.1),
-and [hipfire.dev/benchmarks/0.4.1](https://hipfire.dev/benchmarks/0.4.1).
+See [CHANGELOG.md](CHANGELOG.md) for the complete beta feature list and
+release measurements. [BENCHMARKS.md](docs/BENCHMARKS.md) explains fixture
+identity and admission requirements; its retained tables and older release
+measurements are historical, not current product baselines.
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -145,37 +143,13 @@ changes fail closed to ordinary HIP dispatch.
   <img width="1200" alt="Hipfire runtime and Redline validated replay path, with fail-closed ordinary HIP fallback" src="docs/assets/readme/redline-runtime.svg" />
 </p>
 
-### Qwen 3.6 35B-A3B MQ4R performance
+### MQ4R measurement history
 
-Ordinary autoregressive decode with Q8 KV. No MTP, DFlash, speculative
-acceptance, reduced-output benchmark, or manual clock pinning.
-
-<p align="center">
-  <img width="1200" alt="MQ4R ordinary autoregressive decode performance: gfx1100 253.3 tokens per second, gfx1151 115.1 tokens per second, gfx1201 203.9 tokens per second" src="docs/assets/readme/mq4r-performance.svg" />
-</p>
-
-| GPU | Architecture | TG128 AR | 8-turn average | Final-turn context | Final-turn speed | Health |
-|---|---:|---:|---:|---:|---:|---|
-| Radeon RX 7900 XTX | gfx1100 | **253.3 tok/s** | **191.0 tok/s** | 18.2K | **160.3 tok/s** | 8/8 clean |
-| Radeon 8060S / Strix Halo | gfx1151 | **115.1 tok/s** | **92.2 tok/s** | 21.3K | **82.5 tok/s** | 8/8 clean |
-| Radeon AI PRO R9700 | gfx1201 | **203.9 tok/s** | **169.5 tok/s** | 22.2K | **146.7 tok/s** | 8/8 clean; both recall probes 3/3 |
-
-Short-context measured ranges:
-
-| Architecture | Minimum | Median | Maximum |
-|---|---:|---:|---:|
-| gfx1100 | 253.04 | **253.31** | 253.48 tok/s |
-| gfx1151 | 115.02 | **115.10** | 115.18 tok/s |
-| gfx1201 | 203.42 | **203.93** | 204.04 tok/s |
-
-The eight-turn column is the mean decode speed across the user-facing
-multi-turn serving run. Final-turn context is reported explicitly because
-the three recorded sessions did not all terminate at exactly 22K.
-
-The gfx1201 campaign raised ordinary MQ4R autoregressive decode from
-approximately 110 tok/s to 203.9 tok/s. See the
-[gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md)
-and [Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md).
+The sealed MQ4R measurements and their methods are preserved in the
+[gfx1201 campaign report](docs/perf-checkpoints/2026-07-13-redline-mq4r-110-to-204.md).
+These are historical fixtures, not current product performance claims.
+See [BENCHMARKS.md](docs/BENCHMARKS.md) for claim requirements and the
+[Redline integration boundary](crates/redline-dispatch/HIPFIRE-GRAFT.md).
 To reproduce the sealed TG128 route, model, and sampling fixture on a supported
 GPU, run `python3 -m tools.redline golden`; the
 [Golden Redline guide](docs/GOLDEN-REDLINE.md) also covers making the validated
@@ -184,7 +158,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 89 curated entries (models, quant variants and
+The bundled registry currently contains 90 curated entries (models, quant variants and
 draft sidecars) plus 82 aliases. Run
 `hipfire list -r` to see the authoritative live list.
 
@@ -229,9 +203,9 @@ bring-your-own-model flows through `hipfire quantize`.
 | RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA4 | `gfx1200`, `gfx1201` | WMMA paths and validated retained-PM4 MQ4R route |
 
-Optimized kernel families are RDNA3/3.5 (gfx11) and RDNA4 (gfx12) via WMMA; other architectures — including `gfx906`/`gfx908` and `gfx94x` (CDNA/MI300X) — run correctly via the portable/fallback path. See `AGENTS.md:157` (MQ3 production on gfx11/gfx12; gfx906/gfx94x fallback) and `crates/rdna-compute/src/arch_caps.rs:124` (`has_wmma = is_rdna3 || is_rdna4`).
-
-hipfire is extracting a substrate layer called **saddle** (`crates/saddle-core`) to make per-target compute backends — RDNA today, CDNA and potentially XDNA later — first-class rather than fallbacks. It is partially built; see [saddle design grounding](docs/governance/2026-08-15-saddle-design-grounding.md) §3 for the proposed layering.
+Optimized kernel families are RDNA3/3.5 (gfx11) and RDNA4 (gfx12) via WMMA;
+other architectures run through portable or architecture-specific fallback
+paths. Support for a GPU family does not imply every optimized route is admitted.
 
 Architecture-specific kernels are selected through typed dispatch tables.
 Unsupported specializations return to the correct portable or architecture
@@ -251,50 +225,18 @@ Redline removes launch overhead after the ordinary graph has been proven
 safe. It does not replace the model implementation or bypass hipfire's
 correctness gates.
 
-## Performance snapshots
+## Performance and lifecycle
 
-### Historical — 7900 XTX (gfx1100)
+See [BENCHMARKS.md](docs/BENCHMARKS.md) for historical measurements and the
+requirements for fixture identity, measurement methods, and admission. Historical
+release results remain in [CHANGELOG.md](CHANGELOG.md) and the immutable
+[performance checkpoint ledger](docs/perf-checkpoints/).
 
-Historical decode snapshot measured with the then-default asym3 KV
-configuration (FlashAttention auto):
-
-| Model | hipfire decode | hipfire prefill (peak) | vs ollama Q4_K_M |
-|---|---:|---:|---:|
-| Qwen 3.5 0.8B | **391** | 7383 | **2.10×** decode |
-| Qwen 3.5 4B | **180** | 2487 | **1.78×** decode |
-| Qwen 3.5 9B | **132** | 1663 | **1.71×** decode |
-| Qwen 3.5 27B | **47** | 478 | — |
-
-Historical DFlash measurements using the legacy asym3 / max=120 method
-reached **218 tok/s peak on 27B HumanEval/53** (4.45× over AR) and
-**372 tok/s peak on 9B**. These numbers are retained for historical
-context; they are not current performance baselines. Current DFlash
-claims use q8 / max=256 with prompt and binary hashes recorded. See
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
-and methodology notice.
-
-### RDNA4 (gfx1201, Radeon AI PRO R9700)
-
-| Model | Config | Decode tok/s |
-|---|---|---:|
-| Qwen2 1.5B HFQ4 | single GPU | **266** |
-| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 3` (EP) | **53.1** |
-| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 4` (EP) | **54.3** |
-| DeepSeek V4 Flash (82 GB MQ2-Lloyd, superseded SKU) | 4× R9700, `hipfire serve --tp 4` (EP) | 25.6 |
-| Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
-
-The DeepSeek V4 Flash rows are n=3 fresh-process medians on
-`deepseek-v4-flash-0731.mq2r` (sha256 `cbf2bbcf…`), greedy, speculation off,
-`--kv f32`, 2052-token prompt. MQ2R is the current `deepseek-v4-flash` SKU and
-roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
-not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
-389 tok/s) and leaves a fourth card free.
-
-PFlash (prefill compression) is deprecated and will be removed in 0.5.0: off
-by default, not supported; enabling it prints a deprecation warning.
-CASK / TriAttention KV eviction is deprecated and will be removed in 0.5.0:
-off by default, not supported, and not a recommended setting; loading with a
-CASK option prints a deprecation warning.
+PFlash prefill compression, CASK / TriAttention KV eviction, Givens/asymmetric
+KV modes, and legacy DFlash knobs are deprecated since 0.4.0, unsupported,
+and scheduled for removal in 0.5.0. They are not recommended settings or
+current performance baselines. See [configuration](docs/CONFIG.md) for the
+supported settings and [validation](docs/VALIDATION.md) for current gates.
 
 ## Install
 
@@ -366,50 +308,6 @@ podman run --rm -it --device /dev/kfd --device /dev/dri \
   hipfire run qwen3.5:4b "2+2="
 ```
 
-## Inspiration: Lucebox
-
-hipfire's DFlash work was substantially shaped by Davide Ciffa's
-[Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b) — a
-standalone C++/ggml/CUDA DFlash for Qwen 3.5-27B on a single RTX 3090.
-Different stack, different vendor — but Lucebox's blog gave us
-concrete published numbers to target, n_gen-aware bench methodology,
-and pointers at where the fat is. Cached snapshot at
-`.research-cache/lucebox-dflash27b.html` for forensic reproducibility.
-
-## Inspiration: gfx906 (MI50/MI60) optimizations
-
-hipfire's gfx906 prefill MMQ kernel and AR-decode optimizations were
-shaped by two community forks of `llama.cpp` that target Vega 20:
-
-- **[iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)**
-  — the original fork that ported and tuned gfx906-specific code paths
-  (warp-cooperative GEMV via half-wave split, Y-tile prefetch via
-  inline-asm `global_load_dword`, `__builtin_amdgcn_readfirstlane`-based
-  SGPR hoisting, separate HBM-load → register-cache → LDS-store
-  pipelining in the MMQ body). The "2602.01 version" commit
-  `eec153c086df6a9e7a69499bea3639597c085fff` was the canonical reference
-  we audited against.
-- **[skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)**
-  — fork-of-fork that propagates iacop's optimizations (commit
-  `42c298c` "port iacop optimizations") and tracks upstream more
-  aggressively. The accompanying
-  [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
-  is the best public reference for gfx906 ISA quirks (LDS bank-conflict
-  patterns at stride 32, dp4a issue-rate ceiling, Q8_1 activation
-  layout) — we used it as a sanity-check for several PMC-driven
-  redesign decisions.
-
-And of course an extra shout-out to `ggml-org/llama.cpp` itself: the
-templated `mmq_x` body in `mul_mat_q.cu` was the architectural scaffold
-we ported to gfx906 (templated mmq_x ladder, per-thread accumulator
-layout, MMQ_TILE_NE_K=32 sub-block factoring, Q8_1 quantize math). The
-inner loop is gfx906-specific; the outer shape is descendant.
-
-A standalone gfx906 perf investigation log is at
-[`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
-the prefill MMQ redesign log is at
-[`docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`](docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
-
 ## Documentation
 
 | Page | Topic |
@@ -422,11 +320,11 @@ the prefill MMQ redesign log is at
 | [CONFIG.md](docs/CONFIG.md) | Every config key and env override |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
-| [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
+| [BENCHMARKS.md](docs/BENCHMARKS.md) | Historical measurements and performance claim requirements |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, KV cache modes (q8 / fp8 / fwht; legacy asym), FWHT math |
 | [CONTAINER.md](docs/CONTAINER.md) | Runtime and GPU gate-runner containers |
-| [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
+| [multi-gpu.md](docs/multi-gpu.md) | Multi-GPU serving — EP, TP, pipeline parallelism, budgets and refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
 | [HIPFIRE-GRAFT.md](crates/redline-dispatch/HIPFIRE-GRAFT.md) | Redline integration and enablement boundary |
 
