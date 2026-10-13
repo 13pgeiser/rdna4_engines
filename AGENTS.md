@@ -262,7 +262,8 @@ DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
 # lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
 # measured draft identity (acceptance/perf pin):
-#   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+#   a local copy of the registry draft (same bytes as the
+#   qwen38-27b-dflash-mq4.hfq sidecar)
 #   (see §5 "Pinned Hugging Face bench fixture")
 
 # Smaller / faster smoke only (not the acceptance fixture):
@@ -378,7 +379,8 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 - Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
   (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
 - Measured draft identity (acceptance/perf pin):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
+  a local copy of the registry draft (same bytes as the
+  `qwen38-27b-dflash-mq4.hfq` sidecar; see §5)
 
 Still pullable (smaller smoke / historical):
 
@@ -494,7 +496,7 @@ hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
 # Qwen3.8-27B paired tiers need no config: the registry resolves dflash=auto.
 # Other models: hipfire config set dflash_mode auto    # opt in (schema default: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
-# export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+# export HIPFIRE_DFLASH_DRAFT=/path/to/local-copy-of-registry-draft.hfq   # same bytes as the qwen38-27b-dflash-mq4.hfq sidecar
 hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
 # on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
@@ -599,8 +601,8 @@ The canonical dense trunk is whichever local artifact byte-matches
   three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
   2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
   comparable.
-- Paired draft (the registry sidecar `qwen38-27b-dflash-mq4.hfq`, same bytes):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
+- Paired draft: the registry sidecar `qwen38-27b-dflash-mq4.hfq`, or a local
+  copy of the registry draft (the same bytes)
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
 Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
@@ -625,7 +627,7 @@ update it with the pin.
 Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
 code object v6). Each pin is reproduced in two fresh processes with separate
 HOME directories. gfx1201/gfx1100 use empty kernel caches; gfx1201 repeats
-use different R9700 cards. gfx1100/gfx1151 run serialized under the hipx timing
+use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
 lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
 reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
 can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
@@ -886,7 +888,7 @@ Caveats that are part of the fixture, not trivia:
   `294c4ad9d`). `--matrix` now sizes the load to the run (largest `--pp`, or
   `--ctx` + `--tg`, plus 32), and `--max-seq N` overrides it
   ([CLI.md](docs/CLI.md#bench-context-max_seq)). Measured on 2026-10-04 on
-  hipx (Strix Halo, card `bf:00.0`, `qwen3.8-flash-next-gptq3.mq4`
+  a Strix Halo (gfx1151) host (one card, `qwen3.8-flash-next-gptq3.mq4`
   `8b15b6fe…00972`): `--matrix --pp 8192 --tg 32 --runs 3 --warmups 1` loads
   `max_seq` 20064 (the default `--ctx` tops out at 20000). pp8192 was
   1927.3 / 1921.8 / 1918.3 tok/s, fast-PPT-limited for 48–55 % of each run.
