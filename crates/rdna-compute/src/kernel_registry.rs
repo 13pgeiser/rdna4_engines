@@ -518,7 +518,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("copy_f32_buffer", kernels::COPY_F32_BUFFER_SRC, ["copy_f32_buffer", "copy_f32_strided_slot_buffer"]);
         add!("ep_gather_rows_by_owner", kernels::EP_GATHER_ROWS_BY_OWNER_SRC, ["ep_gather_rows_by_owner"]);
         add!("ep_gather_rows_by_slot_owner", kernels::EP_GATHER_ROWS_BY_SLOT_OWNER_SRC, ["ep_gather_rows_by_slot_owner"]);
-        add!("qwen4_ep_owner_assign", kernels::QWEN4_EP_OWNER_ASSIGN_SRC, ["qwen4_ep_owner_assign"]);
         add!("gemm_bf16_xf32_multirow", kernels::GEMM_BF16_XF32_MULTIROW_SRC, [
             "convert_bf16_to_f16", "gemm_bf16_xf32_multirow", "gemm_bf16_xf32_multirow_pto2", "gemm_bf16_xf32_multirow_rows3",
         ]);
@@ -1779,13 +1778,13 @@ mod tests {
         // prepass `logit_penalty_table`, plus eight dense 27B DFlash cold
         // helpers, the four gfx12 MQ4V2 verify-tile (`*_vt`) dense GEMM
         // modules, the Flash-Next expert-parallel row gather
-        // `ep_gather_rows_by_owner` and its balanced-ownership pair
-        // (`ep_gather_rows_by_slot_owner`, `qwen4_ep_owner_assign`), and the
-        // 27B AR route's plain q8
+        // `ep_gather_rows_by_owner` and its balanced-ownership copy
+        // `ep_gather_rows_by_slot_owner` (the ownership assignment kernel is a
+        // builder module, not a hipcc entry), and the 27B AR route's plain q8
         // Q-resident v2 attention and `_gil_` slab sigmoid producer (ragged
-        // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 141 keys are
+        // fp8q chunks and `HIPFIRE_A4_ATTN_EPI=0`). Those 140 keys are
         // additional to P0's 92.
-        assert_eq!(registry.len(), count + 141, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 140, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

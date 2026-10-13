@@ -3028,8 +3028,10 @@ impl Gpu {
         result
     }
 
-    /// Flash-Next expert-parallel balanced ownership (one workgroup, see
-    /// `kernels/src/qwen4_ep_owner_assign.hip` and [`qwen4_ep_owner_map`]).
+    /// Flash-Next expert-parallel balanced ownership (one 512-thread workgroup;
+    /// the certified builder kernel [`QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL`], whose
+    /// output bytes are [`qwen4_ep_owner_map`]'s). gfx1201 only: EP runs on
+    /// gfx1201, any other device fails closed (there is no hipcc fallback).
     ///
     /// Reads the call's `slots` routed ids from `topk_indices` (i32 bit
     /// patterns, slot order) and rewrites all [`QWEN4_EP_OWNER_EXPERTS`] entries
@@ -3052,6 +3054,12 @@ impl Gpu {
                 &format!("qwen4_ep_owner_assign: {what}"),
             ))
         };
+        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+            return refuse(&format!(
+                "the balanced-ownership kernel is a gfx1201 builder module (device is {}); no hipcc fallback",
+                self.arch
+            ));
+        }
         if !(2..=4).contains(&ranks) || self_rank >= ranks {
             return refuse("ranks must be 2..=4 and self_rank < ranks");
         }
@@ -3064,10 +3072,10 @@ impl Gpu {
         if !tables.is_complete() {
             return refuse("a table address is null");
         }
-        self.ensure_kernel(
-            "qwen4_ep_owner_assign",
-            kernels::QWEN4_EP_OWNER_ASSIGN_SRC,
-            "qwen4_ep_owner_assign",
+        self.ensure_embedded_kernel(
+            QWEN4_EP_OWNER_ASSIGN_PM_MODULE,
+            kernels::QWEN4_EP_OWNER_ASSIGN_PM_GFX1201,
+            QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL,
         )?;
         let ids = topk_indices.buf.as_ptr();
         let full_gate_up = tables.full_gate_up as *mut c_void;
@@ -3094,9 +3102,9 @@ impl Gpu {
             &self_i32 as *const _ as *mut c_void,
         ];
         let bytes = QWEN4_EP_OWNER_EXPERTS * 8 * 4 + slots * 8;
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "qwen4_ep_owner_assign", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL, bytes);
         let result = self.launch_maybe_blob(
-            "qwen4_ep_owner_assign",
+            QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL,
             [1, 1, 1],
             [QWEN4_EP_OWNER_EXPERTS as u32, 1, 1],
             0,
@@ -3127,6 +3135,19 @@ impl Gpu {
 /// Experts per layer `qwen4_ep_owner_assign` handles (Flash-Next's 512; one
 /// thread each).
 pub const QWEN4_EP_OWNER_EXPERTS: usize = 512;
+
+/// Module key of the embedded certified builder (PeaceMaker) image of
+/// [`Gpu::qwen4_ep_owner_assign`] (`hipfire-isa emit --kernel
+/// qwen4_ep_owner_assign_pm --arch gfx1201`).
+pub const QWEN4_EP_OWNER_ASSIGN_PM_MODULE: &str = "qwen4_ep_owner_assign_pm_gfx1201";
+/// Device symbol of the builder kernel.
+pub const QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pm_gfx1201";
+
+/// The balanced-ownership kernel ships as a gfx1201 builder module only
+/// (expert parallelism is a gfx1201 feature); every other device refuses.
+pub fn qwen4_ep_owner_assign_pm_arch(arch: &str) -> bool {
+    arch == "gfx1201"
+}
 
 /// Device addresses [`Gpu::qwen4_ep_owner_assign`] reads and writes for one
 /// layer of one rank. `full_*` are the layer's read-only full pointer tables
@@ -3336,16 +3357,34 @@ mod owner_map_tests {
         assert!(!Qwen4EpOwnerTables { full_gate_up: 0, ..all }.is_complete());
     }
 
-    /// Device check of the kernel against the host reference (ranks 2 and 4,
-    /// decode- and verify-sized id sets). Needs a gfx11/gfx12 GPU; never run
-    /// by the CPU-only gate.
     #[test]
-    #[ignore = "requires a gfx11/gfx12 GPU and working HIP toolchain"]
+    fn the_builder_kernel_is_gfx1201_only() {
+        assert!(qwen4_ep_owner_assign_pm_arch("gfx1201"));
+        for arch in ["gfx1200", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx90a", "gfx1201:xnack-", ""] {
+            assert!(!qwen4_ep_owner_assign_pm_arch(arch), "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn the_embedded_image_exports_the_launcher_symbol() {
+        let image = kernels::QWEN4_EP_OWNER_ASSIGN_PM_GFX1201;
+        let symbol = QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL.as_bytes();
+        assert!(image.windows(4).any(|w| w == b"\x7fELF"), "no device ELF in the bundle");
+        assert!(image.windows(symbol.len()).any(|w| w == symbol), "symbol missing from the image");
+        assert_eq!(QWEN4_EP_OWNER_ASSIGN_PM_MODULE, "qwen4_ep_owner_assign_pm_gfx1201");
+    }
+
+    /// Device check of the production launcher (the embedded certified builder
+    /// kernel) against the host reference: ranks 2 and 4, decode-, verify- and
+    /// few-row-sized id sets plus awkward slot counts, repeats, negative and
+    /// out-of-range ids. Needs a gfx1201 GPU; never run by the CPU-only gate.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
     fn kernel_matches_the_host_reference() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.has_gfx11_plus_simt() => gpu,
+            Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
             _ => {
-                eprintln!("skip: needs a gfx11/gfx12 GPU");
+                eprintln!("skip: the balanced-ownership kernel is gfx1201 only");
                 return;
             }
         };
@@ -3358,14 +3397,15 @@ mod owner_map_tests {
         let full_down_gpu = upload(&mut gpu, &to_bytes(&full_down));
         let live_gate_up_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
         let live_down_gpu = upload(&mut gpu, &vec![0xAAu8; EXPERTS * 8]);
-        let owners_gpu = upload(&mut gpu, &vec![0x55u8; 80 * 4]);
+        let owners_gpu = upload(&mut gpu, &vec![0x55u8; EXPERTS * 4]);
         let mut state = 0x1234_5678_9ABC_DEF0u64;
         for ranks in [2usize, 4] {
-            for slots in [10usize, 40, 80] {
+            for slots in [10usize, 40, 80, 1, 7, 33, 200, 512] {
                 for _ in 0..16 {
                     let ids: Vec<i32> = (0..slots)
-                        .map(|_| match lcg(&mut state) % 9 {
+                        .map(|_| match lcg(&mut state) % 11 {
                             0 => -1,
+                            1 => [512, 513, i32::MIN, i32::MAX, -513][(lcg(&mut state) % 5) as usize],
                             _ => (lcg(&mut state) % EXPERTS as u64) as i32,
                         })
                         .collect();

@@ -9708,11 +9708,17 @@ pub const EP_GATHER_ROWS_BY_OWNER_SRC: &str =
 pub const EP_GATHER_ROWS_BY_SLOT_OWNER_SRC: &str =
     include_str!("../../../kernels/src/ep_gather_rows_by_slot_owner.hip");
 
-/// Flash-Next expert-parallel balanced ownership: one 512-thread workgroup that
+/// Certified builder (PeaceMaker) module of the Flash-Next expert-parallel
+/// balanced ownership (`HIPFIRE_EP_BALANCED_OWNERS=1`), gfx1201 only
+/// (`hipfire-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201`, M7
+/// obligation-free, native bundle with the shipped
+/// `host-x86_64-unknown-linux-gnu-` host entry): one 512-thread workgroup that
 /// deals the call's distinct routed experts to ranks in ascending id order and
-/// rewrites the rank's live gate/up + down pointer tables and slot owners.
-pub const QWEN4_EP_OWNER_ASSIGN_SRC: &str =
-    include_str!("../../../kernels/src/qwen4_ep_owner_assign.hip");
+/// rewrites the rank's live gate/up + down pointer tables and slot owners, the
+/// byte twin of the host reference `qwen4_ep_owner_map`. There is no hipcc
+/// kernel: `Gpu::qwen4_ep_owner_assign` refuses every other architecture.
+pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qwen4_ep_owner_assign_pm_gfx1201.hxaco");
 
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
