@@ -806,6 +806,11 @@ pub trait MoeTileExchange {
     /// first invocation.
     fn before_down(&self, gpu: &mut rdna_compute::Gpu) -> Result<(), String>;
 
+    /// Cross-rank host barrier (every rank calls it at the same point); used to
+    /// order a rank-local drain (`ep_quiesce`) before any rank launches a chunk
+    /// that reads peer VRAM.
+    fn host_barrier(&self) -> Result<(), String>;
+
     /// Publish this rank's `y_down_grouped` and pull the peer-owned tiles into
     /// it. `tile_ids` is the UNMASKED scatter output (the pull's predicate is
     /// `tile_ids[t] >= 0 && owner(tile_ids[t]) != rank`), `tiles` the padded

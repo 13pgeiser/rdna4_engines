@@ -481,6 +481,12 @@ impl EpTileExchange {
         Ok(())
     }
 
+    /// One cross-rank host barrier (both ranks call it at the same point). A timeout or an
+    /// abort returns Err and poisons the transport.
+    pub fn host_barrier(&self) -> HipResult<()> {
+        self.barrier.wait().map_err(|m| err(m.into()))
+    }
+
     /// Poison the barriers: every current/future waiter returns Err (a rank
     /// failed). Barrier waits time out (default 30 s) with Err rather than
     /// hanging.

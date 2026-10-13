@@ -5531,6 +5531,21 @@ impl Qwen4GpuForward {
             }
         }
         let tile_route = tile_route.filter(|_| tile_active);
+        // G2 expert stage under EP: a full-table chunk reads the peer's donor VRAM, so every
+        // rank drains its stage donors and crosses a host barrier before ANY rank launches it.
+        if ep.is_some() && route_n > 1 && !ep_few_rows && !tile_active {
+            if let Some(stage) = self.expert_stage.as_ref() {
+                let hook = ep
+                    .and_then(|ep| ep.tile.as_ref())
+                    .and_then(|route| route.hook.as_ref())
+                    .ok_or_else(|| {
+                        invalid("an EP expert stage needs the owner-routed tile exchange's host barrier")
+                    })?;
+                stage.ep_quiesce(gpu)?;
+                hook.host_barrier()
+                    .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;
+            }
+        }
         if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
         {
             return Err(invalid(
@@ -5545,7 +5560,7 @@ impl Qwen4GpuForward {
         // parity observer keeps its historical unsplit transport. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
         // stream and its failure recovery synchronizes the device.
-        let expert_stage = match self.expert_stage.as_ref().filter(|stage| stage.begin_forward(false)) {
+        let expert_stage = match self.expert_stage.as_ref().filter(|stage| stage.begin_forward(tile_active)) {
             Some(stage)
                 if n >= stage.min_rows
                     && (stage.capture || wide_hidden_capture.is_none())

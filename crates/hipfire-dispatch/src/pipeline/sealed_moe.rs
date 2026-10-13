@@ -7077,6 +7077,10 @@ mod tests {
             unreachable!("lowering does not run stages")
         }
 
+        fn host_barrier(&self) -> Result<(), String> {
+            unreachable!("lowering does not run stages")
+        }
+
         fn exchange(
             &self,
             _gpu: &mut Gpu,

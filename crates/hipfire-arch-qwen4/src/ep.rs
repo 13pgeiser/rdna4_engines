@@ -991,6 +991,10 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
             .map_err(|error| error.to_string())
     }
 
+    fn host_barrier(&self) -> Result<(), String> {
+        self.tile.host_barrier().map_err(|error| error.to_string())
+    }
+
     fn exchange(
         &self,
         gpu: &mut Gpu,
