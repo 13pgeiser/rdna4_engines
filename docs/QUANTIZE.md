@@ -238,11 +238,17 @@ members are uniform-group-only — no plain per-projection key). lm_head adds
 `HFQ3G256` and `F16`. Every `--tier` and `--fixed-tier` recipe on this page
 that stays inside those containers loads on slots — including the mixed
 `--tier pro` body (MQ4G256V2 projections + Q8_0 wo/embed/lm_head/conv1d).
-Refused with named errors: Lloyd-V2 (qt52), PARO, E8/MFP4, G128-rotated
-containers, non-Q8 embeddings, fp32 DeltaNet state. AWQ sidecars are
-refused inside a mixed-dtype group (each scale needs its own rotated
-input). KV tiers: q8 (default), fwht{2,3,4}, bf16, f16 (slots-only), fp8 on
-gfx1201 — `--kv-k`/`--kv-v` splits are not slots-resolved.
+Embedding lookup admits only the loaded formats `Q8_0`, `F32`, `HFQ4G256`
+and `HFQ4G128`. Supported host-decoded embeddings arrive as `F32`: F16,
+BF16, TQ2G128, BQ1G128 and MQ*G256V2 (quant types 44/45/47–50); other
+embedding formats still refuse with a named error.
+Refused projection containers: Lloyd-V2 (qt52), PARO, E8/MFP4 and
+G128-rotated containers. fp32 DeltaNet state also refuses with a named
+error. AWQ sidecars are refused inside a mixed-dtype group (each scale
+needs its own rotated input). KV tiers: q8 (auto/unset default on every
+GPU), fwht{2,3,4} (`asymN`/`turboN` aliases; bare `turbo` = fwht3),
+legacy-asym{2,3,4}, native bf16/f16 (f16 is slots-only), and explicit fp8
+on exact gfx1201 only — `--kv-k`/`--kv-v` splits are not supported by slots.
 
 ### Vision-tower sidecar (`qwen3.8-27b-vision.hfq`)
 
