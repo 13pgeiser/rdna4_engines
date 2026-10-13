@@ -15,7 +15,7 @@ packages and the NixOS module under `nix/`.
 |---|---|
 | Flake nixpkgs input | `github:NixOS/nixpkgs/nixos-unstable` |
 | Module default port | `11435` |
-| System model dir option default | `/var/lib/hipfire/models` (see [modelDir limitation](#modeldir-and-effective-paths)) |
+| System model dir option default | `/var/lib/hipfire/models` (exported as `HIPFIRE_MODELS_DIR`; see [modelDir](#modeldir-and-effective-paths)) |
 | Kernel package default targets | `gfx1201`, `gfx1100`, `gfx1151`, `gfx906`, `gfx942` |
 
 Truth state: **shipped / ref-pinned** for the flake/module surface described
@@ -189,9 +189,14 @@ services.hipfire = {
   enable = true;
   userService = true;
   gpuTargets = [ "gfx1201" ];
-  # Must be user-writable. Default /var/lib/hipfire/models is not; setup's
-  # mkdir -p fails for an unprivileged user unit.
-  modelDir = "/home/yourname/.hipfire/models";  # match effective CLI path
+  # Must be an absolute path writable by the user running the unit. The default
+  # /var/lib/hipfire/models belongs to the system service, so setup's
+  # `mkdir -p` fails for an unprivileged user unit. Create the directory once
+  # and hand it to that user, for example:
+  #   sudo install -d -o <login-user> -g <login-group> /srv/hipfire/models
+  # Do not write `~` or `$HOME` here: the value is passed verbatim to
+  # `mkdir -p` and to HIPFIRE_MODELS_DIR, and neither expands it.
+  modelDir = "/srv/hipfire/models";
   defaultModel = "";                             # module starts --no-prewarm
 };
 
@@ -208,8 +213,9 @@ systemctl --user status hipfire.service
 
 User mode skips the dedicated `hipfire` system user and the oneshot
 precompile unit; setup still copies config and symlinks daemon/kernels under
-`$HOME/.hipfire`. Models for tag discovery must live under
-`$HOME/.hipfire/models` (see [modelDir limitation](#modeldir-and-effective-paths)).
+`$HOME/.hipfire`. Models for tag discovery live in the configured `modelDir`
+(`HIPFIRE_MODELS_DIR`), not under `$HOME/.hipfire/models`
+(see [modelDir and effective paths](#modeldir-and-effective-paths)).
 
 ### Pinning source from the module
 
@@ -259,7 +265,7 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 
 **Security:** `hipfire serve` has **no authentication and no TLS**
 ([SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
-`extraSettings.host = "0.0.0.0"` (or equivalent) to listen on all interfaces. `openFirewall = false` does
+`extraSettings.host = "0.0.0.0"` to listen on all interfaces. `openFirewall = false` does
 **not** change the listen address — it only avoids opening `cfg.port` when the
 **host firewall is enabled**. Keep the firewall closed unless the host is on a
 trusted network or an authenticated TLS reverse proxy terminates in front of
@@ -364,14 +370,16 @@ Interactive shells outside systemd only see variables you export yourself
 Enabling the module starts `hipfire serve`; it does **not** by itself certify
 model quality or GPU numerical correctness.
 
-On a machine with models in the **effective** CLI path
-(`/var/lib/hipfire/.hipfire/models` for the system service, or
-`~/.hipfire/models` for user mode — not necessarily `modelDir`):
+On a machine with models in the configured `services.hipfire.modelDir`
+(`/var/lib/hipfire/models` by default; the service exports it as
+`HIPFIRE_MODELS_DIR`):
 
 ```bash
 curl -s http://127.0.0.1:11435/health
-# GPU serve semantics (manual); pass an absolute model file:
-python3 scripts/serve_harness.py --model /var/lib/hipfire/.hipfire/models/<file> --tag qwen3.5:9b
+# GPU serve semantics (manual); pass an absolute model file. --no-spawn attaches
+# to the running service instead of starting a second server on the same GPU:
+python3 scripts/serve_harness.py --no-spawn --port 11435 \
+  --model /var/lib/hipfire/models/<file> --tag qwen3.5:9b
 ```
 
 Route selection: [VALIDATION.md](VALIDATION.md). No-GPU CI does not replace
