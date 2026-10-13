@@ -618,8 +618,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int seq_len = gmax + 1;
     const int tiles_total = (seq_len + KT - 1) / KT;
     const int tiles_per_split = (tiles_total + n_splits - 1) / n_splits;
-    const int tile0 = split * tiles_per_split;
-    const int tile1 = min(tile0 + tiles_per_split, tiles_total);
+    // PARTIAL=false keeps the direct kernel's original whole-range loop
+    // (tile0 = 0, break at seq_len) so its code object is unchanged.
+    const int tile0 = PARTIAL ? split * tiles_per_split : 0;
+    const int tile1 = PARTIAL ? min(tile0 + tiles_per_split, tiles_total) : tiles_total;
 #if !FA2_FILL
     // The mailbox dwords are the V plane's last two, and the tile loop's
     // first V fill (Transition 2) writes them. Without this barrier a wave
@@ -656,8 +658,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
     __syncthreads();
     if (fill_compute) {
-        for (int tile = tile0; tile < tile1; ++tile) {
+        for (int tile = tile0; ; ++tile) {
             const int ktile = tile * KT;
+            if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
+                break;
             const bool do0 = ktile <= gmax;
             const bool do1 = ktile + 16 <= gmax;
             float8_t sacc0, sacc1;
@@ -689,9 +693,11 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
         uint32_t rk_s[FA2_FILL_HK];
         uint32_t rk_u[FA2_FILL_HK * 8];
-        for (int tile = tile0; tile < tile1; ++tile) {
+        for (int tile = tile0; ; ++tile) {
             const int ktile = tile * KT;
-            const bool next = tile + 1 < tile1;
+            if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
+                break;
+            const bool next = PARTIAL ? tile + 1 < tile1 : ktile + KT < seq_len;
             if (next) {
 #pragma unroll
                 for (int t = 0; t < FA2_FILL_HK; ++t)
@@ -746,8 +752,10 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
 #endif
     // ---- Transitions 2-4: KT tiles ----
-    for (int tile = tile0; tile < tile1; ++tile) {
+    for (int tile = tile0; ; ++tile) {
         const int ktile = tile * KT;
+        if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
+            break;
 #if HIPFIRE_FA2_KT == 32
         // F6: tiles after the first consume the raw bytes prefetched into
         // registers during the previous tile's compute phase (see below);
@@ -970,7 +978,7 @@ __device__ __forceinline__ void fa2_gqa_body(
         // sched_barrier (and never an asm memory clobber) is used.
         {
             const int ktile_next = ktile + KT;
-            if (tile + 1 < tile1) {
+            if (PARTIAL ? tile + 1 < tile1 : ktile_next < seq_len) {
 #if HIPFIRE_FA2_KMODE == 3
 #pragma unroll 1
                 for (int t = 0; t < KT_KITERS; ++t) {

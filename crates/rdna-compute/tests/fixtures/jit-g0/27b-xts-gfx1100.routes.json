@@ -149,7 +149,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "88ea7867357582e9e34b10fbfdd4bd89b86854ad269a051c2d0736af17eed130",
+      "sha256": "6300ab0e4bc073ffed0df40328f01775eee9e68a3c8596c68120ce668fd9178e",
       "symbols": [
         "attention_fa2_q_preconvert_gfx1100",
         "attention_q8_0_fa2_gqa_gfx1100"
