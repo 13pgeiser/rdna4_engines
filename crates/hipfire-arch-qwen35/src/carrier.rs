@@ -665,6 +665,16 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         ctx.cask.cask_m_folding,
         ctx.max_seq,
     )?;
+    validate_gfx1100_split_verify_kv(
+        crate::qwen35::prefill::gfx1100_split_verify_min_ctx(&*ctx.gpu, config).is_some(),
+        adaptive_req.is_none()
+            && matches!(
+                pair,
+                kv_mode::KvPair::Native(hipfire_runtime::kv_mode::KvMode::Q8)
+                    | kv_mode::KvPair::Split(hipfire_runtime::kv_mode::KvMode::Q8, llama::VMode::Q8)
+            ),
+        ctx.kv_backend,
+    )?;
 
     // Adaptive DFlash is out of scope: refuse explicit adaptive + DFlash draft.
     if adaptive_req.is_some() {
@@ -841,6 +851,27 @@ fn validate_adaptive_cask_handoff(
         return Err(format!(
             "memory.cask.handoff_tokens={handoff_tokens} exceeds max_seq={max_seq} and can never activate"
         ));
+    }
+    Ok(())
+}
+
+/// `kernel.gfx1100_fa2_split_verify` admits VMM KV only. When the opt-in
+/// applies to this model (`split_envelope`: exact gfx1100, dense
+/// H24/KV4/D256, parent `kernel.verify_attn` on) and the cache is plain Q8,
+/// a legacy backend is refused before any upload rather than serving the
+/// split route from a legacy cache or silently dropping the opt-in.
+fn validate_gfx1100_split_verify_kv(
+    split_envelope: bool,
+    plain_q8: bool,
+    backend: KvBackend,
+) -> Result<(), String> {
+    if split_envelope && plain_q8 && backend != KvBackend::Vmm {
+        return Err(
+            "kernel.gfx1100_fa2_split_verify admits VMM KV only, but this load resolved \
+             memory.kv_backend=legacy; use memory.kv_backend=vmm or set \
+             kernel.gfx1100_fa2_split_verify=false"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -1524,6 +1555,18 @@ mod tests {
                 .unwrap_err()
                 .contains("exceeds max_seq")
         );
+    }
+
+    #[test]
+    fn gfx1100_split_verify_refuses_legacy_kv() {
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
+            .unwrap_err()
+            .contains("admits VMM KV only"));
+        // Outside the opt-in envelope or off plain Q8 the route never runs,
+        // so the backend is not this check's concern.
+        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy).is_ok());
     }
 
     #[test]

@@ -135,6 +135,9 @@ pub struct Gfx1100SplitVerifyModel<'a> {
 pub struct Gfx1100SplitVerifyRoute<'a> {
     pub model: Gfx1100SplitVerifyModel<'a>,
     pub quant_q8: bool,
+    /// The KV cache is a VMM owner. The route is admitted on VMM KV only;
+    /// a legacy cache is refused, never served by this route.
+    pub kv_vmm: bool,
     pub batch_size: usize,
     pub logical_ctx_len: usize,
     pub flash_partials_numel: usize,
@@ -158,6 +161,7 @@ pub fn gfx1100_split_verify_min_ctx(model: &Gfx1100SplitVerifyModel<'_>) -> Opti
 /// Exact product admission for the gfx1100 Q8 FA2 split-KV verifier.
 pub fn gfx1100_split_verify_admitted(route: &Gfx1100SplitVerifyRoute<'_>) -> bool {
     route.quant_q8
+        && route.kv_vmm
         && (4..=32).contains(&route.batch_size)
         && rdna_compute::attention::gfx1100_q8_fa2_split_partials_len(
             route.batch_size,
@@ -2862,11 +2866,16 @@ mod tests {
         let admitted = Gfx1100SplitVerifyRoute {
             model: gfx1100_split_model(),
             quant_q8: true,
+            kv_vmm: true,
             batch_size: 16,
             logical_ctx_len: 4_097,
             flash_partials_numel: need,
         };
         assert!(gfx1100_split_verify_admitted(&admitted));
+        assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
+            kv_vmm: false,
+            ..admitted
+        }));
         assert!(!gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
             quant_q8: false,
             ..admitted

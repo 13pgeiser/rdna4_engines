@@ -5831,6 +5831,7 @@ fn verify_dflash_block_inner_body(
             gpu,
             &target.config,
             target.kv_cache.quant_q8,
+            target.kv_cache.uses_vmm_backend(),
             b,
             required_tokens,
             target.scratch.flash_partials.numel(),

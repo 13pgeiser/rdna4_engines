@@ -2296,6 +2296,7 @@ fn finish_qwen35_load(
                     && !kv.quant_asym4
                     && matches!(kv.v_mode, llama::VMode::Q8)
             },
+            bundle.kv_cache.uses_vmm_backend(),
             bundle.scratch.flash_partials.numel(),
             // finish_qwen35_load is the single-GPU carrier path.
             true,

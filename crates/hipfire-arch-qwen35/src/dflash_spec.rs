@@ -362,6 +362,8 @@ pub fn load_dflash_state(
     // Retained-PM4 admission facts owned by the loader/target, not the draft.
     target_weights: &Qwen35Weights,
     kv_is_q8: bool,
+    // Target KV is a VMM owner; the gfx1100 split verifier admits VMM KV only.
+    kv_is_vmm: bool,
     target_flash_partials_numel: usize,
     single_gpu: bool,
     // True when adaptive KV is engaged for this load (tier-switching cache).
@@ -644,6 +646,7 @@ pub fn load_dflash_state(
                 gpu,
                 target_config,
                 kv_is_q8,
+                kv_is_vmm,
                 DFLASH_VERIFY_PM4_BLOCK,
                 threshold.saturating_add(1),
                 target_flash_partials_numel,

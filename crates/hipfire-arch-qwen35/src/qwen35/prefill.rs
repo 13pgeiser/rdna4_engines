@@ -9779,11 +9779,15 @@ pub fn gfx1100_split_verify_min_ctx(gpu: &Gpu, config: &Qwen35Config) -> Option<
     dispatch_gfx1100_split_verify_min_ctx(&gfx1100_split_verify_model(gpu, config))
 }
 
+/// `kv_vmm`: the target KV cache is a VMM owner
+/// ([`llama::KvCache::uses_vmm_backend`]). Legacy KV is never admitted.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn gfx1100_split_verify_admitted(
     gpu: &Gpu,
     config: &Qwen35Config,
     quant_q8: bool,
+    kv_vmm: bool,
     batch_size: usize,
     logical_ctx_len: usize,
     flash_partials_numel: usize,
@@ -9791,6 +9795,7 @@ pub fn gfx1100_split_verify_admitted(
     dispatch_gfx1100_split_verify_admitted(&Gfx1100SplitVerifyRoute {
         model: gfx1100_split_verify_model(gpu, config),
         quant_q8,
+        kv_vmm,
         batch_size,
         logical_ctx_len,
         flash_partials_numel,
@@ -10145,6 +10150,7 @@ fn batch_chunk_fa_attend(
                 gpu,
                 config,
                 kv_cache.quant_q8,
+                kv_cache.uses_vmm_backend(),
                 n,
                 start_pos + n,
                 s.flash_partials.numel(),
@@ -13589,6 +13595,7 @@ fn forward_prefill_chunk_pair(
                 gpu,
                 config,
                 kv_cache.quant_q8,
+                kv_cache.uses_vmm_backend(),
                 n,
                 max_ctx,
                 s.flash_partials.numel(),
@@ -14274,8 +14281,9 @@ pub(crate) fn forward_batch_chunk_impl(
     // GEMMs stay batched either way — only the attend step switches to the
     // multi-row tile. The incumbent tile grid is sized from the live logical
     // context and therefore stays out of capture. The gfx1100 split-KV route
-    // uses fixed S=8 geometry and is admitted only inside its exact default-on
-    // gfx1100 envelope (with parent and route-specific opt-outs);
+    // uses fixed S=8 geometry and is admitted only inside its exact opt-in
+    // gfx1100 envelope on VMM KV (`kernel.gfx1100_fa2_split_verify`, default
+    // off; the parent `kernel.verify_attn` still opts out);
     // the launcher independently rejects every other captured shape.
     let fa_attn_multirow = q8_multirow_attn_admitted(
         gpu.arch_caps.arch(),
@@ -14292,6 +14300,7 @@ pub(crate) fn forward_batch_chunk_impl(
             gpu,
             config,
             kv_cache.quant_q8,
+            kv_cache.uses_vmm_backend(),
             n,
             start_pos + n,
             s.flash_partials.numel(),

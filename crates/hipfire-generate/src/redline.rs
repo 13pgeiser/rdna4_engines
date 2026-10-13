@@ -3098,6 +3098,7 @@ pub fn redline_shadow_dflash_verify_pm4(
                 gpu,
                 &slot.config,
                 slot.kv_cache.quant_q8,
+                slot.kv_cache.uses_vmm_backend(),
                 batch,
                 threshold.saturating_add(1),
                 slot.scratch.flash_partials.numel(),
