@@ -2,15 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 //! Production-size two-bank transport gate. No HIP VMM export, no SYNC_BO.
 use npu_tools::coop_gpu;
-use pm_npu::kernels::{gemm_g80, w8a8_epi::bf16_direct};
-use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, OpenOptions, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG}};
+use pm_npu::kernels::{gemm_g80, gemm_g80_n512, w8a8_epi::bf16_direct};
+use railgun::npu::{clflush, trunk::{monotonic_ns, NpuTrunkRuntime, OpenOptions, LayerPanels, PanelProgram, Shape, Seq, WAIT_TIMEOUT, CHAIN_WATCHDOG, OUT_PANEL_K, OUT_PANEL_N, PANEL_K, PANEL_N}, Bo, Device, HwCtx, ERT_STATE_COMPLETED};
 use std::time::{Duration, Instant};
 const ROWS: usize = 8192;
-const K: usize = 2560;
-const N: usize = 1280;
 const CLASSES: usize = 16;
-const ROUNDS: usize = 20;
+const DEFAULT_ROUNDS: usize = 20;
 const POISON: u8 = 0xa5;
+/// Reduction dimension of the shape's program: 2560 (input shapes) or 6144 (out shapes).
+fn shape_k(shape: Shape) -> usize { if shape.is_out() { OUT_PANEL_K } else { PANEL_K } }
 fn a_code(row: usize, k: usize, round: usize) -> i8 { ((k * 5 + (row % CLASSES) * 7 + round * 11) % 23) as i8 - 11 }
 fn b_code(panel: usize, k: usize, col: usize) -> i8 { ((k * 7 + (col % CLASSES) * 3 + panel * 5) % 19) as i8 - 9 }
 fn dm(row: usize, round: usize) -> (u16, i16) {
@@ -28,26 +28,36 @@ fn consumer_columns(shape: Shape) -> [std::ops::Range<usize>; 4] {
     match shape {
         Shape::GdnIn => [0..10240, 10240..16384, 16384..16432, 16432..16480],
         Shape::QsaIn => [0..12288, 12288..12800, 12800..13312, 13312..13952],
+        // The out projection feeds the whole 2560-wide residual: quarters stand in for the consumer windows.
+        Shape::GdnOut | Shape::QsaO => [0..640, 640..1280, 1280..1920, 1920..2560],
     }
 }
 
-fn run(pci: &str, shape: Shape) -> Result<(), String> {
+/// GPU contention for `--corun`: 64 device-to-device copies of 256 MiB (16 GiB read + 16 GiB written per round) queued on a
+/// second stream right before every kick, so the NPU chain runs against a memory-bound GPU.
+const CORUN_BYTES: usize = 256 << 20;
+const CORUN_COPIES: usize = 64;
+
+fn run(pci: &str, shape: Shape, rounds: usize, corun: bool) -> Result<(), String> {
+    let (kdim, pn) = (shape_k(shape), shape.panel_n());
     let panels_count = shape.panels();
     let columns = consumer_columns(shape);
     let live = columns[3].end;
     // The consumer launch geometry uses precisely these live windows, not a
     // panel-rounded width. Diagnostic full-C downloads below also check padding.
+    // (The out shapes have no padding: five 512-column panels exactly fill the 2560-column residual.)
     if columns[0].start != 0 || columns.windows(2).any(|w| w[0].end != w[1].start)
-        || columns.iter().any(|r| r.is_empty() || r.end > live) || live >= shape.pitch()
+        || columns.iter().any(|r| r.is_empty() || r.end > live) || live > shape.pitch() || (live == shape.pitch() && !shape.is_out())
     {
         return at(None, "consumer-padding-bounds", Err("consumer reads padded columns".into()));
     }
-    let design = at(None, "build-panel", gemm_g80::build_panel_program_rowmajor(ROWS, shape.pitch(), 0))?;
+    let design = at(None, "build-panel", if shape.is_out() { gemm_g80_n512::build_panel_program_out(ROWS, shape.pitch(), 0) }
+        else { gemm_g80::build_panel_program_rowmajor(ROWS, shape.pitch(), 0) })?;
     let mut panels = Vec::with_capacity(panels_count);
     for panel in 0..panels_count {
-        let b: Vec<i8> = (0..K).flat_map(|k| (0..N).map(move |n|
-            if panel * N + n < live { b_code(panel, k, n) } else { 0 })).collect();
-        let scales: Vec<_> = (0..N).map(|n| if panel * N + n < live { sm(panel, n) } else { (0, 0) }).collect();
+        let b: Vec<i8> = (0..kdim).flat_map(|k| (0..pn).map(move |n|
+            if panel * pn + n < live { b_code(panel, k, n) } else { 0 })).collect();
+        let scales: Vec<_> = (0..pn).map(|n| if panel * pn + n < live { sm(panel, n) } else { (0, 0) }).collect();
         panels.push(gemm_g80::pack_b_bf16(&design, &b, &scales));
     }
     let program = PanelProgram { shape, pdi: design.pdi.clone(), txn: design.insts.clone(), padded_rows: ROWS, pitch: shape.pitch() };
@@ -55,10 +65,16 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
     let outcome = (|| {
         let hip = runtime.hip();
         let layout = runtime.layout();
+        let a_bytes = layout.a_bytes_for(shape);
         let c_bytes = layout.c_bytes(shape);
         let module = at(None, "load-copy-module", hip.load_module(coop_gpu::CODE_OBJECT))?;
         let copy = at(None, "get-copy-kernel", module.function(coop_gpu::COPY))?;
         let stream = at(None, "create-stream", hip.stream())?;
+        let load_stream = at(None, "create-load-stream", hip.stream())?;
+        let load_end = at(None, "create-load-event", hip.event())?;
+        let load = if corun {
+            Some((at(None, "allocate-load-src", hip.allocate(CORUN_BYTES, None))?, at(None, "allocate-load-dst", hip.allocate(CORUN_BYTES, None))?))
+        } else { None };
         let end = at(None, "create-system-event", hip.system_event())?;
         let anchor = at(None, "create-timing-anchor", hip.event())?;
         let resumed = at(None, "create-resume-event", hip.event())?;
@@ -72,7 +88,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
         let anchor_after = monotonic_ns();
         let anchor_ns = anchor_before + (anchor_after - anchor_before) / 2;
         let anchor_uncertainty_ns = anchor_after - anchor_before;
-        let input = at(None, "allocate-input", hip.allocate(layout.a_bytes, None))?;
+        let input = at(None, "allocate-input", hip.allocate(a_bytes, None))?;
         let output = at(None, "allocate-output", hip.allocate(c_bytes, None))?;
         let poison = at(None, "allocate-poison", hip.allocate(c_bytes, None))?;
         at(None, "initialize-poison", hip.memset(&poison, POISON))?;
@@ -87,40 +103,47 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             hip.wait_event_timeout(&end, WAIT_TIMEOUT)
         };
         let mut observed = vec![0u8; c_bytes];
-        let mut a = vec![0i8; ROWS * K];
+        let mut a = vec![0i8; ROWS * kdim];
         let mut scales = vec![(0u16, 0i16); ROWS];
         let mut reference = vec![0u16; panels_count * CLASSES * CLASSES * 3];
-        let mut latencies = Vec::with_capacity(ROUNDS);
-        let mut resumes = Vec::with_capacity(ROUNDS);
+        let mut latencies = Vec::with_capacity(rounds);
+        let mut resumes = Vec::with_capacity(rounds);
         let mut busy = Duration::ZERO;
         let mut last_seq = [None; 2];
         let wall = Instant::now();
-        println!("transport shape={shape:?} layout=rowmajor pitch={} live={live} banks=2 panels={panels_count} rounds={ROUNDS} A={} C={c_bytes} bytes/bank ready_timeout={WAIT_TIMEOUT:?} chain_watchdog={CHAIN_WATCHDOG:?} shim_axi=default consumer_windows={columns:?} anchor_uncertainty_ns={anchor_uncertainty_ns}", shape.pitch(), layout.a_bytes);
-        for round in 0..ROUNDS {
+        println!("transport shape={shape:?} layout=rowmajor pitch={} live={live} banks=2 panels={panels_count} rounds={rounds} corun={corun} A={} C={c_bytes} bytes/bank ready_timeout={WAIT_TIMEOUT:?} chain_watchdog={CHAIN_WATCHDOG:?} shim_axi=default consumer_windows={columns:?} anchor_uncertainty_ns={anchor_uncertainty_ns}", shape.pitch(), a_bytes);
+        for round in 0..rounds {
             let bank = round % 2;
             for row in 0..ROWS {
                 scales[row] = dm(row, round);
-                for k in 0..K { a[row * K + k] = a_code(row, k, round); }
+                for k in 0..kdim { a[row * kdim + k] = a_code(row, k, round); }
             }
             let packed = gemm_g80::pack_a_bf16(&design, &a, &scales);
-            if packed.len() != layout.a_bytes { return at(Some(round), "pack-A", Err("A sizing mismatch".into())); }
+            if packed.len() != a_bytes { return at(Some(round), "pack-A", Err("A sizing mismatch".into())); }
             at(Some(round), "upload-packed-A", hip.upload(&input, &packed))?;
             // Independent CPU dot products for EVERY class combination. The
             // operand is periodic in rows/columns, but comparisons cover EVERY
             // byte of the fused row-major C arena, including zero padding.
             for panel in 0..panels_count { for r in 0..CLASSES { for n in 0..CLASSES {
-                let dot: i32 = (0..K).map(|k| i32::from(a_code(r, k, round)) * i32::from(b_code(panel, k, n))).sum();
+                let dot: i32 = (0..kdim).map(|k| i32::from(a_code(r, k, round)) * i32::from(b_code(panel, k, n))).sum();
                 let (sm, se) = sm(panel, n);
                 for rem in 0..3 {
                     let (dm, _) = dm(r, round);
                     reference[((panel * CLASSES + r) * CLASSES + n) * 3 + rem] = bf16_direct(dot, sm, se, dm, -20 + rem as i16);
                 }
             } } }
-            let av = at(Some(round), "A-arena", runtime.a_arena(bank))?;
+            let av = at(Some(round), "A-arena", if shape.is_out() { runtime.a_out_arena(bank) } else { runtime.a_arena(bank) })?;
             let cv = at(Some(round), "C-arena", runtime.c_arena(bank, shape))?;
             at(Some(round), "prepare-bank", unsafe { runtime.prepare_bank(bank, stream.raw()) })?;
             at(Some(round), "poison-C", gpu_copy(cv.device, poison.ptr(), c_bytes))?;
-            at(Some(round), "GPU-write-A", gpu_copy(av.device, input.ptr(), layout.a_bytes))?;
+            at(Some(round), "GPU-write-A", gpu_copy(av.device, input.ptr(), a_bytes))?;
+            if let Some((src, dst)) = &load {
+                for _ in 0..CORUN_COPIES {
+                    let mut args = coop_gpu::copy_args(dst.ptr(), src.ptr(), (CORUN_BYTES / 16) as u64, u64::from(blocks * coop_gpu::COPY_BLOCK));
+                    at(Some(round), "queue-load", hip.launch_on(Some(&load_stream), &copy, blocks, coop_gpu::COPY_BLOCK, &mut args))?;
+                }
+                at(Some(round), "record-load-end", hip.record_on(&load_end, Some(&load_stream)))?;
+            }
             let seq = at(Some(round), "kick", unsafe { runtime.kick(0, shape, bank, ROWS, stream.raw()) })?;
             at(Some(round), "wait-GPU-enqueue-ahead", unsafe { runtime.wait_gpu(seq, stream.raw()) })?;
             let wait_enqueue_ns = monotonic_ns();
@@ -129,6 +152,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             at(Some(round), "retire-bank", unsafe { runtime.retire_bank(seq, stream.raw()) })?;
             last_seq[bank] = Some(seq);
             at(Some(round), "consumer-completion", drain())?;
+            if load.is_some() { at(Some(round), "load-completion", hip.wait_event_timeout(&load_end, Duration::from_secs(30)))?; }
             let completion = at(Some(round), "check-terminal-completion", runtime.wait_host(seq))?;
             at(Some(round), "check-runtime-error", runtime.check_error())?;
             if wait_enqueue_ns >= completion.done_ns {
@@ -147,8 +171,8 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             if unsafe { core::slice::from_raw_parts(av.host, av.len) } != &packed[..] {
                 return at(Some(round), "compare-A-alias", Err(format!("bank {bank}: GPU A/userptr alias mismatch")));
             }
-            for panel in 0..panels_count { for row in 0..ROWS { for col in 0..N {
-                let fused_col = panel * N + col;
+            for panel in 0..panels_count { for row in 0..ROWS { for col in 0..pn {
+                let fused_col = panel * pn + col;
                 let offset = 2 * (row * shape.pitch() + fused_col);
                 let actual = u16::from_le_bytes([observed[offset], observed[offset + 1]]);
                 let expected = if fused_col < live {
@@ -164,10 +188,10 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             println!("round={round:02} bank={bank} seq={} exact enqueue_ahead=true gpu_wait_enqueue_ns={wait_enqueue_ns} npu_done_ns={} kick->done={ms:.3} ms npu_submit_wait={:.3} ms npu_done->gpu_resume={:.3} us", seq.value, completion.done_ns, completion.npu_busy.as_secs_f64() * 1000.0, resume_ns as f64 / 1000.0);
         }
         latencies.sort_by(f64::total_cmp);
-        println!("EXACT rounds={ROUNDS} p50={:.3} p99={:.3} max={:.3} ms npu_busy_envelope={:.3} ms wall={:.3} ms (busy=submit-to-timeline host envelope, wall includes CPU oracle/copies)",
-            percentile(&latencies, 0.5), percentile(&latencies, 0.99), latencies[ROUNDS - 1], busy.as_secs_f64() * 1000.0, wall.elapsed().as_secs_f64() * 1000.0);
+        println!("EXACT rounds={rounds} p50={:.3} p99={:.3} max={:.3} ms npu_busy_envelope={:.3} ms wall={:.3} ms (busy=submit-to-timeline host envelope, wall includes CPU oracle/copies)",
+            percentile(&latencies, 0.5), percentile(&latencies, 0.99), latencies[rounds - 1], busy.as_secs_f64() * 1000.0, wall.elapsed().as_secs_f64() * 1000.0);
         resumes.sort_by(f64::total_cmp);
-        println!("RESUME npu_done->GPU_event p50={:.3} p99={:.3} max={:.3} us anchor_uncertainty_ns={anchor_uncertainty_ns}", percentile(&resumes, 0.5), percentile(&resumes, 0.99), resumes[ROUNDS-1]);
+        println!("RESUME npu_done->GPU_event p50={:.3} p99={:.3} max={:.3} us anchor_uncertainty_ns={anchor_uncertainty_ns}", percentile(&resumes, 0.5), percentile(&resumes, 0.99), resumes[rounds-1]);
         // Negative controls run only AFTER every exact round has reported.
         // This generation was never submitted; Shared::wait rejects it in
         // process, without a DRM wait, relay request or GPU wait.
@@ -194,7 +218,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
             return at(None, "negative-missing-wait", Err("negative not distinguishable from reference".into()));
         }
         println!("negative missing-wait: detected poisoned C without replacement submission (all bytes)");
-        println!("EXACT_CONTROLS shape={shape:?} rounds={ROUNDS} negatives=2 consumer_padding_bounds=checked");
+        println!("EXACT_CONTROLS shape={shape:?} rounds={rounds} negatives=2 consumer_padding_bounds=checked");
         Ok(())
     })();
     let teardown = at(None, "teardown", runtime.close());
@@ -202,7 +226,7 @@ fn run(pci: &str, shape: Shape) -> Result<(), String> {
     // A separate runtime is intentional: a real timeout permanently poisons the
     // relay, and can never be followed by success on that same transport.
     watchdog_negative(pci, shape, design.pdi, design.insts)?;
-    println!("PASS shape={shape:?} rounds={ROUNDS} negatives=3 consumer_padding_bounds=checked");
+    println!("PASS shape={shape:?} rounds={rounds} negatives=3 consumer_padding_bounds=checked");
     Ok(())
 }
 fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Result<(), String> {
@@ -210,7 +234,7 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
     // Valid zero operands/program, but a deliberately impossible chain budget:
     // EXEC_CMD must return before its 1 ns deadline can be checked. This exercises
     // production watchdog cancellation, not an environment-dependent test shim.
-    let panels = (0..shape.panels()).map(|_| vec![0; layout.b_bytes]).collect();
+    let panels = (0..shape.panels()).map(|_| vec![0; layout.b_bytes_for(shape)]).collect();
     let runtime = at(None, "negative-timeout-open", NpuTrunkRuntime::open_with_options(
         vec![PanelProgram { shape, pdi, txn, padded_rows: ROWS, pitch: shape.pitch() }],
         vec![LayerPanels { layer: 0, shape, panels }], 1, ROWS, pci,
@@ -250,16 +274,154 @@ fn watchdog_negative(pci: &str, shape: Shape, pdi: Vec<u8>, txn: Vec<u8>) -> Res
         Ok(()) => Err("negative-timeout teardown lost sticky error".into()),
     }
 }
+/// Independent class reference of panel `panel` at `round` for a K-deep operand: `[(r_class * 16 + n_class) * 3 + row % 3]`
+/// holds `bf16_direct` of the exact whole-K int32 dot product.
+fn class_reference(kdim: usize, panel: usize, round: usize) -> Vec<u16> {
+    let mut reference = vec![0u16; CLASSES * CLASSES * 3];
+    for r in 0..CLASSES { for n in 0..CLASSES {
+        let dot: i32 = (0..kdim).map(|k| i32::from(a_code(r, k, round)) * i32::from(b_code(panel, k, n))).sum();
+        let (sm, se) = sm(panel, n);
+        for rem in 0..3 { reference[(r * CLASSES + n) * 3 + rem] = bf16_direct(dot, sm, se, dm(r, round).0, -20 + rem as i16); }
+    } }
+    reference
+}
+
+/// One hardware context with one design's buffers. Field order is the teardown order: the context before its BOs.
+struct Side<'d> { ctx: HwCtx<'d>, _pdi: Bo, insts: Bo, bos: Vec<Bo>, cmd: Bo, rows: usize, pitch: usize, pn: usize, kdim: usize }
+
+/// Create + configure one context for `design` (K-deep periodic operands, panel 0): `(side, create_ms, config_cu_ms)`.
+fn side<'d>(dev: &'d Device, design: &pm_npu::kernels::gemm_array::ArrayDesign, kdim: usize, pn: usize, pitch: usize, rows: usize)
+    -> Result<(Side<'d>, f64, f64), String>
+{
+    let t = Instant::now();
+    let ctx = HwCtx::create(dev, 32, 1)?;
+    let create_ms = t.elapsed().as_secs_f64() * 1e3;
+    let pdi = dev.dev_bo(&design.pdi)?;
+    let t = Instant::now();
+    ctx.config_cu(&pdi)?;
+    let config_ms = t.elapsed().as_secs_f64() * 1e3;
+    let insts = dev.dev_bo(&design.insts)?;
+    let a: Vec<i8> = (0..rows * kdim).map(|i| a_code(i / kdim, i % kdim, 0)).collect();
+    let scales: Vec<_> = (0..rows).map(|r| dm(r, 0)).collect();
+    let b: Vec<i8> = (0..kdim).flat_map(|k| (0..pn).map(move |n| b_code(0, k, n))).collect();
+    let sscales: Vec<_> = (0..pn).map(|n| sm(0, n)).collect();
+    let inputs = [gemm_g80::pack_a_bf16(design, &a, &scales), gemm_g80::pack_b_bf16(design, &b, &sscales)];
+    let mut bos = Vec::new();
+    for (i, spec) in design.args.iter().enumerate() {
+        let mut bo = dev.shmem_bo(spec.bytes)?;
+        if i < 2 { bo.as_mut_slice().copy_from_slice(&inputs[i]); } else { bo.as_mut_slice().fill(POISON); }
+        bo.flush();
+        bos.push(bo);
+    }
+    let cmd = dev.cmd_bo()?;
+    Ok((Side { ctx, _pdi: pdi, insts, bos, cmd, rows, pitch, pn, kdim }, create_ms, config_ms))
+}
+
+impl Side<'_> {
+    /// Poison C, submit, wait: `(submit -> completion ms)`. `check` compares every element with the class reference.
+    fn run(&mut self, check: bool) -> Result<f64, String> {
+        { let c = &mut self.bos[2]; c.as_mut_slice().fill(POISON); c.flush(); }
+        let refs: Vec<&Bo> = self.bos.iter().collect();
+        let t = Instant::now();
+        let seq = self.ctx.submit(&mut self.cmd, &self.insts, &refs)?;
+        let state = self.ctx.wait(&self.cmd, seq, 5000)?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        if state != ERT_STATE_COMPLETED { return Err(format!("chain state {state}")); }
+        if check {
+            self.bos[2].flush();
+            let reference = class_reference(self.kdim, 0, 0);
+            let c = self.bos[2].as_slice();
+            for row in 0..self.rows { for col in 0..self.pn {
+                let off = 2 * (row * self.pitch + col);
+                let actual = u16::from_le_bytes([c[off], c[off + 1]]);
+                let expected = reference[((row % CLASSES) * CLASSES + col % CLASSES) * 3 + row % 3];
+                if actual != expected { return Err(format!("row {row} col {col}: {actual:04x} != {expected:04x}")); }
+            } }
+        }
+        Ok(ms)
+    }
+}
+
+fn median(values: &mut [f64]) -> f64 { values.sort_by(f64::total_cmp); values[values.len() / 2] }
+
+/// H3 second-context probe. Creates the input-shape context (K2560 N1280, 512 rows) and, while it is alive, the out-shape
+/// context (K6144 N512, 512 rows): reports `create_hwctx` / `config_cu` cost of each, then submit-to-completion of each
+/// design repeated on its own context against the same designs alternating between the two contexts (the context-switch
+/// cost), every run checked element-exact. A failed second context creation is the "no coexistence" kill.
+fn coexistence(reps: usize) -> Result<(), String> {
+    let mut dev = Device::open()?;
+    dev.map_heap(64 << 20)?;
+    let rows = 512;
+    let d_in = at(None, "build-in", gemm_g80::build_panel_program_rowmajor(rows, PANEL_N, 0))?;
+    let d_out = at(None, "build-out", gemm_g80_n512::build_panel_program_out(rows, OUT_PANEL_N, 0))?;
+    let (mut a, create_in, config_in) = at(None, "context-in", side(&dev, &d_in, PANEL_K, PANEL_N, PANEL_N, rows))?;
+    println!("COEXIST ctx_in create_hwctx={create_in:.3} ms config_cu={config_in:.3} ms pdi={} B", d_in.pdi.len());
+    let first_in = at(None, "run-in-first", a.run(true))?;
+    let mut same_in: Vec<f64> = (0..reps).map(|_| a.run(false)).collect::<Result<_, _>>().map_err(|e| format!("stage=run-in-same: {e}"))?;
+    let second = side(&dev, &d_out, OUT_PANEL_K, OUT_PANEL_N, OUT_PANEL_N, rows);
+    let (mut b, create_out, config_out) = match second {
+        Ok(s) => s,
+        Err(e) => {
+            println!("COEXIST ctx_out FAILED while ctx_in is alive: {e}");
+            println!("H3_KILL no-coexistence: the out-shape HwCtx cannot be created next to the input-shape HwCtx");
+            return Err(format!("stage=context-out: {e}"));
+        }
+    };
+    println!("COEXIST ctx_out create_hwctx={create_out:.3} ms config_cu={config_out:.3} ms pdi={} B (created with ctx_in alive)", d_out.pdi.len());
+    let first_out = at(None, "run-out-first", b.run(true))?;
+    let mut same_out: Vec<f64> = (0..reps).map(|_| b.run(false)).collect::<Result<_, _>>().map_err(|e| format!("stage=run-out-same: {e}"))?;
+    let (mut alt_in, mut alt_out) = (Vec::new(), Vec::new());
+    for round in 0..reps {
+        let check = round + 1 == reps;
+        alt_in.push(at(Some(round), "alternate-in", a.run(check))?);
+        alt_out.push(at(Some(round), "alternate-out", b.run(check))?);
+    }
+    let (si, so, ai, ao) = (median(&mut same_in), median(&mut same_out), median(&mut alt_in), median(&mut alt_out));
+    let switch = (ai - si).max(ao - so);
+    println!("COEXIST first submit in={first_in:.3} ms out={first_out:.3} ms (exact)");
+    println!("COEXIST p50 submit->done same-context in={si:.3} out={so:.3} ms; alternating in={ai:.3} out={ao:.3} ms; context-switch cost in={:.3} out={:.3} ms (reps={reps}, exact after alternation)", ai - si, ao - so);
+    let config = config_in.max(config_out);
+    let kill = config > 2.0 || switch > 2.0;
+    println!("H3_COEXIST create_hwctx_ms={create_in:.3}/{create_out:.3} config_cu_ms={config_in:.3}/{config_out:.3} switch_ms={switch:.3} kill_threshold_ms=2.0 {}",
+        if kill { "H3_KILL config_cu-or-switch>2ms" } else { "ok" });
+    Ok(())
+}
+
+const USAGE: &str = "npu-trunk-transport [--pci 0000:c0:00.0] [--shape gdn_in|qsa_in|gdn_out|qsa_o]... [--rounds N] [--corun] [--coexist [--reps N]]\n\
+Default (no --shape/--coexist): 8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 enqueue-ahead exact rounds/shape FIRST; negatives AFTER include forced chain timeout and bounded GPU release. Prints npu_done->GPU resume event latency; 3 s ready waits, 300 ms chain watchdog, default shim AXI.\n\
+--shape selects shapes (repeatable): gdn_out / qsa_o are the K=6144 out-projection programs (N512 panels, 5 panels/chain, own PDI), oracle = whole-K int32 sum + bf16_direct, exact on both banks every round.\n\
+--corun: queue 16 GiB of GPU copies per round concurrently with every NPU chain (co-run rate).\n\
+--coexist: second-HwCtx probe (create + config_cu cost, context-switch cost, no transport/HIP).";
+fn usage(why: &str) -> ! {
+    eprintln!("FAIL: stage=arguments round=none: {why}\n{USAGE}");
+    std::process::exit(1)
+}
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let pci = match args.as_slice() {
-        [] => "0000:c0:00.0",
-        [flag, pci] if flag == "--pci" => pci,
-        [flag] if flag == "--help" => { println!("npu-trunk-transport [--pci 0000:c0:00.0]\n8192 rows, row-major GdnIn + QsaIn (13/11 panels), 2 banks, 20 enqueue-ahead exact rounds/shape FIRST; negatives AFTER include forced chain timeout and bounded GPU release. Prints npu_done->GPU resume event latency; 3 s ready waits, 300 ms chain watchdog, default shim AXI."); return; }
-        _ => { eprintln!("FAIL: stage=arguments round=none: usage: npu-trunk-transport [--pci PCI]"); std::process::exit(1); }
-    };
-    for shape in [Shape::GdnIn, Shape::QsaIn] {
-        if let Err(e) = run(pci, shape) { eprintln!("FAIL shape={shape:?}: {e}"); std::process::exit(1); }
+    let (mut pci, mut shapes, mut rounds, mut coexist, mut reps, mut corun) = ("0000:c0:00.0".to_string(), Vec::new(), DEFAULT_ROUNDS, false, 10usize, false);
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        let mut value = |name: &str| it.next().cloned().unwrap_or_else(|| usage(&format!("{name} needs a value")));
+        match flag.as_str() {
+            "--help" => { println!("{USAGE}"); return; }
+            "--pci" => pci = value("--pci"),
+            "--rounds" => rounds = value("--rounds").parse().ok().filter(|&r| r >= 2).unwrap_or_else(|| usage("--rounds needs an integer >= 2 (both banks)")),
+            "--reps" => reps = value("--reps").parse().ok().filter(|&r| r >= 1).unwrap_or_else(|| usage("--reps needs an integer >= 1")),
+            "--coexist" => coexist = true,
+            "--corun" => corun = true,
+            "--shape" => shapes.push(match value("--shape").as_str() {
+                "gdn_in" => Shape::GdnIn, "qsa_in" => Shape::QsaIn, "gdn_out" => Shape::GdnOut, "qsa_o" => Shape::QsaO,
+                other => usage(&format!("unknown shape {other:?}")),
+            }),
+            other => usage(&format!("unknown argument {other:?}")),
+        }
+    }
+    if shapes.is_empty() && !coexist { shapes = vec![Shape::GdnIn, Shape::QsaIn]; }
+    for shape in shapes {
+        if let Err(e) = run(&pci, shape, rounds, corun) { eprintln!("FAIL shape={shape:?}: {e}"); std::process::exit(1); }
+    }
+    if coexist {
+        if let Err(e) = coexistence(reps) { eprintln!("FAIL coexistence: {e}"); std::process::exit(1); }
     }
 }
 
@@ -286,6 +448,30 @@ mod tests {
                     assert!(end <= 2 * (row * shape.pitch() + live));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn out_shapes_fill_the_arena_exactly_and_use_k6144() {
+        for shape in [Shape::GdnOut, Shape::QsaO] {
+            let columns = consumer_columns(shape);
+            assert_eq!((columns[0].start, columns[3].end), (0, shape.pitch()));
+            for pair in columns.windows(2) { assert_eq!(pair[0].end, pair[1].start); }
+            assert_eq!((shape_k(shape), shape.panel_n(), shape.panels()), (6144, 512, 5));
+        }
+        assert_eq!((shape_k(Shape::GdnIn), shape_k(Shape::QsaIn)), (2560, 2560));
+    }
+
+    #[test]
+    fn class_reference_is_the_whole_k_twin_of_one_class_pair() {
+        // Whole-K dot of class (r, n), twin per row % 3 exponent: recompute one entry independently.
+        for kdim in [2560usize, 6144] {
+            let reference = class_reference(kdim, 2, 3);
+            let (r, n, rem) = (5usize, 9usize, 1usize);
+            let mut dot = 0i32;
+            for k in 0..kdim { dot += i32::from(a_code(r, k, 3)) * i32::from(b_code(2, k, n)); }
+            let (sm, se) = sm(2, n);
+            assert_eq!(reference[(r * CLASSES + n) * 3 + rem], bf16_direct(dot, sm, se, dm(r, 3).0, -20 + rem as i16));
         }
     }
 }

@@ -264,6 +264,7 @@
 //! | V9 | 512x512 | full 8x4 | V9 data movement (above): resident B, N-wave outer, not in [`Variant::ALL`] | dynamic TXN, 2 aggregate SYNCs, `design_v9` |
 //! | V10 | 512x512 | full 8x4 | V10 data movement (above): resident A and B, M-wave outer, not in [`Variant::ALL`] | dynamic TXN, 2 aggregate SYNCs, `design_v10` |
 //! | G80 | 256x1280 | full 8x4 | G80 data movement ([`gemm_g80`], N = 1280, `K <= 2560`), not in [`Variant::ALL`] | dynamic TXN, 2 aggregate SYNCs, `gemm_g80::design_g80` |
+//! | G80 N512 | 512x512 | full 8x4 | V8 data movement on the 128x64 BF16 core with the whole B panel resident ([`gemm_g80_n512`], N = 512, `K <= 6336`), `Kind::G80 { n512: true }`, not in [`Variant::ALL`] | dynamic TXN, 2 aggregate SYNCs, `gemm_g80_n512::design_g80_n512` |
 //!
 //! *Static* (V1..V5): the CDO additionally loads core/memtile locks, queues and enables every core and memtile
 //! ring, releases core reset, sets PC 0 and enables the cores last (as `gemm_i8::design` does); the TXN only
@@ -298,7 +299,7 @@
 //!   wave of the design. The remaining words of the frame are unspecified. The output is NOT a GEMM, so
 //!   `unpack_out` is meaningless; check the per-tile frame prefix instead.
 use super::gemm_core::{self, Control, CoreVariant, Epilogue, PairRole};
-use super::{gemm_core_g80, gemm_g80, iu4_ief15, iu4_ief15_core};
+use super::{gemm_core_g80, gemm_g80, gemm_g80_n512, iu4_ief15, iu4_ief15_core};
 use super::gemm_i8::{peak_ops_per_second, ArgKind, ArgSpec};
 use crate::{
     cdo::Cdo,
@@ -330,6 +331,10 @@ const _: () = assert!(TM % 8 == 0 && TN % 8 == 0 && CHUNK_K % 8 == 0);
 pub(crate) const G80_WAVE_M: usize = 2 * gemm_core_g80::TM;
 pub(crate) const G80_WAVE_N: usize = 2 * COLS * gemm_core_g80::TN;
 pub(crate) const G80_A_COLS: usize = 4;
+/// G80 N512 wave ([`gemm_g80_n512`]): the V8 geometry on the 128x64 BF16 core, four 128-row A blocks x eight 64-column
+/// B halves per column pair; every column injects an A half and a B half (V8 data movement, B resident).
+pub(crate) const G80_N512_WAVE_M: usize = ROWS * gemm_core_g80::TM;
+pub(crate) const G80_N512_WAVE_N: usize = COLS * TN;
 /// IEF15 wave: 4 A blocks of 64 tokens x 4 B blocks of 64 features ([`iu4_ief15`], core tile 64 x 32); every column injects A.
 pub(crate) const IEF15_WAVE: usize = 4 * iu4_ief15_core::TM;
 
@@ -546,8 +551,9 @@ pub(crate) enum Kind {
     /// `resident` is the V9 / V10 memtile-resident data movement.
     Pair { epi: Epilogue, ctl: Control, resident: Option<Resident> },
     /// G80: the V8 pair structure on the 128x80 core ([`gemm_core_g80`], int8 or i32 epilogue). `kc` K64 chunks per tile and
-    /// `mw` M-waves fix the memtile B segments and replay counts (N is always one wave of 1280 columns).
-    G80 { epi: Epilogue, ctl: Control, kc: usize, mw: usize, bf16_layout: gemm_g80::Bf16Layout },
+    /// `mw` M-waves fix the memtile B segments and replay counts (N is always one wave of 1280 columns). `n512`: the N=512
+    /// BF16 geometry of [`gemm_g80_n512`] (V8 circuits and wave of 512 x 512, 128x64 tiles, resident K<=6336 B panel).
+    G80 { epi: Epilogue, ctl: Control, kc: usize, mw: usize, bf16_layout: gemm_g80::Bf16Layout, n512: bool },
     /// IEF15 ([`iu4_ief15`]): the V8 pair structure and memtile map on the 64x32 [`iu4_ief15_core`] tile (A/B chunks of 2176 B
     /// per K128 epoch, f32 `Cout` of 8192 B). `epochs` K128 epochs and `mw` x `nw` waves of 256 x 256 fix the host segments.
     Ief15 { ctl: Control, epochs: usize, mw: usize, nw: usize },
@@ -569,8 +575,13 @@ impl Topo {
     }
     /// G80 topology: `kc` K64 chunks, `mw` M-waves of 256 rows; one N wave of 1280 columns.
     pub(crate) fn g80(epi: Epilogue, ctl: Control, kc: usize, mw: usize) -> Topo {
-        Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi, ctl, kc, mw, bf16_layout: gemm_g80::Bf16Layout::NativeTiles } }
+        Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi, ctl, kc, mw, bf16_layout: gemm_g80::Bf16Layout::NativeTiles, n512: false } }
     }
+    /// G80 N512 BF16 topology: `kc` K64 chunks, `mw` M-waves of 512 rows; one N wave of 512 columns.
+    pub(crate) fn g80_n512(ctl: Control, kc: usize, mw: usize, layout: gemm_g80::Bf16Layout) -> Topo {
+        Topo { rows: ROWS, cols: COLS, kind: Kind::G80 { epi: Epilogue::Bf16, ctl, kc, mw, bf16_layout: layout, n512: true } }
+    }
+    pub(crate) fn is_g80_n512(self) -> bool { matches!(self.kind, Kind::G80 { n512: true, .. }) }
     pub(crate) fn is_g80(self) -> bool { matches!(self.kind, Kind::G80 { .. }) }
     /// G80 with the raw i32 epilogue (finite two-stripe C tasks, no C wave-parity state).
     pub(crate) fn is_g80_i32(self) -> bool { matches!(self.kind, Kind::G80 { epi: Epilogue::I32, .. }) }
@@ -601,6 +612,7 @@ impl Topo {
         match self.kind {
             Kind::Pair { epi: Epilogue::Int8 { .. }, .. } => COUT_BYTES,
             Kind::G80 { epi: Epilogue::I32, .. } => gemm_core_g80::C_BYTES,
+            Kind::G80 { epi: Epilogue::Bf16, n512: true, .. } => gemm_core_g80::bf16_n64_tile_bytes(),
             Kind::G80 { epi: Epilogue::Bf16, .. } => gemm_core_g80::C_STRIPE_BYTES,
             Kind::G80 { .. } => gemm_core_g80::COUT_BYTES,
             Kind::Ief15 { .. } => iu4_ief15_core::COUT_BYTES,
@@ -608,16 +620,19 @@ impl Topo {
         }
     }
     pub(crate) fn wave_m(self) -> usize {
-        if self.is_g80() { G80_WAVE_M } else if self.is_ief15() { IEF15_WAVE } else { self.rows * TM }
+        if self.is_g80_n512() { G80_N512_WAVE_M } else if self.is_g80() { G80_WAVE_M }
+        else if self.is_ief15() { IEF15_WAVE } else { self.rows * TM }
     }
     pub(crate) fn wave_n(self) -> usize {
-        if self.is_g80() { G80_WAVE_N } else if self.is_ief15() { IEF15_WAVE } else { self.cols * TN }
+        if self.is_g80_n512() { G80_N512_WAVE_N } else if self.is_g80() { G80_WAVE_N }
+        else if self.is_ief15() { IEF15_WAVE } else { self.cols * TN }
     }
     /// Column injects an A stream: every column of a pair design, columns `< G80_A_COLS` of G80, the column of
     /// core row `col` (Pass/Staged kinds).
     pub(crate) fn has_a(self, col: u32) -> bool {
         match self.kind {
             Kind::Pair { .. } | Kind::Ief15 { .. } => true,
+            Kind::G80 { n512: true, .. } => true,
             Kind::G80 { .. } => (col as usize) < G80_A_COLS,
             _ => (col as usize) < self.rows,
         }
@@ -647,6 +662,17 @@ impl Geometry {
         let (kc, mw) = (k / CHUNK_K, m.div_ceil(G80_WAVE_M));
         assert!(mw <= MAX_WAVES, "{mw} waves exceed {MAX_WAVES}");
         Self { topo: Topo::g80(epi, ctl, kc, mw), m, n, k, kc, mw, nw: 1, waves: mw, a_repeat: false }
+    }
+    /// G80 N512 geometry ([`gemm_g80_n512`]): `n` is exactly one 512-column wave, `k` a multiple of 64 up to
+    /// `gemm_g80_n512::MAX_KC` chunks (resident B panel), `m` padded to 512-row waves (`waves = mw`, `nw = 1`).
+    pub(crate) fn g80_n512(m: usize, n: usize, k: usize, ctl: Control, layout: gemm_g80::Bf16Layout) -> Self {
+        assert!(m > 0, "empty GEMM");
+        assert_eq!(n, G80_N512_WAVE_N, "G80 N512 needs N = {G80_N512_WAVE_N}, got {n}");
+        assert!(k % CHUNK_K == 0 && (CHUNK_K..=gemm_g80_n512::MAX_KC * CHUNK_K).contains(&k),
+            "G80 N512 K must be a multiple of {CHUNK_K} in {CHUNK_K}..={}, got {k}", gemm_g80_n512::MAX_KC * CHUNK_K);
+        let (kc, mw) = (k / CHUNK_K, m.div_ceil(G80_N512_WAVE_M));
+        assert!(mw <= MAX_WAVES, "{mw} waves exceed {MAX_WAVES}");
+        Self { topo: Topo::g80_n512(ctl, kc, mw, layout), m, n, k, kc, mw, nw: 1, waves: mw, a_repeat: false }
     }
     /// IEF15 geometry: `m` tokens x `n` features x `k` (K128 epochs, `kc = k / 128`), 256 x 256 waves in the order
     /// `w = mw*NW + nw`, `waves <= 256`.
@@ -679,6 +705,7 @@ impl Geometry {
     /// Bytes of one B host segment: every wave's B tile (`waves*kc*B_BYTES`) or, for V9 / V10, each `nw` tile once.
     pub(crate) fn b_segment_bytes(&self) -> usize {
         // G80: per chunk both 80-column N tiles of a column, `[even tile 5120 B, odd tile 5120 B]`.
+        if self.topo.is_g80_n512() { return self.kc * gemm_g80::b_chunk_bytes(self.topo); }
         if self.topo.is_g80() { return self.kc * 2 * gemm_g80::b_chunk_bytes(self.topo); }
         if self.topo.is_ief15() { return self.waves * self.kc * iu4_ief15_core::B_BYTES; }
         (if self.topo.resident().is_some() { self.nw } else { self.waves }) * self.kc * B_BYTES
@@ -690,12 +717,13 @@ impl Geometry {
     }
     pub(crate) fn c_segment_bytes(&self) -> usize { self.waves * self.topo.rows * self.topo.c_tile_bytes() }
     pub(crate) fn a_bytes(&self) -> usize {
-        let a_cols = if self.topo.is_g80() { G80_A_COLS } else if self.topo.is_pair() { self.topo.cols } else { self.topo.rows };
+        let a_cols = if self.topo.is_g80_n512() { self.topo.cols } else if self.topo.is_g80() { G80_A_COLS }
+            else if self.topo.is_pair() { self.topo.cols } else { self.topo.rows };
         a_cols * self.a_segment_bytes()
     }
     pub(crate) fn b_bytes(&self) -> usize { self.topo.cols * self.b_segment_bytes() }
     pub(crate) fn c_bytes(&self) -> usize {
-        if let Some((pitch, _)) = self.topo.bf16_rowmajor() { self.waves * G80_WAVE_M * pitch * 2 }
+        if let Some((pitch, _)) = self.topo.bf16_rowmajor() { self.waves * self.topo.wave_m() * pitch * 2 }
         else { self.topo.cols * self.c_segment_bytes() }
     }
 
@@ -957,7 +985,7 @@ fn one_column_circuits() -> Vec<Circuit> {
 }
 
 /// V8 switch circuits of one column (see the module header, "V8 data movement").
-fn pair_column_circuits(col: u32) -> Vec<Circuit> {
+pub(crate) fn pair_column_circuits(col: u32) -> Vec<Circuit> {
     let mut v = Vec::new();
     let (shim, mem) = (shim_loc(col), mem_loc(col));
     let sh = |direction, channel| ShimDma { tile: shim, direction, channel };
@@ -1487,6 +1515,7 @@ fn channel_ctrl(loc: Location, direction: dma::Direction, channel: u32) -> u32 {
 fn core_config(topo: Topo) -> (([[u32; 6]; 6], usize), [i32; 16]) {
     let five = |b: [[u32; 6]; 5]| { let mut bds = [[0; 6]; 6]; bds[..5].copy_from_slice(&b); (bds, 5) };
     match topo.kind {
+        Kind::G80 { n512: true, .. } => (gemm_core_g80::tile_bds_pair_n64(), gemm_core_g80::initial_locks()),
         Kind::G80 { epi, ctl, .. } => (gemm_core_g80::tile_bds_pair(epi, ctl), gemm_core_g80::initial_locks()),
         Kind::Ief15 { .. } => (five(iu4_ief15_core::tile_bds()), gemm_core::initial_locks_pair()),
         Kind::Pair { epi, ctl, .. } => (five(gemm_core::tile_bds_pair(epi, ctl)), gemm_core::initial_locks_pair()),
@@ -1629,24 +1658,31 @@ const ROWMAJOR_C_BDS: [[u32; 7]; 2] = [[1, 4, 6, 7, 8, 9, 10], [3, 5, 11, 12, 13
 /// cut by the preceding run (including same-design lean/ring bodies).
 fn emit_rowmajor_batch(txn: &mut Txn, geo: &Geometry, base: u64, wave: usize) {
     let (pitch, col0) = geo.topo.bf16_rowmajor().unwrap();
+    let n512 = geo.topo.is_g80_n512();
     let count = (geo.waves - wave).min(ROWMAJOR_BATCH_WAVES);
     for col in 0..geo.topo.cols {
         let shim = shim_loc(col as u32);
         for (pair, ids) in ROWMAJOR_C_BDS.iter().enumerate() {
             for index in 0..count {
                 let id = ids[index];
-                let mut bd = Bd::new(0, 10240);
-                bd.dims[0] = dma::Dim { step: 1, wrap: 40 };
+                // 128x80: both 80-column parity tiles of a channel adjoin (40 words each) in the same 128 rows;
+                // 128x64 (N512): both 64-column halves of a channel adjoin (32 words each) in the same 128 rows.
+                let (words, tile_words) = if n512 { (8192, 32) } else { (10240, 40) };
+                let mut bd = Bd::new(0, words);
+                bd.dims[0] = dma::Dim { step: 1, wrap: tile_words };
                 bd.dims[1] = dma::Dim { step: (pitch / 2) as u32, wrap: 128 };
-                bd.dims[2] = dma::Dim { step: 40, wrap: 0 };
+                bd.dims[2] = dma::Dim { step: tile_words, wrap: 0 };
                 bd.next = (index + 1 < count).then(|| ids[index + 1]);
                 if wave == 0 {
                     bd.emit_txn(shim, id, txn);
                 } else if index + 1 == count && count < ROWMAJOR_BATCH_WAVES {
                     txn.write32(Bd::address(shim, id) + 28, bd.shim_words()[7]);
                 }
-                let row = (wave + index) * G80_WAVE_M + pair * 128;
-                let column = col0 + 2 * col * 80;
+                let (row, column) = if n512 {
+                    ((wave + index) * G80_N512_WAVE_M + (2 * pair + col % 2) * 128, col0 + col / 2 * 128)
+                } else {
+                    ((wave + index) * G80_WAVE_M + pair * 128, col0 + 2 * col * 80)
+                };
                 txn.ddr_patch(Bd::address(shim, id) + 4, 2, base + (2 * (row * pitch + column)) as u64);
             }
             Task { direction: S2mm, channel: pair as u32, bd: ids[0], repeat: 1, issue_token: true }.emit_txn(shim, txn);
@@ -1819,7 +1855,13 @@ impl ArrayDesign {
         g.topo.cores().map(|t| {
             let (col, r) = (t.col as usize, t.row as usize - 2);
             if let Some((pitch, col0)) = g.topo.bf16_rowmajor() {
+                let n512 = g.topo.is_g80_n512();
                 let ranges = (0..g.waves).flat_map(|w| (0..128).map(move |i| {
+                    if n512 {
+                        let row = w * G80_N512_WAVE_M + (2 * (r / 2) + col % 2) * 128 + i;
+                        let base = 2 * (row * pitch + col0 + col / 2 * 128 + (r % 2) * 64);
+                        return base..base + 128;
+                    }
                     let row = w * G80_WAVE_M + r / 2 * 128 + i;
                     let base = 2 * (row * pitch + col0 + (2 * col + r % 2) * 80);
                     base..base + 160

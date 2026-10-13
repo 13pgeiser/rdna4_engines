@@ -7,6 +7,7 @@ pub mod gemm_core;
 pub mod gemm_array;
 pub mod gemm_core_g80;
 pub mod gemm_g80;
+pub mod gemm_g80_n512;
 pub mod w8a8_epi;
 pub mod bw_probe;
 pub mod iu4;

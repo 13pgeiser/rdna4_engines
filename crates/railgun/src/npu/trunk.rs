@@ -16,37 +16,60 @@ pub const EXPECTED_CHAIN_TIME: Duration = Duration::from_millis(60);
 pub const CHAIN_WATCHDOG: Duration = Duration::from_millis(300);
 pub const PANEL_N: usize = 1280;
 pub const PANEL_K: usize = 2560;
+/// Out-projection panels: five 512-column panels of K = 6144 (the G80 N512 program, its own PDI / hardware context).
+pub const OUT_PANEL_N: usize = 512;
+pub const OUT_PANEL_K: usize = 6144;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Shape { GdnIn, QsaIn }
+pub enum Shape { GdnIn, QsaIn, GdnOut, QsaO }
 impl Shape {
-    pub fn panels(self) -> usize { match self { Self::GdnIn => 13, Self::QsaIn => 11 } }
-    pub fn pitch(self) -> usize { self.panels() * PANEL_N }
-    fn index(self) -> usize { match self { Self::GdnIn => 0, Self::QsaIn => 1 } }
+    pub const ALL: [Shape; 4] = [Self::GdnIn, Self::QsaIn, Self::GdnOut, Self::QsaO];
+    pub fn is_out(self) -> bool { matches!(self, Self::GdnOut | Self::QsaO) }
+    pub fn panels(self) -> usize { match self { Self::GdnIn => 13, Self::QsaIn => 11, Self::GdnOut | Self::QsaO => 5 } }
+    /// Columns of one panel: 1280 (input shapes) or 512 (out shapes).
+    pub fn panel_n(self) -> usize { if self.is_out() { OUT_PANEL_N } else { PANEL_N } }
+    pub fn pitch(self) -> usize { self.panels() * self.panel_n() }
+    fn index(self) -> usize { match self { Self::GdnIn => 0, Self::QsaIn => 1, Self::GdnOut => 2, Self::QsaO => 3 } }
 }
 
 /// One row-major design per shape, with col0=0; every panel reuses it.
-/// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes.
+/// Supply build_panel_program_rowmajor(rows_max, pitch, 0)'s bytes (input shapes) or
+/// build_panel_program_out(rows_max, 2560, 0)'s bytes (out shapes: a different PDI, one hardware context per distinct PDI).
 pub struct PanelProgram { pub shape: Shape, pub pdi: Vec<u8>, pub txn: Vec<u8>, pub padded_rows: usize, pub pitch: usize }
 /// Every entry is already pack_b_bf16 encoded, including Sm/Se sidecars.
 pub struct LayerPanels { pub layer: usize, pub shape: Shape, pub panels: Vec<Vec<u8>> }
 
+/// Per-bank arenas: input shapes use `a` (`rows * 2880` B) and the C arenas of GdnIn / QsaIn (256-row padded); out shapes use
+/// `a_out` (`rows * 6912` B: K = 6144 packed A, 512-row padded) and their own BF16 C arenas (`rows * 2560 * 2` B).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArenaLayout { pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize, pitches: [usize; 2] }
+pub struct ArenaLayout {
+    pub padded_rows: usize, pub a_bytes: usize, pub b_bytes: usize,
+    /// `rows_max` rounded up to 512-row N512 waves.
+    pub out_padded_rows: usize, pub a_out_bytes: usize, pub b_out_bytes: usize,
+    pitches: [usize; 4],
+}
 impl ArenaLayout {
     pub fn new(rows_max: usize) -> Result<Self, String> {
         if !(1..=65536).contains(&rows_max) { return Err("rows_max outside 1..=65536".into()); }
         let padded_rows = rows_max.div_ceil(256) * 256;
+        let out_padded_rows = rows_max.div_ceil(512) * 512;
         Ok(Self { padded_rows, a_bytes: padded_rows * 2880, b_bytes: 8 * 40 * 2 * 5504,
-            pitches: [Shape::GdnIn.pitch(), Shape::QsaIn.pitch()] })
+            out_padded_rows, a_out_bytes: out_padded_rows * 6912, b_out_bytes: 8 * 96 * 4352,
+            pitches: [Shape::GdnIn.pitch(), Shape::QsaIn.pitch(), Shape::GdnOut.pitch(), Shape::QsaO.pitch()] })
     }
-    pub fn c_bytes(self, shape: Shape) -> usize { self.padded_rows * self.pitches[shape.index()] * 2 }
+    /// Padded rows of the shape's program: 256-row waves (input shapes), 512-row waves (out shapes).
+    pub fn padded_rows_for(self, shape: Shape) -> usize { if shape.is_out() { self.out_padded_rows } else { self.padded_rows } }
+    /// Packed A bytes of one bank for the shape's program.
+    pub fn a_bytes_for(self, shape: Shape) -> usize { if shape.is_out() { self.a_out_bytes } else { self.a_bytes } }
+    /// Bytes of one resident B panel of the shape.
+    pub fn b_bytes_for(self, shape: Shape) -> usize { if shape.is_out() { self.b_out_bytes } else { self.b_bytes } }
+    pub fn c_bytes(self, shape: Shape) -> usize { self.padded_rows_for(shape) * self.pitches[shape.index()] * 2 }
     pub fn c_offset(self, shape: Shape, panel: usize) -> Result<usize, String> {
-        if panel >= self.pitches[shape.index()] / PANEL_N { Err("panel index outside C arena".into()) } else { Ok(panel * PANEL_N * 2) }
+        if panel >= self.pitches[shape.index()] / shape.panel_n() { Err("panel index outside C arena".into()) } else { Ok(panel * shape.panel_n() * 2) }
     }
     /// Addressed span, not the full arg2 declaration: offset panels write only
-    /// their 1280 columns on each row, including the final padded row.
+    /// their panel columns (1280 / 512) on each row, including the final padded row.
     pub fn c_span(self, shape: Shape) -> usize {
-        ((self.padded_rows - 1) * self.pitches[shape.index()] + PANEL_N) * 2
+        ((self.padded_rows_for(shape) - 1) * self.pitches[shape.index()] + shape.panel_n()) * 2
     }
 }
 
@@ -95,11 +118,14 @@ impl Arena {
         Ok(Self { registration, pages })
     }
 }
-struct Bank { a: Arena, c: [Arena; 2], control: Arena, ready: HipEvent, acquire: HipEvent, retired: HipEvent }
+/// `a[0]` / `c[0..2]`: input shapes; `a[1]` / `c[2..4]`: out shapes (one page when no out shape is open).
+struct Bank { a: [Arena; 2], c: [Arena; 4], control: Arena, ready: HipEvent, acquire: HipEvent, retired: HipEvent }
 #[derive(Clone, Copy)]
 struct Binding { handle: u32, addr: u64 }
+/// Registered-page bindings of one bank: `[a_in, a_out, c0, c1, c2, c3]`.
+type BankBindings = [Binding; 6];
 #[derive(Clone, Copy)]
-struct BankPages { a: usize, a_len: usize, c: [usize; 2], c_len: [usize; 2] }
+struct BankPages { a: [usize; 2], a_len: [usize; 2], c: [usize; 4], c_len: [usize; 4] }
 struct Job { seq: Seq, layer: usize, shape: Shape, event: usize, start: Instant }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
 struct Status { pending: Vec<Pending>, failure: Option<String>, stopping: bool }
@@ -194,7 +220,7 @@ pub struct NpuTrunkRuntime {
     hip: HipRuntime,
     api: RelayApi,
     banks: Vec<Bank>,
-    bindings: Vec<[Binding; 3]>,
+    bindings: Vec<BankBindings>,
     layout: ArenaLayout,
     rows_max: usize,
     layers: Vec<(usize, Shape)>,
@@ -214,25 +240,26 @@ impl NpuTrunkRuntime {
     pub fn open_with_options(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, banks: usize, rows_max: usize, pci: &str, options: OpenOptions) -> Result<Self, String> {
         if options.watchdog.is_zero() || options.watchdog > WAIT_TIMEOUT { return Err("chain watchdog outside (0, WAIT_TIMEOUT]".into()); }
         let mut layout = ArenaLayout::new(rows_max)?;
-        layout.pitches = [0; 2];
+        layout.pitches = [0; 4];
         if banks == 0 { return Err("trunk needs at least one bank".into()); }
         let mut shapes = Vec::new();
         for program in &programs {
             if shapes.contains(&program.shape) { return Err("duplicate shape program".into()); }
             if program.pdi.is_empty() || program.txn.is_empty() { return Err("empty panel program".into()); }
-            if program.padded_rows != layout.padded_rows { return Err("panel program padded_rows mismatch".into()); }
-            if program.pitch == 0 || program.pitch % PANEL_N != 0 || program.pitch > program.shape.pitch() {
+            if program.padded_rows != layout.padded_rows_for(program.shape) { return Err("panel program padded_rows mismatch".into()); }
+            if program.pitch == 0 || program.pitch % program.shape.panel_n() != 0 || program.pitch > program.shape.pitch() {
                 return Err("invalid compacted panel pitch".into());
             }
+            // One hardware context per distinct PDI (input shapes and out shapes run different G80 programs); shapes of
+            // the same program share a context. Nothing requires the PDIs of different shape classes to be equal.
             layout.pitches[program.shape.index()] = program.pitch;
-            if programs[0].pdi != program.pdi { return Err("shape programs must share the G80 PDI".into()); }
             shapes.push(program.shape);
         }
         let mut keys = Vec::new();
         for l in &layers {
             if !shapes.contains(&l.shape) { return Err("missing shape program".into()); }
             if keys.contains(&(l.layer, l.shape)) { return Err("duplicate layer/shape".into()); }
-            if l.panels.len() != layout.pitches[l.shape.index()] / PANEL_N || l.panels.iter().any(|b| b.len() != layout.b_bytes) {
+            if l.panels.len() != layout.pitches[l.shape.index()] / l.shape.panel_n() || l.panels.iter().any(|b| b.len() != layout.b_bytes_for(l.shape)) {
                 return Err(format!("layer {} {:?}: invalid BF16 B panel count/size", l.layer, l.shape));
             }
             keys.push((l.layer, l.shape));
@@ -242,16 +269,21 @@ impl NpuTrunkRuntime {
         if hip.device_arch()? != "gfx1151" { return Err("trunk transport currently requires gfx1151".into()); }
         let api = hip.relay_api()?;
         let mut storage = Vec::with_capacity(banks);
+        let (has_in, has_out) = (shapes.iter().any(|s| !s.is_out()), shapes.iter().any(|s| s.is_out()));
         for _ in 0..banks {
-            storage.push(Bank { a: Arena::new(&hip, layout.a_bytes)?,
-                // An absent shape keeps only one registration page for the fixed
-                // binding table, never a full output arena.
-                c: [Arena::new(&hip, layout.c_bytes(Shape::GdnIn).max(4096))?, Arena::new(&hip, layout.c_bytes(Shape::QsaIn).max(4096))?],
+            // An absent shape (or A class) keeps only one registration page for the fixed binding table, never a full arena.
+            let a_in = if has_in { layout.a_bytes } else { 0 }.max(4096);
+            let a_out = if has_out { layout.a_out_bytes } else { 0 }.max(4096);
+            let c = |shape: Shape| layout.c_bytes(shape).max(4096);
+            storage.push(Bank { a: [Arena::new(&hip, a_in)?, Arena::new(&hip, a_out)?],
+                c: [Arena::new(&hip, c(Shape::GdnIn))?, Arena::new(&hip, c(Shape::QsaIn))?,
+                    Arena::new(&hip, c(Shape::GdnOut))?, Arena::new(&hip, c(Shape::QsaO))?],
                 control: Arena::new(&hip, 4096)?, ready: hip.system_event()?, acquire: hip.system_event()?, retired: hip.system_event()? });
         }
-        let pages = storage.iter().map(|b| BankPages { a: b.a.pages.ptr as usize, a_len: b.a.pages.len,
-            c: [b.c[0].pages.ptr as usize, b.c[1].pages.ptr as usize],
-            c_len: [b.c[0].pages.len, b.c[1].pages.len] }).collect();
+        let pages = storage.iter().map(|b| BankPages { a: [b.a[0].pages.ptr as usize, b.a[1].pages.ptr as usize],
+            a_len: [b.a[0].pages.len, b.a[1].pages.len],
+            c: [b.c[0].pages.ptr as usize, b.c[1].pages.ptr as usize, b.c[2].pages.ptr as usize, b.c[3].pages.ptr as usize],
+            c_len: [b.c[0].pages.len, b.c[1].pages.len, b.c[2].pages.len, b.c[3].pages.len] }).collect();
         let shared = Arc::new(Shared {
             status: Mutex::new(Status { pending: (0..banks).map(|_| Pending { value: 0, result: None }).collect(), failure: None, stopping: false }),
             changed: Condvar::new(), signals: storage.iter().map(|b| b.control.pages.ptr as usize).collect(),
@@ -272,15 +304,20 @@ impl NpuTrunkRuntime {
     }
     pub fn layout(&self) -> ArenaLayout { self.layout }
     pub fn hip(&self) -> &HipRuntime { &self.hip }
-    fn view(&self, bank: usize, shape: Option<Shape>) -> Result<HostRegistered, String> {
+    /// `shape = Some(s)`: the C arena of `s`; `None` + `out`: the packed-A arena of the input (`false`) or out (`true`) shapes.
+    fn view(&self, bank: usize, shape: Option<Shape>, out: bool) -> Result<HostRegistered, String> {
         let b = self.banks.get(bank).ok_or("invalid trunk bank")?;
-        let arena = shape.map_or(&b.a, |s| &b.c[s.index()]);
-        let binding = self.bindings[bank][shape.map_or(0, |s| 1 + s.index())];
+        let arena = shape.map_or(&b.a[usize::from(out)], |s| &b.c[s.index()]);
+        let binding = self.bindings[bank][shape.map_or(usize::from(out), |s| 2 + s.index())];
+        let a_len = if out { self.layout.a_out_bytes } else { self.layout.a_bytes };
         Ok(HostRegistered { npu_handle: binding.handle, npu_address: binding.addr, host: arena.pages.ptr,
-            device: arena.registration.ptr(), len: shape.map_or(self.layout.a_bytes, |s| self.layout.c_bytes(s)) })
+            device: arena.registration.ptr(), len: shape.map_or(a_len, |s| self.layout.c_bytes(s)) })
     }
-    pub fn a_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, None) }
-    pub fn c_arena(&self, bank: usize, shape: Shape) -> Result<HostRegistered, String> { self.view(bank, Some(shape)) }
+    /// Packed-A arena of the input shapes (`GdnIn` / `QsaIn`).
+    pub fn a_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, None, false) }
+    /// Packed-A arena of the out shapes (`GdnOut` / `QsaO`, K = 6144).
+    pub fn a_out_arena(&self, bank: usize) -> Result<HostRegistered, String> { self.view(bank, None, true) }
+    pub fn c_arena(&self, bank: usize, shape: Shape) -> Result<HostRegistered, String> { self.view(bank, Some(shape), false) }
     pub fn done_word(&self, bank: usize) -> Result<u64, String> {
         Ok(self.banks.get(bank).ok_or("invalid trunk bank")?.control.registration.ptr())
     }
@@ -411,11 +448,24 @@ impl Drop for NpuTrunkRuntime {
     }
 }
 
-// The order is intentional and tested below: ctx, chains, commands, operands,
+// The order is intentional and tested below: contexts (one per distinct PDI), chains, commands, operands,
 // instruction/PDI BOs. The enclosing Device drops only after this owner.
 struct Resources<C, Ch = Chain, P = Prepared, B = Bo> {
-    ctx: C, chains: Vec<Ch>, commands: Vec<P>, b: Vec<B>, a: Vec<B>, c: Vec<B>,
-    insts: Vec<B>, pdi: B,
+    ctxs: Vec<C>, chains: Vec<Ch>, commands: Vec<P>, b: Vec<B>, a: Vec<B>, a_out: Vec<B>, c: Vec<B>,
+    insts: Vec<B>, pdis: Vec<B>,
+}
+/// Distinct PDIs in first-use order: `(first program of each, program -> PDI index)`. Programs with byte-identical PDIs
+/// (every input shape; both out shapes) share one hardware context, programs with different PDIs get their own.
+fn distinct_pdis(programs: &[PanelProgram]) -> (Vec<usize>, Vec<usize>) {
+    let mut firsts: Vec<usize> = Vec::new();
+    let mut of_program = Vec::with_capacity(programs.len());
+    for (i, program) in programs.iter().enumerate() {
+        match firsts.iter().position(|&f| programs[f].pdi == program.pdi) {
+            Some(index) => of_program.push(index),
+            None => { of_program.push(firsts.len()); firsts.push(i); }
+        }
+    }
+    (firsts, of_program)
 }
 fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: usize, c_bytes: usize) -> Result<Prepared, String> {
     if c_offset.checked_add(c_bytes).is_none_or(|end| end > c.len) { return Err("C panel outside arena".into()); }
@@ -429,25 +479,37 @@ fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: us
     Ok(command)
 }
 fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
-    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<[Binding; 3]>, String>>, shared: Arc<Shared>, options: OpenOptions) {
+    rx: mpsc::Receiver<Job>, init: mpsc::SyncSender<Result<Vec<BankBindings>, String>>, shared: Arc<Shared>, options: OpenOptions) {
     let dev = match Device::open().and_then(|mut d| { d.map_heap(64 << 20)?; Ok(d) }) {
         Ok(d) => d, Err(e) => { let _ = init.send(Err(e)); return; }
     };
+    let (pdi_firsts, pdi_of_program) = distinct_pdis(&programs);
     let setup = (|| {
         api.select()?;
-        let pdi = dev.dev_bo(&programs[0].pdi)?;
-        let ctx = HwCtx::create(&dev, 32, 1)?;
-        let mut r = Resources { ctx, chains: Vec::new(), commands: Vec::new(), b: Vec::new(), a: Vec::new(), c: Vec::new(), insts: Vec::new(), pdi };
-        r.ctx.config_cu(&r.pdi)?;
+        let mut r = Resources { ctxs: Vec::new(), chains: Vec::new(), commands: Vec::new(), b: Vec::new(), a: Vec::new(),
+            a_out: Vec::new(), c: Vec::new(), insts: Vec::new(), pdis: Vec::new() };
+        // One context per distinct PDI, created and configured in first-use order; the single relay thread submits to
+        // them serially, so at most one chain is in flight.
+        for &first in &pdi_firsts {
+            let pdi = dev.dev_bo(&programs[first].pdi)?;
+            let ctx = HwCtx::create(&dev, 32, 1)?;
+            ctx.config_cu(&pdi)?;
+            r.pdis.push(pdi); r.ctxs.push(ctx);
+        }
         for program in &programs { r.insts.push(dev.dev_bo(&program.txn)?); }
         let mut bindings = Vec::with_capacity(pages.len());
         for p in &pages {
-            let a = dev.userptr_bo(p.a as *mut u8, p.a_len)?;
-            let c0 = dev.userptr_bo(p.c[0] as *mut u8, p.c_len[0])?;
-            let c1 = dev.userptr_bo(p.c[1] as *mut u8, p.c_len[1])?;
-            bindings.push([Binding { handle: a.handle, addr: a.dev_addr() },
-                Binding { handle: c0.handle, addr: c0.dev_addr() }, Binding { handle: c1.handle, addr: c1.dev_addr() }]);
-            r.a.push(a); r.c.extend([c0, c1]);
+            let a = dev.userptr_bo(p.a[0] as *mut u8, p.a_len[0])?;
+            let a_out = dev.userptr_bo(p.a[1] as *mut u8, p.a_len[1])?;
+            let mut binding = [Binding { handle: a.handle, addr: a.dev_addr() }, Binding { handle: a_out.handle, addr: a_out.dev_addr() },
+                Binding { handle: 0, addr: 0 }, Binding { handle: 0, addr: 0 }, Binding { handle: 0, addr: 0 }, Binding { handle: 0, addr: 0 }];
+            for s in 0..4 {
+                let c = dev.userptr_bo(p.c[s] as *mut u8, p.c_len[s])?;
+                binding[2 + s] = Binding { handle: c.handle, addr: c.dev_addr() };
+                r.c.push(c);
+            }
+            bindings.push(binding);
+            r.a.push(a); r.a_out.push(a_out);
         }
         for l in &layers {
             let b_start = r.b.len();
@@ -458,9 +520,10 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             }
             for bank in 0..pages.len() {
                 let start = r.commands.len();
+                let a = if l.shape.is_out() { &r.a_out[bank] } else { &r.a[bank] };
                 for panel in 0..l.panels.len() {
-                    r.commands.push(prepared_panel(&dev, &r.insts[program], &r.a[bank], &r.b[b_start + panel],
-                        &r.c[bank * 2 + l.shape.index()], layout.c_offset(l.shape, panel)?, layout.c_span(l.shape))?);
+                    r.commands.push(prepared_panel(&dev, &r.insts[program], a, &r.b[b_start + panel],
+                        &r.c[bank * 4 + l.shape.index()], layout.c_offset(l.shape, panel)?, layout.c_span(l.shape))?);
                 }
                 let refs: Vec<_> = r.commands[start..].iter().collect();
                 r.chains.push(Chain::new(&dev, &refs)?);
@@ -469,7 +532,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
         // Anonymous pages start zeroed; registrations/userptr setup is complete.
         // Evict any initialization lines once, before handing arenas to devices.
         // Production CPU code never accesses A/C again.
-        for arena in r.a.iter().chain(&r.c) { arena.flush(); }
+        for arena in r.a.iter().chain(&r.a_out).chain(&r.c) { arena.flush(); }
         Ok::<_, String>((r, bindings))
     })();
     let (resources, bindings) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
@@ -494,16 +557,21 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             // GPU system release makes A writes visible to NPU DMA in DRAM.
             // Production has no CPU A lines after the open-time flush; only the
             // diagnostic oracle can have cached aliases. Never SYNC_BO.
-            options.flush_for_cpu_reads(|| resources.a[job.seq.bank].flush());
             let layer = layers.iter().position(|l| l.layer == job.layer && l.shape == job.shape).ok_or("unknown relay layer")?;
+            options.flush_for_cpu_reads(|| {
+                if job.shape.is_out() { resources.a_out[job.seq.bank].flush() } else { resources.a[job.seq.bank].flush() }
+            });
             let chain = &resources.chains[layer * pages.len() + job.seq.bank];
+            // The shape's PDI selects its hardware context (the programs list holds one entry per shape).
+            let program = programs.iter().position(|p| p.shape == job.shape).ok_or("missing relay shape program")?;
+            let ctx = &resources.ctxs[pdi_of_program[program]];
             let start = Instant::now();
             let watchdog = options.watchdog;
             let chain_watchdog = Watchdog::new(start, watchdog);
             let submit_ns = monotonic_ns();
-            let point = resources.ctx.submit_chain(chain)?;
+            let point = ctx.submit_chain(chain)?;
             let left = chain_watchdog.remaining(Instant::now())?;
-            let state = resources.ctx.wait_chain(chain, point, left.as_millis().max(1) as u64)
+            let state = ctx.wait_chain(chain, point, left.as_millis().max(1) as u64)
                 .map_err(|e| format!("NPU chain completion failed (watchdog {watchdog:?}): {e}"))?;
             let done_ns = monotonic_ns();
             chain_watchdog.remaining(Instant::now())?;
@@ -512,7 +580,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             // The transaction tail synchronizes all NPU C DMA writes to DRAM.
             // GPU consumers wait on the terminal word then system-acquire; CPU
             // caches hold no C lines in production after the open-time flush.
-            options.flush_for_cpu_reads(|| resources.c[job.seq.bank * 2 + job.shape.index()].flush());
+            options.flush_for_cpu_reads(|| resources.c[job.seq.bank * 4 + job.shape.index()].flush());
             Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns, signal_write_ns: 0 })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
@@ -538,7 +606,7 @@ mod tests {
     }
     #[test] fn compacted_qkv_arena_has_eight_panel_windows() {
         let mut l = ArenaLayout::new(8192).unwrap();
-        l.pitches = [10240, 0];
+        l.pitches = [10240, 0, 0, 0];
         assert_eq!(l.c_bytes(Shape::GdnIn), 8192 * 10240 * 2);
         assert_eq!(l.c_bytes(Shape::QsaIn), 0);
         for panel in 0..8 {
@@ -568,13 +636,50 @@ mod tests {
         assert!(ArenaLayout::new(0).is_err()); assert!(ArenaLayout::new(65537).is_err());
     }
     #[test] fn shape_chains_preserve_panel_order() {
-        for shape in [Shape::GdnIn, Shape::QsaIn] {
+        for shape in Shape::ALL {
             let handles: Vec<u32> = (100..100 + shape.panels() as u32).collect();
             let words = super::super::encode_chain(&handles).unwrap();
             assert_eq!(words[1] as usize, shape.panels());
             for (p, h) in handles.iter().enumerate() { assert_eq!(words[7 + 2 * p], *h); }
             assert_eq!((words[0] >> 23) & 31, 19);
         }
+    }
+    #[test] fn out_shapes_are_five_512_column_panels_with_their_own_arenas() {
+        for shape in [Shape::GdnOut, Shape::QsaO] {
+            assert!(shape.is_out());
+            assert_eq!((shape.panels(), shape.panel_n(), shape.pitch()), (5, OUT_PANEL_N, 2560));
+        }
+        assert!(!Shape::GdnIn.is_out() && !Shape::QsaIn.is_out());
+        let l = ArenaLayout::new(8192).unwrap();
+        // K = 6144 packed A: 8 segments of waves * 96 * 4608 B = rows * 6912; B panel 8 * 96 * 4352; BF16 C 8192 x 2560.
+        assert_eq!((l.out_padded_rows, l.a_out_bytes, l.b_out_bytes), (8192, 56_623_104, 3_342_336));
+        assert_eq!(l.a_out_bytes, 8 * (8192 / 512) * 96 * 4608);
+        for shape in [Shape::GdnOut, Shape::QsaO] {
+            assert_eq!(l.c_bytes(shape), 41_943_040);
+            assert_eq!((l.a_bytes_for(shape), l.b_bytes_for(shape), l.padded_rows_for(shape)), (56_623_104, 3_342_336, 8192));
+            for p in 0..5 {
+                assert_eq!(l.c_offset(shape, p).unwrap(), 2 * p * OUT_PANEL_N);
+                assert!(l.c_offset(shape, p).unwrap() + l.c_span(shape) <= l.c_bytes(shape));
+            }
+            assert!(l.c_offset(shape, 5).is_err());
+            assert_eq!(l.c_offset(shape, 4).unwrap() + l.c_span(shape), l.c_bytes(shape));
+        }
+        // Input shapes keep their sizes; 512-row padding is independent of the 256-row padding.
+        assert_eq!((l.a_bytes_for(Shape::GdnIn), l.b_bytes_for(Shape::QsaIn), l.padded_rows_for(Shape::QsaIn)), (23_592_960, 3_522_560, 8192));
+        let odd = ArenaLayout::new(257).unwrap();
+        assert_eq!((odd.padded_rows, odd.out_padded_rows), (512, 512));
+        let odd = ArenaLayout::new(700).unwrap();
+        assert_eq!((odd.padded_rows, odd.out_padded_rows, odd.a_out_bytes), (768, 1024, 1024 * 6912));
+    }
+    #[test] fn one_context_per_distinct_pdi_in_first_use_order() {
+        let program = |shape, pdi: &[u8]| PanelProgram { shape, pdi: pdi.to_vec(), txn: vec![1], padded_rows: 256, pitch: shape.pitch() };
+        let (firsts, of) = distinct_pdis(&[program(Shape::GdnIn, b"in"), program(Shape::QsaIn, b"in")]);
+        assert_eq!((firsts, of), (vec![0], vec![0, 0]));
+        let (firsts, of) = distinct_pdis(&[program(Shape::GdnIn, b"in"), program(Shape::GdnOut, b"out"),
+            program(Shape::QsaIn, b"in"), program(Shape::QsaO, b"out")]);
+        assert_eq!((firsts, of), (vec![0, 1], vec![0, 1, 0, 1]));
+        let (firsts, of) = distinct_pdis(&[program(Shape::QsaO, b"out"), program(Shape::GdnOut, b"out")]);
+        assert_eq!((firsts, of), (vec![0], vec![0, 0]));
     }
     #[repr(align(64))]
     struct Signal(AtomicU32);
@@ -656,11 +761,11 @@ mod tests {
         let t = |name| Trace(name, Rc::clone(&log));
         // Instantiate the actual production ownership aggregates with tracing
         // resources, exercising their field order without opening either device.
-        let npu = Resources { ctx: t("context"), chains: vec![t("chain")], commands: vec![t("command")],
-            b: vec![t("bo")], a: vec![], c: vec![], insts: vec![t("insts")], pdi: t("pdi") };
+        let npu = Resources { ctxs: vec![t("context"), t("context2")], chains: vec![t("chain")], commands: vec![t("command")],
+            b: vec![t("bo")], a: vec![], a_out: vec![t("a_out")], c: vec![], insts: vec![t("insts")], pdis: vec![t("pdi"), t("pdi2")] };
         let arena = RegisteredPages { registration: t("unregister"), pages: t("unmap") };
         drop((npu, arena));
-        assert_eq!(&*log.borrow(), &["context", "chain", "command", "bo", "insts", "pdi", "unregister", "unmap"]);
+        assert_eq!(&*log.borrow(), &["context", "context2", "chain", "command", "bo", "a_out", "insts", "pdi", "pdi2", "unregister", "unmap"]);
     }
     #[test] fn panel_commands_bind_fixed_arena_offsets() {
         let layout = ArenaLayout::new(8192).unwrap();

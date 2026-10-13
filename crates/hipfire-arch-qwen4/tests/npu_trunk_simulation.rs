@@ -18,8 +18,8 @@
 //! Functional ticks are simulator ticks, never silicon cycles. Budget: a fixed number of submits of one wave,
 //! `tick_limit` as in the pm-npu harness (`Config` default, per wait, so a stall is an `Err`, not a hang).
 use hipfire_arch_qwen4::npu_trunk::{
-    build_programs_for_families, pack_shape, EpilogueContract, Family, FamilyMask, MatrixRef, PackedB, Shape,
-    PANEL_COLS, TRUNK_K,
+    build_out_programs, build_programs_for_families, pack_out, pack_shape, EpilogueContract, Family, FamilyMask, MatrixRef,
+    PackedB, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
 use pm_npu::kernels::gemm_array::ArrayDesign;
 use pm_npu::kernels::gemm_core::{Control, Epilogue};
@@ -57,7 +57,12 @@ impl Rng {
 /// m-1 have all-zero scales and zero points (absmax 0: ws == 0 and all codes 0); row 5 has huge-amplitude scales next to tiny
 /// ones so its codes saturate at +-127.
 fn random_mq6(m: usize, seed: u64) -> Vec<u8> {
-    let groups = TRUNK_K / 256;
+    random_mq6_k(m, TRUNK_K, seed)
+}
+
+/// [`random_mq6`] for rows of width `k` (a multiple of 256).
+fn random_mq6_k(m: usize, k: usize, seed: u64) -> Vec<u8> {
+    let groups = k / 256;
     let mut rng = Rng::new(seed);
     let mut out = vec![0u8; m * groups * MQ6_GROUP_BYTES];
     for row in 0..m {
@@ -453,4 +458,62 @@ fn pack_shape_panels_equal_canonical_b_qsa_in() {
     crosscheck(Shape::QsaIn, mask_of(&[QsaIdx]));
     crosscheck(Shape::QsaIn, mask_of(&[QsaK, QsaV, QsaIdx]));
     crosscheck(Shape::QsaIn, mask_of(&[QsaQ, QsaIdx]));
+}
+
+// ---------------------------------------------------------------- the out-projection program (N512, K = 6144)
+/// `pack_out` panels 0 and 4 of a random `[2560][6144]` MQ6 matrix run through the REAL `build_out_programs` design (512 rows, one
+/// wave, K = 6144, row-major pitch 2560 at col0 = 0): every output equals `bf16_direct` of the independent whole-K dot product
+/// and the independently quantised grid15-up scales; the all-zero rows (3 and 2559) come back +0, the panel equals
+/// `pack_b_bf16` of the independent codes.
+#[test]
+fn sim_out_panels_k6144_equal_the_whole_k_twin() {
+    let mq6 = random_mq6_k(OUT_COLS, OUT_K, 0x6144_0001);
+    let packed = pack_out(Shape::GdnOut, &mq6, OUT_COLS, OUT_K).expect("pack_out");
+    let progs = build_out_programs(512).expect("out programs");
+    assert_eq!(progs.rows_max, 512);
+    let prog = progs.get(Shape::QsaO);
+    assert_eq!((prog.panel_count, prog.padded_cols), (5, OUT_COLS));
+    assert_eq!(packed.panels[0].len(), prog.arg_bytes[1]);
+    let rb = OUT_K / 256 * MQ6_GROUP_BYTES;
+    let a8 = random_a8_rows(512, OUT_K, 0x6144_a8);
+    let ds = token_scales(512, 5);
+    let a_host = pack_a_bf16(&prog.design, &a8, &ds);
+    assert_eq!(a_host.len(), prog.arg_bytes[0]);
+    let mut sim = fresh(&prog.design);
+    for panel in [0usize, 4] {
+        let rows = panel * OUT_PANEL_COLS..(panel + 1) * OUT_PANEL_COLS;
+        let (mut b, mut scales, mut codes) = (vec![0i8; OUT_K * OUT_PANEL_COLS], Vec::new(), Vec::new());
+        for (c, row) in rows.clone().enumerate() {
+            let (q, _, grid) = quantize_direct(&mq6[row * rb..(row + 1) * rb]);
+            for (k, &v) in q.iter().enumerate() {
+                b[k * OUT_PANEL_COLS + c] = v;
+            }
+            scales.push(grid);
+            codes.push(q);
+        }
+        assert_eq!(&packed.scales[rows.clone()], &scales[..], "panel {panel}: scales");
+        assert!(packed.panels[panel] == pack_b_bf16(&prog.design, &b, &scales), "panel {panel}: pack_out != pack_b_bf16 of the independent codes");
+        let c = submit(&mut sim, &prog.design, &a_host, &packed.panels[panel], &format!("out panel {panel} K{OUT_K}"));
+        assert_eq!(c.len(), 512 * OUT_PANEL_COLS);
+        for row in 0..512 {
+            for col in 0..OUT_PANEL_COLS {
+                let dot: i32 = a8[row * OUT_K..(row + 1) * OUT_K].iter().zip(&codes[col]).map(|(&x, &w)| i32::from(x) * i32::from(w)).sum();
+                assert_eq!(c[row * OUT_PANEL_COLS + col], want_bf16(dot, scales[col], ds[row]), "panel {panel} row {row} col {col}");
+            }
+        }
+    }
+    assert!(packed.scales[3] == (0, 0) && packed.scales[OUT_COLS - 1] == (0, 0), "blank rows have zero scale");
+}
+
+/// `m` activation rows `[m][k]` in -127..=127 (edge rows as in `random_a8`).
+fn random_a8_rows(m: usize, k: usize, seed: u64) -> Vec<i8> {
+    let mut rng = Rng::new(seed);
+    let mut a: Vec<i8> = (0..m * k).map(|_| (((rng.next() >> 33) % 255) as i32 - 127) as i8).collect();
+    for kk in 0..k {
+        a[kk] = 127;
+        a[k + kk] = -127;
+        a[2 * k + kk] = 0;
+        a[3 * k + kk] = if kk % 2 == 0 { 127 } else { -127 };
+    }
+    a
 }

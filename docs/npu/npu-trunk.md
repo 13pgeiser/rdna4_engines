@@ -214,6 +214,77 @@ The previous per-wave row-major drain measured 15.05 TOPS on Halo versus
 16.48 TOPS native; the batched drain needs fresh silicon exactness/performance
 validation and the serving cutover still requires the parent-run gates below.
 
+## G80 N512 out-projection program (K = 6144, simulator only)
+
+`pm-npu::kernels::gemm_g80_n512` (`design_g80_n512(m, 512, 6144, Epilogue::Bf16, Fast)`,
+`build_panel_program_out(rows_max, pitch, col0)`) is the program of the QSA `o_proj` / GDN
+`out_proj` shapes (`Shape::{QsaO, GdnOut}`, N = 2560 = five 512-column panels, one pass each,
+K = 6144). Numerics: integer-exact accumulation on the array over the whole K, one RNE to BF16
+(`bf16_direct`); no int32 partial, combine or fold anywhere. It reuses the silicon-proven V8 geometry
+(512 x 512 wave, 128x64 pair cores, V8 switch circuits unchanged) with the B panel resident in the
+memtiles, a new 64-column BF16 epilogue (`g80_bf16::NARROW`, the 128x80 map is byte-identical) and
+`gemm_core::pair_chunk` as the K loop. Core `(col, rho)` computes A block `2*(rho/2) + col%2`,
+B half `rho%2` of block `col/2`; every column injects one A half (4096 codes + `Dm[128]`/`De[128]`
+= 4608 B per K64 chunk) and holds one B half (4096 codes + `Sm[64]`/`Se[64]` = 4352 B per chunk).
+
+Memtile (per column): C stage 4 x 16,384 B at `0x4000`, A ping/pong 2 x 4608 B at `0x14000`, B
+`kc*4352` B at `0x16400` (417,792 B at kc = 96, ends `0x7c400` of `0x80000`, `MAX_KC` = 99).
+17 memtile BDs (15 at kc <= 64) and 14 locks per column: C producers `0/24/2/26` and drains `6->7 / 32->33` (finite,
+`repeat = W`), B fill `4,5` / guarded read `30,31` (finite groups of at most 64 chunks: the iteration
+wrap field is 6 bits) and the lock-free whole-panel replay `36` (`repeat = W-1`), A rings `28<->29`,
+`14<->15`. A memtile lock holds at most 63 and the fill can run a whole panel ahead of the stalled
+reader, so the fill acquires a credit lock (id 6, initial `min(kc,63)`) that the guarded reader
+returns. Core image: lower/upper programs 9,776 B each (limit 16 KiB), PDI 340,944 B, full TXN
+46,448 B (M512) / 63,984 B (row-major M8192), lean TXN 10,608 B (M512). Row-major drain: one shim BD
+per channel and wave with `(1,32),(pitch/2,128),(32,0)` over 8192 words, memtile dims
+`(1,4),(32,8),(4,8),(256,0)`; the existing 7-wave batching applies. PDI/TXN/program hashes are pinned
+in `golden_bytes.rs` (`g80_n512_out_bytes_match_golden`); the 128x80 pins are unchanged.
+
+Host layout: arg0 = A, 8 segments of `W*kc*4608` B (`W` 512-row waves; 56,623,104 B at 8192 rows),
+arg1 = B, 8 segments of `kc*4352` B (3,342,336 B), arg2 = C row-major `rows*pitch*2` B (pitch 2560,
+panel `p` at `col0 = 512*p`, `append_run_body` / `append_lean_run_body` with `arena_base[2] =
+2*512*p`) or native 16,384 B tiles. `pack_a_bf16` / `pack_b_bf16` dispatch on the design.
+
+### Gate K0 (design round verdict section 2), simulator ticks, never silicon
+
+`cargo test --release -p pm-npu --test g80 g80_n512 -- --nocapture` (golden bytes: complete padded
+arena equal to the `bf16_direct` twin over the limb x sign x tie fixture at K = 6144, 1 / 2 / 16
+waves, padded rows zero, outside-window poison untouched, five adjacent panels in one buffer, lean
+and forced-requeue bodies, kc 1..99). Measured with `g80_n512_gate_k0_*`:
+
+| | value |
+|---|---|
+| ticks, 1 / 2 / 16 waves (512 rows each) | 186,175 / 362,484 / 2,830,810 |
+| incremental ticks per wave | **176,309** (K loop 1,152 ticks/chunk = A half 4608 B at 4 B/cycle, per-wave epilogue + drain 65,717) |
+| int8 baseline wave (K2560, N1280) | 58,555 ticks = 33.1 TOPS |
+| simulated rate alone (scaled through the same incremental-tick ratio) | **21.11 TOPS** (gate >= 16) |
+| bytes per 8192-row fragment | A 56,623,104 + B 3,342,336 + C 8,388,608 = 68,354,048 = **1.3262 B/kop** (gate <= 1.4) |
+| 128x64 against 128x80 K-loop MAC efficiency | 88.9 % vs 91.6 %: loses 3.0 % (gate 15 %) |
+
+K0 passes; Option 2 (K-split with on-array partial reload) is not needed. The rate is an estimate
+scaled from the measured int8 wave exactly as the K2560 BF16 numbers above, not a silicon result;
+the K loop is bound by the 1,152-cycle A half stream, not by the MAC schedule.
+
+Relay and transport: `railgun::npu::trunk` runs one hardware context per distinct PDI (input shapes
+and out shapes have different PDIs, both out shapes share one); the single relay thread submits
+serially, B residency, arenas and the device-side rejoin are unchanged. Out shapes use per-bank
+`a_out` (`rows*6912` B = 56,623,104 B at 8192) and BF16 out arenas (`rows*2560*2` B = 41,943,040 B)
+registered like the input C arenas. `npu-trunk-transport --shape gdn_out|qsa_o` is the 20-round
+exact oracle (whole-K int32 sum + `bf16_direct`, both banks); `--corun` queues 16 GiB of GPU copies
+against every chain; `--coexist` measures second-context creation / `config_cu` / context-switch
+cost. Halo (H3, <= 90 s window):
+
+```sh
+# K = 6144 program, 8192 rows, exact vs the twin, rate alone (CPU reference runs before the device opens)
+target/release/npu-gemm 8192 512 6144 --variant G80 --epi bf16 --n512 --rowmajor-pitch 2560 --rowmajor-col0 512 --iters 3 --reuse-ctx
+target/release/npu-gemm 8192 512 6144 --variant G80 --epi bf16 --n512 --rowmajor-pitch 2560 --rowmajor-col0 512 --loop 15
+# out-shape transport oracle: 5-panel chains, 2 banks, 20 exact rounds, forced-watchdog negative; then co-run
+target/release/npu-trunk-transport --shape gdn_out --rounds 20
+target/release/npu-trunk-transport --shape gdn_out --rounds 6 --corun
+# second HwCtx coexistence, config_cu and context-switch cost (kill: no coexistence, or > 2 ms)
+target/release/npu-trunk-transport --coexist --reps 10
+```
+
 ## GPU Bf16Direct glue
 
 `rdna_compute::npu_trunk` exposes an explicit `NpuBf16Layout` (padded rows,

@@ -184,12 +184,15 @@ pub enum Bf16Layout {
 }
 
 impl Bf16Layout {
-    fn validate(self, padded_rows: usize) -> Result<(), String> {
+    fn validate(self, padded_rows: usize) -> Result<(), String> { self.validate_for(padded_rows, WAVE_N) }
+
+    /// `validate` for a wave `wave_n` columns wide (1280 for G80, 512 for the N512 design).
+    pub(crate) fn validate_for(self, padded_rows: usize, wave_n: usize) -> Result<(), String> {
         if let Self::RowMajor { pitch_elems: pitch, col0_elems: col0 } = self {
             if pitch % 2 != 0 || col0 % 2 != 0 || pitch / 2 > 1 << 20 ||
-                col0.checked_add(WAVE_N).is_none_or(|end| end > pitch) ||
+                col0.checked_add(wave_n).is_none_or(|end| end > pitch) ||
                 padded_rows.checked_mul(pitch).and_then(|n| n.checked_mul(2)).is_none() {
-                return Err(format!("BF16 row-major needs even pitch/col0, col0+1280 <= pitch <= {}, and a representable arena", 2 << 20));
+                return Err(format!("BF16 row-major needs even pitch/col0, col0+{wave_n} <= pitch <= {}, and a representable arena", 2 << 20));
             }
         }
         Ok(())
@@ -209,11 +212,11 @@ const _: () = assert!(B_OFF as usize + 2 * g80_core::MAX_KC * B_BYTES == MEM_END
 const _: () = assert!(A_HALF_BYTES <= 0x2000);
 
 // BD ids and channels (banks: even channel < 24, odd >= 24).
-const C_S2MM_BD: [[u32; 2]; ROWS] = [[0, 1], [24, 25], [2, 3], [26, 27]];
-const C_DRAIN_CH: [u32; 2] = [0, 3];
-const C_DRAIN_BD0: [u32; 2] = [6, 32];
-const B_FILL_CH: u32 = 4;
-const B_FILL_BD: [u32; 2] = [4, 5];
+pub(crate) const C_S2MM_BD: [[u32; 2]; ROWS] = [[0, 1], [24, 25], [2, 3], [26, 27]];
+pub(crate) const C_DRAIN_CH: [u32; 2] = [0, 3];
+pub(crate) const C_DRAIN_BD0: [u32; 2] = [6, 32];
+pub(crate) const B_FILL_CH: u32 = 4;
+pub(crate) const B_FILL_BD: [u32; 2] = [4, 5];
 /// B readers per parity: MM2S1 (parity 0) and MM2S5 (parity 1).
 pub(crate) const G80_B_MM2S_CH: [u32; 2] = [1, 5];
 /// Finite guarded B readers (`repeat = kc`, iteration `step 1280, wrap kc`) and whole-stream readers (`repeat = mw - 1`).
@@ -224,14 +227,14 @@ const B_GUARD_BD: [u32; 2] = G80_B_GUARD_BD;
 const B_WHOLE_BD: [u32; 2] = G80_B_WHOLE_BD;
 /// B ready locks per parity (`gemm_core::B_EMPTY` ids 4 and 6; the `B_FULL` ids 5 and 7 are unused).
 pub(crate) const B_READY: [u32; 2] = [gemm_core::B_EMPTY[0], gemm_core::B_EMPTY[1]];
-const A_S2MM_CH: u32 = 5;
-const A_S2MM_BD: [u32; 2] = [28, 29];
-const A_MM2S_CH: u32 = 2;
-const A_MM2S_BD: [u32; 2] = [14, 15];
-const C_LOCK0: u32 = 8;
+pub(crate) const A_S2MM_CH: u32 = 5;
+pub(crate) const A_S2MM_BD: [u32; 2] = [28, 29];
+pub(crate) const A_MM2S_CH: u32 = 2;
+pub(crate) const A_MM2S_BD: [u32; 2] = [14, 15];
+pub(crate) const C_LOCK0: u32 = 8;
 const _: () = assert!(B_READY[0] == 4 && B_READY[1] == 6 && g80_core::MAX_KC < 63);
 
-fn c_lock(slot: usize, row: usize) -> u32 { C_LOCK0 + (slot * 8 + row * 2) as u32 }
+pub(crate) fn c_lock(slot: usize, row: usize) -> u32 { C_LOCK0 + (slot * 8 + row * 2) as u32 }
 fn c_off(slot: usize, row: usize) -> u32 { C_OFF + slot as u32 * C_SLOT_STRIDE + row as u32 * C_ROW_STRIDE }
 /// `Epilogue::I32` stage of row `r`: one 20480 B slot (`g80_core::C_STRIPE_BYTES`), rows contiguous from `0x4000`, ending `0x18000`.
 fn c_i32_off(row: usize) -> u32 { C_OFF + row as u32 * g80_core::C_STRIPE_BYTES as u32 }
@@ -255,6 +258,7 @@ pub(crate) fn a_chunk_bytes(topo: Topo) -> usize {
     if topo.is_g80_bf16() { bf16::A_BYTES } else { A_HALF_BYTES }
 }
 pub(crate) fn b_chunk_bytes(topo: Topo) -> usize {
+    if topo.is_g80_n512() { return bf16::NARROW.b_bytes(); }
     if topo.is_g80_bf16() { bf16::B_BYTES } else { B_BYTES }
 }
 fn a_offsets(topo: Topo) -> [u32; 2] {
@@ -281,6 +285,7 @@ fn chain_bd(first: u32, idx: usize, len: usize, addr: u32, words: u32, acq: u32,
 
 /// Static stream-switch circuits of one column (see the module header, "Switch circuits").
 pub(crate) fn column_circuits(topo: Topo, col: u32) -> Vec<Circuit> {
+    if topo.is_g80_n512() { return super::gemm_g80_n512::column_circuits(topo, col); }
     shape(topo);
     let has_a = topo.has_a(col);
     let mut v = Vec::new();
@@ -327,6 +332,7 @@ pub(crate) fn column_circuits(topo: Topo, col: u32) -> Vec<Circuit> {
 
 /// All memtile BDs of a column `(id, bd)`: B fill / guarded / whole readers, C rings and drains, A rings (columns 0..3).
 pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
+    if topo.is_g80_n512() { return super::gemm_g80_n512::memtile_descriptors(topo, col); }
     let (kc, _) = shape(topo);
     let mut v = Vec::new();
     let chunk_words = (b_chunk_bytes(topo) / 4) as u32;
@@ -425,6 +431,7 @@ pub(crate) fn memtile_descriptors(topo: Topo, col: u32) -> Vec<(u32, Bd)> {
 
 /// Initial memtile lock values: `*_EMPTY` 1, `*_FULL` 0, B ready 0.
 pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
+    if topo.is_g80_n512() { return super::gemm_g80_n512::memtile_locks(topo, col); }
     shape(topo);
     let mut v = vec![(B_READY[0], 0), (B_READY[1], 0)];
     if topo.has_a(col) {
@@ -443,6 +450,7 @@ pub(crate) fn memtile_locks(topo: Topo, col: u32) -> Vec<(u32, u32)> {
 /// Core ring tasks plus the memtile tasks of a column (the shim tasks depend on the arguments). Finite B tasks come in queue
 /// order: per reader channel the guarded task, then the whole-stream task (omitted for `mw = 1`).
 pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
+    if topo.is_g80_n512() { return super::gemm_g80_n512::ring_tasks(topo, col); }
     let (kc, mw) = shape(topo);
     let rep = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
     let task = |direction, channel, bd| rep(direction, channel, bd, 1);
@@ -473,6 +481,7 @@ pub(crate) fn ring_tasks(topo: Topo, col: u32) -> Vec<(Location, Task)> {
 
 /// A argument: 4 injecting-column segments, `(wave, chunk, E/O half 4 KiB)`.
 pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
+    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_a(geo, a); }
     let (kc, _) = check_geometry(geo);
     assert_eq!(a.len(), geo.m * geo.k, "A must be m*k");
     let chunk = a_chunk_bytes(geo.topo);
@@ -491,6 +500,7 @@ pub(crate) fn pack_a(geo: &Geometry, a: &[i8]) -> Vec<u8> {
 
 /// B argument: 8 column segments, chunk-major `[even N tile, odd N tile]`, each tile `(kb 0..8, nb 0..10)` 8x8 blocks.
 pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
+    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_b(geo, b); }
     let (kc, _) = check_geometry(geo);
     assert_eq!(b.len(), geo.k * geo.n, "B must be k*n");
     let chunk = b_chunk_bytes(geo.topo);
@@ -516,6 +526,7 @@ pub(crate) fn pack_b(geo: &Geometry, b: &[i8]) -> Vec<u8> {
 /// 40960 B (stripe 0 = `mb 0..8`, stripe 1 = `mb 8..16`, contiguous) of little-endian i32 8x8 blocks in `(mb 0..16, nb 0..10)`
 /// order.
 pub(crate) fn unpack_c(geo: &Geometry, output: &[u8]) -> Vec<i32> {
+    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::unpack_c(geo, output); }
     check_geometry(geo);
     assert_eq!(output.len(), geo.c_bytes(), "C stream size");
     let i32_tiles = is_i32(geo.topo);
@@ -584,6 +595,7 @@ const WAVEFRONT_BUNDLES: u64 = (32 * 5 * 8 + 35) as u64;
 /// `output_dma_cycles` reports the per-wave epilogue plus exposed `Cout` drain cycles summed over the waves (I32: the
 /// six-phase `C_EMPTY` stall per wave plus one final drain phase).
 pub(crate) fn estimate(geo: &Geometry, ctl: Control, clock_hz: u64) -> CycleEstimate {
+    if geo.topo.is_g80_n512() { return super::gemm_g80_n512::estimate(geo, ctl, clock_hz); }
     assert!(clock_hz > 0);
     let (kc, _) = check_geometry(geo);
     let (kc, waves) = (kc as u64, geo.waves as u64);
@@ -702,6 +714,7 @@ pub fn build_panel_program_rowmajor(rows_max: usize, pitch: usize, col0: usize) 
 /// Padding tokens have zero scales. Scale metadata is deliberately repeated per
 /// chunk to reuse the existing ping/pong descriptors and locks.
 pub fn pack_a_bf16(design: &ArrayDesign, a: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
+    if design.geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_a_bf16(design, a, scales); }
     let geo = &design.geo;
     assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
     assert_eq!(scales.len(), geo.m);
@@ -722,6 +735,7 @@ pub fn pack_a_bf16(design: &ArrayDesign, a: &[i8], scales: &[(u16, i16)]) -> Vec
 /// BF16 resident B panel: each 5120-byte K64 N80 tile is followed by Sm[96]
 /// u16 and Se[96] i16 (80 live +16 zero padding for aligned vector loads).
 pub fn pack_b_bf16(design: &ArrayDesign, b: &[i8], scales: &[(u16, i16)]) -> Vec<u8> {
+    if design.geo.topo.is_g80_n512() { return super::gemm_g80_n512::pack_b_bf16(design, b, scales); }
     let geo = &design.geo;
     assert!(geo.topo.is_g80_bf16(), "BF16 sidecars require a BF16 G80 design");
     assert_eq!(scales.len(), geo.n);

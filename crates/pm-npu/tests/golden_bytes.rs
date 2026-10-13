@@ -112,3 +112,28 @@ fn g80_bf16_native_bytes_match_golden() {
         assert_eq!((fnv(&d.pdi), fnv(&d.insts)), hashes, "G80 BF16 native {m} bytes changed");
     }
 }
+
+/// The N512 / K6144 out-projection design (`gemm_g80_n512`), native tiles and row-major (pitch 2560, col0 0), M512 and M8192:
+/// `(pdi, txn, lower program, upper program)` FNV-1a hashes, pinned when the design was first committed so the production
+/// bytes of the out program cannot drift silently. Tuples are `(m, layout, pdi, txn, lower, upper)`.
+#[test]
+fn g80_n512_out_bytes_match_golden() {
+    use pm_npu::kernels::gemm_g80::Bf16Layout;
+    let rowmajor = Bf16Layout::RowMajor { pitch_elems: 2560, col0_elems: 0 };
+    let pins: [(usize, Bf16Layout, [u64; 4]); 4] = [
+        (512, Bf16Layout::NativeTiles, [0xc928b89c58012467, 0x4291c32493ddc1b0, 0x67f57222824ad41a, 0x1ce87df7f313cb6a]),
+        (8192, Bf16Layout::NativeTiles, [0x3135f27ae09c3207, 0xac5209c99a816729, 0xb1a9d43c99961334, 0x1910880189b8b7ec]),
+        (512, rowmajor, [0x5e6b30e57fdec1d7, 0x1fd333c421b95278, 0x67f57222824ad41a, 0x1ce87df7f313cb6a]),
+        (8192, rowmajor, [0x51878e7e9a89df77, 0x93952abc61528a3b, 0xb1a9d43c99961334, 0x1910880189b8b7ec]),
+    ];
+    let mut bad = Vec::new();
+    for (m, layout, want) in pins {
+        let d = pm_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, 512, 6144, Epilogue::Bf16, Control::Fast, layout);
+        let got = [fnv(&d.pdi), fnv(&d.insts), fnv(d.core_program()), fnv(d.core_program_upper().unwrap())];
+        println!("N512 {m} {layout:?} {:016x} {:016x} {:016x} {:016x}", got[0], got[1], got[2], got[3]);
+        println!("N512 {m} sizes: pdi {} B, txn {} B, lean {} B, lower {} B, upper {} B", d.pdi.len(), d.insts.len(),
+            d.lean_insts().unwrap().len(), d.core_program().len(), d.core_program_upper().unwrap().len());
+        bad.extend((got != want).then(|| format!("N512 out {m} {layout:?} bytes changed")));
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+}

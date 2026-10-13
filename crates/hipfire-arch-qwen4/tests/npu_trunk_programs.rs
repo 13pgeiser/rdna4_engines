@@ -3,7 +3,8 @@
 //! documented layout, not from the design), row bounds and rounding, sidecar bytes, and masked panel counts.
 //! Nothing here runs the simulator or touches a device.
 use hipfire_arch_qwen4::npu_trunk::{
-    build_programs, build_programs_for_families, EpilogueContract, Family, FamilyMask, NpuPrograms, Shape, PANEL_COLS, TRUNK_K,
+    build_out_programs, build_programs, build_programs_for_families, EpilogueContract, Family, FamilyMask, NpuPrograms, Shape, OUT_COLS,
+    OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
 
 const WAVE_M: usize = 256;
@@ -173,4 +174,36 @@ fn full_build_is_the_all_families_masked_build() {
         assert_eq!((x.panel_count, x.padded_cols, x.arg_bytes), (y.panel_count, y.padded_cols, y.arg_bytes));
         assert_eq!((&x.design.pdi, &x.design.insts), (&y.design.pdi, &y.design.insts), "deterministic bytes");
     }
+}
+
+/// Out-projection programs (`build_out_programs`): K = 6144, five 512-column panels, 512-row waves, one design / PDI shared by
+/// `GdnOut` and `QsaO` and distinct from the input shapes'; sizes computed here from the documented layout.
+#[test]
+fn out_programs_are_k6144_n512_with_their_own_pdi() {
+    for rows in [1usize, 511, 512, 513, 8192, 65535, 65536] {
+        let progs = build_out_programs(rows).unwrap();
+        let waves = rows.div_ceil(512);
+        assert_eq!(progs.rows_max, waves * 512);
+        let args = [8 * waves * 96 * 4608, 8 * 96 * 4352, waves * 512 * OUT_COLS * 2];
+        for shape in Shape::OUT {
+            let p = progs.get(shape);
+            assert_eq!((p.shape, p.panel_count, p.padded_cols), (shape, 5, OUT_COLS));
+            assert_eq!(p.arg_bytes, args, "rows {rows} {shape}");
+            assert_eq!((p.host_bytes_read, p.host_bytes_written), ((args[0] + args[1]) as u64, (waves * 512 * OUT_PANEL_COLS * 2) as u64)); // one panel's BF16 columns per submit
+            assert_eq!(p.design.epilogue(), Some(pm_npu::kernels::gemm_core::Epilogue::Bf16));
+            assert_eq!(p.design.waves(), waves);
+        }
+        assert_eq!(progs.get(Shape::GdnOut).design.pdi, progs.get(Shape::QsaO).design.pdi);
+    }
+    let out = build_out_programs(512).unwrap();
+    let input = build_programs(EpilogueContract::Bf16Direct, 512).unwrap();
+    assert_ne!(out.get(Shape::GdnOut).design.pdi, input.get(Shape::GdnIn).design.pdi, "second PDI");
+    assert_eq!(OUT_PANEL_COLS * 5, OUT_COLS);
+    assert_eq!(OUT_K, 6144);
+    assert!(std::panic::catch_unwind(|| build_out_programs(512).unwrap().get(Shape::GdnIn).panel_count).is_err());
+    for rows in [0usize, 65537, usize::MAX] {
+        let err = build_out_programs(rows).unwrap_err();
+        assert!(err.contains(&rows.to_string()) && err.contains("65536"), "{err}");
+    }
+    let _ = (PANEL_COLS, TRUNK_K);
 }

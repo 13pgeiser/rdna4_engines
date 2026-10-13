@@ -1668,3 +1668,302 @@ fn g80_bf16_rowmajor_batch_descriptor_budget_and_instruction_counts() {
         }
     }
 }
+
+// ---------------------------------------------------------------- N512 / K6144 direct BF16 (gate K0)
+// `gemm_g80_n512`: the V8 wave (512 rows x 512 columns, 128x64 core tiles, B panel resident) with the integer BF16 epilogue.
+// The CPU twin is `bf16_direct` over the exact int32 whole-K sum; golden bytes means the complete padded arena.
+use pm_npu::kernels::{gemm_g80::Bf16Layout as OutLayout, gemm_g80_n512::{build_panel_program_out, design_g80_n512_layout,
+    pack_a_bf16 as out_pack_a, pack_b_bf16 as out_pack_b}, w8a8_epi::bf16_direct as out_twin};
+const ON:usize=512;
+const OUT_WAVE_M:usize=512;
+const OUT_K:usize=6144;
+const OUT_A_CHUNK:usize=4608;
+const OUT_B_CHUNK:usize=4352;
+const OUT_C_TILE:usize=16384;
+
+fn out_design(m:usize,k:usize,layout:OutLayout)->ArrayDesign {design_g80_n512_layout(m,ON,k,Epilogue::Bf16,Control::Fast,layout)}
+fn out_rowmajor(pitch:usize,col0:usize)->OutLayout {OutLayout::RowMajor{pitch_elems:pitch,col0_elems:col0}}
+
+/// Token scales: every third row has the exact tie scale `Dm = 2^14, De = -18`, some zero scales, the rest on the exponent range.
+fn out_token_scales(m:usize,seed:usize)->Vec<(u16,i16)> {
+    (0..m).map(|t|if (t+seed)%3==0 {(16384,-18)} else if (t+seed)%17==5 {(0,0)}
+        else {((16384+(t*7919+seed*1237)%16384) as u16,[-163,-110,-90,-70,-35,-18,0,45,110][(t+seed)%9])}).collect()
+}
+fn out_feature_scales(n:usize,seed:usize)->Vec<(u16,i16)> {
+    (0..n).map(|j|if (j+seed)%2==0 {(16384,-18)} else if (j+seed)%19==3 {(0,0)}
+        else {((16384+(j*104729+seed*7717)%16384) as u16,[-163,-110,-90,-70,-35,-18,0,45,110][(j*5+seed)%9])}).collect()
+}
+/// B column `j` is the constant `OUT_BCOL[j % 8]` down all of K, A row `t` sums to `limb_sum(t)`: the exact int32 result is
+/// `OUT_BCOL[j % 8] * limb_sum(t)`, so every limb length (|I| from 1 to 2^26), both signs, exact BF16 ties, carries and
+/// all-ones patterns are constructed, not hoped for.
+const OUT_BCOL:[i32;8]=[1,127,-127,3,-1,64,-64,5];
+fn limb_sum(t:usize,k:usize)->i32 {
+    let (idx,sign)=(t%120,if (t/120)%2==0 {1i64} else {-1});
+    let (l,flavor)=(idx/6,idx%6);
+    let tie=|extra:i64|if l>=8 {(0x101+extra)<<(l-8)} else {(1i64<<l)+1};
+    let magnitude:i64=match flavor {
+        0=>1<<l,1=>tie(0),2=>if l>=8 {0x1ff<<(l-8)} else {(1<<(l+1))-1},3=>tie(2),4=>(1<<(l+1))-1,
+        _=>((t as i64*2654435761)%(1<<(l+1)).max(1))|(1<<l)};
+    (sign*magnitude).clamp(-127*k as i64,127*k as i64) as i32
+}
+fn out_limb_fixture(m:usize,k:usize)->(Vec<i8>,Vec<i8>,Vec<i32>) {
+    let mut a=vec![0i8;m*k];
+    for t in 0..m {
+        let s=limb_sum(t,k) as i64;let base=s/k as i64;let rem=(s-base*k as i64).unsigned_abs() as usize;let step=if s<0 {-1} else {1};
+        for kk in 0..k {a[t*k+kk]=(base+if kk<rem {step} else {0}) as i8;}
+    }
+    let mut b=vec![0i8;k*ON];
+    for kk in 0..k {for j in 0..ON {b[kk*ON+j]=OUT_BCOL[j%8] as i8;}}
+    let raw=(0..m*ON).map(|x|OUT_BCOL[(x%ON)%8]*limb_sum(x/ON,k)).collect();
+    (a,b,raw)
+}
+fn out_random(m:usize,k:usize,seed:u32)->(Vec<i8>,Vec<i8>) {
+    let mut state=seed;let mut next=|| {state^=state<<13;state^=state>>17;state^=state<<5;state as i8};
+    let mut a:Vec<_>=(0..m*k).map(|_|next()).collect();let mut b:Vec<_>=(0..k*ON).map(|_|next()).collect();a[0]=-128;b[0]=-128;(a,b)
+}
+/// Expected complete arena: native tiles are rebuilt tile by tile (padding rows zero), row-major is poison everywhere except the
+/// `[col0, col0+512)` window of the padded rows, which holds the twin (padding rows zero).
+fn out_expected_arena(d:&ArrayDesign,layout:OutLayout,raw:&[i32],ds:&[(u16,i16)],ss:&[(u16,i16)],m:usize,extra:usize)->Vec<u8> {
+    let twin=|row:usize,col:usize|if row<m {out_twin(raw[row*ON+col],ss[col].0,ss[col].1,ds[row].0,ds[row].1)} else {0};
+    let mut arena=vec![POISON;d.args[2].bytes+extra];
+    match layout {
+        OutLayout::RowMajor{pitch_elems:pitch,col0_elems:col0}=>{
+            for row in 0..d.waves()*OUT_WAVE_M {for col in 0..ON {
+                let off=2*(row*pitch+col0+col);arena[off..off+2].copy_from_slice(&twin(row,col).to_le_bytes());}}
+        }
+        OutLayout::NativeTiles=>{
+            for ((col,prow),ranges) in d.output_tile_ranges() {
+                let (c,rho)=(col as usize,prow as usize-2);
+                for (w,range) in ranges.iter().enumerate() {
+                    assert_eq!(range.len(),OUT_C_TILE);
+                    let (m0,n0)=(w*OUT_WAVE_M+(2*(rho/2)+c%2)*128,(c/2)*128+(rho%2)*64);
+                    for mb in 0..16 {for nb in 0..8 {for i in 0..8 {for j in 0..8 {
+                        let off=range.start+((mb*8+nb)*64+i*8+j)*2;
+                        arena[off..off+2].copy_from_slice(&twin(m0+mb*8+i,n0+nb*8+j).to_le_bytes());}}}}
+                }
+            }
+        }
+    }
+    arena
+}
+/// One checked submit of `insts` (full or lean) of `d`; returns the simulator ticks. Golden bytes: the complete arena
+/// (poisoned, padding rows zero, nothing outside the window written) equals the `bf16_direct` twin of `raw`.
+fn out_submit(sim:&mut Config,d:&ArrayDesign,insts:&[u8],a:&[i8],b:&[i8],raw:&[i32],ds:&[(u16,i16)],ss:&[(u16,i16)],m:usize,layout:OutLayout,what:&str)->usize {
+    let (ah,bh)=(out_pack_a(d,a,ds),out_pack_b(d,b,ss));
+    assert_eq!((ah.len(),bh.len()),(d.args[0].bytes,d.args[1].bytes),"{what}: packed sizes");
+    let inputs=[signature(&ah),signature(&bh)];
+    let mut args=vec![ah,bh,vec![POISON;d.args[2].bytes]];
+    let (before,t0)=(traffic(sim),sim.ticks);
+    sim.submit(insts,&mut args).unwrap_or_else(|e|panic!("{what}: submit failed: {e}"));
+    let ticks=sim.ticks-t0;
+    assert_eq!([signature(&args[0]),signature(&args[1])],inputs,"{what}: packed inputs changed");
+    let want=out_expected_arena(d,layout,raw,ds,ss,m,0);
+    if let Some(at)=first_diff(&args[2],&want) {
+        let got=d.unpack_out(&args[2]);let (elem,row,col)=(at/2,0,0);let _=(elem,row,col);
+        let bad=(0..m*ON).find(|&i|got[i]!=i32::from(out_twin(raw[i],ss[i%ON].0,ss[i%ON].1,ds[i/ON].0,ds[i/ON].1)));
+        panic!("{what}: arena differs at byte {at}; first wrong element {:?} ({})",bad.map(|i|(i/ON,i%ON,raw[i],got[i])),
+            if bad.is_none() {"all live elements match: padding / poison / window violation"} else {"value mismatch"});
+    }
+    let (waves,kc)=(m.div_ceil(OUT_WAVE_M),d.args[1].bytes/(8*OUT_B_CHUNK));
+    for (&(_,dir,ch,was),(_,_,_,now)) in before.iter().zip(traffic(sim)) {
+        let bytes=match (dir,ch) {
+            (Direction::Mm2s,0)=>kc*OUT_B_CHUNK,(Direction::Mm2s,1)=>waves*kc*OUT_A_CHUNK,
+            (Direction::S2mm,0|1)=>waves*2*OUT_C_TILE,_=>panic!("unexpected shim channel")};
+        assert_eq!(now-was,bytes as u64,"{what}: shim {dir:?} ch {ch} bytes");
+    }
+    eprintln!("PASS {what}: {m}x{ON}x{} {ticks} functional ticks (simulator ticks, not hardware cycles), complete arena equal to the bf16_direct twin",kc*64);
+    ticks
+}
+
+fn out_case(m:usize,k:usize,layout:OutLayout,seed:usize,what:&str)->usize {
+    let d=out_design(m,k,layout);let (a,b)=out_random(m,k,SEEDS[seed%3]);
+    let raw=cpu_reference(&a,&b,m,ON,k);
+    let (ds,ss)=(out_token_scales(m,seed),out_feature_scales(ON,seed+3));
+    out_submit(&mut fresh(&d),&d,&d.insts,&a,&b,&raw,&ds,&ss,m,layout,what)
+}
+#[test] fn g80_n512_smoke_native_k128_one_wave() {out_case(512,128,OutLayout::NativeTiles,0,"N512 smoke native K128 W1");}
+
+fn out_limb_case(m:usize,layout:OutLayout,seed:usize,what:&str)->usize {
+    let d=out_design(m,OUT_K,layout);let (a,b,raw)=out_limb_fixture(m,OUT_K);
+    let (ds,ss)=(out_token_scales(m,seed),out_feature_scales(ON,seed+3));
+    out_submit(&mut fresh(&d),&d,&d.insts,&a,&b,&raw,&ds,&ss,m,layout,what)
+}
+#[test] fn g80_n512_k6144_limb_fixture_one_wave_native() {out_limb_case(512,OutLayout::NativeTiles,0,"N512 limb K6144 W1 native");}
+#[test] fn g80_n512_k6144_limb_fixture_one_wave_rowmajor_panel4() {out_limb_case(512,out_rowmajor(2560,2048),1,"N512 limb K6144 W1 rowmajor pitch 2560 col0 2048");}
+#[test] fn g80_n512_k6144_random_one_wave_rowmajor() {out_case(512,OUT_K,out_rowmajor(2560,512),2,"N512 random K6144 W1 rowmajor panel1");}
+
+/// 1, 2 and many waves of the limb fixture at K = 6144 (many = 8192 rows = 16 waves, the H3 shape), both destinations.
+#[test] fn g80_n512_k6144_limb_fixture_two_waves_rowmajor() {out_limb_case(1024,out_rowmajor(2560,0),3,"N512 limb K6144 W2 rowmajor col0 0");}
+#[test] fn g80_n512_k6144_limb_fixture_two_waves_native() {out_limb_case(1024,OutLayout::NativeTiles,4,"N512 limb K6144 W2 native");}
+#[test] fn g80_n512_k6144_limb_fixture_many_waves_rowmajor_8192() {out_limb_case(8192,out_rowmajor(2560,1536),5,"N512 limb K6144 W16 rowmajor col0 1536");}
+/// Padded rows: 700 rows = 2 waves with 324 padding rows (zero scales), and a single row; random operands, poisoned arena.
+#[test] fn g80_n512_k6144_random_padded_rows_rowmajor() {
+    out_case(700,OUT_K,out_rowmajor(2560,1024),6,"N512 random K6144 M700 rowmajor");
+    out_case(1,OUT_K,out_rowmajor(2562,2),7,"N512 random K6144 M1 rowmajor pitch 2562 col0 2");
+}
+#[test] fn g80_n512_k6144_random_padded_rows_native() {out_case(700,OUT_K,OutLayout::NativeTiles,8,"N512 random K6144 M700 native");}
+/// Short K (kc 1, 2, 3, 63, 64, 65): the B credit window and the two-group B split at every boundary.
+#[test] fn g80_n512_short_k_and_b_group_boundaries() {
+    for kc in [1usize,2,3,63,64,65,99] {for m in [512usize,1024] {
+        out_case(m,kc*64,out_rowmajor(2560,512),kc+m,&format!("N512 random kc={kc} M{m} rowmajor"));}}
+}
+/// Five adjacent 512-column panels of one 2560-pitch arena through ONE design (col0 = 0) with per-panel arena offsets; poison
+/// guard before the first and after the last element of the arena.
+#[test] fn g80_n512_k6144_adjacent_panels_one_design_one_buffer() {
+    let (m,pitch)=(700,2560);
+    let d=out_design(m,OUT_K,out_rowmajor(pitch,0));
+    let rows=d.waves()*OUT_WAVE_M;
+    let mut ah=Vec::new();let mut bh=Vec::new();
+    let mut expected=vec![POISON;rows*pitch*2+GAP];
+    let mut txn=Txn::aie2p_8col();
+    let (a,_)=out_random(m,OUT_K,SEEDS[0]);let ds=out_token_scales(m,1);
+    for panel in 0..5 {
+        let (_,b)=out_random(m,OUT_K,SEEDS[1]^(panel as u32+1));
+        let ss=out_feature_scales(ON,panel+2);
+        let base=[ah.len() as u64,bh.len() as u64,(2*panel*ON) as u64];
+        ah.extend(out_pack_a(&d,&a,&ds));bh.extend(out_pack_b(&d,&b,&ss));
+        d.append_run_body(&mut txn,base);
+        let raw=cpu_reference(&a,&b,m,ON,OUT_K);
+        for row in 0..rows {for col in 0..ON {
+            let bits=if row<m {out_twin(raw[row*ON+col],ss[col].0,ss[col].1,ds[row].0,ds[row].1)} else {0};
+            let off=2*(row*pitch+panel*ON+col);expected[off..off+2].copy_from_slice(&bits.to_le_bytes());}}
+    }
+    let mut args=vec![ah,bh,vec![POISON;expected.len()]];
+    let mut sim=fresh(&d);
+    sim.submit(&txn.to_bytes(),&mut args).unwrap();
+    assert_eq!(first_diff(&args[2],&expected),None,"adjacent panels, padded rows and trailing guard");
+    let read:u64=traffic(&sim).iter().filter(|s|s.1==Direction::Mm2s).map(|s|s.3).sum();
+    let written:u64=traffic(&sim).iter().filter(|s|s.1==Direction::S2mm).map(|s|s.3).sum();
+    assert_eq!([read,written],[5*d.host_bytes_read(),5*d.host_bytes_written()]);
+    eprintln!("PASS N512 5 adjacent panels M{m}: {} ticks total", sim.ticks);
+}
+/// Argument sizes, tile ranges tiling the native arena exactly, row-major window ranges, builder bounds.
+#[test] fn g80_n512_layout_ranges_and_builder_bounds() {
+    for (m,k) in [(512usize,64usize),(512,6144),(1,6144),(1025,6144),(8192,6144)] {
+        let d=out_design(m,k,OutLayout::NativeTiles);let (waves,kc)=(m.div_ceil(OUT_WAVE_M),k/64);
+        assert_eq!(d.waves(),waves);assert_eq!(d.wave_m(),OUT_WAVE_M);
+        let sizes=[8*waves*kc*OUT_A_CHUNK,8*kc*OUT_B_CHUNK,8*waves*4*OUT_C_TILE];
+        assert_eq!(d.args.iter().map(|x|x.bytes).collect::<Vec<_>>(),sizes);
+        assert_eq!(d.host_bytes_read(),(sizes[0]+sizes[1]) as u64);assert_eq!(d.host_bytes_written(),sizes[2] as u64);
+        let tiles=d.output_tile_ranges();assert_eq!(tiles.len(),32);
+        let mut all:Vec<Range<usize>>=tiles.iter().flat_map(|(_,r)|r.clone()).collect();
+        all.sort_by_key(|r|r.start);let mut end=0;
+        for r in &all {assert_eq!(r.start,end);assert_eq!(r.len(),OUT_C_TILE);end=r.end}
+        assert_eq!(end,sizes[2]);
+    }
+    let d=out_design(700,OUT_K,out_rowmajor(2560,1024));
+    assert_eq!(d.args[2].bytes,2*OUT_WAVE_M*2560*2);
+    let ranges=d.output_tile_ranges();
+    let mut live=vec![0u8;d.args[2].bytes];
+    for (_,rs) in &ranges {for r in rs {assert_eq!(r.len(),128);for b in &mut live[r.clone()] {*b+=1}}}
+    for row in 0..2*OUT_WAVE_M {for col in 0..2560 {
+        let inside=(1024..1536).contains(&col);
+        for b in 0..2 {assert_eq!(live[2*(row*2560+col)+b],u8::from(inside),"row {row} col {col}");}}}
+    for (rows,pitch,col0) in [(0,2560,0),(131073,2560,0),(512,2559,0),(512,2561,1),(512,2560,1),(512,2560,2560),(512,2560,2049)] {
+        assert!(build_panel_program_out(rows,pitch,col0).is_err(),"rows {rows} pitch {pitch} col0 {col0}");
+    }
+    let p=build_panel_program_out(8192,2560,0).unwrap();
+    assert_eq!((p.args[0].bytes,p.args[1].bytes,p.args[2].bytes),(8*16*96*OUT_A_CHUNK,8*96*OUT_B_CHUNK,8192*2560*2));
+    assert!(catch_unwind(AssertUnwindSafe(||out_design(512,OUT_K+64*4,OutLayout::NativeTiles))).is_err(),"K beyond the memtile bound");
+    assert!(catch_unwind(AssertUnwindSafe(||design_g80_n512_layout(512,1280,64,Epilogue::Bf16,Control::Fast,OutLayout::NativeTiles))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(||design_g80_n512_layout(512,ON,64,Epilogue::I32,Control::Fast,OutLayout::NativeTiles))).is_err());
+}
+
+/// Gate K0 (design round verdict section 2). Simulator-first numbers, never silicon: incremental ticks per 512-row wave at
+/// K = 6144 (W = 2 minus W = 1, and the 16-wave mean), the TOPS scaled from the measured 33.1 TOPS int8 wave through the SAME
+/// incremental-tick ratio the BF16 docs use (`docs/npu/npu-trunk.md`), bytes per kilo-op of the 8192-row program, and the
+/// 128x64 (V8 pair) against the 128x80 (G80) K-loop MAC efficiency from per-chunk tick fits. Gate: golden mismatch (any
+/// sub-test above), or alone rate < 16 TOPS, or bytes > 1.4 B/kop kills Option 1 for 0.4.2.
+#[test] fn g80_n512_gate_k0_ticks_per_wave_tops_bytes_and_tile_efficiency() {
+    let ticks=|m:usize,k:usize|->usize {
+        let d=out_design(m,k,out_rowmajor(2560,512));let (a,b,raw)=out_limb_fixture(m,k);
+        let (ds,ss)=(out_token_scales(m,1),out_feature_scales(ON,4));
+        out_submit(&mut fresh(&d),&d,&d.insts,&a,&b,&raw,&ds,&ss,m,out_rowmajor(2560,512),&format!("K0 {m}x{ON}x{k}"))
+    };
+    let (t1,t2,t16)=(ticks(512,OUT_K),ticks(1024,OUT_K),ticks(8192,OUT_K));
+    let inc=t2-t1;let mean16=(t16-t1) as f64/15.0;
+    let (c1,c2)=(ticks(512,2048),ticks(1024,2048));let inc32=c2-c1;
+    let chunk64=(inc-inc32) as f64/(96.0-32.0);let wave_const64=inc as f64-96.0*chunk64;
+    // int8 baseline wave (K2560 N1280, 256 x 1280): the 33.1 TOPS reference of the BF16 docs.
+    let i8_ticks=|m:usize|once(&design(m,2560,Control::Fast,12),&case("K0 int8 baseline",m,2560,12),&extremes(m,2560,0).0,&extremes(m,2560,0).1).ticks;
+    let i8_inc=i8_ticks(512)-i8_ticks(256);
+    // 128x80 BF16 per-chunk fit: kc 8 against 40 at the same two wave counts.
+    let g80_ticks=|m:usize,k:usize|{let d=design_g80(m,N,k,Epilogue::Bf16,Control::Fast);let (a,b)=pattern_b(m,k,false);
+        submit_bf16(&mut fresh(&d),&d,&d.insts,m,k,&a,&b,&bf16_scales(m,1),&bf16_scales(N,2))};
+    let g80_inc=|k:usize|g80_ticks(512,k)-g80_ticks(256,k);
+    let chunk80=(g80_inc(2560)-g80_inc(512)) as f64/(40.0-8.0);
+    let ops_wave=2.0*OUT_WAVE_M as f64*ON as f64*OUT_K as f64;
+    let i8_ops_wave=2.0*256.0*1280.0*2560.0;
+    let tops=|inc_ticks:f64|33.1*(ops_wave/inc_ticks)/(i8_ops_wave/i8_inc as f64);
+    let (alone,alone16)=(tops(inc as f64),tops(mean16));
+    let (m8192,a_bytes,b_bytes,c_bytes)=(8192usize,8*16*96*OUT_A_CHUNK,8*96*OUT_B_CHUNK,8192*ON*2);
+    let bytes=(a_bytes+b_bytes+c_bytes) as f64;let kop=2.0*m8192 as f64*ON as f64*OUT_K as f64/1000.0;
+    let eff64=524288.0/chunk64/512.0;let eff80=655360.0/chunk80/512.0;
+    eprintln!("K0 REPORT ticks: W1={t1} W2={t2} W16={t16}; incremental per wave {inc} (W2-W1) / {mean16:.0} (16-wave mean); \
+        K-loop {chunk64:.1} ticks/chunk, per-wave epilogue+drain {wave_const64:.0} ticks");
+    eprintln!("K0 REPORT rate: int8 baseline incremental wave {i8_inc} ticks = 33.1 TOPS; N512 K6144 alone {alone:.2} TOPS \
+        (16-wave mean {alone16:.2}); gate >= 16");
+    eprintln!("K0 REPORT bytes: A {a_bytes} + B {b_bytes} + C {c_bytes} = {bytes} per 8192 rows = {:.4} B/kop; gate <= 1.4",bytes/kop);
+    eprintln!("K0 REPORT tile: 128x64 K-loop {chunk64:.1} ticks/chunk = {:.1}% of MAC peak; 128x80 {chunk80:.1} ticks/chunk = {:.1}%; \
+        128x64 loses {:.1}% of the 128x80 MAC efficiency (gate: > 15% triggers Option 2)",100.0*eff64,100.0*eff80,100.0*(1.0-eff64/eff80));
+    assert!(alone>=16.0,"K0: simulated rate alone {alone:.2} TOPS < 16");
+    assert!(bytes/kop<=1.4,"K0: {:.4} B/kop > 1.4",bytes/kop);
+    assert!(1.0-eff64/eff80<=0.15,"K0: 128x64 tile loses more than 15% MAC efficiency vs 128x80");
+}
+
+// ---------------------------------------------------------------- N512 lean submits
+/// Full (zero operands) -> lean submits with fresh operands on one `Config`: exact, byte-equal to a fresh full run, and the
+/// retained state equals the fresh full state, for the plain lean TXN and every forced-channel set.
+fn out_lean_case(m:usize,k:usize,layout:OutLayout,forced:&[(u32,DmaDirection,u32)],full_between:bool,what:&str) {
+    let d=out_design(m,k,layout);
+    let lean=d.lean_insts_requeue(forced).unwrap_or_else(|e|panic!("{what}: lean_insts_requeue: {e}"));
+    let mut sim=fresh(&d);
+    {let mut args=zero_args(&d);sim.submit(&d.insts,&mut args).unwrap();}
+    let initial=sim.state_snapshot();
+    for (i,seed) in SEEDS.into_iter().enumerate() {
+        let (a,b)=out_random(m,k,seed);let raw=cpu_reference(&a,&b,m,ON,k);
+        let (ds,ss)=(out_token_scales(m,i),out_feature_scales(ON,i+1));
+        let mut full=fresh(&d);
+        out_submit(&mut full,&d,&d.insts,&a,&b,&raw,&ds,&ss,m,layout,&format!("{what} fresh full #{i}"));
+        assert!(full.state_snapshot()==initial,"{what}: fresh full state != primed state");
+        let use_full=full_between&&i==1;
+        out_submit(&mut sim,&d,if use_full {&d.insts} else {&lean},&a,&b,&raw,&ds,&ss,m,layout,&format!("{what} {} #{i}",if use_full {"full"} else {"lean"}));
+        assert!(sim.state_snapshot()==initial,"{what}: retained state != fresh full state after #{i}");
+    }
+    eprintln!("PASS {what}: full {} B lean {} B",d.insts.len(),lean.len());
+}
+#[test] fn g80_n512_lean_exact_and_state_restored() {
+    for (m,k) in [(512usize,64usize),(512,192),(1024,128),(700,6144),(1024,4160)] {
+        out_lean_case(m,k,out_rowmajor(2560,512),&[],false,&format!("N512 lean {m}x{ON}x{k} rowmajor"));
+    }
+    out_lean_case(512,192,OutLayout::NativeTiles,&[],true,"N512 lean 512x512x192 native full->lean interleave");
+}
+#[test] fn g80_n512_lean_forced_requeue() {
+    for (m,k) in [(512usize,64usize),(1024,192)] {
+        for (label,extra) in [("B S2MM4",vec![FORCE_B]),("C MM2S0",vec![FORCE_C]),("both",vec![FORCE_B,FORCE_C])] {
+            out_lean_case(m,k,out_rowmajor(2560,0),&extra,false,&format!("N512 forced {label} {m}x{ON}x{k}"));
+        }
+    }
+}
+/// Lean bodies append behind a full body with per-panel arena offsets (the transport / relay pattern): five panels, one buffer.
+#[test] fn g80_n512_lean_panels_after_full_body_one_buffer() {
+    let (m,k,pitch)=(512,192,2560);
+    let d=out_design(m,k,out_rowmajor(pitch,0));let rows=d.waves()*OUT_WAVE_M;
+    let (a,_)=out_random(m,k,SEEDS[0]);let ds=out_token_scales(m,1);
+    let (mut ah,mut bh,mut expected)=(Vec::new(),Vec::new(),vec![POISON;rows*pitch*2+GAP]);
+    let mut txn=Txn::aie2p_8col();
+    for panel in 0..5 {
+        let (_,b)=out_random(m,k,SEEDS[1]^(panel as u32+7));let ss=out_feature_scales(ON,panel+2);
+        let base=[ah.len() as u64,bh.len() as u64,(2*panel*ON) as u64];
+        ah.extend(out_pack_a(&d,&a,&ds));bh.extend(out_pack_b(&d,&b,&ss));
+        if panel==0 {d.append_run_body(&mut txn,base);} else {d.append_lean_run_body_same_design(&mut txn,base,&[]).unwrap();}
+        let raw=cpu_reference(&a,&b,m,ON,k);
+        for row in 0..rows {for col in 0..ON {
+            let bits=if row<m {out_twin(raw[row*ON+col],ss[col].0,ss[col].1,ds[row].0,ds[row].1)} else {0};
+            let off=2*(row*pitch+panel*ON+col);expected[off..off+2].copy_from_slice(&bits.to_le_bytes());}}
+    }
+    let mut args=vec![ah,bh,vec![POISON;expected.len()]];
+    let mut sim=fresh(&d);sim.submit(&txn.to_bytes(),&mut args).unwrap();
+    assert_eq!(first_diff(&args[2],&expected),None);
+    assert!(d.append_lean_run_body_b_resident(&mut Txn::aie2p_8col(),[0;3],&[]).is_err(),"B-resident lean body is not derived for N512");
+}

@@ -11,6 +11,7 @@
 //!        npu-gemm M N K --variant V8|V9|V10 [--epi i32|int8] [--shift S] [--core Fast|FastSlowCtl] [--ctl-probe knob,...] [--a-from-hip] [--iters I] [--reuse-ctx] [--loop SECONDS [--gap-us G]] [--timeout-ms T] [--dump-status]
 //!        ... [--memory native|vmm-host|vmm-host-uncached] [--burst 0..3] [--axcache 0..15] [--axqos 0..15]
 //!        npu-gemm M 1280 K --variant G80 [--epi i32|int8|bf16] [--rowmajor-pitch P --rowmajor-col0 C0] [--shift S] [--core Fast|FastSlowCtl] [--iters I] [--reuse-ctx] [--timeout-ms T].
+//!        npu-gemm M 512 K --variant G80 --epi bf16 --n512 [--rowmajor-pitch P --rowmajor-col0 C0] [--iters I] [--reuse-ctx] [--loop SECONDS]   (out-projection design, K <= 6336).
 //!        npu-gemm M N K --variant V10 --b-prefix [same V8|V9|V10 options]             (B prefix mode; V10 only)
 //!        npu-gemm TOKENS FEATURES K --fold-contract ief15 [--iters N] [--loop SECS] [--reuse-ctx] [--lean] [--switch-with T2,F2,K2] [--timeout-ms T] [--dump-status]   (IEF15 N0 probe; K a multiple of 128 with 1..=136 epochs)
 //!        npu-gemm --ief15-probe [--col C] [--timeout-ms T] [--dump PATH] [--dump-status] [--expected-only]   (IEF15 N0 single-core semantics probe: expected bytes from the simulator running the exact PDI+TXN, one fresh-context submit, per-case MATCH/MISMATCH table; `--expected-only` never touches the hardware)
@@ -489,6 +490,12 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         eprintln!("--epi/--shift are only valid with --variant V8, V9, V10 or G80");
         std::process::exit(2)
     } else { None };
+    // `--n512` (G80 BF16 only): the N=512 / K<=6336 resident-B out-projection design (`gemm_g80_n512`, 512-row waves).
+    let n512 = args.iter().any(|a| a == "--n512");
+    if n512 && !(g80 && epi == Some(Epilogue::Bf16)) {
+        eprintln!("--n512 needs --variant G80 --epi bf16"); std::process::exit(2)
+    }
+    let (wave_m, wave_n) = if n512 { (512, 512) } else { (256, 1280) };
     let rowmajor = opt_str(args, "--rowmajor-pitch").map(|p| {
         let parse = |name: &str, value: &str| value.parse::<usize>().unwrap_or_else(|_| {
             eprintln!("{name} needs an unsigned integer"); std::process::exit(2)
@@ -496,9 +503,9 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         let pitch = parse("--rowmajor-pitch", p);
         let col0 = parse("--rowmajor-col0", opt_str(args, "--rowmajor-col0").unwrap_or("0"));
         if epi != Some(Epilogue::Bf16) || pitch % 2 != 0 || col0 % 2 != 0 ||
-            pitch / 2 > 1 << 20 || col0.checked_add(1280).is_none_or(|end| end > pitch) ||
-            m.div_ceil(256).checked_mul(256).and_then(|r| r.checked_mul(pitch)).and_then(|n| n.checked_mul(2)).is_none() {
-            eprintln!("row-major needs G80 BF16, even pitch/col0, col0+1280 <= pitch <= {}, and a representable arena", 2 << 20);
+            pitch / 2 > 1 << 20 || col0.checked_add(wave_n).is_none_or(|end| end > pitch) ||
+            m.div_ceil(wave_m).checked_mul(wave_m).and_then(|r| r.checked_mul(pitch)).and_then(|n| n.checked_mul(2)).is_none() {
+            eprintln!("row-major needs G80 BF16, even pitch/col0, col0+{wave_n} <= pitch <= {}, and a representable arena", 2 << 20);
             std::process::exit(2)
         }
         pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }
@@ -532,9 +539,10 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
         std::process::exit(2)
     }
     if g80 {
-        let (max_k, wave_n) = (pm_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1);
+        let (max_k, wave_n) = if n512 { (pm_npu::kernels::gemm_g80_n512::MAX_KC * 64, 512) }
+            else { (pm_npu::kernels::gemm_core_g80::MAX_KC * 64, Variant::G80.shape().1) };
         if n != wave_n || k % 64 != 0 || k == 0 || k > max_k {
-            eprintln!("--variant G80 needs N = {wave_n} and K a multiple of 64 in 64..={max_k}, got N={n} K={k}");
+            eprintln!("--variant G80{} needs N = {wave_n} and K a multiple of 64 in 64..={max_k}, got N={n} K={k}", if n512 { " --n512" } else { "" });
             std::process::exit(2)
         }
     }
@@ -610,6 +618,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             iu4_io = Some((g.padded(&partials), g.pack_in(&w, &x), g.useful_ops()));
             g.design
         }
+        Some(epi) if g80 && n512 => pm_npu::kernels::gemm_g80_n512::design_g80_n512_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
         Some(epi) if g80 => pm_npu::kernels::gemm_g80::design_g80_bf16_layout(m, n, k, epi, control, rowmajor.unwrap_or_default()),
         Some(epi) if v10 && b_prefix => design_v10_prefix(m, n, k, epi, control),
         Some(epi) if v10 => design_v10(m, n, k, epi, control),
@@ -778,7 +787,7 @@ fn run_array(args: &[String], m: usize, n: usize, k: usize) -> bool {
             }).count()
         } else { 0 };
         let padding_bad = if let Some(pm_npu::kernels::gemm_g80::Bf16Layout::RowMajor { pitch_elems: pitch, col0_elems: col0 }) = rowmajor {
-            (m..d.waves() * 256).flat_map(|row| (0..n).map(move |col| 2 * (row * pitch + col0 + col)))
+            (m..d.waves() * d.wave_m()).flat_map(|row| (0..n).map(move |col| 2 * (row * pitch + col0 + col)))
                 .filter(|&off| bos[out_idx].as_slice()[off..off + 2] != [0, 0]).count()
         } else { 0 };
         (got.iter().zip(&want).filter(|(g, w)| g != w).count() + outside_bad + padding_bad, got[0].to_string())

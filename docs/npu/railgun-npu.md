@@ -176,6 +176,13 @@ Mirrors the GPU railgun replay tape (`replay_sequence_hash`, FNV-1a 64).
 accepts one `build_panel_program_rowmajor(rows_max, shape.pitch(), 0)` PDI/TXN
 per shape and resident `pack_b_bf16` panels including Sm/Se. The shape programs
 share the same G80 PDI/context but retain distinct pitch-specific instruction BOs.
+The out shapes (`Shape::GdnOut` / `Shape::QsaO`, K=6144, five 512-column panels,
+`build_panel_program_out(rows_max, 2560, 0)`) run a different PDI: the relay creates one
+`HwCtx` + `config_cu` per distinct PDI (input shapes share one, both out shapes share one),
+submits serially from its single thread, and routes each chain to its shape's context. Each
+bank additionally owns `a_out` (`rows*6912` B, `a_out_arena(bank)`) and BF16 out C arenas
+(`rows*2560*2` B); padding for out shapes is 512-row waves. Whether two contexts coexist and
+what a context switch costs is measured by `npu-trunk-transport --coexist`.
 GdnIn/QsaIn use 13/11 START_CUs in a retained chain per (layer, shape, bank).
 The program declares its padded row extent; rows never patch the program.
 The caller zeros all padding codes/scales. A is one `pack_a_bf16` stream, not

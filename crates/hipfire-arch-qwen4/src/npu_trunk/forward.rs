@@ -51,7 +51,8 @@ fn family_view<'a>(map: &trunk::ColumnMap, tensor: &'a GpuTensor, family: Family
     })
 }
 fn transport_shape(shape: Shape) -> railgun::npu::trunk::Shape {
-    match shape { Shape::GdnIn => railgun::npu::trunk::Shape::GdnIn, Shape::QsaIn => railgun::npu::trunk::Shape::QsaIn }
+    use railgun::npu::trunk::Shape as T;
+    match shape { Shape::GdnIn => T::GdnIn, Shape::QsaIn => T::QsaIn, Shape::GdnOut => T::GdnOut, Shape::QsaO => T::QsaO }
 }
 
 fn registered_c_view(rt: &NpuTrunkRuntime, bank: usize, shape: Shape, families: FamilyMask) -> Result<Option<GpuTensor>, Qwen4GpuForwardError> {

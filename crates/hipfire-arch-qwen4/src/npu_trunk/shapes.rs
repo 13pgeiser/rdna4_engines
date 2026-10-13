@@ -209,28 +209,75 @@ impl ColumnMap {
     }
 }
 
-/// A fused trunk input shape.
+/// A fused trunk shape: the two input shapes (`GdnIn`, `QsaIn`; K = 2560, 1280-column panels) and the two out-projection
+/// shapes (`GdnOut`, `QsaO`; K = 6144, N = 2560 as five 512-column panels of one pass, their own program / PDI).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shape {
     /// GDN input projections `qkv|z|a|b` (16480 columns).
     GdnIn,
     /// QSA input projections `q|k|v|idx` (13952 columns).
     QsaIn,
+    /// GDN out projection (`out_proj`, `[2560][6144]`).
+    GdnOut,
+    /// QSA attention output projection (`o_proj`, `[2560][6144]`).
+    QsaO,
 }
 
-impl Shape {
-    pub const ALL: [Shape; 2] = [Shape::GdnIn, Shape::QsaIn];
+/// Reduction dimension of the out-projections.
+pub const OUT_K: usize = 6144;
+/// Output features of the out-projections (the model width).
+pub const OUT_COLS: usize = 2560;
+/// Output columns of one out-projection panel (the G80 N512 wave width).
+pub const OUT_PANEL_COLS: usize = 512;
 
-    /// Position in [`Shape::ALL`]; indexes `PackedTrunk::map`.
+impl Shape {
+    /// The input shapes in index order: the shapes the family masks, [`ColumnMap`]s and the in-projection programs cover.
+    /// Out shapes are never part of a fused family map; see [`Shape::OUT`].
+    pub const ALL: [Shape; 2] = [Shape::GdnIn, Shape::QsaIn];
+    /// The out-projection shapes.
+    pub const OUT: [Shape; 2] = [Shape::GdnOut, Shape::QsaO];
+
+    /// Position in the declaration order (`0..4`); for the input shapes also the index into [`Shape::ALL`] / `PackedTrunk::map`.
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// The shape's families in fused order.
+    /// `GdnOut` / `QsaO`.
+    pub const fn is_out(self) -> bool {
+        matches!(self, Shape::GdnOut | Shape::QsaO)
+    }
+
+    /// Reduction dimension: [`TRUNK_K`] for the input shapes, [`OUT_K`] for the out shapes.
+    pub const fn k(self) -> usize {
+        if self.is_out() { OUT_K } else { TRUNK_K }
+    }
+
+    /// Columns of one panel: [`PANEL_COLS`] (1280) or [`OUT_PANEL_COLS`] (512).
+    pub const fn panel_cols(self) -> usize {
+        if self.is_out() { OUT_PANEL_COLS } else { PANEL_COLS }
+    }
+
+    /// Panels of the full-width shape: 13 / 11 for the input shapes with every family selected, 5 for the out shapes
+    /// (`2560 / 512`, one pass each).
+    pub const fn panels(self) -> usize {
+        match self {
+            Shape::GdnIn => 13,
+            Shape::QsaIn => 11,
+            Shape::GdnOut | Shape::QsaO => OUT_COLS / OUT_PANEL_COLS,
+        }
+    }
+
+    /// Submits per row block of one panel: always one (the whole K is accumulated on the array).
+    pub const fn passes(self) -> usize {
+        1
+    }
+
+    /// The shape's families in fused order (none for the out shapes: one matrix, no family fusion).
     pub const fn families(self) -> &'static [Family] {
         match self {
             Shape::GdnIn => &[Family::GdnQkv, Family::GdnZ, Family::GdnA, Family::GdnB],
             Shape::QsaIn => &[Family::QsaQ, Family::QsaK, Family::QsaV, Family::QsaIdx],
+            Shape::GdnOut | Shape::QsaO => &[],
         }
     }
 
@@ -238,11 +285,13 @@ impl Shape {
         match self {
             Shape::GdnIn => "gdn_in",
             Shape::QsaIn => "qsa_in",
+            Shape::GdnOut => "gdn_out",
+            Shape::QsaO => "qsa_o",
         }
     }
 
     /// Fused column map of the families of `mask` that belong to this shape, concatenated in
-    /// fused order without per-family padding.
+    /// fused order without per-family padding. Empty for the out shapes.
     pub fn column_map(self, mask: FamilyMask) -> ColumnMap {
         let mut parts = Vec::new();
         let mut col0 = 0u32;
@@ -405,5 +454,24 @@ mod tests {
     fn epilogue_contract_spellings() {
         assert_eq!(EpilogueContract::default(), EpilogueContract::Bf16Direct);
         assert_eq!(EpilogueContract::Bf16Direct.as_str(), "bf16_direct");
+    }
+
+    #[test]
+    fn out_shapes_are_five_512_column_panels_of_one_pass() {
+        assert_eq!(Shape::OUT, [Shape::GdnOut, Shape::QsaO]);
+        assert_eq!(Shape::ALL.map(Shape::index), [0, 1]);
+        assert_eq!(Shape::OUT.map(Shape::index), [2, 3]);
+        for shape in Shape::OUT {
+            assert!(shape.is_out());
+            assert_eq!((shape.k(), shape.panel_cols(), shape.panels(), shape.passes()), (6144, 512, 5, 1));
+            assert_eq!(shape.panels() * shape.panel_cols(), OUT_COLS);
+            assert!(shape.families().is_empty());
+            assert!(shape.column_map(FamilyMask::ALL).parts.is_empty());
+        }
+        for shape in Shape::ALL {
+            assert!(!shape.is_out());
+            assert_eq!((shape.k(), shape.panel_cols()), (TRUNK_K, PANEL_COLS));
+        }
+        assert_eq!((Shape::GdnOut.name(), Shape::QsaO.name()), ("gdn_out", "qsa_o"));
     }
 }

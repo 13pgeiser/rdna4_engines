@@ -395,7 +395,7 @@ pub(super) const A_LOAD_TIMES: [[i32; 8]; 2] = [
     [-10, -5, -4, 3, 5, 6, 13, 14],
     [-12, -5, -4, 3, 4, 5, 13, 14],
 ];
-const MODIFIERS: [i32; 8] = [512, -2048, 2560, 2432, -1920, 2944, -2432, -512];
+pub(super) const MODIFIERS: [i32; 8] = [512, -2048, 2560, 2432, -1920, 2944, -2432, -512];
 pub(super) type Cycle = [Option<u64>; 8];
 pub(super) fn put(cycles: &mut [Cycle], time: i32, instruction: (Slot, u64)) {
     let (slot, bits) = instruction;
@@ -778,7 +778,7 @@ pub(super) fn pair_release(a: &mut Assembler, role: PairRole) {
     }
 }
 /// Pair chunk compute is always the VLIW wavefront (no serial gaps), whatever the control discipline.
-fn pair_chunk(a: &mut Assembler, overwrite: bool, c: u32) {
+pub(super) fn pair_chunk(a: &mut Assembler, overwrite: bool, c: u32) {
     let serial = a.serial; a.serial = false; chunk(a, overwrite, true, c); a.serial = serial;
 }
 

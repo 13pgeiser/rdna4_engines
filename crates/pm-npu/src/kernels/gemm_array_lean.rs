@@ -225,15 +225,22 @@ impl ArrayDesign {
                     mem.lock(a_empty[1]);
                 }
                 let task = |direction, channel, bd, repeat| Task { direction, channel, bd, repeat, issue_token: false };
-                let (kc, whole) = (geo.kc as u32, (geo.waves - 1) as u32);
-                mem.requeues.push(task(S2mm, B_S2MM_CH, B_S2MM_BD[0], kc));
-                for p in 0..2 { mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_GUARD_BD[p], kc)); }
-                if whole > 0 {
-                    for p in 0..2 {
-                        mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_WHOLE_BD[p], whole));
+                if topo.is_g80_n512() {
+                    // N512: the B fill / guard groups (BD 4, 5 / 30, 31, `repeat = group length`) and the whole-panel BD 36.
+                    let (requeues, currents) = gemm_g80_n512::lean_b_tasks(geo.kc, geo.waves);
+                    mem.requeues.extend(requeues);
+                    mem.currents.extend(currents);
+                } else {
+                    let (kc, whole) = (geo.kc as u32, (geo.waves - 1) as u32);
+                    mem.requeues.push(task(S2mm, B_S2MM_CH, B_S2MM_BD[0], kc));
+                    for p in 0..2 { mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_GUARD_BD[p], kc)); }
+                    if whole > 0 {
+                        for p in 0..2 {
+                            mem.requeues.push(task(Mm2s, gemm_g80::G80_B_MM2S_CH[p], gemm_g80::G80_B_WHOLE_BD[p], whole));
+                        }
                     }
+                    mem.currents.extend([B_S2MM_BD[0], B_S2MM_BD[1], gemm_g80::G80_B_GUARD_BD[0], gemm_g80::G80_B_GUARD_BD[1]]);
                 }
-                mem.currents.extend([B_S2MM_BD[0], B_S2MM_BD[1], gemm_g80::G80_B_GUARD_BD[0], gemm_g80::G80_B_GUARD_BD[1]]);
                 // G80 I32: the C producers (two-stripe chain per row) and the C drains (four-stripe chain per drain channel) are
                 // finite and run `mw` passes, like the B tasks: after a completed submit they are idle with empty queues and
                 // every C lock is back at its initial value (no lookahead, single slot), for every wave parity. Requeue them.
@@ -369,7 +376,7 @@ impl ArrayDesign {
     pub fn append_lean_run_body_b_resident(&self, txn: &mut Txn, arena_base: [u64; 3], extra: &[(u32, dma::Direction, u32)])
         -> Result<(), String>
     {
-        if self.variant != Variant::G80 {
+        if self.variant != Variant::G80 || self.geo.topo.is_g80_n512() {
             return Err(format!("B-resident lean body is derived for G80 only, not {}", self.variant));
         }
         self.lean_body(txn, arena_base, extra, false, true)

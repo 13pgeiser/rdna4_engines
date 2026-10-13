@@ -382,6 +382,67 @@ fn program_bf16(kc: usize, tiles: usize, role: PairRole, ctl: Control) -> Progra
     a.finish()
 }
 
+/// Bytes of one N=512 BF16 core tile as it reaches memtile / host (128 x 64 x 2 B).
+pub const fn bf16_n64_tile_bytes() -> usize { bf16::NARROW.out_bytes() }
+
+/// The N=512 / K=6144 BF16 core: the V8 128x64 pair wavefront of [`gemm_core`] (E/O A halves through the peer's data memory,
+/// the same 9-step lock protocol and chunk issue schedule as the silicon-proven V8 pair core) with the direct-BF16 integer
+/// epilogue narrowed to 64 features ([`bf16::NARROW`]): per wave the 128 x 64 i32 tile is zeroed, accumulated over `kc`
+/// chunks (`kc <= gemm_core::MAX_KC`, K up to 10,240), then reduced to BF16 into the upper half of `C` and drained by the
+/// core DMA as one 16,384 B tile. The last chunk's sidecars are captured before its input locks are returned.
+pub fn program_bf16_n64(kc: usize, tiles: usize, role: PairRole, ctl: Control) -> Program {
+    assert_eq!(ctl.probe().layout, 0);
+    assert!(!ctl.probe().no_compute && ctl.probe().repeat <= 1, "BF16 requires ordinary GEMM compute");
+    assert!((1..=gemm_core::MAX_KC).contains(&kc) && (1..=256).contains(&tiles), "N64 kc {kc} tiles {tiles}");
+    let t = bf16::NARROW;
+    let layout = PairLayout { a: t.a, b: t.b, c: t.c, cout: t.out };
+    let mut a = Assembler::default();
+    a.serial = ctl.probe().serial;
+    for (r, v) in [(0, -1i32 as u32), (1, 1), (2, SIGNED_8X8), (3, tiles as u32), (4, 0)] { a.mov(0, r, v); }
+    bf16::initialize_for(&mut a, t);
+    let wave = a.label(); let chunks = a.label(); let captured = a.label(); let pong = a.label(); let copied = a.label();
+    a.bind(wave);
+    for (m, value) in gemm_core::MODIFIERS.into_iter().enumerate() { a.mov(2, m, value as u32); }
+    a.lock(true, gemm_core::C_EMPTY);
+    bf16::zero_for(&mut a, t);
+    a.mov(0, 5, kc as u32);
+    a.bind(chunks);
+    pair_acquire(&mut a, role, layout);
+    gemm_core::pair_chunk(&mut a, false, t.c);
+    a.emit(&[instruction!("ADD_add_r_ri", &[("d0", 11), ("s0", 5), ("imm", 0x7f)])]);
+    a.nop(7); a.branch(captured, Some((11, true))); a.delay();
+    a.branch(pong, Some((4, true))); a.delay();
+    bf16::capture_for(&mut a, 0, t); a.branch(copied, None); a.delay();
+    a.bind(pong); bf16::capture_for(&mut a, 1, t);
+    a.bind(copied);
+    a.bind(captured);
+    pair_release(&mut a, role);
+    a.branch(chunks, Some((5, true))); a.delay();
+    bf16::epilogue_for(&mut a, t);
+    a.lock(false, gemm_core::C_FULL);
+    a.add(3, -1); a.branch(wave, Some((3, true))); a.delay();
+    a.emit(&[instruction!("DONE", &[])]);
+    a.finish()
+}
+
+/// DMA-view descriptors of the N=512 BF16 core: A halves (4608 B) on S2MM0 (BD 0, 1), B (4352 B) on S2MM1 (BD 2, 3) and the
+/// 16,384 B BF16 tile on MM2S0 as the self-cyclic BD 4 (five BDs, same ids, channels and locks as [`tile_bds_pair`]).
+pub fn tile_bds_pair_n64() -> ([[u32; 6]; 6], usize) {
+    let t = bf16::NARROW;
+    let mut bds = [[0; 6]; 6];
+    for slot in 0..2 {
+        bds[gemm_core::A_BD[slot] as usize] = dma::tile_bd(t.a[slot], (t.a_bytes() / 4) as u32,
+            BdLocks {acq: Some((gemm_core::A_EMPTY[slot], -1)), rel: Some((gemm_core::A_FULL[slot], 1))},
+            Some(gemm_core::A_BD[1 - slot]));
+        bds[gemm_core::B_BD[slot] as usize] = dma::tile_bd(t.b[slot], (t.b_bytes() / 4) as u32,
+            BdLocks {acq: Some((gemm_core::B_EMPTY[slot], -1)), rel: Some((gemm_core::B_FULL[slot], 1))},
+            Some(gemm_core::B_BD[1 - slot]));
+    }
+    bds[gemm_core::C_BD as usize] = dma::tile_bd(t.out, (t.out_bytes() / 4) as u32,
+        BdLocks {acq: Some((gemm_core::C_FULL, -1)), rel: Some((gemm_core::C_EMPTY, 1))}, Some(gemm_core::C_BD));
+    (bds, 5)
+}
+
 /// Arithmetic issue cycles per 32-output BF16 pack group (simulator schedule).
 pub fn bf16_group_cycles() -> usize { bf16::group_cycles() }
 

@@ -28,11 +28,15 @@ pub use plan::{
 };
 pub use config::{NpuTrunkMode, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV};
 pub use packing::{
-    pack_matrix, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract,
-    LayerTrunkRefs, MatrixRef, PackedB, PackedTrunk,
+    pack_matrix, pack_out, pack_out_layers, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract,
+    LayerTrunkRefs, MatrixRef, PackedB, PackedOut, PackedTrunk,
 };
-pub use programs::{build_programs, build_programs_for_families, NpuPrograms, ShapeProgram};
-pub use shapes::{ColumnMap, EpilogueContract, Family, FamilyMask, Shape, PANEL_COLS, TRUNK_K};
+pub use programs::{
+    build_out_programs, build_programs, build_programs_for_families, NpuOutPrograms, NpuPrograms, ShapeProgram,
+};
+pub use shapes::{
+    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
+};
 
 #[cfg(test)]
 mod plan_tests;

@@ -28,10 +28,11 @@ use rayon::prelude::*;
 use pm_npu::kernels::gemm_array::ArrayDesign;
 use pm_npu::kernels::gemm_core::{Control, Epilogue};
 use pm_npu::kernels::gemm_g80::design_g80;
+use pm_npu::kernels::gemm_g80_n512::design_g80_n512;
 use pm_npu::kernels::{gemm_g80::pack_b_bf16, w8a8_epi::grid15_up};
 
 use super::shapes::{
-    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, PANEL_COLS, TRUNK_K,
+    ColumnMap, EpilogueContract, Family, FamilyMask, Shape, OUT_COLS, OUT_K, OUT_PANEL_COLS, PANEL_COLS, TRUNK_K,
 };
 
 /// K covered by one MQ6G256V2 group.
@@ -352,6 +353,91 @@ pub fn pack_trunk_with_contract(
         per_layer.push(b.map(|b| (layer.shape, b)));
     }
     Ok(PackedTrunk { per_layer, ws, map: maps })
+}
+
+/// One out-projection matrix packed for the N512 K6144 program (`Shape::GdnOut` / `Shape::QsaO`): the five resident
+/// 512-column BF16 B panels (`pack_b_bf16` of the N512 design, each `8 * 96 * 4352` B), the grid15-up weight scale as f32 per
+/// output feature and its `(Sm, Se)` decomposition (what the panels carry as sidecars). 2560 features fill the five panels
+/// exactly: there is no padding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedOut {
+    pub shape: Shape,
+    pub panels: Vec<Vec<u8>>,
+    pub ws: Vec<f32>,
+    pub scales: Vec<(u16, i16)>,
+}
+
+/// The design whose `B` packer is the canonical one of the out shapes: one panel (N512), K6144, one A row, direct BF16.
+fn out_packing_design() -> ArrayDesign {
+    design_g80_n512(1, OUT_PANEL_COLS, OUT_K, Epilogue::Bf16, Control::Fast)
+}
+
+fn validate_out(shape: Shape, mq6: &[u8], m: usize, k: usize) -> Result<(), String> {
+    if !shape.is_out() {
+        return Err(format!("{shape} is not an out-projection shape"));
+    }
+    if m != OUT_COLS || k != OUT_K {
+        return Err(format!("{shape}: expected {OUT_COLS}x{OUT_K}, got {m}x{k}"));
+    }
+    let want = m * row_bytes(k);
+    if mq6.len() != want {
+        return Err(format!("{shape}: expected {want} MQ6G256V2 bytes for {m}x{k}, got {}", mq6.len()));
+    }
+    Ok(())
+}
+
+/// Quantize and pack one validated out matrix: per output row the same W8 numerics as the input shapes
+/// ([`quantize_scaled_row`], direct grid15-up scale), transposed into reused `K x 512` panel scratch, then `pack_b_bf16`.
+/// Panels are independent and packed in parallel; the result does not depend on thread count.
+fn pack_out_validated(design: &ArrayDesign, shape: Shape, mq6: &[u8]) -> PackedOut {
+    let rb = row_bytes(OUT_K);
+    let panels = OUT_COLS / OUT_PANEL_COLS;
+    let done: Vec<(Vec<u8>, Vec<f32>, Vec<(u16, i16)>)> = (0..panels)
+        .into_par_iter()
+        .map(|p| {
+            let mut b = vec![0i8; OUT_K * OUT_PANEL_COLS];
+            let mut w = vec![0.0f32; OUT_K];
+            let mut codes = vec![0i8; OUT_K];
+            let mut ws = Vec::with_capacity(OUT_PANEL_COLS);
+            let mut scales = Vec::with_capacity(OUT_PANEL_COLS);
+            for c in 0..OUT_PANEL_COLS {
+                let row = p * OUT_PANEL_COLS + c;
+                let (scale, grid) = quantize_scaled_row(&mq6[row * rb..(row + 1) * rb], &mut w, &mut codes, true);
+                ws.push(scale);
+                scales.push(grid);
+                for (k, &v) in codes.iter().enumerate() {
+                    b[k * OUT_PANEL_COLS + c] = v;
+                }
+            }
+            (pack_b_bf16(design, &b, &scales), ws, scales)
+        })
+        .collect();
+    let mut out = PackedOut { shape, panels: Vec::with_capacity(panels), ws: Vec::with_capacity(OUT_COLS), scales: Vec::with_capacity(OUT_COLS) };
+    for (panel, ws, scales) in done {
+        out.panels.push(panel);
+        out.ws.extend(ws);
+        out.scales.extend(scales);
+    }
+    out
+}
+
+/// Pack one out-projection matrix: `mq6` is the stock `[2560][6144]` MQ6G256V2 matrix (`m = 2560`, `k = 6144`). Rows are the
+/// output features; the per-row scale and the W8 codes are those of the input shapes (INTERFACES.md §0, grid15-up).
+pub fn pack_out(shape: Shape, mq6: &[u8], m: usize, k: usize) -> Result<PackedOut, String> {
+    validate_out(shape, mq6, m, k)?;
+    Ok(pack_out_validated(&out_packing_design(), shape, mq6))
+}
+
+/// Pack every `(shape, matrix)` layer (errors name the layer index); the canonical design is built once.
+pub fn pack_out_layers(layers: &[(Shape, &[u8])]) -> Result<Vec<PackedOut>, String> {
+    for (i, &(shape, mq6)) in layers.iter().enumerate() {
+        validate_out(shape, mq6, OUT_COLS, OUT_K).map_err(|e| format!("layer {i}: {e}"))?;
+    }
+    if layers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let design = out_packing_design();
+    Ok(layers.par_iter().map(|&(shape, mq6)| pack_out_validated(&design, shape, mq6)).collect())
 }
 
 #[cfg(test)]
@@ -830,5 +916,112 @@ mod tests {
         }];
         let e = pack_trunk(&swapped, Family::GdnA | Family::GdnB).unwrap_err();
         assert!(e.starts_with("layer 0:") && e.contains("out of order"), "{e}");
+    }
+
+    // ---- out-projection (N512 K6144) packing ---------------------------------------------
+
+    /// `m` random rows of width `k` with random payload and headers from [`HDR`].
+    fn synth_k(m: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut v = vec![0u8; m * row_bytes(k)];
+        for g in v.chunks_exact_mut(GROUP_BYTES) {
+            for i in 0..4 {
+                let h = HDR[(next() % HDR.len() as u64) as usize];
+                g[2 * i..2 * i + 2].copy_from_slice(&h.to_le_bytes());
+            }
+            for b in &mut g[8..] {
+                *b = next() as u8;
+            }
+        }
+        v
+    }
+
+    /// Independent direct-BF16 weight quantiser of one row (bit-stream decode, separate multiply and add, grid15-up scale,
+    /// manual ties-to-even): the codes and `(Sm, Se)` the packer must produce.
+    fn ref_direct_row(row: &[u8]) -> (Vec<i8>, (u16, i16)) {
+        let mut w = Vec::new();
+        for g in row.chunks_exact(GROUP_BYTES) {
+            let hd = |i| h2f(u16::from_le_bytes([g[2 * i], g[2 * i + 1]]));
+            for j in 0..256 {
+                let bit = j * 6;
+                let mut q = 0u8;
+                for k in 0..6 { q |= ((g[8 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k; }
+                w.push(f32::from(q) * hd(2 * (j / 128)) + hd(2 * (j / 128) + 1));
+            }
+        }
+        let absmax = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let raw = (f64::from(absmax) / 127.0) as f32;
+        if raw == 0.0 { return (vec![0; w.len()], (0, 0)); }
+        let mut e = f64::from(raw).log2().floor() as i16 - 14;
+        let mut sm = (f64::from(raw) * 2f64.powi(-i32::from(e))).ceil() as u16;
+        if sm == 32768 { sm = 16384; e += 1; }
+        let s = (f64::from(sm) * 2f64.powi(i32::from(e))) as f32;
+        let codes = w.iter().map(|&value| {
+            let v = value / s; let floor = v.floor(); let fraction = v - floor;
+            let rounded = floor + u8::from(fraction > 0.5 || (fraction == 0.5 && floor % 2.0 != 0.0)) as f32;
+            rounded.clamp(-127.0, 127.0) as i8
+        }).collect();
+        (codes, (sm, e))
+    }
+
+    #[test]
+    fn out_pack_matches_independent_quantizer_and_n512_b_stream() {
+        let mut mq6 = synth_k(OUT_COLS, OUT_K, 0x6144);
+        let rb = row_bytes(OUT_K);
+        // Rows 3, 515 (panel boundary neighbours) and the last row are all-zero: zero scale, zero codes.
+        for r in [3usize, 511, 512, OUT_COLS - 1] {
+            mq6[r * rb..(r + 1) * rb].fill(0);
+        }
+        let packed = pack_out(Shape::GdnOut, &mq6, OUT_COLS, OUT_K).unwrap();
+        assert_eq!(packed.shape, Shape::GdnOut);
+        assert_eq!((packed.panels.len(), packed.ws.len(), packed.scales.len()), (5, OUT_COLS, OUT_COLS));
+        let design = out_packing_design();
+        assert_eq!(design.args[1].bytes, 8 * 96 * 4352);
+        let mut scales = vec![(0u16, 0i16); OUT_COLS];
+        let mut panels = Vec::new();
+        for p in 0..5 {
+            let mut b = vec![0i8; OUT_K * OUT_PANEL_COLS];
+            for c in 0..OUT_PANEL_COLS {
+                let row = p * OUT_PANEL_COLS + c;
+                let (codes, grid) = ref_direct_row(&mq6[row * rb..(row + 1) * rb]);
+                scales[row] = grid;
+                for (k, &v) in codes.iter().enumerate() {
+                    b[k * OUT_PANEL_COLS + c] = v;
+                }
+            }
+            panels.push(pack_b_bf16(&design, &b, &scales[p * OUT_PANEL_COLS..(p + 1) * OUT_PANEL_COLS]));
+        }
+        assert_eq!(packed.scales, scales);
+        for (row, &(sm, se)) in scales.iter().enumerate() {
+            assert_eq!(packed.ws[row], (f64::from(sm) * 2f64.powi(i32::from(se))) as f32, "ws row {row}");
+        }
+        for r in [3usize, 511, 512, OUT_COLS - 1] {
+            assert_eq!((packed.scales[r], packed.ws[r]), ((0, 0), 0.0));
+        }
+        assert!(packed.panels == panels, "pack_out panels != pack_b_bf16 of the independent W8 / grid scales");
+        // Same bytes for the other out shape; deterministic.
+        let again = pack_out(Shape::QsaO, &mq6, OUT_COLS, OUT_K).unwrap();
+        assert!(again.panels == packed.panels && again.ws == packed.ws && again.scales == packed.scales);
+        let layers = pack_out_layers(&[(Shape::GdnOut, &mq6), (Shape::QsaO, &mq6)]).unwrap();
+        assert_eq!(layers[0].panels, packed.panels);
+        assert_eq!((layers[1].shape, &layers[1].panels), (Shape::QsaO, &packed.panels));
+    }
+
+    #[test]
+    fn out_pack_validates_shape_dimensions_and_length() {
+        let mq6 = synth_k(OUT_COLS, OUT_K, 7);
+        assert!(pack_out(Shape::GdnIn, &mq6, OUT_COLS, OUT_K).unwrap_err().contains("not an out-projection"));
+        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS - 1, OUT_K).unwrap_err().contains("2560x6144"));
+        assert!(pack_out(Shape::QsaO, &mq6, OUT_COLS, 2560).unwrap_err().contains("2560x6144"));
+        assert!(pack_out(Shape::QsaO, &mq6[1..], OUT_COLS, OUT_K).unwrap_err().contains("bytes"));
+        let e = pack_out_layers(&[(Shape::GdnOut, &mq6), (Shape::QsaIn, &mq6)]).unwrap_err();
+        assert!(e.starts_with("layer 1:"), "{e}");
+        assert!(pack_out_layers(&[]).unwrap().is_empty());
     }
 }

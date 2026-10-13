@@ -9,11 +9,14 @@
 use pm_npu::kernels::gemm_array::ArrayDesign;
 use pm_npu::kernels::gemm_core::Epilogue;
 use pm_npu::kernels::gemm_g80::{build_panel_program, build_panel_program_rowmajor};
+use pm_npu::kernels::gemm_g80_n512::build_panel_program_out;
 
-use super::shapes::{EpilogueContract, FamilyMask, Shape};
+use super::shapes::{EpilogueContract, FamilyMask, Shape, OUT_COLS};
 
 /// Rows of one G80 M wave: every program is built for a whole number of these.
 const WAVE_ROWS: usize = 256;
+/// Rows of one G80 N512 (out-projection) M wave.
+const OUT_WAVE_ROWS: usize = 512;
 /// Largest row count a G80 design accepts (256 waves of 256 rows).
 const ROWS_LIMIT: usize = 256 * WAVE_ROWS;
 
@@ -139,6 +142,56 @@ pub fn build_rowmajor_programs_for_families(rows_max: usize, families: FamilyMas
         contract: EpilogueContract::Bf16Direct, rows_max: rows,
         per_shape: [program(Shape::GdnIn)?, program(Shape::QsaIn)?],
     })
+}
+
+
+/// The programs of both out-projection shapes: one K6144, N512 BF16 row-major design per shape (the same program and PDI
+/// for [`Shape::GdnOut`] and [`Shape::QsaO`], a PDI distinct from the input shapes').
+pub struct NpuOutPrograms {
+    /// Rows the programs are built for: the requested maximum rounded up to a whole 512-row wave.
+    pub rows_max: usize,
+    /// Indexed by `shape.index() - 2` in [`Shape::OUT`] order.
+    pub per_shape: [ShapeProgram; 2],
+}
+
+impl NpuOutPrograms {
+    /// The program of the out shape `shape`.
+    ///
+    /// # Panics
+    /// For an input shape.
+    pub fn get(&self, shape: Shape) -> &ShapeProgram {
+        assert!(shape.is_out(), "{shape} is not an out-projection shape");
+        &self.per_shape[shape.index() - Shape::OUT[0].index()]
+    }
+}
+
+impl std::fmt::Debug for NpuOutPrograms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NpuOutPrograms").field("rows_max", &self.rows_max).field("per_shape", &self.per_shape).finish()
+    }
+}
+
+/// Out-projection programs: each shape's design writes BF16 rows into a compact fused arena of pitch `OUT_COLS` (2560) at
+/// `col0 = 0`; panel `p` advances arg2's base by `2 * 512 * p` bytes (the relay's per-panel command). M is rounded up to
+/// 512-row waves. `Err` for `rows_max` outside `1..=65536`.
+pub fn build_out_programs(rows_max: usize) -> Result<NpuOutPrograms, String> {
+    if !(1..=ROWS_LIMIT).contains(&rows_max) {
+        return Err(format!("npu-trunk: rows_max {rows_max} outside 1..={ROWS_LIMIT}"));
+    }
+    let rows = rows_max.div_ceil(OUT_WAVE_ROWS) * OUT_WAVE_ROWS;
+    let program = |shape: Shape| -> Result<ShapeProgram, String> {
+        let design = build_panel_program_out(rows, OUT_COLS, 0)?;
+        Ok(ShapeProgram {
+            shape,
+            panel_count: shape.panels(),
+            padded_cols: shape.panels() * shape.panel_cols(),
+            arg_bytes: [design.args[0].bytes, design.args[1].bytes, design.args[2].bytes],
+            host_bytes_read: design.host_bytes_read(),
+            host_bytes_written: design.host_bytes_written(),
+            design,
+        })
+    };
+    Ok(NpuOutPrograms { rows_max: rows, per_shape: [program(Shape::GdnOut)?, program(Shape::QsaO)?] })
 }
 
 #[cfg(test)]
