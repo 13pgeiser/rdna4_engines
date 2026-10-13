@@ -1961,17 +1961,18 @@ pub(crate) fn run() {
     // it the quantizer would stamp 5 and the loader would refuse the .hfq.
     // Every other checkpoint keeps resolving by `model_type`
     // (`arch_mapping::quantize_arch_id`).
-    let architectures: Vec<&str> = config
+    let architectures = config
         .get("architectures")
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
+        .into_iter()
+        .flat_map(|a| a.iter())
+        .filter_map(|v| v.as_str());
     // Single source of truth for model_type -> arch_id lives in hipfire-runtime::arch_mapping.
     // Fail-closed on unknown model_type: error naming the type and listing supported ones,
     // unless an explicit --arch-id override is supplied (operator knows best).
     let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::quantize_arch_id(
         arch_str,
-        &architectures,
+        architectures,
     ) {
         Some(id) => id,
         None => {

@@ -166,9 +166,12 @@ pub fn lookup_architecture(arch: &str) -> Option<u32> {
 /// `Qwen3_5MoeForConditionalGeneration` (`model_type: qwen3_5_moe`, 6) as
 /// dense 5, and resolves classes whose `model_type` is unsupported (e.g.
 /// `Qwen3MoeForCausalLM` → 6) instead of failing closed.
-pub fn quantize_arch_id(model_type: &str, architectures: &[&str]) -> Option<u32> {
+pub fn quantize_arch_id<'a>(
+    model_type: &str,
+    architectures: impl IntoIterator<Item = &'a str>,
+) -> Option<u32> {
     if architectures
-        .iter()
+        .into_iter()
         .any(|class| lookup_architecture(class) == Some(17))
     {
         return Some(17);
@@ -237,31 +240,31 @@ mod tests {
     #[test]
     fn quantize_arch_id_reads_architectures_only_for_the_embed_encoder() {
         use super::quantize_arch_id;
-        assert_eq!(quantize_arch_id("qwen3_5", &["Qwen3_5Model"]), Some(17));
+        assert_eq!(quantize_arch_id("qwen3_5", ["Qwen3_5Model"]), Some(17));
         assert_eq!(
-            quantize_arch_id("qwen3_5", &["Qwen3_5ForConditionalGeneration"]),
+            quantize_arch_id("qwen3_5", ["Qwen3_5ForConditionalGeneration"]),
             Some(5)
         );
         // model_type stays authoritative everywhere else: the MoE class name
         // substring-matches the dense `qwen3_5` key, and an unsupported
         // model_type must not resolve through its class name.
         assert_eq!(
-            quantize_arch_id("qwen3_5_moe", &["Qwen3_5MoeForConditionalGeneration"]),
+            quantize_arch_id("qwen3_5_moe", ["Qwen3_5MoeForConditionalGeneration"]),
             Some(6)
         );
         assert_eq!(
-            quantize_arch_id("qwen3_5_moe", &["Qwen3_5MoeForCausalLM"]),
+            quantize_arch_id("qwen3_5_moe", ["Qwen3_5MoeForCausalLM"]),
             Some(6)
         );
         assert_eq!(
-            quantize_arch_id("qwen3_moe", &["Qwen3MoeForCausalLM"]),
+            quantize_arch_id("qwen3_moe", ["Qwen3MoeForCausalLM"]),
             None
         );
         assert_eq!(
-            quantize_arch_id("qwen3_next", &["Qwen3NextForCausalLM"]),
+            quantize_arch_id("qwen3_next", ["Qwen3NextForCausalLM"]),
             None
         );
-        assert_eq!(quantize_arch_id("qwen2", &["Qwen2ForCausalLM"]), Some(7));
-        assert_eq!(quantize_arch_id("llama", &[]), Some(0));
+        assert_eq!(quantize_arch_id("qwen2", ["Qwen2ForCausalLM"]), Some(7));
+        assert_eq!(quantize_arch_id("llama", []), Some(0));
     }
 }
