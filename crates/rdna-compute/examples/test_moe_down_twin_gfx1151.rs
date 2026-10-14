@@ -106,10 +106,10 @@
 //! (exit 2).
 //!
 //! Run:
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 [case-name-filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --variants=xs4 [filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [--variants=xs4] [filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --precheck [filter]
+//!   cargo run --release -p rdna-compute --features lab --example test_moe_down_twin_gfx1151 [case-name-filter]
+//!   cargo run --release -p rdna-compute --features lab --example test_moe_down_twin_gfx1151 -- --variants=xs4 [filter]
+//!   cargo run --release -p rdna-compute --features lab --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [--variants=xs4] [filter]
+//!   cargo run --release -p rdna-compute --features lab --example test_moe_down_twin_gfx1151 -- --precheck [filter]
 
 use hip_bridge::KernargBlob;
 use std::borrow::Cow;

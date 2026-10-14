@@ -74,6 +74,10 @@ name = "test_mq4v2_xlds_gfx1151"
 required-features = ["lab"]
 
 [[example]]
+name = "test_moe_down_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
 name = "test_moe_gateup_twin_gfx1151"
 required-features = ["lab"]
 
