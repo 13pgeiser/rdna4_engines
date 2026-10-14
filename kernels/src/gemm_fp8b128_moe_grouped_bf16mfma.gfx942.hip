@@ -57,7 +57,12 @@
 
 #include <hip/hip_runtime.h>
 
-#if defined(__gfx942__)
+// gfx942-only at build time: a device compile for any other target (RDNA
+// included) is refused, so no non-gfx942 code object of this module (or of
+// its FP8MOE_TEST_REFERENCE variant) can be produced or packed.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx942__)
+#error "gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip is gfx942-only"
+#endif
 
 // 16-row subtiles per wave (rows per workgroup = 64 * NSUB; the launcher's
 // FP8B128_MOE_ROWS_PER_WG is pinned to this by a unit test) and K-blocks per
@@ -334,5 +339,3 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_tile_desc_pad
     const int t = blockIdx.x * 256 + threadIdx.x;
     if (t < n_tiles) tile_desc[t] = int4{tile_ids[t], 16 * t, 16, 0};
 }
-
-#endif // __gfx942__

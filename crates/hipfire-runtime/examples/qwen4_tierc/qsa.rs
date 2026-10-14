@@ -2493,6 +2493,9 @@ const FP8_PROBE_SRC: &str = concat!(
     include_str!("../../../../kernels/src/rope_yarn.h"),
     include_str!("../../../../kernels/src/tensor_ops.hip"),
     r#"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx942__)
+#error "qwen4_tierc_qsa_fp8_decode_bits is a gfx942-only Tier C probe"
+#endif
 extern "C" __global__ __launch_bounds__(256) void qsa_tierc_fp8_decode_bits(
     const unsigned char* rows, float* values, float* keys, int kv_heads, int head_dim) {
     const int row = (int)blockIdx.y;
