@@ -28,14 +28,16 @@
 //! store's [`FetchActivity`] busy (bound by `RowStore::attach_hot_store`), and
 //! the prewarm resumes `FETCH_QUIET` after the last one.
 //!
-//! A rank-ordered table's worker can also start while the model is still
-//! loading ([`LoadFill`]): it reads the hottest prefix of the table at a
-//! capped rate until the model is ready.  The weight upload streams the model
-//! file through the same page cache and evicts the oldest pages first (the
-//! hottest ones read here), so the fill watches the prefix's residency
-//! (`mincore`) and re-reads evicted pages, hottest first, before reading on.
-//! The prewarm after ready then continues at the end of the resident prefix.
-//! Ready never waits for the fill.
+//! A rank-ordered table's worker instead runs its PLE prewarm as part of
+//! model load ([`LoadPrewarm`]): it starts with the load and reads the
+//! hottest prefix of the table concurrently with the weight upload.  The
+//! upload streams the model file through the same page cache and evicts the
+//! oldest pages first (the hottest ones read here), so the prewarm watches
+//! the prefix's residency (`mincore`) and re-reads evicted pages, hottest
+//! first.  Once the upload is done ([`HotRowStore::finish_load`]) a last pass
+//! re-reads whatever it evicted, and the loader declares the model ready
+//! only after that ([`HotRowStore::wait_load_prewarm`]): nothing of it runs
+//! while requests are served.
 //!
 //! # Public API (exact signatures)
 //!
@@ -55,16 +57,17 @@
 //!                                            // rank-ordered ple-table: serves at once
 //! HotRowStore::spawn_worker(self: &Arc<Self>, model_path: &Path, shard_offsets: Vec<u64>)
 //!     -> JoinHandle<()>                      // verify, then prewarm once a budget is set
-//! HotRowStore::spawn_table_worker(self: &Arc<Self>, load_fill: Option<LoadFill>) -> JoinHandle<()>
+//! HotRowStore::spawn_table_worker(self: &Arc<Self>, prewarm: Option<LoadPrewarm>) -> JoinHandle<()>
 //!                                            // table: the same prewarm, no verification;
-//!                                            // `load_fill` reads the hottest prefix first
-//! HotRowStore::{set_prewarm_budget(bytes: u64), stop(), is_serving() -> bool,
+//!                                            // `prewarm` reads the hottest prefix during load
+//! HotRowStore::{finish_load(), wait_load_prewarm() -> bool,
+//!               set_prewarm_budget(bytes: u64), stop(), is_serving() -> bool,
 //!               verified() -> Option<bool>, pack_offset(row: u64) -> Option<u64>,
 //!               read_pack(offset: u64, dst: &mut [u8]) -> Result<(), SourceError>,
 //!               tier_count(), kept_buckets(), data_bytes(), prewarmed_bytes(),
 //!               load_filled_bytes(), prewarm_complete(), hot_rows(), hot_pages(),
 //!               hot_reads(), row_width()}
-//! LoadFill { bytes: u64, bytes_per_sec: u64 }
+//! LoadPrewarm { bytes: u64, bytes_per_sec: u64 }   // bytes_per_sec 0 = unthrottled
 //! mem_available_bytes() -> Option<u64>
 //! ```
 //!
@@ -116,12 +119,12 @@ pub(crate) const READ_ALIGN: u64 = 4096;
 const BUSY_QUIET: Duration = FETCH_QUIET;
 /// Bytes per prewarm read.
 const PREWARM_CHUNK: usize = 8 << 20;
-/// A [`LoadFill`] reads about this much time's worth of its rate per read, so
+/// A throttled [`LoadPrewarm`] reads about this much time's worth of its rate per read, so
 /// the rate cap holds over short spans too.
 const LOAD_FILL_SLICE: Duration = Duration::from_millis(50);
-/// Smallest [`LoadFill`] read.
+/// Smallest throttled [`LoadPrewarm`] read.
 const LOAD_FILL_MIN_CHUNK: usize = 4096;
-/// A [`LoadFill`] looks for evicted pages of its prefix this often.
+/// A [`LoadPrewarm`] looks for evicted pages of its prefix this often.
 const LOAD_FILL_REPAIR_PERIOD: Duration = Duration::from_secs(1);
 /// Pages per `mincore` call of a residency scan.
 const RESIDENCY_SCAN_PAGES: usize = 16 << 10;
@@ -501,7 +504,7 @@ fn fadvise(file: &File, advice: libc::c_int) {
 /// Page-cache residency of a file's first bytes, through `mincore` on a
 /// shared read-only mapping that is never read through (mapping a file does
 /// not read it).
-struct Residency {
+pub(crate) struct Residency {
     addr: NonNull<libc::c_void>,
     len: usize,
     page: u64,
@@ -510,7 +513,7 @@ struct Residency {
 
 impl Residency {
     /// Map the first `len` bytes of `file`.
-    fn map(file: &File, len: u64) -> io::Result<Residency> {
+    pub(crate) fn map(file: &File, len: u64) -> io::Result<Residency> {
         // SAFETY: sysconf has no preconditions.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page)
@@ -547,7 +550,7 @@ impl Residency {
 
     /// The first offset in `from..to` whose page is not in the page cache,
     /// or `to` (clipped to the mapping) when every page is.
-    fn first_hole(&mut self, from: u64, to: u64) -> io::Result<u64> {
+    pub(crate) fn first_hole(&mut self, from: u64, to: u64) -> io::Result<u64> {
         let to = to.min(self.len as u64);
         if from >= to {
             return Ok(to);
@@ -686,8 +689,12 @@ pub struct HotRowStore {
     prewarm_budget: AtomicU64,
     prewarmed: AtomicU64,
     prewarm_done: AtomicBool,
-    /// Bytes of the data read by the [`LoadFill`] before the model was ready.
+    /// Bytes of the data the in-load [`LoadPrewarm`] has resident so far.
     load_filled: AtomicU64,
+    /// [`HotRowStore::finish_load`] was called: the weights are uploaded.
+    upload_done: AtomicBool,
+    /// The table worker's in-load prewarm ended (complete, stopped or failed).
+    fill_ended: AtomicBool,
     /// Bytes of tier 0 re-read by the prewarm's second phase.
     retouched: AtomicU64,
     /// The row store's fetch activity (see [`HotRowStore::bind_activity`]).
@@ -836,6 +843,8 @@ impl HotRowStore {
             prewarmed: AtomicU64::new(0),
             prewarm_done: AtomicBool::new(false),
             load_filled: AtomicU64::new(0),
+            upload_done: AtomicBool::new(false),
+            fill_ended: AtomicBool::new(false),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
         }))
@@ -936,6 +945,8 @@ impl HotRowStore {
             prewarmed: AtomicU64::new(0),
             prewarm_done: AtomicBool::new(false),
             load_filled: AtomicU64::new(0),
+            upload_done: AtomicBool::new(false),
+            fill_ended: AtomicBool::new(false),
             retouched: AtomicU64::new(0),
             activity: OnceLock::new(),
         }))
@@ -997,7 +1008,7 @@ impl HotRowStore {
         self.prewarmed.load(Ordering::Relaxed)
     }
 
-    /// Bytes of the data the [`LoadFill`] read while the model loaded.
+    /// Bytes of the data the in-load [`LoadPrewarm`] has resident so far.
     pub fn load_filled_bytes(&self) -> u64 {
         self.load_filled.load(Ordering::Relaxed)
     }
@@ -1165,62 +1176,84 @@ impl HotRowStore {
     }
 
     /// Start the worker of a table store ([`HotRowStore::open_table`]): it
-    /// verifies nothing (the table serves from the start).  With `load_fill`
-    /// it first reads the table's hottest prefix while the model loads (see
-    /// [`LoadFill`]); once [`HotRowStore::set_prewarm_budget`] was called it
-    /// runs the same prewarm as [`HotRowStore::spawn_worker`] over the
-    /// table's tiers, from where the fill stopped.  Call
-    /// [`HotRowStore::stop`] then join it before unloading the row store.
+    /// verifies nothing (the table serves from the start).  With `prewarm`
+    /// it reads the table's hottest prefix into the page cache while the
+    /// model loads ([`LoadPrewarm`]); without one it ends at once.  The
+    /// loader calls [`HotRowStore::finish_load`] once the weights are
+    /// uploaded and declares the model ready only after
+    /// [`HotRowStore::wait_load_prewarm`] returns: nothing of it runs while
+    /// requests are served.  Call [`HotRowStore::stop`] then join it before
+    /// unloading the row store.
     pub fn spawn_table_worker(
         self: &std::sync::Arc<Self>,
-        load_fill: Option<LoadFill>,
+        prewarm: Option<LoadPrewarm>,
     ) -> JoinHandle<()> {
         let store = self.clone();
         std::thread::Builder::new()
             .name("ple-table".to_string())
             .spawn(move || {
-                let filled = load_fill.map_or(0, |fill| store.load_fill(fill));
-                if let Some(budget) = store.wait_for_budget() {
-                    store.prewarm(budget, filled);
+                match prewarm {
+                    Some(prewarm) => store.load_prewarm(prewarm),
+                    None => store.prewarm_done.store(true, Ordering::Release),
                 }
+                store.fill_ended.store(true, Ordering::Release);
             })
             .expect("spawn ple table thread")
     }
 
-    /// Read the first `fill.bytes` of the data (hottest tier first) into the
-    /// page cache at no more than `fill.bytes_per_sec`, until the prewarm
-    /// budget is set (the model is ready) or the store stops.  The weight
-    /// upload streams the model file through the same cache and evicts the
-    /// oldest pages first, which are the hottest ones read here, so every
+    /// The weights are uploaded: the in-load prewarm makes its last pass
+    /// over the budget (re-reading what the upload evicted) and ends.
+    pub fn finish_load(&self) {
+        self.upload_done.store(true, Ordering::Release);
+    }
+
+    /// Block until the table worker's in-load prewarm ended (after
+    /// [`HotRowStore::finish_load`]); `true` when its whole budget is
+    /// resident, `false` when it was stopped or a read failed.
+    pub fn wait_load_prewarm(&self) -> bool {
+        while !self.fill_ended.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.prewarm_complete()
+    }
+
+    /// Read the first `prewarm.bytes` of the data (hottest tier first) into
+    /// the page cache, at no more than `prewarm.bytes_per_sec` when that is
+    /// nonzero, concurrently with the weight upload.  The upload streams the
+    /// model file through the same cache and evicts the oldest pages first,
+    /// which are the hottest ones read here, so every
     /// [`LOAD_FILL_REPAIR_PERIOD`] a pass over the prefix read so far
-    /// re-reads its evicted pages, hottest first, before the fill reads on.
-    /// Once the whole prefix is resident it keeps repairing it until ready.
-    /// Returns the resident prefix (from `data_offset`) at the end, where the
-    /// prewarm after ready continues.
-    fn load_fill(&self, fill: LoadFill) -> u64 {
-        let target = fill.bytes.min(self.data_bytes);
-        if target == 0 || fill.bytes_per_sec == 0 {
-            return 0;
+    /// re-reads its evicted pages, hottest first, before reading on.  Once
+    /// [`HotRowStore::finish_load`] was called and the whole prefix is read,
+    /// one more pass (from the hottest row) re-reads every evicted page;
+    /// when it finds none, tier 0 is read a second time (promoting it to the
+    /// active list), `ple prewarm complete` is logged and the prewarm is
+    /// complete.
+    fn load_prewarm(&self, prewarm: LoadPrewarm) {
+        let target = prewarm.bytes.min(self.data_bytes);
+        if target == 0 {
+            self.prewarm_done.store(true, Ordering::Release);
+            return;
         }
         let file = match File::open(&self.pack_path) {
             Ok(file) => file,
             Err(error) => {
-                eprintln!("{TAG}: load fill: opening the table failed: {error}");
-                return 0;
+                eprintln!("{TAG}: ple prewarm: opening the table failed: {error}");
+                return;
             }
         };
         fadvise(&file, libc::POSIX_FADV_SEQUENTIAL);
         let begin = self.data_offset;
         let end = begin + target;
-        // Without a residency view the fill reads the prefix once, in order.
+        // Without a residency view the prewarm reads the prefix once, in order.
         let mut residency = match Residency::map(&file, end) {
             Ok(residency) => Some(residency),
             Err(error) => {
-                eprintln!("{TAG}: load fill: no residency view ({error}); reading the prefix once");
+                eprintln!("{TAG}: ple prewarm: no residency view ({error}); reading the prefix once");
                 None
             }
         };
-        let chunk = fill.chunk();
+        let chunk = prewarm.chunk();
         let mut buffer = vec![0u8; chunk];
         let started = Instant::now();
         // Next unread offset; bytes read so far (the rate's count), and how
@@ -1229,25 +1262,35 @@ impl HotRowStore {
         let mut read_bytes = 0u64;
         let mut repaired = 0u64;
         // Where the running repair pass looks for the next hole; `None`
-        // between passes, the next one starting at `next_pass`.
+        // between passes, the next one starting at `next_pass`.  `final_pass`:
+        // the running pass started after the upload with the prefix read.
         let mut scan_from = None;
+        let mut final_pass = false;
         let mut next_pass = started;
-        let mut ended = "stopped at ready";
+        let mut upload_secs = None;
         loop {
             if self.stopped() {
-                return 0;
+                return;
             }
-            if self.prewarm_budget.load(Ordering::Acquire) != BUDGET_UNSET {
+            let uploaded = self.upload_done.load(Ordering::Acquire);
+            if uploaded && upload_secs.is_none() {
+                upload_secs = Some(started.elapsed().as_secs_f64());
+            }
+            if prewarm.bytes_per_sec > 0 {
+                let due = Duration::from_secs_f64(read_bytes as f64 / prewarm.bytes_per_sec as f64);
+                let elapsed = started.elapsed();
+                if due > elapsed {
+                    std::thread::sleep((due - elapsed).min(LOAD_FILL_SLICE));
+                    continue;
+                }
+            }
+            let settle = uploaded && cursor >= end;
+            if residency.is_none() && settle {
                 break;
             }
-            let due = Duration::from_secs_f64(read_bytes as f64 / fill.bytes_per_sec as f64);
-            let elapsed = started.elapsed();
-            if due > elapsed {
-                std::thread::sleep((due - elapsed).min(LOAD_FILL_SLICE));
-                continue;
-            }
-            if scan_from.is_none() && residency.is_some() && Instant::now() >= next_pass {
+            if scan_from.is_none() && residency.is_some() && (settle || Instant::now() >= next_pass) {
                 scan_from = Some(begin);
+                final_pass = settle;
             }
             let mut at = None;
             if let (Some(view), Some(from)) = (residency.as_mut(), scan_from) {
@@ -1263,28 +1306,33 @@ impl HotRowStore {
                             self.load_filled.store(cursor - begin, Ordering::Relaxed);
                         }
                         scan_from = None;
+                        if final_pass {
+                            break;
+                        }
                         next_pass = Instant::now() + LOAD_FILL_REPAIR_PERIOD;
                     }
                     Err(error) => {
-                        eprintln!("{TAG}: load fill: residency scan failed ({error}); reading on in order");
+                        eprintln!("{TAG}: ple prewarm: residency scan failed ({error}); reading on in order");
                         residency = None;
                         scan_from = None;
                     }
                 }
             }
             let Some(at) = at.or((cursor < end).then_some(cursor)) else {
-                // The whole prefix is resident: wait for the next pass.
+                // The whole prefix is read: wait for the next pass.
                 std::thread::sleep(LOAD_FILL_SLICE);
                 continue;
             };
             if !self.wait_until_idle() {
-                return 0;
+                return;
             }
             let len = ((end - at) as usize).min(chunk);
             if let Err(error) = read_exact_at(&file, at, &mut buffer[..len]) {
-                eprintln!("{TAG}: load fill: read at {:.2} GiB failed: {error}", gib(at - begin));
-                ended = "stopped by a read error";
-                break;
+                eprintln!(
+                    "{TAG}: ple prewarm stopped by a read error at {:.2} GiB: {error}",
+                    gib(at - begin)
+                );
+                return;
             }
             read_bytes += len as u64;
             if at < cursor {
@@ -1297,7 +1345,7 @@ impl HotRowStore {
                     .as_mut()
                     .is_some_and(|view| !matches!(view.first_hole(at, at + 1), Ok(hole) if hole > at));
                 if blind {
-                    eprintln!("{TAG}: load fill: the residency view is blind; reading on in order");
+                    eprintln!("{TAG}: ple prewarm: the residency view is blind; reading on in order");
                     residency = None;
                     scan_from = None;
                 }
@@ -1308,25 +1356,42 @@ impl HotRowStore {
                 }
             }
         }
-        let filled = match residency.as_mut().map(|view| view.first_hole(begin, cursor)) {
-            Some(Ok(hole)) => hole,
-            _ => cursor,
-        } - begin;
-        self.load_filled.store(filled, Ordering::Relaxed);
+        self.load_filled.store(target, Ordering::Relaxed);
+        self.prewarmed.store(target, Ordering::Relaxed);
+        let fill_secs = started.elapsed().as_secs_f64();
+        // Tier 0 a second time: a page touched twice is promoted to the
+        // kernel's active list, so the hottest rows outlive colder ones.
+        let tier0_end = self
+            .tier_base
+            .get(1)
+            .copied()
+            .unwrap_or(self.data_offset + self.data_bytes);
+        let (_, touch) = prewarm_spans(begin, tier0_end, target, target);
+        let mut paused = Duration::ZERO;
+        let mut touch_buffer = vec![0u8; PREWARM_CHUNK];
+        if !self.read_span(&file, &mut touch_buffer, &mut paused, touch, &self.retouched) {
+            return;
+        }
+        self.prewarm_done.store(true, Ordering::Release);
         let secs = started.elapsed().as_secs_f64();
         eprintln!(
-            "{TAG}: load fill {ended}: {:.2} GiB resident from the hottest row on ({:.2} GiB read \
-             of {:.2}); {:.2} GiB read in {secs:.1} s, {:.2} of it re-reading evicted pages, {:.2} GB/s \
-             (cap {:.2})",
-            gib(filled),
-            gib(cursor - begin),
+            "{TAG}: ple prewarm complete: {:.2} GiB of {:.2} GiB resident (hottest first) in {secs:.1} s \
+             (upload done at {:.1} s); {:.2} GiB read in {fill_secs:.1} s, {:.2} of it re-reading \
+             evicted pages, {:.2} GB/s (cap {}); tier 0 re-touched ({:.2} GiB); MemAvailable {:.1} GiB",
             gib(target),
+            gib(self.data_bytes),
+            upload_secs.unwrap_or(fill_secs),
             gib(read_bytes),
             gib(repaired),
-            read_bytes as f64 / 1e9 / secs.max(1e-9),
-            fill.bytes_per_sec as f64 / 1e9,
+            read_bytes as f64 / 1e9 / fill_secs.max(1e-9),
+            if prewarm.bytes_per_sec == 0 {
+                "none".to_string()
+            } else {
+                format!("{:.2}", prewarm.bytes_per_sec as f64 / 1e9)
+            },
+            gib(self.retouched.load(Ordering::Relaxed)),
+            mem_available_bytes().map_or(f64::NAN, gib),
         );
-        filled
     }
 
     /// Sleep until a prewarm budget is set; `None` when the store was stopped
@@ -1430,7 +1495,7 @@ impl HotRowStore {
     ///
     /// Phase 1 reads the pack's data from its start, hottest tier first, so
     /// early requests hit sooner after load; it skips the first `filled`
-    /// bytes, which a [`LoadFill`] already read.  Phase 2 then reads tier 0 (the
+    /// bytes, already read.  Phase 2 then reads tier 0 (the
     /// first `tier_base[1]` bytes, clipped to the budget) a second time: a
     /// page touched twice is promoted to the kernel's active list, so the
     /// hottest rows stay resident when the cache is reclaimed.  Both phases
@@ -1538,21 +1603,25 @@ fn prewarm_spans(
     )
 }
 
-/// A table worker's fill of the table's hottest prefix while the model loads
-/// ([`HotRowStore::spawn_table_worker`]): the first `bytes` of the data at
-/// no more than `bytes_per_sec`, so it leaves the drive to the weight upload.
-/// It runs until the model is ready, re-reading pages of the prefix the
-/// cache evicted meanwhile, hottest first.
+/// A table worker's PLE prewarm during model load
+/// ([`HotRowStore::spawn_table_worker`]): the first `bytes` of the data,
+/// read concurrently with the weight upload, at no more than `bytes_per_sec`
+/// when that is nonzero (0 = unthrottled).  It ends after
+/// [`HotRowStore::finish_load`] once the whole prefix is resident.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LoadFill {
+pub struct LoadPrewarm {
     pub bytes: u64,
     pub bytes_per_sec: u64,
 }
 
-impl LoadFill {
+impl LoadPrewarm {
     /// Bytes per read: [`LOAD_FILL_SLICE`] worth of the rate, at least
-    /// [`LOAD_FILL_MIN_CHUNK`] and at most [`PREWARM_CHUNK`].
+    /// [`LOAD_FILL_MIN_CHUNK`] and at most [`PREWARM_CHUNK`]; unthrottled
+    /// reads [`PREWARM_CHUNK`].
     fn chunk(self) -> usize {
+        if self.bytes_per_sec == 0 {
+            return PREWARM_CHUNK;
+        }
         let slice = (self.bytes_per_sec as f64 * LOAD_FILL_SLICE.as_secs_f64()) as u64;
         usize::try_from(slice)
             .unwrap_or(usize::MAX)
@@ -1986,8 +2055,9 @@ mod tests {
     }
 
     #[test]
-    fn load_fill_reads_about_a_slice_of_its_rate_per_read() {
-        let chunk = |bytes_per_sec| LoadFill { bytes: 1, bytes_per_sec }.chunk();
+    fn load_prewarm_reads_about_a_slice_of_its_rate_per_read() {
+        let chunk = |bytes_per_sec| LoadPrewarm { bytes: 1, bytes_per_sec }.chunk();
+        assert_eq!(chunk(0), PREWARM_CHUNK, "unthrottled");
         assert_eq!(chunk(200_000_000), PREWARM_CHUNK.min(10_000_000));
         assert_eq!(chunk(100_000), 5_000);
         assert_eq!(chunk(1), LOAD_FILL_MIN_CHUNK);
@@ -2147,51 +2217,28 @@ mod tests {
         assert!(HotRowStore::open_table(&dir.path().join("absent")).is_err());
     }
 
-    /// The table worker runs the shared prewarm: nothing before a budget, then
-    /// exactly the budget (capped at the data size); `stop` ends a worker that
-    /// is still waiting.
+    /// Without an in-load prewarm the table worker ends at once and the
+    /// (empty) prewarm is complete; nothing is read.
     #[test]
-    fn table_worker_prewarms_under_its_budget() {
+    fn table_worker_without_a_prewarm_ends_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let shards = table_shards(RowEncoding::Q4Lm);
         let path = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q4Lm, &shards);
-
         let store = HotRowStore::open_table(&path).unwrap();
         let worker = store.spawn_table_worker(None);
-        std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
-        assert!(!store.prewarm_complete());
-        let budget = store.data_bytes() / 2;
-        store.set_prewarm_budget(budget);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !store.prewarm_complete() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(store.prewarm_complete());
-        assert_eq!(store.prewarmed_bytes(), budget);
-        store.stop();
+        assert!(store.wait_load_prewarm());
         worker.join().unwrap();
-        assert!(
-            store.is_serving(),
-            "the worker never changes the serving state"
-        );
+        assert_eq!(store.prewarmed_bytes(), 0);
+        assert!(store.is_serving(), "the worker never changes the serving state");
 
-        let capped = HotRowStore::open_table(&path).unwrap();
-        let worker = capped.spawn_table_worker(None);
-        capped.set_prewarm_budget(u64::MAX - 1);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !capped.prewarm_complete() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(capped.prewarmed_bytes(), capped.data_bytes());
-        capped.stop();
+        let zero = HotRowStore::open_table(&path).unwrap();
+        let worker = zero.spawn_table_worker(Some(LoadPrewarm {
+            bytes: 0,
+            bytes_per_sec: 0,
+        }));
+        assert!(zero.wait_load_prewarm());
         worker.join().unwrap();
-
-        let waiting = HotRowStore::open_table(&path).unwrap();
-        let worker = waiting.spawn_table_worker(None);
-        waiting.stop();
-        worker.join().unwrap();
-        assert!(!waiting.prewarm_complete());
+        assert_eq!(zero.load_filled_bytes(), 0);
     }
 
     fn wait_for(mut what: impl FnMut() -> bool) {
@@ -2201,52 +2248,62 @@ mod tests {
         }
     }
 
-    /// A load fill reads its prefix before any budget is set; the prewarm
-    /// after ready continues from there and reads the budget in total.
+    /// The load ordering, with a fake weight upload: the prewarm starts with
+    /// the load (it reads while the "upload" runs, before `finish_load`),
+    /// it never completes before the upload is done, and
+    /// `wait_load_prewarm` (the loader's gate before ready) returns only once
+    /// the whole budget is resident.
     #[test]
-    fn table_worker_load_fill_reads_the_prefix_before_ready() {
+    fn ready_waits_for_the_load_prewarm_which_starts_with_the_load() {
         let dir = tempfile::tempdir().unwrap();
         let shards = table_shards(RowEncoding::Q4Lm);
         let path = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q4Lm, &shards);
         let store = HotRowStore::open_table(&path).unwrap();
-        let prefix = store.data_bytes() / 3;
-        let worker = store.spawn_table_worker(Some(LoadFill {
-            bytes: prefix,
-            bytes_per_sec: u64::MAX,
-        }));
-        wait_for(|| store.load_filled_bytes() == prefix);
-        assert_eq!(store.load_filled_bytes(), prefix);
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(store.prewarmed_bytes(), 0, "no budget, no prewarm");
-        assert!(!store.prewarm_complete());
         let budget = store.data_bytes() / 2;
-        store.set_prewarm_budget(budget);
-        wait_for(|| store.prewarm_complete());
+        // Load start: the prewarm is spawned, then the fake upload runs.
+        let worker = store.spawn_table_worker(Some(LoadPrewarm {
+            bytes: budget,
+            bytes_per_sec: 0,
+        }));
+        wait_for(|| store.load_filled_bytes() == budget);
+        assert_eq!(store.load_filled_bytes(), budget, "read during the upload");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !store.prewarm_complete(),
+            "the prewarm cannot complete before the upload is done"
+        );
+        store.finish_load();
+        assert!(store.wait_load_prewarm(), "ready only once resident");
         assert!(store.prewarm_complete());
         assert_eq!(store.prewarmed_bytes(), budget);
-        assert_eq!(store.load_filled_bytes(), prefix);
-        store.stop();
         worker.join().unwrap();
 
-        // A budget below the filled prefix reads nothing more in phase 1.
-        let small = HotRowStore::open_table(&path).unwrap();
-        let worker = small.spawn_table_worker(Some(LoadFill {
+        // A slow (throttled) prewarm outlasting a fast upload holds ready back
+        // until its whole budget is read; capped at the data.
+        // 4 KiB reads at 400 KB/s over the whole table.
+        let slow = HotRowStore::open_table(&path).unwrap();
+        let worker = slow.spawn_table_worker(Some(LoadPrewarm {
             bytes: u64::MAX,
-            bytes_per_sec: u64::MAX,
+            bytes_per_sec: 400_000,
         }));
-        wait_for(|| small.load_filled_bytes() == small.data_bytes());
-        assert_eq!(small.load_filled_bytes(), small.data_bytes(), "capped at the data");
-        small.set_prewarm_budget(prefix);
-        wait_for(|| small.prewarm_complete());
-        assert_eq!(small.prewarmed_bytes(), prefix);
-        small.stop();
+        let load_start = Instant::now();
+        wait_for(|| slow.load_filled_bytes() > 0);
+        assert!(slow.load_filled_bytes() > 0, "the prewarm starts with the load");
+        slow.finish_load();
+        assert!(slow.load_filled_bytes() < slow.data_bytes(), "still filling at upload end");
+        assert!(slow.wait_load_prewarm());
+        let ready = load_start.elapsed();
+        assert_eq!(slow.load_filled_bytes(), slow.data_bytes());
+        let floor = Duration::from_secs_f64(slow.data_bytes() as f64 / 400_000.0 * 0.9);
+        assert!(ready >= floor, "ready at {ready:?} before the rate allows {floor:?}");
         worker.join().unwrap();
     }
 
-    /// Pages of the prefix the cache drops during the load are read again.
+    /// Pages of the prefix the cache drops during the load are read again,
+    /// and the last pass after the upload leaves the budget resident.
     /// (Skipped where the file system keeps the pages, e.g. tmpfs.)
     #[test]
-    fn table_worker_load_fill_repairs_evicted_pages() {
+    fn load_prewarm_repairs_evicted_pages_before_ready() {
         let dir = tempfile::tempdir().unwrap();
         let shards = table_shards(RowEncoding::Q4Lm);
         let path = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q4Lm, &shards);
@@ -2264,63 +2321,43 @@ mod tests {
             eprintln!("the file system keeps the pages; nothing to repair");
             return;
         }
-        let worker = store.spawn_table_worker(Some(LoadFill {
+        let worker = store.spawn_table_worker(Some(LoadPrewarm {
             bytes: u64::MAX,
-            bytes_per_sec: u64::MAX,
+            bytes_per_sec: 0,
         }));
         let full = store.data_bytes();
         wait_for(|| store.load_filled_bytes() == full);
-        assert_eq!(store.load_filled_bytes(), full);
         assert_eq!(view.first_hole(store.data_offset, end).unwrap(), end);
         evict();
-        // The next pass (within LOAD_FILL_REPAIR_PERIOD) sees the holes and
-        // reads them again.
+        // The next pass (within LOAD_FILL_REPAIR_PERIOD) reads them again.
         std::thread::sleep(LOAD_FILL_REPAIR_PERIOD + Duration::from_millis(500));
         wait_for(|| view.first_hole(store.data_offset, end).unwrap() == end);
         assert_eq!(view.first_hole(store.data_offset, end).unwrap(), end);
-        store.set_prewarm_budget(0);
-        wait_for(|| store.prewarm_complete());
-        assert_eq!(store.load_filled_bytes(), full);
-        store.stop();
+        // Evicted again right at upload end: the last pass repairs it.
+        evict();
+        store.finish_load();
+        assert!(store.wait_load_prewarm());
+        assert_eq!(view.first_hole(store.data_offset, end).unwrap(), end);
         worker.join().unwrap();
     }
 
-    /// The fill holds its rate, ends when the model is ready (the prewarm
-    /// then reads the rest), and `stop` ends a worker mid-fill.
+    /// `stop` ends a worker mid-prewarm; the prewarm is then not complete.
     #[test]
-    fn table_worker_load_fill_is_throttled_and_yields_at_ready() {
+    fn stop_ends_the_load_prewarm() {
         let dir = tempfile::tempdir().unwrap();
         let shards = table_shards(RowEncoding::Q4Lm);
         let path = write_table(dir.path(), PackOrder::Rank, RowEncoding::Q4Lm, &shards);
-        // 4 KiB reads at 80 KB/s: the whole table would take ~8 s.
-        let slow = LoadFill {
+        let stopped = HotRowStore::open_table(&path).unwrap();
+        let worker = stopped.spawn_table_worker(Some(LoadPrewarm {
             bytes: u64::MAX,
             bytes_per_sec: 80_000,
-        };
-        let store = HotRowStore::open_table(&path).unwrap();
-        let worker = store.spawn_table_worker(Some(slow));
-        std::thread::sleep(Duration::from_millis(200));
-        store.set_prewarm_budget(store.data_bytes());
-        wait_for(|| store.prewarm_complete());
-        assert!(store.prewarm_complete());
-        let filled = store.load_filled_bytes();
-        assert!(filled > 0, "the first read is not delayed");
-        assert!(
-            filled < store.data_bytes() / 2,
-            "{filled} B in ~0.2 s exceeds the rate"
-        );
-        assert_eq!(store.prewarmed_bytes(), store.data_bytes());
-        store.stop();
-        worker.join().unwrap();
-
-        let stopped = HotRowStore::open_table(&path).unwrap();
-        let worker = stopped.spawn_table_worker(Some(slow));
+        }));
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
         stopped.stop();
+        assert!(!stopped.wait_load_prewarm());
         worker.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(!stopped.prewarm_complete());
         assert!(stopped.load_filled_bytes() < stopped.data_bytes());
     }
 

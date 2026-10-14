@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Idle-only page-cache prewarm of the PLE rows of a sidecar file.
+//! PLE prewarm of a row-order PLE sidecar file, as part of model load.
 //!
 //! When the PLE rows live in a `.ple-q4` / `.ple-q8` sidecar (and no hot-row
 //! pack serves them), reading the sidecar's data region sequentially once puts
@@ -10,26 +10,29 @@
 //! instead of the SSD.  The pages are ordinary clean file pages: under memory
 //! pressure the kernel drops them rather than swapping.
 //!
-//! [`PleRowsPrewarm`] reads `[data_offset, data_offset + min(budget, data_bytes))`
-//! in 8 MiB chunks with plain buffered `pread`s into one reused buffer (the data
-//! is discarded), and only while the row store is idle: before every chunk it
-//! waits on the row store's [`FetchActivity`] until no fetch is in flight and the
-//! last one finished [`FETCH_QUIET`] ago (the rule of the hot-row prewarm).  The
-//! budget can be set after spawn ([`PleRowsPrewarm::set_budget`]); the worker
-//! reads nothing before it.  Dropping the handle stops and joins the worker.
+//! [`PleRowsPrewarm::spawn`] starts with the model load and reads
+//! `[data_offset, data_offset + min(budget, data_bytes))` in 8 MiB chunks with
+//! plain buffered `pread`s into one reused buffer (the data is discarded),
+//! concurrently with the weight upload, at no more than `bytes_per_sec` when
+//! that is nonzero.  The upload streams the model through the same page cache
+//! and can evict what was read, so once the loader calls
+//! [`PleRowsPrewarm::finish_load`] (the weights are uploaded) the worker
+//! re-reads every evicted page of the budget (`mincore`) and only then is the
+//! prewarm complete.  The loader declares the model ready after
+//! [`PleRowsPrewarm::wait`]: nothing of it runs while requests are served.
+//! Dropping the handle stops and joins the worker.
 //!
 //! # Public API (exact signatures)
 //!
 //! ```text
-//! PleRowsPrewarm::spawn(path: &Path, data_offset: u64, data_bytes: u64,
-//!                       activity: Arc<FetchActivity>) -> std::io::Result<PleRowsPrewarm>
-//! PleRowsPrewarm::{set_budget(bytes: u64), stop(), prewarmed_bytes() -> u64,
+//! PleRowsPrewarm::spawn(path: &Path, data_offset: u64, data_bytes: u64, budget: u64,
+//!                       bytes_per_sec: u64) -> std::io::Result<PleRowsPrewarm>
+//! PleRowsPrewarm::{finish_load(), wait() -> bool, stop(), prewarmed_bytes() -> u64,
 //!                  complete() -> bool, failed() -> bool}
 //! ```
 //!
-//! Log lines (stderr, harness scripts key on the prefixes):
-//! `  qwen4 ple prewarm: complete, <MiB> MiB in <secs> s ...`,
-//! `  qwen4 ple prewarm: stopped, ...`, `  qwen4 ple prewarm: failed, ...`.
+//! Log lines (stderr): `  qwen4 ple prewarm complete: <MiB> MiB ...`,
+//! `  qwen4 ple prewarm stopped, ...`, `  qwen4 ple prewarm failed, ...`.
 
 use std::fs::File;
 use std::io;
@@ -41,13 +44,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::external_rows::{FetchActivity, FETCH_QUIET};
+use crate::ple_hot_store::Residency;
 
 /// Bytes per prewarm read.
 const PREWARM_CHUNK: usize = 8 << 20;
-/// `budget` before [`PleRowsPrewarm::set_budget`].
-const BUDGET_UNSET: u64 = u64::MAX;
-const TAG: &str = "  qwen4 ple prewarm:";
+const TAG: &str = "  qwen4 ple prewarm";
 
 fn mib(bytes: u64) -> u64 {
     bytes >> 20
@@ -55,42 +56,34 @@ fn mib(bytes: u64) -> u64 {
 
 struct Shared {
     data_offset: u64,
-    data_bytes: u64,
-    budget: AtomicU64,
+    budget: u64,
+    bytes_per_sec: u64,
     prewarmed: AtomicU64,
+    upload_done: AtomicBool,
     done: AtomicBool,
     failed: AtomicBool,
+    ended: AtomicBool,
     stop: AtomicBool,
 }
 
-/// Background reader that warms the page cache with a sidecar's rows while the
-/// row store is idle.  Stops and joins its worker on drop.
+/// Load-time reader that warms the page cache with a sidecar's rows.  Stops
+/// and joins its worker on drop.
 pub struct PleRowsPrewarm {
     shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl PleRowsPrewarm {
-    /// Open `path` and start the worker over its data region
-    /// `[data_offset, data_offset + data_bytes)`.  It reads nothing until
-    /// [`PleRowsPrewarm::set_budget`], and only while `activity` (the row
-    /// store's, [`crate::external_rows::RowStore::activity`]) is idle.
+    /// Open `path` and start reading the first `budget` bytes (capped at
+    /// `data_bytes`) of its data region `[data_offset, data_offset +
+    /// data_bytes)` at once, at no more than `bytes_per_sec` (0 =
+    /// unthrottled).
     pub fn spawn(
         path: &Path,
         data_offset: u64,
         data_bytes: u64,
-        activity: Arc<FetchActivity>,
-    ) -> io::Result<PleRowsPrewarm> {
-        Self::spawn_with_quiet(path, data_offset, data_bytes, activity, FETCH_QUIET)
-    }
-
-    /// [`PleRowsPrewarm::spawn`] with an explicit quiet period (tests).
-    pub(crate) fn spawn_with_quiet(
-        path: &Path,
-        data_offset: u64,
-        data_bytes: u64,
-        activity: Arc<FetchActivity>,
-        quiet: Duration,
+        budget: u64,
+        bytes_per_sec: u64,
     ) -> io::Result<PleRowsPrewarm> {
         data_offset.checked_add(data_bytes).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "prewarm range overflows u64")
@@ -102,29 +95,40 @@ impl PleRowsPrewarm {
         }
         let shared = Arc::new(Shared {
             data_offset,
-            data_bytes,
-            budget: AtomicU64::new(BUDGET_UNSET),
+            budget: budget.min(data_bytes),
+            bytes_per_sec,
             prewarmed: AtomicU64::new(0),
+            upload_done: AtomicBool::new(false),
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let worker_shared = shared.clone();
         let worker = std::thread::Builder::new()
             .name("ple-rows-prewarm".to_string())
-            .spawn(move || worker_shared.run(&file, &activity, quiet))?;
+            .spawn(move || {
+                worker_shared.run(&file);
+                worker_shared.ended.store(true, Ordering::Release);
+            })?;
         Ok(PleRowsPrewarm {
             shared,
             worker: Some(worker),
         })
     }
 
-    /// Bytes of the data region to read (capped at its size; 0 = none).  The
-    /// worker starts reading at once, subject to idleness.
-    pub fn set_budget(&self, bytes: u64) {
-        self.shared
-            .budget
-            .store(bytes.min(self.shared.data_bytes), Ordering::Release);
+    /// The weights are uploaded: re-read what the upload evicted, then end.
+    pub fn finish_load(&self) {
+        self.shared.upload_done.store(true, Ordering::Release);
+    }
+
+    /// Block until the worker ended (after [`PleRowsPrewarm::finish_load`]);
+    /// `true` when the whole budget is resident.
+    pub fn wait(&self) -> bool {
+        while !self.shared.ended.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.complete()
     }
 
     /// Ask the worker to stop at its next chunk.  Dropping the handle does this
@@ -138,7 +142,7 @@ impl PleRowsPrewarm {
         self.shared.prewarmed.load(Ordering::Relaxed)
     }
 
-    /// The worker read its whole budget.
+    /// The whole budget was read and, after the upload, found resident.
     pub fn complete(&self) -> bool {
         self.shared.done.load(Ordering::Acquire)
     }
@@ -163,60 +167,108 @@ impl Shared {
         self.stop.load(Ordering::Acquire)
     }
 
-    fn run(&self, file: &File, activity: &FetchActivity, quiet: Duration) {
-        let budget = loop {
-            if self.stopped() {
-                return;
-            }
-            match self.budget.load(Ordering::Acquire) {
-                BUDGET_UNSET => std::thread::sleep(Duration::from_millis(50)),
-                budget => break budget,
-            }
-        };
+    /// Read `[at, at + len)` (absolute); `false` after logging a failure.
+    fn read(&self, file: &File, buffer: &mut [u8], at: u64, len: usize) -> bool {
+        if let Err(error) = file.read_exact_at(&mut buffer[..len], at) {
+            self.failed.store(true, Ordering::Release);
+            eprintln!(
+                "{TAG} failed, read error at {} MiB of {} MiB: {error}",
+                mib(at - self.data_offset),
+                mib(self.budget)
+            );
+            return false;
+        }
+        true
+    }
+
+    fn run(&self, file: &File) {
+        let budget = self.budget;
         if budget == 0 {
             self.done.store(true, Ordering::Release);
             return;
         }
         let started = Instant::now();
-        let mut paused = Duration::ZERO;
         let mut buffer = vec![0u8; PREWARM_CHUNK];
-        let end = self.data_offset + budget;
-        let mut offset = self.data_offset;
+        let begin = self.data_offset;
+        let end = begin + budget;
+        let mut offset = begin;
         while offset < end {
-            let idle_from = Instant::now();
-            if !activity.wait_idle(quiet, &self.stop) {
+            if self.stopped() {
                 eprintln!(
                     "{TAG} stopped, {} MiB of {} MiB in {:.1} s",
-                    mib(offset - self.data_offset),
+                    mib(offset - begin),
                     mib(budget),
                     started.elapsed().as_secs_f64()
                 );
                 return;
             }
-            paused += idle_from.elapsed();
+            if self.bytes_per_sec > 0 {
+                let due = Duration::from_secs_f64((offset - begin) as f64 / self.bytes_per_sec as f64);
+                let elapsed = started.elapsed();
+                if due > elapsed {
+                    std::thread::sleep((due - elapsed).min(Duration::from_millis(50)));
+                    continue;
+                }
+            }
             let len = ((end - offset) as usize).min(PREWARM_CHUNK);
-            if let Err(error) = file.read_exact_at(&mut buffer[..len], offset) {
-                self.failed.store(true, Ordering::Release);
-                eprintln!(
-                    "{TAG} failed, read error at {} MiB of {} MiB: {error}",
-                    mib(offset - self.data_offset),
-                    mib(budget)
-                );
+            if !self.read(file, &mut buffer, offset, len) {
                 return;
             }
             offset += len as u64;
-            self.prewarmed
-                .store(offset - self.data_offset, Ordering::Relaxed);
+            self.prewarmed.store(offset - begin, Ordering::Relaxed);
+        }
+        let read_secs = started.elapsed().as_secs_f64();
+        while !self.upload_done.load(Ordering::Acquire) {
+            if self.stopped() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Re-read the pages of the budget the upload evicted, hottest
+        // (lowest offset) first, until a pass finds none.
+        let mut repaired = 0u64;
+        match Residency::map(file, end) {
+            Ok(mut view) => {
+                let mut from = begin;
+                loop {
+                    if self.stopped() {
+                        return;
+                    }
+                    let hole = match view.first_hole(from, end) {
+                        Ok(hole) => hole,
+                        Err(error) => {
+                            eprintln!("{TAG}: residency scan failed ({error}); not re-reading evicted pages");
+                            break;
+                        }
+                    };
+                    if hole >= end {
+                        break;
+                    }
+                    let len = ((end - hole) as usize).min(PREWARM_CHUNK);
+                    if !self.read(file, &mut buffer, hole, len) {
+                        return;
+                    }
+                    repaired += len as u64;
+                    if !matches!(view.first_hole(hole, hole + 1), Ok(next) if next > hole) {
+                        eprintln!("{TAG}: the residency view is blind; not re-reading evicted pages");
+                        break;
+                    }
+                    from = hole + len as u64;
+                }
+            }
+            Err(error) => {
+                eprintln!("{TAG}: no residency view ({error}); not re-reading evicted pages")
+            }
         }
         self.done.store(true, Ordering::Release);
-        let elapsed = started.elapsed();
-        let reading = elapsed.saturating_sub(paused).as_secs_f64();
+        let elapsed = started.elapsed().as_secs_f64();
         eprintln!(
-            "{TAG} complete, {} MiB in {:.1} s ({:.2} GB/s reading, {:.1} s paused for requests)",
+            "{TAG} complete: {} MiB resident in {elapsed:.1} s ({} MiB read in {read_secs:.1} s, \
+             {:.2} GB/s; {} MiB re-reading evicted pages after the upload)",
             mib(budget),
-            elapsed.as_secs_f64(),
-            budget as f64 / 1e9 / reading.max(1e-9),
-            paused.as_secs_f64(),
+            mib(budget),
+            budget as f64 / 1e9 / read_secs.max(1e-9),
+            mib(repaired),
         );
     }
 }
@@ -226,7 +278,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    const QUIET: Duration = Duration::from_millis(60);
     const OFFSET: u64 = 4096;
     /// Two full chunks and a partial one.
     const DATA: u64 = 2 * PREWARM_CHUNK as u64 + (4 << 20);
@@ -247,84 +298,59 @@ mod tests {
         }
     }
 
-    fn spawn(path: &Path, activity: &Arc<FetchActivity>) -> PleRowsPrewarm {
-        PleRowsPrewarm::spawn_with_quiet(path, OFFSET, DATA, activity.clone(), QUIET).unwrap()
+    fn spawn(path: &Path, budget: u64) -> PleRowsPrewarm {
+        PleRowsPrewarm::spawn(path, OFFSET, DATA, budget, 0).unwrap()
     }
 
-    /// Nothing is read before a budget; then exactly the budget (capped at the
-    /// data size) is, once idle.
+    /// The prewarm reads its budget (capped at the data) at once, during the
+    /// load, but completes only after the upload is done.
     #[test]
-    fn reads_exactly_its_budget() {
+    fn reads_exactly_its_budget_and_completes_after_the_upload() {
         let (_dir, path) = data_file(OFFSET + DATA);
-        let activity = Arc::new(FetchActivity::new());
-        let prewarm = spawn(&path, &activity);
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!((prewarm.prewarmed_bytes(), prewarm.complete()), (0, false));
         let budget = PREWARM_CHUNK as u64 + (1 << 20);
-        prewarm.set_budget(budget);
-        wait_until("a partial budget", || prewarm.complete());
+        let prewarm = spawn(&path, budget);
+        wait_until("a partial budget", || prewarm.prewarmed_bytes() == budget);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!prewarm.complete(), "not complete before the upload is done");
+        prewarm.finish_load();
+        assert!(prewarm.wait());
         assert_eq!(prewarm.prewarmed_bytes(), budget);
         assert!(!prewarm.failed());
 
-        let activity = Arc::new(FetchActivity::new());
-        let all = spawn(&path, &activity);
-        all.set_budget(u64::MAX - 1);
-        wait_until("the whole region", || all.complete());
+        let all = spawn(&path, u64::MAX - 1);
+        all.finish_load();
+        assert!(all.wait());
         assert_eq!(all.prewarmed_bytes(), DATA);
 
-        let activity = Arc::new(FetchActivity::new());
-        let none = spawn(&path, &activity);
-        none.set_budget(0);
-        wait_until("a zero budget", || none.complete());
+        let none = spawn(&path, 0);
+        assert!(none.wait(), "a zero budget is complete at once");
         assert_eq!(none.prewarmed_bytes(), 0);
     }
 
-    /// A fetch in flight pauses the worker; it resumes `quiet` after the last
-    /// fetch finished.
+    /// A throttled prewarm outlasting the upload holds `wait` (ready) back
+    /// until its whole budget is read.
     #[test]
-    fn pauses_while_a_fetch_is_in_flight() {
+    fn wait_holds_ready_until_a_throttled_budget_is_read() {
         let (_dir, path) = data_file(OFFSET + DATA);
-        let activity = Arc::new(FetchActivity::new());
-        let guard = activity.busy();
-        let prewarm = spawn(&path, &activity);
-        prewarm.set_budget(DATA);
-        std::thread::sleep(Duration::from_millis(250));
-        assert_eq!(prewarm.prewarmed_bytes(), 0, "a fetch in flight pauses it");
-        let released = Instant::now();
-        drop(guard);
-        std::thread::sleep(QUIET / 3);
-        assert_eq!(prewarm.prewarmed_bytes(), 0, "quiet period not over yet");
-        wait_until("resume", || prewarm.complete());
-        assert!(released.elapsed() >= QUIET);
+        let rate = 40_000_000;
+        let prewarm = PleRowsPrewarm::spawn(&path, OFFSET, DATA, DATA, rate).unwrap();
+        let load_start = Instant::now();
+        prewarm.finish_load();
+        assert!(prewarm.wait());
+        let floor = Duration::from_secs_f64((DATA - PREWARM_CHUNK as u64) as f64 / rate as f64);
+        assert!(load_start.elapsed() >= floor);
         assert_eq!(prewarm.prewarmed_bytes(), DATA);
-
-        // A fetch between chunks pauses it again.
-        let activity = Arc::new(FetchActivity::new());
-        let prewarm = spawn(&path, &activity);
-        let guard = activity.busy();
-        prewarm.set_budget(DATA);
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(prewarm.prewarmed_bytes(), 0);
-        drop(guard);
-        wait_until("second resume", || prewarm.complete());
     }
 
-    /// Dropping the handle ends a worker that is paused or waiting for a budget.
+    /// Dropping the handle ends a worker that waits for the upload.
     #[test]
     fn drop_stops_and_joins() {
         let (_dir, path) = data_file(OFFSET + DATA);
-        let activity = Arc::new(FetchActivity::new());
-        let waiting = spawn(&path, &activity);
-        drop(waiting);
-
-        let guard = activity.busy();
-        let paused = spawn(&path, &activity);
-        paused.set_budget(DATA);
-        std::thread::sleep(Duration::from_millis(100));
+        let waiting = spawn(&path, DATA);
+        wait_until("the budget", || waiting.prewarmed_bytes() == DATA);
         let started = Instant::now();
-        drop(paused);
+        drop(waiting);
         assert!(started.elapsed() < Duration::from_secs(2));
-        drop(guard);
     }
 
     /// A file shorter than the declared data region fails the worker instead of
@@ -332,21 +358,19 @@ mod tests {
     #[test]
     fn a_short_file_fails() {
         let (_dir, path) = data_file(OFFSET + PREWARM_CHUNK as u64 + 12345);
-        let activity = Arc::new(FetchActivity::new());
-        let prewarm = spawn(&path, &activity);
-        prewarm.set_budget(DATA);
-        wait_until("the read error", || prewarm.failed());
-        assert!(!prewarm.complete());
+        let prewarm = spawn(&path, DATA);
+        prewarm.finish_load();
+        assert!(!prewarm.wait());
+        assert!(prewarm.failed());
         assert_eq!(prewarm.prewarmed_bytes(), PREWARM_CHUNK as u64);
     }
 
     #[test]
     fn spawn_reports_a_missing_file_and_a_bad_range() {
         let dir = tempfile::tempdir().unwrap();
-        let activity = Arc::new(FetchActivity::new());
         let missing = dir.path().join("absent");
-        assert!(PleRowsPrewarm::spawn(&missing, 0, 1, activity.clone()).is_err());
+        assert!(PleRowsPrewarm::spawn(&missing, 0, 1, 1, 0).is_err());
         let (_dir, path) = data_file(16);
-        assert!(PleRowsPrewarm::spawn(&path, u64::MAX, 2, activity).is_err());
+        assert!(PleRowsPrewarm::spawn(&path, u64::MAX, 2, 1, 0).is_err());
     }
 }
