@@ -840,16 +840,68 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
     steps: &[Step<'a>],
     hooks: &mut dyn MoeStepHooks,
 ) -> Result<(), DispatchError> {
-    let mut i = 0;
+    execute_window(
+        gpu,
+        ctx,
+        steps,
+        0..steps.len(),
+        &mut HcFusionCursor::default(),
+        hooks,
+    )
+}
+
+/// HC fusion pairing state of one program, carried between the windows of a
+/// program that its owner executes piecewise (the NPU pair route runs each
+/// layer as prepare `[start..mixer)`, an out-of-interpreter mixer Core, then
+/// `[mixer..end)`).  Indices are into the whole program.  A fresh cursor per
+/// program run; the tensors a pending entry refers to (the paired write's
+/// `gates`, BF16 streams) must survive whatever the owner runs between
+/// windows.
+#[derive(Debug, Default)]
+pub struct HcFusionCursor {
     // A fused hyper write that produced the gate quarters of the hyper write
     // at this index, and the quarter slot it used.
-    let mut gates_ready: Option<(usize, usize)> = None;
+    gates_ready: Option<(usize, usize)>,
     // The hyper write at this index takes its gates from its paired read
     // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
-    let mut pregated: Option<usize> = None;
+    pregated: Option<usize>,
     // The hyper read at this index had its norm + paired-write gates produced
     // by the preceding MoE call's HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`).
-    let mut prenormed: Option<usize> = None;
+    prenormed: Option<usize>,
+}
+
+/// [`execute_validated_steps`] over `program[window]`, with the HC pairings
+/// looked up in the whole `program` and their state kept in `cursor` across
+/// calls.  A fusion only consumes steps inside `window`; a pairing that
+/// reaches past `window.end` stays pending in `cursor` for the window that
+/// runs that step.  A paired read hands its gates past the window only to a
+/// BF16-stream write, whose kernel reads the gates and streams but not the
+/// shared `normalized` scratch.
+pub fn execute_validated_steps_window<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    program: &[Step<'a>],
+    window: std::ops::Range<usize>,
+    cursor: &mut HcFusionCursor,
+) -> Result<(), DispatchError> {
+    execute_window(gpu, ctx, program, window, cursor, &mut NoMoeHooks)
+}
+
+fn execute_window<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+    window: std::ops::Range<usize>,
+    cursor: &mut HcFusionCursor,
+    hooks: &mut dyn MoeStepHooks,
+) -> Result<(), DispatchError> {
+    let end = window.end;
+    let mut i = window.start;
+    let HcFusionCursor {
+        gates_ready,
+        pregated,
+        prenormed,
+    } = cursor;
     let hc_level = if cpu_exec::cpu_exec_enabled() {
         0
     } else {
@@ -857,7 +909,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
     };
     let hc_fuse = hc_level >= 1;
     let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
-    while i < steps.len() {
+    while i < end {
         if hc_fuse {
             use crate::pipeline::layer_ops::{
                 execute_gated_delta_net_hc, execute_hyper_read_paired,
@@ -865,21 +917,23 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 execute_indexed_attention_hc, hyper_read_pairs_write,
             };
             match &steps[i] {
-                Step::HyperWrite(write) if pregated == Some(i) => {
-                    pregated = None;
+                Step::HyperWrite(write) if *pregated == Some(i) => {
+                    *pregated = None;
                     execute_hyper_write_pregated(gpu, write)?;
                     i += 1;
                     continue;
                 }
                 Step::HyperRead(read) => {
-                    if let Some((j, write)) = paired_hyper_write(steps, i + 1, read) {
+                    if let Some((j, write)) = paired_hyper_write(steps, i + 1, read)
+                        .filter(|(j, write)| *j < end || write.state_bf16)
+                    {
                         if hyper_read_pairs_write(gpu, read, write) {
-                            if prenormed == Some(i) {
-                                prenormed = None;
+                            if *prenormed == Some(i) {
+                                *prenormed = None;
                                 execute_hyper_read_prenormed(gpu, read, write)?;
-                                pregated = Some(j);
+                                *pregated = Some(j);
                             } else if execute_hyper_read_paired(gpu, read, write)? {
-                                pregated = Some(j);
+                                *pregated = Some(j);
                             }
                             gpu.scratch.prerotated = None;
                             i += 1;
@@ -893,7 +947,8 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // covered (the write then runs pregated as at level 1).
                 Step::GatedDeltaNet(op)
                     if hc_level >= 2
-                        && pregated == Some(i + 1)
+                        && i + 1 < end
+                        && *pregated == Some(i + 1)
                         && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
                 {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
@@ -901,7 +956,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                         execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
                         gpu.scratch.prerotated = None;
                         if fused {
-                            pregated = None;
+                            *pregated = None;
                         }
                         i += 1 + usize::from(fused);
                         continue;
@@ -909,7 +964,8 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 }
                 Step::IndexedAttention(op)
                     if hc_level >= 2
-                        && pregated == Some(i + 1)
+                        && i + 1 < end
+                        && *pregated == Some(i + 1)
                         && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
                 {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
@@ -917,7 +973,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                         execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
                         gpu.scratch.prerotated = None;
                         if fused {
-                            pregated = None;
+                            *pregated = None;
                         }
                         i += 1 + usize::from(fused);
                         continue;
@@ -933,16 +989,19 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
         // hyper write that closes the block already has its gates, the shared
         // down may carry it; a write so carried is skipped.
         if moe_zinit || hc_level >= 3 {
-            if let (Step::Clear(clear), Some(Step::Moe(call))) = (&steps[i], steps.get(i + 1)) {
-                let write = match steps.get(i + 2) {
-                    Some(Step::HyperWrite(write)) if hc_level >= 3 && pregated == Some(i + 2) => {
+            if let (Step::Clear(clear), Some(Step::Moe(call))) =
+                (&steps[i], steps[..end].get(i + 1))
+            {
+                let write = match steps[..end].get(i + 2) {
+                    Some(Step::HyperWrite(write)) if hc_level >= 3 && *pregated == Some(i + 2) => {
                         Some(write)
                     }
                     _ => None,
                 };
                 // Row fold lookahead: the HyperRead of the same streams right
                 // after the write, with its own paired write (the same pairing
-                // the read itself will take), on the F16 WMMA read route.
+                // the read itself will take), on the F16 WMMA read route.  The
+                // read may open the caller's next window of this program.
                 let next = match (write, steps.get(i + 3)) {
                     (Some(write), Some(Step::HyperRead(read)))
                         if gpu.flags.qwen4_hc_row_fold_enabled()
@@ -970,10 +1029,10 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 )?;
                 hooks.after_moe(gpu)?;
                 if done.folded {
-                    pregated = None;
+                    *pregated = None;
                 }
                 if done.row_folded {
-                    prenormed = Some(i + 3);
+                    *prenormed = Some(i + 3);
                 }
                 i += 2 + usize::from(done.folded);
                 continue;
@@ -984,7 +1043,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
         // half-land on the CPU seam, and splitting it costs launches it was
         // there to save — nothing else. (Fusion has no numerical contract to
         // preserve here; see the module docs on the tolerance contract.)
-        let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
+        let fused = match_prefix(FUSED_TABLE, &steps[i..end], ctx).filter(|(_, len)| {
             !cpu_exec::cpu_exec_enabled()
                 || !steps[i..i + *len]
                     .iter()
@@ -1034,7 +1093,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 cpu_exec::count_host_mapped_gpu_step();
             }
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
-                (&steps[i], steps.get(i + 1))
+                (&steps[i], steps[..end].get(i + 1))
             {
                 use crate::pipeline::layer_ops::{
                     execute_hyper_write_then_read, hyper_gate_quarters,
@@ -1043,15 +1102,16 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                     .filter(|(at, _)| *at == i)
                     .and_then(|(_, slot)| hyper_gate_quarters(write, slot));
                 let slot = gates_ready.map_or(0, |(_, slot)| slot ^ 1);
-                let next =
-                    next_fused_hyper_write(steps, i + 2, read).and_then(|j| match &steps[j] {
+                let next = next_fused_hyper_write(steps, i + 2, read)
+                    .filter(|&j| j < end)
+                    .and_then(|j| match &steps[j] {
                         Step::HyperWrite(next) => {
                             hyper_gate_quarters(next, slot).map(|q| (j, next, q))
                         }
                         _ => None,
                     });
                 // A Clear right after the read is folded into the same launch.
-                let clear = match steps.get(i + 2) {
+                let clear = match steps[..end].get(i + 2) {
                     Some(Step::Clear(op)) => Some(op),
                     _ => None,
                 };
@@ -1059,7 +1119,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // the read writes that rotation too (consumed by the mixer's
                 // first rotate, cleared after that step).
                 let mixed = read.mixed.buf.as_ptr();
-                let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
+                let rotate_into = match steps[..end].get(i + if clear.is_some() { 3 } else { 2 }) {
                     // Only a phase that rotates its `input` can take the read's
                     // rotation: the core and the output projection never do.
                     Some(Step::GatedDeltaNet(op))
@@ -1102,7 +1162,7 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                     clear,
                     rotate_into,
                 )? {
-                    gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
+                    *gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
                     i += if clear.is_some() { 3 } else { 2 };
                     continue;
                 }

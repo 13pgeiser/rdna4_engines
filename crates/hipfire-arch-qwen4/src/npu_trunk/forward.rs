@@ -9,6 +9,7 @@ use hipfire_dispatch::pipeline::{
     execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows, CoreWindow,
     GdnTrunkArenas, QsaTrunkArenas,
     execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
+    execute_validated_steps_window, HcFusionCursor,
 };
 use std::{ffi::c_void, io::Write};
 
@@ -502,15 +503,17 @@ impl NpuForward {
 fn skips_input_projections(phase: MixerPhase) -> bool {
     matches!(phase, MixerPhase::Core | MixerPhase::OutProj)
 }
-fn execute(gpu: &mut Gpu, ctx: &DispatchCtx, steps: &[Step<'_>]) -> Result<(), Qwen4GpuForwardError> {
+/// `program[window]` of one bank, with the bank's HC pairings carried in `hc`
+/// across its prepare / Core / OutProj windows.
+fn execute(gpu: &mut Gpu, ctx: &DispatchCtx, program: &[Step<'_>], window: std::ops::Range<usize>, hc: &mut HcFusionCursor) -> Result<(), Qwen4GpuForwardError> {
     // The dispatch guards project_trunk (MQ6 AND A4/IU4) with Whole|InProj.
     // Every mixer reaching this covered executor must therefore omit both.
-    debug_assert!(steps.iter().all(|step| match step {
+    debug_assert!(program[window.clone()].iter().all(|step| match step {
         Step::GatedDeltaNet(op) => skips_input_projections(op.phase),
         Step::IndexedAttention(op) => skips_input_projections(op.phase),
         _ => true,
     }), "covered NPU/twin mixer must not launch native input projections");
-    execute_validated_steps(gpu,ctx,steps).map_err(fail)
+    execute_validated_steps_window(gpu,ctx,program,window,hc).map_err(fail)
 }
 fn phase(step: &mut Step<'_>, value: MixerPhase) {
     match step { Step::GatedDeltaNet(op) => op.phase=value, Step::IndexedAttention(op) => op.phase=value, _=>unreachable!() }
@@ -643,7 +646,7 @@ impl NpuForward {
             _ => unreachable!("typed layer mixer"),
         }
     }
-    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, layer: usize, bank: usize, records: &mut [TraceRow], snapshot: Option<Snapshot<'_>>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
+    fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, records: &mut [TraceRow], snapshot: Option<Snapshot<'_>>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
         let covered = self.layers[layer].map.panel_count() != 0;
@@ -659,7 +662,8 @@ impl NpuForward {
         }
         // Includes PLE (when present) and the attention HC read. Neither reads
         // recurrent/QSA state; bank B's input can be prepared ahead of bank A.
-        let pre = &program.steps[program.ranges[layer].start..index];
+        let start = program.ranges[layer].start;
+        let pre = &program.steps[start..index];
         let ple_cut = snapshot.and_then(|snapshot| {
             let launch = snapshot.geometry[bank];
             match (launch.cut, launch.stage_after) {
@@ -669,14 +673,14 @@ impl NpuForward {
             }
         });
         match ple_cut {
-            None => execute(gpu,ctx,pre)?,
+            None => execute(gpu,ctx,&program.steps,start..index,hc)?,
             Some((stage,row)) => {
                 // The PLE depthwise convolution carries state: the snapshot holds
                 // it at the snapshot row, so a cut inside this bank splits it too.
                 let mut from = 0;
                 for (at,step) in pre.iter().enumerate() {
                     let Step::GroupedDepthwise(op) = step else { continue };
-                    if from < at { execute(gpu,ctx,&pre[from..at])?; }
+                    if from < at { execute(gpu,ctx,&program.steps,start+from..start+at,hc)?; }
                     match row {
                         Some(row) => {
                             execute_grouped_depthwise_rows(gpu,op,CoreWindow{lo:0,rows:row}).map_err(fail)?;
@@ -684,13 +688,13 @@ impl NpuForward {
                             execute_grouped_depthwise_rows(gpu,op,CoreWindow{lo:row,rows:op.rows-row}).map_err(fail)?;
                         }
                         None => {
-                            execute(gpu,ctx,&pre[at..=at])?;
+                            execute(gpu,ctx,&program.steps,start+at..start+at+1,hc)?;
                             stage.copy(gpu, stage.fixed.len() - 2, op.state).map_err(fail)?;
                         }
                     }
                     from = at + 1;
                 }
-                if from < pre.len() { execute(gpu,ctx,&pre[from..])?; }
+                if from < pre.len() { execute(gpu,ctx,&program.steps,start+from..index,hc)?; }
             }
         }
         let prep_end = records.get(layer*2+bank).map(|r| &r.prep_end);
@@ -720,7 +724,7 @@ impl NpuForward {
         }
         Ok(Some(seq))
     }
-    fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, layer: usize, bank: usize, seq: Option<Seq>, cut: Option<CoreCut<'_>>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
+    fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, seq: Option<Seq>, cut: Option<CoreCut<'_>>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
         let covered = self.layers[layer].map.panel_count() != 0;
@@ -740,19 +744,19 @@ impl NpuForward {
         if !covered {
             let end=program.ranges[layer].end;
             match &cut {
-                None => execute_validated_steps(gpu,ctx,&program.steps[index..end]).map_err(fail)?,
+                None => execute_validated_steps_window(gpu,ctx,&program.steps,index..end,hc).map_err(fail)?,
                 Some(cut) => {
                     // Native route with a snapshot row inside this bank: bank-wide
                     // input projections, the Core in two launches, then the rest.
                     phase(&mut program.steps[index],MixerPhase::InProj);
-                    execute_validated_steps(gpu,ctx,&program.steps[index..=index]).map_err(fail)?;
+                    execute_validated_steps_window(gpu,ctx,&program.steps,index..index+1,hc).map_err(fail)?;
                     phase(&mut program.steps[index],MixerPhase::Core);
                     for (at,window) in core_windows(rows,Some(cut.row)).into_iter().enumerate() {
                         self.core_launch(gpu,layer,bank,&program.steps[index],false,window)?;
                         if at == 0 { copy_mixer_state(gpu,cut.stage,&program.steps[index],cut.gdn_total,cut.gdn_slot,cut.qsa_slot)?; }
                     }
                     phase(&mut program.steps[index],MixerPhase::OutProj);
-                    execute_validated_steps(gpu,ctx,&program.steps[index..end]).map_err(fail)?;
+                    execute_validated_steps_window(gpu,ctx,&program.steps,index..end,hc).map_err(fail)?;
                     phase(&mut program.steps[index],MixerPhase::Whole);
                 }
             }
@@ -776,7 +780,8 @@ impl NpuForward {
         // `emulate` has no relay to retire.
         if let (Some(rt),Some(seq))=(rt,seq) { unsafe { rt.retire_bank(seq,stream(gpu)).map_err(fail)?; } }
         phase(&mut program.steps[index],MixerPhase::OutProj);
-        execute(gpu,ctx,&program.steps[index..program.ranges[layer].end])?;
+        let end=program.ranges[layer].end;
+        execute(gpu,ctx,&program.steps,index..end,hc)?;
         if !records.is_empty() { gpu.hip.event_record(&records[layer*2+bank].end,gpu.active_stream.as_ref())?; }
         Ok(())
     }
@@ -896,13 +901,16 @@ impl NpuForward {
         let mut host_ple=std::mem::take(&mut self.host_ple);
         let attempt: Result<(),Qwen4GpuForwardError>=(|| {
             let snapshot = stage.as_ref().map(|stage| Snapshot { stage, geometry });
-            let mut seq=[self.prepare(gpu,&ctx,&programs[0],0,0,&mut records,snapshot)?, None];
+            // Each bank's HC pairings cross its windows (prepare, Core, OutProj);
+            // the gates they hand over live in the bank's private `hc_gates`.
+            let mut hc=[HcFusionCursor::default(),HcFusionCursor::default()];
+            let mut seq=[self.prepare(gpu,&ctx,&programs[0],&mut hc[0],0,0,&mut records,snapshot)?, None];
             // Same stream: prepare(0, A) is enqueued before bank B's
             // initialization overwrites the shared init buffers (Footprint table).
             let bank_b_tokens=&tokens[rows[0]..];
             initialize(gpu,bundle,b,bank_b_tokens,&history,programs[1].ple_rows_f16,&mut host_tokens,&mut host_ple,ple_next.take(),None)?;
             for &token in bank_b_tokens { history.push(token); }
-            seq[1]=self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,snapshot)?;
+            seq[1]=self.prepare(gpu,&ctx,&programs[1],&mut hc[1],0,1,&mut records,snapshot)?;
             let mut last_seq = seq;
             // (GDN, QSA) layers already run per bank: the snapshot slots.
             let mut slots = [(0usize, 0usize); 2];
@@ -913,7 +921,7 @@ impl NpuForward {
                         Some(CoreCut { stage, row, gdn_total, gdn_slot: slots[bank].0, qsa_slot: slots[bank].1 }),
                     _ => None,
                 };
-                self.run_bank(gpu,&ctx,&mut programs[bank],layer,bank,seq[bank],cut,&mut records)?;
+                self.run_bank(gpu,&ctx,&mut programs[bank],&mut hc[bank],layer,bank,seq[bank],cut,&mut records)?;
                 let mixer = &programs[bank].steps[mixer_index(&programs[bank], layer)];
                 if geometry[bank].stage_after {
                     if let Some(stage) = &stage {
@@ -926,7 +934,7 @@ impl NpuForward {
                     _ => unreachable!("typed mixer"),
                 }
                 if layer+1<bundle.config.num_hidden_layers {
-                    seq[bank]=self.prepare(gpu,&ctx,&programs[bank],layer+1,bank,&mut records,snapshot)?;
+                    seq[bank]=self.prepare(gpu,&ctx,&programs[bank],&mut hc[bank],layer+1,bank,&mut records,snapshot)?;
                     if seq[bank].is_some() { last_seq[bank] = seq[bank]; }
                 }
             }

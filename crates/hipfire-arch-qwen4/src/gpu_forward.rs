@@ -2807,20 +2807,22 @@ impl ScratchField {
         Self::MoeYDownGrouped, Self::Logits,
     ];
 
-    /// Pair execution splits before the mixer: prepare's HC read cannot fuse
-    /// with its HC write, so only `HcMixed` survives that split. MLP HC fusions
-    /// remain wholly inside a fragment. Keep this exhaustive when adding fields.
+    /// Pair execution splits before the mixer: `HcMixed` (the mixer input)
+    /// and `HcGates` (the attention write's gates, from prepare's paired HC
+    /// read or the previous fragment's MoE row fold; the BF16-stream write
+    /// reads no `HcNormalized`) survive that split. Keep this exhaustive when
+    /// adding fields.
     fn npu_bank_lifetime(self) -> NpuBankLifetime {
         use NpuBankLifetime as L;
         match self {
             Self::TokenIds | Self::EmbeddingRot | Self::Embeddings | Self::PleStaged => L::Initialize,
             Self::Streams => L::Residual,
-            Self::HcMixed => L::PreparedInput,
+            Self::HcMixed | Self::HcGates => L::PreparedInput,
             Self::PleRows => L::StagedRows,
             Self::HcNormalized | Self::HcLow | Self::HcUp | Self::Rotation | Self::GdnBf16
             | Self::PleKey | Self::PleValue | Self::PleQuery | Self::PleGated
             | Self::PleNormed | Self::PleOutput => L::PrepareAndFragment,
-            Self::HcGates | Self::Projection | Self::Projection2
+            Self::Projection | Self::Projection2
             | Self::GdnA | Self::GdnB | Self::GdnGate | Self::GdnBeta
             | Self::GdnRecurrentOutput | Self::GdnZ | Self::GdnOutput
             | Self::QsaIndex | Self::QsaQgate | Self::QsaK | Self::QsaV
@@ -7149,25 +7151,30 @@ mod tests {
         let local_init = [(0, 0), (1, 1)];
         let residual = [(0, 10), (1, 11)];
         let input = [(2, 4), (3, 6), (5, 8), (7, 9)];
+        // The attention write's gates: prepare's paired read, or the MoE row
+        // fold of the bank's previous fragment, to the next fragment.
+        let gates = [(2, 4), (3, 6), (4, 8), (5, 8), (6, 9), (7, 9)];
         let ple_rows = [(0, 5), (1, 7)];
         let prepare_and_fragment = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6),
             (7, 7), (8, 8), (9, 9), (10, 10), (11, 11)];
         let fragments = [(4, 4), (6, 6), (8, 8), (9, 9)];
         let finish = [(10, 10), (11, 11)];
         // This independent data-flow table is also the full private/shared
-        // inventory. HC prepare cannot pair its gates with a write outside
-        // its step slice; fragment-local HC fusions consume their gates before
-        // returning. PLE normed rows are retained only for verify rollback,
-        // not prompt pairs; session capture copies fixed state, not this field.
+        // inventory. HC gates cross from prepare (or the previous fragment's
+        // row fold) to the bank's next fragment; fragment-local HC fusions
+        // consume their gates before returning. PLE normed rows are retained
+        // only for verify rollback, not prompt pairs; session capture copies
+        // fixed state, not this field.
         let rules: &[(L, &[F], &[(usize, usize)])] = &[
             (L::Initialize, &[F::TokenIds, F::EmbeddingRot, F::Embeddings, F::PleStaged], &local_init),
             (L::Residual, &[F::Streams], &residual),
             (L::PreparedInput, &[F::HcMixed], &input),
+            (L::PreparedInput, &[F::HcGates], &gates),
             (L::StagedRows, &[F::PleRows], &ple_rows),
             (L::PrepareAndFragment, &[F::HcNormalized, F::HcLow, F::HcUp,
                 F::Rotation, F::GdnBf16, F::PleKey, F::PleValue, F::PleQuery,
                 F::PleGated, F::PleNormed, F::PleOutput], &prepare_and_fragment),
-            (L::Fragment, &[F::HcGates, F::Projection, F::Projection2, F::GdnA,
+            (L::Fragment, &[F::Projection, F::Projection2, F::GdnA,
                 F::GdnB, F::GdnGate, F::GdnBeta, F::GdnRecurrentOutput, F::GdnZ,
                 F::GdnOutput, F::QsaIndex, F::QsaQgate, F::QsaK, F::QsaV,
                 F::QsaOutput, F::QsaSelected, F::AttentionOutput, F::RouterLogits,
@@ -7194,7 +7201,7 @@ mod tests {
             assert_eq!(field as usize, index);
         }
         assert_eq!(F::ALL.into_iter().filter(|field| field.npu_bank_lifetime().private())
-            .collect::<Vec<_>>(), [F::Streams, F::HcMixed, F::PleRows]);
+            .collect::<Vec<_>>(), [F::Streams, F::HcMixed, F::HcGates, F::PleRows]);
     }
 
     #[test]
@@ -7203,14 +7210,14 @@ mod tests {
         for rows in [512, 8151, 8192] {
             let private = Scratch::npu_bank_device_bytes(&config, rows).unwrap();
             let slots = plan(rows, Mode::Full);
-            let expected = [F::Streams, F::HcMixed, F::PleRows].into_iter()
+            let expected = [F::Streams, F::HcMixed, F::HcGates, F::PleRows].into_iter()
                 .map(|field| field_bytes(&slots, field)).sum::<u64>();
             assert_eq!(private, expected);
-            assert_eq!(private, rows as u64 * (4 * 2560 + 2560 + 2560) * 4);
+            assert_eq!(private, rows as u64 * (4 * 2560 + 2560 + 4 + 2560) * 4);
         }
         let private = Scratch::npu_bank_device_bytes(&config, 8192).unwrap();
-        assert_eq!(private, 503_316_480);
-        assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_682_500);
+        assert_eq!(private, 503_447_552);
+        assert_eq!(scratch_bytes(8192, Mode::Full) - private, 8_454_551_428);
     }
 
     #[test]

@@ -47,8 +47,9 @@ pub use layer_ops::{
     CoreWindow,
 };
 pub use steps::{
-    execute_steps, execute_validated_steps, execute_validated_steps_with_moe_hooks,
-    validate_steps, FusedPattern, GemvInput, MoeStepHooks, Step,
+    execute_steps, execute_validated_steps, execute_validated_steps_window,
+    execute_validated_steps_with_moe_hooks, validate_steps, FusedPattern, GemvInput,
+    HcFusionCursor, MoeStepHooks, Step,
 };
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
