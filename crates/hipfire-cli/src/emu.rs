@@ -652,7 +652,7 @@ mod tests {
         // daemon. A daemon-less, model-less environment still yields the
         // registry error rather than "model not found"/"daemon binary not found".
         let args = parse_bench(&["bench", "no-such-model", "--emu", "rx9999"]);
-        let err = crate::bench_command(&Paths::discover(), args).unwrap_err();
+        let err = crate::bench_command(&Paths::discover().unwrap(), args).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("rx9999") && text.contains("unknown"), "{text}");
     }
