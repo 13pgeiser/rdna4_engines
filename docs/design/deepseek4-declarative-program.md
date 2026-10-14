@@ -15,7 +15,7 @@ The architecture crate binds resident weights, per-layer caches and scratch;
 
 | Block | Steps |
 |---|---|
-| Attention sublayer | `HcPre` → `QLoraPrepare` → [`PackedProjections`] → `QLoraProject` → `KvJoint` → `ApplyTailRope` → (ratio > 0) `KvCompress` main → (ratio 4) [`PackedProjections`] → `KvCompress` indexer → `SparseIndex` → `SparseLatentAttention` → `HcPost` |
+| Attention sublayer | `HcPre` → `QLoraPrepare` → [`PackedProjections`] → `QLoraProject` → `KvJoint` → `ApplyTailRope` → (ratio > 0) [`CompressorProject`] → `KvCompress` main → (ratio 4) [`PackedProjections`] → [`CompressorProject`] → `KvCompress` indexer → `SparseIndex` → `SwaRingWrite` → (ratio 128) `IdentityGather` → `SparseAttention` (ratio > 0; ratio 4 gathers the indexer's top-k first) or `SwaAttention` (ratio 0) → `ApplyTailRope` (inverse) → `OLora` → `HcPost` |
 | FFN sublayer | `HcPre` → `ExpertFfn` (or `Clear` under `HIPFIRE_DEEPSEEK4_SKIP_FFN`) → `HcPost` |
 | Head | `HcHead` → `PreparedProjection` (lm_head) |
 
@@ -44,9 +44,15 @@ as `apply_tail_rope` did.
 | `HcHead` (`hc::HcHeadOp`) | head HC combine, MTP capture of the full streams, output norm, FWHT | |
 | `QLoraPrepare`, `QLoraProject` | attention RMSNorm (plain + rotated), `wq_a` → `q_norm` → `wq_b` → per-head norm | fused q_norm + rotate route |
 | `KvJoint`, `ApplyTailRope` | joint latent KV + `kv_norm`; tail YaRN RoPE of Q and KV | YaRN parameters bound per layer |
-| `KvCompress` (`compressor::KvCompressOp`) | strided compressor: projections + APE, ring write, softmax pool, norm, RoPE, F32/F16 store, overlap shift | device-slot route (decode/capture) and host-gated route (batched prefill fallback) |
+| `CompressorProject` (`compressor::CompressorProjectOp`) | the compressor's `wkv` / `wgate` projections into the `kv` / `score` scratch (one step per flavor; skipped when a packed projection wrote them) | |
+| `KvCompress` (`compressor::KvCompressOp`) | strided compressor over the projected row: APE, ring write, softmax pool, norm, RoPE, F32/F16 store, overlap shift | device-slot route (decode/capture) and host-gated route (batched prefill fallback) |
 | `SparseIndex` (`attention::SparseIndexOp`) | ratio-4 indexer: query + RoPE, head weights, relu scores, top-k | two-stage, owner-parallel (gfx942) and portable top-k |
-| `SparseLatentAttention` | SWA ring write, joint softmax over window + gathered compressed rows + sink, inverse RoPE, grouped O-LoRA | F32 / F16 / block-cyclic sharded caches; grouped wo_a per arch |
+| `SwaRingWrite` (`attention::SwaRingWriteOp`) | the row's KV into both SWA rings (decode attention reads the rings, so the write comes first) | ring slot from device state |
+| `IdentityGather` (`attention::IdentityGatherOp`) | ratio 128: the first active compressed rows, in order | F32 / F16 / block-cyclic sharded caches |
+| `SwaAttention` (`attention::SwaAttentionOp`) | ratio 0: softmax over the window and the sink | developer `Pos0` route (`HIPFIRE_DEEPSEEK4_ATTN=pos0`) on every layer |
+| `SparseAttention` (`attention::SparseAttentionOp`) | ratio > 0: one joint softmax over the window, the gathered compressed rows and the sink; ratio 4 gathers the indexer's top-k first | F32 / F16 / block-cyclic sharded caches |
+| `ApplyTailRope` (`inverse`) | inverse tail RoPE of the attention output | same YaRN parameters as the forward rotation |
+| `OLora` (`attention::OLoraOp`) | grouped O-LoRA: (rotate) → per-group `wo_a` → (rotate) → `wo_b` | grouped wo_a per arch (MQ4, E8 gfx1151 / gfx1201 / gfx1100, gfx942 backend, per group) |
 | `ExpertFfn` (`expert_ffn::ExpertFfnOp`) | FFN norm, shared SwiGLU expert, `sqrt(softplus)` router, bias-aware or hash routed experts | serial, two-stream overlap and retained-split schedules; EP partial redirection |
 | `PreparedProjection`, `PackedProjections` | one projection of an architecture-prepared (plain + rotated) input; several in one gfx1201 mixed-row launch | |
 
@@ -72,7 +78,7 @@ Removed: the hand layer loop and the #397 single-lane super-op path
 
 gfx1151 (halo), fixture `deepseek-v4-flash-0731.mq2r` (registry
 `deepseek-v4-flash`, sha256 `cbf2bbcf…`, 82,191,359,851 bytes), against beta
-`09540d8c4`:
+`8d1801c77` (and earlier `09540d8c4`, one step per moved operation group):
 
 - 2,300 committed positions (2,200 teacher-forced + 100 greedy): input and
   argmax tokens, full-logit hash and HC residual-stream hash at every
@@ -80,9 +86,18 @@ gfx1151 (halo), fixture `deepseek-v4-flash-0731.mq2r` (registry
   and score rings and `mtp_last_hidden` every 32 positions and at the end —
   all **bitwise identical**, eager and hipGraph. The run passes the
   128-token sliding window, the ratio-128 compressor commits and the 512-row
-  indexer top-k saturation (position 2,048).
-- Beta itself is deterministic on this harness (two eager runs and the
-  hipGraph run hash identically).
+  indexer top-k saturation (position 2,048). Beta itself is deterministic on
+  this harness (repeat eager runs and the hipGraph run hash identically).
+- Serve (`serve_harness.py --thinking off --sampling greedy
+  --compare-transcript`, prefill included): battery and chain transcripts
+  byte-identical.
+- Decode, `hipfire bench --matrix --tg 64`, A/B/A/B under the halo lock with
+  no build running (power-limited at ~86 W): 26.45 / 26.33 → 26.35 / 26.35
+  tok/s at ctx 128, 23.31 / 23.24 → 23.23 / 23.23 at ctx 2048.
+- DSpark speculative decoding is not bitwise comparable: greedy DSpark is
+  non-deterministic run to run on beta itself (four beta runs, four
+  acceptance-τ sequences); the PR's runs reproduce τ sequences beta also
+  produced.
 
 Hardware-blocked on halo: the gfx1201 (packed projections, TP3/TP4 peer HC,
 sharded caches), gfx942 and heterogeneous gfx1100+gfx1151 routes, and physical
