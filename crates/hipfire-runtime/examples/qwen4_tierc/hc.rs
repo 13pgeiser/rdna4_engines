@@ -7,7 +7,7 @@
 //! What the gfx942 C1 route launches for HC (census: `local://census-hc.md`):
 //!   - stream init      `hc_streams_init_from_embed_batched` (F32 streams)
 //!   - HC read          `hyper_norm_f32` -> BF16 down projection (trunk MFMA GEMM)
-//!                      -> `bf16_roundtrip_f32` (per row) / `scale_f32` / `silu_f32`
+//!                      -> `bf16_roundtrip_f32` (all rows) / `scale_f32` / `silu_f32`
 //!                      -> BF16 up projection -> `hyper_read_projected_f32`
 //!                      (`hyper_read_projected_rotate_f32` when the next mixer
 //!                      consumes `mixed` through the read's rotation scratch)
@@ -343,36 +343,33 @@ fn case_hyper_norm(gpu: &mut Gpu) -> Result<String, String> {
 }
 
 /// The non-gfx11 arm of the HC read activation, launch for launch as
-/// `execute_hyper_read_inner` issues it (per-row `bf16_roundtrip_f32` on views,
-/// flat `scale_f32`, per-row roundtrip, flat `silu_f32`, per-row roundtrip).
+/// `execute_hyper_read_inner` issues it (`bf16_roundtrip_f32` over all rows,
+/// flat `scale_f32`, round trip, flat `silu_f32`, round trip; the round trip's
+/// BF16 staging is a `rows * low_rank` buffer, as the read's `up`).
 /// Round trips and the scale are exact; the SiLU stage carries `expf`.
 fn case_activation_chain(gpu: &mut Gpu) -> Result<String, String> {
     let mut rng = Rng::new(0x4843_3001);
-    let scratch = up_bf16(gpu, &vec![0.0f32; HIDDEN])?;
     let mut out = Vec::new();
     for &rows in &ROW_COUNTS {
         let v = rng.vec(rows * HC_LOW, -6.0, 6.0);
         let low = up_f32(gpu, &v)?;
-        let roundtrip_rows = |gpu: &mut Gpu| -> Result<(), String> {
-            for r in 0..rows {
-                let row = low.sub_offset(r * HC_LOW, HC_LOW);
-                bf16_roundtrip_f32(
-                    gpu,
-                    &Bf16Roundtrip { input: &row, scratch: &scratch, output: &row, elements: HC_LOW },
-                )
-                .map_err(e)?;
-            }
-            Ok(())
+        let staging = up_bf16(gpu, &vec![0.0f32; rows * HC_LOW])?;
+        let roundtrip = |gpu: &mut Gpu| -> Result<(), String> {
+            bf16_roundtrip_f32(
+                gpu,
+                &Bf16Roundtrip { input: &low, scratch: &staging, output: &low, elements: rows * HC_LOW },
+            )
+            .map_err(e)
         };
-        roundtrip_rows(gpu)?;
+        roundtrip(gpu)?;
         let s1: Vec<f32> = v.iter().map(|&x| bf(x)).collect();
         out.push(exact_f32(&format!("roundtrip#1 rows={rows}"), &down_f32(gpu, &low)?, &s1));
         scale_f32(gpu, &ScaleF32 { values: &low, scale: 1.0 / HC_STREAMS as f32 }).map_err(e)?;
-        roundtrip_rows(gpu)?;
+        roundtrip(gpu)?;
         let s2: Vec<f32> = s1.iter().map(|&x| bf(x * 0.25)).collect();
         out.push(exact_f32(&format!("scale+roundtrip#2 rows={rows}"), &down_f32(gpu, &low)?, &s2));
         gpu.silu_f32(&low, &low).map_err(e)?;
-        roundtrip_rows(gpu)?;
+        roundtrip(gpu)?;
         let s3: Vec<f32> = s2.iter().map(|&x| bf(x / (1.0 + (-x).exp()))).collect();
         out.push(close_f32(
             &format!("silu+roundtrip#3 rows={rows}"),
@@ -380,9 +377,8 @@ fn case_activation_chain(gpu: &mut Gpu) -> Result<String, String> {
             &s3,
             BF16_INPUT_F32_ACCUM,
         ));
-        free_all(gpu, vec![low])?;
+        free_all(gpu, vec![low, staging])?;
     }
-    free_all(gpu, vec![scratch])?;
     all(out)
 }
 
@@ -688,7 +684,6 @@ fn run_route_read(gpu: &mut Gpu, final_read: bool) -> Result<String, String> {
     let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.02, 0.02);
     let upw = rng.vec_bf16_exact(HC_WIDE * HC_LOW, -0.1, 0.1);
     let (wnt, downt, upt) = (up_bf16(gpu, &wn)?, up_bf16(gpu, &down)?, up_bf16(gpu, &upw)?);
-    let scratch = up_bf16(gpu, &vec![0.0f32; HIDDEN])?;
     let mut out = Vec::new();
     for &rows in &ROW_COUNTS {
         let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
@@ -708,7 +703,6 @@ fn run_route_read(gpu: &mut Gpu, final_read: bool) -> Result<String, String> {
             low: &lowt,
             up: &uot,
             mixed: &mt,
-            bf16_scratch: &scratch,
             rows,
             branches: HC_STREAMS,
             hidden: HIDDEN,
@@ -735,7 +729,7 @@ fn run_route_read(gpu: &mut Gpu, final_read: bool) -> Result<String, String> {
         ));
         free_all(gpu, vec![xt, nt, lowt, uot, mt, rot])?;
     }
-    free_all(gpu, vec![wnt, downt, upt, scratch])?;
+    free_all(gpu, vec![wnt, downt, upt])?;
     all(out)
 }
 
@@ -826,7 +820,6 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         up_bf16(gpu, &down)?,
         up_bf16(gpu, &upw)?,
     );
-    let scratch = up_bf16(gpu, &vec![0.0f32; HIDDEN])?;
     let mut out = Vec::new();
     // (rows, prefill_invariant_scope): gfx942 prefill pins the invariant scope
     // (`gpu_forward.rs trunk_prefill_invariant_scope`), so `route_rows` is 8192
@@ -870,7 +863,6 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
             low: &lowt,
             up: &uot,
             mixed,
-            bf16_scratch: &scratch,
             rows,
             branches: HC_STREAMS,
             hidden: HIDDEN,
@@ -902,6 +894,6 @@ fn case_step_program(gpu: &mut Gpu) -> Result<String, String> {
         out.push(close_f32(&format!("program read B mixed rows={rows} invariant={invariant}"), &down_f32(gpu, &out_b)?, &m_b, BF16_INPUT_F32_ACCUM));
         free_all(gpu, vec![st, mat, mbt, gat, gbt, nt, lowt, uot, out_a, out_b, rot])?;
     }
-    free_all(gpu, vec![wn_at, wn_bt, rn_at, rn_bt, inj_at, inj_bt, downt, upt, scratch])?;
+    free_all(gpu, vec![wn_at, wn_bt, rn_at, rn_bt, inj_at, inj_bt, downt, upt])?;
     all(out)
 }

@@ -156,7 +156,6 @@ fn hc_read<'a>(
         low: &scratch.hc_low,
         up: &scratch.hc_up,
         mixed: &scratch.hc_mixed,
-        bf16_scratch: &scratch.hc_bf16,
         rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
@@ -253,7 +252,7 @@ pub struct MtpGpuScratch {
     hc_up: GpuTensor,
     hc_mixed: GpuTensor,
     hc_gates: GpuTensor,
-    /// BF16 scratch of the shared HC read and indexed attention.
+    /// BF16 scratch of the indexed attention.
     hc_bf16: GpuTensor,
     rotation: GpuTensor,
     index: GpuTensor,

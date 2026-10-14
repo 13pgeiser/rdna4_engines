@@ -905,7 +905,6 @@ pub struct HyperReadOp<'a> {
     pub low: &'a GpuTensor,
     pub up: &'a GpuTensor,
     pub mixed: &'a GpuTensor,
-    pub bf16_scratch: &'a GpuTensor,
     pub rows: usize,
     pub branches: usize,
     pub hidden: usize,
@@ -951,12 +950,6 @@ impl HyperReadOp<'_> {
             checked_mul(self.rows, self.hidden, "hyper read mixed")?,
             DType::F32,
             "hyper read mixed",
-        )?;
-        require_tensor(
-            self.bf16_scratch,
-            self.low_rank.max(self.hidden),
-            DType::BF16,
-            "hyper read BF16 scratch",
         )?;
         require_weight(&self.input_mix_down, self.low_rank, wide, "hyper read down")?;
         require_weight(&self.input_mix_up, wide, self.low_rank, "hyper read up")?;
@@ -1200,18 +1193,20 @@ fn execute_hyper_read_inner(
             ))?;
         }
     } else {
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        // The three source BF16 boundaries, each one launch over all rows of
+        // `low`: the round trip is elementwise, so this is bitwise the
+        // per-row launches it replaces. Its BF16 copy is staged in `up`,
+        // which the up projection below overwrites before anything reads it.
+        let elements = op.rows * op.low_rank;
+        let mut staging = view(op.up, 0, elements);
+        staging.dtype = DType::BF16;
+        let roundtrip = Bf16Roundtrip {
+            input: &low,
+            scratch: &staging,
+            output: &low,
+            elements,
+        };
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
         hip(scale_f32(
             gpu,
             &ScaleF32 {
@@ -1219,31 +1214,9 @@ fn execute_hyper_read_inner(
                 scale: 1.0 / op.branches as f32,
             },
         ))?;
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
         hip(gpu.silu_f32(&low, &low))?;
-        for row in 0..op.rows {
-            let low_row = view(&low, row * op.low_rank, op.low_rank);
-            hip(bf16_roundtrip_f32(
-                gpu,
-                &Bf16Roundtrip {
-                    input: &low_row,
-                    scratch: op.bf16_scratch,
-                    output: &low_row,
-                    elements: op.low_rank,
-                },
-            ))?;
-        }
+        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
     }
     if up_fused {
         // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
