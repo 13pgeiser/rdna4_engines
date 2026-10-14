@@ -185,11 +185,15 @@ __device__ __forceinline__ void fp8moe_grouped_body(
 #pragma unroll
     for (int j = 0; j < NSUB; ++j) acc[j] = fp8moe_f32x4{0.0f, 0.0f, 0.0f, 0.0f};
 
+    // Raw next-group operands: W stays contiguous (transposed at consumption),
+    // each scale keeps its own register (no packing wait at load time), and F32 X
+    // stays raw (x[d][0..1] = 8 floats) until LDS publication rounds it to BF16.
+    // BF16 X uses x[d][0] only.
     uint4 wc[D][NSUB][2], wn[D][NSUB][2];
-    unsigned short scc[D][NSUB], scn[D][NSUB];
-    uint4 xc[D], xn[D];
+    unsigned scc[D][NSUB], scn[D][NSUB];
+    uint4 xc[D][2], xn[D][2];
 
-    auto load_x_group = [&](int kb0, uint4 (&xv)[D]) {
+    auto load_x_group = [&](int kb0, uint4 (&xv)[D][2]) {
 #pragma unroll
         for (int d = 0; d < D; ++d) {
             const int kb = kb0 + d;
@@ -197,22 +201,36 @@ __device__ __forceinline__ void fp8moe_grouped_body(
                 if (xrow >= 0) {
                     const long long off = xrow * K + kb * 128 + st_k;
                     if constexpr (XBF16) {
-                        xv[d] = *reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned short*>(X) + off);
+                        xv[d][0] = *reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned short*>(X) + off);
                     } else {
-                        const float4 a = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(X) + off);
-                        const float4 b = *reinterpret_cast<const float4*>(reinterpret_cast<const float*>(X) + off + 4);
-                        xv[d] = uint4{fp8moe_f32x2_to_bf16x2(a.x, a.y), fp8moe_f32x2_to_bf16x2(a.z, a.w),
-                                      fp8moe_f32x2_to_bf16x2(b.x, b.y), fp8moe_f32x2_to_bf16x2(b.z, b.w)};
+                        xv[d][0] = *reinterpret_cast<const uint4*>(reinterpret_cast<const float*>(X) + off);
+                        xv[d][1] = *reinterpret_cast<const uint4*>(reinterpret_cast<const float*>(X) + off + 4);
                     }
                 } else {
-                    xv[d] = uint4{0u, 0u, 0u, 0u};
+                    xv[d][0] = uint4{0u, 0u, 0u, 0u};
+                    xv[d][1] = uint4{0u, 0u, 0u, 0u};
                 }
             }
         }
     };
 
+    // Identical BF16 words to the load-time conversion; +0.0f raw padding
+    // rounds to the same zero words.
+    auto publish_x = [&](const uint4 (&xv)[2]) -> uint4 {
+        if constexpr (XBF16) {
+            return xv[0];
+        } else {
+            const uint4 a = xv[0];
+            const uint4 b = xv[1];
+            return uint4{fp8moe_f32x2_to_bf16x2(__uint_as_float(a.x), __uint_as_float(a.y)),
+                         fp8moe_f32x2_to_bf16x2(__uint_as_float(a.z), __uint_as_float(a.w)),
+                         fp8moe_f32x2_to_bf16x2(__uint_as_float(b.x), __uint_as_float(b.y)),
+                         fp8moe_f32x2_to_bf16x2(__uint_as_float(b.z), __uint_as_float(b.w))};
+        }
+    };
+
     // Production keeps W raw (contiguous uint4); transpose happens at consumption.
-    auto load_w_group = [&](int kb0, uint4 (&w)[D][NSUB][2], unsigned short (&sv)[D][NSUB]) {
+    auto load_w_group = [&](int kb0, uint4 (&w)[D][NSUB][2], unsigned (&sv)[D][NSUB]) {
 #pragma unroll
         for (int d = 0; d < D; ++d) {
             const int kb = kb0 + d;
@@ -241,7 +259,7 @@ __device__ __forceinline__ void fp8moe_grouped_body(
         __syncthreads();
 #pragma unroll
         for (int d = 0; d < D; ++d) {
-            if (kb0 + d < nkb) *reinterpret_cast<uint4*>(&xl[d][st_slot][st_k / 2]) = xc[d];
+            if (kb0 + d < nkb) *reinterpret_cast<uint4*>(&xl[d][st_slot][st_k / 2]) = publish_x(xc[d]);
         }
         __syncthreads();
         if (kb0 + D < nkb) {
@@ -260,7 +278,7 @@ __device__ __forceinline__ void fp8moe_grouped_body(
                     const unsigned b3x = xr[24], b3y = xr[25];
 #pragma unroll
                     for (int j = 0; j < NSUB; ++j) {
-                        const float s2 = fp8moe_scale2(scc[d][j]);
+                        const float s2 = fp8moe_scale2((unsigned short)scc[d][j]);
                         uint4 w;
                         if constexpr (REFERENCE) {
                             w = wc[d][j][h];
@@ -283,7 +301,8 @@ __device__ __forceinline__ void fp8moe_grouped_body(
 #pragma unroll
         for (int d = 0; d < D; ++d) {
             if (kb0 + D + d < nkb) {
-                xc[d] = xn[d];
+                xc[d][0] = xn[d][0];
+                xc[d][1] = xn[d][1];
 #pragma unroll
                 for (int j = 0; j < NSUB; ++j) {
                     wc[d][j][0] = wn[d][j][0];
