@@ -58,6 +58,21 @@ fn grouped_geometry(p: &MoePrefillParams<'_>) -> bool {
     let Some(policy) = p.route_policy else {
         return false;
     };
+    if policy.capability.is_slab() {
+        return p.batch_size > 0
+            && crate::families::moe::slab_route_geometry_supported(
+                &policy,
+                p.n_exp,
+                p.k_top,
+                p.gate_up_k,
+                p.mi,
+                p.gate_up_k,
+                p.down_m,
+                p.down_k,
+                &p.dtypes,
+                p.expert_dtype_tags.is_some(),
+            );
+    }
     p.batch_size > 0
         && crate::families::moe::grouped_route_geometry_supported(
             &policy,
@@ -92,6 +107,25 @@ fn require_geometry(p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
 fn is_fp8(p: &MoePrefillParams<'_>) -> bool {
     p.route_policy
         .is_some_and(|policy| policy.capability.is_fp8_grouped())
+}
+
+/// The declared route is the gfx1201 sealed expert-slab route.
+#[inline]
+fn is_slab(p: &MoePrefillParams<'_>) -> bool {
+    p.route_policy
+        .is_some_and(|policy| policy.capability.is_slab())
+}
+
+/// Whether this slab call runs the K2 grouped IU4 kernels (`route_rows > 8`:
+/// long prefill, and every row count under the batch-invariant profile); the
+/// other slab calls run the K1 lane-union GEMV in the path-1 stage shape.
+fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    is_slab(p)
+        && gpu.arch == "gfx1201"
+        && p.recipe.bf16_round_trip()
+        && p.x_norm_batch.dtype == DType::F32
+        && p.down_k == p.mi
+        && gpu.route_rows(p.batch_size) > super::slab_route::K1_MAX_ROWS
 }
 
 /// Geometry gate of whichever grouped route `p` declares.
@@ -1138,6 +1172,9 @@ fn shared_down_row_fold(
 /// gate/up, unscatter/rotation and down; the combine reads its BF16 rows like
 /// the F16 WMMA arm's.
 fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    if is_slab(p) {
+        return use_path2 && slab_k2(gpu, p);
+    }
     use_path2
         && p
             .route_policy
@@ -1192,7 +1229,8 @@ pub(crate) fn scatter(
 /// BF16 rows: the recipe rounds gate/up to BF16 before SiLU anyway.  The
 /// BF16-output entries exist in the gfx11 source only.
 fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    p.recipe.bf16_round_trip()
+    !is_slab(p)
+        && p.recipe.bf16_round_trip()
         && gpu.arch_caps.has_wmma_w32()
         && gpu.qwen4_moe_gateup_wmma_applies(2 * p.mi, p.gate_up_k, p.batch_size)
 }
@@ -1200,7 +1238,8 @@ fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// Whether the grouped down takes the F16 WMMA arm: rotated straight to F16 in
 /// `down`, output as BF16 for the combine, which rounds every row to BF16.
 fn down_wmma(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    p.down_k == p.mi && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
+    !is_slab(p)
+        && p.down_k == p.mi && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
 }
 
 
@@ -1319,6 +1358,9 @@ pub(crate) fn gate_up(
     let gate_up_ptrs = p
         .expert_stage_ptrs
         .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
+    if is_slab(p) {
+        return slab_gate_up(gpu, p, grouped_rows);
+    }
     if sym_iu4(gpu, p, use_path2) {
         let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
         return hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
@@ -1418,6 +1460,11 @@ pub(crate) fn unscatter(
     }
     require_geometry(p)?;
     validate_scratch(gpu, p, true, grouped_rows)?;
+    // The slab route has no unscatter: K2 keeps SwiGLU in the gate/up epilogue
+    // and rotates in `down`; K1 writes slot-ordered F32 rows.
+    if is_slab(p) {
+        return Ok(());
+    }
     // Symmetric IU4: SiLU in the gate/up epilogue, rotation + A4 in `down`.
     if sym_iu4(gpu, p, true) {
         return Ok(());
@@ -1485,7 +1532,8 @@ pub(crate) fn unscatter(
 /// Whether path 2's F32 unscatter also applies the down's 128-wide rotation
 /// (in the same launch), leaving [`activation`] nothing to do.
 fn unscatter_rotates(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    !sym_iu4(gpu, p, true)
+    !is_slab(p)
+        && !sym_iu4(gpu, p, true)
         && !gateup_bf16(gpu, p)
         && !down_wmma(gpu, p)
         && p.mi.is_multiple_of(128)
@@ -1516,6 +1564,9 @@ pub(crate) fn activation(
     }
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
+    if is_slab(p) {
+        return slab_activation(gpu, p);
+    }
     // Path 2's unscatter already produced the activation.
     if !use_path2 {
         hip(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
@@ -1578,6 +1629,9 @@ fn down_stage(
         .expert_stage_ptrs
         .map_or(p.expert_down_ptrs, |stage| stage.down);
     let total_slots = p.batch_size * p.k_top;
+    if is_slab(p) {
+        return slab_down(gpu, p, grouped_rows);
+    }
     if sym_iu4(gpu, p, use_path2) {
         // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
         // grouped IU4 down, BF16 per grouped row for the BF16-input combine.
@@ -1774,6 +1828,218 @@ fn combine_stage(
         hip(gpu.bf16_round_trip_f32(target))?;
     }
     Ok(())
+}
+
+// ───────────────────── sealed expert-slab (gfx1201) ─────────────────────
+
+/// Slab gate/up. K2: rotate256 A4 once, then the W3 and MQ4 NT1 kernels over
+/// the same grouped Y rows, each on its own codec-masked tile ids (a uniform
+/// layer launches its one kernel on the scatter's ids). K1: the lane-union GEMV
+/// over the rotated F32 activation, BF16-rounded gate/up rows in path-1 shape.
+fn slab_gate_up(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    use rdna_compute::slab_moe::SlabBuckets;
+    if gpu.arch != "gfx1201" {
+        return Err(DispatchError::Hip("sealed expert-slab route is gfx1201-only".into()));
+    }
+    let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+    if !slab_k2(gpu, p) {
+        // The activation basis the path-1 shape reads. Idempotent: the same
+        // bytes the input-basis stage produced.
+        hip(gpu.rotate_x_mq_batched(p.x_norm_batch, p.x_rot_batch, p.gate_up_k, p.batch_size))?;
+        let active = p
+            .batch_size
+            .checked_mul(p.k_top)
+            .and_then(|slots| slots.checked_mul(p.mi))
+            .ok_or_else(|| DispatchError::Hip("slab gate/up extent overflows".into()))?;
+        super::slab_route::k1_gate_up(
+            gpu,
+            buckets,
+            p.expert_gate_up_ptrs,
+            p.topk_indices,
+            p.x_rot_batch,
+            p.gate_batch,
+            p.up_batch,
+            p.batch_size,
+        )?;
+        if p.recipe.bf16_round_trip() {
+            hip(gpu.bf16_round_trip_f32(&f32_view(p.gate_batch, 0, active)))?;
+            hip(gpu.bf16_round_trip_f32(&f32_view(p.up_batch, 0, active)))?;
+        }
+        return Ok(());
+    }
+    let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+    let host_mapped = experts_host_mapped(p);
+    let (m, k) = (2 * p.mi, p.gate_up_k);
+    match buckets {
+        SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_gate_up_grouped,
+            m,
+            k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+        )),
+        SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+            p.expert_gate_up_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_gate_up_grouped,
+            m,
+            k,
+            p.k_top,
+            grouped_rows,
+            p.batch_size,
+            host_mapped,
+        )),
+        SlabBuckets::Table(tags) => {
+            let owner = super::slab_route::codec_i32(tags)?;
+            let [w3, mq4] = hip(gpu.qwen4_slab_tile_masks(
+                p.expert_tile_ids,
+                &owner,
+                grouped_tiles(grouped_rows),
+            ))?;
+            hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
+                p.expert_gate_up_ptrs,
+                &w3,
+                p.sorted_slot_index,
+                &xq,
+                p.y_gate_up_grouped,
+                m,
+                k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ))?;
+            hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                p.expert_gate_up_ptrs,
+                &mq4,
+                p.sorted_slot_index,
+                &xq,
+                p.y_gate_up_grouped,
+                m,
+                k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+                host_mapped,
+            ))
+        }
+    }
+}
+
+/// Slab activation: K2 owes nothing (SwiGLU is in the gate/up epilogue,
+/// rotation + A4 in `down`); K1 runs the path-1 shape's SwiGLU with the
+/// recipe's BF16 round trips and the down's 128-wide rotation.
+fn slab_activation(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+    if slab_k2(gpu, p) {
+        return Ok(());
+    }
+    let total_slots = p.batch_size * p.k_top;
+    let active = total_slots * p.mi;
+    let gate = f32_view(p.gate_batch, 0, active);
+    let up = f32_view(p.up_batch, 0, active);
+    let rot = f32_view(p.rot_batch, 0, active);
+    hip(gpu.silu_mul_f32(&gate, &up, &rot))?;
+    if p.recipe.bf16_round_trip() {
+        hip(gpu.bf16_round_trip_f32(&rot))?;
+    }
+    hip(gpu.rotate_x_mq_128_v2(p.rot_batch, p.rot_batch, p.mi, total_slots))
+}
+
+/// Slab down. K2: rotate128 A4 (the hipcc producer, byte-identical to K3), then
+/// the W3 and MQ4 down kernels over the grouped BF16 rows on codec-masked
+/// tiles. K1: the lane-union GEMV over the rotated activation, unweighted F32
+/// rows in slot order for the top-10 combine.
+fn slab_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    use rdna_compute::slab_moe::SlabBuckets;
+    let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
+    let total_slots = p.batch_size * p.k_top;
+    if !slab_k2(gpu, p) {
+        let rot = f32_view(p.rot_batch, 0, total_slots * p.mi);
+        let y0 = f32_view(p.down_expanded, 0, total_slots * p.down_m);
+        return super::slab_route::k1_down(gpu, buckets, p.expert_down_ptrs, &rot, &y0, p.batch_size);
+    }
+    let xq = hip(gpu.qwen4_moe_rotate128_i4(
+        p.y_gate_up_grouped,
+        p.sorted_slot_index,
+        p.down_k,
+        grouped_rows,
+        total_slots,
+    ))?;
+    let host_mapped = experts_host_mapped(p);
+    match buckets {
+        SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+        )),
+        SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+            p.expert_down_ptrs,
+            p.expert_tile_ids,
+            p.sorted_slot_index,
+            &xq,
+            p.y_down_grouped,
+            p.down_m,
+            p.down_k,
+            1,
+            grouped_rows,
+            total_slots,
+            host_mapped,
+        )),
+        SlabBuckets::Table(tags) => {
+            let owner = super::slab_route::codec_i32(tags)?;
+            let [w3, mq4] = hip(gpu.qwen4_slab_tile_masks(
+                p.expert_tile_ids,
+                &owner,
+                grouped_tiles(grouped_rows),
+            ))?;
+            hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
+                p.expert_down_ptrs,
+                &w3,
+                p.sorted_slot_index,
+                &xq,
+                p.y_down_grouped,
+                p.down_m,
+                p.down_k,
+                1,
+                grouped_rows,
+                total_slots,
+            ))?;
+            hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+                p.expert_down_ptrs,
+                &mq4,
+                p.sorted_slot_index,
+                &xq,
+                p.y_down_grouped,
+                p.down_m,
+                p.down_k,
+                1,
+                grouped_rows,
+                total_slots,
+                host_mapped,
+            ))
+        }
+    }
 }
 
 // ───────────────────────── qt=55 FP8E4M3B128 (gfx942) ─────────────────────────

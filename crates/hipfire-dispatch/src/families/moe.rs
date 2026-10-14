@@ -138,6 +138,14 @@ pub enum MoeRouteCapability {
     /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
     /// never by generic resolution.
     Fp8B128Grouped,
+    /// gfx1201 sealed expert-slab route (ctl3-hot): the same fixed
+    /// 512/10/2560/640/640 geometry over experts whose codec is per expert
+    /// (MQ4 symmetric QT44/QT53 or MQ3-I4 planar qt131/qt132), addressed
+    /// through the layer's pointer tables. Decode rows (`route_rows <= 8`)
+    /// run the K1 lane-union GEMV over codec buckets; longer prefill runs the
+    /// K2 grouped IU4 kernels over codec-masked tile ids. Declared from the
+    /// slab artifact's per-expert table only, never from a dtype.
+    SlabCodecGrouped,
 }
 
 impl MoeRouteCapability {
@@ -147,7 +155,9 @@ impl MoeRouteCapability {
     /// device-independent predicate (see [`Self::admitted_on_arch`]).
     pub(crate) fn admitted_on(self) -> bool {
         match self {
-            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => cfg!(feature = "deltanet"),
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped => {
+                cfg!(feature = "deltanet")
+            }
             Self::Fp8B128Grouped => false,
         }
     }
@@ -157,14 +167,23 @@ impl MoeRouteCapability {
     pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
         match self {
             Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
+            Self::SlabCodecGrouped => self.admitted_on() && arch.is_gfx1201(),
             Self::Fp8B128Grouped => arch.is_gfx942(),
         }
     }
 
-    /// Either QT44/QT53 grouped declaration: both lower through the same
-    /// fixed-shape stages. False for the FP8 route.
+    /// The gfx1201 sealed expert-slab declaration.
+    pub fn is_slab(self) -> bool {
+        matches!(self, Self::SlabCodecGrouped)
+    }
+
+    /// Any QT44/QT53 grouped declaration (the slab one included): they lower
+    /// through the same fixed-shape stages. False for the FP8 route.
     pub fn is_qt44_qt53_grouped(self) -> bool {
-        matches!(self, Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric)
+        matches!(
+            self,
+            Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric | Self::SlabCodecGrouped
+        )
     }
 
     /// The gfx942 qt=55 FP8E4M3B128 grouped declaration.
@@ -219,6 +238,72 @@ pub(crate) fn grouped_route_geometry_supported(
         && formats.routed_down == DType::MQ4G128V2
         && gate_up == formats.routed_gate_up
         && down == formats.routed_down
+}
+
+/// Whether `dtype` is a routed gate/up format of the sealed expert-slab route.
+pub fn slab_gate_up_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G256V2 | DType::MQ3I4G128R256)
+}
+
+/// Whether `dtype` is a routed down format of the sealed expert-slab route.
+pub fn slab_down_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ4G128V2 | DType::MQ3I4G128R128)
+}
+
+/// Whether a routed `(gate_up, down)` pair is one slab codec: MQ4 symmetric
+/// (QT44, QT53) or MQ3-I4 (qt131, qt132), never crossed.
+pub fn slab_codec_pair(gate_up: DType, down: DType) -> bool {
+    matches!(
+        (gate_up, down),
+        (DType::MQ4G256V2, DType::MQ4G128V2) | (DType::MQ3I4G128R256, DType::MQ3I4G128R128)
+    )
+}
+
+/// Exact geometry and operand contract of the sealed expert-slab route: the
+/// fixed geometry, and routed experts that are either all one slab codec
+/// (no per-expert tables) or a per-expert table of slab codec pairs, one entry
+/// per expert, that really varies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn slab_route_geometry_supported(
+    policy: &MoeRoutePolicy,
+    experts: usize,
+    top_k: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtypes: &MoeDtypes<'_>,
+    has_codec_table: bool,
+) -> bool {
+    let geometry = policy.geometry;
+    let shape = policy.capability.is_slab()
+        && geometry == FIXED_ROUTE_GEOMETRY
+        && experts == geometry.experts
+        && top_k == geometry.top_k
+        && hidden == geometry.hidden
+        && intermediate == geometry.routed_intermediate
+        && gate_up_k == geometry.hidden
+        && down_m == geometry.hidden
+        && down_k == geometry.routed_intermediate;
+    if !shape {
+        return false;
+    }
+    if dtypes.routed_has_mixed_experts {
+        let (Some(gate_up), Some(down)) = (dtypes.per_expert_gate_up, dtypes.per_expert_down) else {
+            return false;
+        };
+        has_codec_table
+            && gate_up.len() == experts
+            && down.len() == experts
+            && gate_up.iter().zip(down).all(|(g, d)| slab_codec_pair(*g, *d))
+            && gate_up.iter().any(|g| *g != gate_up[0])
+    } else {
+        !has_codec_table
+            && dtypes.per_expert_gate_up.is_none()
+            && dtypes.per_expert_down.is_none()
+            && slab_codec_pair(dtypes.routed_gate_up, dtypes.routed_down)
+    }
 }
 
 /// Exact geometry and wire-format contract of the gfx942 qt=55 grouped
