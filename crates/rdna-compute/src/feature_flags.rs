@@ -650,6 +650,16 @@ pub struct FeatureFlags {
     /// incumbent while sharing activation loads across weight rows. Default on
     /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
     pub fn_lane_pm_rows: bool,
+    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): parsed
+    /// on only for the exact value `1`, default off on every arch. KLD-gated,
+    /// not bit-exact against the per-head kernel.
+    pub qwen4_qsa_decode_splitk: bool,
+}
+
+/// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`: on only for the exact string `1`; unset,
+/// `0`, `true`, ` 1` and every other value are off.
+fn qsa_decode_splitk_env_on(raw: Option<&str>) -> bool {
+    raw == Some("1")
 }
 
 impl FeatureFlags {
@@ -1114,6 +1124,9 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
+            qwen4_qsa_decode_splitk: qsa_decode_splitk_env_on(
+                value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref(),
+            ),
         }
     }
 
@@ -1181,6 +1194,13 @@ impl FeatureFlags {
     /// ([`crate::Gpu::lane_rows_pm_enabled`]).
     pub fn fn_lane_pm_rows_enabled(&self) -> bool {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
+    }
+
+    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1`, default
+    /// off). Exact gfx1151 only; the runtime additionally requires F32 K/V,
+    /// head_dim 256, 1..8 route rows and an eager (unrecorded, uncaptured) launch.
+    pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
+        self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -1548,6 +1568,7 @@ impl FeatureFlags {
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
+            qwen4_qsa_decode_splitk: false,
         }
     }
 }
@@ -1630,6 +1651,42 @@ mod tests {
             assert_eq!(flags(Some("1")).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
+    }
+
+    /// Pure parser: only the exact string `1` enables the QSA split-K knob.
+    #[test]
+    fn qsa_decode_splitk_env_on_matches_only_exact_one() {
+        assert!(qsa_decode_splitk_env_on(Some("1")));
+        assert!(!qsa_decode_splitk_env_on(None));
+        for raw in ["0", "", "true", "TRUE", "on", "ON", "yes", "2", "11", " 1", "1 ", "01"] {
+            assert!(!qsa_decode_splitk_env_on(Some(raw)), "{raw:?}");
+        }
+    }
+
+    /// The QSA split-K decode knob is default off everywhere and parses on only
+    /// for the exact value `1`; the arch gate admits gfx1151 alone.
+    #[test]
+    fn qwen4_qsa_decode_splitk_parses_on_only_for_exactly_one() {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_QWEN4_QSA_DECODE_SPLITK" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert!(!flags(None).qwen4_qsa_decode_splitk, "{arch}: unset");
+            for raw in ["0", "", "true", "TRUE", "on", "ON", "yes", "2", " 1", "1 "] {
+                assert!(!flags(Some(raw)).qwen4_qsa_decode_splitk, "{arch}: {raw:?}");
+                assert!(!flags(Some(raw)).qwen4_qsa_decode_splitk_enabled(), "{arch}: {raw:?}");
+            }
+            assert!(flags(Some("1")).qwen4_qsa_decode_splitk, "{arch}: 1");
+            assert_eq!(
+                flags(Some("1")).qwen4_qsa_decode_splitk_enabled(),
+                arch == "gfx1151",
+                "{arch}: 1 enabled"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
     }
 
     #[test]

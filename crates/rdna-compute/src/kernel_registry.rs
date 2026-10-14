@@ -536,6 +536,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, ["gemv_bf16_xf32_x2_q8_0_k2560_staged_pair"]);
         // Exact-gfx1151 derived BF16 mirror of the F32 pooled index keys (HIPFIRE_QWEN4_QSA_POOLED_BF16, default off).
         add!("qsa_pooled_bf16_mirror", kernels::QSA_POOLED_BF16_MIRROR_SRC, ["qsa_pooled_f32_to_bf16_mirror", "qsa_pooled_f32_low_nonzero_count"]);
+        // Exact-gfx1151 Qwen4 QSA split-K decode (opt-in HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1, default off; KLD-gated; tensor_ops.rs qsa_decode_splitk_launch).
+        add!("qsa_decode_splitk", kernels::QSA_DECODE_SPLITK_SRC, ["qsa_decode_splitk_partial_f32", "qsa_decode_splitk_combine_f32"]);
         add!("repeat_interleave_qk_batched", kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC, ["repeat_interleave_qk_f32_batched"]);
         add!("rope_partial_halfsplit_f32_headgrid", kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC, ["rope_partial_halfsplit_f32_headgrid"]);
     }

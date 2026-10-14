@@ -1557,6 +1557,7 @@ pub const SITES: &[Site] = &[
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_impl", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_fused", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "indexed_attention_select_batch_pm_arm", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
+    Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_decode_splitk_eager", occurrences: 2, decisions: &["qwen4-opt-in-eager-fusions"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_dense_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_gathered_wmma_applies", occurrences: 2, decisions: &["qwen4-f16-wmma-prefill"] },
     Site { file: "rdna-compute/src/tensor_ops.rs", function: "qsa_f16_arena_sync", occurrences: 2, decisions: &["eager-only-refusals"] },
