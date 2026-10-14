@@ -128,10 +128,10 @@ pub fn row_repeats(arch: Arch) -> &'static [u8] {
 pub fn module_specs(arch: Arch) -> Vec<Spec> { module_specs_codec(arch, WeightCodec::Mq4Sym) }
 
 /// [`module_specs`] for one weight codec. The MQ3-I4 module (gfx1201) holds the
-/// NT1 gate/up entry; the MQ4 module is the shipped one.
+/// NT1 gate/up and down entries; the MQ4 module is the shipped one.
 pub fn module_specs_codec(arch: Arch, codec: WeightCodec) -> Vec<Spec> {
     if codec == WeightCodec::Mq3I4 {
-        return if arch == Arch::Gfx1201 { vec![Spec { arch, kind: Kind::GateUp, nt: 1, rr: 1, codec }] } else { Vec::new() };
+        return if arch == Arch::Gfx1201 { Kind::ALL.into_iter().map(|kind| Spec { arch, kind, nt: 1, rr: 1, codec }).collect() } else { Vec::new() };
     }
     tile_widths(arch).iter()
         .flat_map(|&nt| Kind::ALL.into_iter().map(move |kind| Spec { arch, kind, nt, rr: 1, codec }))
@@ -171,8 +171,8 @@ impl Spec {
         if self.rr > 1 && (self.kind != Kind::Down || self.nt != 4 || self.arch.gfx12()) {
             return Err(format!("qwen4_moe_sym: row repeat {} is built for the gfx1151 down NT4 entry only", self.rr))
         }
-        if self.codec == WeightCodec::Mq3I4 && !(self.arch == Arch::Gfx1201 && self.kind == Kind::GateUp && self.nt == 1 && self.rr == 1) {
-            return Err("qwen4_moe_sym: the MQ3-I4 codec is built for the gfx1201 NT1 gate/up entry only".into())
+        if self.codec == WeightCodec::Mq3I4 && !(self.arch == Arch::Gfx1201 && self.nt == 1 && self.rr == 1) {
+            return Err("qwen4_moe_sym: the MQ3-I4 codec is built for the gfx1201 NT1 entries only".into())
         }
         Ok(())
     }

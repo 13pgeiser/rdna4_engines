@@ -2,14 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `WeightCodec::Mq3I4` NT1 gate/up of the grouped symmetric IU4 MoE GEMM
-//! (gfx1201): `qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201`.
+//! `WeightCodec::Mq3I4` NT1 entries of the grouped symmetric IU4 MoE GEMM
+//! (gfx1201): gate/up `qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201` (R256, K2560)
+//! and down `qwen4_moe_down_iu4_sym_w3_pm_gfx1201` (R128, K640).
 //!
-//! Same 60-byte ABI, grid `(M/64, m_total/16)`, block 64, A4 activations, WMMA
-//! chain, fold and epilogue as the MQ4 NT1 entry. Only the weight side differs.
-//! `expert_weight_ptrs[e]` is the planar qt131 tensor `[M, K]` (`M = 1280`,
-//! `K = 2560`): `[codes: M*K*3/8 B][scales: M*(K/128) f16]`, code `j` of a row at
-//! bits `3j..3j+3` of the row's little-endian bitstream, weight `d * (2c - 7)`.
+//! Same 60-byte ABI, grid `(M/cta_rows, m_total/16)`, A4 activations, WMMA chain,
+//! fold and epilogue as the MQ4 NT1 entries. Only the weight side differs.
+//! `expert_weight_ptrs[e]` is the planar qt131/qt132 tensor `[M, K]`:
+//! `[codes: M*K*3/8 B][scales: M*(K/128) f16]`, code `j` of a row at bits
+//! `3j..3j+3` of the row's little-endian bitstream, weight `d * (2c - 7)`.
 //!
 //! Per K128 epoch every wave loads its 16 rows' 48-byte code groups (and the
 //! scale pair of the trip) straight into registers. A WMMA lane (`hi`, row
@@ -17,12 +18,13 @@
 //! (the same 16 elements the MQ4 entry feeds it). A chunk is 24 bits at byte
 //! `12i + 6hi` (+3 for the second chunk) of the epoch's 48-byte group, so each
 //! lane loads one (unaligned) dword per chunk and uses its low 24 bits: no funnel
-//! shifts. The chunk is then spread to
-//! eight 4-bit slots with three bit-field inserts and finished to the signed
-//! nibble `(2c - 7) & 15 = ((2c + 1) ^ 8)`; the exact int32 WMMA chain, the
-//! magic-seeded fold `sum = fma(RN(d_act * d_w), float(dot), sum)` and the BF16
-//! SiLU epilogue are the MQ4 entry's own. Junk above bit 23 of a chunk never
-//! reaches an output (see `spread_model` and its exhaustive test).
+//! shifts. The chunk is then spread to eight 4-bit slots with three bit-field
+//! inserts and finished to the signed nibble `(2c - 7) & 15 = ((2c + 1) ^ 8)`;
+//! the exact int32 WMMA chain, the magic-seeded fold
+//! `sum = fma(RN(d_act * d_w), float(dot), sum)` and the BF16 epilogue (SiLU for
+//! gate/up) are the MQ4 entries' own. Junk above bit 23 of a chunk never reaches
+//! an output (see `spread_model` and its exhaustive test). The down entry's K640
+//! has an odd epoch count: its tail is the MQ4 down entry's `if_else`.
 use super::*;
 
 // VGPRs added over the MQ4 layout.
@@ -35,7 +37,7 @@ const ONES: u8 = TMPN + 4; // 168: 0x11111111
 const SRD_WS: u8 = 68;
 const SRD_US: u8 = 72;
 const SROW: u8 = 76;
-const UPOFF: u8 = 78; // acc entry: (M/2)*4, the up-row byte offset
+const UPOFF: u8 = 78; // gate/up acc entry: (M/2)*4, the up-row byte offset
 
 fn set_base(p: usize) -> u8 { SET0 + p as u8 * SET_LEN }
 /// Code dword of step `i` (`which` 0 = chunk 4i+2hi, 1 = chunk 4i+2hi+1) of tensor `t`.
@@ -47,7 +49,7 @@ fn a_out(t: u8, i: u8) -> u8 { AOUT + 8 * t + 2 * i }
 fn srd_c(t: u8) -> u8 { if t == 0 { SRD_W } else { SRD_U } }
 fn srd_s(t: u8) -> u8 { if t == 0 { SRD_WS } else { SRD_US } }
 
-/// CPU model of the chunk spread (`x` = the funnelled dword; bits above 23 are
+/// CPU model of the chunk spread (`x` = the chunk's dword; bits above 23 are
 /// junk). Returns eight signed nibbles `(2c - 7) & 15`, code `k` in nibble `k`.
 pub fn spread_model(x: u32) -> u32 {
     let bfi = |m: u32, a: u32, b: u32| (a & m) | (b & !m);
@@ -59,6 +61,8 @@ pub fn spread_model(x: u32) -> u32 {
 }
 
 pub(super) fn plan(g: &Gen, acc: bool) -> Result<RegPlan, String> {
+    let tn = g.t();
+    let gate_up = g.spec.kind == Kind::GateUp;
     let mut p = RegPlan::new(VGPR_CEILING, 104)?;
     let l = |n: &str| g.label(n);
     let kernel = || Live::Between("entry".into(), l("epilogue"));
@@ -69,7 +73,7 @@ pub(super) fn plan(g: &Gen, acc: bool) -> Result<RegPlan, String> {
     for (name, r) in [("x_off", XOFF), ("xq_off", XQOFF), ("w_off", WOFF), ("h_off", HOFF)] { p.v::<1>(name, r, kernel())?; }
     p.v::<1>("y_off", YOFF, Live::Whole)?;
     p.v::<8>("magic8", MAGIC8, kernel())?;
-    for t in 0..2u8 {
+    for t in 0..tn {
         p.v::<8>("cacc", CACC + 8 * t, kernel())?;
         p.v::<8>("sum", SUM + 8 * t, Live::Whole)?;
         p.v::<8>("scale_rows", SCF + 8 * t, kernel())?;
@@ -77,18 +81,20 @@ pub(super) fn plan(g: &Gen, acc: bool) -> Result<RegPlan, String> {
     }
     p.v::<8>("fold_t", TPROD, kernel())?;
     for set in 0..2usize {
-        for t in 0..2u8 { for k in 0..8u8 { p.v::<1>("code_dword", raw(set, t, k / 2, k % 2), kernel())?; } }
+        for t in 0..tn { for k in 0..8u8 { p.v::<1>("code_dword", raw(set, t, k / 2, k % 2), kernel())?; } }
         for chunk in 0..4u8 { p.v::<2>("operand", xr(set) + 2 * chunk, kernel())?; }
-        for t in 0..2u8 { p.v::<1>("scale_pair", hr(set, t), kernel())?; }
+        for t in 0..tn { p.v::<1>("scale_pair", hr(set, t), kernel())?; }
         p.v::<1>("d", dr(set), kernel())?;
     }
-    for t in 0..2u8 { for i in 0..4u8 { p.v::<2>("a_nibbles", a_out(t, i), kernel())?; } }
+    for t in 0..tn { for i in 0..4u8 { p.v::<2>("a_nibbles", a_out(t, i), kernel())?; } }
     for i in 0..4u8 { p.v::<1>("unpack_tmp", TMPN + i, kernel())?; }
     p.v::<1>("ones", ONES, kernel())?;
     // Epilogue registers over the dead K-loop ranges.
     for i in 0..8u8 { p.v::<1>("rt_tmp", RT_TMP + i, epi())?; }
-    for i in 0..(6 * SILU_N) { p.v::<1>("silu_tmp", SET0 + i, epi())?; }
-    for i in 0..(3 * SILU_N) { p.s::<2>("silu_mask", SILU_MASK + 2 * i, epi())?; }
+    if gate_up {
+        for i in 0..(6 * SILU_N) { p.v::<1>("silu_tmp", SET0 + i, epi())?; }
+        for i in 0..(3 * SILU_N) { p.s::<2>("silu_mask", SILU_MASK + 2 * i, epi())?; }
+    }
     p.v::<4>("out", OUT, epi())?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
     p.s::<4>("srd_y", SRD_Y, epi())?;
@@ -101,7 +107,7 @@ pub(super) fn plan(g: &Gen, acc: bool) -> Result<RegPlan, String> {
     p.s::<2>("kernargs_0x30", ARGS2, kernel())?;
     p.s::<1>("x_src_rows", ARGS3, kernel())?;
     p.s::<1>("expert", EID, kernel())?;
-    for t in 0..2u8 { p.s::<4>("srd_codes", srd_c(t), kernel())?; p.s::<4>("srd_scales", srd_s(t), kernel())?; }
+    for t in 0..tn { p.s::<4>("srd_codes", srd_c(t), kernel())?; p.s::<4>("srd_scales", srd_s(t), kernel())?; }
     for r in SRD_X { p.s::<4>("srd_x", r, kernel())?; }
     p.s::<4>("srd_sorted", SRD_S, kernel())?;
     for (name, r) in [("trips", TRIPS), ("x_stride2", XS2), ("row_bytes", ROWB), ("scale_row_bytes", SROW), ("tile16", TILE16), ("wave", WAVE), ("row_base", RBASE), ("wg_x", WGX), ("wg_y", WGY)] {
@@ -109,20 +115,20 @@ pub(super) fn plan(g: &Gen, acc: bool) -> Result<RegPlan, String> {
     }
     p.s::<2>("w_ptr", WPTR, kernel())?;
     p.s::<2>("live", LIVE, Live::Whole)?;
-    if acc { p.s::<1>("up_offset", UPOFF, Live::Whole)?; }
+    if acc && gate_up { p.s::<1>("up_offset", UPOFF, Live::Whole)?; }
     for m in MASKT { p.s::<2>("cmp_mask", m, Live::Whole)?; }
     let top = p.next_free_vgpr();
     if top % 8 != 0 { p.v::<1>("granule_pad", (top.div_ceil(8) * 8 - 1) as u8, Live::Whole)?; }
     Ok(p)
 }
 
-/// The shipped NT1 gate/up entry (BF16 SiLU epilogue).
+/// The shipped NT1 entry (BF16 epilogue).
 pub(super) fn emit(spec: Spec) -> Result<Emitted, String> { emit_impl(spec, false) }
 
 /// Qualification entry `..._acc`: the same K loop, but stores the 16 rows' F32
-/// accumulators (gate rows then up rows, `Y[P][M]` f32, padding slots +0) instead
-/// of the SiLU epilogue, so G1 compares the exact fold bytes against the CPU twin.
-/// Never dispatched.
+/// accumulators (`Y[P][M]` f32; gate/up: gate rows then up rows; padding slots +0)
+/// instead of the BF16 epilogue, so G1 compares the exact fold bytes against the
+/// CPU twin. Never dispatched.
 pub fn emit_acc(spec: Spec) -> Result<Emitted, String> { spec.validate()?; emit_impl(spec, true) }
 
 fn emit_impl(spec: Spec, acc: bool) -> Result<Emitted, String> {
@@ -150,6 +156,7 @@ fn body(wg: &mut Wg<Gfx1201>, g: &Gen, acc: bool) -> Result<(), String> {
 
 fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), String> {
     let a = g.arch();
+    let gate_up = g.spec.kind == Kind::GateUp;
     let b = wg.isa();
     smem(b, ARGS0, 8, KARG, 0)?;
     smem(b, ARGS1, 2, KARG, 0x20)?;
@@ -186,8 +193,8 @@ fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), S
     sop(b, format!("s_lshr_b32 s{TRIPS}, s{k}, 7"), &[TRIPS], &[k])?;
     sop(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(a)), &[TRIPS], &[TRIPS])?;
     sop(b, format!("s_lshr_b32 s{TRIPS}, s{TRIPS}, 1"), &[TRIPS], &[TRIPS])?;
-    // Row base of this wave: x*32 + 16*wave.
-    sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, 5"), &[RBASE], &[WGX])?;
+    // Row base of this wave: x*cta_rows + 16*wave.
+    sop(b, format!("s_lshl_b32 s{RBASE}, s{WGX}, {}", if gate_up { 5 } else { 6 }), &[RBASE], &[WGX])?;
     sop(b, format!("s_lshl_b32 s{T0}, s{WAVE}, 4"), &[T0], &[WAVE])?;
     sop(b, format!("{} s{RBASE}, s{RBASE}, s{T0}", s_add_i32(a)), &[RBASE], &[RBASE, T0])?;
     // Sorted slots of this tile.
@@ -205,24 +212,28 @@ fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), S
     add64(b, SRD_X[1], ARGS0 + 6, T0)?;
     srd_tail(b, SRD_X[1], Some(T0))?;
     sop(b, format!("s_lshl_b32 s{XS2}, s{T0}, 1"), &[XS2], &[T0])?;
-    // Code descriptors: rows rbase.. of the expert (up rows M/2 further).
+    // Code descriptors: rows rbase.. of the expert (gate/up: up rows M/2 further).
     sop(b, format!("s_mul_i32 s{T0}, s{RBASE}, s{ROWB}"), &[T0], &[RBASE, ROWB])?;
     add64(b, SRD_W, WPTR, T0)?;
     srd_tail(b, SRD_W, None)?;
-    sop(b, format!("s_lshr_b32 s{T1}, s{m}, 1"), &[T1], &[m])?;
-    sop(b, format!("s_mul_i32 s{T1}, s{T1}, s{ROWB}"), &[T1], &[T1, ROWB])?;
-    add64(b, SRD_U, SRD_W, T1)?;
-    srd_tail(b, SRD_U, None)?;
+    if gate_up {
+        sop(b, format!("s_lshr_b32 s{T1}, s{m}, 1"), &[T1], &[m])?;
+        sop(b, format!("s_mul_i32 s{T1}, s{T1}, s{ROWB}"), &[T1], &[T1, ROWB])?;
+        add64(b, SRD_U, SRD_W, T1)?;
+        srd_tail(b, SRD_U, None)?;
+    }
     // Scale descriptors: the scale plane starts M*row_bytes after the tensor base.
     sop(b, format!("s_mul_i32 s{T0}, s{m}, s{ROWB}"), &[T0], &[m, ROWB])?;
     add64(b, SRD_WS, WPTR, T0)?;
     sop(b, format!("s_mul_i32 s{T1}, s{RBASE}, s{SROW}"), &[T1], &[RBASE, SROW])?;
     add64(b, SRD_WS, SRD_WS, T1)?;
-    sop(b, format!("s_lshr_b32 s{T1}, s{m}, 1"), &[T1], &[m])?;
-    sop(b, format!("s_mul_i32 s{T1}, s{T1}, s{SROW}"), &[T1], &[T1, SROW])?;
-    add64(b, SRD_US, SRD_WS, T1)?;
+    if gate_up {
+        sop(b, format!("s_lshr_b32 s{T1}, s{m}, 1"), &[T1], &[m])?;
+        sop(b, format!("s_mul_i32 s{T1}, s{T1}, s{SROW}"), &[T1], &[T1, SROW])?;
+        add64(b, SRD_US, SRD_WS, T1)?;
+        srd_tail(b, SRD_US, None)?;
+    }
     srd_tail(b, SRD_WS, None)?;
-    srd_tail(b, SRD_US, None)?;
     // Lane offsets. Codes: lr*row_bytes + 6*hi (the lane's first 8-code chunk of a K32 step).
     op(b, format!("v_mul_u32_u24_e32 v{WOFF}, s{ROWB}, v3"), &[v(WOFF)], &[s(ROWB), v(3)])?;
     op(b, format!("v_mad_u32_u24 v{WOFF}, v4, 6, v{WOFF}"), &[v(WOFF)], &[v(4), v(WOFF)])?;
@@ -230,14 +241,16 @@ fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), S
     op(b, "v_and_b32_e32 v7, 7, v3", &[v(7)], &[v(3)])?;
     op(b, "v_lshl_or_b32 v7, v4, 3, v7", &[v(7)], &[v(4), v(7)])?;
     op(b, format!("v_mul_u32_u24_e32 v{HOFF}, s{SROW}, v7"), &[v(HOFF)], &[s(SROW), v(7)])?;
-    // Y offset: ((16*tile + lr)*row_len + rbase + 8*hi)*2 (BF16 H, row_len M/2) or
-    // *4 (F32 accumulators, row_len M).
-    if acc {
-        sop(b, format!("s_mov_b32 s{T1}, s{}", ARGS1 + 2), &[T1], &[ARGS1 + 2])?;
-        // Up rows sit M/2 columns (4 bytes each) further.
-        sop(b, format!("s_lshl_b32 s{UPOFF}, s{}, 1", ARGS1 + 2), &[UPOFF], &[ARGS1 + 2])?;
+    // Y offset: ((16*tile + lr)*row_len + rbase + 8*hi)*2 (BF16) or *4 (F32 accumulators).
+    // row_len is M/2 for the BF16 gate/up H and M otherwise.
+    if gate_up && !acc {
+        sop(b, format!("s_lshr_b32 s{T1}, s{m}, 1"), &[T1], &[m])?;
     } else {
-        sop(b, format!("s_lshr_b32 s{T1}, s{}, 1", ARGS1 + 2), &[T1], &[ARGS1 + 2])?;
+        sop(b, format!("s_mov_b32 s{T1}, s{m}"), &[T1], &[m])?;
+    }
+    if gate_up && acc {
+        // Up rows sit M/2 columns (4 bytes each) further.
+        sop(b, format!("s_lshl_b32 s{UPOFF}, s{m}, 1"), &[UPOFF], &[m])?;
     }
     op(b, format!("v_add_nc_u32_e32 v8, s{TILE16}, v3"), &[v(8)], &[s(TILE16), v(3)])?;
     op(b, format!("v_mul_lo_u32 v8, v8, s{T1}"), &[v(8)], &[v(8), s(T1)])?;
@@ -247,10 +260,10 @@ fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), S
     // Activation row offset (padding slots get the gather's out-of-range offset).
     common::gather_offset(b, XOFF, 6, Some(ARGS2), iu4_fold::XBLK_BYTES, LIVE, GatherTemps { v: [11, 12, 13, 10], mask: MASKT[0] })?;
     op(b, format!("v_lshl_add_u32 v{XQOFF}, v4, 3, v{XOFF}"), &[v(XQOFF)], &[v(4), v(XOFF)])?;
-    load_set(b, 0)?;
+    load_set(b, g, 0)?;
     op(b, format!("v_mov_b32_e32 v{ONES}, 0x11111111"), &[v(ONES)], &[])?;
     for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)), &[v(MAGIC8 + j)], &[])?; }
-    for t in 0..2u8 { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j), &[v(SUM + 8 * t + j)], &[])?; } }
+    for t in 0..g.t() { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j), &[v(SUM + 8 * t + j)], &[])?; } }
     Ok(())
 }
 
@@ -258,12 +271,13 @@ fn prologue(wg: &mut Wg<Gfx1201>, g: &Gen, end: &End, acc: bool) -> Result<(), S
 /// scale pair of each tensor's header row, `d`, the activation nibbles, then
 /// one unaligned dword per 8-code chunk (byte `12i + 6hi` and `+ 3` of the
 /// epoch's 48-byte group), as one clause.
-fn load_set(b: &mut Builder, p: usize) -> Result<(), String> {
+fn load_set(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
+    let tn = g.t();
     b.clause(|b| {
-        for t in 0..2u8 { bload(b, 1, hr(p, t), HOFF, srd_s(t), 0)?; }
+        for t in 0..tn { bload(b, 1, hr(p, t), HOFF, srd_s(t), 0)?; }
         bload(b, 1, dr(p), XOFF, SRD_X[p], 0)?;
         for i in 0..4u8 { bload(b, 2, xr(p) + 2 * i, XQOFF, SRD_X[p], 8 + 16 * u32::from(i))?; }
-        for t in 0..2u8 {
+        for t in 0..tn {
             for i in 0..4u8 {
                 let off = 48 * p as u32 + 12 * u32::from(i);
                 bload(b, 1, raw(p, t, i, 0), WOFF, srd_c(t), off)?;
@@ -294,17 +308,18 @@ fn unpack(b: &mut Builder, dst: u8, raw: u8, tmp: u8) -> Result<(), String> {
 /// Fold set `p` (one K128 epoch) into the sums.
 fn compute(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
     let a = g.arch();
+    let tn = g.t();
     // Row scales: epoch parity selects the low (even) or high (odd) half of
     // the scale pair, then the ds_swizzle broadcast to the accumulator rows.
     let half = if p == 0 { "l" } else { "h" };
-    for t in 0..2u8 {
+    for t in 0..tn {
         op(b, format!("v_cvt_f32_f16_e64 v{}, v{}.{half}", HF + t, hr(p, t)), &[v(HF + t)], &[v(hr(p, t))])?;
         for j in 0..8u8 {
             let text = format!("ds_swizzle_b32 v{}, v{} offset:swizzle(BROADCAST,16,{j})", SCF + 8 * t + j, HF + t);
             b.ds_crosslane(Instruction::new(text, vec![v(SCF + 8 * t + j)], vec![v(HF + t)]).memory(MemoryClass::DsLoad))?;
         }
     }
-    for t in 0..2u8 {
+    for t in 0..tn {
         for i in 0..4u8 {
             for which in 0..2u8 {
                 let n = (usize::from(t) * 8 + usize::from(i) * 2 + usize::from(which)) % 2;
@@ -313,16 +328,16 @@ fn compute(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
         }
     }
     for i in 0..4u8 {
-        for t in 0..2u8 {
+        for t in 0..tn {
             iu4_fold::wmma_step(b, a, V::<8>(CACC + 8 * t), V::<2>(a_out(t, i)), V::<2>(xr(p) + 2 * i), i == 0, V::<8>(MAGIC8))?;
         }
     }
-    for t in 0..2u8 { iu4_fold::fold_pass(b, CACC + 8 * t, SUM + 8 * t, SCF + 8 * t, dr(p), TPROD)?; }
+    for t in 0..tn { iu4_fold::fold_pass(b, CACC + 8 * t, SUM + 8 * t, SCF + 8 * t, dr(p), TPROD)?; }
     Ok(())
 }
 
-fn advance(b: &mut Builder) -> Result<(), String> {
-    for t in 0..2u8 { add64_imm(b, srd_c(t), 96)?; add64_imm(b, srd_s(t), 4)?; }
+fn advance(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    for t in 0..g.t() { add64_imm(b, srd_c(t), 96)?; add64_imm(b, srd_s(t), 4)?; }
     for r in SRD_X { add64(b, r, r, XS2)?; }
     Ok(())
 }
@@ -335,10 +350,10 @@ fn kloop(wg: &mut Wg<Gfx1201>, g: &Gen) -> Result<(), String> {
     wg.wg_skip_if(no_trip, &done, (), |wg, ()| {
         wg.loop_carried(&head, (), |wg, ()| {
             let b = wg.isa();
-            load_set(b, 1)?;
+            load_set(b, g, 1)?;
             compute(b, g, 0)?;
-            advance(b)?;
-            load_set(b, 0)?;
+            advance(b, g)?;
+            load_set(b, g, 0)?;
             compute(b, g, 1)?;
             op(b, format!("{} s{TRIPS}, s{TRIPS}, -1", s_add_i32(b.spec.arch)), &[s(TRIPS)], &[s(TRIPS)])?;
             Ok(((), trips_cmp(wg, "s_cmp_lg_u32", TRIPS)?))
@@ -346,27 +361,42 @@ fn kloop(wg: &mut Wg<Gfx1201>, g: &Gen) -> Result<(), String> {
         if wg.isa().ledger.shape() != entry { return Err("k loop exit ledger differs from its entry".into()) }
         Ok(())
     })?;
-    // K % 256 == 0: an even epoch count, two epochs left.
-    let b = wg.isa();
-    load_set(b, 1)?;
-    compute(b, g, 0)?;
-    compute(b, g, 1)
+    match g.spec.kind {
+        // K % 256 == 0: an even epoch count, two epochs left.
+        Kind::GateUp => {
+            let b = wg.isa();
+            load_set(b, g, 1)?;
+            compute(b, g, 0)?;
+            compute(b, g, 1)
+        }
+        // K % 128 == 0: one epoch left when K/128 is odd, else two (the MQ4 down entry's branch).
+        Kind::Down => {
+            let odd = wg.scmp(Instruction::new(format!("s_bitcmp1_b32 s{}, 7", ARGS1 + 3), vec![], vec![s(ARGS1 + 3)]))?;
+            wg.if_else(odd, &g.label("tail_odd"), &g.label("epilogue"), |w| {
+                let b = w.isa();
+                load_set(b, g, 1)?;
+                compute(b, g, 0)?;
+                compute(b, g, 1)
+            }, |w| compute(w.isa(), g, 0))
+        }
+    }
 }
 
-/// F32 accumulators of the 16 rows of gate and up (`Y[P][M]` f32): lane (hi, lr)
-/// stores rows `rbase + 8hi..+8` of token `lr` for each tensor; padding stores +0.
+/// F32 accumulators (`Y[P][M]` f32): lane (hi, lr) stores rows `rbase + 8hi..+8`
+/// of token `lr` for each tensor (gate/up: the up rows M/2 columns further);
+/// padding stores +0.
 fn epilogue_acc(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    let tn = g.t();
     b.label(&g.label("epilogue"))?;
-    for t in 0..2u8 { for j in 0..8u8 {
+    for t in 0..tn { for j in 0..8u8 {
         let r = SUM + 8 * t + j;
         op(b, format!("v_cndmask_b32_e64 v{r}, 0, v{r}, s{LIVE}"), &[v(r)], &[v(r), s(LIVE)])?;
     } }
     sop(b, format!("s_mov_b32 s{SRD_Y}, s{ARGS1}"), &[SRD_Y], &[ARGS1])?;
     sop(b, format!("s_mov_b32 s{}, s{}", SRD_Y + 1, ARGS1 + 1), &[SRD_Y + 1], &[ARGS1 + 1])?;
     srd_tail(b, SRD_Y, None)?;
-    // Up rows sit M/2 columns (4 bytes each) further.
-    op(b, format!("v_add_nc_u32_e32 v{RT_TMP}, s{UPOFF}, v{YOFF}"), &[v(RT_TMP)], &[s(UPOFF), v(YOFF)])?;
-    for (t, voff) in [(0u8, YOFF), (1u8, RT_TMP)] {
+    if tn == 2 { op(b, format!("v_add_nc_u32_e32 v{RT_TMP}, s{UPOFF}, v{YOFF}"), &[v(RT_TMP)], &[s(UPOFF), v(YOFF)])?; }
+    for (t, voff) in [(0u8, YOFF), (1u8, RT_TMP)].into_iter().take(usize::from(tn)) {
         bstore_b128(b, SUM + 8 * t, voff, SRD_Y, 0)?;
         bstore_b128(b, SUM + 8 * t + 4, voff, SRD_Y, 16)?;
     }

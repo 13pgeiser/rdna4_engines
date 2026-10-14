@@ -72,18 +72,21 @@ fn w3_specs() -> Vec<Spec> { qwen4_moe_sym::module_specs_codec(Arch::Gfx1201, qw
 fn w3_entry_is_deterministic_and_isolated_from_the_mq4_module() {
     use qwen4_moe_sym::WeightCodec::Mq3I4;
     let specs = w3_specs();
-    assert_eq!(specs.len(), 1);
+    assert_eq!(specs.len(), 2);
     let spec = specs[0];
     assert_eq!(spec.symbol(), "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201");
+    assert_eq!(specs[1].symbol(), "qwen4_moe_down_iu4_sym_w3_pm_gfx1201");
     assert_eq!(Spec::module_codec(Arch::Gfx1201, Mq3I4), "qwen4_moe_iu4_sym_w3_pm_gfx1201");
-    let (a, b) = (qwen4_moe_sym::emit(spec).unwrap(), qwen4_moe_sym::emit(spec).unwrap());
-    assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
-    assert_eq!((a.shape.barriers, a.s_text.contains("ds_store") || a.s_text.contains("ds_load")), (0, false));
-    let acc = peacemaker_isa::kernels::qwen4_moe_sym::w3::emit_acc(spec).unwrap();
-    assert!(acc.s_text.contains(&format!("{}_acc", spec.symbol())));
+    for spec in specs {
+        let (a, b) = (qwen4_moe_sym::emit(spec).unwrap(), qwen4_moe_sym::emit(spec).unwrap());
+        assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
+        assert_eq!((a.shape.barriers, a.s_text.contains("ds_store") || a.s_text.contains("ds_load")), (0, false));
+        let acc = peacemaker_isa::kernels::qwen4_moe_sym::w3::emit_acc(spec).unwrap();
+        assert!(acc.s_text.contains(&format!("{}_acc", spec.symbol())));
+    }
     for bad in [
         Spec { arch: Arch::Gfx1151, ..spec },
-        Spec { kind: Kind::Down, ..spec },
+        Spec { arch: Arch::Gfx1100, ..spec },
         Spec { nt: 4, ..spec },
     ] {
         assert!(qwen4_moe_sym::emit(bad).is_err(), "{bad:?}");
@@ -182,17 +185,19 @@ mod toolchain {
         let _ = require_rocm_tool!("llvm-readobj");
         let arch = Arch::Gfx1201;
         let (emitted, text, _) = qwen4_moe_sym::emit_module_codec(arch, qwen4_moe_sym::WeightCodec::Mq3I4).unwrap();
-        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted.len(), 4);
         for e in &emitted { ledger_replay::replay_waits(&e.s_text, arch).unwrap(); }
         let dir = std::env::temp_dir().join(format!("peacemaker-isa-q4s-w3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("module.s");
         std::fs::write(&s, &text).unwrap();
         let build = build(&Toolchain::oracle(), &s, &dir.join("module.hsaco"), arch.name()).unwrap();
-        let base = w3_specs()[0].symbol();
-        for symbol in [base.clone(), format!("{base}_acc")] {
-            let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
-            assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
+        for spec in w3_specs() {
+            let base = spec.symbol();
+            for symbol in [base.clone(), format!("{base}_acc")] {
+                let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
+                assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
+            }
         }
     }
 }

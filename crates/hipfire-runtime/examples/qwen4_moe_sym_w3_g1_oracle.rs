@@ -21,10 +21,14 @@ use serde_json::{json, Value};
 type Result<T, E = String> = std::result::Result<T, E>;
 fn err(e: impl std::fmt::Display) -> String { e.to_string() }
 
-const M: usize = 1280;
-const K: usize = 2560;
-const HALF: usize = M / 2;
-const GROUPS: usize = K / 128;
+static DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn is_down() -> bool { DOWN.load(std::sync::atomic::Ordering::Relaxed) }
+/// FN geometry: gate/up `[1280, 2560]` (H = `[P][640]`), down `[2560, 640]` (Y = `[P][2560]`).
+fn dm() -> usize { if is_down() { 2560 } else { 1280 } }
+fn dk() -> usize { if is_down() { 640 } else { 2560 } }
+fn dh() -> usize { if is_down() { 2560 } else { 640 } }
+fn dg() -> usize { dk() / 128 }
+fn dthreads() -> u32 { if is_down() { 128 } else { 64 } }
 const BLK: usize = 72;
 const SLAB_ALIGN: usize = 256;
 
@@ -36,24 +40,26 @@ impl Rng {
 
 struct Expert { codes: Vec<u8>, scales: Vec<u16>, w3: Vec<u8>, qt44: Vec<u8> }
 
-fn profile() -> Profile { Profile { codec: Codec::W3, rotation: Rotation::R256 } }
+fn profile() -> Profile { Profile { codec: Codec::W3, rotation: if is_down() { Rotation::R128 } else { Rotation::R256 } } }
 
-/// QT44 (136 B per K256: two `[f16 sc, f16 zp]` headers, then two 64-byte nibble halves, low nibble first)
-/// holding the same signed values: stored nibble `2c-7+8 = 2c+1`.
+/// Anchor tensor holding the same signed values (stored nibble `2c-7+8 = 2c+1`, low nibble first):
+/// gate/up QT44 (136 B per K256: two `[f16 sc, f16 zp]` headers, then two 64-byte nibble halves) or
+/// down QT53 (68 B per K128: `[f16 sc, f16 zp]` then 64 nibble bytes).
 fn qt44(codes: &[u8], scales: &[u16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(M * (K / 256) * 136);
-    for r in 0..M {
-        for g2 in 0..K / 256 {
-            let mut block = [0u8; 136];
-            for h in 0..2 {
-                let sc = scales[r * GROUPS + 2 * g2 + h];
+    let gpb = if is_down() { 1 } else { 2 }; // K128 groups per anchor block
+    let mut out = Vec::new();
+    for r in 0..dm() {
+        for g2 in 0..dg() / gpb {
+            let mut block = vec![0u8; 4 * gpb + 64 * gpb];
+            for h in 0..gpb {
+                let g = gpb * g2 + h;
+                let sc = scales[r * dg() + g];
                 let zp: u16 = if (sc >> 10) & 0x1f != 0 && ((sc >> 10) & 0x1f) <= 27 { (sc + (3 << 10)) | 0x8000 } else { 0 };
                 block[4 * h..4 * h + 2].copy_from_slice(&sc.to_le_bytes());
                 block[4 * h + 2..4 * h + 4].copy_from_slice(&zp.to_le_bytes());
                 for j in 0..128 {
-                    let c = codes[r * K + (2 * g2 + h) * 128 + j];
-                    let u = 2 * c + 1;
-                    block[8 + 64 * h + j / 2] |= u << (4 * (j % 2));
+                    let u = 2 * codes[r * dk() + g * 128 + j] + 1;
+                    block[4 * gpb + 64 * h + j / 2] |= u << (4 * (j % 2));
                 }
             }
             out.extend_from_slice(&block);
@@ -67,21 +73,21 @@ enum Kind { Random, Extreme, EveryCode, Sentinel(u16) }
 fn expert(kind: Kind, seed: u32) -> Result<Expert> {
     let mut rng = Rng(seed | 1);
     let mid = profile().codec.midpoint();
-    let mut codes: Vec<u8> = (0..M * K).map(|_| rng.below(8) as u8).collect();
+    let mut codes: Vec<u8> = (0..dm() * dk()).map(|_| rng.below(8) as u8).collect();
     let pool = [0x3000u16, 0x3800, 0x3c00, 0x4000, 0x2c00, 0x3555];
-    let mut scales: Vec<u16> = (0..M * GROUPS).map(|_| pool[rng.below(pool.len() as u32) as usize]).collect();
+    let mut scales: Vec<u16> = (0..dm() * dg()).map(|_| pool[rng.below(pool.len() as u32) as usize]).collect();
     match kind {
         Kind::Random => {}
         Kind::Extreme => {
             for (i, c) in codes.iter_mut().enumerate() { *c = if (i / 3) % 2 == 0 { 0 } else { 7 }; }
             for (i, s) in scales.iter_mut().enumerate() { *s = [0x7bff, 0x0001, 0x0400, 0x3c00][i % 4]; }
             // zero scale groups hold only the midpoint code
-            for r in (0..M).step_by(97) { for g in 0..GROUPS { if g % 5 == 0 { scales[r * GROUPS + g] = 0; for j in 0..128 { codes[r * K + g * 128 + j] = mid; } } } }
+            for r in (0..dm()).step_by(97) { for g in 0..dg() { if g % 5 == 0 { scales[r * dg() + g] = 0; for j in 0..128 { codes[r * dk() + g * 128 + j] = mid; } } } }
         }
-        Kind::EveryCode => { for (i, c) in codes.iter_mut().enumerate() { *c = ((i + i / K) % 8) as u8; } }
+        Kind::EveryCode => { for (i, c) in codes.iter_mut().enumerate() { *c = ((i + i / dk()) % 8) as u8; } }
         Kind::Sentinel(first) => { scales[0] = first; }
     }
-    let w3 = mq_i4::encode_tensor(profile(), M, K, &codes, &scales).map_err(err)?;
+    let w3 = mq_i4::encode_tensor(profile(), dm(), dk(), &codes, &scales).map_err(err)?;
     let qt = qt44(&codes, &scales);
     Ok(Expert { codes, scales, w3, qt44: qt })
 }
@@ -92,7 +98,7 @@ fn make_x(rows: usize, seed: u32) -> (Vec<u8>, Vec<A4Block>) {
     let ds = [1.0f32, 0.5, 1.0 / 64.0, 1.0e-3, 3.0, 0.0, 65536.0, 1.0e-20];
     let mut tok: Vec<A4Block> = Vec::new();
     for r in 0..rows {
-        for g in 0..GROUPS {
+        for g in 0..dg() {
             let mut qs = [0u8; 64];
             let mut s = 0i32;
             for j in 0..128 {
@@ -103,9 +109,9 @@ fn make_x(rows: usize, seed: u32) -> (Vec<u8>, Vec<A4Block>) {
             tok.push(A4Block { d: ds[(r * 3 + g) % ds.len()], s, qs });
         }
     }
-    let mut epoch_major = vec![0u8; rows * GROUPS * BLK];
-    for g in 0..GROUPS { for r in 0..rows {
-        let b = &tok[r * GROUPS + g];
+    let mut epoch_major = vec![0u8; rows * dg() * BLK];
+    for g in 0..dg() { for r in 0..rows {
+        let b = &tok[r * dg() + g];
         let o = (g * rows + r) * BLK;
         epoch_major[o..o + 4].copy_from_slice(&b.d.to_le_bytes());
         epoch_major[o + 4..o + 8].copy_from_slice(&b.s.to_le_bytes());
@@ -189,17 +195,17 @@ fn run_scenario(hip: &HipRuntime, f_acc: &Function, f_w3: &Function, f_mq4: &Fun
     let tiles_dev = up(&tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     let sorted_dev = up(&sorted.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
     let x_dev = up(&xq)?;
-    let acc_bytes = m_total * M * 4;
-    let h_bytes = m_total * HALF * 2;
+    let acc_bytes = m_total * dm() * 4;
+    let h_bytes = m_total * dh() * 2;
     let y_acc = hip.malloc(acc_bytes).map_err(err)?;
     let y_w3 = hip.malloc(h_bytes).map_err(err)?;
     let y_mq4 = hip.malloc(h_bytes).map_err(err)?;
     let launch = |f: &Function, ptrs: &hip_bridge::DeviceBuffer, y: &hip_bridge::DeviceBuffer| -> Result<()> {
         let mut a = [0u8; 60];
         for (off, p) in [(0usize, hip_ptr(ptrs)), (8, hip_ptr(&tiles_dev)), (16, hip_ptr(&sorted_dev)), (24, hip_ptr(&x_dev)), (32, hip_ptr(y))] { a[off..off + 8].copy_from_slice(&p.to_le_bytes()); }
-        for (off, v) in [(40usize, M as u32), (44, K as u32), (48, sc.div as u32), (52, m_total as u32), (56, rows as u32)] { a[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
+        for (off, v) in [(40usize, dm() as u32), (44, dk() as u32), (48, sc.div as u32), (52, m_total as u32), (56, rows as u32)] { a[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
         // SAFETY: exact 60-byte ABI; every buffer outlives the synchronize.
-        unsafe { hip.launch_kernel_blob(f, [(M / 64) as u32, sc.tiles.len() as u32, 1], [64, 1, 1], 0, None, &mut a) }.map_err(err)?;
+        unsafe { hip.launch_kernel_blob(f, [(dm() / 64) as u32, sc.tiles.len() as u32, 1], [dthreads(), 1, 1], 0, None, &mut a) }.map_err(err)?;
         hip.device_synchronize().map_err(err)
     };
     hip.memset(&y_acc, 0xa5, acc_bytes).map_err(err)?;
@@ -214,15 +220,15 @@ fn run_scenario(hip: &HipRuntime, f_acc: &Function, f_w3: &Function, f_mq4: &Fun
     let mut dense: Vec<Option<Vec<f32>>> = vec![None; sc.experts.len()];
     for t in &sc.tiles { if t.0 >= 0 && dense[t.0 as usize].is_none() {
         let e = &sc.experts[t.0 as usize];
-        dense[t.0 as usize] = Some(mq_i4_reference::iu4_gemm_f32_parts(profile(), M, K, &e.codes, &e.scales, &x_tok));
+        dense[t.0 as usize] = Some(mq_i4_reference::iu4_gemm_f32_parts(profile(), dm(), dk(), &e.codes, &e.scales, &x_tok));
     } }
     let (mut acc_bad, mut first_acc, mut checked) = (0usize, None, 0usize);
     for (ti, t) in sc.tiles.iter().enumerate() { for lane in 0..16 {
         let p = ti * 16 + lane;
         let live = t.0 >= 0 && t.1[lane] >= 0;
-        for r in 0..M {
-            let bits = u32::from_le_bytes(got_acc[(p * M + r) * 4..(p * M + r) * 4 + 4].try_into().unwrap());
-            let want = if t.0 < 0 { 0xa5a5_a5a5 } else if live { dense[t.0 as usize].as_ref().unwrap()[(t.1[lane] as usize / sc.div) * M + r].to_bits() } else { 0 };
+        for r in 0..dm() {
+            let bits = u32::from_le_bytes(got_acc[(p * dm() + r) * 4..(p * dm() + r) * 4 + 4].try_into().unwrap());
+            let want = if t.0 < 0 { 0xa5a5_a5a5 } else if live { dense[t.0 as usize].as_ref().unwrap()[(t.1[lane] as usize / sc.div) * dm() + r].to_bits() } else { 0 };
             checked += 1;
             if bits != want { acc_bad += 1; if first_acc.is_none() { first_acc = Some(json!({"p": p, "row": r, "gpu": format!("{bits:#010x}"), "twin": format!("{want:#010x}")})); } }
         }
@@ -243,12 +249,100 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[derive(Default)]
+struct TimeArgs { trace: String, layer_artifact: String, card: String, owner: String, out: String, reps: usize, warmup: usize }
+impl TimeArgs {
+    fn set(&mut self, flag: &str, v: String) -> Result<()> {
+        match flag {
+            "--trace" => self.trace = v, "--layer-artifact" => self.layer_artifact = v, "--card" => self.card = v, "--owner" => self.owner = v, "--time-out" => self.out = v,
+            "--reps" => self.reps = v.parse().map_err(err)?, "--warmup" => self.warmup = v.parse().map_err(err)?,
+            _ => return Err(format!("unknown timing flag {flag}")),
+        }
+        Ok(())
+    }
+}
+
+/// Prefill NT1 layer-pass timing (`gp_bench.py` JsonTimingDriver input): per codec, `reps` HIP-event samples of ONE
+/// launch covering every padded 16-slot tile of the trace's routed rows (ascending experts), after `warmup` untimed
+/// launches. Weights are synthetic per-codec experts of the real FN geometry (kernel time is data independent).
+/// Run under `fabric-run.sh --class timing`.
+fn time_layer(hip: &HipRuntime, t: &TimeArgs, ids: (&String, &String, &String), variants: &[(&str, &str, &Vec<u8>, &Function)]) -> Result<()> {
+    let trace: Value = serde_json::from_slice(&std::fs::read(&t.trace).map_err(err)?).map_err(err)?;
+    let layer: Value = serde_json::from_slice(&std::fs::read(&t.layer_artifact).map_err(err)?).map_err(err)?;
+    let rows: Vec<usize> = trace["rows_per_expert"].as_array().ok_or("trace.rows_per_expert")?.iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let tokens = trace.get("token_count").or(trace.get("prompt_tokens")).and_then(Value::as_u64).ok_or("trace token_count")? as usize;
+    let tile_rows = layer["tile_rows"].as_u64().ok_or("layer.tile_rows")? as usize;
+    let k_epochs = layer["k_epochs_per_tile"].as_u64().ok_or("layer.k_epochs_per_tile")? as usize;
+    if tile_rows != 16 || layer["nt"].as_u64() != Some(1) { return Err("NT1 timing needs tile_rows 16 and nt 1".into()); }
+    let (reps, warmup) = (t.reps.max(20), t.warmup.max(3));
+    let experts = rows.len();
+    let routed: usize = rows.iter().sum();
+    let (mut tile_ids, mut sorted) = (Vec::new(), Vec::new());
+    let mut next = 0usize;
+    let slots = tokens * 10;
+    for (e, &n) in rows.iter().enumerate() {
+        for chunk in (0..n).collect::<Vec<_>>().chunks(16) {
+            tile_ids.push(e as i32);
+            let mut t16 = [-1i32; 16];
+            for (i, _) in chunk.iter().enumerate() { t16[i] = ((next * 7919) % slots) as i32; next += 1; }
+            sorted.extend_from_slice(&t16);
+        }
+    }
+    let (tiles, m_total) = (tile_ids.len(), tile_ids.len() * 16);
+    let (xq, _) = { let (x, tok) = make_x(1, 7); (x, tok) };
+    // activations: the one random row's blocks replicated across `tokens` rows, epoch-major
+    let mut x_all = vec![0u8; dg() * tokens * BLK];
+    for g in 0..dg() { for r in 0..tokens { x_all[(g * tokens + r) * BLK..(g * tokens + r + 1) * BLK].copy_from_slice(&xq[g * BLK..(g + 1) * BLK]); } }
+    let up = |bytes: &[u8]| -> Result<hip_bridge::DeviceBuffer> { let b = hip.malloc(bytes.len().max(8)).map_err(err)?; hip.memcpy_htod(&b, bytes).map_err(err)?; Ok(b) };
+    let x_dev = up(&x_all)?;
+    let tiles_dev = up(&tile_ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    let sorted_dev = up(&sorted.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    let y = hip.malloc(m_total * dh() * 2).map_err(err)?;
+    let (ex_w3, ex_qt) = { let e = expert(Kind::Random, 11)?; (e.w3, e.qt44) };
+    let mut runs = Vec::new();
+    for (codec, symbol, module_bytes, f) in variants {
+        let one = if *codec == "mq3i4" { &ex_w3 } else { &ex_qt };
+        let mut slab = Vec::with_capacity(one.len() * experts);
+        for _ in 0..experts { slab.extend_from_slice(one); }
+        let dev = up(&slab)?;
+        let ptrs = up(&(0..experts).flat_map(|e| (dev.as_ptr() as u64 + (e * one.len()) as u64).to_le_bytes()).collect::<Vec<_>>())?;
+        let launch = || -> Result<()> {
+            let mut a = [0u8; 60];
+            for (off, p) in [(0usize, hip_ptr(&ptrs)), (8, hip_ptr(&tiles_dev)), (16, hip_ptr(&sorted_dev)), (24, hip_ptr(&x_dev)), (32, hip_ptr(&y))] { a[off..off + 8].copy_from_slice(&p.to_le_bytes()); }
+            for (off, v) in [(40usize, dm() as u32), (44, dk() as u32), (48, 10), (52, m_total as u32), (56, tokens as u32)] { a[off..off + 4].copy_from_slice(&v.to_le_bytes()); }
+            // SAFETY: exact 60-byte ABI; buffers outlive the event synchronization below.
+            unsafe { hip.launch_kernel_blob(f, [(dm() / 64) as u32, tiles as u32, 1], [dthreads(), 1, 1], 0, None, &mut a) }.map_err(err)
+        };
+        for _ in 0..warmup { launch()?; }
+        hip.device_synchronize().map_err(err)?;
+        let (e0, e1) = (hip.event_create().map_err(err)?, hip.event_create().map_err(err)?);
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            hip.event_record(&e0, None).map_err(err)?;
+            launch()?;
+            hip.event_record(&e1, None).map_err(err)?;
+            hip.event_synchronize(&e1).map_err(err)?;
+            samples.push(f64::from(hip.event_elapsed_ms(&e0, &e1).map_err(err)?) / 1000.0);
+        }
+        runs.push(json!({"codec": codec, "symbol": symbol, "code_object_sha": sha256_hex(module_bytes), "timing_source": "device",
+            "warmup_runs": warmup, "samples_s": samples, "launches_per_sample": 1, "routed_rows": routed, "tile_epochs": tiles * k_epochs,
+            "padded_rows": m_total, "tiles": tiles, "weights": "synthetic per-codec experts, real FN geometry",
+            "fabric": {"class": "timing", "card": t.card, "owner": t.owner, "wrapper": "/home/kaden/qcal/locks/fabric-sched/fabric-run.sh"},
+            "device": {"arch": ids.2, "card": t.card, "uuid": ids.0, "bdf": ids.1}}));
+    }
+    let doc = json!({"runs": runs});
+    if t.out.is_empty() { println!("{doc}"); } else { std::fs::write(&t.out, serde_json::to_vec_pretty(&doc).map_err(err)?).map_err(err)?; }
+    Ok(())
+}
+
 fn run() -> Result<()> {
-    let (mut w3, mut mq4, mut seed, mut expect_bdf, mut neg) = (None, None, 1u32, None, 0u8);
+    let (mut w3, mut mq4, mut seed, mut expect_bdf, mut neg, mut time_args) = (None, None, 1u32, None, 0u8, None::<TimeArgs>);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let v = args.next().ok_or("flag needs a value")?;
-        match a.as_str() { "--w3" => w3 = Some(v), "--mq4" => mq4 = Some(v), "--seed" => seed = v.parse().map_err(err)?, "--expect-bdf" => expect_bdf = Some(v.to_ascii_lowercase()), "--negative-control" => neg = v.parse().map_err(err)?, _ => return Err(format!("unknown flag {a}")) }
+        match a.as_str() { "--w3" => w3 = Some(v), "--mq4" => mq4 = Some(v), "--seed" => seed = v.parse().map_err(err)?, "--expect-bdf" => expect_bdf = Some(v.to_ascii_lowercase()), "--negative-control" => neg = v.parse().map_err(err)?,
+            "--trace" | "--layer-artifact" | "--card" | "--owner" | "--time-out" | "--reps" | "--warmup" => { time_args.get_or_insert_with(TimeArgs::default).set(&a, v)?; }
+            _ => return Err(format!("unknown flag {a}")) }
     }
     let (w3, mq4) = (w3.ok_or("--w3 required")?, mq4.ok_or("--mq4 required")?);
     let hip = HipRuntime::load().map_err(err)?;
@@ -263,14 +357,32 @@ fn run() -> Result<()> {
     let f_acc = hip.module_get_function(&m_w3, &format!("{sym}_acc")).map_err(err)?;
     let f_w3 = hip.module_get_function(&m_w3, sym).map_err(err)?;
     let f_mq4 = hip.module_get_function(&m_mq4, "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201").map_err(err)?;
+    if let Some(t) = time_args {
+        let ids = (&uuid, &bdf, &arch);
+        return time_layer(&hip, &t, ids, &[("mq3i4", sym, &w3_bytes, &f_w3), ("xts_mq4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201", &mq4_bytes, &f_mq4)]);
+    }
     let (mut rows, mut bad) = (Vec::new(), 0usize);
-    for sc in scenarios(seed, neg)? {
-        let r = run_scenario(&hip, &f_acc, &f_w3, &f_mq4, &sc, seed)?;
-        bad += r["acc_mismatches"].as_u64().unwrap() as usize + r["h_mismatches"].as_u64().unwrap() as usize;
-        rows.push(r);
+    let mut symbols = Vec::new();
+    for down in [false, true] {
+        DOWN.store(down, std::sync::atomic::Ordering::Relaxed);
+        let (w3_sym, mq4_sym) = if down {
+            ("qwen4_moe_down_iu4_sym_w3_pm_gfx1201", "qwen4_moe_down_iu4_sym_pm_gfx1201")
+        } else {
+            (sym, "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201")
+        };
+        symbols.push(json!({"w3": w3_sym, "mq4_anchor": mq4_sym}));
+        let f_acc = hip.module_get_function(&m_w3, &format!("{w3_sym}_acc")).map_err(err)?;
+        let f_w3 = hip.module_get_function(&m_w3, w3_sym).map_err(err)?;
+        let f_mq4 = hip.module_get_function(&m_mq4, mq4_sym).map_err(err)?;
+        for sc in scenarios(seed, neg)? {
+            let mut r = run_scenario(&hip, &f_acc, &f_w3, &f_mq4, &sc, seed)?;
+            r["kind"] = json!(if down { "down" } else { "gate_up" });
+            bad += r["acc_mismatches"].as_u64().unwrap() as usize + r["h_mismatches"].as_u64().unwrap() as usize;
+            rows.push(r);
+        }
     }
     println!("{}", json!({"schema": "qwen4-moe-sym-w3-g1-oracle-v1", "device": device, "w3_module": w3, "w3_module_sha256": sha256_hex(&w3_bytes),
-        "mq4_module": mq4, "mq4_module_sha256": sha256_hex(&mq4_bytes), "seed": seed, "negative_control": neg, "scenarios": rows, "mismatch_total": bad, "pass": bad == 0}));
+        "mq4_module": mq4, "mq4_module_sha256": sha256_hex(&mq4_bytes), "symbols": symbols, "seed": seed, "negative_control": neg, "scenarios": rows, "mismatch_total": bad, "pass": bad == 0}));
     if bad != 0 { return Err("K2 W3 G1 mismatch".into()); }
     Ok(())
 }

@@ -71,12 +71,12 @@ fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt,rr,codec:qwen4_moe_sym::WeightCodec::Mq4Sym})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
-/// MQ3-I4 (`WeightCodec::Mq3I4`) grouped IU4 MoE entries: `--epi all` (default) is the module, `gate_up` the NT1 gate/up entry.
+/// MQ3-I4 (`WeightCodec::Mq3I4`) grouped IU4 MoE entries: `--epi all` (default) is the module, `gate_up`/`down` one NT1 entry.
 fn qwen4_moe_sym_w3(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use peacemaker_isa::kernels::qwen4_moe_sym::{self,Kind,Spec,WeightCodec};
  if epi=="all"{let (_,text,proof)=qwen4_moe_sym::emit_module_codec(arch,WeightCodec::Mq3I4)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
- if epi!="gate_up"{return Err(format!("qwen4_moe_sym_w3 --epi {epi} (gate_up|all)"))}
- let e=qwen4_moe_sym::emit(Spec{arch,kind:Kind::GateUp,nt:1,rr:1,codec:WeightCodec::Mq3I4})?;
+ let kind=match epi{"gate_up"=>Kind::GateUp,"down"=>Kind::Down,_=>return Err(format!("qwen4_moe_sym_w3 --epi {epi} (gate_up|down|all)"))};
+ let e=qwen4_moe_sym::emit(Spec{arch,kind,nt:1,rr:1,codec:WeightCodec::Mq3I4})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
