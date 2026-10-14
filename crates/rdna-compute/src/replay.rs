@@ -8082,17 +8082,20 @@ impl ReplayController {
     /// per-call [`Self::note_route_identity`] of the HIP body: every
     /// `(key, identity)` the tape latched must be observed again, equal.
     /// `observed` may carry more pairs (layers outside the tape's forward).
-    pub fn validate_route_identities(&self, observed: &[(u64, String)]) -> Result<(), String> {
+    pub fn validate_route_identities<'a>(
+        &self,
+        observed: impl Fn(u64) -> Option<&'a str>,
+    ) -> Result<(), String> {
         for (key, latched) in &self.route_identities {
-            match observed.iter().find(|(observed_key, _)| observed_key == key) {
+            match observed(*key) {
                 None => {
                     return Err(format!(
                         "retained route identity for table {key:#x} (latched {latched}) is not \
                          bound at replay"
                     ))
                 }
-                Some((_, identity)) if identity == latched => {}
-                Some((_, identity)) => {
+                Some(identity) if identity == latched => {}
+                Some(identity) => {
                     return Err(format!(
                         "retained route identity for table {key:#x} changed since capture: \
                          latched {latched}, bound {identity}"
@@ -11302,17 +11305,17 @@ mod tests {
         // Sealed: a new table id is not a valid new map, a known one still matches.
         assert!(controller.note_route_identity(4, "d").is_err());
         controller.note_route_identity(2, "b").unwrap();
-        let bound = |pairs: &[(u64, &str)]| -> Vec<(u64, String)> {
-            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+        let check = |pairs: &'static [(u64, &'static str)]| {
+            controller.validate_route_identities(|key| {
+                pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+            })
         };
-        controller
-            .validate_route_identities(&bound(&[(1, "a"), (2, "b"), (3, "c"), (9, "extra")]))
-            .unwrap();
-        // Missing, or changed, tables fail the whole binding.
-        assert!(controller.validate_route_identities(&bound(&[(1, "a"), (2, "b")])).is_err());
-        assert!(controller
-            .validate_route_identities(&bound(&[(1, "a"), (2, "B"), (3, "c")]))
-            .is_err());
+        check(&[(1, "a"), (2, "b"), (3, "c"), (9, "extra")]).unwrap();
+        // Missing, changed, or replaced (a rebuilt table has a new id) tables
+        // fail the whole binding.
+        assert!(check(&[(1, "a"), (2, "b")]).unwrap_err().contains("not bound"));
+        assert!(check(&[(1, "a"), (2, "B"), (3, "c")]).is_err());
+        assert!(check(&[(1, "a"), (2, "b"), (30, "c")]).unwrap_err().contains("not bound"));
     }
 
     #[test]

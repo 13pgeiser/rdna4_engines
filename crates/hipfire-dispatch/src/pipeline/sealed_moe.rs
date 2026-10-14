@@ -7429,4 +7429,43 @@ mod retained_route_identity_tests {
         assert_ne!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 2)), "generation");
         assert_eq!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 1)));
     }
+
+    #[test]
+    fn every_input_field_moves_a_slab_identity_and_a_rebuilt_table_is_unbound() {
+        let codecs = [0u8, 1, 1];
+        let base = input(Some(&codecs), 1);
+        let reference = retained_route_identities(&base);
+        let vary: [(&str, Box<dyn Fn(&mut RetainedRouteInputs<'_>)>); 7] = [
+            ("layer", Box::new(|i| i.layer += 1)),
+            ("table", Box::new(|i| i.table_identity += 1)),
+            ("fingerprint", Box::new(|i| i.mapping_fingerprint = "other")),
+            ("gate_up table", Box::new(|i| i.gate_up_table.0 += 16)),
+            ("down table", Box::new(|i| i.down_table.1 += 8)),
+            ("tag table", Box::new(|i| i.tag_table = Some((0x3100, 512)))),
+            ("generation", Box::new(|i| i.owner_generation += 1)),
+        ];
+        for (name, change) in vary {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(reference, retained_route_identities(&changed), "{name}");
+        }
+        // A reload at reused addresses builds a new table (new id): the key
+        // sets are disjoint, so a tape latched on the old ones finds none bound.
+        let mut reloaded = base.clone();
+        reloaded.table_identity += 100;
+        let fresh = retained_route_identities(&reloaded);
+        assert!(reference.iter().all(|(key, _)| fresh.iter().all(|(other, _)| other != key)));
+        let mut controller =
+            rdna_compute::replay::ReplayController::new(rdna_compute::replay::ReplayBackendRequest::Auto);
+        for (key, identity) in &reference {
+            controller.note_route_identity(*key, identity).unwrap();
+        }
+        let bound = |pairs: &'static [(u64, String)]| {
+            controller.validate_route_identities(|key| {
+                pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+            })
+        };
+        let fresh: &'static [(u64, String)] = Box::leak(fresh.into_boxed_slice());
+        assert!(bound(fresh).unwrap_err().contains("not bound"));
+    }
 }
