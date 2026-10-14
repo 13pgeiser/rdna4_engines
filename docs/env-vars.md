@@ -681,7 +681,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1598
+**Count:** 1607
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2011,6 +2011,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REDLINE_PROBE_VMEMAP` | crates/redline-rocr/src/runtime.rs | developer |
 | `HIPFIRE_REDLINE_QUEUE_TIMEOUT` | crates/redline-rocr/src/runtime.rs | developer |
 | `HIPFIRE_REGISTRY_URL` | crates/hipfire-cli/src/main.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_RELEASES_LATEST_API` | scripts/install.sh, scripts/test_install_revision.py | harness |
 | `HIPFIRE_REMOTE` | scripts/mi300x_bootstrap.sh | harness |
 | `HIPFIRE_REPLAY_BACKEND` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/hipfire-arch-qwen35/tests/pm_decode_twins_hw.rs | stable |
 | `HIPFIRE_REPLAY_BINDINGS_VERIFY` | crates/rdna-compute/src/replay.rs | developer |
