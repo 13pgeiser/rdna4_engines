@@ -2,8 +2,6 @@
 
 ## v0.4.2 — 2026-10-14
 
-<!-- PLE prewarm-in-load (fix/ple-prewarm-in-load): its entry lands directly below this line; remove this comment before tagging. -->
-
 - **Strix Halo NPU trunk: the fused HC kernels now also run under the NPU pair route (16K Flash-Next TTFT −298 ms, exact).** The pair executor runs each bank layer as prepare, an NPU-fed Core and the output projection, and the interpreter dropped its HC pairing state between those windows. So under the NPU route the attention HC read never handed its gates to the HC write, the `hcw` output-projection epilogue never fired, and the MoE HC row fold was skipped. The GPU-only route took all three. `HcFusionCursor` now carries each bank's pairings across its windows, and `hc_gates` is bank-private (+16 B/row) because those gates now cross the bank switch. The fused kernels are the GPU-only route's byte-exact twins.
   - Halo, Flash-Next p16k, bounded memlock, 3 fresh processes × 3 measured per arm, interleaved against 1be80ed54. The all-9 median dropped from 7,194 to 6,896 ms (2,274 → 2,372 tok/s), with per-process medians of 6,882 / 6,892 / 6,907 ms against 7,709 / 7,086 / 7,194 ms. Every candidate TTFT was lower than every base TTFT.
   - Greedy p16k, p16k plus a cached-prefix suffix, and short prompts: NPU `on`, `emulate` and `off` bytes match beta.
