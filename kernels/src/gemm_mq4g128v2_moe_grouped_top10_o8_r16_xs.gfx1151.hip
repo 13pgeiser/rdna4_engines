@@ -22,7 +22,8 @@
 // eight output rows (about fifteen times the expert-weight traffic).  Here a
 // block of W waves owns 8 * W adjacent rows of the same tile; each group's X
 // chunk (16 slots x 128 floats) is staged into LDS once per block,
-// double-buffered with one LDS-only barrier per group.
+// double-buffered with one LDS-only barrier per group.  W = 4 is the routed
+// instantiation (Halo oracle, 5d6ae67e8: W = 4 beat 8 and 16 at every batch).
 // Grid [M / (8 * W), ceil(grouped_rows / 16), 1], block 32 * W.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -254,7 +255,5 @@ extern "C" __global__ void NAME( \
 }
 
 HF_DOWN_XS_KERNEL(gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151, 4)
-HF_DOWN_XS_KERNEL(gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs8_gfx1151, 8)
-HF_DOWN_XS_KERNEL(gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs16_gfx1151, 16)
 #undef HF_GROUPS
 #undef HF_ROWS

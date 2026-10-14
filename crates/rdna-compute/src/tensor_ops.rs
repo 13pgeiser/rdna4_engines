@@ -24,6 +24,8 @@ pub(crate) const TENSOR_OPS_SRC: &str = concat!(
 );
 pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
+pub(crate) const HYPER_READ_UP_FUSED_TWIN_SRC: &str =
+    include_str!("../../../kernels/src/hyper_read_up_fused_twin.gfx1151.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 pub(crate) const GATED_DELTA_CHUNK_WMMA_SRC: &str =
@@ -1669,6 +1671,28 @@ pub struct HyperReadUpFused<'a> {
     pub normalized_bf16: bool,
 }
 
+/// `HIPFIRE_QWEN4_HC_UP_TWIN` (default on; `0` restores `hyper_read_up_fused_f32`
+/// for every row count): on exact gfx1151 the Qwen4 HC read tail runs the
+/// bitwise twin `hyper_read_up_fused_f32_sx` on batches of
+/// [`QWEN4_HC_UP_TWIN_MIN_ROWS`] rows or more. Read once.
+static QWEN4_HC_UP_TWIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_TWIN", true));
+
+/// Smallest row count (inclusive) that takes the `hyper_read_up_fused` twin.
+const QWEN4_HC_UP_TWIN_MIN_ROWS: usize = 16;
+
+/// Whether [`hyper_read_up_fused`] launches `hyper_read_up_fused_f32_sx`
+/// instead of `hyper_read_up_fused_f32`. The twin is bitwise the incumbent: only
+/// its output stores move, so the wave-uniform X loads become scalar loads.
+/// Decode/verify-sized batches below 16 rows keep the incumbent.
+fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> bool {
+    enabled && exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
+}
+
+/// Same arguments, grid, block, dynamic LDS and kernarg blob for either entry:
+/// on exact gfx1151 with at least 16 rows (and `HIPFIRE_QWEN4_HC_UP_TWIN`
+/// not `0`) the launch is the bitwise twin `hyper_read_up_fused_f32_sx`
+/// (module `hyper_read_up_fused_twin`); otherwise it is `hyper_read_up_fused_f32`.
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
     ensure_f32(p.low)?;
     ensure_f32(p.normalized)?;
@@ -1693,7 +1717,20 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
     let row_grid = checked_u32(p.rows.div_ceil(128), "HC read row grid")?;
     let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")?;
+    let (module, source, kernel) = if qwen4_hc_up_twin_applies(
+        *QWEN4_HC_UP_TWIN,
+        gpu.arch_caps.is_gfx1151(),
+        p.rows,
+    ) {
+        (
+            "hyper_read_up_fused_twin",
+            HYPER_READ_UP_FUSED_TWIN_SRC,
+            "hyper_read_up_fused_f32_sx",
+        )
+    } else {
+        ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
+    };
+    gpu.ensure_kernel_public(module, source, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
     args.push_ptr(p.low.buf.as_ptr());
@@ -1705,7 +1742,7 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     args.push_i32(i32::from(p.normalized_bf16));
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "hyper_read_up_fused_f32",
+        kernel,
         [column_grid, row_grid, 1],
         [256, 1, 1],
         lds_bytes,
@@ -11480,6 +11517,35 @@ mod route_selector_tests {
                     assert_eq!(qsa_gathered_pm_shape_fits(capacity, kv, heads), old);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hc_up_twin_route_tests {
+    use super::*;
+
+    #[test]
+    fn qwen4_hc_up_twin_route_table() {
+        // (enabled, exact_gfx1151, rows, expected)
+        let cases: [(bool, bool, usize, bool); 10] = [
+            (false, true, 145, false),
+            (false, true, 16, false),
+            (true, false, 145, false),
+            (true, true, 1, false),
+            (true, true, 15, false),
+            (true, true, 16, true),
+            (true, true, 145, true),
+            (true, true, 401, true),
+            (true, true, 529, true),
+            (true, false, 16, false),
+        ];
+        for (enabled, exact, rows, want) in cases {
+            assert_eq!(
+                qwen4_hc_up_twin_applies(enabled, exact, rows),
+                want,
+                "enabled={enabled} exact_gfx1151={exact} rows={rows}"
+            );
         }
     }
 }

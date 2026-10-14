@@ -3009,6 +3009,12 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_MULTIROW_SRC: &str =
 /// predecessor.
 pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip");
+/// gfx1151 X-in-LDS bitwise twin of the O8×R16 QT53 grouped down above. Same
+/// per-output decode and wave32 reduction association; four waves per block
+/// (32 rows) share each group's X chunk through LDS instead of every 8-row
+/// wave loading it. Exact shape only: M = 2560, K = 640, one X row per slot.
+pub const GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_XS_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs.gfx1151.hip");
 /// gfx1151 F16 WMMA grouped QT53 down (not bit-exact; see moe.rs routing).
 pub const GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_wmma.gfx1151.hip");
@@ -3019,6 +3025,11 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
 /// to the O2×R8 sibling.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip");
+/// gfx1151 bitwise twin of the O4×R8 X4 QT44 grouped gate/up above. Same
+/// per-output decode and static four-chain reduction; only the scheduling
+/// differs (fully unrolled ten-group walk, waves per block, prefetch depth).
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_PIPE_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe.gfx1151.hip");
 /// gfx1151 exact-shape O2×R8 QT44 grouped gate/up consumer.
 /// It pairs two adjacent output rows with eight route slots while retaining
 /// the existing 16-slot metadata and the static four-chain reduction order.

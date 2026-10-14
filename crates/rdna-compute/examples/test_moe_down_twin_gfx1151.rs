@@ -11,12 +11,10 @@
 //!              grid [ceil(M/8),  ceil(grouped_rows/16), 2], block [32,1,1]   (z = half tile)
 //!   o16r16     `gemm_mq4g128v2_moe_grouped_top10_o16_r16_gfx1151`
 //!              grid [ceil(M/16), ceil(grouped_rows/16), 1], block [32,1,1]
-//!   xs4        `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151`
+//!   xs4        `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151` (routed)
 //!              32 rows/block,  block [128,1,1], grid [ceil(M/32),  ceil(grouped_rows/16), 1]
-//!   xs8        `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs8_gfx1151`
-//!              64 rows/block,  block [256,1,1], grid [ceil(M/64),  ceil(grouped_rows/16), 1]
-//!   xs16       `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs16_gfx1151`
-//!              128 rows/block, block [512,1,1], grid [ceil(M/128), ceil(grouped_rows/16), 1]
+//!              (the 64- and 128-row xs8/xs16 instantiations of 5d6ae67e8 lost to it
+//!              at every batch on Halo and were dropped)
 //!
 //! All variants take the production 11-argument signature and are compiled
 //! directly from the `.hip` sources (`include_str!`) through
@@ -109,8 +107,8 @@
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 [case-name-filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --variants=xs4,xs8,xs16 [filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [--variants=xs8] [filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --variants=xs4 [filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [--variants=xs4] [filter]
 //!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --precheck [filter]
 
 use hip_bridge::KernargBlob;
@@ -157,7 +155,7 @@ const fn xs(label: &'static str, func: &'static str, rows_per_block: usize, bloc
 
 /// Index 0 is the incumbent (the bitwise reference); the rest are candidates.
 /// Index 1 is the O8R8 twin (the sweep default's second variant).
-const VARIANTS: [Variant; 6] = [
+const VARIANTS: [Variant; 4] = [
     Variant {
         label: "incumbent o8r16",
         module: "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
@@ -186,8 +184,6 @@ const VARIANTS: [Variant; 6] = [
         grid_z: 1,
     },
     xs("xs4", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151", 32, 128),
-    xs("xs8", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs8_gfx1151", 64, 256),
-    xs("xs16", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs16_gfx1151", 128, 512),
 ];
 
 const K_TOP: usize = 10;

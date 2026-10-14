@@ -2,15 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Bitwise oracle + timing for the gfx1151 QT44 grouped top-10 MoE gate/up
-//! pipelined twins, against the production incumbent:
+//! unrolled twin, against the production incumbent:
 //!
 //!   incumbent  `gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4`
 //!              module = symbol, block [128,1,1],
 //!              grid [ceil(M/16), ceil(grouped_rows/8), 1]
-//!   twins      `gemm_mq4g256v2_moe_grouped_top10_o4_r8_x{W}_d{D}` (one module,
-//!              `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`, compiled once and
-//!              every symbol bound through `ensure_kernel_public`), W waves per
-//!              block, block [32*W,1,1], grid [ceil(M/(4*W)), ceil(grouped_rows/8), 1]
+//!   twin       `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151` (module
+//!              `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`), same geometry.
+//!              The scheduling variants this oracle ranked on Halo (W waves per
+//!              block, prefetch depth, double-buffered LDS; commit 0b0fd7848)
+//!              were reduced to the winner, W = 4 with one group in flight.
 //!
 //! The variants live in the `VARIANTS` table: adding/removing a twin is one line.
 //! All kernels take the same nine production arguments (expert_weight_ptrs,
@@ -69,7 +70,7 @@
 //! GFX1151 ONLY: refuses any other arch (exit 2). Exit 1 on any mismatch.
 //!
 //! Run:
-//!   cargo run --release -p rdna-compute --features lab --example test_moe_gateup_twin_gfx1151 [-- --tokens=145,273 --variants=x8_d3,x16_d3] [case-name-filter]
+//!   cargo run --release -p rdna-compute --features lab --example test_moe_gateup_twin_gfx1151 [-- --tokens=145,273 --variants=pipe --precheck] [case-name-filter]
 
 use hip_bridge::KernargBlob;
 use rdna_compute::{Gpu, GpuTensor};
@@ -99,7 +100,7 @@ const fn pipe(label: &'static str, func: &'static str, waves: usize) -> Variant 
 }
 
 /// Index 0 is the incumbent (the bitwise reference); the rest are twins.
-const VARIANTS: [Variant; 10] = [
+const VARIANTS: [Variant; 2] = [
     Variant {
         label: "incumbent",
         module: MODULE_INCUMBENT,
@@ -107,15 +108,7 @@ const VARIANTS: [Variant; 10] = [
         src: SRC_INCUMBENT,
         waves: 4,
     },
-    pipe("x4d1f0", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f0", 4),
-    pipe("x4d1f2", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f2", 4),
-    pipe("x4d1f3", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f3", 4),
-    pipe("x4d2f2", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d2_f2", 4),
-    pipe("x4d2f3", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d2_f3", 4),
-    pipe("x8d1f3", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d1_f3", 8),
-    pipe("x8d2f2", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d2_f2", 8),
-    pipe("x8d2f3", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d2_f3", 8),
-    pipe("x8d3f3", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d3_f3", 8),
+    pipe("pipe", "gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151", 4),
 ];
 
 const E: usize = 512;
@@ -719,7 +712,7 @@ fn main() {
             precheck = true;
         } else if a.starts_with("--") {
             eprintln!(
-                "unknown flag {a} (supported: --tokens=a,b,c, --variants=x8_d3,x16_d3, --precheck)"
+                "unknown flag {a} (supported: --tokens=a,b,c, --variants=pipe, --precheck)"
             );
             std::process::exit(2);
         } else {

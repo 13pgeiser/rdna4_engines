@@ -1,41 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — gfx1151 QT44 grouped top-10 gate/up O4×R8, pipelined twin.
+// hipfire — gfx1151 QT44 grouped top-10 gate/up O4×R8, unrolled twin.
 //
-// Bitwise twin of `gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4` (same file
-// family, `.._o4_r8_x4.gfx1151.hip`) for the exact Qwen4 shape M = 1280,
-// K = 2560 (ten MQ4G256V2 groups per row).  Every output element is computed
-// by one wave with the incumbent's per-element arithmetic:
+// Bitwise twin of `gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4`
+// (`gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip`) for the exact
+// Qwen4 shape M = 1280, K = 2560 (ten MQ4G256V2 groups per row).  Same nine
+// arguments, grid [ceil(M / 16), ceil(grouped_rows / 8), 1] and block 128:
+// four waves per block each own four adjacent output rows of one eight-slot
+// subtile, the subtile's X is staged through LDS once per group, and per
+// output element the arithmetic is the incumbent's:
 //   * the same MQ4G256V2 decode (fma(sc, (float)nibble, zp), f16 scale/zero
-//     halves selected by lane < 16), the same lane -> K mapping (lane t owns
-//     the eight values t*8 .. t*8 + 7 of every 256-value group);
-//   * group g accumulates into static chain g & 3, groups visited in
-//     increasing order, with the incumbent's 8-term expression
-//     w0*x0 + ... + w7*x7 as its compiled code evaluates it (see PIPE_ROW);
+//     halves selected by lane < 16) and lane -> K map (lane t owns values
+//     t*8 .. t*8 + 7 of every 256-value group);
+//   * group g accumulates into static chain g & 3, groups in increasing
+//     order, with the incumbent's 8-term expression as its code object
+//     evaluates it (see HF_ROW);
 //   * the fold (acc0 + acc1) + (acc2 + acc3) and the lane-0 tree
 //     (hf_lane0_tree_sum2, offsets 16, 8, 4, 2, 1);
 //   * dead slots skip accumulation and store +0.0; a subtile without a live
 //     slot stores zeros; rows past M read row M - 1 and are never stored; a
 //     negative expert id leaves the output untouched; slots past grouped_rows
 //     are never stored.
-// Only scheduling changes, which cannot change results:
-//   * W waves per block (4 * W output rows) share each group's staged X, so
-//     X is fetched once per 4 * W rows instead of once per 16;
-//   * D groups of weight and X loads are in flight per wave (the incumbent
-//     issues one group ahead), from a static register ring;
-//   * optionally the staged X is double-buffered in LDS (one barrier per
-//     group instead of two) and the barriers are LDS-only;
-//   * the ten-group walk is fully unrolled (K = 2560 is a launch contract).
-//
-// Layouts are the live grouped gate/up contract:
-//   expert_weight_ptrs: [E] device pointers to [M, K] MQ4G256V2 rows
-//   expert_tile_ids:   [ceil(grouped_rows / 16)] expert ID per 16-slot tile
-//   sorted_slot_index: [grouped_rows] flat token/top-k slot, -1 for padding
-//   X_src:             [N, K] F32 rotated token rows
-//   Y_grouped:         [grouped_rows, M] F32 grouped output
-// Grid: [ceil(M / (4 * W)), ceil(grouped_rows / 8), 1], block 32 * W.
-// K must be 2560 (the launcher only selects this module for M = 1280,
-// K = 2560); M must be a multiple of 4.
+// Only scheduling changes: K = 2560 is a launch contract, so the ten-group
+// walk is fully unrolled (the incumbent runs a four-group loop plus a
+// four-way tail switch at 253 VGPRs; unrolled, the chain index and buffer
+// offsets are static and the kernel needs 202).  Halo oracle (0b0fd7848):
+// 1.045x at 145 tokens, 1.068x at 273, 1.092x at 401; deeper prefetch,
+// double-buffered LDS and eight-wave blocks were all slower than this.
 // HIPFIRE_COMPILER_FLAGS: -mllvm -amdgpu-sched-strategy=max-ilp
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -72,92 +63,48 @@ static __device__ __forceinline__ unsigned int hf_nibble_bytes(unsigned int x) {
     return r;
 }
 
-// LDS-only workgroup barrier (the attention_verify_wmma.gfx1151 idiom): keeps
-// the in-flight global prefetches in flight, where __syncthreads() would wait
-// for every outstanding load (vmcnt(0)) before the barrier.  Each wave waits
-// for its own LDS stores (lgkmcnt(0); gfx11 s_waitcnt 0xFC07 leaves vmcnt and
-// expcnt open) before it signals: in WGP mode a workgroup's waves span both
-// CUs and their LDS queues are not ordered against each other.  X and the
-// weights are read-only and Y is written only after the walk, so no global
-// ordering is needed.
-#define HF_LDS_BARRIER()                                                  \
-    do {                                                                  \
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");  \
-        __builtin_amdgcn_s_waitcnt(0xFC07);                               \
-        __builtin_amdgcn_s_barrier();                                     \
-        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");  \
-    } while (0)
-
 namespace {
 
-constexpr int kSlots = 8;    // R: slots per subtile
+constexpr int kSlots = 8;    // slots per subtile
 constexpr int kGroups = 10;  // K / 256 for K = 2560
 constexpr int kGroupBytes = 136;
 
-// Register ring entry: one group's weight words for four rows plus this
-// thread's share of the staged X chunk (S float4 of the 8 x 64).
-template <int S>
-struct Stage {
-    unsigned int nh[4];
-    unsigned int npk[4];
-    float4 st[S];
-};
-
-// F bits: 1 = double-buffered LDS, one barrier per group (else one buffer, two
-// barriers like the incumbent); 2 = LDS-only barrier (else __syncthreads).
-template <bool LdsBar>
-__device__ __forceinline__ void hf_barrier() {
-    if constexpr (LdsBar) HF_LDS_BARRIER();
-    else __syncthreads();
-}
-
-template <int W, int D, int F>
 struct Walk {
-    static constexpr bool kDbuf = F & 1, kLdsBar = F & 2;
-    static constexpr int S = kSlots * 64 / (32 * W);
-    static_assert(S >= 1 && S * 32 * W == kSlots * 64, "X chunk split");
-    static_assert(D >= 1 && D <= kGroups, "prefetch depth");
-
     __amdgpu_buffer_rsrc_t wrsrc, xrsrc;
     int row_soff[4];
-    int stage_soff[S];
+    int stage_soff[4];
     int hoff, boff, stage_voff;
     bool live[kSlots];
     float acc[4][4][kSlots];  // [chain][row][slot]
-    Stage<S> ring[D];
+    unsigned int nh[4], npk[4];
+    float4 st[4];
 
-    __device__ __forceinline__ void load(Stage<S>& p, int g) {
+    __device__ __forceinline__ void load(int g) {
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
-            p.nh[r] = __builtin_amdgcn_raw_buffer_load_b32(
+            nh[r] = __builtin_amdgcn_raw_buffer_load_b32(
                 wrsrc, hoff, row_soff[r] + g * kGroupBytes, 0);
-            p.npk[r] = __builtin_amdgcn_raw_buffer_load_b32(
+            npk[r] = __builtin_amdgcn_raw_buffer_load_b32(
                 wrsrc, 8 + boff, row_soff[r] + g * kGroupBytes, 0);
         }
 #pragma unroll
-        for (int j = 0; j < S; ++j)
-            p.st[j] = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128(
+        for (int j = 0; j < 4; ++j)
+            st[j] = __builtin_bit_cast(float4, __builtin_amdgcn_raw_buffer_load_b128(
                 xrsrc, stage_voff, stage_soff[j] + g * 1024, 0));
     }
 
     template <int G>
     __device__ __forceinline__ void group(float4* __restrict__ xs) {
         constexpr int C = G & 3;
-        constexpr int P = G % D;
-        float4* __restrict__ xg = xs + (kDbuf ? (G & 1) * (kSlots * 64) : 0);
         unsigned int ch[4], cpk[4];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) { ch[r] = ring[P].nh[r]; cpk[r] = ring[P].npk[r]; }
+        for (int r = 0; r < 4; ++r) { ch[r] = nh[r]; cpk[r] = npk[r]; }
 #pragma unroll
-        for (int j = 0; j < S; ++j) xg[j * (32 * W) + threadIdx.x] = ring[P].st[j];
-        // Double-buffered: one barrier per group (buffer G & 1 was last read
-        // in group G - 2, and every wave passed this group's predecessor
-        // barrier after that).  Single buffer: a second barrier after the
-        // compute, as in the incumbent.
-        hf_barrier<kLdsBar>();
-        if constexpr (G + D < kGroups) load(ring[P], G + D);
+        for (int j = 0; j < 4; ++j) xs[j * 128 + threadIdx.x] = st[j];
+        __syncthreads();
+        if constexpr (G + 1 < kGroups) load(G + 1);
 
-#define PIPE_DECODE(R) \
+#define HF_DECODE(R) \
         float w##R[8]; \
         { \
             const float sc = __half2float(__ushort_as_half( \
@@ -181,9 +128,9 @@ struct Walk {
 // t = w1*x1; t = fma(w0, x0, t); t = fma(wk, xk, t) for k = 2..7; acc += t
 // (DAGCombiner folds the left product of the first add when both products
 // have one use).  Spelled out here with explicit fmas so a different
-// surrounding schedule cannot flip that choice: the same source text in this
-// file contracted some instances as fma(w1, x1, w0*x0) instead.
-#define PIPE_ROW(R) do { \
+// surrounding schedule cannot flip that choice: the same source text under
+// another schedule contracted some instances as fma(w1, x1, w0*x0) instead.
+#define HF_ROW(R) do { \
             float t = w##R[1] * x1; \
             t = __builtin_fmaf(w##R[0], x0, t); \
             t = __builtin_fmaf(w##R[2], x2, t); \
@@ -194,50 +141,51 @@ struct Walk {
             t = __builtin_fmaf(w##R[7], x7, t); \
             acc[C][R][slot] += t; \
         } while (0)
-        PIPE_DECODE(0) PIPE_DECODE(1) PIPE_DECODE(2) PIPE_DECODE(3)
+        HF_DECODE(0) HF_DECODE(1) HF_DECODE(2) HF_DECODE(3)
         const int tid = threadIdx.x & 31;
 #pragma unroll
         for (int slot = 0; slot < kSlots; ++slot) {
             if (!live[slot]) continue;
-            const float4 xa = xg[slot * 64 + tid * 2];
-            const float4 xb = xg[slot * 64 + tid * 2 + 1];
+            const float4 xa = xs[slot * 64 + tid * 2];
+            const float4 xb = xs[slot * 64 + tid * 2 + 1];
             const float x0 = xa.x, x1 = xa.y, x2 = xa.z, x3 = xa.w;
             const float x4 = xb.x, x5 = xb.y, x6 = xb.z, x7 = xb.w;
-            PIPE_ROW(0); PIPE_ROW(1); PIPE_ROW(2); PIPE_ROW(3);
+            HF_ROW(0); HF_ROW(1); HF_ROW(2); HF_ROW(3);
         }
-#undef PIPE_ROW
-#undef PIPE_DECODE
-        // ALU results carry no memory chain; pin them before the next
-        // group's LDS store and barrier.
+#undef HF_ROW
+#undef HF_DECODE
+        // ALU results carry no memory chain; pin them before the barrier.
 #pragma unroll
         for (int slot = 0; slot < kSlots; ++slot)
             asm volatile("" : "+v"(acc[C][0][slot]), "+v"(acc[C][1][slot]),
                          "+v"(acc[C][2][slot]), "+v"(acc[C][3][slot]));
-        if constexpr (!kDbuf) hf_barrier<kLdsBar>();
+        __syncthreads();
     }
 };
 
-template <int W, int D, int F>
-__device__ __forceinline__ void grouped_top10_o4_r8_pipe_body(
+}  // namespace
+
+__launch_bounds__(128, 1)
+extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151(
     const unsigned long long* __restrict__ expert_weight_ptrs,
     const int* __restrict__ expert_tile_ids,
     const int* __restrict__ sorted_slot_index,
     const float* __restrict__ X_src,
     float* __restrict__ Y_grouped,
     int M,
+    int K,
     int x_row_div,
-    int grouped_rows,
-    float4* __restrict__ xs
+    int grouped_rows
 ) {
+    (void)K;
+    __shared__ float4 xs[kSlots * 64];
     constexpr int R = kSlots;
-    using WalkT = Walk<W, D, F>;
-    constexpr int S = WalkT::S;
     // readfirstlane: the compiler cannot see that threadIdx.x >> 5 is
     // wave-uniform, and a VGPR row offset turns every buffer load into a
     // waterfall loop.
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
     const int tid = threadIdx.x & 31;
-    const int row0 = (blockIdx.x * W + wave) * 4;
+    const int row0 = (blockIdx.x * 4 + wave) * 4;
     const int slot_start = blockIdx.y * R;
     // Block-uniform exits only: every wave takes part in the barriers.
     if (slot_start >= grouped_rows) return;
@@ -256,7 +204,7 @@ __device__ __forceinline__ void grouped_top10_o4_r8_pipe_body(
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
-    WalkT wk;
+    Walk wk;
     // Rows past M read row M - 1 and are never stored.
     bool row_valid[4];
     constexpr int row_stride = kGroups * kGroupBytes;
@@ -293,31 +241,24 @@ __device__ __forceinline__ void grouped_top10_o4_r8_pipe_body(
         wk.xrsrc = __builtin_amdgcn_make_buffer_rsrc((void*)X_src, 0, 0x7FFFFFFF, 0x31004000);
         wk.boff = tid * 4;
         wk.hoff = (tid < 16) ? 0 : 4;
-        // Staging: float4 v = j * 32W + threadIdx.x of the 8 x 64 chunk
-        // belongs to slot j * W/2 + (wave >> 1) (wave-uniform), float4
+        // Staging: float4 v = j * 128 + threadIdx.x of the 8 x 64 chunk
+        // belongs to slot 2j + (wave >> 1) (wave-uniform), float4
         // (wave & 1) * 32 + tid within it.
         wk.stage_voff = ((wave & 1) * 32 + tid) * 16;
-        const int half = wave >> 1;
 #pragma unroll
-        for (int j = 0; j < S; ++j) {
-            int s = x_soff[j * (W / 2)];
-#pragma unroll
-            for (int q = 1; q < W / 2; ++q)
-                s = (half == q) ? x_soff[j * (W / 2) + q] : s;
-            wk.stage_soff[j] = s;
-        }
-#pragma unroll
-        for (int d = 0; d < D; ++d) wk.load(wk.ring[d], d);
-        wk.template group<0>(xs);
-        wk.template group<1>(xs);
-        wk.template group<2>(xs);
-        wk.template group<3>(xs);
-        wk.template group<4>(xs);
-        wk.template group<5>(xs);
-        wk.template group<6>(xs);
-        wk.template group<7>(xs);
-        wk.template group<8>(xs);
-        wk.template group<9>(xs);
+        for (int j = 0; j < 4; ++j)
+            wk.stage_soff[j] = (wave >> 1) ? x_soff[2 * j + 1] : x_soff[2 * j];
+        wk.load(0);
+        wk.group<0>(xs);
+        wk.group<1>(xs);
+        wk.group<2>(xs);
+        wk.group<3>(xs);
+        wk.group<4>(xs);
+        wk.group<5>(xs);
+        wk.group<6>(xs);
+        wk.group<7>(xs);
+        wk.group<8>(xs);
+        wk.group<9>(xs);
     }
 
     float sum[4][R];
@@ -344,34 +285,3 @@ __device__ __forceinline__ void grouped_top10_o4_r8_pipe_body(
         }
     }
 }
-
-}  // namespace
-
-#define HF_PIPE_KERNEL(NAME, W, D, F) \
-__launch_bounds__(32 * (W), 1) \
-extern "C" __global__ void NAME( \
-    const unsigned long long* __restrict__ expert_weight_ptrs, \
-    const int* __restrict__ expert_tile_ids, \
-    const int* __restrict__ sorted_slot_index, \
-    const float* __restrict__ X_src, \
-    float* __restrict__ Y_grouped, \
-    int M, \
-    int K, \
-    int x_row_div, \
-    int grouped_rows \
-) { \
-    (void)K; \
-    __shared__ float4 xs[(((F) & 1) ? 2 : 1) * kSlots * 64]; \
-    grouped_top10_o4_r8_pipe_body<(W), (D), (F)>(expert_weight_ptrs, expert_tile_ids, \
-        sorted_slot_index, X_src, Y_grouped, M, x_row_div, grouped_rows, xs); \
-}
-
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f0, 4, 1, 0)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f2, 4, 1, 2)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d1_f3, 4, 1, 3)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d2_f2, 4, 2, 2)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_d2_f3, 4, 2, 3)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d1_f3, 8, 1, 3)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d2_f2, 8, 2, 2)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d2_f3, 8, 2, 3)
-HF_PIPE_KERNEL(gemm_mq4g256v2_moe_grouped_top10_o4_r8_x8_d3_f3, 8, 3, 3)
