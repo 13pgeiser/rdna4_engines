@@ -4,9 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 pub const CALIBRATION_SCHEMA_VERSION: u32 = 4;
-/// Change the contract suffix when serving numerics/transport change.
+/// Identity of the NPU serving numerics/transport the stored calibrations were measured against.
+/// Deliberately not the crate version: a release bump does not change the NPU route, and tying the
+/// two would orphan every shipped calibration on each bump. Change this when serving
+/// numerics/transport change (and re-measure the shipped calibrations).
 pub fn calibration_build_identity() -> String {
-    format!("hipfire-{}:npu-trunk-bf16-rowmajor-v1", env!("CARGO_PKG_VERSION"))
+    "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1".to_owned()
 }
 pub(crate) const FAMILY_NAMES: [&str; 4] = ["qkv", "zab", "q", "kvidx"];
 pub(crate) const OUT_FAMILY_NAMES: [&str; 2] = ["gdn.out", "qsa.o"];
