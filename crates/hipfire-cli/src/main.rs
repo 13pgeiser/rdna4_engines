@@ -51,6 +51,7 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod emu;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
@@ -124,6 +125,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// SKU capacity emulation: list profiles, validate a profile, or estimate a target.
+    Emu(emu::EmuArgs),
     /// Measure this host's GPU share for a split offload step.
     OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
@@ -751,6 +754,11 @@ pub(crate) struct BenchArgs {
     /// no trimming). Mutually exclusive with positional PROMPT words.
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+    /// SKU capacity-emulation profile (`hipfire emu list`) or `off` for every
+    /// spawned bench daemon. Overrides `HIPFIRE_EMU`, including `off`. The host
+    /// still executes at full speed; only application memory capacity is capped.
+    #[arg(long, value_name = "ID|off")]
+    emu: Option<String>,
 }
 
 impl BenchArgs {
@@ -997,6 +1005,7 @@ fn run() -> Result<()> {
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::Emu(args)) => emu::emu_command(&paths, args),
         Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
@@ -5806,6 +5815,9 @@ fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
 }
 
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+    // An explicit `--emu` is validated before anything else (model lookup, pull,
+    // daemon spawn): an unknown id or a UMA-knob conflict is a hard error here.
+    emu::preflight_bench(paths, args.emu.as_deref())?;
     if args.runs == 0 {
         bail!("--runs must be positive");
     }
@@ -6555,6 +6567,13 @@ fn open_bench_engine(
             .values
             .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
     }
+    // `--emu` overrides HIPFIRE_EMU in this child's process snapshot (including
+    // `off`). Every bench arm (standard, matrix, ttft, concurrency, exp) opens its
+    // daemon here, so every spawned arm gets the same profile.
+    let effective_emu = emu::apply_cli_override(&mut process_config, args.emu.as_deref())?;
+    if let Some(line) = effective_emu.log_line() {
+        eprintln!("  {line}");
+    }
     let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
@@ -7118,6 +7137,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
+            emu: None,
         };
         let (mut engine, _, _, _, _, _, _) =
             open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
@@ -16747,6 +16767,7 @@ mod tests {
             temperature: None,
             prompt,
             prompt_file,
+            emu: None,
         }
     }
 

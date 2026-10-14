@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hipfire_config::devices::{RDNA_CU_MASK_BAN, cu_mask_refused_on};
+use hipfire_config::emu_budget;
 
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
@@ -2323,41 +2324,52 @@ impl KernargPool {
                 pointer: None,
                 length: 0,
                 allocation_size: 0,
+                budget_token: None,
             });
         }
         let allocation_size = length
             .checked_add(self.inner.granule - 1)
             .map(|value| value / self.inner.granule * self.inner.granule)
             .ok_or(RuntimeError::KernargSizeOverflow(length))?;
-        let mut pointer = ptr::null_mut();
-        // SAFETY: selected pool allows runtime allocations and output is valid.
-        let status = unsafe {
-            (self.inner.runtime.symbols.memory_pool_allocate)(
-                self.inner.pool,
-                allocation_size,
-                flags,
-                &mut pointer,
-            )
-        };
-        check_status(
-            &self.inner.runtime.symbols,
-            "hsa_amd_memory_pool_allocate",
-            status,
+        // Emu capacity gate: reserve the rounded size before the raw pool
+        // allocation; no-op (one `active()` check) when emu is off.
+        let (reservation, pointer) = reserve_then_allocate(
+            || reserve_kernarg_budget(self.inner.device_local, allocation_size),
+            || {
+                let mut pointer = ptr::null_mut();
+                // SAFETY: selected pool allows runtime allocations and output is valid.
+                let status = unsafe {
+                    (self.inner.runtime.symbols.memory_pool_allocate)(
+                        self.inner.pool,
+                        allocation_size,
+                        flags,
+                        &mut pointer,
+                    )
+                };
+                check_status(
+                    &self.inner.runtime.symbols,
+                    "hsa_amd_memory_pool_allocate",
+                    status,
+                )?;
+                match NonNull::new(pointer.cast::<u8>()) {
+                    Some(pointer) => Ok(pointer),
+                    None => Err(RuntimeError::InvalidRuntimeObject(
+                        "memory-pool allocation returned null",
+                    )),
+                }
+            },
         )?;
-        let pointer = match NonNull::new(pointer.cast::<u8>()) {
-            Some(pointer) => pointer,
-            None => {
-                return Err(RuntimeError::InvalidRuntimeObject(
-                    "memory-pool allocation returned null",
-                ));
-            }
-        };
         if pointer.as_ptr() as usize % required_alignment != 0
             || pointer.as_ptr() as usize % self.inner.alignment != 0
         {
             // SAFETY: pointer came from the matching allocation function.
-            let _ =
+            let free_status =
                 unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            settle_reservation_after_cleanup(
+                reservation,
+                free_status == abi::STATUS_SUCCESS,
+                emu_budget::Reservation::commit,
+            );
             return Err(RuntimeError::KernargAlignmentNotMet {
                 required: required_alignment.max(self.inner.alignment),
                 address: pointer.as_ptr() as usize,
@@ -2386,8 +2398,13 @@ impl KernargPool {
             status,
         ) {
             // SAFETY: pointer came from the matching allocation function.
-            let _ =
+            let free_status =
                 unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            settle_reservation_after_cleanup(
+                reservation,
+                free_status == abi::STATUS_SUCCESS,
+                emu_budget::Reservation::commit,
+            );
             return Err(error);
         }
         // Zero the entire allocation before callers populate the ABI payload,
@@ -2403,7 +2420,223 @@ impl KernargPool {
             pointer: Some(pointer),
             length,
             allocation_size,
+            budget_token: reservation.map(emu_budget::Reservation::commit),
         })
+    }
+}
+
+/// Emu capacity class charged for a kernarg-pool allocation: device-local
+/// (VRAM) pools charge the device, CPU/system pools charge pinned GTT host.
+fn kernarg_budget_class(device_local: bool) -> emu_budget::AllocationClass {
+    if device_local {
+        emu_budget::AllocationClass::Device
+    } else {
+        emu_budget::AllocationClass::HostPinnedGtt
+    }
+}
+
+/// Reserve the rounded `allocation_size` against the emu ledger. `Ok(None)`
+/// (no ledger work at all) when no emu budget is installed.
+fn reserve_kernarg_budget(
+    device_local: bool,
+    allocation_size: usize,
+) -> Result<Option<emu_budget::Reservation>, RuntimeError> {
+    let Some(id) = emu_budget::active() else {
+        return Ok(None);
+    };
+    let (class, class_name) = if device_local {
+        (kernarg_budget_class(true), "device-local")
+    } else {
+        (kernarg_budget_class(false), "host-pinned GTT")
+    };
+    emu_budget::reserve(id, class, allocation_size as u64)
+        .map(Some)
+        .map_err(|error| {
+            RuntimeError::EmuBudgetRefused(format!(
+                "emulated SKU capacity refused {allocation_size}-byte {class_name} kernarg pool \
+                 allocation: {error}"
+            ))
+        })
+}
+
+/// Reserve first, then run the raw allocation. A refused reservation never
+/// reaches `raw`; a failed `raw` drops (rolls back) the reservation.
+fn reserve_then_allocate<R, P, E>(
+    reserve: impl FnOnce() -> Result<Option<R>, E>,
+    raw: impl FnOnce() -> Result<P, E>,
+) -> Result<(Option<R>, P), E> {
+    let reservation = reserve()?;
+    let allocation = raw()?;
+    Ok((reservation, allocation))
+}
+
+/// Settle a reservation whose raw allocation succeeded but was then freed on
+/// an error path. A successful free rolls the reservation back; a failed free
+/// commits it and leaves the charge outstanding (the token is not releasing).
+fn settle_reservation_after_cleanup<R, T>(
+    reservation: Option<R>,
+    raw_freed: bool,
+    commit: impl FnOnce(R) -> T,
+) {
+    if let Some(reservation) = reservation {
+        if raw_freed {
+            drop(reservation);
+        } else {
+            let _retained = commit(reservation);
+        }
+    }
+}
+
+/// Release a committed charge only after the physical free succeeded.
+fn release_after_free<T>(token: Option<T>, raw_freed: bool, release: impl FnOnce(T)) {
+    if let Some(token) = token {
+        if raw_freed {
+            release(token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod emu_kernarg_budget_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+
+    /// Reservation stand-in recording rollback (drop) vs commit.
+    struct FakeReservation<'a> {
+        log: &'a RefCell<Vec<&'static str>>,
+        committed: bool,
+    }
+
+    impl<'a> FakeReservation<'a> {
+        fn new(log: &'a RefCell<Vec<&'static str>>) -> Self {
+            Self {
+                log,
+                committed: false,
+            }
+        }
+
+        fn commit(mut self) -> &'static str {
+            self.committed = true;
+            self.log.borrow_mut().push("commit");
+            "token"
+        }
+    }
+
+    impl Drop for FakeReservation<'_> {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.log.borrow_mut().push("rollback");
+            }
+        }
+    }
+
+    #[test]
+    fn class_follows_pool_locality() {
+        assert!(matches!(
+            kernarg_budget_class(true),
+            emu_budget::AllocationClass::Device
+        ));
+        assert!(matches!(
+            kernarg_budget_class(false),
+            emu_budget::AllocationClass::HostPinnedGtt
+        ));
+    }
+
+    #[test]
+    fn disabled_state_reserves_nothing() {
+        // No emu budget is installed by these CPU tests.
+        assert!(emu_budget::active().is_none());
+        assert!(matches!(reserve_kernarg_budget(true, 4096), Ok(None)));
+        assert!(matches!(reserve_kernarg_budget(false, 4096), Ok(None)));
+    }
+
+    #[test]
+    fn refusal_never_reaches_raw_allocation() {
+        let raw_calls = Cell::new(0);
+        let result: Result<(Option<()>, u32), &'static str> = reserve_then_allocate(
+            || Err("refused"),
+            || {
+                raw_calls.set(raw_calls.get() + 1);
+                Ok(7)
+            },
+        );
+        assert_eq!(result.err(), Some("refused"));
+        assert_eq!(raw_calls.get(), 0);
+    }
+
+    #[test]
+    fn raw_failure_rolls_back_reservation() {
+        let log = RefCell::new(Vec::new());
+        let result: Result<(Option<FakeReservation<'_>>, u32), &'static str> =
+            reserve_then_allocate(|| Ok(Some(FakeReservation::new(&log))), || Err("raw failed"));
+        assert_eq!(result.err(), Some("raw failed"));
+        assert_eq!(*log.borrow(), ["rollback"]);
+    }
+
+    #[test]
+    fn raw_success_keeps_reservation_pending_for_commit() {
+        let log = RefCell::new(Vec::new());
+        let (reservation, value) = reserve_then_allocate::<_, _, &'static str>(
+            || Ok(Some(FakeReservation::new(&log))),
+            || Ok(11u32),
+        )
+        .unwrap();
+        assert_eq!(value, 11);
+        assert!(log.borrow().is_empty());
+        assert_eq!(reservation.map(FakeReservation::commit), Some("token"));
+        assert_eq!(*log.borrow(), ["commit"]);
+    }
+
+    #[test]
+    fn disabled_path_passes_through_without_reservation() {
+        let (reservation, value) = reserve_then_allocate::<FakeReservation<'_>, _, &'static str>(
+            || Ok(None),
+            || Ok(5u32),
+        )
+        .unwrap();
+        assert!(reservation.is_none());
+        assert_eq!(value, 5);
+    }
+
+    #[test]
+    fn cleanup_after_successful_free_rolls_back() {
+        let log = RefCell::new(Vec::new());
+        settle_reservation_after_cleanup(
+            Some(FakeReservation::new(&log)),
+            true,
+            FakeReservation::commit,
+        );
+        assert_eq!(*log.borrow(), ["rollback"]);
+    }
+
+    #[test]
+    fn cleanup_after_failed_free_retains_charge() {
+        let log = RefCell::new(Vec::new());
+        settle_reservation_after_cleanup(
+            Some(FakeReservation::new(&log)),
+            false,
+            FakeReservation::commit,
+        );
+        // Committed, never rolled back, never released.
+        assert_eq!(*log.borrow(), ["commit"]);
+    }
+
+    #[test]
+    fn cleanup_without_reservation_is_a_no_op() {
+        settle_reservation_after_cleanup::<FakeReservation<'_>, _>(None, true, |_| ());
+        settle_reservation_after_cleanup::<FakeReservation<'_>, _>(None, false, |_| ());
+    }
+
+    #[test]
+    fn release_only_after_successful_free() {
+        let released = Cell::new(0);
+        release_after_free(Some("token"), true, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1);
+        release_after_free(Some("token"), false, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1, "failed free must retain the charge");
+        release_after_free(None::<&str>, true, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1, "no token means nothing to release");
     }
 }
 
@@ -2429,6 +2662,8 @@ pub struct KernargBuffer {
     pointer: Option<NonNull<u8>>,
     length: usize,
     allocation_size: usize,
+    /// Emu capacity-ledger charge for this backing (`None` when emu is off).
+    budget_token: Option<emu_budget::AllocationToken>,
 }
 
 impl fmt::Debug for KernargBuffer {
@@ -2514,8 +2749,15 @@ impl Drop for KernargBuffer {
             // The owning graph guarantees all dispatches have completed.
             // SAFETY: pointer was allocated from this runtime memory pool and
             // is uniquely owned here.
-            let _ =
+            let status =
                 unsafe { (self.pool.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            // The emu charge is released only after the physical backing was
+            // freed; a failed free retains the charge (token dropped unreleased).
+            release_after_free(
+                self.budget_token.take(),
+                status == abi::STATUS_SUCCESS,
+                emu_budget::release,
+            );
         }
     }
 }
@@ -3171,6 +3413,10 @@ pub enum RuntimeError {
     /// `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` is set while an RDNA device may be
     /// visible; refused at runtime initialization (`hipfire_config::devices::cu_mask_env_guard`).
     CuMaskEnvRefused(String),
+    /// The emu capacity ledger (`HIPFIRE_EMU`) refused an allocation before the
+    /// raw ROCr pool allocation was attempted; this is the out-of-memory
+    /// analogue for an emulated smaller SKU.
+    EmuBudgetRefused(String),
     ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
@@ -3286,6 +3532,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "CU mask refused on {device}: {RDNA_CU_MASK_BAN}")
             }
             Self::CuMaskEnvRefused(message) => f.write_str(message),
+            Self::EmuBudgetRefused(message) => f.write_str(message),
             Self::ProfilingUnavailable(symbol) => {
                 write!(f, "ROCr profiling capability is unavailable: {symbol}")
             }

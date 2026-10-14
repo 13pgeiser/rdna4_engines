@@ -1176,31 +1176,27 @@ fn qwen4_placement_inputs(
 }
 
 /// Free VRAM of every device in `devices` (HIP logical ids), in order, as
-/// `hipMemGetInfo` reports it before any rank of the load allocates. Run on
-/// the thread that owns `gpu` (the daemon thread): other devices are queried
-/// by switching the thread's current device, and `gpu`'s is restored with a
-/// raw `hipSetDevice` after every query. `Gpu::bind_thread` cannot restore it:
-/// its per-thread cache still names `gpu`'s device, so it would skip the call
-/// and leave every later rank-0 allocation on the last queried device.
+/// [`rdna_compute::Gpu::device_mem_info_for`] reports it before any rank of
+/// the load allocates. Run on the thread that owns `gpu` (the daemon thread):
+/// other devices are queried by `device_mem_info_for`, which switches the
+/// thread's current device with raw HIP setters and restores the previous
+/// ACTUAL current device on every return path (`Gpu::bind_thread` cannot do
+/// that: its per-thread cache still names `gpu`'s device, so it would skip the
+/// call and leave every later rank-0 allocation on the last queried device).
+///
+/// Under a `HIPFIRE_EMU` profile expert parallelism is refused (single-device
+/// capacity budget); a one-device list is the budget owner's capped query.
 pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Vec<u64>, String> {
+    if devices.len() > 1 {
+        gpu.emu_refuse_multi_device("qwen4 expert parallelism")
+            .map_err(|error| format!("qwen4: {error}"))?;
+    }
     let mut free = Vec::with_capacity(devices.len());
     for &device in devices {
-        let bytes = if device == gpu.device_id {
-            gpu.device_mem_info().map(|(free, _)| free)
-        } else {
-            let queried = gpu
-                .hip
-                .set_device(device)
-                .and_then(|_| gpu.hip.get_vram_info())
-                .map(|(free, _)| free);
-            gpu.hip
-                .set_device(gpu.device_id)
-                .map_err(|error| format!("qwen4: restoring device {}: {error}", gpu.device_id))?;
-            queried
-        };
-        free.push(
-            bytes.map_err(|error| format!("qwen4: device {device} memory query: {error}"))? as u64,
-        );
+        let (bytes, _) = gpu
+            .device_mem_info_for(device)
+            .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
+        free.push(bytes as u64);
     }
     Ok(free)
 }
@@ -1807,6 +1803,12 @@ pub fn load_qwen4_rank(
         residency::check_host_ram(host_check_bytes, mem_available, ttm_pool)
             .map_err(|error| format!("qwen4: {error}"))?;
         residency::check_gtt_cap(host_check_bytes, residency::gtt_budget())
+            .map_err(|error| format!("qwen4: {error}"))?;
+        // SKU emulation: the same pinned-host (GTT) bytes against the capacity
+        // ledger's shared-host/GTT room, in addition to the real checks above.
+        // No-op when HIPFIRE_EMU is off.
+        ctx.gpu
+            .emu_check_host_allocation(host_check_bytes, true)
             .map_err(|error| format!("qwen4: {error}"))?;
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
         eprintln!(

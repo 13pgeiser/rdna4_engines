@@ -3984,13 +3984,18 @@ fn load_model_ep_ds4(
             &config,
             ep_prefill_max_batch,
         )?;
+        // TP across several devices has no per-rank budget: refuse under a
+        // HIPFIRE_EMU profile (a no-op when emulation is off).
+        staging.gpus_mut().devices[0]
+            .emu_refuse_multi_device("gfx1201 TP batched prefill")
+            .map_err(|e| format!("{e:?}"))?;
         for rank in 0..n {
             let dev = &mut staging.gpus_mut().devices[rank];
             dev.bind_thread()
                 .map_err(|e| format!("bind gfx1201 TP prefill rank {rank}: {e:?}"))?;
+            // Capped per-device query (UMA-safe clamp, then the emu cap).
             let (free, _total) = dev
-                .hip
-                .get_vram_info()
+                .device_mem_info_for(dev.device_id)
                 .map_err(|e| format!("query gfx1201 TP prefill VRAM rank {rank}: {e:?}"))?;
             if free < projected {
                 return Err(format!(

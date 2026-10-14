@@ -3602,6 +3602,11 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
             }
         }
         d.bind_thread()?;
+        // PHYSICAL (raw hipMemGetInfo) per-rank free memory: this uniformity
+        // proof compares real cards and is never an emulated capacity. Several
+        // devices cannot share a single-device HIPFIRE_EMU budget, so multi-GPU
+        // is refused under emulation (Gpu init refuses a second device and
+        // HIPFIRE_EMULATE_GPUS); this raw query is unreachable there.
         let (free, _total) = d.hip.get_vram_info()?;
         frees.push(free);
     }

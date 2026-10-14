@@ -535,6 +535,13 @@ impl VmmArena {
         fd: BorrowedFd<'_>,
         physical_bytes: usize,
     ) -> HipResult<Self> {
+        // Emu: refuse an over-cap import before the (never-freed) VA reservation
+        // is consumed. The authoritative reserve/commit happens in
+        // `mem_import_posix_charged`, which also keeps the token with the handle
+        // until `mem_release` succeeds.
+        if let Some(budget) = crate::emu_budget::active() {
+            crate::emu_budget::precheck(&budget, crate::emu_budget::Class::Device, physical_bytes)?;
+        }
         let mut arena = Self::reserve_kind(
             hip,
             device,
@@ -542,7 +549,7 @@ impl VmmArena {
             VmmArenaKind::ImportedReadOnly,
             true,
         )?;
-        let handle = match hip.mem_import_posix(fd) {
+        let handle = match hip.mem_import_posix_charged(fd, physical_bytes) {
             Ok(handle) => handle,
             Err(err) => return Err(arena.abort_import(hip, None, false, err)),
         };

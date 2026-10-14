@@ -50,7 +50,7 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// (`ReservedSharedMemPerBlock` was inserted ahead of
 /// `MaxSharedMemoryPerBlock`, moving it 74 → 75), so re-verify on any ROCm
 /// bump — see [`Gpu::is_uma`], the only consumer.
-const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
+pub(crate) const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
 /// Process-wide host→device upload counter, read through [`Gpu::htod_uploads`].
 /// Diagnostics only: a per-call constant upload in a hot loop is invisible in a
@@ -1318,6 +1318,9 @@ pub struct Gpu {
     /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
     /// via `Gpu::route_rows` while launches keep the real row count.
     pub prefill_invariant_scope: bool,
+    /// SKU-emulation state (`HIPFIRE_EMU`): profile, host facts and the
+    /// installed budget id. `None` when emulation is off (the default).
+    pub(crate) emu: Option<crate::emu::EmuGpuState>,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
@@ -1580,11 +1583,16 @@ impl Gpu {
     /// page pool estimate); see [`crate::uma_memory::device_free_from`].
     /// Discrete GPUs and carve-out APUs get `hipMemGetInfo` unchanged. Every
     /// free-memory sizing site uses this, not `hip.get_vram_info` directly.
+    ///
+    /// Under a `HIPFIRE_EMU` profile the UMA-safe figure is then capped by the
+    /// profile ([`crate::uma_memory::emu_capped_mem_info`]): the same
+    /// managed-allocation ledger the allocators charge. Off-state unchanged.
     pub fn device_mem_info(&self) -> HipResult<(usize, usize)> {
         self.bind_thread()?;
         let (free, total) = self.hip.get_vram_info()?;
+        // Emu cap applies after the UMA-safe clamp; identity without an installed profile.
         if !self.is_uma() {
-            return Ok((free, total));
+            return Ok(self.emu_cap_mem_info(free, total));
         }
         use crate::uma_memory;
         let carveout_total = self
@@ -1607,7 +1615,7 @@ impl Gpu {
                 "unified-memory free bytes: /proc/meminfo has no readable MemAvailable",
             )
         })?;
-        Ok((free.min(usize::MAX as u64) as usize, total))
+        Ok(self.emu_cap_mem_info(free.min(usize::MAX as u64) as usize, total))
     }
 
     /// Install a real stream if launches are still going to the null stream.
@@ -1905,6 +1913,11 @@ impl Gpu {
         // Set once here: this `Gpu` owns its `HipRuntime` for exactly one
         // device, so the per-runtime limit is race-free.
         hip.set_launch_grid_limit_for_arch(&detected_arch);
+        // SKU emulation (capacity-only): install the process budget now, after
+        // set_device and the real-arch read and before any pool, model,
+        // scratch, CK workspace or rocBLAS allocation. No-op when HIPFIRE_EMU
+        // is unset; any failure is a hard init error (no uncapped fallback).
+        let emu = crate::emu::install_for_device(&hip, id, &detected_arch)?;
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -2137,6 +2150,7 @@ impl Gpu {
             qwen4_scope: false,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            emu,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {

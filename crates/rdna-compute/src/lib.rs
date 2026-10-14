@@ -18,6 +18,8 @@ pub mod dflash_state_copy;
 pub mod device_wait;
 mod dispatch;
 pub mod embedding;
+pub mod emu;
+pub mod emu_validate;
 pub mod feature_flags;
 pub mod fp8_e4m3;
 #[cfg(feature = "flash-attn-ck")]

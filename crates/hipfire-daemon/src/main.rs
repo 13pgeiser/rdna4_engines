@@ -80,6 +80,8 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod emu_daemon;
+use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
 mod request_guards;
@@ -2409,8 +2411,8 @@ fn main() {
                                     Err(e) => Some(e),
                                 };
                                 let mut msg = format!(
-                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
-                                    gpu.arch,
+                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {}{}",
+                                    gpu_memory_text(&gpu, free_mb, total_mb),
                                     no_model_loaded_suffix(model.is_some())
                                 );
                                 if let Some(rb) = rollback_err {
@@ -2740,8 +2742,8 @@ fn main() {
                             &mut stdout,
                             None,
                             &format!(
-                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
-                                gpu.arch,
+                                "load failed: {e}. GPU: {}{}",
+                                gpu_memory_text(&gpu, free_mb, total_mb),
                                 no_model_loaded_suffix(model.is_some())
                             ),
                             "gpu",
@@ -4527,8 +4529,7 @@ fn main() {
                     .expect("kv_backend_warning serializable");
                 let kv_mode_json = serde_json::to_string(&kv.and_then(|k| k.mode.as_deref()))
                     .expect("kv_mode serializable");
-                let _ = writeln!(
-                    stdout,
+                let mut diag_line = format!(
                     r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{},"kv_backend":{},"kv_backend_request":{},"kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"kv_mode":{}}}"#,
                     gpu.arch,
                     hip_ver.0,
@@ -4546,8 +4547,12 @@ fn main() {
                     kv_warning_json,
                     kv_mode_json,
                 );
+                emu_daemon::append_diag_emu(&gpu, &mut diag_line);
+                let _ = writeln!(stdout, "{diag_line}");
                 let _ = stdout.flush();
             }
+
+            "emu_validate" => validate(&mut gpu, &msg, &mut stdout, (&model, &slot_backend)),
 
             "bench_prefill" => {
                 // Synthetic prefill benchmark — measures the architecture's
