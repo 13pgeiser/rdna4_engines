@@ -444,13 +444,15 @@ impl Model {
         }
     }
 
-    /// Greedy ids for `prompt` from a fresh state and why they ended: the
-    /// first terminator (included, "stop") or `max_new` tokens ("length").
+    /// Greedy ids for `prompt` from a fresh state, why they ended (the first
+    /// terminator, included, "stop"; or `max_new` tokens, "length") and the
+    /// prefill wall seconds (`prefill_final` through the prompt-logits
+    /// download, which synchronizes the device).
     fn generate(
         &mut self,
         prompt: &[u32],
         max_new: usize,
-    ) -> Result<(Vec<u32>, &'static str), String> {
+    ) -> Result<(Vec<u32>, &'static str, f64), String> {
         if prompt.is_empty() {
             return Err("prompt rendered to zero tokens".into());
         }
@@ -466,6 +468,7 @@ impl Model {
             ));
         }
         // `reused = 0` with no session cache attached resets every owner.
+        let prefill_started = std::time::Instant::now();
         self.bundle
             .prefill_final(&mut self.gpu, prompt, 0, &self.prompt_logits)
             .map_err(|e| format!("prefill: {e}"))?;
@@ -473,6 +476,7 @@ impl Model {
             .gpu
             .download_f32(&self.prompt_logits)
             .map_err(|e| e.to_string())?;
+        let prefill_s = prefill_started.elapsed().as_secs_f64();
         if row.iter().any(|v| !v.is_finite()) {
             return Err("non-finite prefill logits".into());
         }
@@ -487,10 +491,10 @@ impl Model {
                 .map_err(|e| format!("decode: {e}"))?;
             ids.push(token);
             if token == self.eos_token || self.tokenizer.is_terminator(token) {
-                return Ok((ids, "stop"));
+                return Ok((ids, "stop", prefill_s));
             }
         }
-        Ok((ids, "length"))
+        Ok((ids, "length", prefill_s))
     }
 }
 
@@ -518,18 +522,19 @@ fn run() -> Result<(), String> {
         let prompt = model
             .prompt_ids(&record.prompt, args.thinking)
             .map_err(|e| format!("record {label}: {e}"))?;
-        let (ids, finish) = model
+        let (ids, finish, prefill_s) = model
             .generate(&prompt, args.max_new_tokens)
             .map_err(|e| format!("record {label}: {e}"))?;
         writeln!(out, "{}", output_line(&record.id, &ids, finish, prompt.len()))
             .and_then(|()| out.flush())
             .map_err(|e| format!("write output: {e}"))?;
         eprintln!(
-            "qwen4_greedy_ids: {}/{total} id {label}: prompt {} tokens, generated {}  {:.0}s",
+            "qwen4_greedy_ids: {}/{total} id {label}: prompt {} tokens, generated {}  {:.0}s  prefill {:.3}s",
             i + 1,
             prompt.len(),
             ids.len(),
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            prefill_s
         );
     }
     Ok(())
