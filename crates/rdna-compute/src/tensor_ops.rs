@@ -3995,7 +3995,7 @@ fn indexed_attention_select_rows8(
     mirror: Option<&GpuTensor>,
     pm: QsaSelectPmArm,
 ) -> HipResult<bool> {
-    let filter = qsa_filter_production(gpu, p);
+    let filter = qsa_filter_production(gpu, p, pm);
     indexed_attention_select_rows8_core(gpu, p, mirror, pm, filter, None)
 }
 
@@ -4188,10 +4188,18 @@ const QSA_FILTER_CAP: usize = 4096;
 /// The kernels stage samples and candidates in LDS: neither may exceed 4096.
 const QSA_FILTER_MAX_SAMPLES: usize = 4096;
 const QSA_FILTER_MAX_CAP: usize = 4096;
-/// The route is used for calls with more pooled blocks than this.
+/// Blocks above which the filter replaces select-from-scores. It beats the
+/// hipcc select from 8192 blocks; against the PM select (gfx1151) only past
+/// the measured crossovers (Halo, per call: 1-16 rows PM 18.6 / 50.7 us vs
+/// filter 37 / 39 us at 8192 / 32768 blocks; 256 rows PM 0.26 / 1.15 ms vs
+/// filter 0.35 / 0.80 ms at 32768 / 65536 blocks).
 const QSA_FILTER_MIN_BLOCKS: usize = 4096;
+const QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS: usize = 24576;
+const QSA_FILTER_MIN_BLOCKS_PM: usize = 49152;
+/// Calls of at most this many rows (decode, verify) use the few-row crossover.
+const QSA_FILTER_FEW_ROWS: usize = 16;
 /// `HIPFIRE_QWEN4_QSA_FILTER_SELECT=1` runs eager gfx11+ calls of more than
-/// [`QSA_FILTER_MIN_BLOCKS`] blocks and at most
+/// [`qsa_filter_min_blocks`] blocks and at most
 /// [`QSA_SELECT_FROM_SCORES_MAX_BUDGET`] budget blocks through the filter
 /// trio instead of select-from-scores. Default off. Read once.
 static QWEN4_QSA_FILTER_SELECT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -4230,15 +4238,28 @@ fn qsa_filter_cfg_check(k: QsaFilterCfg) -> HipResult<()> {
     Ok(())
 }
 
+fn qsa_filter_min_blocks(rows: usize, pm_select: bool) -> usize {
+    match (pm_select, rows <= QSA_FILTER_FEW_ROWS) {
+        (false, _) => QSA_FILTER_MIN_BLOCKS,
+        (true, true) => QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS,
+        (true, false) => QSA_FILTER_MIN_BLOCKS_PM,
+    }
+}
+
 /// Production admission of the filter route for a call the score/select
 /// route already admitted: env on, gfx11+ SIMT, eager, more than
-/// [`QSA_FILTER_MIN_BLOCKS`] blocks, budget within the select bound.
-fn qsa_filter_production(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> Option<QsaFilterCfg> {
+/// [`qsa_filter_min_blocks`] blocks for the select it replaces, budget within
+/// the select bound.
+fn qsa_filter_production(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    pm: QsaSelectPmArm,
+) -> Option<QsaFilterCfg> {
     (*QWEN4_QSA_FILTER_SELECT
         && gpu.arch_caps.has_gfx11_plus_simt()
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
-        && p.block_count > QSA_FILTER_MIN_BLOCKS
+        && p.block_count > qsa_filter_min_blocks(p.rows, pm.select())
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
         && qsa_filter_score_group(p.block_count).is_some())
         .then_some(QSA_FILTER_PRODUCTION)
