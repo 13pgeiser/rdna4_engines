@@ -16,9 +16,9 @@
 //! the qwen4 forward on gfx1151 via `Gpu::prefill_invariant_scope`.
 //!
 //! The same canonical-routing switch is also engaged per tile by the agent-turn
-//! append route (`HIPFIRE_QWEN4_APPEND_WMMA`, exact gfx1151, prefill tiles of
-//! `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS..512` rows), which additionally
-//! suppresses the symmetric IU4 MoE arm for that tile
+//! append route (`HIPFIRE_QWEN4_APPEND_WMMA`, on by default, exact gfx1151,
+//! prefill tiles of `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS..512` rows), which
+//! additionally suppresses the symmetric IU4 MoE arm for that tile
 //! (`Gpu::qwen4_append_f16_moe_scope`).
 
 use crate::dispatch::Gpu;
@@ -67,10 +67,12 @@ pub fn qwen4_gdn_prefill() -> Qwen4GdnPrefill {
     *QWEN4_GDN_PREFILL
 }
 
-/// Default of `HIPFIRE_QWEN4_APPEND_WMMA`.
-pub const QWEN4_APPEND_WMMA_DEFAULT: bool = false;
-/// Default of `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS`.
-pub const QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT: usize = 64;
+/// Default of `HIPFIRE_QWEN4_APPEND_WMMA`: on (KLD, coherence and timing gates
+/// on Strix Halo in the 0.4.3 CHANGELOG).
+pub const QWEN4_APPEND_WMMA_DEFAULT: bool = true;
+/// Default of `HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS`: above the measured
+/// F32/append-route crossover (the route loses at 33 rows, wins at 55 and 81).
+pub const QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT: usize = 48;
 
 static QWEN4_APPEND_WMMA: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_APPEND_WMMA", QWEN4_APPEND_WMMA_DEFAULT)
@@ -184,7 +186,7 @@ mod tests {
 
     #[test]
     fn append_route_defaults() {
-        assert!(!QWEN4_APPEND_WMMA_DEFAULT);
+        assert!(QWEN4_APPEND_WMMA_DEFAULT);
         assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT >= 2);
         assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT < QWEN4_F16_WMMA_MIN_TOKENS);
     }
