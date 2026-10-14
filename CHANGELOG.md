@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **`scripts/install.sh` installs the latest release by default.** With no `--tag`/`--branch`/`--ref`/`--commit`, the installer resolves the latest published release tag from the GitHub releases API (`releases/latest`) and installs that tag with its prebuilt kernel pack, instead of the master branch. If the API cannot be reached or returns no usable tag, it warns and falls back to master. `--branch master`/`--branch beta` still install a branch; the interactive prompt defaults to the latest tag. New `--print-selection` prints the resolved selector and exits; `HIPFIRE_RELEASES_LATEST_API` overrides the API URL for tests.
 - **Crate maps: one sorted entry per line.** `scripts/check-crate-maps.py` now generates only stable structure — each `src/**/*.rs` file with a sub-list of its exported symbols, plus dependency and reverse-dependency edges — and drops the per-file line, public-item and test counts and the totals line. Every generated list and sub-list is sorted alphabetically with one entry per line (dependencies under one `####` heading per kind), so branches that add different entries merge without conflict. `--check` still fails when a file is added or removed, an export changes, or a dependency edge changes; a body-only edit no longer needs a regen. All 50 `crates/*/map.md` regenerated; `docs/crate-maps.md` updated.
 
 ## v0.4.2 — 2026-10-14
