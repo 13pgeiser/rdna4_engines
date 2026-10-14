@@ -24,7 +24,7 @@ fn probe(arch:Arch)->Result<Emitted,String>{
  b.finish()
 }
 const USAGE:&str="usage: peacemaker-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel spec_sampling_rows_pm|spec_accept_pm --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_ep_owner_assign_pm --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE --proof FILE\n       peacemaker-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
-const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       peacemaker-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)\n       peacemaker-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (tiles bt1w1, bt{2,4,8}w{4,8}; with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_fp8_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (the four-export lane-rows module qwen4_lane_rows_pm; --co is required and M7 runs on every export of the linked object)\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module mq4_rows_x4_pm_<arch> holds the single export gemv_mq4g256v2_rows_x4_pm_<arch>)\n       peacemaker-isa emit --kernel mtp_dense_det_gfx11 [--epi w8|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (experimental standalone DET dense F16 WMMA GEMM, module mtp_dense_det_pm_gfx1151; --co is required and M7 runs on the single export of the linked object; no --shape: its contract is committed in kernels/)";
+const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       peacemaker-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)\n       peacemaker-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (tiles bt1w1, bt{2,4,8}w{4,8}; with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_fp8_verify.gfx1201.<entry>.contract.json)\n       peacemaker-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (the four-export lane-rows module qwen4_lane_rows_pm; --co is required and M7 runs on every export of the linked object)\n       peacemaker-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module mq4_rows_x4_pm_<arch> holds the single export gemv_mq4g256v2_rows_x4_pm_<arch>)\n       peacemaker-isa emit --kernel mq_i4_rows [--epi w3_r256|w3_r128|w2_r256|w2_r128|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (the four-export planar MQ-I4 row module mq_i4_rows_pm_gfx1201; with --co, M7 runs on every selected export of the linked object; --shape writes DIR/mq_i4_rows.gfx1201.<codec>_<rotation>.contract.json)\n       peacemaker-isa emit --kernel mtp_dense_det_gfx11 [--epi w8|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (experimental standalone DET dense F16 WMMA GEMM, module mtp_dense_det_pm_gfx1151; --co is required and M7 runs on the single export of the linked object; no --shape: its contract is committed in kernels/)";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
 fn iu4_gemm(fold:&str,tile:&str,cacc:&str,epi:&str,act:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -163,6 +163,21 @@ fn mq4_rows_x4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  if epi=="all"{let (_,text,proof)=mq4_rows_x4::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
  if epi!="entry"{return Err(format!("mq4_rows_x4 --epi {epi} (entry|all)"))}
  let e=mq4_rows_x4::emit(Spec{arch})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1201 planar MQ3-I4 / MQ2-I4 one-row decode GEMVs (`kernels::mq_i4_rows`):
+/// `--epi <w3|w2>_<r256|r128>` one entry, `all` (default) the four-entry module.
+fn mq_i4_rows_specs(epi:&str,arch:Arch)->Result<Vec<peacemaker_isa::kernels::mq_i4_rows::Spec>,String>{
+ use peacemaker_isa::kernels::mq_i4_rows;
+ let all=mq_i4_rows::module_specs(arch);
+ if epi=="all"{return Ok(all)}
+ all.into_iter().find(|s|s.tag()==epi).map(|s|vec![s]).ok_or_else(||format!("mq_i4_rows --epi {epi} (w3_r256|w3_r128|w2_r256|w2_r128|all)"))
+}
+fn mq_i4_rows(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use peacemaker_isa::kernels::mq_i4_rows;
+ if epi=="all"{let (_,text,proof)=mq_i4_rows::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let [spec]=mq_i4_rows_specs(epi,arch)?[..] else {return Err("mq_i4_rows: one entry expected".into())};
+ let e=mq_i4_rows::emit(spec)?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// gfx1151 Flash-Next shared-expert gate/up (fused GEMM + BF16-recipe SwiGLU + selector sigmoid + F16 hidden):
@@ -336,6 +351,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_lane_rows"=>qwen4_lane_rows(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq4_x4_gfx11"=>qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
+  "mq_i4_rows"=>mq_i4_rows(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_shared_gu_gfx11"=>qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mtp_dense_det_gfx11"=>mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mtp_q8_det_gfx11"=>mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
@@ -347,11 +363,12 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  let pm_module=kernel.strip_prefix("pm_decode_");
  let mq4v=kernel=="mq4_verify";
  let mq4f8=kernel=="mq4_fp8_verify";
+ let mqi4=kernel=="mq_i4_rows";
  let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk"||kernel=="npu_trunk_arena";
  let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm";
  let mtp_q8=kernel=="mtp_q8_det_gfx11";
  let mtp_det=kernel=="mtp_dense_det_gfx11"||mtp_q8;
- if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n4_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
+ if pm_module.is_none()&&!mq4v&&!mq4f8&&!mqi4&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, mq_i4_rows, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n4_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
  if spec_pm&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if lane_rows&&shape.is_some() {return Err("qwen4_lane_rows has no --shape contract (use --m7)".into())}
  if lane_rows&&co.is_none() {return Err("qwen4_lane_rows emission requires --co (M7 certifies the linked object)".into())}
@@ -360,6 +377,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  if pm_module.is_some()&&co.is_none() {return Err("pm_decode emission requires --co (M7 certifies the linked object)".into())}
  if mq4v&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if mq4f8&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
+ if mqi4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_rows --shape/--m7 require --co (M7 certifies the linked object)".into())}
  // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
  if co.is_some()||bundle.is_some(){
   let elf=peacemaker_isa::native::assemble(&text,arch)?;
@@ -448,6 +466,8 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  if mq4v&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
  #[cfg(not(feature="toolchain"))]
  if mq4f8&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
+ #[cfg(not(feature="toolchain"))]
+ if mqi4&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_rows --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
  #[cfg(feature="toolchain")]
  if mq4v&&co.is_some() {
   let path=co.as_deref().ok_or("missing --co")?;
@@ -459,6 +479,26 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
     let e=peacemaker_isa::kernels::mq4_verify::emit(spec)?;
     let file=format!("{dir}/mq4_verify.{}.{}.contract.json",arch.name(),spec.tag());
     fs::write(&file,serde_json::to_vec_pretty(&peacemaker_isa::kernels::mq4_verify::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
+   }
+   receipts.insert(symbol,m7);
+  }
+  let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+  println!("{}",String::from_utf8_lossy(&receipts));
+  if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
+ }
+ // mq_i4_rows: with --co, M7 on every selected export of the linked object, plus each
+ // export's shape contract (--shape DIR).
+ #[cfg(feature="toolchain")]
+ if mqi4&&co.is_some() {
+  let path=co.as_deref().ok_or("missing --co")?;
+  let mut receipts=serde_json::Map::new();
+  for spec in mq_i4_rows_specs(epi.as_deref().unwrap_or("all"),arch)? {
+   let symbol=spec.symbol();
+   let m7=peacemaker_isa::pm_check::m7(std::path::Path::new(path),arch.name(),&symbol)?;
+   if let Some(dir)=&shape {
+    let e=peacemaker_isa::kernels::mq_i4_rows::emit(spec)?;
+    let file=format!("{dir}/mq_i4_rows.{}.{}.contract.json",arch.name(),spec.tag());
+    fs::write(&file,serde_json::to_vec_pretty(&peacemaker_isa::kernels::mq_i4_rows::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
    }
    receipts.insert(symbol,m7);
   }
