@@ -673,7 +673,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1595
+**Count:** 1604
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1527,6 +1527,15 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LDS_EPI_DIRECT` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
 | `HIPFIRE_LFM2_GRAPH` | crates/hipfire-arch-lfm2moe/examples/graph_parity_lfm2moe.rs, crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
+| `HIPFIRE_LFM2_LOAD_TRACE` | crates/hipfire-arch-lfm2moe/src/lfm2moe.rs | developer |
+| `HIPFIRE_LFM2_MOE_DUMP` | crates/hipfire-arch-lfm2moe/src/forward.rs | developer |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_BASELINE` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_DEEP` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_LAYERS` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_MODEL` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_PLACEMENT` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_RECORD` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
+| `HIPFIRE_LFM2_OFFLOAD_PARITY_STEPS` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs | harness |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs | experimental |
 | `HIPFIRE_LLOYD_K3` | crates/hipfire-quantize/src/pipeline.rs, crates/hipfire-quantize/src/quant_mq.rs | developer |
 | `HIPFIRE_LLOYD_MB4` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs | experimental |

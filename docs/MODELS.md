@@ -247,7 +247,7 @@ Served by `hipfire img <tag>` and `/v1/images/generations`; see [`IMAGEGEN.md`](
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
 
-### LFM2.5-24B-A2B — loadable, **no published artifact, and blocked on an open MoE defect**
+### LFM2.5-24B-A2B — loadable, **no published artifact**
 
 `LiquidAI/LFM2.5-24B-A2B` (40 layers, 64 experts top-4, hidden 2048, 128k vocab,
 `conv_L_cache` 3, `num_dense_layers` 2, `use_expert_bias` true) loads on arch 11.
@@ -282,24 +282,23 @@ where a non-degenerate comparison is possible (see
 both match a resident baseline byte-for-byte, whole-layer and routed-expert
 tiers, with a prompt-variety guard that rejects a saturated oracle).
 
-**Open blocker — LFM2.5 MoE output is incoherent, and it is NOT this branch.**
-On gfx1101, LFM2.5 **MoE** models emit degenerate text while the LFM2.5 **dense**
-2.6B is coherent (it answers a code prompt normally). Reproduced with the
-**registry-published** `lfm2.5:8b-a1b` artifact (sha256 `07da9942…4148`) on
-**pristine `upstream/beta`** (`d40c3301a`), which returns the byte-identical
-garbage `" ' -- -- -- -- -- -- ' "` — so the defect predates and is independent
-of the offload work, the expert-packing change, and any local quantization. The
-24B-A2B shows the same class of degeneration (`confuse confuse confuse identify
-purpose purpose …` with temp 0.1 / rep 1.05; all five probed prompts saturate to
-1–3 distinct tokens under greedy). Treat every LFM2.5 **MoE** coherence claim as
-blocked until that defect is found; do not describe the 24B as production-ready
-on the strength of "it loads and emits tokens".
-
-Known limitation to state plainly: a parity test cannot detect a defect that is
-*consistent* across placements — a wrong expert read that is wrong the same way
-in both arms passes any placement A/B. That is why the pre-existing-MoE check
-above was run against pristine beta with the published artifact rather than
-inferred from the parity suite.
+**Resolved blocker — LFM2.5 MoE incoherence.** On gfx1100/gfx1101 the published
+`lfm2.5:8b-a1b` artifact used to emit degenerate text (saturated to 1–3 distinct
+tokens under greedy) while the dense 2.6B stayed coherent, and the 24B showed
+the same class of failure. Root cause was
+`kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip`: the
+atomic-free MoE down GEMV was hardcoded to K=512 (two 256-weight groups),
+summing only the first 512 columns of each expert's down projection. LFM2's
+`moe_inter` (1792 on the 8B, 1536 on the 24B) dropped 5/7–6/7 of the dot
+product. The kernel now keeps the K=512 fast path verbatim and loops
+`groups_per_row = K/256` groups otherwise; the gfx1151 buffer/row variants were
+already `k == 512`-gated in `gemv.rs` and are untouched. Verified on gfx1100:
+per-stage intermediates (router sigmoid, top-k, gate/up, rot, down-expanded,
+combine) match a NumPy replay of the HFQ weights to cos=1.0000 on every MoE
+stage, `prompt_probe` emits 36–41 distinct tokens per 48 greedy steps, and
+`hipfire run` on `lfm2.5-8b-a1b.mq4` produces coherent code + reasoning text.
+The same K-hardcoding affected every consumer with `moe_inter != 512` — e.g.
+MiniMax-M2 (`moe_inter` 1536) reads through this kernel too.
 
 ### Gemma4 (registry — no published artifact yet)
 
