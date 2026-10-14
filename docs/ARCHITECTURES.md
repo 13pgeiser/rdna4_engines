@@ -16,6 +16,7 @@ into the id an architecture plugin claims.
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense (text): two attention classes — sliding-window and proportional-RoPE global (`attention_k_eq_v`) — over one GemmaRMSNorm stream, GELU ffn, two KV groups, softcapped logits, tied scaled embedding; served from a CT-INT4 (QAT w4a16) checkpoint as group-128 int4 codes with an f16 scale. Optional draft head: Google's assistant (`rad-convert --draft-model`), a serial head with no cache of its own (`rad_drafter_shared_kv`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint — the 26B-A4B MoE (a dense and a routed arm side by side) and the dense sizes without per-layer embeddings — with z-lab's DFlash drafter; routed experts bf16 or block fp8, as the recipe chose |
+| `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image GENERATOR: a Qwen3-VL-8B text encoder, a 32-block single-stream DiT and an RGBA VAE, from the diffusers pipeline directory; the DiT and text encoder bf16 or block fp8, as the recipe chose |
 
 This document is the geometry of each, and the handful of readings that are **arithmetically
 silent** — wrong in a way that produces fluent output and no error anywhere.
@@ -576,3 +577,58 @@ say so. arch_test holds the two live ranges to overlap.
 that carries one is served with `--mm-max-patches 0`. An fp8 attention or dense arm — under a tenth
 of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
 
+---
+
+# `qwenimage21` — Qwen-Image 2.1 and 2.1-Turbo, an image generator
+
+`arch/qwenimage21` declares a GENERATOR (`rad_declare_generator`), which makes the program a
+three-pass one the engine drives through `core/gen`: COND once a request (the text encoder over the
+prompt and its pictures, then the DiT over that prefix into the KV cache), DENOISE once a step (the
+image's latent rows against the cached prefix), DECODE once an image (the VAE). It is served on
+`/v1/images/generations` and `/v1/images/edits` ([GUIDE §5.6](GUIDE.md)); fp8 on one or two cards,
+bf16 on two. The checkpoint is the diffusers pipeline directory, read as one.
+
+```
+text      Qwen3-VL-8B-Instruct as released: 36 layers of 4096 (32 x 128, 8 kv heads), interleaved
+          M-RoPE over (t, h, w) at 24, 20, 20 pairs, theta 5e6; the vision tower's 27 layers with
+          deepstack taps 8, 16, 24 added to text layers 0..2 at the picture rows
+          OUTPUT: the last layer BEFORE the final norm, without the 14 tokens of the system turn
+DiT       32 single-stream blocks of 4096 (32 x 128, gqa 1), SwiGLU 12288, q and k RMS-normed, no
+          biases; ONE modulation linear for every block (scale1, gate1, scale2, gate2 -- no shift,
+          tanh gates) over a LayerNorm without affine; rope over (t, h, w) at 8, 28, 28 adjacent
+          pairs, theta 1e4, the picture grid centred on zero; txt_in = RMSNorm (gain 1 + w),
+          linear, gelu-tanh, linear; timestep embedding at t * 1000, rounded
+          THE CONDITION IS A CAUSAL PREFIX: text and reference latents, modulated at t = 0,
+          block-causal (text causal, a picture bidirectional within itself); written to the KV
+          cache once, and a step runs only the image's rows, non-causal over prefix and self
+VAE       Wan 2.2's on one frame: RGBA in and out, 64 latent channels, 16x down, decoder widths
+          1152..144, one single-head 1152-wide attention in each middle block
+schedule  flow-matching Euler, exponential dynamic shift (0.5 at 256 tokens to 0.9 at 8192),
+          shift_terminal 0.02, 40 steps; Turbo: the 8 sigmas model_index.json lists, no guidance
+```
+
+The traps:
+
+- **The noise is radiance's, not torch's.** A seed is a Philox stream (`abi/rad_philox.h`), element
+  (k, c) of image row k drawn at k * 64 + c, identical on every card count. Parity against diffusers
+  means handing diffusers the same latents; a NumPy port of the stream does.
+- **The conditioning is modulated at t = 0**, not at the step's timestep: the prefix is written once,
+  and a step that re-modulated it would differ from the reference at every step after the first.
+- **The text encoder's output skips the final norm.** Taking the normed output scales every row by
+  the norm's gain and leaves a picture that is plausible and wrong.
+- **A reference picture is read twice**: by the VAE as RGBA in [-1, 1], and by the vision tower
+  composited on white, both after PIL's premultiplied Lanczos resize to the 1024x1024 area at its
+  own aspect, sides rounded to 32. A different resampler changes every token the picture becomes.
+- **The Euler step rounds where diffusers does**: x' = bf16(x + bf16(bf16(sigma_next - sigma) * v)),
+  and guidance bf16(neg + bf16(cfg * bf16(pos - neg))). Unrounded is not more accurate here; it is a
+  different trajectory.
+- **The VAE config's `temperal_downsample` is a boolean array**; a reader that drops booleans makes
+  every level look unscaled.
+- **Alpha off the decoder is never exactly 255** (243..255 on an opaque picture). Reading it as
+  transparency makes every picture the model made a transparent one when it is edited again; the
+  server's cutoff is alpha 128, the mask's.
+
+Measured against diffusers' own pipeline in bf16, from the same latents (1024x1024, 20 steps, PSNR):
+bf16 TP2 33.9 dB for a prompt and 42.2 for an edit, where diffusers differs from itself by 32.6 to
+34.4 dB across its own attention kernels; fp8 28.7 to 29.3 and 37.6 to 38.4; Turbo fp8 33.4 and
+38.9 at its 8 steps.

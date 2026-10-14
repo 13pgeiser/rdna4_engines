@@ -137,6 +137,7 @@ public:
     int         declare_drafter(const RadDrafterDecl* d);
     int         drafter_shared_kv(int pos_offset);
     int         declare_encoder(const RadEncoderDecl* d);
+    int         declare_generator(const RadGeneratorDecl* d);
     void        note_v       (const char* f, va_list ap);
 
     /* The buffer operands of an op.

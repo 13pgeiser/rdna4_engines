@@ -1232,3 +1232,80 @@ extern "C" int r4d_rad_layout_moe_fp8_mod4(const RadParam* p, int n_p, int opera
     return rc != RAD_OK ? rc : r4d_rad_layout_fp8_rowmajor(v.p, v.n, v.operand, enc, sel, pl,
                                                                n, out);
 }
+
+/* ---- conv2d_nhwc: PyTorch's [cout][cin][k][k] stored TAP-MAJOR, [cout][k][k][cin].
+ *
+ * The implicit-GEMM convolution (r4d_gen.hip) contracts over K = (tap, channel) with the channel
+ * innermost, so that eight consecutive K are eight channels of one input pixel -- one 16-byte read
+ * of an NHWC row. The weight's K has to run the same way, and PyTorch's runs channel-major. A
+ * permutation of a bf16 plane, so the inverse is the same loop backwards. Operand 1 of
+ * conv2d_nhwc; the bias is read as it is. */
+namespace {
+constexpr int CONV_W_OPERAND = 1;
+
+int conv_geom(const RadParam* p, int n_p, const RadTensor* pl, int n, long long* cout,
+              long long* cin, long long* k) {
+    *cout = r4d_pgeti_or(p, n_p, "cout", 0);
+    *cin = r4d_pgeti_or(p, n_p, "cin", 0);
+    *k = r4d_pgeti_or(p, n_p, "k", 0);
+    if (n != 1 || !pl || *cout <= 0 || *cin <= 0 || *k <= 0) return RAD_E_SHAPE;
+    if (pl[0].dtype != RAD_BF16 || pl[0].rank != 2 ||
+        pl[0].shape[0] * pl[0].shape[1] != *cout * *cin * *k * *k)
+        return RAD_E_SHAPE;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_conv_tap(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                       int n, RadLayout* out) {
+    (void)sel;
+    if (!out) return RAD_E_INVAL;
+    if (operand != CONV_W_OPERAND) return RAD_E_UNSUPPORTED;
+    if (!enc || !rad_enc_is(enc, "plain")) return RAD_E_DTYPE;
+    long long co, ci, k;
+    const int rc = conv_geom(p, n_p, pl, n, &co, &ci, &k);
+    if (rc != RAD_OK) return rc;
+    fill(out, "r4d.conv.tap_major", RAD_BF16, co, k * k * ci, co * k * k * ci * 2);
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_relayout_conv_tap(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    RadLayout L;
+    const int rc = r4d_rad_layout_conv_tap(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (dst_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    long long co, ci, k;
+    conv_geom(p, n_p, pl, n, &co, &ci, &k);
+    const uint16_t* s = (const uint16_t*)pl[0].data;
+    uint16_t* d = (uint16_t*)dst;
+    const long long kk = k * k;
+    for (long long o = 0; o < co; ++o)
+        for (long long c = 0; c < ci; ++c)
+            for (long long t = 0; t < kk; ++t)
+                d[(o * kk + t) * ci + c] = s[(o * ci + c) * kk + t];
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_unrelayout_conv_tap(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const void* src, int64_t src_bytes,
+                                           const RadTensor* pl, int n) {
+    RadLayout L;
+    const int rc = r4d_rad_layout_conv_tap(p, n_p, operand, enc, sel, pl, n, &L);
+    if (rc != RAD_OK) return rc;
+    if (src_bytes != L.bytes || !pl[0].data) return RAD_E_SHAPE;
+    long long co, ci, k;
+    conv_geom(p, n_p, pl, n, &co, &ci, &k);
+    const uint16_t* s = (const uint16_t*)src;
+    uint16_t* d = (uint16_t*)pl[0].data;
+    const long long kk = k * k;
+    for (long long o = 0; o < co; ++o)
+        for (long long c = 0; c < ci; ++c)
+            for (long long t = 0; t < kk; ++t)
+                d[(o * ci + c) * kk + t] = s[(o * kk + t) * ci + c];
+    return RAD_OK;
+}

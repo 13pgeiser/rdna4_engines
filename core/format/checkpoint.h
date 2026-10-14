@@ -125,6 +125,9 @@ public:
     GgufFile&          gguf() { return gguf_; }
     const std::string& path() const { return path_; }
     const std::string& dir() const { return dir_; }   /* where config.json and tokenizer.json sit */
+    /* Where tokenizer.json, tokenizer_config.json and the chat template sit: dir() for a model
+     * repository, the `processor/` (or `tokenizer/`) folder of a diffusers pipeline. */
+    const std::string& tok_dir() const { return tok_dir_.empty() ? dir_ : tok_dir_; }
     MetaOwn&           meta() { return meta_; }
     const MetaOwn&     meta() const { return meta_; }
 
@@ -162,11 +165,12 @@ private:
     int add_shard(const std::string& p, const std::string& prefix = "",
                   const std::unordered_map<std::string, std::string>* owner = nullptr);
     int open_safetensors(const std::string& path);
+    int open_diffusers();
     int open_gguf(const std::string& path);
     void detect_import();
 
     enum Kind { None, Gguf, SafeT } kind_ = None;
-    std::string path_, dir_;
+    std::string path_, dir_, tok_dir_;
     GgufFile    gguf_;
     MetaOwn     meta_;
     std::vector<std::unique_ptr<SafeTensorsFile>> shards_;

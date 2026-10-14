@@ -615,6 +615,106 @@ typedef struct RadEncoderDecl {
 
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
 
+/* ================================================================== the image generator */
+/* A PROGRAM THAT MAKES IMAGES: a conditioning network that reads a prompt (and pictures), a
+ * denoiser that turns a latent from noise into an image's latent over a number of steps, and a
+ * decoder that turns the latent into pixels. Declared for the reason the logits buffer is: the
+ * core drives the passes, so it has to be told what it is driving, and only the plugin knows.
+ *
+ * DECLARING ONE MAKES THE PROGRAM A GENERATOR, and a generator is driven by passes rather than by
+ * token steps (RadBatch::gen):
+ *
+ *   RAD_GEN_PASS_COND     one conditioning sequence -- the prompt, and any reference pictures --
+ *                         encoded into the generator's KV group. Read once per request (twice
+ *                         with guidance: the negative prompt is a sequence of its own).
+ *   RAD_GEN_PASS_DENOISE  one step of every image in flight that the pass carries: each image's
+ *                         latent rows, read from and written back to the plugin's own state at the
+ *                         image's lane, against its conditioning's KV.
+ *   RAD_GEN_PASS_DECODE   one image's latent to pixels, in `image_out`, which the core reads back.
+ *
+ * A program declares this, logits or pooled vectors -- one of the three.
+ *
+ * WHAT IS HERE IS THE MODEL'S CONTRACT WITH A CLIENT: the prompt it was trained on, the sizes it
+ * makes, the schedule its sampler follows. The core turns a request into passes with it and
+ * nothing in the core names a model. */
+enum { RAD_GEN_PASS_COND = 1, RAD_GEN_PASS_DENOISE = 2, RAD_GEN_PASS_DECODE = 3 };
+
+/* HOW THE GENERATOR'S SEQUENCE IS LAID OUT, which the core builds from the conditioning prompt.
+ *
+ *   JOINT_GRID   the prompt's rows after `drop_prefix`, each media slot standing for `slot_rows`
+ *                rows that a reference picture's latent tokens take in raster order, then the
+ *                image being made. Rotary positions are three components: a text row counts up
+ *                in all three; a picture of h x w tokens holds the count in the first, and its row
+ *                and column, centred on zero (-(n - n/2) .. n/2 - 1), in the other two, after which
+ *                the count moves on by max(h, w). Text rows attend causally, a picture's rows to
+ *                each other both ways, every row to every row before it. */
+enum { RAD_GEN_LAYOUT_JOINT_GRID = 1 };
+
+typedef struct RadGeneratorDecl {
+    const char* name;             /* "qwen-image" -- for messages */
+    int32_t     layout;           /* RAD_GEN_LAYOUT_* */
+
+    /* THE CONDITIONING PROMPT, as text the core tokenises. `{prompt}` is replaced by the user's
+     * prompt; in `tmpl_edit`, `{images}` by one `tmpl_image` for each reference picture, joined by
+     * `tmpl_image_sep`. In `tmpl_image`, `{n}` is the picture's 1-based number and `{image}` where
+     * the picture's own tokens go -- the run the media processor makes of it, its markers
+     * included. */
+    const char* tmpl_text;
+    const char* tmpl_edit;
+    const char* tmpl_image;
+    const char* tmpl_image_sep;
+    /* The tokens this text tokenises to at the start of the prompt are ENCODED but not handed to
+     * the generator: the conditioning starts after them (a fixed system turn, say). */
+    const char* drop_prefix;
+    /* A TRANSPARENT IMAGE, asked for in the words the model was trained on: `{prompt}` is the
+     * user's description. Empty when the model makes no alpha. */
+    const char* tmpl_transparent;
+
+    /* GEOMETRY. One latent token covers `latent_scale` x `latent_scale` pixels and holds
+     * `latent_channels` values; a side is a multiple of `size_multiple` pixels; an image has
+     * `pixel_channels` channels (4: RGBA). A media slot of the conditioning prompt -- one
+     * encoder output row -- stands for `slot_rows` rows of the generator's sequence. */
+    int64_t latent_channels;
+    int64_t latent_scale;
+    int64_t size_multiple;
+    int64_t pixel_channels;
+    int64_t slot_rows;
+    /* The largest image, in latent tokens: every buffer the plugin sized for one image. */
+    int64_t max_tokens;
+    /* Reference pictures: at most `max_refs` a request, each resized to `ref_area` pixels. */
+    int64_t max_refs;
+    int64_t ref_area;
+    /* The size a request that names none is made at. */
+    int64_t default_width, default_height;
+
+    /* THE SAMPLER: flow matching, an Euler step from sigma 1 towards 0.
+     *   A FIXED SCHEDULE: `n_sigmas` values, the terminal 0 implied; a request may not change the
+     *   step count. Otherwise `default_steps` sigmas from 1 to 1/steps, shifted:
+     *     dyn_shift 0   sigma' = shift * s / (1 + (shift - 1) * s)
+     *     dyn_shift 1   mu linear in the image's token count, 256 -> base_shift .. max_seq ->
+     *                   max_shift; shift_exp 1: exp(mu) / (exp(mu) + (1/s - 1)), 0: mu / (mu + ...)
+     *   then, with shift_terminal > 0, stretched so the last sigma is shift_terminal. */
+    int64_t       default_steps;
+    int32_t       n_sigmas;
+    const double* sigmas;
+    double        shift;
+    int32_t       dyn_shift;
+    int32_t       shift_exp;
+    double        base_shift, max_shift;
+    int64_t       base_seq, max_seq;
+    double        shift_terminal;
+    /* Guidance a request gets when it names none; 1 is off. */
+    double        default_cfg;
+
+    /* WHERE THINGS ARE. `max_lanes` images may be in flight at once, each in a lane of the
+     * plugin's own state; `image_out` is [max_tokens * latent_scale^2, pixel_channels] u8 on the
+     * device, row-major pixels of the image a decode pass made. */
+    int64_t max_lanes;
+    rad_buf image_out;
+} RadGeneratorDecl;
+
+int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d);
+
 /* ================================================================== diagnostics */
 /* A plugin may annotate the graph dump. Free-form, printed under --debug-graph. */
 void rad_note(RadBuilder* b, const char* fmt, ...);
@@ -687,6 +787,15 @@ typedef struct RadArchProbe {
      * number of its merge), when it declares one: the engine sizes the audio pass with it
      * (RadBuildCtx::max_audio_frames). 0 is no audio. */
     int64_t audio_frames;
+
+    /* AN IMAGE GENERATOR (rad_declare_generator), and the rows its largest pass carries: the
+     * engine sizes the step for it before declare -- a denoise pass carries an image's every
+     * latent row at once, twice with guidance -- and turns off what a generator has no use for.
+     * 0 is a program that generates text or embeds. */
+    int64_t gen_rows;
+    /* ...and the patches its conditioning pass encodes at most: every reference picture a request
+     * may carry, at the size the model resizes them to. The encoder's pass size (max_enc_patches). */
+    int64_t gen_patches;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

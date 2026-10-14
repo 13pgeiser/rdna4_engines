@@ -222,11 +222,19 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
 // rotated pair: the norm's sum of squares first, then each lane re-reads its pair, norms, gains,
 // rounds (the norm rounded before the rotation, as above) and rotates it. Channels past `rot`
 // are normed only; a v head (v_norm) is normed at unit gain.
+//
+// `pm` picks the pairing, which is all that separates three rotaries over the same table:
+//   0  blocks       a section's pairs are (start + j, start + sec + j), its own ladder
+//   1  gptj_blocks  a section's pairs are ADJACENT, (start + 2j, start + 2j + 1), its own ladder:
+//                   the complex-number form of a 3-axis image rotary (Qwen-Image)
+//   2  imrope       NeoX pairs (i, i + rot/2) on one ladder theta^(-2i/rot), the position
+//                   component interleaved: 1 where i % 3 == 1 and i < 3 * sec[1], 2 where
+//                   i % 3 == 2 and i < 3 * sec[2], 0 elsewhere (Qwen3-VL's text attention)
 __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
     uint16_t* __restrict__ qkv, const int* __restrict__ pos, const uint16_t* __restrict__ qw,
     const uint16_t* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
     uint32_t rot, int v_norm, float theta, float eps, float rscale, float wadd, uint32_t ld,
-    QkBlocks blk, uint32_t pplane) {
+    QkBlocks blk, uint32_t pplane, int pm) {
     __shared__ float cs_s[kQkMaxHalf], sn_s[kQkMaxHalf];
     __shared__ int   pa_s[kQkMaxHalf], pb_s[kQkMaxHalf];
     const uint32_t m = blockIdx.x;
@@ -236,13 +244,29 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
     uint16_t* row = qkv + (size_t)m * ld;
     const float div = rscale != 0.0f ? rscale : 1.0f;
     for (uint32_t i = threadIdx.x; i < half; i += kQkThreads) {
+        if (pm == 2) {
+            int c = 0;
+            if (i % 3 == 1 && (int)i < 3 * blk.sec[1]) c = 1;
+            else if (i % 3 == 2 && (int)i < 3 * blk.sec[2]) c = 2;
+            const float p = (float)pos[(size_t)c * pplane + m] / div;
+            const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
+            sincosf(p * inv, &sn_s[i], &cs_s[i]);
+            pa_s[i] = (int)i;
+            pb_s[i] = (int)(i + half);
+            continue;
+        }
         int c = 0, s0 = 0;
         while (c + 1 < blk.n && (int)i >= s0 + blk.sec[c]) { s0 += blk.sec[c]; ++c; }
         const float p = (float)pos[(size_t)blk.comp[c] * pplane + m] / div;
         const float inv = 1.0f / powf(theta, (float)((int)i - s0) / (float)blk.sec[c]);
         sincosf(p * inv, &sn_s[i], &cs_s[i]);
-        pa_s[i] = 2 * s0 + ((int)i - s0);
-        pb_s[i] = pa_s[i] + blk.sec[c];
+        if (pm == 1) {
+            pa_s[i] = 2 * (int)i;
+            pb_s[i] = 2 * (int)i + 1;
+        } else {
+            pa_s[i] = 2 * s0 + ((int)i - s0);
+            pb_s[i] = pa_s[i] + blk.sec[c];
+        }
     }
     __syncthreads();
     const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
@@ -589,15 +613,34 @@ extern "C" int r4d_seg_mean_bf16(long x, long cu, long y, int S, int n, int x_ld
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// mode: 0 neox, 1 gptj, 2 blocks (`blk` and the position plane stride `pplane` used only there).
+// mode: 0 neox, 1 gptj, 2 blocks, 3 gptj_blocks, 4 imrope (`blk` and the position plane stride
+// `pplane` used only by the last three).
 extern "C" int r4d_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int M, int head_dim,
                                      int n_head, int n_head_kv, int rot, int mode, int v_norm,
                                      float theta, float eps, float rscale, float wadd, int ld,
                                      const QkBlocks* blk, int pplane, long stream) {
     if (!qkv || !pos || !qw || !kw) return -1;
     if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv <= 0 || rot <= 0 || rot > head_dim ||
-        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || mode < 0 || mode > 2)
+        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || mode < 0 || mode > 4)
         return -2;
+    if (mode >= 3) {
+        /* The two forms only the general kernel takes: its pair table is built per mode. */
+        if (!blk || blk->n <= 0 || blk->n > 8) return -2;
+        int total = 0;
+        for (int c = 0; c < blk->n; ++c) {
+            if (blk->sec[c] <= 0) return -2;
+            total += blk->sec[c];
+        }
+        if (mode == 3 && 2 * total != rot) return -2;
+        if (mode == 4 && (blk->n < 3 || 2 * total != rot)) return -2;
+        hipLaunchKernelGGL(qk_norm_rope_any_kernel, dim3((uint32_t)M), dim3(kQkThreads), 0,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos,
+                           (const uint16_t*)qw, (const uint16_t*)kw, (uint32_t)head_dim,
+                           (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta,
+                           eps, rscale, wadd, (uint32_t)ld, *blk, (uint32_t)pplane,
+                           mode == 3 ? 1 : 2);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
     if (mode != 2 && head_dim % 32) return -2;
     if (mode == 1 && head_dim % 64) return -2;
     if (mode == 0 && (rot / 2) % 32) return -2;
@@ -620,7 +663,7 @@ extern "C" int r4d_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int M
                            (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos,
                            (const uint16_t*)qw, (const uint16_t*)kw, (uint32_t)head_dim,
                            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta,
-                           eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane);
+                           eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane, 0);
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
 #define R4D_QN(MD)                                                                              \
@@ -837,12 +880,21 @@ extern "C" int r4d_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
     int md = 0;
     if (mode && !std::strcmp(mode, "gptj")) md = 1;
     else if (mode && !std::strcmp(mode, "blocks")) md = 2;
+    else if (mode && !std::strcmp(mode, "gptj_blocks")) md = 3;
+    else if (mode && !std::strcmp(mode, "imrope")) md = 4;
     else if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
-    /* Any head_dim in the blocks mode (qk_norm_rope_any_kernel); the others need multiples of 32. */
-    if (md != 2 && hd % 32) return R4D_NO(RAD_E_SHAPE);
+    /* Any head_dim in the section modes (qk_norm_rope_any_kernel); the others need multiples of 32. */
+    if (md < 2 && hd % 32) return R4D_NO(RAD_E_SHAPE);
     QkBlocks blk{};
     long long M = 0, pplane = 0;
-    if (md == 2) {
+    if (md == 4) {
+        /* Interleaved M-RoPE reads three position planes, its sections only bound the
+         * interleave. */
+        blk.n = parse_ints(r4d_gets(a, "sections"), blk.sec, 8);
+        if (blk.n < 3 || pos->rank != 2 || pos->shape[0] < 3) return R4D_NO(RAD_E_SHAPE);
+        M = pos->shape[1];
+        pplane = pos->stride[0];
+    } else if (md >= 2) {
         blk.n = parse_ints(r4d_gets(a, "sections"), blk.sec, 8);
         if (blk.n <= 0) return R4D_NO(RAD_E_SHAPE);
         for (int c = 0; c < blk.n; ++c) blk.comp[c] = c;

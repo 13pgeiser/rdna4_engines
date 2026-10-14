@@ -98,6 +98,8 @@ constexpr uint32_t kFN = 128, kFK = 64;   // kFK is BYTES per LDS row
 // alone.
 constexpr uint32_t kFKNarrow = 256;
 constexpr uint32_t kFWaves = 8;
+// Activation bands a raster group of the prefill tile holds in cache -- see the kernel's grouping.
+constexpr uint32_t kGroupM = 16;
 // 1 M tile x 8 N tiles a wave, so the 8 waves cover 8 DISTINCT row tiles.
 //
 // The register tile is the two of these together and it is a genuine knob -- the body takes it as a
@@ -415,8 +417,25 @@ void gemm_fp8a8_kernel(
     const uint32_t kend = ck ? min(cols, kbeg + ck) : cols;
     if (kbeg >= kend) return;
 
-    const uint32_t m0 = blockIdx.x * FM;
-    const uint32_t n0 = blockIdx.y * FN;
+    // THE PREFILL TILE RUNS IN GROUPS OF kGroupM ACTIVATION BANDS. Blocks are dispatched in
+    // flattened-id order, so with the plain x-fastest grid every weight band sweeps ALL of the
+    // activation, and the activation is read once per 128 weight rows. That is free while it sits
+    // in the 64 MB MALL and is the whole cost once it does not: at M = 16384 x K = 4096 (64 MB)
+    // gate_up's 192 bands read 12 GB and ran at half the rate of M = 4096. Within a group the
+    // kGroupM bands stay cached across the full N sweep, and the weight is read once a group.
+    // With kGroupM bands or fewer the order is the plain one, and skipping the division keeps a
+    // short prefill chunk at its old rate (2% at M = 512).
+    uint32_t bm = blockIdx.x, bn = blockIdx.y;
+    if (!AW && gridDim.x > kGroupM) {
+        const uint32_t per = kGroupM * gridDim.y;
+        const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+        const uint32_t first = (lin / per) * kGroupM, r = lin % per;
+        const uint32_t gm = min(gridDim.x - first, kGroupM);
+        bm = first + r % gm;
+        bn = r / gm;
+    }
+    const uint32_t m0 = bm * FM;
+    const uint32_t n0 = bn * FN;
     // Wave grid MW(M) x 1(N): a wave owns MT*16 A rows and all FN B rows. A 4x2 grid at the same
     // 128x128 tile -- 2x4 a wave, so 6 fragment reads per 8 WMMA rather than 9 -- is a WASH, which
     // says the fragment reads, which do not bank-conflict, are not the wall. There is no

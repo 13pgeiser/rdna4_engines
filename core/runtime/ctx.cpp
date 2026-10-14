@@ -994,6 +994,14 @@ int Ctx::lane_init() {
     /* Local: a lane join orders one card's two queues and nothing else reads through it. */
     for (int i = 0; i < 2; ++i)
         if (!lane_ev_[i]) RAD_TRY(rad_event_create_local(&lane_ev_[i]));
+    /* A NEW LANE STARTS BEHIND EVERYTHING LANE 0 HAS ISSUED. Its first use is mid-step, and the
+     * join an architecture puts in front of it -- rad_lane_join(0, 1), then rad_lane(1) -- found no
+     * lane 1 to order and returned without doing anything. Unordered, the first op on the new
+     * stream reads lane 0's output before lane 0 has written it: on Qwen-Image's two-rank pass
+     * the first picture after startup took its first all-reduce of stale rows and came out a
+     * different picture, every later one the right one. */
+    RAD_TRY(rad_event_record(lane_ev_[0], stream_));
+    RAD_TRY(rad_event_wait(lane1_, lane_ev_[0]));
     return RAD_OK;
 }
 
@@ -1008,8 +1016,9 @@ int Ctx::set_lane(int lane) {
 int Ctx::lane_join(int from, int to) {
     if (from == to) return RAD_OK;
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
-    /* Nothing was ever issued on lane 1, so there is nothing to order against. This is the arm
-     * every unpipelined step takes at the end of run_step, and it must not build a stream. */
+    /* Nothing was ever issued on lane 1, so there is nothing to order against -- and a lane 1
+     * built later starts behind lane 0 (lane_init). This is the arm every unpipelined step takes
+     * at the end of run_step, and it must not build a stream. */
     if (!lane1_) return RAD_OK;
     RadStream fs = from ? lane1_ : stream_, ts = to ? lane1_ : stream_;
     RAD_TRY(rad_event_record(lane_ev_[from], fs));
@@ -1025,6 +1034,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* An encoder pass is shaped by its media, and a pass that carries encoder rows issues the
      * scatter that puts them in place only when it has some: neither repeats as a tape would. */
     if (b->enc || b->n_mm_rows > 0) return 0;
+    /* A generator pass is shaped by what RadBatch::gen_b carries, which no key below reads. */
+    if (b->gen) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);

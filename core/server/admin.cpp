@@ -429,12 +429,17 @@ json Server::capabilities() const {
     caps["chat"]      = deps_.chat != nullptr;
     caps["tools"]     = deps_.chat && deps_.chat->supports_tools();
     caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
-    caps["grammar"]   = deps_.grammar != nullptr;
+    /* An image model reads pictures for its edits and nothing else, and writes no text a grammar
+     * could constrain -- whatever its conditioning network's processor would take. */
+    const bool img = opt_.image_model;
+    caps["grammar"]   = !img && deps_.grammar != nullptr;
     caps["embedding"] = deps_.embed != nullptr;
     caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
-    caps["video"]     = deps_.mm && deps_.mm->accepts(MediaKind::Video);
-    caps["audio"]     = deps_.mm && deps_.mm->accepts(MediaKind::Audio);
+    caps["video"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Video);
+    caps["audio"]     = !img && deps_.mm && deps_.mm->accepts(MediaKind::Audio);
     caps["logprobs"]  = opt_.supports_logprobs;
+    caps["image_generation"] = deps_.images != nullptr;
+    caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     /* THE EFFORTS A CHAT REQUEST MAY SEND, as probed from the template at startup: null when it
      * takes any word. "none" and "minimal" are this server's, and turn thinking off. */
     if (lim_.reasoning_efforts.empty()) {

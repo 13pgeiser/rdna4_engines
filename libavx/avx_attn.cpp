@@ -61,11 +61,11 @@
 
 using namespace avx;
 
-/* The widest head this accumulates in one frame. MLA's 576 is the widest in circulation and
- * libr4d's widest is 256, so 1024 is headroom rather than a limit anyone meets; above it the op
+/* The widest head this accumulates in one frame. The widest in circulation is an image VAE's
+ * single-head mid-block attention at 1152 (Qwen-Image 2.1), so 2048 is headroom; above it the op
  * says RAD_E_UNSUPPORTED by name instead of overflowing. Same number as libref's, so the two
  * refuse the same calls. */
-enum { AVX_HD_MAX = 1024 };
+enum { AVX_HD_MAX = 2048 };
 
 /* Keys per online-softmax tile. Sized so a tile of scores and the key rows behind it stay in L1
  * beside the query head and the accumulator: at head_dim 128 that is 64 keys x 128 floats = 32 KiB

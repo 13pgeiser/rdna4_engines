@@ -436,7 +436,8 @@ static const RadOperandSpec oGatedNorm[] = { OPD("x"), OPD("z"), WGT("w"), OUT("
 
 /* ---- collectives -------------------------------------------------------------------------- */
 static const RadParamSpec pAllReduce[]   = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),
-                                             P_INT("exact"), P_INTO("min_bytes"), P_INTO("hops") };
+                                             P_INT("exact"), P_INTO("min_bytes"), P_INTO("hops"),
+                                             P_INTO("overlap") };
 static const RadOperandSpec oAllReduce[] = { INOUT("x"), OUT_O("y") };
 
 static const RadParamSpec pAllGather[]   = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),

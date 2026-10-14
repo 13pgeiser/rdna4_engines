@@ -544,7 +544,7 @@ static const RadOperandSpec oGatedNorm[] = { OPD("x"), OPD("z"), WGT("w"), OUT("
 /* ---- collectives -------------------------------------------------------------------------- */
 static const RadParamSpec pAllReduce[] = { P_INT("world_size"), P_INT("numel"), P_STR("dtype"),
                                            P_INT("exact"), P_INTO("min_bytes"),
-                                           P_INTO("hops") };
+                                           P_INTO("hops"), P_INTO("overlap") };
 /* `y` is an optional SECOND operand: absent means in place, which is what docs/OPS.md draws and
  * what every one-shot kernel does. libr4d's two-shot rows are not safe in place -- a rank gathers
  * into the output while its own input is still being read for the scatter -- so they need the
@@ -641,6 +641,46 @@ static const RadOperandSpec oPick[]      = { OPD("cand_idx"), OPD("cand_val"), O
  * rank adds its own vocab offset before the gather, so the merge needs no shard layout. */
 static const RadOperandSpec oMerge[]     = { OPD("gathered"), OPD("params"),
                                              OUT("cand_idx"), OUT("cand_val") };
+
+/* ---- image generation (ref_gen.cpp) --------------------------------------------------------- */
+static const RadParamSpec pLnMod[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
+static const RadOperandSpec oLnMod[] = { OPD("x"), OPD("s"), OPD("cu_seqlens"), OUT("y") };
+static const RadOperandSpec oGateAdd[] = { OPD("y"), OPD("g"), OPD("cu_seqlens"), INOUT("x") };
+static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
+                                         P_INT("gated"), P_STR("dtype") };
+static const RadOperandSpec oLnModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), OPD("cu_seqlens"),
+                                          INOUT("x"), OUT("q"), OUT("scale"), OUT_O("z") };
+static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
+                                          P_INTO("round"), P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
+static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
+static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
+static const RadOperandSpec oLaneGather[] = { OPD("src"), OPD("lane"), OPD("cu_seqlens"), OUT("y") };
+static const RadOperandSpec oLaneStore[]  = { OPD("src"), OPD("lane"), INOUT("dst") };
+static const RadOperandSpec oRandnLanes[] = { OPD("flags"), OPD("seed"), OPD("lane"),
+                                              OPD("cu_seqlens"), INOUT("dst") };
+static const RadOperandSpec oFlowEuler[]  = { OPD("v"), OPD("sigma"), OPD("sigma_next"), OPD("cfg"),
+                                              OPD("pair"), OPD("lane"), OPD("flags"), OPD("seed"),
+                                              OPD("cu_seqlens"), OPD_O("inp_lat"), OPD_O("inp_mask"),
+                                              INOUT("state"), INOUT_O("preview") };
+static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
+                                            P_STR("mode"), P_STR("dtype") };
+static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                          P_INT("stride"), P_STR("pad"), P_INT("up"), P_STR("dtype") };
+static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
+static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
+static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oSpaceDepth[] = { OPD("x"), INOUT("y") };
+static const RadParamSpec pAttnPS[] = { P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"),
+                                        P_INTD("block_size"), P_INT("causal"), P_STR("q_dtype"),
+                                        P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk") };
+static const RadOperandSpec oAttnPS[] = { OPD("q"), OPD("k"), OPD("v"), OPD("kv_cache"),
+                                          OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"),
+                                          OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("k_i8"),
+                                          OPD_O("k_scale"), OUT("out") };
 
 /* ================================================================== the schema table */
 static const RadOpSchema kSchemas[] = {
@@ -1041,7 +1081,7 @@ static const RadOpSchema kSchemas[] = {
   "is a no-op. On the host backend the ranks are threads in one address space, so this is a "
   "rendezvous rather than a transfer. exact=0 is served exactly, so `min_bytes` -- the byte "
   "floor under which a lossy row must serve the message exactly anyway -- is accepted and "
-  "ignored, as is `hops`. "
+  "ignored, as is `hops`, and so is `overlap` (the caller issues it beside compute). "
   "`y` absent is the in-place form; present, the sum lands in y and x is left alone." },
 { "all_gather", ARR(pAllGather), ARR(oAllGather),
   "y is [world_size * numel] with rank r's contribution at offset r * numel. `row` -- one row of "
@@ -1111,6 +1151,67 @@ static const RadOpSchema kSchemas[] = {
 { "sample_logprobs", ARR(pLogprobs), ARR(oLogprobs),
   "For a row with RAD_SP_LOGPROBS: the raw logits' max, sum of exp(l - max) and k largest as (id, "
   "logit) pairs, descending, ties to the lower id. Other rows are not written." },
+/* ---- image generation -------------------------------------------------------------------- */
+{ "ln_mod_quant_fp8", ARR(pLnModQ), ARR(oLnModQ),
+  "the DiT block's norm in front of a quantised linear, in one pass: with `gated` 1 the branch "
+  "before it is added first, x = bf16(x + bf16(bf16(tanh(g[seq])) * y)); then z = ln_mod(x) and "
+  "(q, scale) = quant_act_fp8(z, group) -- written when bound, z." },
+{ "ln_mod", ARR(pLnMod), ARR(oLnMod),
+  "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the row's "
+  "sequence's modulation row of `s` ([n_seq, >= n] at its own pitch). A diffusion transformer's "
+  "adaptive norm without a shift." },
+{ "gate_add", ARR(pMnD), ARR(oGateAdd),
+  "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual added through its sequence's gate row." },
+{ "timestep_embed", ARR(pTimestep), ARR(oTimestep),
+  "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2)) with "
+  "t' = scale * t; `round` 1 takes t through bf16 at scale and back first, as diffusers' "
+  "pipeline hands it to its transformer." },
+{ "gather_rows2", ARR(pMnD), ARR(oGather2),
+  "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]: a sequence assembled from two sources." },
+{ "lane_gather", ARR(pLane), ARR(oLaneGather),
+  "y[cu[e] + k] = src[lane[e] * stride + k]: each entry's rows out of its lane of a per-image "
+  "state." },
+{ "lane_store", ARR(pLane), ARR(oLaneStore),
+  "dst[l * stride + k] = src[k] for every lane l listed: one source's rows into several lanes." },
+{ "randn_lanes", ARR(pLane), ARR(oRandnLanes),
+  "an image's first step: its lane's rows become its seed's standard-normal stream "
+  "(abi/rad_philox.h), element (k, c) the stream's k * n + c; entries without flag 1 are left." },
+{ "flow_euler", ARR(pLane), ARR(oFlowEuler),
+  "one Euler step of a flow-matching sampler per entry that moves a lane: guidance against the "
+  "paired entry, x' = bf16(x + bf16(bf16(sigma_next - sigma) * v)), a preview of the clean "
+  "latent with flag 4, the kept region of a repaint restored with flag 2 (docs/OPS.md)." },
+{ "chan_affine", ARR(pChanAffine), ARR(oUnary),
+  "a per-channel affine from two parameter lists of n values (rounded to bf16): `fma` is "
+  "bf16(bf16(x * mul) + add), `inv` bf16(bf16(x - add) / mul)." },
+{ "conv2d_nhwc", ARR(pConvNhwc), ARR(oConvNhwc),
+  "an image convolution, channels innermost: x [Hin, Win * cin] and y [Hout, Wout * cout] dense, "
+  "the sizes read off them; PyTorch's [cout, cin, k, k] weight and a bias; `up` 2 reads the input "
+  "upsampled nearest-neighbour; `pad` same (k/2 a side) or down (0 above and left, 1 below and "
+  "right)." },
+{ "l2norm_chan", ARR(pL2Norm), ARR(oL2Norm),
+  "each row normalised to unit L2 (eps 1e-12), times sqrt(n), times gamma -- three bf16 roundings "
+  "-- then `act` none or silu: an image decoder's channel norm." },
+{ "d2s_add", ARR(pSpaceDepth), ARR(oSpaceDepth),
+  "y [2H, 2W * cout] += x [H, W * cin] repeated and dealt into 2x2 blocks: an upsampling "
+  "shortcut (Wan's DupUp3D on one frame; ft 2 keeps the second frame)." },
+{ "s2d_avg_add", ARR(pSpaceDepth), ARR(oSpaceDepth),
+  "y [H, W * cout] += the 2x2 blocks of x [2H, 2W * cin] dealt into channels and averaged in "
+  "groups: a downsampling shortcut (Wan's AvgDown3D on one frame; ft 2 counts the zero frame)." },
+{ "to_rgba8", ARR(pMnD), ARR(oUnary),
+  "decoded pixels in [-1, 1] to bytes as diffusers' postprocess makes them: "
+  "round(clamp(bf16(bf16(clamp(x) / 2) + 0.5), 0, 1) * 255), u8 out." },
+{ "gelu_tanh", ARR(pMnD), ARR(oUnary), "the tanh approximation of gelu." },
+{ "scatter_add_rows", ARR(pMnD), ARR(oScatterRows),
+  "x[idx[i]] += v[i], rounded to x's dtype; a negative index adds nothing." },
+{ "attn_prefix_self", ARR(pAttnPS), ARR(oAttnPS),
+  "attention over two key sources: `seqused[s]` prefix positions in the paged cache and the "
+  "step's own rows `k`/`v` beside `q`; self row i sees every prefix key and its own rows j <= i "
+  "with `causal`, all of them without. `qk` \"i8\" with `k_i8` [tokens, kv_heads * head_dim] and "
+  "`k_scale` [tokens, kv_heads] selects the int8 Q.K form: they are the own keys as quant_act_i8g "
+  "writes them at group head_dim (scale amax/127, 1 for an all-zero row; code "
+  "rint(clamp(x * (1/scale), +-127))), the query and each prefix key are quantised by the same "
+  "rule per (row, head), and a score is the exact integer dot product times both scales. `k` is "
+  "then not read for the own rows." },
 };
 
 /* ================================================================== the kernel table */
@@ -1361,6 +1462,40 @@ SIMPLE("ref_sample_xtc", "sample_xtc", "sample", "exclude-top-choices narrowing 
        DT_FLOAT, ref_sample_xtc),
 SIMPLE("ref_sample_merge_topk", "sample_merge_topk", "sample",
        "vocab-parallel candidate merge", DT_FLOAT, ref_sample_merge_topk),
+SIMPLE("ref_ln_mod", "ln_mod", "norm", "gainless layer norm times (1 + a sequence's scale row)",
+       DT_FLOAT, ref_ln_mod),
+SIMPLE("ref_gate_add", "gate_add", "elem", "x += tanh(gate row) * y", DT_FLOAT, ref_gate_add),
+SIMPLE("ref_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
+       "gated residual, gainless layer norm times (1 + scale row), block-scaled E4M3",
+       DT_FLOAT, ref_ln_mod_quant_fp8),
+SIMPLE("ref_timestep_embed", "timestep_embed", "elem", "sinusoidal timestep embedding",
+       DT_FLOAT, ref_timestep_embed),
+SIMPLE("ref_gather_rows2", "gather_rows2", "elem", "rows from two sources by a signed index",
+       DT_ANY, ref_gather_rows2),
+SIMPLE("ref_lane_gather", "lane_gather", "elem", "each entry's rows out of its lane", DT_ANY,
+       ref_lane_gather),
+SIMPLE("ref_lane_store", "lane_store", "elem", "one source's rows into several lanes", DT_ANY,
+       ref_lane_store),
+SIMPLE("ref_randn_lanes", "randn_lanes", "elem", "a lane's rows from its seed's normal stream",
+       DT_FLOAT, ref_randn_lanes),
+SIMPLE("ref_flow_euler", "flow_euler", "elem", "a flow-matching Euler step with guidance",
+       DT_FLOAT, ref_flow_euler),
+SIMPLE("ref_chan_affine", "chan_affine", "elem", "a per-channel affine from parameter lists",
+       DT_FLOAT, ref_chan_affine),
+SIMPLE("ref_conv2d_nhwc", "conv2d_nhwc", "elem", "an image convolution, channels innermost",
+       DT_FLOAT, ref_conv2d_nhwc),
+SIMPLE("ref_l2norm_chan", "l2norm_chan", "norm", "unit-L2 channel norm, scaled, optional silu",
+       DT_FLOAT, ref_l2norm_chan),
+SIMPLE("ref_d2s_add", "d2s_add", "elem", "an upsampling shortcut added in", DT_FLOAT,
+       ref_d2s_add),
+SIMPLE("ref_s2d_avg_add", "s2d_avg_add", "elem", "a downsampling shortcut added in", DT_FLOAT,
+       ref_s2d_avg_add),
+SIMPLE("ref_to_rgba8", "to_rgba8", "elem", "decoded pixels to bytes", DT_FLOAT, ref_to_rgba8),
+SIMPLE("ref_gelu_tanh", "gelu_tanh", "elem", "tanh gelu", DT_FLOAT, ref_gelu_tanh),
+SIMPLE("ref_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", DT_FLOAT,
+       ref_scatter_add_rows),
+SIMPLE("ref_attn_prefix_self", "attn_prefix_self", "attn",
+       "attention over a paged prefix and the step's own rows", DT_FLOAT, ref_attn_prefix_self),
 };
 
 /* ================================================================== plugin exports */

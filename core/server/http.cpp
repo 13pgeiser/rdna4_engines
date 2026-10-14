@@ -406,11 +406,12 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     };
 
     auto bridge = [&router](const httplib::Request& hreq, std::string body,
-                            httplib::Response& hres) {
+                            httplib::Response& hres, std::vector<FormPart> form = {}) {
         HttpRequest req;
         req.method = hreq.method;
         req.path = hreq.path;
         req.body = std::move(body);
+        req.form = std::move(form);
         req.peer = hreq.remote_addr + ":" + std::to_string(hreq.remote_port);
         req.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -459,14 +460,24 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         /* A POST BODY IS READ STRAIGHT INTO THE STRING THE HANDLER PARSES. Left to httplib it
          * lands in its own Request first, which only hands it out const, so it would be copied
          * into ours: a body at the size limit held twice before a byte of it is looked at. A
-         * multipart body is not read at all -- no endpoint takes one, and httplib discards what a
-         * handler leaves unread -- so the handler sees an empty body and refuses it. */
+         * multipart body (an image upload) is read as its parts, each straight into its own
+         * string, under the same size limit. */
         svr.Post(path, [gate, bridge](const httplib::Request& q, httplib::Response& s,
                                       const httplib::ContentReader& read) {
             if (!gate(q, s)) return;
             std::string body;
-            if (!q.is_multipart_form_data() &&
-                !read([&body](const char* p, size_t n) { body.append(p, n); return true; })) {
+            std::vector<FormPart> form;
+            const bool ok = q.is_multipart_form_data()
+                ? read([&form](const httplib::FormData& f) {
+                           form.push_back(FormPart{ f.name, f.filename, f.content_type, {} });
+                           return true;
+                       },
+                       [&form](const char* p, size_t n) {
+                           if (!form.empty()) form.back().data.append(p, n);
+                           return true;
+                       })
+                : read([&body](const char* p, size_t n) { body.append(p, n); return true; });
+            if (!ok) {
                 /* httplib has already set 413 for a body over the limit; anything else is a peer
                  * that stopped sending partway, which has to be answered as something. */
                 if (s.status < 0) {
@@ -477,7 +488,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 }
                 return;
             }
-            bridge(q, std::move(body), s);
+            bridge(q, std::move(body), s, std::move(form));
         });
     }
     /* THE PREFLIGHT ALLOWS WHATEVER HEADERS IT IS ASKED ABOUT. A browser client sends more than

@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -76,6 +77,7 @@ static void flatten_json(const nlohmann::json& j, const std::string& prefix, Met
                 if (e.is_number_integer()) s += fmt("%lld", (long long)e.get<int64_t>());
                 else if (e.is_number())    s += fmt("%.17g", e.get<double>());
                 else if (e.is_string())    s += e.get<std::string>();
+                else if (e.is_boolean())   s += e.get<bool>() ? "1" : "0";
                 else { ok = false; break; }
             }
             if (ok) out->kv(key, s);
@@ -480,6 +482,95 @@ int shard_list(const std::string& dir, const std::string& index, bool index_give
 
 }  /* namespace */
 
+/* A JSON file flattened under `prefix`; absent is not an error when `optional`. */
+static int meta_merge_json_file(const std::string& path, const std::string& prefix, bool optional,
+                                MetaOwn* out) {
+    std::ifstream f(path);
+    if (!f) {
+        if (optional) return RAD_OK;
+        RAD_ERR("%s: cannot read it", path.c_str());
+        return RAD_E_NOTFOUND;
+    }
+    nlohmann::json j;
+    try { f >> j; }
+    catch (const std::exception& e) { RAD_ERR("%s: %s", path.c_str(), e.what()); return RAD_E_FORMAT; }
+    if (!j.is_object()) {
+        RAD_ERR("%s: not a JSON object", path.c_str());
+        return RAD_E_FORMAT;
+    }
+    flatten_json(j, prefix, out);
+    return RAD_OK;
+}
+
+static bool path_exists(const std::string& p) { std::ifstream f(p); return (bool)f; }
+
+/* A DIFFUSERS PIPELINE: model_index.json at the top and one folder a component, each with its own
+ * config and weights. It is read as ONE checkpoint, because the components are one model to the
+ * architecture plugin that serves them:
+ *
+ *   text_encoder/   its config.json is the container's model config -- the typed dimensions and
+ *                   the bare keys -- and its tensors keep their names;
+ *   transformer/    tensors under `transformer.`, config.json under `transformer.` keys;
+ *   vae/            tensors under `vae.`, config.json under `vae.` keys;
+ *   scheduler/      scheduler_config.json under `scheduler.` keys;
+ *   processor/ (or tokenizer/)  the tokenizer, the chat template and the preprocessor configs.
+ *
+ * model_index.json itself goes under `pipeline.` keys, and its `_class_name` names the
+ * architecture: `QwenImage21Pipeline` is `qwenimage21`. A component folder may be a link to
+ * another pipeline's (a distilled release sharing its base's text encoder). */
+int Checkpoint::open_diffusers() {
+    kind_ = SafeT;
+    RAD_TRY(meta_merge_json_file(dir_ + "/model_index.json", "pipeline", false, &meta_));
+    const std::string te = dir_ + "/text_encoder";
+    if (path_exists(te + "/config.json")) {
+        std::vector<std::string> shards;
+        std::unordered_map<std::string, std::string> owner;
+        RAD_TRY(shard_list(te, te + "/model.safetensors.index.json", false, &shards, &owner));
+        for (const auto& sh : shards) RAD_TRY(add_shard(sh, "", owner.empty() ? nullptr : &owner));
+        RAD_TRY(meta_from_config_json(te, &meta_));
+        RAD_TRY(meta_merge_generation_config(te, &meta_));
+    }
+    for (const char* comp : { "transformer", "vae" }) {
+        const std::string d = dir_ + "/" + comp;
+        if (!path_exists(d + "/config.json")) continue;
+        const std::string idx = d + "/diffusion_pytorch_model.safetensors.index.json";
+        std::vector<std::string> shards;
+        std::unordered_map<std::string, std::string> owner;
+        if (path_exists(idx)) {
+            RAD_TRY(shard_list(d, idx, true, &shards, &owner));
+        } else {
+            shards.push_back(d + "/diffusion_pytorch_model.safetensors");
+        }
+        for (const auto& sh : shards)
+            RAD_TRY(add_shard(sh, std::string(comp) + ".", owner.empty() ? nullptr : &owner));
+        RAD_TRY(meta_merge_json_file(d + "/config.json", comp, false, &meta_));
+    }
+    RAD_TRY(meta_merge_json_file(dir_ + "/scheduler/scheduler_config.json", "scheduler", true,
+                                 &meta_));
+    for (const char* sub : { "processor", "tokenizer" }) {
+        const std::string d = dir_ + "/" + sub;
+        if (!path_exists(d + "/tokenizer.json")) continue;
+        tok_dir_ = d;
+        RAD_TRY(meta_merge_preprocessor_configs(d, &meta_));
+        break;
+    }
+    /* The architecture is the pipeline's, whatever the text encoder calls itself. */
+    if (const char* cn = meta_.get("pipeline._class_name")) {
+        std::string a = cn;
+        const std::string suf = "Pipeline";
+        if (a.size() > suf.size() && a.compare(a.size() - suf.size(), suf.size(), suf) == 0)
+            a.resize(a.size() - suf.size());
+        for (char& ch : a) ch = (char)std::tolower((unsigned char)ch);
+        meta_.arch = a;
+    }
+    if (tensors_.empty()) {
+        RAD_ERR("%s: a diffusers pipeline with no component weights", dir_.c_str());
+        return RAD_E_NOTFOUND;
+    }
+    meta_.finish();
+    return RAD_OK;
+}
+
 int Checkpoint::open_safetensors(const std::string& path) {
     kind_ = SafeT;
     /* One shard, an index, or the directory holding either: one namespace whichever it is. */
@@ -488,6 +579,9 @@ int Checkpoint::open_safetensors(const std::string& path) {
     const bool is_index = path.size() > 10 && path.compare(path.size() - 10, 10, "index.json") == 0;
     const bool is_file = path.size() > 12 &&
                          path.compare(path.size() - 12, 12, ".safetensors") == 0;
+    if (!is_file && !is_index && path_exists(dir_ + "/model_index.json") &&
+        !path_exists(dir_ + "/config.json"))
+        return open_diffusers();
     if (is_file) {
         shards.push_back(path);
     } else {

@@ -1067,6 +1067,11 @@ int Builder::declare_logits(rad_buf b) {
             prog_.buffers[prog_.pooled_buf].name.c_str());
         return RAD_E_STATE;
     }
+    if (prog_.generator.layout != 0) {
+        err(RAD_E_STATE, "declare_logits: this program already declared the image generator '%s'",
+            prog_.gen_str.name.c_str());
+        return RAD_E_STATE;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1091,6 +1096,11 @@ int Builder::declare_pooled(rad_buf b) {
         err(RAD_E_STATE, "declare_pooled: this program already declared '%s' as its logits; a "
                          "program generates or embeds, not both",
             prog_.buffers[prog_.logits_buf].name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.generator.layout != 0) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared the image generator '%s'",
+            prog_.gen_str.name.c_str());
         return RAD_E_STATE;
     }
     const RadBufDecl& d = prog_.buffers[b].decl;
@@ -1170,6 +1180,105 @@ int Builder::declare_encoder(const RadEncoderDecl* d) {
     slot = *d;
     slot_name = nm;
     slot.name = nullptr;   /* the plugin's storage; the name is the copy */
+    return RAD_OK;
+}
+
+/* WHAT THE GENERATOR IS. Checked whole here: a generator's every request runs all three of its
+ * passes, so a declaration the core cannot drive fails the first request rather than a rare one,
+ * and the first request is the wrong place to learn that the plugin sized its image buffer for a
+ * smaller picture than it says it makes. The strings are copied: the plugin's storage is not the
+ * Program's, and the Program outlives a declare. */
+int Builder::declare_generator(const RadGeneratorDecl* d) {
+    if (finished_) { err(RAD_E_STATE, "declare_generator after declare finished"); return RAD_E_STATE; }
+    if (!d) { err(RAD_E_INVAL, "declare_generator: null declaration"); return RAD_E_INVAL; }
+    const char* nm = d->name && *d->name ? d->name : "(unnamed)";
+    if (prog_.generator.layout != 0) {
+        err(RAD_E_STATE, "declare_generator: '%s' was already declared; '%s' is a second one",
+            prog_.gen_str.name.c_str(), nm);
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE) {
+        err(RAD_E_STATE, "declare_generator '%s': this program already declared %s; a program "
+                         "generates text, embeds or makes images -- one of the three", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits" : "a pooled output");
+        return RAD_E_STATE;
+    }
+    if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID) {
+        err(RAD_E_INVAL, "declare_generator '%s': layout %d is not one this engine builds", nm,
+            (int)d->layout);
+        return RAD_E_INVAL;
+    }
+    auto has = [](const char* t, const char* what) { return t && std::strstr(t, what); };
+    if (!has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}") ||
+        !has(d->tmpl_edit, "{images}") || !has(d->tmpl_image, "{image}")) {
+        err(RAD_E_INVAL, "declare_generator '%s': tmpl_text needs {prompt}, tmpl_edit {images} and "
+                         "{prompt}, and tmpl_image {image}, where the picture's tokens go", nm);
+        return RAD_E_INVAL;
+    }
+    if (d->latent_channels <= 0 || d->latent_scale <= 0 || d->size_multiple <= 0 ||
+        d->size_multiple % d->latent_scale != 0 || d->pixel_channels <= 0 ||
+        d->pixel_channels > 4 || d->slot_rows <= 0 || d->max_tokens <= 0 || d->max_refs < 0 ||
+        d->ref_area <= 0 || d->default_width <= 0 || d->default_height <= 0 ||
+        d->default_width % d->size_multiple != 0 || d->default_height % d->size_multiple != 0 ||
+        (d->default_width / d->latent_scale) * (d->default_height / d->latent_scale) > d->max_tokens ||
+        d->max_lanes <= 0) {
+        err(RAD_E_INVAL, "declare_generator '%s': a geometry field is out of range (latent %lld x "
+                         "%lld px, multiple %lld, %lld channels, slot rows %lld, max %lld tokens, "
+                         "default %lldx%lld, %lld lanes)", nm, (long long)d->latent_channels,
+            (long long)d->latent_scale, (long long)d->size_multiple, (long long)d->pixel_channels,
+            (long long)d->slot_rows, (long long)d->max_tokens, (long long)d->default_width,
+            (long long)d->default_height, (long long)d->max_lanes);
+        return RAD_E_INVAL;
+    }
+    if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
+        (d->n_sigmas == 0 && d->default_steps <= 0) || !(d->default_cfg >= 1.0) ||
+        (d->dyn_shift && (d->max_seq <= d->base_seq || d->base_seq <= 0)) ||
+        (!d->dyn_shift && !(d->shift > 0)) || d->shift_terminal < 0 || d->shift_terminal >= 1) {
+        err(RAD_E_INVAL, "declare_generator '%s': the sampler is incomplete (%d fixed sigmas, %lld "
+                         "default steps, shift %g, dynamic %d over %lld..%lld, terminal %g, "
+                         "guidance %g)", nm, (int)d->n_sigmas, (long long)d->default_steps,
+            d->shift, (int)d->dyn_shift, (long long)d->base_seq, (long long)d->max_seq,
+            d->shift_terminal, d->default_cfg);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < d->n_sigmas; ++i)
+        if (!(d->sigmas[i] > 0.0 && d->sigmas[i] <= 1.0) ||
+            (i > 0 && !(d->sigmas[i] < d->sigmas[i - 1]))) {
+            err(RAD_E_INVAL, "declare_generator '%s': fixed sigma %d (%g) is not in (0, 1] below "
+                             "the one before it", nm, i, d->sigmas[i]);
+            return RAD_E_INVAL;
+        }
+    if (d->image_out == RAD_NULL_HANDLE || (size_t)d->image_out >= prog_.buffers.size()) {
+        err(RAD_E_INVAL, "declare_generator '%s': image_out %u is not a declared buffer", nm,
+            (unsigned)d->image_out);
+        return RAD_E_INVAL;
+    }
+    const RadBufDecl& ob = prog_.buffers[d->image_out].decl;
+    int64_t numel = 1;
+    for (uint32_t i = 0; i < ob.rank; ++i) numel *= ob.shape[i];
+    const int64_t px = d->max_tokens * d->latent_scale * d->latent_scale;
+    if (ob.dtype != RAD_U8 || ob.domain != RAD_DOMAIN_DEVICE || numel < px * d->pixel_channels) {
+        err(RAD_E_INVAL, "declare_generator '%s': image_out '%s' must be a device u8 buffer of at "
+                         "least %lld x %lld -- the largest image", nm,
+            prog_.buffers[d->image_out].name.c_str(), (long long)px, (long long)d->pixel_channels);
+        return RAD_E_INVAL;
+    }
+    Program::GenStrings& g = prog_.gen_str;
+    g.name             = nm;
+    g.tmpl_text        = d->tmpl_text;
+    g.tmpl_edit        = d->tmpl_edit;
+    g.tmpl_image       = d->tmpl_image;
+    g.tmpl_image_sep   = d->tmpl_image_sep ? d->tmpl_image_sep : "";
+    g.drop_prefix      = d->drop_prefix ? d->drop_prefix : "";
+    g.tmpl_transparent = d->tmpl_transparent ? d->tmpl_transparent : "";
+    g.sigmas.assign(d->sigmas, d->sigmas + d->n_sigmas);
+    prog_.generator = *d;
+    /* The Program is moved after declare, and a pointer into a moved string is a pointer into the
+     * old one's storage: nothing here may be read through the decl, only through gen_str. */
+    RadGeneratorDecl& c = prog_.generator;
+    c.name = c.tmpl_text = c.tmpl_edit = c.tmpl_image = c.tmpl_image_sep = nullptr;
+    c.drop_prefix = c.tmpl_transparent = nullptr;
+    c.sigmas = nullptr;
     return RAD_OK;
 }
 
@@ -1820,6 +1929,11 @@ int rad_drafter_shared_kv(RadBuilder* b, int pos_offset) {
 int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_encoder(d);
+}
+
+int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_generator(d);
 }
 
 void rad_note(RadBuilder* b, const char* f, ...) {

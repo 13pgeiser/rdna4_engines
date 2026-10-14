@@ -27,6 +27,13 @@ struct Frame {
     std::vector<uint8_t> rgb;          /* [h, w, 3] */
 };
 
+/* A picture with its alpha: packed 8-bit RGBA, row-major, no padding -- what an image generator
+ * reads and writes. A source without alpha comes back opaque. */
+struct FrameRGBA {
+    int32_t              w = 0, h = 0;
+    std::vector<uint8_t> rgba;         /* [h, w, 4] */
+};
+
 /* Is there a decoder in this build. */
 bool decoder_available();
 
@@ -34,6 +41,16 @@ bool decoder_available();
  * `max_pixels` in the SOURCE, which is what bounds the memory a request can make the server
  * allocate before any resize happens. */
 int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, std::string* why);
+/* The same, keeping the alpha channel. */
+int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRGBA* out,
+                      std::string* why);
+
+/* A PICTURE TO A FILE: `px` is [h, w, ch] 8-bit, ch 3 (RGB) or 4 (RGBA), and `format` one of png,
+ * jpeg and webp. `quality` 0..100 is jpeg's and lossy webp's (0 or above 100: the format's own
+ * default); png is lossless and webp is lossless at 100. jpeg has no alpha and is refused one.
+ * RAD_E_UNSUPPORTED, with the reason, for a format this build has no encoder for. */
+int encode_image(const uint8_t* px, int32_t w, int32_t h, int32_t ch, const std::string& format,
+                 int32_t quality, std::vector<uint8_t>* out, std::string* why);
 
 /* HOW A VIDEO IS SAMPLED, and it happens INSIDE the decode rather than after it: a minute of 1080p
  * is 10 GB of RGB, so frames that are not sampled are never converted or kept. The choice of which

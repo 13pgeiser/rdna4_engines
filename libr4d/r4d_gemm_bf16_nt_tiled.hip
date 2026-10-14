@@ -58,7 +58,18 @@ __global__ __launch_bounds__(256) void r4d_gemm_bf16_nt_tiled_kernel(
 
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31;
   const int wm = wave / BT_WN, wn = wave % BT_WN;
-  const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+  // THE GRID RUNS IN GROUPS OF 8 ACTIVATION BANDS, M fastest inside a group. Blocks are
+  // dispatched in flattened-id order, and the launch's x-fastest grid swept every weight band for
+  // each activation band, reading the whole weight once per 128 rows: free while it sits in the
+  // 64 MB MALL, and half the rate once it does not (N 12288 x K 4096, 96 MB, ran at 68 TFLOP/s
+  // where N 8192 ran at 118). A group keeps its bands' weight tiles shared by the blocks in
+  // flight and reads the weight once a group. Small grids take it too: with fewer bands than a
+  // group the order is plain M-fastest, which is what reads the weight once.
+  constexpr unsigned kGroupM = 8;
+  const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+  const unsigned first = lin / per * kGroupM, r = lin % per;
+  const unsigned gm = min(gridDim.y - first, kGroupM);
+  const int m0 = (int)(first + r % gm) * BM, n0 = (int)(r / gm) * BN;
 
   // Staging: chunk c = tid + 256 i is row c / CPR, elements (c % CPR) * 8 of it. Eight threads
   // cover a row's 128 bytes, so a warp's loads are four whole lines.

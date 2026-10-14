@@ -81,6 +81,11 @@ set(R4D_UNITS
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
   "r4d_attn_dense_bf16|"
   "r4d_encoder_bf16|"
+  # The image generator: attention over a paged prefix and the pass's own rows, the causal
+  # head_dim-128 dense form and the 1152-wide decoder head; and the sampler, adaptive norm,
+  # implicit-GEMM convolution and pixel ops around them.
+  "r4d_attn_gen|"
+  "r4d_gen|"
   # The vision tower's own small ops: layer norm, the learned-grid position embedding, and the
   # biased GEMM with a linear layer's activation and residual in its store.
   "r4d_vit_bf16|"

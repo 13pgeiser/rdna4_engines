@@ -937,18 +937,38 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* ---- 2. coverage */
-    int missing = 0;
+    /* ---- 2. coverage
+     *
+     * OPS WITH NO CPU PATH BY DECISION, named one by one: the image generator's (arch/qwenimage21).
+     * A DiT step at 2048^2 is about 4e14 FLOP, minutes on a CPU, so the generator is a GPU program
+     * and libavx serves none of its ops. The list is what keeps the rule a rule -- an op missing
+     * from libavx and not named here is still a kernel built and never wired. */
+    static const char* const kNoCpuPath[] = {
+        "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
+        "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "l2norm_chan", "d2s_add",
+        "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
+        "ln_mod_quant_fp8",
+    };
+    auto no_cpu_path = [](const char* op) {
+        for (const char* o : kNoCpuPath)
+            if (!std::strcmp(o, op)) return true;
+        return false;
+    };
+    int missing = 0, exempt = 0;
     for (int i = 0, n = ref.kernel_count(); i < n; ++i) {
         const RadKernelInfo* kr = ref.kernel_at(i);
         if (!kr || !kr->op) continue;
+        if (!avx.row(kr->op) && no_cpu_path(kr->op)) {
+            ++exempt;
+            continue;
+        }
         if (!avx.row(kr->op)) {
             std::printf("COVER   %-24s libref implements it, libavx does not\n", kr->op);
             ++missing;
         }
     }
-    std::printf("coverage: libref %d rows, libavx %d rows, %d op(s) missing\n",
-                ref.kernel_count(), avx.kernel_count(), missing);
+    std::printf("coverage: libref %d rows, libavx %d rows, %d op(s) missing, %d with no CPU path "
+                "(the image generator's)\n", ref.kernel_count(), avx.kernel_count(), missing, exempt);
 
     /* ---- 3/4. the numbers, per ISA level */
     const std::vector<Case> cases = build_cases();

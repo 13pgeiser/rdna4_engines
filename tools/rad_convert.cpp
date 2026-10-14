@@ -904,8 +904,8 @@ int main(int argc, char** argv) {
             w.abort();
             return 1;
         }
-    } else if (file_exists(ck.dir() + "/tokenizer.json")) {
-        const std::string tj = ck.dir() + "/tokenizer.json";
+    } else if (file_exists(ck.tok_dir() + "/tokenizer.json")) {
+        const std::string tj = ck.tok_dir() + "/tokenizer.json";
         RAD_INFO("vocab    %s", tj.c_str());
         if (parse_tokenizer_json(tj.c_str(), vb) < 0) { w.abort(); return 1; }
     } else {

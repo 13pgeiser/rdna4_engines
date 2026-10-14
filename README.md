@@ -1,8 +1,8 @@
 # radiance
 
-An LLM inference server for AMD GPUs, in C++ and HIP. Its HTTP API speaks OpenAI's chat, completions
-and Responses APIs, Anthropic's Messages API and llama-server's native one, so their clients and
-SDKs work unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this tree are built
+An LLM and image-generation inference server for AMD GPUs, in C++ and HIP. Its HTTP API speaks OpenAI's
+chat, completions, Responses and images APIs, Anthropic's Messages API and llama-server's native one,
+so their clients and SDKs work unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this tree are built
 and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
 The bundled device kernels (`libr4d`) target **AMD RDNA4** (`gfx1200`, `gfx1201`). The serve flags
@@ -23,6 +23,8 @@ If you wish to support the developement of the radiance engine you can do so [he
 | MiniCPM5-2B FP8, DSpark drafter | `minicpm5-2b-fp8.rad` (3 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-fp8) | `minicpm5-2b.yaml` |
 | MiniCPM5-2B bf16, DSpark drafter | `minicpm5-2b-bf16.rad` (5 GiB) | [download](https://huggingface.co/StillDeadcode/minicpm5-2b-bf16) | `minicpm5-2b-bf16.yaml` |
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
+| Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
+| Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
@@ -50,6 +52,12 @@ Givens rotations it was trained in. Convert int4 from `z-lab/Qwen3.8-27B-PARO`, 
 `data/recipes/q38-27b-paro-mxfp4-df2.recipe` and the DFlash2 drafter. A ParoQuant container made
 before 1.5.0 is refused at startup. Convert it again and pass the old one as `--reuse` to copy every
 tensor that did not change.
+
+The Qwen-Image containers serve OpenAI's images API (`/v1/images/generations`, `/v1/images/edits`):
+pictures from a prompt, and edits of up to ten pictures with an optional mask, 2048x2048 by default.
+On two R9700s a 2048x2048 picture takes 61 s at the base model's 40 steps and 13 s with Turbo (56 and
+12 s with `--tp-wire wht6`); 1024x1024 takes 6 s and 2.6 s. Qwen-Image 2.1 is under Qwen's research
+license, which is non-commercial.
 
 ## Run with Docker
 
@@ -121,6 +129,7 @@ prefix-cache tiers:
 | Qwen3.8-27B bf16 | `--tp 2 --max-num-seqs 8 --max-model-len 200000 --kv-cache-dtype fp8` |
 | MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
 | Qwen3.8-Flash-Next bf16 | `--tp 2 --max-model-len 32768 --placement expert_tiered --weights-disk-tier --host-pool-mib 12288 --gpu-headroom-mib 768 --deterministic --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0` |
+| Qwen-Image 2.1 and 2.1 Turbo | `--tp 2 --tp-wire wht6` |
 
 Every model serves up to 32 sequences a step. Two rows keep 8, because on a hybrid model each
 sequence holds its own recurrent state, and 32 of them take that memory from the attention cache
@@ -152,6 +161,14 @@ and the kernel it resolved to, then exit without serving. Then:
 ```sh
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":50}'
+```
+
+An image model answers OpenAI's images API instead, with base64 pictures:
+
+```sh
+curl -s localhost:8000/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt":"a lighthouse on a cliff at sunset, oil painting","size":"1024x1024"}' \
+  | python3 -c 'import sys,json,base64; open("out.png","wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
 ```
 
 `http://localhost:8000/` is the dashboard. [`docs/GUIDE.md`](docs/GUIDE.md) covers the API, memory

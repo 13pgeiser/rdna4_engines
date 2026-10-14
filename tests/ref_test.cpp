@@ -283,6 +283,12 @@ TEST(op_vocabulary) {
         "sample_penalties", "sample_dry", "sample_temp", "sample_topk", "sample_topp",
         "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
         "sample_argmax", "sample_merge_topk", "sample_logprobs",
+        /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
+         * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
+        "ln_mod", "gate_add", "timestep_embed", "gather_rows2", "lane_gather", "lane_store",
+        "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "l2norm_chan", "d2s_add",
+        "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
+        "ln_mod_quant_fp8",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);

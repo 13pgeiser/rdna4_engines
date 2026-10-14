@@ -660,6 +660,10 @@ static const RadParamSpec pAllReduce[] = {
      * plugin reads it, because the message size picks the two-shot (the all-reduce constraints
      * below). */
     { "hops",       RAD_P_INT, RAD_OPTIONAL },
+    /* 1 when the caller issues this collective on its second lane, beside compute (rad_lane). It
+     * picks the rows whose launch is narrow -- see tArLane -- and changes nothing the kernel
+     * computes. */
+    { "overlap",    RAD_P_INT, RAD_OPTIONAL },
 };
 /* docs/OPS.md has `x` -> `x` (inout). Every kernel here is safe in place -- the thread that
  * overwrites a word of the input is the one that read it (r4d_ar_entry.hip says so per kernel) --
@@ -2186,6 +2190,82 @@ static const RadOperandSpec oExpertScale[] = {
 
 #define SCHEMA(op, p, o, doc) { (op), ROW(p), ROW(o), (doc) }
 
+/* ---- image generation (r4d_gen.hip, r4d_attn_gen.hip) -------------------------------------
+ * ref's spellings (libref/ref_registry.cpp), field for field: the first plugin to declare an op
+ * fixes its schema and the second is refused if it disagrees. */
+static const RadParamSpec pGenMn[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadParamSpec pLnMod[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
+static const RadOperandSpec oLnMod[] = {
+    { "x", RAD_OPD_IN, 0 }, { "s", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLnModQ[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
+                                        P_INT("gated"), P_STR("dtype") };
+static const RadOperandSpec oLnModQ[] = {
+    { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 }, { "q", RAD_OPD_OUT, 0 },
+    { "scale", RAD_OPD_OUT, 0 }, { "z", RAD_OPD_OUT, 1 },
+};
+static const RadOperandSpec oGateAdd[] = {
+    { "y", RAD_OPD_IN, 0 }, { "g", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "x", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"),
+                                          P_F64("max_period"), P_INTO("round"), P_STR("dtype") };
+static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+static const RadOperandSpec oGather2[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
+static const RadOperandSpec oLaneGather[] = {
+    { "src", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oLaneStore[] = {
+    { "src", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "dst", RAD_OPD_INOUT, 0 },
+};
+static const RadOperandSpec oRandnLanes[] = {
+    { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "dst", RAD_OPD_INOUT, 0 },
+};
+static const RadOperandSpec oFlowEuler[] = {
+    { "v", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 }, { "sigma_next", RAD_OPD_IN, 0 },
+    { "cfg", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 },
+    { "flags", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "inp_lat", RAD_OPD_IN, 1 }, { "inp_mask", RAD_OPD_IN, 1 }, { "state", RAD_OPD_INOUT, 0 },
+    { "preview", RAD_OPD_INOUT, 1 },
+};
+static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
+                                            P_STR("mode"), P_STR("dtype") };
+static const RadOperandSpec oGenUnary[] = { { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                          P_INT("stride"), P_STR("pad"), P_INT("up"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oConvNhwc[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oL2Norm[] = {
+    { "x", RAD_OPD_IN, 0 }, { "gamma", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
+                                            P_STR("dtype") };
+static const RadOperandSpec oSpaceDepth[] = { { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_INOUT, 0 } };
+static const RadOperandSpec oScatterAdd[] = {
+    { "v", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pAttnPS[] = { P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"),
+                                        P_INTD("block_size"), P_INT("causal"), P_STR("q_dtype"),
+                                        P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk") };
+static const RadOperandSpec oAttnPS[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "kv_cache", RAD_OPD_IN, 0 }, { "block_table", RAD_OPD_IN, 0 }, { "seqused", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "k_descale", RAD_OPD_IN, 1 }, { "v_descale", RAD_OPD_IN, 1 },
+    { "k_i8", RAD_OPD_IN, 1 }, { "k_scale", RAD_OPD_IN, 1 }, { "out", RAD_OPD_OUT, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd). `wadd` is GemmaRMSNorm's `1 +`, added in "
@@ -2718,6 +2798,40 @@ static const RadOpSchema kSchemas[] = {
            "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
            "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
            "bit for bit. Gemma 4's per_expert_scale on the renormalised routing weights."),
+    SCHEMA("ln_mod", pLnMod, oLnMod,
+           "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the "
+           "row's sequence's modulation row of `s`."),
+    SCHEMA("ln_mod_quant_fp8", pLnModQ, oLnModQ,
+           "gated 1: x = bf16(x + bf16(bf16(tanh(g[seq])) * y)) first; then z = ln_mod(x) and "
+           "(q, scale) = quant_act_fp8(z, group), z written when bound."),
+    SCHEMA("gate_add", pGenMn, oGateAdd,
+           "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual through its sequence's gate."),
+    SCHEMA("timestep_embed", pTimestep, oTimestep,
+           "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2))."),
+    SCHEMA("gather_rows2", pGenMn, oGather2,
+           "y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]."),
+    SCHEMA("lane_gather", pLane, oLaneGather, "y[cu[e] + k] = src[lane[e] * stride + k]."),
+    SCHEMA("lane_store", pLane, oLaneStore, "dst[l * stride + k] = src[k] for every lane listed."),
+    SCHEMA("randn_lanes", pLane, oRandnLanes,
+           "an image's first step: its lane's rows become its seed's normal stream."),
+    SCHEMA("flow_euler", pLane, oFlowEuler,
+           "one Euler step of a flow-matching sampler per entry that moves a lane."),
+    SCHEMA("chan_affine", pChanAffine, oGenUnary,
+           "a per-channel affine from two parameter lists of n values."),
+    SCHEMA("conv2d_nhwc", pConvNhwc, oConvNhwc,
+           "an image convolution, channels innermost, the sizes read off the operands."),
+    SCHEMA("l2norm_chan", pL2Norm, oL2Norm,
+           "unit-L2 per row, times sqrt(n), times gamma, then `act`: an image decoder's norm."),
+    SCHEMA("d2s_add", pSpaceDepth, oSpaceDepth, "an upsampling shortcut added in."),
+    SCHEMA("s2d_avg_add", pSpaceDepth, oSpaceDepth, "a downsampling shortcut added in."),
+    SCHEMA("to_rgba8", pGenMn, oGenUnary, "decoded pixels in [-1, 1] to bytes."),
+    SCHEMA("gelu_tanh", pGenMn, oGenUnary, "the tanh approximation of gelu."),
+    SCHEMA("scatter_add_rows", pGenMn, oScatterAdd, "x[idx[i]] += v[i]; a negative index adds nothing."),
+    SCHEMA("attn_prefix_self", pAttnPS, oAttnPS,
+           "attention over a paged prefix and the step's own rows, causal over the own rows or not. "
+           "`qk` \"i8\" with `k_i8` and `k_scale` selects the INT8 Q.K form: the own keys as quant_act_i8g "
+           "codes and scales at group head_dim, the query and the prefix keys quantised the same "
+           "way inside the op, the score product exact in integers and P.V as in the bf16 form."),
 };
 
 /* ================================================================================ constraints
@@ -3118,6 +3232,15 @@ static const RadConstraint cArTsExact8[] = {
 static const RadConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
     C_P2P,
+};
+/* The same two at `overlap` 1: the rows below whose launch defaults leave the CUs to compute. */
+static const RadConstraint cArExactLane[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_EQ("overlap", 1),
+    C_P2P,
+};
+static const RadConstraint cArWht6Lane[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+    C_EQ("overlap", 1), C_P2P,
 };
 /* DIV 32, not 96: the three-rank split is uneven in whole groups (r4d_rad_ar_twoshot_3rank_ti8). */
 static const RadConstraint cArTi8Ts3[] = {
@@ -3783,6 +3906,19 @@ static const RadTunable tAr[] = {
   { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
   { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
 };
+/* THE SAME AXES WITH NARROW DEFAULTS, for a collective issued beside compute (`overlap` 1). The
+ * wide launch -- up to 24 blocks of 1024 threads, 768 waves pushing over the link and then
+ * spinning on peer flags -- is right when the all-reduce has the card to itself and wrong when a
+ * GEMM shares it: on Qwen-Image's two-rank pass the GEMMs that ran beside it took 1.45 to 2.1x
+ * their time alone, which ate the whole overlap. Eight blocks of 256 threads still keep the link
+ * busy, and the same picture went 13.8 -> 13.0 s at 2048^2, bit for bit the same; 8 x 512 and
+ * 24 x 256 were 13.4 and 13.5. */
+static const RadTunable tArLane[] = {
+  { "nblocks",  kArNblocks,  NELEM(kArNblocks),  8, "blocks in the grid. 0 = scale with the message and clamp" },
+  { "nthreads", kArNthreads, NELEM(kArNthreads), 256, "threads per block" },
+  { "drain",    kArDrain,    NELEM(kArDrain),    3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+  { "acq",      kArAcq,      NELEM(kArAcq),      0, "acquire fence after the flag read" },
+};
 
 /* --------------------------------------------------------------------------------- row top-k
  * NCH is a REQUEST -- libr4d rounds the chunk width up to a multiple of eight columns -- so the
@@ -3891,6 +4027,33 @@ static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtyp
 /* No axes: one implementation with nothing to tune. The core appends no choices and the kernel
  * reads no tuned key. */
 #define NOTUNE nullptr, 0, nullptr
+
+/* ---- image generation ------------------------------------------------------------------- */
+/* Rows read 16 bytes at a time, so the widths are whole eights. */
+static const RadConstraint cGenRows8[] = { C_IN("dtype", "bf16"), C_DIV("n", 8) };
+static const RadConstraint cGenBf16[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cLnModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
+                                         C_EQ("group", 128) };
+/* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
+static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
+/* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
+static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
+static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
+/* The paged prefix at libr4d's block of 16, both caches bf16, up to eight query heads a KV head
+ * (the shim takes 1, 2, 4 and 8). */
+static const RadConstraint cAttnPrefixSelf[] = {
+    C_EQ("head_dim", 128), C_LE("gqa", 8), C_EQ("block_size", 16), C_IN("q_dtype", "bf16"),
+    C_IN("kv_dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH128[] = {
+    C_EQ("head_dim", 128), C_LE("gqa", 8), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH768[] = {
+    C_EQ("head_dim", 768), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH1152[] = {
+    C_EQ("head_dim", 1152), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
 
 static const RadKernelInfo kKernels[] = {
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
@@ -5137,6 +5300,27 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
   r4d_shape_all_reduce },
 
+/* The two above at `overlap` 1: the same entry points and the same arithmetic, a launch that
+ * leaves the CUs to the compute running beside it (tArLane). */
+{ "ar_oneshot_2rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch, narrow launch beside compute",
+  "exactly 2 ranks, peer-accessible, overlap 1; scratch sized by the full message; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate, bit-identical across ranks and to the wide row",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cArExactLane), ROW(tArLane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_2rank_exact, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
+{ "ar_oneshot_2rank_wht6_lane", "all_reduce", "ar",
+  "all-reduce (sum) with a Walsh-Hadamard-rotated 6-bit wire payload -- lossy; narrow launch "
+  "beside compute",
+  "exactly 2 ranks, peer-accessible, overlap 1; groups of 64 elements; cudagraph-safe",
+  "bf16 / fp16 payload, 6 bits + bf16 scale per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_AR_ONESHOT + 1,
+  ROW(cArWht6Lane), ROW(tArLane), nullptr,
+  r4d_rad_ar_init, r4d_rad_ar_fini, r4d_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
+  r4d_shape_all_reduce },
+
 { "ar_gather_3rank", "all_gather", "ar",
   "all-gather, one-shot push over P2P IPC scratch, the wide family's per-block handshake",
   "exactly 3 ranks, all peer-accessible; y is [3 * numel] with rank r's input at r * numel, or "
@@ -6325,6 +6509,194 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cExpertScale), NOTUNE,
   nullptr, nullptr, r4d_rad_expert_scale_bf16, nullptr, nullptr, nullptr,
   nullptr },
+{ "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
+  "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
+  "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "
+  "the int8 Q.K form (k_i8 / k_scale) at 1 only",
+  "bf16 q/k/v/out and cache, bf16 operands, fp32 accumulate; or i8 Q.K codes, i32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnPrefixSelf), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefix_self, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "attn_dense_h128_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens, causal or bidirectional",
+  "head_dim 128, 1/2/4/8 query heads a KV head",
+  "bf16 query / key / value / out, bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH128), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_h128, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "attn_dense_h768_bf16", "attn_dense", "attn",
+  "one 768-wide head over every row of a segment: an image encoder's mid-block attention",
+  "head_dim 768 split across eight waves, 16 queries a workgroup",
+  "bf16 query / key / value / out, bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH768), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_wide, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "attn_dense_h1152_bf16", "attn_dense", "attn",
+  "one 1152-wide head over every row of a segment: an image decoder's mid-block attention",
+  "head_dim 1152 split across eight waves, 16 queries a workgroup",
+  "bf16 query / key / value / out, bf16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH1152), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_wide, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "ln_mod_quant_fp8_bf16", "ln_mod_quant_fp8", "norm",
+  "gate_add, ln_mod and quant_act_fp8 in one pass: a workgroup a row",
+  "any M, n a multiple of 128 up to 8192, group 128",
+  "bf16 in, E4M3 codes with f32 scales out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cLnModQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_ln_mod_quant_fp8, nullptr, nullptr, nullptr,
+  nullptr },
+{ "ln_mod_bf16", "ln_mod", "norm",
+  "gainless layer norm times (1 + a sequence's scale row): a workgroup a row",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_ln_mod, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "gate_add_bf16", "gate_add", "elem",
+  "x += tanh(gate row) * y, the reference's three roundings",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gate_add, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "timestep_embed_bf16", "timestep_embed", "elem",
+  "sinusoidal timestep embedding, f32 angles",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenTimestep), NOTUNE,
+  nullptr, nullptr, r4d_rad_timestep_embed, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "gather_rows2_bf16", "gather_rows2", "elem",
+  "rows from two sources by a signed index",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gather_rows2, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "lane_gather_w32", "lane_gather", "elem",
+  "each entry's rows out of its lane",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenLanes), NOTUNE,
+  nullptr, nullptr, r4d_rad_lane_gather, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "lane_store_w32", "lane_store", "elem",
+  "one source's rows into several lanes",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenLanes), NOTUNE,
+  nullptr, nullptr, r4d_rad_lane_store, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "randn_lanes_bf16", "randn_lanes", "elem",
+  "a lane's rows from its seed's Philox normal stream",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_randn_lanes, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "flow_euler_bf16", "flow_euler", "elem",
+  "a flow-matching Euler step with guidance, preview and repaint",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_euler, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "chan_affine_bf16", "chan_affine", "elem",
+  "a per-channel affine from parameter lists",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenAffine), NOTUNE,
+  nullptr, nullptr, r4d_rad_chan_affine, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "l2norm_chan_bf16", "l2norm_chan", "norm",
+  "unit-L2 channel norm, scaled, optional silu: a wave a pixel",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_l2norm_chan, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "d2s_add_bf16", "d2s_add", "elem",
+  "an upsampling shortcut added in",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_d2s_add, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "s2d_avg_add_bf16", "s2d_avg_add", "elem",
+  "a downsampling shortcut added in",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_s2d_avg_add, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "to_rgba8_bf16", "to_rgba8", "elem",
+  "decoded pixels to bytes",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_to_rgba8, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "gelu_tanh_bf16", "gelu_tanh", "elem",
+  "tanh gelu",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu_tanh, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "scatter_add_rows_bf16", "scatter_add_rows", "elem",
+  "x[idx[i]] += v[i]",
+  "any M, row pitches honoured",
+  "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenRows8), NOTUNE,
+  nullptr, nullptr, r4d_rad_scatter_add_rows, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "conv2d_nhwc_bf16", "conv2d_nhwc", "conv",
+  "an image convolution as an implicit GEMM over (tap, cin), the weight stored tap-major",
+  "128 pixels x 64 or 128 output channels a block, 64 K a stage; cin % 8 != 0 takes a direct kernel",
+  "bf16 image, weight and bias, fp32 accumulate, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv2d_nhwc, nullptr, r4d_rad_layout_conv_tap, r4d_rad_relayout_conv_tap,
+  nullptr, r4d_rad_unrelayout_conv_tap },
 };
 
 /* ================================================================================== the exports */

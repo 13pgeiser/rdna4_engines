@@ -34,6 +34,13 @@ static int no_decoder(std::string* why) {
 int decode_image(const uint8_t*, size_t, int64_t, Frame*, std::string* why) {
     return no_decoder(why);
 }
+int decode_image_rgba(const uint8_t*, size_t, int64_t, FrameRGBA*, std::string* why) {
+    return no_decoder(why);
+}
+int encode_image(const uint8_t*, int32_t, int32_t, int32_t, const std::string&, int32_t,
+                 std::vector<uint8_t>*, std::string* why) {
+    return no_decoder(why);
+}
 int decode_video(const uint8_t*, size_t, SampleFn, const void*, int64_t, Video*,
                  std::string* why) {
     return no_decoder(why);
@@ -211,6 +218,46 @@ int to_rgb(const AVFrame* f, SwsContext** sws, Frame* out, std::string* why) {
     return RAD_OK;
 }
 
+/* The same conversion to packed RGBA, for a picture whose alpha is kept. */
+int to_rgba(const AVFrame* f, SwsContext** sws, FrameRGBA* out, std::string* why) {
+    const AVPixelFormat src = (AVPixelFormat)f->format;
+    *sws = sws_getCachedContext(*sws, f->width, f->height, src, f->width, f->height,
+                                AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!*sws) { *why = "no colour conversion from this pixel format"; return RAD_E_UNSUPPORTED; }
+    int cs = f->colorspace;
+    if (cs == AVCOL_SPC_UNSPECIFIED || cs == AVCOL_SPC_RGB) cs = AVCOL_SPC_BT470BG;
+    const int src_full = f->color_range == AVCOL_RANGE_JPEG ||
+                         src == AV_PIX_FMT_YUVJ420P || src == AV_PIX_FMT_YUVJ422P ||
+                         src == AV_PIX_FMT_YUVJ444P || src == AV_PIX_FMT_YUVJ440P;
+    sws_setColorspaceDetails(*sws, sws_getCoefficients(cs), src_full,
+                             sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+    AVFrame* dst = av_frame_alloc();
+    if (!dst) { *why = "out of memory"; return RAD_E_NOMEM; }
+    dst->format = AV_PIX_FMT_RGBA;
+    dst->width = f->width;
+    dst->height = f->height;
+    if (av_frame_get_buffer(dst, 0) < 0) {
+        av_frame_free(&dst);
+        *why = "out of memory";
+        return RAD_E_NOMEM;
+    }
+    const int e = sws_scale(*sws, f->data, f->linesize, 0, f->height, dst->data, dst->linesize);
+    if (e != f->height) {
+        av_frame_free(&dst);
+        *why = "colour conversion failed";
+        return RAD_E_INVAL;
+    }
+    out->w = f->width;
+    out->h = f->height;
+    const size_t row = (size_t)f->width * 4;
+    out->rgba.resize(row * (size_t)f->height);
+    for (int y = 0; y < f->height; ++y)
+        std::memcpy(out->rgba.data() + (size_t)y * row, dst->data[0] + (ptrdiff_t)y * dst->linesize[0],
+                    row);
+    av_frame_free(&dst);
+    return RAD_OK;
+}
+
 /* THE DECODE LOOP, for both kinds: every frame in presentation order, `keep(i, frame)` told the
  * index of each and whether to stop.
  *
@@ -311,6 +358,138 @@ int decode_image(const uint8_t* data, size_t n, int64_t max_pixels, Frame* out, 
     if (s < 0) return s;
     if (!got) { *why = "the image decoded to no frame"; return RAD_E_INVAL; }
     return RAD_OK;
+}
+
+int decode_image_rgba(const uint8_t* data, size_t n, int64_t max_pixels, FrameRGBA* out,
+                      std::string* why) {
+    std::string w;
+    if (!why) why = &w;
+    if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
+    Input in;
+    RAD_TRY(in.open(data, n, true, why));
+    const AVCodecParameters* cp = in.fmt->streams[in.stream]->codecpar;
+    if (cp->width <= 0 || cp->height <= 0) { *why = "the image has no size"; return RAD_E_INVAL; }
+    if ((int64_t)cp->width * cp->height > max_pixels) {
+        *why = "the image is " + std::to_string(cp->width) + "x" + std::to_string(cp->height) +
+               ", over the server's " + std::to_string(max_pixels) + "-pixel limit for a source";
+        return RAD_E_INVAL;
+    }
+    SwsContext* sws = nullptr;
+    bool got = false;
+    const int s = decode_frames(in, [&](int64_t, const AVFrame* f) -> int {
+        const int c = to_rgba(f, &sws, out, why);
+        if (c < 0) return c;
+        got = true;
+        return 1;
+    }, why);
+    sws_freeContext(sws);
+    if (s < 0) return s;
+    if (!got) { *why = "the image decoded to no frame"; return RAD_E_INVAL; }
+    return RAD_OK;
+}
+
+/* ONE PICTURE THROUGH ONE ENCODER. The pixels are converted to the pixel format the encoder takes
+ * (swscale, full-range BT.601 for jpeg's YUV, as PIL writes it), sent as one frame, and the one
+ * packet that comes back is the file: png, mjpeg and libwebp all write a complete image file a
+ * packet. */
+int encode_image(const uint8_t* px, int32_t w, int32_t h, int32_t ch, const std::string& format,
+                 int32_t quality, std::vector<uint8_t>* out, std::string* why) {
+    std::string wy;
+    if (!why) why = &wy;
+    if (!px || w <= 0 || h <= 0 || (ch != 3 && ch != 4) || !out) {
+        *why = "no picture to encode";
+        return RAD_E_INVAL;
+    }
+    const AVCodec* codec = nullptr;
+    AVPixelFormat pf = AV_PIX_FMT_NONE;
+    if (format == "png") {
+        codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+        pf = ch == 4 ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+    } else if (format == "jpeg") {
+        if (ch == 4) { *why = "jpeg carries no alpha"; return RAD_E_INVAL; }
+        codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+        pf = AV_PIX_FMT_YUVJ420P;
+    } else if (format == "webp") {
+        codec = avcodec_find_encoder_by_name("libwebp");
+        pf = AV_PIX_FMT_BGRA;
+    } else {
+        *why = "'" + format + "' is not an image format this server writes (png, jpeg, webp)";
+        return RAD_E_INVAL;
+    }
+    if (!codec) {
+        *why = "this build has no " + format + " encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+    AVCodecContext* cx = avcodec_alloc_context3(codec);
+    AVFrame* fr = av_frame_alloc();
+    AVPacket* pk = av_packet_alloc();
+    SwsContext* sws = nullptr;
+    int st = RAD_OK;
+    auto fail = [&](const std::string& m, int code) { *why = m; st = code; };
+    do {
+        if (!cx || !fr || !pk) { fail("out of memory", RAD_E_NOMEM); break; }
+        cx->width = w;
+        cx->height = h;
+        cx->pix_fmt = pf;
+        cx->time_base = AVRational{ 1, 25 };
+        cx->color_range = format == "jpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_UNSPECIFIED;
+        if (format == "jpeg") {
+            const int q = quality > 0 && quality <= 100 ? quality : 90;
+            /* qscale 2 (best) .. 31 (worst), linear in the quality */
+            const int qs = 2 + (100 - q) * 29 / 100;
+            cx->flags |= AV_CODEC_FLAG_QSCALE;
+            cx->global_quality = FF_QP2LAMBDA * qs;
+        }
+        /* PNG AT zlib LEVEL 1 WITH PER-ROW PREDICTION: a 2048^2 picture in 0.16 s and 5.9 MB, where
+         * the encoder's default (level 6) takes 1.0 s for 5.3 MB -- a second of a few-step image
+         * model's request, on one core, for a tenth of the bytes. */
+        if (format == "png") {
+            cx->compression_level = 1;
+            av_opt_set(cx->priv_data, "pred", "mixed", 0);
+        }
+        if (format == "webp") {
+            const int q = quality > 0 && quality <= 100 ? quality : 90;
+            if (q >= 100) av_opt_set_int(cx->priv_data, "lossless", 1, 0);
+            else          av_opt_set_double(cx->priv_data, "quality", (double)q, 0);
+        }
+        int r = avcodec_open2(cx, codec, nullptr);
+        if (r < 0) { fail("the " + format + " encoder would not open (" + averr(r) + ")", RAD_E_INVAL); break; }
+        fr->format = pf;
+        fr->width = w;
+        fr->height = h;
+        if (av_frame_get_buffer(fr, 0) < 0) { fail("out of memory", RAD_E_NOMEM); break; }
+        const AVPixelFormat src = ch == 4 ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        sws = sws_getContext(w, h, src, w, h, pf, SWS_BILINEAR | SWS_ACCURATE_RND, nullptr,
+                             nullptr, nullptr);
+        if (!sws) { fail("no colour conversion to the encoder's format", RAD_E_UNSUPPORTED); break; }
+        if (format == "jpeg")
+            sws_setColorspaceDetails(sws, sws_getCoefficients(SWS_CS_DEFAULT), 1,
+                                     sws_getCoefficients(SWS_CS_ITU601), 1, 0, 1 << 16, 1 << 16);
+        const uint8_t* sp[1] = { px };
+        const int sl[1] = { w * ch };
+        if (sws_scale(sws, sp, sl, 0, h, fr->data, fr->linesize) != h) {
+            fail("colour conversion failed", RAD_E_INVAL);
+            break;
+        }
+        fr->pts = 0;
+        r = avcodec_send_frame(cx, fr);
+        if (r >= 0) r = avcodec_send_frame(cx, nullptr);
+        if (r < 0) { fail("encoding failed (" + averr(r) + ")", RAD_E_INVAL); break; }
+        out->clear();
+        for (;;) {
+            r = avcodec_receive_packet(cx, pk);
+            if (r == AVERROR_EOF || r == AVERROR(EAGAIN)) break;
+            if (r < 0) { fail("encoding failed (" + averr(r) + ")", RAD_E_INVAL); break; }
+            out->insert(out->end(), pk->data, pk->data + pk->size);
+            av_packet_unref(pk);
+        }
+        if (st == RAD_OK && out->empty()) fail("the encoder wrote nothing", RAD_E_INVAL);
+    } while (false);
+    sws_freeContext(sws);
+    av_packet_free(&pk);
+    av_frame_free(&fr);
+    avcodec_free_context(&cx);
+    return st;
 }
 
 int decode_video(const uint8_t* data, size_t n, SampleFn sample, const void* user,

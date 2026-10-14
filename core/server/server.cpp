@@ -137,6 +137,8 @@ void Server::register_routes() {
     router_.post("/v1/chat/completions", [this](const HttpRequest& q) { return handle_chat(q); });
     router_.post("/v1/completions",      [this](const HttpRequest& q) { return handle_completion(q); });
     router_.post("/v1/embeddings",       [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.post("/v1/images/generations", [this](const HttpRequest& q) { return handle_images(q, false); });
+    router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/models/:id",       [this](const HttpRequest& q) { return handle_models(q); });
@@ -149,6 +151,8 @@ void Server::register_routes() {
     router_.post("/completions",         [this](const HttpRequest& q) { return handle_native_completion(q); });
     router_.post("/infill",              [this](const HttpRequest& q) { return handle_infill(q); });
     router_.post("/embeddings",          [this](const HttpRequest& q) { return handle_embeddings(q); });
+    router_.post("/images/generations",  [this](const HttpRequest& q) { return handle_images(q, false); });
+    router_.post("/images/edits",        [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
     /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
     router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
@@ -1268,6 +1272,11 @@ HttpResponse Server::handle_chat(const HttpRequest& req) {
         return error_response(err_not_implemented("this is an embedding model: it serves "
                                                   "/v1/embeddings and generates no text"),
                               req.peer);
+    if (opt_.image_model)
+        return error_response(err_not_implemented("this is an image model: it serves "
+                                                  "/v1/images/generations and /v1/images/edits "
+                                                  "and generates no text"),
+                              req.peer);
 
     OaiRequest r;
     ApiError err;
@@ -1329,6 +1338,11 @@ HttpResponse Server::handle_messages(const HttpRequest& req) {
         return error_response(err_not_implemented("this is an embedding model: it serves "
                                                   "/v1/embeddings and generates no text"),
                               req.peer, ApiShape::Anthropic);
+    if (opt_.image_model)
+        return error_response(err_not_implemented("this is an image model: it serves "
+                                                  "/v1/images/generations and /v1/images/edits "
+                                                  "and generates no text"),
+                              req.peer, ApiShape::Anthropic);
     std::string chat, label;
     ApiError err;
     OaiRequest r;
@@ -1362,6 +1376,11 @@ HttpResponse Server::handle_native_completion(const HttpRequest& req) {
     if (opt_.embedding_model)
         return error_response(err_not_implemented("this is an embedding model: it serves "
                                                   "/v1/embeddings and generates no text"),
+                              req.peer);
+    if (opt_.image_model)
+        return error_response(err_not_implemented("this is an image model: it serves "
+                                                  "/v1/images/generations and /v1/images/edits "
+                                                  "and generates no text"),
                               req.peer);
     OaiRequest r;
     ApiError err;
@@ -1525,6 +1544,11 @@ HttpResponse Server::handle_responses(const HttpRequest& req) {
         return error_response(err_not_implemented("this is an embedding model: it serves "
                                                   "/v1/embeddings and generates no text"),
                               req.peer);
+    if (opt_.image_model)
+        return error_response(err_not_implemented("this is an image model: it serves "
+                                                  "/v1/images/generations and /v1/images/edits "
+                                                  "and generates no text"),
+                              req.peer);
     std::string chat, echo;
     ApiError err;
     OaiRequest r;
@@ -1578,6 +1602,11 @@ HttpResponse Server::handle_completion(const HttpRequest& req) {
         return error_response(err_not_implemented("this is an embedding model: it serves "
                                                   "/v1/embeddings and generates no text"),
                               req.peer);
+    if (opt_.image_model)
+        return error_response(err_not_implemented("this is an image model: it serves "
+                                                  "/v1/images/generations and /v1/images/edits "
+                                                  "and generates no text"),
+                              req.peer);
 
     OaiRequest r;
     ApiError err;
@@ -1602,7 +1631,9 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
                               req.peer);
     if (!deps_.embed)
         return error_response(err_not_implemented(
-            "/v1/embeddings requires an embedding model; this one generates text"), req.peer);
+            opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
+                             : "/v1/embeddings requires an embedding model; this one generates "
+                               "text"), req.peer);
 
     OaiRequest r;
     ApiError err;

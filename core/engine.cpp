@@ -5,6 +5,7 @@
  * engine_priv.h for what the four share.
  */
 #include "engine_priv.h"
+#include "gen/driver.h"
 #include "kld.h"
 #include "mm/processor.h"
 
@@ -321,7 +322,7 @@ void Engine::rank_loop(int index) {
             /* This rank's view of the step: the same numbers, pointed at this card's staging.
              * The upload that filled it was issued on THIS stream, so the ordering is an
              * ordinary same-stream dependency and no cross-rank fence is needed. */
-            const RadBatch* mine = sched_.batch_for(index);
+            const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
             if (!mine) {
                 RAD_ERR("rank %d: the builder has no batch for this rank", index);
                 step_status_.store(RAD_E_STATE, std::memory_order_release);
@@ -1596,11 +1597,29 @@ int Engine::serve() {
         return RAD_E_STATE;
     }
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
-    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_) {
-        RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits) and no pooled "
-                "output (rad_declare_pooled), so a step produces nothing anyone can read. An "
-                "encoder-only plugin cannot serve.", plugins_.arch_plugin.c_str());
+    const bool generator = ranks_[0]->program.is_generator();
+    if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
+        RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
+                "(rad_declare_pooled) and no image generator (rad_declare_generator), so a step "
+                "produces nothing anyone can read. An encoder-only plugin cannot serve.",
+                plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
+    }
+    if (generator) {
+        if (cfg_.kld() || cfg_.n_spec > 0) {
+            RAD_ERR("the '%s' plugin makes images: --kld and speculative decoding have no tokens to "
+                    "work on", plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        for (size_t i = 1; i < ranks_.size(); ++i)
+            if (!ranks_[i]->program.is_generator()) {
+                RAD_ERR("rank %zu declared no image generator and rank 0 did", i);
+                return RAD_E_STATE;
+            }
+        cfg_.prefix_cache = false;
+        prefix_off_why_ = "an image generator: a conditioning is read by its own request's images "
+                          "and by nothing after them";
+        decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     if (embedding_) {
         if (cfg_.kld() || cfg_.n_spec > 0) {
@@ -1747,6 +1766,16 @@ int Engine::serve() {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+    if (generator) {
+        /* THE GENERATOR'S DRIVER IN PLACE OF THE SCHEDULER: the scheduler is never initialised,
+         * so its step staging -- sized for token steps the generator never runs -- is never
+         * allocated, and nothing calls it. */
+        std::vector<gen::Driver::RankIO> gio;
+        for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
+        gen_ = std::make_unique<gen::Driver>();
+        RAD_TRY(gen_->init(ranks_[0]->program, cfg_, kv_iface_.get(), gio));
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
     /* THE SMALLEST STEP THE PREFILL STAGER OVERLAPS. A prefill chunk the scheduler holds back for
      * other work in the step (--busy-prefill-chunk) is kept at or above it: under it every routed
@@ -1769,7 +1798,7 @@ int Engine::serve() {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { step_loop(); });
+    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
 
     if (cfg_.kld()) print_startup_report(RAD_OK);
     int s = cfg_.kld() ? run_kld() : run_server();
@@ -2290,6 +2319,8 @@ int Engine::run_server() {
             chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
             chat_bridge.ready())
             embed_info.tpl = &chat_bridge;
+    } else if (gen_) {
+        /* An image model's template is its conditioning network's; nothing is served as chat. */
     } else if (vocab_ && !vocab_->chat_template().empty() &&
         chat_bridge.init(*vocab_, declared_format, plugins_.arch_plugin) >= 0 &&
         chat_bridge.ready()) {
@@ -2301,6 +2332,7 @@ int Engine::run_server() {
 
     server::ServerOptions o{};
     o.embedding_model = embedding_;
+    o.image_model = gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
@@ -2536,6 +2568,68 @@ int Engine::run_server() {
         d.mm = mm_bridge.get();
     }
 
+    /* AN IMAGE GENERATOR'S ENDPOINTS: the driver's queue, the model's declared prompts and sizes,
+     * and the processor for the conditioning network's view of a reference picture. */
+    struct ImageBridge final : server::IImageGen {
+        gen::Driver*         drv = nullptr;
+        const mm::Processor* proc = nullptr;
+        server::ImageGenInfo inf;
+        const server::ImageGenInfo& info() const override { return inf; }
+        int submit(std::unique_ptr<gen::Request> r, std::string* why) override {
+            return drv->submit(std::move(r), why);
+        }
+        int picture(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string* why) override {
+            if (!proc) {
+                if (why) *why = "this model reads no pictures";
+                return RAD_E_UNSUPPORTED;
+            }
+            return proc->image_from(f, out, why);
+        }
+        int64_t queued() const override { return drv->queued(); }
+        int64_t running() const override { return drv->running(); }
+    } image_bridge;
+    if (gen_) {
+        const Program& pg = ranks_[0]->program;
+        const RadGeneratorDecl& gd = pg.generator;
+        server::ImageGenInfo& in = image_bridge.inf;
+        in.name = pg.gen_str.name;
+        in.tmpl_text = pg.gen_str.tmpl_text;
+        in.tmpl_edit = pg.gen_str.tmpl_edit;
+        in.tmpl_image = pg.gen_str.tmpl_image;
+        in.tmpl_image_sep = pg.gen_str.tmpl_image_sep;
+        in.drop_prefix = pg.gen_str.drop_prefix;
+        in.tmpl_transparent = pg.gen_str.tmpl_transparent;
+        in.latent_scale = gd.latent_scale;
+        in.size_multiple = gd.size_multiple;
+        in.pixel_channels = gd.pixel_channels;
+        in.max_tokens = gd.max_tokens;
+        /* Edits need the conditioning network to read pictures. */
+        in.max_refs = mm_proc ? gd.max_refs : 0;
+        in.ref_area = gd.ref_area;
+        in.default_width = gd.default_width;
+        in.default_height = gd.default_height;
+        in.default_steps = gd.default_steps;
+        in.max_lanes = gd.max_lanes;
+        in.max_cond_tokens = gen_->max_cond_tokens();
+        in.fixed_schedule = !pg.gen_str.sigmas.empty();
+        in.fixed_steps = (int64_t)pg.gen_str.sigmas.size();
+        in.default_cfg = gd.default_cfg;
+        image_bridge.drv = gen_.get();
+        image_bridge.proc = mm_proc.get();
+        d.images = &image_bridge;
+        /* The model a client lists and names is the generator's own (qwen-image-2.1), not the
+         * architecture a diffusers pipeline's container is named after. */
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "an image generator: its own name");
+        }
+        RAD_INFO("images: '%s', %lldx%lld by default, up to %lld latent tokens, %lld picture(s) an "
+                 "edit, %s", in.name.c_str(), (long long)in.default_width,
+                 (long long)in.default_height, (long long)in.max_tokens, (long long)in.max_refs,
+                 in.fixed_schedule ? (std::to_string(in.fixed_steps) + " fixed steps").c_str()
+                                   : (std::to_string(in.default_steps) + " steps by default").c_str());
+    }
+
     if (encd.modalities == 0 && aend.modalities == 0 && cfg_.media_flags_set())
         RAD_WARN("media: the media flags do nothing here -- this model %s",
                  cfg_.mm_max_patches == 0 ? "is served text only (--mm-max-patches 0)"
@@ -2595,6 +2689,11 @@ int Engine::run_server() {
     if (embedding_)
         RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501)%s",
                  o.host.c_str(), o.port, o.api_key.empty() ? "" : "  -- a bearer key is required");
+    else if (gen_)
+        RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
+                 "501)%s", o.host.c_str(), o.port,
+                 d.images && d.images->info().max_refs > 0 ? " and /v1/images/edits" : "",
+                 o.api_key.empty() ? "" : "  -- a bearer key is required");
     else
         RAD_INFO("serving on http://%s:%d  (/v1/completions%s)%s", o.host.c_str(), o.port,
                  d.chat ? "; /v1/chat/completions with tools and reasoning" : "; chat is 501",

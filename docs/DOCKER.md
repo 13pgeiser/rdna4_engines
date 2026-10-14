@@ -134,6 +134,8 @@ the cards the engine runs on.
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
 | `minicpm5-2b-bf16.yaml` | `minicpm5-2b-bf16.rad` | MiniCPM5-2B in bf16 with its DSpark drafter |
 | `embeddinggemma2.yaml` | `embeddinggemma2-bf16.rad` | EmbeddingGemma 2 in bf16: text, image, video and audio embeddings on one card |
+| `qwen-image-2.1.yaml` | `qwen-image-2.1-fp8.rad` | Qwen-Image 2.1 as block fp8 on two cards: OpenAI's images API, generation and edits |
+| `qwen-image-2.1-turbo.yaml` | `qwen-image-2.1-turbo-fp8.rad` | Qwen-Image 2.1 Turbo, the same in 8 steps |
 
 The container names are the files the README's model table downloads or converts.
 

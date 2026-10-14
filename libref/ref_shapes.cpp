@@ -89,6 +89,7 @@
 #include "rad_plugin.h"
 #include "rad_sample.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <initializer_list>
@@ -2135,4 +2136,276 @@ int ref_sample_pick_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
  * works. See ref_row_topk_merge_shape. */
 int ref_sample_merge_topk_shape(const RadParam*, int, int, RadOpdDesc*) {
     return RAD_E_UNSUPPORTED;
+}
+
+/* ================================================================== image generation (ref_gen.cpp)
+ *
+ * The row-wise ones are described; the rest DECLINE. A lane op's indices are lanes of a state the
+ * case would have to size to match them, a flow step's entries pair across the batch, and an image
+ * op reads its height and width off its operands -- each a case a cold draw would make up, and a
+ * description that makes up a case tests the bounds handling and calls it correctness. */
+int ref_ln_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* x */
+    o.t(D, { 1, n });                                         /* s: one sequence */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("ln_mod", operand, out);
+}
+int ref_ln_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* y */
+    o.t(D, { 1, n });                                         /* g: one sequence */
+    o.t(D, { 1, n });                                         /* s */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M, n });                                         /* x, INOUT */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
+    o.t(D, { M, n });                                         /* z */
+    return o.finish("ln_mod_quant_fp8", operand, out);
+}
+int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* y */
+    o.t(D, { 1, n });                                         /* g */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M, n });                                         /* x */
+    return o.finish("gate_add", operand, out);
+}
+int ref_timestep_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t_fill((uint32_t)RAD_F32, { M }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* t: a sigma in (0, 1) */
+    o.t(act_dt(p, n_p), { M, n });                                    /* y */
+    return o.finish("timestep_embed", operand, out);
+}
+int ref_gather_rows2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    (void)p; (void)n_p; (void)operand; (void)out;
+    return RAD_E_UNSUPPORTED;   /* a signed index: half its draw would have to be negative */
+}
+/* ---- the image generator's per-lane ops. A LANE is one image's slot of a state buffer, `stride`
+ * rows apart; an entry of the step reads or writes its own lane. Four lanes is the smallest count
+ * that leaves lanes no entry touches, so a write into the wrong lane shows as a difference in
+ * one that should have kept its fill. The entries are as many as the rows need at `stride` a
+ * piece (one, unless M is longer than a lane), split by cu_seqlens. */
+enum { REF_LANES = 4 };
+static int64_t lane_entries(const RadParam* p, int n_p, int64_t M, int64_t stride) {
+    const int64_t s = n_seq_of(p, n_p), need = (M + stride - 1) / stride;
+    return std::min<int64_t>(std::max(s, need), REF_LANES);
+}
+
+int ref_lane_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = lane_entries(p, n_p, M, st);
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { REF_LANES * st, n });                            /* src: every lane */
+    o.t_idx({ S }, REF_LANES, -1, 0);                         /* lane: may repeat */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("lane_gather", operand, out);
+}
+
+int ref_lane_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0 || M > st) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* src */
+    /* Distinct, two of the four: one image stored to the lanes of its guided pair. */
+    o.t_idx({ 2 }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t(D, { REF_LANES * st, n });                            /* dst, INOUT */
+    return o.finish("lane_store", operand, out);
+}
+
+int ref_randn_lanes_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = lane_entries(p, n_p, M, st);
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    Opd o;
+    /* Flags drawn over all three bits, so some entries are first steps and some are left. */
+    o.t_idx({ S }, 8, -1, 0);                                 /* flags */
+    o.t_idx({ 2 * S }, (int64_t)1 << 30, -1, 0);              /* seed: two words an entry */
+    /* Distinct: two first steps in one lane would be a race between their seeds. */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t((uint32_t)RAD_BF16, { REF_LANES * st, n });           /* dst, INOUT */
+    return o.finish("randn_lanes", operand, out);
+}
+
+int ref_flow_euler_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || n <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    /* TWO ENTRIES OF EQUAL LENGTH where M allows, so a pair drawn from {0, 1} is always legal:
+     * an entry guided against the other, or against itself. -1 and -2 are not drawable, so the
+     * unguided and the parked entry are left to the engine's own tests. */
+    const int64_t S = (M % 2 == 0 && M / 2 <= st) ? 2 : 1;
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32, B = (uint32_t)RAD_BF16;
+    Opd o;
+    o.t(B, { M, n });                                         /* v */
+    o.t(F, { S });                                            /* sigma */
+    o.t(F, { S });                                            /* sigma_next */
+    o.t(F, { S });                                            /* cfg */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ S }, 8, -1, 0);                                 /* flags: preview and repaint drawn */
+    o.t_idx({ 2 * S }, (int64_t)1 << 30, -1, 0);              /* seed */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(B, { REF_LANES * st, n });                            /* inp_lat */
+    o.t(F, { REF_LANES * st });                               /* inp_mask */
+    o.t(B, { REF_LANES * st, n });                            /* state, INOUT */
+    o.t(B, { REF_LANES * st, n });                            /* preview, INOUT */
+    return o.finish("flow_euler", operand, out);
+}
+
+/* ---- an image decoder's convolutions and shortcuts. Both sizes are read off the operands, and
+ * M counts the OUTPUT's pixels, so the picture's shape is this description's to choose: eight
+ * columns where M allows -- a row then has both edges and an interior -- and the input whatever
+ * makes that output. A shape no input produces is declined rather than bent. */
+static int64_t cols_for(int64_t M, int64_t mult) {
+    for (int64_t w = 8; w >= 1; w /= 2)
+        if (w % mult == 0 && M % w == 0 && (M / w) % mult == 0) return w;
+    return 0;
+}
+
+int ref_conv2d_nhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t k = gi(p, n_p, "k", 0), stride = gi(p, n_p, "stride", 1);
+    const int64_t up = gi(p, n_p, "up", 1);
+    const char* pad = gs(p, n_p, "pad");
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || stride <= 0 || up <= 0)
+        return RAD_E_UNSUPPORTED;
+    const bool down = pad && !std::strcmp(pad, "down");
+    const int64_t pads = down ? 1 : 2 * (k / 2);
+    const int64_t Wo = cols_for(M, 1), Ho = Wo ? M / Wo : 0;
+    if (!Wo) return RAD_E_UNSUPPORTED;
+    /* The smallest upsampled input the output needs, which must be a whole input at `up`. */
+    const int64_t Hv = (Ho - 1) * stride + k - pads, Wv = (Wo - 1) * stride + k - pads;
+    if (Hv <= 0 || Wv <= 0 || Hv % up || Wv % up) return RAD_E_UNSUPPORTED;
+    if ((Hv + pads - k) / stride + 1 != Ho || (Wv + pads - k) / stride + 1 != Wo)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { Hv / up, (Wv / up) * cin });                     /* x */
+    o.t(D, { cout, cin, k, k });                              /* w */
+    o.t(D, { cout });                                         /* b */
+    o.t(D, { Ho, Wo * cout });                                /* y */
+    return o.finish("conv2d_nhwc", operand, out);
+}
+
+int ref_d2s_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    if (M <= 0 || cin <= 0 || cout <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t Wo = cols_for(M, 2);
+    if (!Wo) return RAD_E_UNSUPPORTED;
+    const int64_t Ho = M / Wo;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { Ho / 2, (Wo / 2) * cin });                       /* x */
+    o.t(D, { Ho, Wo * cout });                                /* y, INOUT */
+    return o.finish("d2s_add", operand, out);
+}
+
+int ref_s2d_avg_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    if (M <= 0 || cin <= 0 || cout <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t Wo = cols_for(M, 1), Ho = Wo ? M / Wo : 0;
+    if (!Wo) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { 2 * Ho, 2 * Wo * cin });                         /* x */
+    o.t(D, { Ho, Wo * cout });                                /* y, INOUT */
+    return o.finish("s2d_avg_add", operand, out);
+}
+
+/* ---- attention over a paged prefix and the step's own rows. The prefix is `ctx` deep when the
+ * harness sweeps depth and 37 otherwise: two whole blocks and a part of a third, so both the
+ * block-table walk and the partial block's bound run. */
+int ref_attn_prefix_self_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "q_len", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 16);
+    const int64_t gqa = gi(p, n_p, "gqa", 1);
+    const int64_t nh  = gi(p, n_p, "n_head", gqa);
+    if (M <= 0 || hd <= 0 || bs <= 0 || gqa <= 0 || nh <= 0 || nh % gqa) return RAD_E_UNSUPPORTED;
+    const int64_t kvh = nh / gqa, S = n_seq_of(p, n_p);
+    int64_t P = gi(p, n_p, "ctx", 0);
+    if (P <= 0) P = 37;
+    const int64_t max_blocks = (P + bs - 1) / bs;
+    const uint32_t Q  = act_dt(p, n_p);
+    const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
+    const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? Q : kv;
+    Opd o;
+    o.t(Q,  { M, nh, hd });                                   /* q */
+    o.t(Q,  { M, kvh, hd });                                  /* k */
+    o.t(Q,  { M, kvh, hd });                                  /* v */
+    o.t(KV, { S * max_blocks, kvh, bs, 2 * hd });             /* kv_cache */
+    o.t_idx({ S, max_blocks }, S * max_blocks, -1, 0);        /* block_table: may repeat */
+    o.t_idx({ S }, 0, P, 0);                                  /* seqused: the prefix depth */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.skip();                                                 /* k_descale */
+    o.skip();                                                 /* v_descale */
+    const char* qk = gs(p, n_p, "qk");
+    if (qk && !std::strcmp(qk, "i8")) {
+        o.t((uint32_t)RAD_I8, { M, kvh, hd });                /* k_i8 */
+        o.t((uint32_t)RAD_F32, { M, kvh });                   /* k_scale */
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.t(Q,  { M, nh, hd });                                   /* out */
+    return o.finish("attn_prefix_self", operand, out);
+}
+
+int ref_chan_affine_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });
+    o.t(D, { M, n });
+    return o.finish("chan_affine", operand, out);
+}
+int ref_l2norm_chan_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* x */
+    o.t(D, { n });                                            /* gamma */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("l2norm_chan", operand, out);
+}
+int ref_to_rgba8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });
+    o.t((uint32_t)RAD_U8, { M, n });
+    return o.finish("to_rgba8", operand, out);
+}
+int ref_gelu_tanh_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });
+    o.t(D, { M, n });
+    return o.finish("gelu_tanh", operand, out);
+}
+int ref_scatter_add_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });                                      /* v */
+    o.t_idx({ M }, 4 * M, -1, RAD_OPD_F_IDX_UNIQUE);       /* idx, distinct destinations */
+    o.t(D, { 4 * M, n });                                  /* x, inout */
+    return o.finish("scatter_add_rows", operand, out);
 }

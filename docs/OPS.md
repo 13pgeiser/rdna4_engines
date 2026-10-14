@@ -694,6 +694,95 @@ nearly cancel the ULP comes out as a few percent and the transcript moves after 
 The kernel reproduces the reference's fold exactly: the widths above the head dim contribute zeros
 and adding 0.0f is exact, so a block sum over 8 wave partials and over 32 are the same number.
 
+## Image generation
+
+The ops a diffusion image generator declares (`rad_declare_generator`, abi/rad_builder.h): a
+single-stream diffusion transformer's adaptive norm and gated residual, the timestep embedding, the
+per-image latent LANES and the flow-matching sampler over them, attention over a cached
+conditioning prefix, and an image decoder's convolution, channel norm, resampling shortcuts and
+pixel output. Each rounds where the reference model materialises a bf16 tensor; the libref
+function says which (libref/ref_gen.cpp).
+
+| op | params | operands |
+|---|---|---|
+| `ln_mod` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `s`, `cu_seqlens` → `y` |
+| `gate_add` | `M`(range) `n` `dtype` | `y`, `g`, `cu_seqlens`, `x`:inout |
+| `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `dtype` | `t` → `y` |
+| `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
+| `lane_gather` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `cu_seqlens` → `y` |
+| `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
+| `randn_lanes` | `M`(range) `n` `stride` `dtype` | `flags`, `seed`, `lane`, `cu_seqlens`, `dst`:inout |
+| `flow_euler` | `M`(range) `n` `stride` `dtype` | `v`, `sigma`, `sigma_next`, `cfg`, `pair`, `lane`, `flags`, `seed`, `cu_seqlens`, `inp_lat`?, `inp_mask`?, `state`:inout, `preview`:inout? |
+| `chan_affine` | `M`(range) `n` `mul` `add` `mode` `dtype` | `x` → `y` |
+| `conv2d_nhwc` | `M`(range) `cin` `cout` `k` `stride` `pad` `up` `dtype` | `x`, `w`w, `b`w → `y` |
+| `l2norm_chan` | `M`(range) `n` `act` `dtype` | `x`, `gamma`w → `y` |
+| `d2s_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
+| `s2d_avg_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
+| `to_rgba8` | `M`(range) `n` `dtype` | `x` → `y` |
+| `gelu_tanh` | `M`(range) `n` `dtype` | `x` → `y` |
+| `scatter_add_rows` | `M`(range) `n` `dtype` | `v`, `idx`, `x`:inout |
+| `attn_prefix_self` | `q_len` `head_dim` `gqa` `block_size`/der `causal` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `qk`/opt | `q`, `k`, `v`, `kv_cache`, `block_table`, `seqused`, `cu_seqlens`, `k_descale`?, `v_descale`?, `k_i8`?, `k_scale`? → `out` |
+
+**Sequences and lanes.** `cu_seqlens` partitions the rows into entries (`[n_seq+1]` i32, entry `e`
+owning `[cu[e], cu[e+1])`; it need not start at 0). `ln_mod` and `gate_add` take each row's
+modulation row from `s`/`g`, `[n_seq, >= n]` at its own row pitch -- a column slice of one shared
+modulation projection. A LANE is one image's latent in a per-image state buffer, `stride` rows
+apart: `lane_gather` copies entry `e`'s rows out of lane `lane[e]`, `lane_store` copies one
+source into every listed lane (a repainted picture's latent into each of its images).
+
+- `ln_mod`: `y = bf16(bf16(LN(x)) * bf16(1 + s[seq]))`, a layer norm with no gain and no bias.
+- `gate_add`: `x = bf16(x + bf16(bf16(tanh(g[seq])) * y))`.
+- `ln_mod_quant_fp8`: with `gated` 1, `gate_add` first; then `z = ln_mod(x)` and
+  `(q, scale) = quant_act_fp8(z, group)`, `z` written when bound -- the three in one pass, each
+  rounded as its own store would round it, so the bytes are the three ops'.
+- `timestep_embed`: `[cos | sin]` of `t' * f_i`, `f_i = exp(-ln(max_period) * i / (n/2))` in f32,
+  `t' = scale * t`; with `round` 1, `t' = scale * bf16(bf16(t * scale) / scale)` -- the value
+  diffusers' pipeline hands its transformer. `t` is f32 `[M]`.
+- `gather_rows2`: `y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]`, zeros past either source.
+- `randn_lanes`: for entries whose `flags` carry 1, the lane's rows become the entry's seed's
+  standard-normal stream (abi/rad_philox.h), element `(k, c)` the stream's `k * n + c`. `seed` is
+  `[n_seq, 2]` u32, low word first.
+- `flow_euler`: for every entry with `pair != -2` (an entry that IS a negative conditioning moves
+  no lane), `v' = pair >= 0 ? bf16(neg + bf16(cfg * bf16(v - neg))) : v`, `neg` the paired entry's
+  rows; flag 4 writes `bf16(x - sigma * v')` to the lane's `preview`; then
+  `x' = bf16(x + bf16(bf16(sigma_next - sigma) * v'))`; flag 2 restores the kept region,
+  `x' = bf16(m x' + (1 - m)((1 - sigma_next) src + sigma_next noise))` with `m` the lane's f32
+  `inp_mask` row, `src` its `inp_lat` row and `noise` the seed's stream.
+
+**Images** are `[height, width * channels]`, dense, and the ops read both sizes off the operand
+shapes: an image's size is a request's, and a parameter is fixed at declare.
+
+- `conv2d_nhwc`: `w` is PyTorch's `[cout, cin, k, k]` (a kernel may store it permuted through its
+  layout hook), `b` `[cout]`; `up` 2 reads the input upsampled 2x nearest-neighbour; `pad` `same`
+  is `k/2` zeros a side, `down` is none above and left and one below and right (`ZeroPad2d((0,1,0,1))`
+  before a stride-2 conv). f32 accumulation, the bias added, one rounding.
+- `l2norm_chan`: each pixel's channels to unit L2 (eps 1e-12), times `sqrt(n)`, times `gamma` --
+  three roundings -- then `act` `none` or `silu`.
+- `chan_affine`: `mul` and `add` are space-separated lists of `n` values, each rounded to bf16;
+  `fma` is `bf16(bf16(x * mul) + add)`, `inv` is `bf16(bf16(x - add) / mul)`.
+- `d2s_add` (Wan's DupUp3D on one frame): `y[2r+i, 2c+j, o] += x[r, c, (o F + off + 2i + j) /
+  rep]`, `F = 4 ft`, `off = 4` when `ft` is 2, `rep = cout F / cin`.
+- `s2d_avg_add` (AvgDown3D on one frame): `y` gains the mean of each output channel's group of
+  `cin F / cout` dealt values, a dealt channel being `(c, t, i, j)` at `c F + 4t + 2i + j`; with
+  `ft` 2 the frame `t = 0` is the zero frame the reference pads in, which the mean still counts.
+- `to_rgba8`: `round(clamp(bf16(bf16(clamp(x, -1, 1) / 2) + 0.5), 0, 1) * 255)`, u8 out.
+
+**`attn_prefix_self`** attends over two key sources: entry `s`'s first `seqused[s]` keys in the
+paged cache, all visible, and the pass's own rows `k`/`v` beside `q` (dense, at their own pitch,
+rows indexed as `q`'s), of which row `i` sees `j <= i` with `causal` and all of them without. It
+is an image's latent rows against its conditioning, and one segment of a conditioning against the
+segments before it. `qk` `"i8"` is the int8 score form and takes `k_i8` [tokens, kv_heads *
+head_dim] and `k_scale` [tokens, kv_heads] f32, the own keys as `quant_act_i8g` writes them at
+group `head_dim`; the query and every prefix key are quantised inside the op by the same rule
+(scale `amax/127`, 1 for an all-zero row; code `rint(clamp(x * (1/scale), +-127))`) and a score is
+the exact integer dot product times both scales. `k` is then not read for the own rows.
+
+`qk_norm_rope` takes two more `mode`s for these models: `gptj_blocks` is `blocks` with each
+section's pairs ADJACENT, `(start + 2j, start + 2j + 1)` -- a 3-axis image rotary's complex form
+-- and `imrope` is the interleaved M-RoPE of Qwen3-VL's text attention over NeoX pairs (`rope`'s
+`imrope`), reading three position planes.
+
 ## Mixture of experts
 
 | op | params | operands |
@@ -977,7 +1066,7 @@ and the third is what needs the token stride carried separately.
 
 | op | params | operands |
 |---|---|---|
-| `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt | `x`:inout, `y`:out? |
+| `all_reduce` | `world_size` `numel`(range) `dtype` `exact` `min_bytes`/opt `hops`/opt `overlap`/opt | `x`:inout, `y`:out? |
 | `all_gather` | `world_size` `numel` `dtype` `row`/opt | `x` → `y` |
 
 `exact` separates the exact sum from the quantised wire, and a caller has to say which it wants: a
@@ -988,6 +1077,9 @@ libr4d separates one-shot from two-shot, at a width that has both, by message si
 rows start above 524288 elements, which makes that a band edge of the ranged `numel`, so a caller
 states nothing for it. `hops` is a caller's request for one or the other (1 or 2); libref accepts
 and ignores it, and no libr4d row reads it. Every all-reduce kernel serves `y` absent, in place.
+`overlap` 1 says the caller issues the collective on its second lane, beside compute: libr4d then
+serves it with rows whose launch is narrow (8 blocks of 256 threads at two ranks), which compute
+the same bits and leave the CUs to the kernels running beside them; libref ignores it.
 
 libr4d serves these at **2, 3, 4 and 8 ranks**. Two ranks have their own kernels (one flag word a
 block, the rotated 6-bit wire, the fused norm-and-reduce forms). The wide family is one template on

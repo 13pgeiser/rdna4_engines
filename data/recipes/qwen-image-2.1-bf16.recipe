@@ -1,0 +1,9 @@
+# qwen-image-2.1-bf16.recipe -- Qwen-Image 2.1 or 2.1-Turbo served at the checkpoint's precision.
+#
+#   rad-convert <Qwen-Image-2.1 pipeline directory> --recipe data/recipes/qwen-image-2.1-bf16.recipe \
+#       -o qwen-image-2.1-bf16.rad
+#
+# The text encoder and the DiT ship bf16 and are kept. The base model's VAE ships f32, which the
+# plugin reads as bf16 -- the precision diffusers runs it at -- so the cast is done here, once.
+
+vae.*                                cast dtype=bf16

@@ -24,10 +24,17 @@ struct CiLess {
     bool operator()(const std::string& a, const std::string& b) const;
 };
 
+/* One part of a multipart/form-data body: a field's value, or an uploaded file's bytes. */
+struct FormPart {
+    std::string name, filename, content_type, data;
+};
+
 struct HttpRequest {
     std::string method = "GET";
     std::string path;                                    /* no query string */
     std::string body;
+    /* A multipart/form-data body arrives as its parts, in order, and `body` is empty. */
+    std::vector<FormPart> form;
     std::map<std::string, std::string, CiLess> headers;
     std::map<std::string, std::string> query;
     std::map<std::string, std::string> params;           /* from a ":name" route segment */

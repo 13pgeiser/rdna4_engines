@@ -1,0 +1,16 @@
+# Qwen-Image 2.1 (Qwen/Qwen-Image-2.1) as block fp8: pictures from a prompt and edits of up to ten
+# pictures on OpenAI's /v1/images/generations and /v1/images/edits, 2048x2048 by default. Two
+# cards: the conditioning cache then holds all ten reference pictures, where one card holds four.
+# 2.1-Turbo is qwen-image-2.1-turbo.yaml; the bf16 container needs both cards. The engine sizes
+# the step, the batch and the context for an image generator itself (docs/GUIDE.md §5.6). --tp-wire
+# wht6 sends the DiT's all-reduces as 6-bit: about 10% off every picture for a few tenths of a dB
+# against diffusers; drop it for the exact wire.
+name: radiance-qwen-image
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen-image
+    command: >
+      --model /models/qwen-image-2.1-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --tp-wire wht6

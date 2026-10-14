@@ -11,8 +11,9 @@
 #
 # Stages:
 #   ffmpeg   FFmpeg built with only the demuxers core/mm/media.cpp admits and the decoders their
-#            streams need (pictures, video, and audio with swresample); the distribution's build
-#            brings ~200 packages of encoders, filters and display libraries the engine never calls
+#            streams need (pictures, video, and audio with swresample), and the three encoders the
+#            images API writes (png, mjpeg, libwebp); the distribution's build brings ~200
+#            packages of encoders, filters and display libraries the engine never calls
 #   llvm     ROCm's libLLVM rebuilt from ROCm's own llvm-project at the commit the image's clang
 #            reports, with docker/llvm-vopd-pairing.patch -- the fix that makes LLVM 24's device
 #            code repeatable from build to build (cmake/RadAddPlugin.cmake, rad_hip_repeatable)
@@ -53,13 +54,15 @@ ARG JOBS=
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential nasm pkg-config ca-certificates curl xz-utils zlib1g-dev libdav1d-dev \
+      libwebp-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 # The demuxers are media.cpp's kFormats whitelist, the only containers it opens. The decoders are
 # what those containers carry: still images, H.264 and HEVC (MP4, MOV, HEIF), VP8 and VP9 (WebM,
 # WebP), AV1 through dav1d (WebM, MP4, AVIF), MPEG-1/2/4, Theora and the FLV/H.263 family. JPEG XL
-# is recognised and refused by name: its only decoder is libjxl's. No protocols: media.cpp reads
-# from memory through its own I/O context.
+# is recognised and refused by name: its only decoder is libjxl's. The encoders are an image
+# model's output formats (media.cpp encode_image): png, jpeg as mjpeg, webp through libwebp. No
+# protocols: media.cpp reads from memory through its own I/O context.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
  && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
@@ -67,9 +70,10 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
  && ./configure --prefix=/opt/ffmpeg --enable-shared --disable-static --disable-debug \
       --disable-programs --disable-doc --disable-network --disable-autodetect --disable-everything \
       --disable-avdevice --disable-avfilter --enable-swresample \
-      --enable-zlib --enable-libdav1d \
+      --enable-zlib --enable-libdav1d --enable-libwebp \
       --enable-demuxer=mov,matroska,avi,mpegts,flv,ogg,gif,apng,image2pipe,image_png_pipe,image_jpeg_pipe,image_jpegls_pipe,image_jpegxl_pipe,image_webp_pipe,image_bmp_pipe,image_tiff_pipe,image_qoi_pipe,image_pgm_pipe,image_ppm_pipe,image_pbm_pipe,image_pam_pipe,image_gif_pipe,wav,w64,mp3,flac,aac,aiff \
       --enable-decoder=h264,hevc,vp8,vp9,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,jpegls,png,apng,gif,webp,bmp,tiff,qoi,pgm,ppm,pbm,pam,pgmyuv,theora,vp3,flv,h263,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f32be,pcm_f64le,pcm_alaw,pcm_mulaw,mp3float,mp2float,flac,vorbis,opus,aac \
+      --enable-encoder=png,mjpeg,libwebp \
       --enable-parser=h264,hevc,vp8,vp9,av1,mpeg4video,mpegvideo,mjpeg,png,gif,bmp,webp,vp3,qoi,pnm,h263,jpegxl,mpegaudio,flac,aac,vorbis,opus \
  && make -j"${JOBS:-$(nproc)}" \
  && make install \
@@ -136,11 +140,11 @@ ARG JOBS=
 # g++-14 rather than the image's default 13: its libstdc++ is the one hipcc then compiles the
 # device-side translation units against too, and it is the runtime image's libstdc++ as well.
 # gawk because tools/ops_doc_check.sh uses gensub, which Ubuntu's default awk (mawk) lacks.
-# libdav1d7 is the runtime half of the AV1 decoder the ffmpeg stage linked; busybox-static goes
-# into the runtime image.
+# libdav1d7 and libwebp7 are the runtime halves of the AV1 decoder and the WebP encoder the ffmpeg
+# stage linked; busybox-static goes into the runtime image.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      cmake ninja-build pkg-config g++-14 gawk libdav1d7 busybox-static \
+      cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 busybox-static \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg

@@ -23,6 +23,8 @@
 #include <vector>
 
 namespace rad {
+namespace gen { struct Request; }
+namespace mm { struct Frame; struct Item; }
 namespace server {
 
 /* ordered_json, not json, and the reason is not cosmetic: a tool's parameter schema is rendered
@@ -593,6 +595,35 @@ public:
                         std::shared_ptr<mm::Item>* out, std::string* why) = 0;
 };
 
+
+/* THE IMAGE GENERATOR (core/gen), for a model that makes pictures rather than text: what the
+ * model declared about its prompts and sizes, and the queue a request goes into. The server turns
+ * an OpenAI images request into a gen::Request -- the prompt rendered and tokenised, the reference
+ * pictures resized for both of the model's readers -- and reads the pictures back off its ticket. */
+struct ImageGenInfo {
+    std::string name, tmpl_text, tmpl_edit, tmpl_image, tmpl_image_sep, drop_prefix,
+                tmpl_transparent;
+    int64_t latent_scale = 16, size_multiple = 32, pixel_channels = 4, max_tokens = 0;
+    int64_t max_refs = 0, ref_area = 0, default_width = 0, default_height = 0;
+    int64_t default_steps = 0, max_lanes = 1, max_cond_tokens = 0;
+    /* The model samples on a schedule of its own and takes no step count (a distilled model). */
+    bool    fixed_schedule = false;
+    int64_t fixed_steps = 0;
+    double  default_cfg = 1.0;
+};
+
+class IImageGen {
+public:
+    virtual ~IImageGen() = default;
+    virtual const ImageGenInfo& info() const = 0;
+    /* Queue a request; refused at once, with `why`, when it can never run. */
+    virtual int submit(std::unique_ptr<gen::Request> r, std::string* why) = 0;
+    /* A reference picture as the conditioning network's encoder reads it: RGB at the size it was
+     * resized to, which the processor must not change. */
+    virtual int picture(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string* why) = 0;
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
 
 }  /* namespace server */
 }  /* namespace rad */

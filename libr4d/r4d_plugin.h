@@ -138,6 +138,30 @@ int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
 int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
+/* The image generator's attention (r4d_attn_gen.hip): a paged prefix and the pass's own rows, the
+ * causal-capable dense form at head_dim 128 (a text encoder's prompt), and one 1152-wide head
+ * (an image decoder's mid block). */
+int     r4d_rad_attn_prefix_self      (const RadArgs*, RadStream);
+int     r4d_rad_attn_dense_h128       (const RadArgs*, RadStream);
+int     r4d_rad_attn_dense_wide       (const RadArgs*, RadStream);
+/* The image generator's other ops (r4d_gen.hip). */
+int     r4d_rad_ln_mod                (const RadArgs*, RadStream);
+int     r4d_rad_ln_mod_quant_fp8      (const RadArgs*, RadStream);
+int     r4d_rad_gate_add              (const RadArgs*, RadStream);
+int     r4d_rad_timestep_embed        (const RadArgs*, RadStream);
+int     r4d_rad_gather_rows2          (const RadArgs*, RadStream);
+int     r4d_rad_lane_gather           (const RadArgs*, RadStream);
+int     r4d_rad_lane_store            (const RadArgs*, RadStream);
+int     r4d_rad_randn_lanes           (const RadArgs*, RadStream);
+int     r4d_rad_flow_euler            (const RadArgs*, RadStream);
+int     r4d_rad_chan_affine           (const RadArgs*, RadStream);
+int     r4d_rad_conv2d_nhwc           (const RadArgs*, RadStream);
+int     r4d_rad_l2norm_chan           (const RadArgs*, RadStream);
+int     r4d_rad_d2s_add               (const RadArgs*, RadStream);
+int     r4d_rad_s2d_avg_add           (const RadArgs*, RadStream);
+int     r4d_rad_to_rgba8              (const RadArgs*, RadStream);
+int     r4d_rad_gelu_tanh             (const RadArgs*, RadStream);
+int     r4d_rad_scatter_add_rows      (const RadArgs*, RadStream);
 /* Eight queries per KV head (r4d_attn_paged_gqa8.hip): the routed 35B-A3B at head_dim 256
  * and MiniCPM5-2B at 128. A decode workgroup holds 64 rows of q_len*gqa, so the verify
  * width is 8 here against the gqa6 leg's 10 -- which is the row's constraint value. */
@@ -460,6 +484,14 @@ int r4d_rad_layout_gdense(const RadParam*, int, int, const RadEncoding*, const i
                           const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_gdense(const RadParam*, int, int, const RadEncoding*, const int*,
                             const RadTensor*, int, void*, int64_t);
+/* conv2d_nhwc's weight, PyTorch's [cout][cin][k][k] stored tap-major [cout][k][k][cin]
+ * (r4d_layout.cpp). */
+int r4d_rad_layout_conv_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_conv_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                              const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_conv_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const void*, int64_t, const RadTensor*, int);
 int r4d_rad_layout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,
                          const RadTensor*, int, RadLayout*);
 int r4d_rad_relayout_mxfp4(const RadParam*, int, int, const RadEncoding*, const int*,

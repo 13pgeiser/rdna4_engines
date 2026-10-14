@@ -380,6 +380,16 @@ public:
     /* ...and the audio encoder, the second a program may declare (RAD_MM_AUDIO). */
     RadEncoderDecl audio_encoder{};
     std::string    audio_encoder_name;
+    /* THE IMAGE GENERATOR THIS PLUGIN DECLARED (rad_declare_generator); `layout` 0 when it declared
+     * none. The strings and the fixed schedule it points at are the copies below, not the plugin's
+     * storage. A generator program has no logits and no pooled vectors. */
+    RadGeneratorDecl generator{};
+    struct GenStrings {
+        std::string name, tmpl_text, tmpl_edit, tmpl_image, tmpl_image_sep, drop_prefix,
+                    tmpl_transparent;
+        std::vector<double> sigmas;
+    } gen_str;
+    bool is_generator() const { return generator.layout != 0; }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
      * colours the domains SEPARATELY -- a transient may share storage only with a transient in the

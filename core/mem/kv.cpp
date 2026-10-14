@@ -101,8 +101,10 @@ int KVManager::configure(const std::vector<KVGroupInfo>& groups, const Config& c
 
 int KVManager::plan_groups(const std::vector<KVGroupInfo>& groups, const Config& cfg) {
     /* Only to say it is ignored on a model with no recurrent state: the slots are host memory and
-     * the engine opens them (set_checkpoint_store). */
-    const int64_t budget_ckpts = cfg.checkpoint_slots > 0 ? cfg.checkpoint_slots : 0;
+     * the engine opens them (set_checkpoint_store). The operator's own flag, not the default --
+     * every model without such state would otherwise warn about a flag nobody passed. */
+    const int64_t budget_ckpts = cfg.given.count("--checkpoint-slots") && cfg.checkpoint_slots > 0
+                                     ? cfg.checkpoint_slots : 0;
 
     forget();
     max_seqs_ = cfg.max_seqs > 0 ? cfg.max_seqs : 1;

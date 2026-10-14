@@ -8,6 +8,7 @@
  * path and shares nothing with this but the Engine's fields. See engine_priv.h.
  */
 #include "engine_priv.h"
+#include "gen/driver.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -979,6 +980,40 @@ int Engine::declare() {
             "the KL mode: a prefix hit would start a document past positions the reference holds";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
+    /* AN IMAGE GENERATOR SIZES THE STEP ITSELF (RadArchProbe::gen_rows): a denoise pass carries an
+     * image's every latent row at once -- twice with guidance -- and a conditioning pass encodes
+     * every reference picture a request may carry. What the operator named is kept; what they did
+     * not is the generator's. A generator samples no tokens, so it drafts none, and a conditioning
+     * is read only by its own request's images, so there is no prefix to cache. */
+    {
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (pb.gen_rows > 0) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "an image generator: a denoise pass carries the largest image's latent "
+                       "rows twice (with guidance)");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 16;
+                decide("--max-num-seqs", "16", "an image generator: images in one pass");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "an image generator: the longest conditioning, a prompt and its pictures, "
+                       "as the generator's rows");
+            }
+            if (cfg_.mm_max_patches < 0 && pb.gen_patches > 0) {
+                cfg_.mm_max_patches = pb.gen_patches;
+                decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
+                       "an image generator: every reference picture of a request at once");
+            }
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
+        }
+    }
     if (cfg_.n_spec < 0) {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb);
@@ -1381,7 +1416,8 @@ int Engine::plan() {
                 const int64_t w = probe.state_index_width((int32_t)i);
                 if (w > 0) kg.g[i].sidx_width = w;
             }
-            f.staging = BatchBuilder::device_bytes(r->program, cfg_, kg);
+            f.staging = r->program.is_generator() ? gen::Driver::device_bytes(r->program, cfg_)
+                                                  : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
@@ -3167,6 +3203,17 @@ int Engine::configure_kv() {
              * in vram_budget.cpp says it.) What is never acceptable is a pool that cannot
              * hold ONE max-length sequence:
              * that request is accepted by the API and can never complete, whatever the load. */
+            /* An image generator's sequence is a conditioning, and its driver refuses one the
+             * cache can never hold by name at admission; the limit is the operator's to know,
+             * in its own terms, with nothing about experts the model does not have. */
+            if (ranks_[0]->program.is_generator()) {
+                RAD_WARN("kv group '%s' holds %lld rows: a conditioning longer than that -- a "
+                         "prompt with its pictures, up to %lld rows -- is refused. A picture "
+                         "costs a latent row per 16x16 pixels of the reference area; more ranks "
+                         "give the cache more room.",
+                         p->name.c_str(), (long long)cap, (long long)want);
+                continue;
+            }
             RAD_WARN("kv group '%s' holds %lld tokens but the context limit is %lld: ONE request "
                      "longer than %lld tokens is accepted by the API and then refused as too "
                      "large to ever fit -- this is a hard limit, not a backing ratio. Give the "

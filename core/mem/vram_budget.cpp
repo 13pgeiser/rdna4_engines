@@ -173,7 +173,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             exp = std::min(std::max(b.expert_ceiling, b.expert_floor), b.elastic - kv);
             /* THE ONE SEQUENCE WINS, and the experts it pushes off the card have no tier: the
              * planner refuses them by name. Said here too, with what moves it. */
-            if (log && exp < b.expert_floor)
+            if (log && b.expert_floor > 0 && exp < b.expert_floor)
                 RAD_WARN("one --max-model-len sequence's cache (%s) leaves the experts %s, short of "
                          "the %s the pinned host pool cannot hold: raise --host-pool-mib or lower "
                          "--max-model-len",

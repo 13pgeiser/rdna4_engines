@@ -42,6 +42,7 @@
 namespace rad {
 
 class Kld;
+namespace gen { class Driver; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -294,6 +295,11 @@ private:
     float*               pooled_host_ = nullptr;
     int  collect_pooled_issue(const RadBatch* b, StepOut& so);
     int  collect_pooled(const RadBatch* b, StepOut& so);
+    /* AN IMAGE GENERATOR (rad_declare_generator): the driver that turns its requests into passes
+     * and the loop that runs them, in place of the scheduler and the step loop (engine_gen.cpp).
+     * Null for every other program. */
+    std::unique_ptr<gen::Driver> gen_;
+    int  gen_loop();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, const RadBatch* b, StepOut& so);

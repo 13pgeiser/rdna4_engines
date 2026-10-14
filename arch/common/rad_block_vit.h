@@ -14,8 +14,11 @@
  *     x += fc2(gelu_tanh(fc1(LN2(x))))
  *   out = fc2'(gelu(fc1'(LN(x) viewed [P/merge^2, merge^2 * width])))   the patch merger
  *
- * which is transformers' Qwen3_5VisionModel with no deepstack taps (the checkpoints this tree
- * serves list none, and one that did would be refused at declare). Every linear layer is
+ * which is transformers' Qwen3_5VisionModel. Qwen3-VL's DEEPSTACK taps -- the residual stream
+ * after named blocks, each through a merger of its own whose norm is taken AFTER the 2x2 view
+ * (over merge^2 * width), into rows added to the language model's hidden state after its first
+ * layers -- are declared only for a plugin that asks (declare's `deepstack`); one that does not is
+ * refused a tower with taps rather than served without them. Every linear layer is
  * `gemm_nt_bias` with its activation and residual in the epilogue, each rounded where the
  * reference's separate tensors are.
  *
@@ -35,6 +38,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -61,6 +65,16 @@ struct VisionTower {
     rad_buf b_x = 0, b_h = 0, b_qkv = 0, b_att = 0, b_ff = 0, b_mh = 0, b_mf = 0, b_out = 0;
     char    sec[48] = {};
 
+    /* DEEPSTACK: tap t is the residual stream after block `ds_layer[t]`, merged into `b_ds[t]`
+     * ([P / merge^2, n_embd], one row a merged token, in the order `b_out` holds them). */
+    enum { MAX_DS = 4 };
+    int        n_ds = 0;
+    int        ds_layer[MAX_DS] = {};
+    rad_weight ds_nw[MAX_DS] = {}, ds_nb[MAX_DS] = {}, ds_1w[MAX_DS] = {}, ds_1b[MAX_DS] = {};
+    rad_weight ds_2w[MAX_DS] = {}, ds_2b[MAX_DS] = {};
+    rad_op     ds_ln[MAX_DS] = {}, ds_1[MAX_DS] = {}, ds_2[MAX_DS] = {};
+    rad_buf    b_ds[MAX_DS] = {};
+
     /* Is there a tower to declare: the container carries one and the deployment asked for media.
      * `why` is set when the container carries one this block cannot serve. */
     static bool present(const RadModelMeta* m) {
@@ -68,12 +82,12 @@ struct VisionTower {
     }
 
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
-                int64_t model_embd, int first_group);
+                int64_t model_embd, int first_group, bool deepstack = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx,
-                                Names& nm, int64_t model_embd, int first_group) {
+                                Names& nm, int64_t model_embd, int first_group, bool deepstack) {
     on = false;
     if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
 
@@ -105,14 +119,27 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
         return RAD_E_INVAL;
     }
     /* DEEPSTACK -- tower layers feeding the language model's early layers directly -- is a second
-     * input path this block does not carry. Refused by name rather than dropped. */
+     * input path, and a plugin that does not consume it is refused the tower by name rather than
+     * served without it. */
     const char* ds = rad_meta_gets(m, "vision_config.deepstack_visual_indexes", "");
-    for (const char* q = ds; q && *q; ++q)
-        if (*q >= '0' && *q <= '9') {
+    n_ds = 0;
+    for (const char* q = ds; q && *q;) {
+        if (*q < '0' || *q > '9') { ++q; continue; }
+        char* e = nullptr;
+        const long v = std::strtol(q, &e, 10);
+        q = e;
+        if (!deepstack) {
             fprintf(stderr, "radiance: this vision tower has deepstack taps (%s), which this plugin "
                             "does not serve\n", ds);
             return RAD_E_UNSUPPORTED;
         }
+        if (n_ds >= MAX_DS || v < 0 || v >= depth) {
+            fprintf(stderr, "radiance: deepstack taps '%s' do not fit a %lld-block tower\n", ds,
+                    (long long)depth);
+            return RAD_E_INVAL;
+        }
+        ds_layer[n_ds++] = (int)v;
+    }
     const char* act = rad_meta_gets(m, "vision_config.hidden_act", "gelu_pytorch_tanh");
     if (std::strcmp(act, "gelu_pytorch_tanh") && std::strcmp(act, "gelu")) {
         fprintf(stderr, "radiance: vision_config.hidden_act '%s' is not served\n", act);
@@ -182,6 +209,17 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
     m2_b = bw(nm.f("v.merger.fc2.bias"),    nm.ckpt("model.visual.merger.linear_fc2.bias"),   RAD_BF16, { n_embd }, grp_model());
     if (!w_patch || !b_patch || !w_pos || !mn_w || !mn_b || !m1_w || !m1_b || !m2_w || !m2_b)
         return RAD_E_INVAL;
+    for (int t = 0; t < n_ds; ++t) {
+        const char* pre = "model.visual.deepstack_merger_list";
+        ds_nw[t] = bw(nm.f("v.ds.%d.norm.weight", t), nm.ckpt("%s.%d.norm.weight", pre, t), RAD_BF16, { mm * width }, grp_model());
+        ds_nb[t] = bw(nm.f("v.ds.%d.norm.bias", t),   nm.ckpt("%s.%d.norm.bias", pre, t),   RAD_BF16, { mm * width }, grp_model());
+        ds_1w[t] = bw(nm.f("v.ds.%d.fc1.weight", t),  nm.ckpt("%s.%d.linear_fc1.weight", pre, t), RAD_BF16, { mm * width, mm * width }, grp_model());
+        ds_1b[t] = bw(nm.f("v.ds.%d.fc1.bias", t),    nm.ckpt("%s.%d.linear_fc1.bias", pre, t),   RAD_BF16, { mm * width }, grp_model());
+        ds_2w[t] = bw(nm.f("v.ds.%d.fc2.weight", t),  nm.ckpt("%s.%d.linear_fc2.weight", pre, t), RAD_BF16, { n_embd, mm * width }, grp_model());
+        ds_2b[t] = bw(nm.f("v.ds.%d.fc2.bias", t),    nm.ckpt("%s.%d.linear_fc2.bias", pre, t),   RAD_BF16, { n_embd }, grp_model());
+        if (!ds_nw[t] || !ds_nb[t] || !ds_1w[t] || !ds_1b[t] || !ds_2w[t] || !ds_2b[t])
+            return RAD_E_INVAL;
+    }
 
     /* ---- activations. `mh` is the merger's input, declared at the MERGED width: the norm writes
      * it as P rows of `width` and the first merger layer reads it as P/mm rows of mm * width,
@@ -244,6 +282,22 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
     op_mln = rw(b, lnorm(P, mn_w, mn_b), { b_x }, { b_mh });
     op_m1  = rw(b, gemm(R, mm * width, mm * width, "gelu", m1_w, m1_b), { b_mh }, { b_mf });
     op_m2  = rw(b, gemm(R, n_embd, mm * width, "none", m2_w, m2_b), { b_mf }, { b_out });
+    /* A deepstack merger normalises AFTER the view, over a merged row: the same bytes as P rows of
+     * `width`, read as R rows of merge^2 * width. Its ops are declared here, after the tower, and
+     * issued between its blocks; their working planes are consumed before the next block runs.
+     * Each tap's OUTPUT is not -- it waits for the language model while the remaining blocks
+     * overwrite the tower's planes -- so it is PERSIST, outside the planner's sharing. */
+    for (int t = 0; t < n_ds; ++t) {
+        b_ds[t] = decl_b(b, nm.f("v.ds.%d.out", t), RAD_BF16, { R, n_embd }, RAD_BUF_PERSIST);
+        if (!b_ds[t]) return RAD_E_INVAL;
+        ds_ln[t] = rw(b, RAD_OP(b, "layernorm",
+                                RAD_PARAMS(RAD_RANGE("M", 1, R), RAD_INT("n", mm * width),
+                                           RAD_F64("eps", eps), RAD_STR("dtype", "bf16")),
+                                RAD_WEIGHTS(ds_nw[t], ds_nb[t])),
+                      { b_x }, { b_mh });
+        ds_1[t] = rw(b, gemm(R, mm * width, mm * width, "gelu", ds_1w[t], ds_1b[t]), { b_mh }, { b_mf });
+        ds_2[t] = rw(b, gemm(R, n_embd, mm * width, "none", ds_2w[t], ds_2b[t]), { b_mf }, { b_ds[t] });
+    }
 
     if (!ctx->shape_probe) {
         RadEncoderDecl e{};
@@ -282,7 +336,8 @@ inline void VisionTower::step(RadCtx* c, const RadBatch* batch) const {
 
     RAD_ISSUE_N(c, op_patch, Pn, pix, RAD_W(w_patch), RAD_W(b_patch), RAD_NONE, brows(b_x, Pn));
     RAD_ISSUE_N(c, op_pos, Pn, brows(b_x, Pn), RAD_W(w_pos), crd);
-    for (const Layer& l : L) {
+    for (size_t li = 0; li < L.size(); ++li) {
+        const Layer& l = L[li];
         RAD_ISSUE_N(c, l.ln1, Pn, brows(b_x, Pn), RAD_W(l.n1w), RAD_W(l.n1b), brows(b_h, Pn));
         RAD_ISSUE_N(c, l.qkv, Pn, brows(b_h, Pn), RAD_W(l.qkv_w), RAD_W(l.qkv_b), RAD_NONE,
                     brows(b_qkv, Pn));
@@ -297,6 +352,15 @@ inline void VisionTower::step(RadCtx* c, const RadBatch* batch) const {
                     brows(b_ff, Pn));
         RAD_ISSUE_N(c, l.down, Pn, brows(b_ff, Pn), RAD_W(l.down_w), RAD_W(l.down_b),
                     brows(b_x, Pn), brows(b_x, Pn));
+        for (int t = 0; t < n_ds; ++t) {
+            if (ds_layer[t] != (int)li) continue;
+            RAD_ISSUE_N(c, ds_ln[t], Rn, brows(b_x, Pn), RAD_W(ds_nw[t]), RAD_W(ds_nb[t]),
+                        brows(b_mh, Rn));
+            RAD_ISSUE_N(c, ds_1[t], Rn, brows(b_mh, Rn), RAD_W(ds_1w[t]), RAD_W(ds_1b[t]), RAD_NONE,
+                        brows(b_mf, Rn));
+            RAD_ISSUE_N(c, ds_2[t], Rn, brows(b_mf, Rn), RAD_W(ds_2w[t]), RAD_W(ds_2b[t]), RAD_NONE,
+                        brows(b_ds[t], Rn));
+        }
     }
     /* The merger norm writes P rows of `width` into a buffer declared at the merged width: the
      * same bytes the next layer reads as P/mm rows. */

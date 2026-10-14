@@ -340,6 +340,14 @@ rad-convert ~/models/ukisai/Swift-1.5-Qwen3.8-27b -o swift-27b-fp8.rad \
 # arch/gemma4; docs/ARCHITECTURES.md says why down stays bf16 unless the experts were padded to 768)
 rad-convert ~/models/google/gemma-4-26B-A4B-it -o gemma4-26b-a4b-df.rad \
     --draft-model ~/models/z-lab/gemma-4-26B-A4B-it-DFlash --recipe data/recipes/gemma4-26b-a4b-df.recipe
+
+# Qwen-Image 2.1 or 2.1-Turbo, an image model (§5.6): the diffusers pipeline directory is the
+# checkpoint -- text encoder, DiT, VAE and the tokenizer together. fp8 blocks for the text encoder
+# and the DiT (17 GB, one card or two), or the checkpoint's bf16 (31 GB, two cards)
+rad-convert ~/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
+    --recipe data/recipes/qwen-image-2.1-fp8.recipe
+rad-convert ~/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
+    --recipe data/recipes/qwen-image-2.1-fp8.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -1237,6 +1245,7 @@ for a model that takes no images or video.
 | `POST /v1/chat/completions` | chat, with tools, reasoning and streaming |
 | `POST /v1/completions` | raw text completion |
 | `POST /v1/embeddings` | needs a model with an embedding head, else 501 |
+| `POST /v1/images/generations`, `POST /v1/images/edits` | OpenAI's images API, needs an image model (Qwen-Image 2.1), else 501 — §5.6 |
 | `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 — §5.12 |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs — §5.9 |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client — §5.9 |
@@ -1400,7 +1409,7 @@ refused, never dropped: an unconstrained 200 would leave you
 parsing free prose against a schema you were told was enforced. `/v1/completions` has no template
 in the way, so the same grammar works there — which is why the example above uses it.
 
-### 5.6 Completions, embeddings, tokenising
+### 5.6 Completions, embeddings, images, tokenising
 
 ```sh
 curl -s http://localhost:8000/v1/completions -H 'Content-Type: application/json' \
@@ -1465,6 +1474,69 @@ An image becomes up to 280 tokens by default (`--image-tokens`, or a request's `
 cut at 30 seconds. `prompt_name` takes the names the model's sentence-transformers configuration
 states (`query`, `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part
 inputs; a model that states a default prompt applies it when the request names none.
+
+**An image model** (Qwen-Image 2.1 or 2.1-Turbo) serves OpenAI's images API and nothing else;
+completions, chat and embeddings answer 501. Clients written against OpenAI's images endpoints
+(Open WebUI, the OpenAI SDKs) work as they are; the picture always comes back in the response.
+
+```sh
+# a picture from a prompt: b64_json, 2048x2048 unless `size` says otherwise
+curl -s http://localhost:8000/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt":"a lighthouse at dusk, oil painting","size":"1536x1024","seed":7}'
+
+# an edit: one picture or up to ten (`image[]`), multipart as OpenAI's SDKs send it
+curl -s http://localhost:8000/v1/images/edits -F 'prompt=put a red scarf on the fox' \
+  -F 'image[]=@fox.png'
+
+# repaint only where the mask is transparent; the rest comes back exactly as it was
+curl -s http://localhost:8000/v1/images/edits -F 'prompt=a green wool hat' \
+  -F 'image=@fox.png' -F 'mask=@mask.png'
+
+# progress as server-sent events: `partial_images` previews, then the picture
+curl -sN http://localhost:8000/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt":"a red apple, product shot","background":"transparent","stream":true,
+       "partial_images":2}'
+```
+
+| field | |
+|---|---|
+| `prompt` | required |
+| `size` | `WxH` or `auto`; each side is rounded down to a multiple of 32. `auto` is the model's native 2048x2048, and for an edit the last picture's aspect at that area. Larger than the model makes (16800 latent tokens, about 2400x1792) is refused |
+| `n` | pictures from one prompt, 1..16; picture i uses seed + i |
+| `seed` | the noise; the same seed, prompt and size give the same picture |
+| `quality` | `auto`/`high` the model's step count (40 for 2.1), `medium` three quarters, `low` half |
+| `num_inference_steps` | the step count itself; refused by a model with a fixed schedule (Turbo: 8) |
+| `negative_prompt`, `true_cfg_scale` | guidance against the negative prompt, at twice the cost of a step; `true_cfg_scale` above 1 needs a `negative_prompt` |
+| `background` | `transparent` asks the model for one (png or webp), `opaque` flattens on white, `auto` keeps the transparency of an edit's input and is opaque otherwise |
+| `output_format`, `output_compression` | `png` (default), `jpeg` or `webp`; compression 0..100 for jpeg and webp |
+| `stream`, `partial_images` | OpenAI's `image_generation.partial_image` / `image_edit.partial_image` events, 0..3 previews of the clean picture the step predicts, then `.completed` |
+| `image`, `image[]`, `mask` | an edit's pictures (png, jpeg, webp; up to ten) and the first picture's mask: alpha below 128 is where the picture may change |
+
+`response_format: url` is refused: nothing here stores a picture to serve later. The response
+carries `usage` (input tokens: the prompt and the pictures' tokens; output: latent tokens) and
+each picture's `seed` and `revised_prompt` (the prompt as given).
+
+On two cards the step's two all-reduces of the image's rows (128 MB each at 2048x2048, over the
+cards' link) run on a second stream: the rows go through each block in two halves, and one half's
+all-reduce travels while the card computes the other's. `--tp-wire wht6` sends them as 6-bit and
+makes a picture about 9% faster still (2048x2048, 40 steps: 61 -> 56 s; Turbo 12.9 -> 11.9 s, at
+1024x1024 2.6 -> 2.2 s), within a dB of the exact wire against diffusers. Exact is the default.
+The VAE decoder is split by rows across the cards after its mid-block, with the same pixels.
+
+On an fp8 container the denoising attention computes its scores in int8 (about 16% faster
+attention); a picture moves by less than switching between two exact attention implementations
+moves it. A bf16 container keeps bf16 scores.
+
+Two cards (`--tp 2`) are the fastest picture; two servers of one card each make the most
+pictures an hour (each takes 1.7x as long and there are two). A card runs these models at its
+300 W limit, in the DiT's GEMMs and attention alike.
+
+A reference picture costs 4096 rows of the conditioning's KV cache at the model's 1024x1024
+reference area -- its latent rows, which take its vision tokens' places. One card holds the fp8
+container and a cache of 20256 rows: four pictures with their prompt. Two cards (`--tp 2`) hold
+all ten the model takes, and the bf16 container. A request the cache can never hold is a 400
+that says how many rows it needed. The models are under Qwen's research license,
+non-commercial.
 
 ### 5.7 Request fields
 
@@ -1957,7 +2029,7 @@ of a log to paste into an issue.
   fix. Every warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.5.0
+I STARTUP REPORT -- radiance 1.6.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

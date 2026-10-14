@@ -40,6 +40,7 @@ struct Deps {
     IGrammarCompiler* grammar = nullptr;   /* absent -> response_format is 501 */
     IEmbedder*        embed   = nullptr;   /* absent -> /v1/embeddings is 501 */
     IMultimodal*      mm      = nullptr;   /* absent -> image and audio parts are 501 */
+    IImageGen*        images  = nullptr;   /* absent -> the images endpoints are 501 */
 
     /* WHAT ONLY THE ENGINE CAN SEE: per-card VRAM, the expert plane. The server holds interfaces
      * and no device handle, so this dependency is a function rather than an object -- there is
@@ -57,6 +58,9 @@ struct ServerOptions {
      * /v1/completions answer 501 naming /v1/embeddings, rather than queueing a request the engine
      * would finish after one step with no text. */
     bool        embedding_model = false;
+    /* AN IMAGE GENERATOR (rad_declare_generator) GENERATES NO TEXT either: the text endpoints
+     * answer 501 naming /v1/images/generations and /v1/images/edits. */
+    bool        image_model = false;
     /* WHICH DECISION PROTOCOL THE MODEL WAS TRAINED ON, from the container's `decision.type`:
      * "d1" serves /v1/systemone (systemone.h); empty answers it 501. Never inferred from a name. */
     std::string decision_type;
@@ -197,6 +201,8 @@ private:
     HttpResponse handle_chat(const HttpRequest& req);
     HttpResponse handle_completion(const HttpRequest& req);
     HttpResponse handle_embeddings(const HttpRequest& req);
+    /* ------------------------------------------------------------------ images.cpp */
+    HttpResponse handle_images(const HttpRequest& req, bool edit);
     HttpResponse handle_systemone(const HttpRequest& req);
     HttpResponse handle_models(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);

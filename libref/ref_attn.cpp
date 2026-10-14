@@ -40,10 +40,10 @@ using namespace ref;
 
 namespace {
 
-/* The largest head this reference accumulates in one stack frame. MLA's 576 is the widest head in
- * circulation and libr4d's widest is 256, so 1024 is headroom rather than a limit anyone will
- * meet; above it the op says RAD_E_UNSUPPORTED by name instead of overflowing a frame. */
-enum { REF_HD_MAX = 1024 };
+/* The largest head this reference accumulates in one stack frame. The widest in circulation is an
+ * image VAE's single-head mid-block attention at 1152 (Qwen-Image 2.1), so 2048 is headroom; above
+ * it the op says RAD_E_UNSUPPORTED by name instead of overflowing a frame. */
+enum { REF_HD_MAX = 2048 };
 
 struct KVView {
     const RadTensor* t;
@@ -564,10 +564,15 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const float   rscale    = p_f32(a, "scale", 1.0f);
     const float   wadd      = p_f32(a, "wadd", 0.0f);
     const int     v_norm    = (int)p_int(a, "v_norm", 0);
-    static const char* kModes[] = { "neox", "gptj", "blocks" };
-    const int mode = p_enum(a, "mode", kModes, 3, 0);
+    /* `gptj_blocks` is `blocks` with each section's pairs ADJACENT -- (start + 2j, start + 2j + 1),
+     * the complex-number form a 3-axis image rotary takes (Qwen-Image's). `imrope` is `rope`'s
+     * interleaved M-RoPE over NeoX pairs, after the norm (Qwen3-VL's text attention). */
+    static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope" };
+    const int mode = p_enum(a, "mode", kModes, 5, 0);
     if (mode < 0) return RAD_E_UNSUPPORTED;
-    const bool blocks = mode == 2;
+    const bool blocks = mode == 2 || mode == 3;
+    const bool adjacent = mode == 3;
+    const bool im = mode == 4;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
     if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
     if (numel(qw) < head_dim || numel(kw) < head_dim) return RAD_E_SHAPE;
@@ -578,6 +583,10 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
      * fill the rotated prefix exactly. Positions are [C, M], component-major. */
     int64_t sec[8] = {}, comp[8] = {};
     int n_sec = 0;
+    if (im) {
+        n_sec = rope_sections(a, sec);
+        if (n_sec < 3) return RAD_E_SHAPE;
+    }
     if (blocks) {
         n_sec = rope_sections(a, sec);
         if (n_sec <= 0) return RAD_E_SHAPE;
@@ -599,8 +608,9 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const bool multi = pos->rank >= 2;
     const int64_t n_comp = multi ? pos->shape[0] : 1;
     const int64_t M = multi ? pos->shape[1] : numel(pos);
-    if (multi && !blocks) return RAD_E_SHAPE;
-    for (int c = 0; c < n_sec; ++c)
+    if (multi && !blocks && !im) return RAD_E_SHAPE;
+    if (multi && im && n_comp < 3) return RAD_E_SHAPE;
+    for (int c = 0; blocks && c < n_sec; ++c)
         if (comp[c] < 0 || comp[c] >= n_comp) return RAD_E_SHAPE;
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
@@ -610,7 +620,8 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const int64_t ds = laststride(qkv);
     RopeFreq f;
     /* No `ladder` on this row yet: the fused norm+rope measures by `rot`, as it always has. */
-    RAD_REF_TRY(rope_freqs(mode, rot, rot, theta, nullptr, 0, &f));
+    if (im) RAD_REF_TRY(rope_freqs(ROPE_IMROPE, rot, rot, theta, sec, multi ? n_sec : 0, &f));
+    else    RAD_REF_TRY(rope_freqs(blocks ? 0 : mode, rot, rot, theta, nullptr, 0, &f));
 
 
     #pragma omp parallel for schedule(static)
@@ -637,7 +648,7 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
             for (int64_t d = 0; d < head_dim; ++d)
                 stt(qkv, base + d * ds, ldt(qkv, base + d * ds) * sc * (ldt(w, d * ws) + wadd));
             if (!blocks) {
-                rope_head(qkv, base, ds, rot, mode, f, p);
+                rope_head(qkv, base, ds, rot, im ? ROPE_IMROPE : mode, f, p);
                 continue;
             }
             int64_t start = 0;
@@ -646,7 +657,8 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
                     const float inv = 1.0f / std::pow(theta, (float)j / (float)sec[c]);
                     const float ang = p[comp[c]] * inv;
                     const float cs = std::cos(ang), sn = std::sin(ang);
-                    const int64_t i0 = start + j, i1 = start + sec[c] + j;
+                    const int64_t i0 = adjacent ? start + 2 * j : start + j;
+                    const int64_t i1 = adjacent ? start + 2 * j + 1 : start + sec[c] + j;
                     const float x0 = ldt(qkv, base + i0 * ds), x1 = ldt(qkv, base + i1 * ds);
                     stt(qkv, base + i0 * ds, x0 * cs - x1 * sn);
                     stt(qkv, base + i1 * ds, x0 * sn + x1 * cs);

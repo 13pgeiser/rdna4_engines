@@ -229,7 +229,94 @@ typedef struct RadBatch {
     int64_t        enc_n_seg;
     const int32_t* enc_cu;             /* [enc_n_seg + 1] device: segment boundaries in patches */
     int32_t        enc_max_seg;        /* host: the longest segment, which bands the attention */
+
+    /* ================================================ image generation */
+
+    /* A GENERATOR PASS (rad_declare_generator): RAD_GEN_PASS_*, and `gen_b` what it carries. 0 on
+     * every step of a program that declared no generator. */
+    int32_t                   gen;
+    const struct RadGenBatch* gen_b;
 } RadBatch;
+
+/* WHAT A GENERATOR PASS CARRIES beside the step batch's own fields, which keep their meanings:
+ *
+ *   COND     ONE sequence. `token_ids`, `positions` and `rope_pos` are its conditioning prompt, the
+ *            encoder's input (`enc_*`) is the prompt's reference pictures and `mm_rows` the prompt
+ *            rows the encoder's output rows replace, as on any media step. What is here lays out
+ *            the generator's sequence over those rows and writes it into the KV group.
+ *   DENOISE  one entry per (image, conditioning): `cu_seqlens` bounds each entry's latent rows,
+ *            and the KV group's `block_table` and `seqused` name its conditioning's sequence.
+ *   DECODE   one image.
+ *
+ * Every pointer is device memory unless the name ends in _h. */
+typedef struct RadGenBatch {
+    /* ---- COND */
+    int64_t        rows;          /* the generator's rows for this sequence */
+    /* Where each row comes from: >= 0 the prompt row of that index (the conditioning network's
+     * output there), < 0 the reference latent row -(1 + src). [rows] */
+    const int32_t* src;
+    /* Rotary positions, three components a row. On a COND pass they are laid out SEGMENT BY
+     * SEGMENT: segment s's [3, length] component-major block starts at element 3 * seg_h[s], so a
+     * segment's positions are one dense operand. On a DENOISE pass, [3, n_tok] component-major,
+     * the latent rows'. */
+    const int32_t* rope;
+    /* The sequence in SEGMENTS: rows [seg_h[s], seg_h[s+1]), each a picture (`seg_bidi_h` 1, its
+     * rows attend to each other both ways) or a run of text (0, causal). A segment is never split
+     * and attends to every segment before it. `seg` is the same offsets on the device; `seg_cu`
+     * is [n_seg, 2], segment s's own cu_seqlens {0, length}, and `seg_start` [n_seg] its first
+     * row -- the keys before it, which is its `seqused` when it is run on its own. */
+    int64_t        n_seg;
+    const int32_t* seg;
+    const int32_t* seg_h;
+    const int32_t* seg_bidi_h;
+    const int32_t* seg_cu;
+    const int32_t* seg_start;
+    /* [rows] the KV slot each row is stored at. */
+    const int32_t* slot_mapping;
+    /* PIXELS the decoder's encoder takes: `n_px` blocks of `px` [*, pixel_channels] bf16 in
+     * [-1, 1], block b at pixel px_h[3b], px_h[3b+1] high and px_h[3b+2] wide. The reference
+     * pictures, in prompt order, and -- with `inpaint` -- a last block that is no reference but
+     * the picture being repainted, at the size being made: its latents go to the lanes below. */
+    int64_t        n_px;
+    const void*    px;
+    const int32_t* px_h;
+    /* [n_px, 2] each block's own cu_seqlens over its latent tokens: {0, (h / scale) (w / scale)}. */
+    const int32_t* px_cu;
+    int32_t        inpaint;
+    /* [image tokens] f32: 1 where the image is repainted, 0 where the picture is kept. */
+    const float*   inp_mask;
+    /* The lanes this conditioning's images run in, which take the repainted picture's latents. */
+    int64_t        n_lane;
+    const int32_t* lane_h;
+
+    /* ---- DENOISE, one value per entry ([n_seq]); on a COND pass `sigma` is one 0, the time
+     * the conditioning is modulated at */
+    const float*   sigma;         /* where the entry's latent is */
+    const float*   sigma_next;    /* where this step takes it */
+    const float*   cfg;           /* guidance: v = neg + cfg * (pos - neg); 1 without a pair */
+    /* The entry holding this image's NEGATIVE conditioning, or -1 for none; -2 marks an entry
+     * that IS one, whose rows serve another entry's step and whose lane it does not move. */
+    const int32_t* pair;
+    const int32_t* lane;          /* the plugin's lane the image's latent lives in */
+    const int32_t* lane_dh;       /* ... the same, host */
+    /* RAD_GEN_F_*. */
+    const int32_t* flags;
+    /* [n_seq, 2] the image's noise seed, low word first. */
+    const uint32_t* seed;
+
+    /* ---- DECODE */
+    int32_t        dec_lane;
+    int32_t        dec_height, dec_width;    /* pixels */
+    int32_t        dec_preview;              /* the lane's preview latent, not its state */
+} RadGenBatch;
+
+/* An entry's flags on a DENOISE pass. */
+enum {
+    RAD_GEN_F_FIRST   = 1,   /* the image's first step: its latent is the noise its seed draws */
+    RAD_GEN_F_INPAINT = 2,   /* repaint: after the step, the kept region goes back to the picture,
+                              * noised to sigma_next with the image's own noise */
+    RAD_GEN_F_PREVIEW = 4    /* write the step's estimate of the clean latent to the lane's preview */
+};
 
 /* ================================================================== operands */
 /* RAD_OPK_KV names a KV group's pool rather than a buffer: attention and kv_store take the cache

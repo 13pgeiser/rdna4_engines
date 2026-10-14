@@ -3,7 +3,7 @@
 #
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS so that adding a file to a component
 # does not mean editing a file another component owns. Re-run cmake if a new file does not appear.
-set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag)
+set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})

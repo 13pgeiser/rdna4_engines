@@ -1,0 +1,13 @@
+# Qwen-Image 2.1 Turbo (Qwen/Qwen-Image-2.1-Turbo) as block fp8: the 8-step distillation of
+# qwen-image-2.1.yaml's model, the same images API, 2048x2048 by default. It samples on its own
+# 8-step schedule, so a request's num_inference_steps may only be 8. --tp-wire wht6 sends the DiT's
+# all-reduces as 6-bit; drop it for the exact wire.
+name: radiance-qwen-image-turbo
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-qwen-image-turbo
+    command: >
+      --model /models/qwen-image-2.1-turbo-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --tp-wire wht6
