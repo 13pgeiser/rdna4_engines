@@ -68,7 +68,15 @@ fn qwen4_moe_sym(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
   Some(t)=>{let (n,r)=t.split_once('r').map_or((t,None),|(n,r)|(n,Some(r)));
    (n.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?,match r{Some(r)=>r.parse::<u8>().map_err(|e|format!("--epi {epi}: {e}"))?,None=>1})}
   None=>(1,1)};
- let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt,rr})?;
+ let e=qwen4_moe_sym::emit(Spec{arch,kind:kind.parse()?,nt,rr,codec:qwen4_moe_sym::WeightCodec::Mq4Sym})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// MQ3-I4 (`WeightCodec::Mq3I4`) grouped IU4 MoE entries: `--epi all` (default) is the module, `gate_up` the NT1 gate/up entry.
+fn qwen4_moe_sym_w3(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use peacemaker_isa::kernels::qwen4_moe_sym::{self,Kind,Spec,WeightCodec};
+ if epi=="all"{let (_,text,proof)=qwen4_moe_sym::emit_module_codec(arch,WeightCodec::Mq3I4)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ if epi!="gate_up"{return Err(format!("qwen4_moe_sym_w3 --epi {epi} (gate_up|all)"))}
+ let e=qwen4_moe_sym::emit(Spec{arch,kind:Kind::GateUp,nt:1,rr:1,codec:WeightCodec::Mq3I4})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 /// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
@@ -335,6 +343,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "iu4_v2b"=>iu4_v2b(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "iu4_v2b_a4"=>iu4_v2b_a4(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "qwen4_moe_sym"=>qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?,arch)?,
+  "qwen4_moe_sym_w3"=>qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_gather"=>qsa_gather(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_select"=>qsa_select(epi.as_deref().unwrap_or("all"),arch)?,
   "dflash_accept"=>dflash_accept(epi.as_deref().unwrap_or("all"),arch)?,
