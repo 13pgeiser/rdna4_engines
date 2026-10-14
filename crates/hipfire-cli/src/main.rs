@@ -6169,8 +6169,8 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// swap, so an overcommit is an OOM kill of the whole machine rather than a
 /// slow run. Checked between the two backends because that is precisely where
 /// a leaked first model would show up: if the slots engine did not actually
-/// release its weights, `MemAvailable` is still depressed here and this stops
-/// the sweep instead of taking the box down.
+/// release its weights, available physical memory is still depressed here and
+/// this stops the sweep instead of taking the box down.
 ///
 /// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
 /// process never initializes a GPU, so `auto` falls back to host swap state —
@@ -6190,16 +6190,12 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
         return Ok(());
     };
     let need = meta.len();
-    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+    // Available physical memory (`MemAvailable` on Linux); no host memory
+    // source means no check.
+    let Some(host) = hipfire_config::host_memory() else {
         return Ok(());
     };
-    let avail_kb = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let avail = avail_kb * 1024;
+    let avail = host.available_physical_bytes;
     // 20% headroom over the raw weight bytes for KV arenas and scratch.
     let want = need + need / 5;
     if avail < want {
@@ -8329,7 +8325,13 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         .iter()
         .map(|(key, value)| (key.clone(), serde_json::json!(value)))
         .collect::<serde_json::Map<_, _>>();
-    let report = serde_json::json!({
+    // One DXGI query serves both the JSON and the text report. Failures stay
+    // as text so the report names them instead of showing an empty adapter list.
+    #[cfg(windows)]
+    let gpu_budget_query = hipfire_config::host_memory::dxgi_adapter_budgets()
+        .map_err(|error| error.to_string());
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut report = serde_json::json!({
         "registry": registry_source(loaded_registry.source),
         "platform": platform,
         "hardware_probe": if cfg!(target_os = "linux") { "linux" } else { "limited" },
@@ -8346,7 +8348,15 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "config_format": format!("{:?}", loaded_config.format).to_lowercase(),
         "config_overrides": config_overrides,
         "warnings": loaded_registry.warnings,
+        "host_memory": hipfire_config::host_memory(),
     });
+    #[cfg(windows)]
+    {
+        report["gpu_memory_budget"] = gpu_memory_budget_json(
+            std::process::id(),
+            gpu_budget_query.as_ref().map(Vec::as_slice).map_err(String::as_str),
+        );
+    }
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -8443,8 +8453,144 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         } else if daemon.is_some() {
             println!("HIP probe:     failed (run the daemon directly for detailed startup errors)");
         }
+        #[cfg(windows)]
+        for line in gpu_memory_budget_text(
+            std::process::id(),
+            gpu_budget_query.as_ref().map(Vec::as_slice).map_err(String::as_str),
+        ) {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+/// Provenance of every figure in the diag DXGI section. These are budgets as
+/// seen by the calling process (the CLI), not an admission budget: the engine
+/// has to query DXGI itself from its own process before it admits a load.
+#[cfg(any(windows, test))]
+const GPU_MEMORY_BUDGET_SOURCE: &str = hipfire_config::host_memory::DXGI_BUDGET_SOURCE;
+
+#[cfg(any(windows, test))]
+fn dxgi_adapter_is_amd(adapter: &hipfire_config::host_memory::DxgiAdapterBudget) -> bool {
+    hipfire_config::host_memory::amd_adapters(std::slice::from_ref(adapter))
+        .next()
+        .is_some()
+}
+
+#[cfg(any(windows, test))]
+fn dxgi_luid_hex(luid: &[u8; 8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(16);
+    for &byte in luid {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    text
+}
+
+#[cfg(any(windows, test))]
+fn dxgi_mib_text(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// JSON for `hipfire diag --json` key `gpu_memory_budget`. `result` is the
+/// single DXGI query: the adapter list, or the failure rendered as text so a
+/// failed query is reported rather than shown as "no adapters".
+#[cfg(any(windows, test))]
+fn gpu_memory_budget_json(
+    pid: u32,
+    result: Result<&[hipfire_config::host_memory::DxgiAdapterBudget], &str>,
+) -> serde_json::Value {
+    let (adapters, error) = match result {
+        Ok(adapters) => (adapters, None),
+        Err(error) => (&[][..], Some(error)),
+    };
+    let adapters = adapters
+        .iter()
+        .map(|adapter| {
+            let mut entry = match serde_json::to_value(adapter) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return serde_json::json!({ "serialization_error": error.to_string() })
+                }
+            };
+            if let Some(map) = entry.as_object_mut() {
+                let amd = dxgi_adapter_is_amd(adapter);
+                map.insert("amd".into(), serde_json::json!(amd));
+                map.insert(
+                    "vendor_label".into(),
+                    serde_json::json!(if amd { "AMD" } else { "non-AMD" }),
+                );
+                map.insert(
+                    "luid_hex".into(),
+                    serde_json::json!(dxgi_luid_hex(&adapter.luid)),
+                );
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "source": GPU_MEMORY_BUDGET_SOURCE,
+        "calling_process_pid": pid,
+        "adapters": adapters,
+        "error": error,
+    })
+}
+
+/// Text lines for the "GPU memory budget (DXGI, this process)" diag section.
+#[cfg(any(windows, test))]
+fn gpu_memory_budget_text(
+    pid: u32,
+    result: Result<&[hipfire_config::host_memory::DxgiAdapterBudget], &str>,
+) -> Vec<String> {
+    let mut lines = vec![
+        "GPU memory budget (DXGI, this process):".to_string(),
+        format!(
+            "  source: {GPU_MEMORY_BUDGET_SOURCE}; calling process pid {pid}; \
+             not an admission budget"
+        ),
+    ];
+    match result {
+        Err(error) => lines.push(format!("  error: {error}")),
+        Ok([]) => lines.push(
+            "  no hardware adapters reported (software adapters are skipped)".to_string(),
+        ),
+        Ok(adapters) => {
+            for (index, adapter) in adapters.iter().enumerate() {
+                let label = if dxgi_adapter_is_amd(adapter) {
+                    "AMD"
+                } else {
+                    "non-AMD"
+                };
+                lines.push(format!(
+                    "  adapter {index}: {} [{label}]  vendor 0x{:04x}  device 0x{:04x}  \
+                     LUID {}  flags 0x{:x}  node {}",
+                    adapter.description,
+                    adapter.vendor_id,
+                    adapter.device_id,
+                    dxgi_luid_hex(&adapter.luid),
+                    adapter.flags,
+                    adapter.node_index,
+                ));
+                lines.push(format!(
+                    "    dedicated {}   shared {}",
+                    dxgi_mib_text(adapter.dedicated_video_memory_bytes),
+                    dxgi_mib_text(adapter.shared_system_memory_bytes),
+                ));
+                for (name, segment) in [("local:", &adapter.local), ("non-local:", &adapter.non_local)]
+                {
+                    lines.push(format!(
+                        "    {name:<10} budget {}  usage {}  available-for-reservation {}  reservation {}",
+                        dxgi_mib_text(segment.budget_bytes),
+                        dxgi_mib_text(segment.current_usage_bytes),
+                        dxgi_mib_text(segment.available_for_reservation_bytes),
+                        dxgi_mib_text(segment.current_reservation_bytes),
+                    ));
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
@@ -9189,6 +9335,107 @@ mod tests {
 
     use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
+
+    fn test_dxgi_adapter(
+        description: &str,
+        vendor_id: u32,
+        luid: [u8; 8],
+    ) -> hipfire_config::host_memory::DxgiAdapterBudget {
+        use hipfire_config::host_memory::{DxgiAdapterBudget, SegmentBudget};
+        DxgiAdapterBudget {
+            description: description.to_string(),
+            vendor_id,
+            device_id: 0x744c,
+            luid,
+            dedicated_video_memory_bytes: 8 * 1024 * 1024 * 1024,
+            shared_system_memory_bytes: 16 * 1024 * 1024 * 1024,
+            flags: 0,
+            source: GPU_MEMORY_BUDGET_SOURCE,
+            node_index: 0,
+            local: SegmentBudget {
+                budget_bytes: 7 * 1024 * 1024 * 1024,
+                current_usage_bytes: 1024 * 1024 * 1024,
+                available_for_reservation_bytes: 4 * 1024 * 1024 * 1024,
+                current_reservation_bytes: 512 * 1024 * 1024,
+            },
+            non_local: SegmentBudget {
+                budget_bytes: 15 * 1024 * 1024 * 1024,
+                current_usage_bytes: 2 * 1024 * 1024 * 1024,
+                available_for_reservation_bytes: 8 * 1024 * 1024 * 1024,
+                current_reservation_bytes: 256 * 1024 * 1024,
+            },
+        }
+    }
+
+    #[test]
+    fn gpu_memory_budget_json_marks_amd_and_non_amd_adapters() {
+        let adapters = vec![
+            test_dxgi_adapter("AMD Radeon", 0x1002, [1, 0, 0, 0, 0, 0, 0, 0]),
+            test_dxgi_adapter("Other GPU", 0x10de, [2, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let json = gpu_memory_budget_json(4242, Ok(&adapters));
+        assert_eq!(json["source"], GPU_MEMORY_BUDGET_SOURCE);
+        assert_eq!(json["calling_process_pid"], 4242);
+        assert!(json["error"].is_null());
+        let listed = json["adapters"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["amd"], true);
+        assert_eq!(listed[0]["vendor_label"], "AMD");
+        assert_eq!(listed[0]["description"], "AMD Radeon");
+        assert_eq!(listed[0]["luid_hex"], "0100000000000000");
+        assert_eq!(listed[0]["local"]["budget_bytes"], 7u64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            listed[0]["non_local"]["current_reservation_bytes"],
+            256u64 * 1024 * 1024
+        );
+        assert_eq!(listed[1]["amd"], false);
+        assert_eq!(listed[1]["vendor_label"], "non-AMD");
+    }
+
+    #[test]
+    fn gpu_memory_budget_json_reports_error_and_empty_explicitly() {
+        let failed = gpu_memory_budget_json(7, Err("CreateDXGIFactory1 failed: 0x887A0004"));
+        assert_eq!(failed["error"], "CreateDXGIFactory1 failed: 0x887A0004");
+        assert_eq!(failed["adapters"].as_array().unwrap().len(), 0);
+        assert_eq!(failed["calling_process_pid"], 7);
+        let empty = gpu_memory_budget_json(7, Ok(&[]));
+        assert!(empty["error"].is_null());
+        assert_eq!(empty["adapters"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn gpu_memory_budget_text_lists_every_segment_field() {
+        let adapters = vec![
+            test_dxgi_adapter("AMD Radeon", 0x1002, [1, 0, 0, 0, 0, 0, 0, 0]),
+            test_dxgi_adapter("Other GPU", 0x10de, [2, 0, 0, 0, 0, 0, 0, 0]),
+        ];
+        let text = gpu_memory_budget_text(4242, Ok(&adapters)).join("\n");
+        assert!(text.starts_with("GPU memory budget (DXGI, this process)"));
+        assert!(text.contains("pid 4242"));
+        assert!(text.contains("not an admission budget"));
+        assert!(text.contains("AMD Radeon [AMD]"));
+        assert!(text.contains("Other GPU [non-AMD]"));
+        assert!(text.contains("dedicated 8192.0 MiB"));
+        assert!(text.contains("shared 16384.0 MiB"));
+        assert!(text.contains("non-local:"));
+        assert!(text.contains("budget 7168.0 MiB"));
+        assert!(text.contains("usage 1024.0 MiB"));
+        assert!(text.contains("available-for-reservation 4096.0 MiB"));
+        assert!(text.contains("reservation 512.0 MiB"));
+        assert!(text.contains("budget 15360.0 MiB"));
+        assert!(text.contains("reservation 256.0 MiB"));
+    }
+
+    #[test]
+    fn gpu_memory_budget_text_reports_error_and_empty_explicitly() {
+        let failed = gpu_memory_budget_text(7, Err("QueryVideoMemoryInfo failed")).join("\n");
+        assert!(failed.starts_with("GPU memory budget (DXGI, this process)"));
+        assert!(failed.contains("error: QueryVideoMemoryInfo failed"));
+        let empty = gpu_memory_budget_text(7, Ok(&[])).join("\n");
+        assert!(empty.contains("no hardware adapters reported"));
+        assert!(empty.contains("software adapters are skipped"));
+    }
+
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

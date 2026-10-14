@@ -10,7 +10,10 @@
 //! resolved values; they do not parse user configuration in hot paths.
 
 pub mod devices;
+pub mod host_memory;
 pub mod rocm;
+
+pub use host_memory::{host_memory, HostMemory};
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -4311,20 +4314,11 @@ pub fn is_discrete_memory_arch(arch: &str) -> bool {
         .any(|known| arch.eq_ignore_ascii_case(known))
 }
 
-/// `SwapTotal` (kB) from a /proc/meminfo body; `None` when absent/unreadable.
-fn swap_total_kb_from_meminfo(meminfo: &str) -> Option<u64> {
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("SwapTotal:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-/// Host swap size in kB; `None` when /proc/meminfo cannot be read.
+/// Whether the host has swap; `None` when the host memory snapshot or its
+/// swap size is unavailable. On Linux this is `SwapTotal > 0`; on Windows the
+/// swap size is the pagefile approximation from [`host_memory::host_memory`].
 fn host_has_swap() -> Option<bool> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    Some(swap_total_kb_from_meminfo(&meminfo)? > 0)
+    Some(host_memory::host_memory()?.swap_total_bytes? > 0)
 }
 
 /// Pure auto decision, testable without pinning host state. With a known GPU
@@ -6203,15 +6197,6 @@ mod tests {
         assert!(oom_guard_auto_for(None, Some(false)));
         // Unreadable /proc/meminfo: fail safe.
         assert!(oom_guard_auto_for(None, None));
-    }
-
-    #[test]
-    fn swap_total_parses_from_meminfo() {
-        let with_swap = "MemTotal:       130000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        2000000 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(with_swap), Some(2_000_000));
-        let no_swap = "MemTotal:       130000000 kB\nSwapTotal:             0 kB\n";
-        assert_eq!(swap_total_kb_from_meminfo(no_swap), Some(0));
-        assert_eq!(swap_total_kb_from_meminfo("MemTotal: 100 kB\n"), None);
     }
 
     #[test]

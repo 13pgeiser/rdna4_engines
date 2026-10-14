@@ -848,6 +848,35 @@ Two checks exist; only one is gated:
 
 `scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
 
+#### Windows host memory and `hipfire diag`
+
+- **Host memory.** `hipfire diag --json` carries an additive `host_memory`
+  object (`null` when the platform has no host-memory source). On Linux it
+  is parsed from `/proc/meminfo`. On Windows it comes from
+  `GlobalMemoryStatusEx`: `available_physical_bytes` is *physical* RAM
+  (`ullAvailPhys`), whereas the commit figures (`commit_limit_bytes` /
+  `commit_available_bytes`, from `ullTotalPageFile` / `ullAvailPageFile`)
+  count RAM plus pagefile. `swap_total_bytes` on Windows is the **pagefile
+  approximation** `commit limit − total physical`, saturating at 0; it is not a
+  direct pagefile-size query. The bench-sweep headroom check compares the
+  model against available *physical* memory on every platform.
+- **GPU memory budget.** On Windows only, `hipfire diag` adds a
+  `gpu_memory_budget` JSON key and a text section *GPU memory budget (DXGI,
+  this process)*: per hardware adapter, identity (vendor/device id, LUID, AMD
+  vs non-AMD), dedicated/shared sizes, and for the local and non-local
+  segments the `Budget`, `CurrentUsage`, `AvailableForReservation` and
+  `CurrentReservation` from `IDXGIAdapter3::QueryVideoMemoryInfo` (node 0).
+  A failed query is reported as `error`, not as an empty list. Software
+  adapters (`DXGI_ADAPTER_FLAG_SOFTWARE`) are skipped.
+- **Not an admission budget.** These numbers are what the *calling process*
+  (the CLI) sees on node 0, at one instant. They are diagnostics. Admission of
+  a load must query DXGI from inside the engine process itself.
+- **GPU-less `auto` on Windows.** With no GPU arch known, `auto` decides by
+  host swap state. On Windows that state is the pagefile approximation above:
+  approximation `> 0` counts as swap and **disables** the guard; `0` or an
+  unavailable query **enables** it. The arch overrides apply unchanged
+  (unified APU → on, discrete → off).
+
 ### Partial GPU offload (`memory.gpu_layer_budget` / `memory.moe_expert_budget` / `memory.offload_exec`)
 
 | Key | Default | Values |
