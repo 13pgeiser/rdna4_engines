@@ -861,7 +861,11 @@ request run alone on the singleton route. **Default off, experimental.**
 - **Eligible requests:** greedy decoding, plain text chat only — no tools,
   images, logprobs or penalties. Ineligible requests keep the singleton route.
 - **Singleton when alone:** a request that is alone at dispatch runs the
-  unchanged singleton route (including native MTP).
+  unchanged singleton route (including native MTP). When a batched peer
+  queues behind it, a greedy singleton moves into a lane at its next
+  committed window boundary (promotion): into an MTP lane with its trunk,
+  head and draft states, or, with `serve.batch_spec = false`, into an AR lane
+  with its trunk state, continuing the AR singleton's text byte for byte.
 - **MTP lanes (default when the MTP head is loaded):** each lane runs its own
   native MTP window per step: a step-synchronous batched draft for every
   drafting lane, then one `(d+1)`-row verify per lane inside the shared lane
@@ -869,7 +873,7 @@ request run alone on the singleton route. **Default off, experimental.**
   drafts nothing, or that the floor retires, decodes one AR row per step.
   `serve.batch_spec = false` (`HIPFIRE_SERVE_BATCH_SPEC=0`) keeps the AR lanes
   of before (one token per lane per step). There is no per-lane session
-  cache, parking or promotion.
+  cache or parking.
 - **Per-lane AR floor:** each lane keeps the singleton's MTP floor (probe
   windows, sticky retirement, decayed per-depth costs), priced in AR-row
   units from a measured model of the shared step (an AR row costs its
