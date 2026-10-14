@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use hipfire_config::devices::{RDNA_CU_MASK_BAN, cu_mask_refused_on};
+
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
 
@@ -68,6 +70,7 @@ struct RuntimeInner {
 
 impl Runtime {
     pub fn initialize(symbols: Arc<abi::Symbols>) -> Result<Self, RuntimeError> {
+        hipfire_config::devices::cu_mask_env_guard().map_err(RuntimeError::CuMaskEnvRefused)?;
         // SAFETY: `Symbols::load` established the function ABI and keeps the
         // dynamic library mapped.
         let status = unsafe { (symbols.init)() };
@@ -1110,6 +1113,9 @@ pub struct AqlQueue {
     /// from the KFD path without updating its internal `cu_mask_`, so
     /// `hsa_amd_queue_cu_get_mask` keeps reporting the init-time all-CU mask.
     effective_cu_mask: Option<Vec<bool>>,
+    /// Owning device's ISA name, kept so mask entry points without a
+    /// `GpuDevice` parameter can refuse RDNA (see [`RDNA_CU_MASK_BAN`]).
+    device_name: String,
 }
 
 impl fmt::Debug for AqlQueue {
@@ -1168,6 +1174,7 @@ impl AqlQueue {
             active: true,
             cu_mask_was_reduced: false,
             effective_cu_mask: None,
+            device_name: device.name().to_owned(),
         };
         let descriptor = queue.descriptor();
         if descriptor.base_address.is_null()
@@ -1200,11 +1207,16 @@ impl AqlQueue {
     /// Diagnostic-only entry point: hipfire wires no default partition. The
     /// disjoint-mask slowdown upstream measured (0.57x/0.43x) is why this
     /// stays opt-in.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12): returns
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any HSA call, so no queue is
+    /// created. See [`RDNA_CU_MASK_BAN`].
     pub fn create_with_cu_mask(
         device: &GpuDevice,
         requested_size: u32,
         cu_mask: &[bool],
     ) -> Result<Self, RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
         let cu_count = device.compute_unit_count()?;
         if cu_mask.len() > cu_count as usize {
             return Err(RuntimeError::CuMaskWiderThanDevice {
@@ -1222,6 +1234,7 @@ impl AqlQueue {
     /// See `create_with_cu_mask` for `HSA_STATUS_CU_MASK_REDUCED` semantics
     /// (effective-mask read-back and empty-mask rejection).
     fn set_cu_mask(&mut self, device: &GpuDevice, cu_mask: &[bool]) -> Result<(), RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
         let cu_count = device.compute_unit_count()? as usize;
         let (num_bits, words) = pack_cu_mask_words(cu_mask);
         let cu_mask_ptr = if num_bits == 0 {
@@ -1357,6 +1370,7 @@ impl AqlQueue {
     }
 
     fn set_cu_mask_words(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+        refuse_rdna_cu_mask(&self.device_name)?;
         if mask_bits == 0 || !mask_bits.is_multiple_of(32) {
             return Err(RuntimeError::InvalidCuMask(
                 "mask bit count must be a non-zero multiple of 32",
@@ -1651,11 +1665,16 @@ impl QueueSet {
     /// Empty `cu_masks` is rejected (`ZeroQueues`). Each mask is forwarded to
     /// `AqlQueue::create_with_cu_mask`; an empty per-lane mask enables every CU.
     /// Diagnostic-only: hipfire wires no default partition.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12) with
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any queue is created; see
+    /// [`RDNA_CU_MASK_BAN`].
     pub fn create_with_cu_masks(
         device: &GpuDevice,
         queue_size: u32,
         cu_masks: &[Vec<bool>],
     ) -> Result<Self, RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
         if cu_masks.is_empty() {
             return Err(RuntimeError::ZeroQueues);
         }
@@ -1721,6 +1740,11 @@ impl QueueSet {
         Ok(())
     }
 
+    /// Apply a raw HSA CU mask to every queue.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12) with
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any HSA call; see
+    /// [`RDNA_CU_MASK_BAN`].
     pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
         for queue in &self.queues {
             queue.set_cu_mask_words(mask_bits, mask)?;
@@ -3050,6 +3074,15 @@ fn cu_mask_is_all_enabled(mask: &[bool]) -> bool {
     !mask.is_empty() && mask.iter().all(|&bit| bit)
 }
 
+fn refuse_rdna_cu_mask(device_name: &str) -> Result<(), RuntimeError> {
+    if cu_mask_refused_on(device_name) {
+        return Err(RuntimeError::CuMaskRefusedOnRdna {
+            device: device_name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn check_status(
     symbols: &abi::Symbols,
     operation: &'static str,
@@ -3131,6 +3164,13 @@ pub enum RuntimeError {
     },
     /// Effective CU mask after `HSA_STATUS_CU_MASK_REDUCED` enables no CUs.
     CuMaskEmptyAfterReduce,
+    /// A CU-mask entry point was called on an RDNA device; see [`RDNA_CU_MASK_BAN`].
+    CuMaskRefusedOnRdna {
+        device: String,
+    },
+    /// `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` is set while an RDNA device may be
+    /// visible; refused at runtime initialization (`hipfire_config::devices::cu_mask_env_guard`).
+    CuMaskEnvRefused(String),
     ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
@@ -3242,6 +3282,10 @@ impl fmt::Display for RuntimeError {
                 f,
                 "CU mask was reduced by process-wide HSA_CU_MASK to an empty affinity (no compute units enabled)"
             ),
+            Self::CuMaskRefusedOnRdna { device } => {
+                write!(f, "CU mask refused on {device}: {RDNA_CU_MASK_BAN}")
+            }
+            Self::CuMaskEnvRefused(message) => f.write_str(message),
             Self::ProfilingUnavailable(symbol) => {
                 write!(f, "ROCr profiling capability is unavailable: {symbol}")
             }
@@ -3367,6 +3411,36 @@ mod tests {
     #[test]
     fn status_cu_mask_reduced_is_hsa_value_44() {
         assert_eq!(STATUS_CU_MASK_REDUCED, 44);
+    }
+
+    #[test]
+    fn refuse_rdna_cu_mask_rejects_rdna_and_allows_cdna() {
+        for name in ["gfx1201", "gfx1151"] {
+            match refuse_rdna_cu_mask(name) {
+                Err(RuntimeError::CuMaskRefusedOnRdna { device }) => assert_eq!(device, name),
+                other => panic!("{name}: expected CuMaskRefusedOnRdna, got {other:?}"),
+            }
+        }
+        assert!(refuse_rdna_cu_mask("gfx942").is_ok());
+    }
+
+    #[test]
+    fn cu_mask_refused_display_names_device_and_incident() {
+        let text = RuntimeError::CuMaskRefusedOnRdna {
+            device: "gfx1201".to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("gfx1201"), "{text}");
+        assert!(text.contains("2026-10-14"), "{text}");
+        assert!(text.contains("MES"), "{text}");
+        assert!(text.contains(RDNA_CU_MASK_BAN), "{text}");
+    }
+
+    #[test]
+    fn cu_mask_env_refused_display_is_the_guard_message() {
+        let text = RuntimeError::CuMaskEnvRefused("HSA_CU_MASK set but refused".to_owned())
+            .to_string();
+        assert_eq!(text, "HSA_CU_MASK set but refused");
     }
 
     proptest! {

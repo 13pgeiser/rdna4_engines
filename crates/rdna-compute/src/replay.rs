@@ -515,7 +515,6 @@ impl Pm4Commands {
         device: &GpuDevice,
         pool: &KernargPool,
         ib_pool: Option<&KernargPool>,
-        cu_mask: Option<&[u32; 2]>,
         dispatch_profile: bool,
     ) -> Result<SingleQueuePm4Ib, String> {
         let graph = match self {
@@ -559,14 +558,8 @@ impl Pm4Commands {
                     SingleQueuePm4Ib::create_profiled(device, pool, commands)
                 }
             }
-        }
-        .map_err(|error| error.to_string())?;
-        if let Some(cu_mask) = cu_mask {
-            graph
-                .set_cu_mask(64, cu_mask)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(graph)
+        };
+        graph.map_err(|error| error.to_string())
     }
 }
 
@@ -3341,50 +3334,26 @@ fn gfx1151_resource_limits_policy_from_value(
     }
 }
 
-fn gfx1151_cu_mask(architecture: Pm4Architecture, device_name: &str) -> Option<[u32; 2]> {
+/// `HIPFIRE_GFX1151_REDLINE_CU_COUNT` can no longer produce a CU mask: any value
+/// other than `all`/`inherit`/`40`/empty is refused (CU masks on RDNA hung the
+/// R9700 MES on 2026-10-14).
+fn gfx1151_cu_count_knob_refusal() -> Result<(), String> {
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_REDLINE_CU_COUNT")
         .unwrap_or_else(|| "all".to_owned());
-    let mask = gfx1151_cu_mask_from_value(architecture, device_name, &value).unwrap_or_else(|| {
-        eprintln!("WARNING: unknown HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?}; retaining all CUs");
-        None
-    });
-    if let Some(mask) = mask {
-        let enabled = mask.into_iter().map(u32::count_ones).sum::<u32>();
-        eprintln!("[redline] gfx1151 queue CU mask enables {enabled}/40 CUs");
-    }
-    mask
+    gfx1151_cu_count_refusal(&value)
 }
 
-fn gfx1151_cu_mask_from_value(
-    architecture: Pm4Architecture,
-    device_name: &str,
-    value: &str,
-) -> Option<Option<[u32; 2]>> {
-    if architecture != Pm4Architecture::Gfx11 || !device_name.eq_ignore_ascii_case("gfx1151") {
-        return Some(None);
-    }
+fn gfx1151_cu_count_refusal(value: &str) -> Result<(), String> {
     if matches!(
         value.to_ascii_lowercase().as_str(),
         "" | "all" | "inherit" | "40"
     ) {
-        return Some(None);
+        return Ok(());
     }
-    let count = value.parse::<u32>().ok()?;
-    if count == 0 || count >= 40 || !count.is_multiple_of(2) {
-        return None;
-    }
-    let low = if count >= 32 {
-        u32::MAX
-    } else {
-        (1_u32 << count) - 1
-    };
-    let high_count = count.saturating_sub(32);
-    let high = if high_count == 0 {
-        0
-    } else {
-        (1_u32 << high_count) - 1
-    };
-    Some(Some([low, high]))
+    Err(format!(
+        "HIPFIRE_GFX1151_REDLINE_CU_COUNT={value:?} requests a CU mask and is refused: {}",
+        hipfire_config::devices::RDNA_CU_MASK_BAN
+    ))
 }
 
 fn gfx1151_entry_acquire_policy(
@@ -6050,7 +6019,7 @@ impl ReplayController {
         let dispatch_interleave = gfx1151_dispatch_interleave(pm4_architecture, device.name());
         let resource_limits_policy =
             gfx1151_resource_limits_policy(pm4_architecture, device.name());
-        let cu_mask = gfx1151_cu_mask(pm4_architecture, device.name());
+        gfx1151_cu_count_knob_refusal()?;
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
@@ -6254,9 +6223,6 @@ impl ReplayController {
         };
         let stream_accounting = pm4_stream_accounting_enabled();
         validate_pm4_stream_accounting_queue_count(stream_accounting, queue_limit)?;
-        if cu_mask.is_some() && queue_limit != 1 {
-            return Err("gfx1151 CU-mask experiments require single-queue PM4 replay".to_owned());
-        }
         let gfx1010_exact = gfx1010_release_wait_required(pm4_architecture, device.name());
         let gfx1010_dependency =
             gfx1010_dependency_policy_from_config(pm4_architecture, device.name())?;
@@ -6613,7 +6579,6 @@ impl ReplayController {
                 &device,
                 &pool,
                 ib_pool.as_ref(),
-                cu_mask.as_ref(),
                 dispatch_profile,
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
@@ -10441,35 +10406,20 @@ mod tests {
     }
 
     #[test]
-    fn gfx1151_cu_mask_is_exact_arch_and_wgp_paired() {
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "all"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "32"),
-            Some(Some([u32::MAX, 0]))
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "36"),
-            Some(Some([u32::MAX, 0xf]))
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1100", "32"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx12, "gfx1201", "32"),
-            Some(None)
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "35"),
-            None
-        );
-        assert_eq!(
-            gfx1151_cu_mask_from_value(Pm4Architecture::Gfx11, "gfx1151", "42"),
-            None
-        );
+    fn gfx1151_cu_count_knob_is_refused() {
+        for value in ["all", "", "inherit", "40", "ALL", "Inherit"] {
+            assert_eq!(gfx1151_cu_count_refusal(value), Ok(()), "{value:?}");
+        }
+        for value in ["32", "36", "35", "42"] {
+            let message = gfx1151_cu_count_refusal(value)
+                .expect_err(&format!("{value:?} must be refused"));
+            assert!(
+                message.contains("HIPFIRE_GFX1151_REDLINE_CU_COUNT"),
+                "{message}"
+            );
+            assert!(message.contains("2026-10-14"), "{message}");
+            assert!(message.contains(value), "{message}");
+        }
     }
 
     #[test]

@@ -3781,13 +3781,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
         "gfx1151 compute-resource-limits packet policy."
     ),
+    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CU masking on RDNA hung the R9700 MES (2026-10-14); refused
     diagnostic_field!(
         "diagnostic.replay.gfx1151_cu_count",
         "gfx1151_redline_cu_count",
         DefaultValue::String("all"),
         ValueRule::String,
         "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
-        "Even gfx1151 CU count below 40, or all."
+        "Refused: any value other than all fails PM4 replay preparation (CU masks on RDNA hung the R9700 MES on 2026-10-14). Default all."
     ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_entry_acquire",
@@ -5908,10 +5909,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             (
                 "diagnostic.replay.gfx1151_resource_limits",
                 ConfigValue::String("legacy".to_owned()),
-            ),
-            (
-                "diagnostic.replay.gfx1151_cu_count",
-                ConfigValue::String("all".to_owned()),
             ),
             (
                 "diagnostic.replay.gfx1151_entry_acquire",

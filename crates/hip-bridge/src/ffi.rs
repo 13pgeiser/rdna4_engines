@@ -813,6 +813,9 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
+        // CU masks on RDNA hung the R9700 MES (2026-10-14): refuse before any
+        // ROCm library is mapped.
+        hipfire_config::devices::cu_mask_env_guard().map_err(|message| HipError::new(0, &message))?;
         keep_pageable_copies_out_of_reclaim();
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));

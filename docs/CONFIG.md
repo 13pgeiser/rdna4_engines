@@ -1225,7 +1225,7 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.gfx1151_initiator` | `"legacy"` | `legacy` \| `order` \| `radv` |
 | `diagnostic.replay.gfx1151_interleave` | `"inherit"` | `inherit`, `off`, `64`, `128`, `256`, `512` |
 | `diagnostic.replay.gfx1151_resource_limits` | `"legacy"` | `legacy` \| `simd-always` \| `radv` |
-| `diagnostic.replay.gfx1151_cu_count` | `"all"` | `all` or an even CU count below 40 |
+| `diagnostic.replay.gfx1151_cu_count` | `"all"` | deprecated; `all` only (`inherit`/`40` accepted as aliases). Any other value is refused at PM4 replay preparation: CU masks on RDNA hung the R9700 MES on 2026-10-14 |
 | `diagnostic.replay.gfx1151_entry_acquire` | `"system"` | `system` \| `agent` \| `vmem` \| `none` |
 | `diagnostic.compiler.no_device_compiler` | `false` | bool; treat the device compiler as absent so precompiled code objects are used verbatim |
 
@@ -1429,7 +1429,7 @@ misspelled key is unknown and fails the load with
 | `diagnostic.prompt_token_heat` | `prompt_token_heat` | `HIPFIRE_PROMPT_TOKEN_HEAT` | experimental |
 | `diagnostic.qkv_bias` | `fuse_qkv_bias_debug` | `HIPFIRE_FUSE_QKV_BIAS_DEBUG` | experimental |
 | `diagnostic.replay.dispatch_profile` | `replay_dispatch_profile` | `HIPFIRE_REDLINE_DISPATCH_PROFILE` | experimental |
-| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | experimental |
+| `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | `HIPFIRE_GFX1151_REDLINE_CU_COUNT` | deprecated |
 | `diagnostic.replay.gfx1151_entry_acquire` | `gfx1151_pm4_entry_acquire` | `HIPFIRE_GFX1151_PM4_ENTRY_ACQUIRE` | experimental |
 | `diagnostic.replay.gfx1151_initiator` | `gfx1151_pm4_initiator` | `HIPFIRE_GFX1151_PM4_INITIATOR` | experimental |
 | `diagnostic.replay.gfx1151_interleave` | `gfx1151_pm4_interleave` | `HIPFIRE_GFX1151_PM4_INTERLEAVE` | experimental |
