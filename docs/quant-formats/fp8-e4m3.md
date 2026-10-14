@@ -112,6 +112,22 @@ Exceptions, both handled by the decoder rather than by rewriting the artifact:
 CPU model of the hardware path: `fp8_e4m3::fnuz_fold_decode(b, s_bf16)`
 (`e4m3fnuz_to_f32` + explicit `0x80` + multiply by `f32(2*s)` + `bf16_rne`).
 
+## gfx942 QSA K/V rows (explicit `memory.kv_cache = "fp8"`)
+
+Not an artifact format: the Qwen4 QSA context K/V arenas of `QsaKvFormat::Fp8Fnuz`.
+A K or V row is `kv_heads * (head_dim + 2)` bytes: `kv_heads * head_dim` E4M3
+codes, then one f16 scale per head (516 B at Hkv 2, D256; K+V 1,032 B per
+token). The raw and pooled index keys stay F32. Per layer-token, 1,032 + 512 +
+128 = 1,672 B (20,064 B over Flash-Next's 12 QSA layers).
+
+The encoder feeds `(v / s) * 0.5` to the FNUZ convert, so the stored byte is the
+OCP e4m3fn code of `v / s` (the Theorem above) and the decoder multiplies by
+`2 * s`. The sole deviation from the OCP code is the negative-zero code: FNUZ
+has no `-0` (`0x80` is NaN), so the quantized code `0x80` is stored as `0x00`.
+That covers an input of exactly `-0` and a negative nonzero input that rounds
+(RNE) to zero. Every other finite OCP code is stored unchanged, and a stored K/V
+row never contains `0x80`.
+
 ## Verification
 
 `cargo test -p rdna-compute --lib fp8` asserts BF16-bit identity of

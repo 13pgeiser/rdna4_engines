@@ -125,7 +125,10 @@ fn read_kv_rows(
     for row in bytes.chunks_exact(row_bytes) {
         match format {
             QsaKvFormat::F32 => out.extend(row.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
-            QsaKvFormat::Fp8 => {
+            // The gfx942 FNUZ rows hold the OCP-equivalent codes (the device decode
+            // doubles the scale to compensate the FNUZ bias), so the host decode
+            // is the same as the RDNA row's.
+            QsaKvFormat::Fp8 | QsaKvFormat::Fp8Fnuz => {
                 let (codes, scales) = row.split_at(width);
                 for head in 0..kv_heads {
                     let scale = f16_bits_to_f32(u16::from_le_bytes([scales[2 * head], scales[2 * head + 1]]));
@@ -418,6 +421,10 @@ impl Probe {
                 eprintln!("[dump-pos] phase {} position {} rows {}", self.phase, op.state.position, op.rows);
             }
             if self.phase != "all_prefill" || !positions.contains(&op.state.position) { return Ok(()); }
+        }
+        if op.state.format == QsaKvFormat::Fp8Fnuz {
+            // The exact attention oracle replays the RDNA fp8 kernels only.
+            return Err("qsa evidence dumps cover the f32 and RDNA fp8 states only (gfx942 fp8 has no exact oracle)".into());
         }
         if op.state.format == QsaKvFormat::Q8 {
             // Lab (BF16-index select route G0): with QSA_DUMP_POSITIONS, the q8

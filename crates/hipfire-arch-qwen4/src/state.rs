@@ -554,23 +554,40 @@ fn grow_context_arena(
 
 /// The QSA state format for a `memory.kv_cache` request on `gpu`
 /// ([`hipfire_runtime::kv_mode::resolve_qwen4`]): `bf16` is the exact
-/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 and a head
-/// geometry its kernels implement (head_dim 256, an even KV-head count);
-/// `q8` ([`QsaKvFormat::Q8`], opt-in) needs gfx11/gfx12 and head_dim 256.
-/// `auto` is fp8 where both hold and the reference state elsewhere; an
-/// explicit request the device or model cannot serve is refused, never
-/// rewritten.
+/// reference state ([`QsaKvFormat::F32`]); `fp8` needs gfx1201 or gfx942 and
+/// a head geometry its kernels implement (head_dim 256, an even KV-head
+/// count) and is [`QsaKvFormat::Fp8`] (OCP E4M3, BF16 index keys) on gfx1201
+/// and [`QsaKvFormat::Fp8Fnuz`] (E4M3 FNUZ hardware codes, F32 index and
+/// pooled keys) on gfx942; `q8` ([`QsaKvFormat::Q8`], opt-in) needs
+/// gfx11/gfx12 and head_dim 256. `auto` is fp8 on gfx1201 where the geometry
+/// holds and the reference F32 state elsewhere, gfx942 included: gfx942
+/// serves fp8 K/V only when explicitly requested. An explicit request the
+/// device or model cannot serve is refused, never rewritten.
 pub fn resolve_qsa_format(
     request: &str,
     gpu: &Gpu,
     config: &Qwen4Config,
 ) -> Result<QsaKvFormat, String> {
+    resolve_qsa_format_for_arch(request, &gpu.arch, config)
+}
+
+/// [`resolve_qsa_format`] on the architecture name alone.
+fn resolve_qsa_format_for_arch(
+    request: &str,
+    arch: &str,
+    config: &Qwen4Config,
+) -> Result<QsaKvFormat, String> {
     use hipfire_runtime::kv_mode::{resolve_qwen4, KvMode};
     let (kv_heads, head_dim) = (config.num_key_value_heads, config.head_dim);
-    let fp8_geometry = QsaKvFormat::Fp8.supports(kv_heads, head_dim);
+    let fp8 = if arch == "gfx942" {
+        QsaKvFormat::Fp8Fnuz
+    } else {
+        QsaKvFormat::Fp8
+    };
+    let fp8_geometry = fp8.supports(kv_heads, head_dim);
     let auto = matches!(request.trim(), "" | "auto");
-    match resolve_qwen4(request, &gpu.arch)?.mode {
-        KvMode::Fp8 if fp8_geometry => Ok(QsaKvFormat::Fp8),
+    match resolve_qwen4(request, arch)?.mode {
+        KvMode::Fp8 if fp8_geometry => Ok(fp8),
         KvMode::Fp8 if auto => Ok(QsaKvFormat::F32),
         KvMode::Fp8 => Err(format!(
             "qwen4: fp8 QSA K/V needs head_dim 256 and an even KV-head count \
@@ -2943,6 +2960,140 @@ mod tests {
         assert_eq!(QsaKvFormat::Fp8.kv_row_bytes(2, 256), 516);
         let fp8 = context_arena_plan(516, s, 2 * MIB).unwrap();
         assert_eq!(fp8.token_capacity(2 * MIB), 4064);
+    }
+
+    /// gfx942 serves fp8 K/V only on an explicit request, as the FNUZ format
+    /// (F32 index keys); `auto`/unset/`bf16` stay on the F32 reference state.
+    /// gfx1201 keeps its OCP `Fp8` (BF16 index) default.
+    #[test]
+    fn gfx942_explicit_fp8_is_fnuz_and_auto_stays_f32() {
+        let config = crate::config::compact_test_config();
+        for request in ["", "auto", " auto ", "bf16"] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx942", &config),
+                Ok(QsaKvFormat::F32),
+                "{request:?} on gfx942"
+            );
+        }
+        for request in ["fp8", " fp8 "] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx942", &config),
+                Ok(QsaKvFormat::Fp8Fnuz),
+                "{request:?} on gfx942"
+            );
+        }
+        assert!(resolve_qsa_format_for_arch("q8", "gfx942", &config).is_err());
+        // The RDNA formats are unchanged.
+        for request in ["", "auto", "fp8"] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx1201", &config),
+                Ok(QsaKvFormat::Fp8),
+                "{request:?} on gfx1201"
+            );
+        }
+        assert_eq!(
+            resolve_qsa_format_for_arch("auto", "gfx1151", &config),
+            Ok(QsaKvFormat::F32)
+        );
+        assert!(resolve_qsa_format_for_arch("fp8", "gfx1151", &config).is_err());
+        // An odd KV-head count has no FNUZ kernel: explicit fp8 is refused,
+        // never rewritten, and auto stays F32.
+        let mut odd = config.clone();
+        odd.num_key_value_heads = 3;
+        let error = resolve_qsa_format_for_arch("fp8", "gfx942", &odd).unwrap_err();
+        assert!(error.contains("even KV-head count"), "{error}");
+        assert_eq!(
+            resolve_qsa_format_for_arch("auto", "gfx942", &odd),
+            Ok(QsaKvFormat::F32)
+        );
+    }
+
+    /// Flash-Next (H24 Hkv2 D256, one 128-wide index head, compress 4) charge
+    /// of the gfx942 FP8 state: K and V rows are 2 x (2 x (256 + 2)) = 1032 B,
+    /// the F32 raw index key 512 B and the pooled key 128 B per token, so
+    /// 1672 B per layer-token and 20,064 B over the 12 QSA layers (the F32
+    /// reference state is 4736 B and 56,832 B).
+    #[test]
+    fn gfx942_fp8_state_charge_is_1672_bytes_per_layer_token() {
+        let config = crate::config::compact_test_config();
+        let fnuz = QsaKvFormat::Fp8Fnuz;
+        assert_eq!(fnuz.kv_row_bytes(2, 256), 516);
+        assert_eq!(fnuz.index_dtype(), DType::F32);
+        assert_eq!(config.n_full_layers(), 12);
+        let s = 4096; // a multiple of the compress ratio: pooled rows = s / 4.
+        let layer = config.qsa_context_arena_bytes(s, fnuz).unwrap();
+        assert_eq!(layer, s * 1672);
+        assert_eq!(layer * config.n_full_layers(), s * 20_064);
+        assert_eq!(
+            config.qsa_context_arena_bytes(s, QsaKvFormat::F32).unwrap(),
+            s * 4736
+        );
+        // The RDNA fp8 row keeps its BF16 index keys.
+        assert_eq!(
+            config.qsa_context_arena_bytes(s, QsaKvFormat::Fp8).unwrap(),
+            s * (1032 + 256 + 64)
+        );
+        // Legacy storage (gfx942 is not a VMM arch) commits the whole layer.
+        let context = Qwen4ContextCommit::legacy(s);
+        assert_eq!(context.committed_layer_bytes(&config, fnuz), Some(layer));
+        // The state charge differs from the F32 state by exactly the K/V and
+        // index-row savings of the QSA layers (GDN state untouched).
+        let state = |qsa| Qwen4StateFormat {
+            qsa,
+            ..Qwen4StateFormat::F32
+        };
+        assert_eq!(
+            Qwen4State::device_bytes(&config, state(QsaKvFormat::F32), &context).unwrap()
+                - Qwen4State::device_bytes(&config, state(fnuz), &context).unwrap(),
+            s * (4736 - 1672) * config.n_full_layers()
+        );
+    }
+
+    /// The gfx942 FNUZ encoder feeds `(v / s) * 0.5` to a round-to-nearest-even
+    /// FNUZ convert, which cannot produce `0x80` (its NaN). Modeled on the CPU
+    /// FNUZ table: every finite OCP code except `0x80` is stored as itself, the
+    /// quantized negative zero `0x80` is stored as `0x00`, and `0x80` is never
+    /// stored, including for an input of -0 and for negative nonzero inputs
+    /// that round to zero.
+    #[test]
+    fn gfx942_fp8_kv_codes_canonicalize_negative_zero_and_never_store_0x80() {
+        use rdna_compute::fp8_e4m3::{e4m3fn_to_f32, e4m3fnuz_to_f32};
+        let encode = |x: f32| -> u8 {
+            let mut best: Option<(f64, u8)> = None;
+            for code in 0..=255u8 {
+                let Some(value) = e4m3fnuz_to_f32(code) else {
+                    continue; // 0x80: FNUZ NaN, never produced
+                };
+                let distance = (f64::from(x) - f64::from(value)).abs();
+                best = match best {
+                    Some((d, c)) if d < distance || (d == distance && c & 1 == 0) => Some((d, c)),
+                    _ => Some((distance, code)),
+                };
+            }
+            best.unwrap().1
+        };
+        let mut finite = 0;
+        for code in 0..=255u8 {
+            let Some(value) = e4m3fn_to_f32(code) else {
+                continue; // 0x7F / 0xFF: OCP NaN
+            };
+            finite += 1;
+            let stored = encode(value * 0.5);
+            assert_ne!(stored, 0x80, "code {code:#04x} stored 0x80");
+            assert_eq!(
+                stored,
+                if code == 0x80 { 0x00 } else { code },
+                "code {code:#04x}"
+            );
+        }
+        assert_eq!(finite, 254);
+        // -0, a negative value below the smallest FNUZ subnormal (2^-10), and
+        // the exact tie at half of it (to even: zero) all store +0.
+        for x in [-0.0f32, -1e-9, -2f32.powi(-12), -2f32.powi(-11)] {
+            assert_eq!(encode(x), 0x00, "{x:e}");
+        }
+        // Just past the tie rounds to the smallest negative subnormal 0x81.
+        assert_eq!(encode(-2f32.powi(-11) * 1.0001), 0x81);
     }
 
     #[test]

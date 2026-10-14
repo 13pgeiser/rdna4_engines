@@ -428,20 +428,36 @@ sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
 recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
 arch, `fp32` through the `state_quant` load parameter.
 
-| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other gfx11/gfx12 | other arches |
-|---|---|---|---|
-| `auto` / unset | `fp8` | `bf16` | `bf16` |
-| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same | same |
-| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | refused |
-| `q8` (opt-in) | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same | refused |
-| anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused |
+| `kv_cache` | gfx1201 | gfx1100, gfx1151 (Halo), other gfx11/gfx12 | gfx942 (MI300X) | other arches |
+|---|---|---|---|---|
+| `auto` / unset | `fp8` | `bf16` | `bf16` (never `fp8`) | `bf16` |
+| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | same | same | same |
+| `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | explicit opt-in: the same row (E4M3 codes plus one f16 scale per head and token) in the gfx942 FNUZ-hardware format; indexer raw/pooled keys stay F32 | refused |
+| `q8` (opt-in) | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same | refused | refused |
+| anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused | refused |
 
 `auto` picks fp8 only on exact gfx1201 and only for a head geometry the
 kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
-otherwise it stays `bf16`. `auto` never picks `q8`; it needs head_dim 256.
+otherwise it stays `bf16`. On exact gfx942 `auto`/unset stays the exact `bf16`
+state; fp8 is served only by an explicit `kv_cache = "fp8"` (same geometry
+requirement, refused rather than rewritten when the model does not meet it).
+`auto` never picks `q8`; it needs head_dim 256.
 The native MTP layer keeps the exact state. On Flash-Next, each trunk QSA
-layer's context state is 4,736 bytes per token at `bf16`, 1,352 at fp8 and
-1,408 at q8 (12 layers at 262,144 tokens: 14,208, 4,056 and 4,224 MiB). The
+layer's context state is 4,736 bytes per token at `bf16`, 1,352 at gfx1201
+fp8, 1,672 at gfx942 fp8 and 1,408 at q8 (12 layers at 262,144 tokens:
+14,208, 4,056, 5,016 and 4,224 MiB). The gfx942 fp8 charge is the K and V
+rows (2 × 516 = 1,032 B; a row is 2 KV heads × (256 E4M3 codes + one f16
+scale)), the F32 raw index key (512 B) and the F32 pooled key (one 512 B row
+per four tokens, 128 B); the index state is the same F32 state as `bf16`.
+gfx942 uses legacy (fully allocated) context storage, so admission charges
+the whole `max_seq`. The gfx942 FNUZ hardware encoder stores the
+OCP-equivalent code bytes with one f16 scale per head and token (the decoder
+doubles the scale for the FNUZ bias), so decoded values equal the gfx1201 fp8
+row's. FNUZ has no negative zero (`0x80` is its NaN), so a stored K/V row never
+contains `0x80`: the sole deviation from the OCP code is that the quantized
+negative-zero code `0x80` is stored as `0x00` (+0). That covers an input of
+exactly −0 and a negative nonzero input that rounds to zero; every other finite
+code is stored unchanged. The
 Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
 native 262,144. Index keys hold the same values in every format, so
 selection is unchanged; only the attention over the selected K/V rows sees
