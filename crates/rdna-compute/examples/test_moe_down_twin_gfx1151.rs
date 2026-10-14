@@ -2,18 +2,34 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Bitwise oracle + timing for the gfx1151 QT53 grouped top-10 MoE down
-//! variants, against the production incumbent:
+//! variants, against the production incumbent. Variants live in the `VARIANTS`
+//! table (index 0 is the incumbent and the bitwise reference):
 //!
 //!   incumbent  `gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151`
-//!              grid [ceil(M/8),  ceil(grouped_rows/16), 1]
+//!              grid [ceil(M/8),  ceil(grouped_rows/16), 1], block [32,1,1]
 //!   twin       `gemm_mq4g128v2_moe_grouped_top10_o8_r8_gfx1151`
-//!              grid [ceil(M/8),  ceil(grouped_rows/16), 2]   (z = half tile)
+//!              grid [ceil(M/8),  ceil(grouped_rows/16), 2], block [32,1,1]   (z = half tile)
 //!   o16r16     `gemm_mq4g128v2_moe_grouped_top10_o16_r16_gfx1151`
-//!              grid [ceil(M/16), ceil(grouped_rows/16), 1]
+//!              grid [ceil(M/16), ceil(grouped_rows/16), 1], block [32,1,1]
+//!   xs4        `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151`
+//!              32 rows/block,  block [128,1,1], grid [ceil(M/32),  ceil(grouped_rows/16), 1]
+//!   xs8        `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs8_gfx1151`
+//!              64 rows/block,  block [256,1,1], grid [ceil(M/64),  ceil(grouped_rows/16), 1]
+//!   xs16       `gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs16_gfx1151`
+//!              128 rows/block, block [512,1,1], grid [ceil(M/128), ceil(grouped_rows/16), 1]
 //!
-//! All three are block = [32,1,1], take the production 11-argument signature,
-//! and are compiled directly from the `.hip` sources (`include_str!`) through
-//! `ensure_kernel_public`; no dispatch/production code is touched.
+//! All variants take the production 11-argument signature and are compiled
+//! directly from the `.hip` sources (`include_str!`) through
+//! `ensure_kernel_public(module, src, func)`; the three xs symbols share one
+//! module (`gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs`) and each symbol is
+//! bound through it. No dispatch/production code is touched.
+//!
+//! ## Shape applicability
+//! The xs variants require K = 640 and M a multiple of their rows_per_block
+//! (`Variant::applies`). A case where a variant does not apply prints
+//! `[label] skipped (shape)` and runs without it (the old three variants apply
+//! to every shape, so the K=639/641/M=17/M=40 tail cases still run them);
+//! its summary cells show `-`.
 //!
 //! ## What is verified
 //! Every f32 bit of `Y_grouped` (INCLUDING padding / invalid slots, which must
@@ -46,8 +62,8 @@
 //!
 //! ## Timing
 //! Each variant: warmup launches, then SAMPLES individually timed launches
-//! (HIP event pair around ONE launch each), launch order rotated through all
-//! six permutations of the three variants between samples. Reported: median
+//! (HIP event pair around ONE launch each), launch order cyclically rotated
+//! over the case's active-variant list between samples. Reported: median
 //! and min per-launch time.
 //!
 //! ## Bandwidth denominator (effective GB/s, 1 GB = 1e9 B)
@@ -64,23 +80,38 @@
 //! ## Sweep mode (`--sweep`)
 //! Runs the same production scatter, weight and X generators over uniform
 //! E512 M2560 K640 `x_row_div = 1` cases at tokens 145..=497 step 32 plus the 529
-//! control, comparing ONLY incumbent vs O8R8 (O16 is neither compiled nor run).
-//! Weights are built once and reused across cases. Every case still checks every
-//! output bit (padding, guard band, unwritten cells) against the incumbent, with
-//! WARMUP warmup launches and the median of SAMPLES event-timed launches, order
-//! alternating (inc,twin / twin,inc) per sample. Each case is seeded by its token
-//! count, so `--tokens=` reproduces the same routing/X for shared counts.
+//! control. Default active set: incumbent vs O8R8 only (the other variants are
+//! neither compiled nor run) unless `--variants=` is given. Weights are built
+//! once and reused across cases. Every case still checks every output bit
+//! (padding, guard band, unwritten cells) against the incumbent, with WARMUP
+//! warmup launches and the median of SAMPLES event-timed launches, order
+//! cyclically rotated per sample. Each case is seeded by its token count, so
+//! `--tokens=` reproduces the same routing/X for shared counts.
 //! `--tokens=a,b,c` (requires `--sweep`) replaces the token list, e.g. a dense
 //! pass around the crossover. The summary lists one row per case: tokens, live /
-//! launched tiles, incumbent and O8R8 median us and effective GB/s, the
-//! difference (inc - o8r8, positive = O8R8 faster) and the ratio. A positional
-//! argument still substring-filters case names.
+//! launched tiles, then per active variant median us and effective GB/s, and for
+//! non-incumbent variants the difference (inc - var, positive = variant faster)
+//! and the ratio. A positional argument still substring-filters case names.
 //!
-//! GFX1151 ONLY: refuses any other arch (exit 2).
+//! ## Flags
+//!   --sweep              sweep mode (above)
+//!   --tokens=a,b,c       replace the sweep token list (requires --sweep)
+//!   --variants=a,b       run only variants whose label or symbol contains any
+//!                        of the given substrings; the incumbent always runs.
+//!                        Without --sweep the default is every variant; with
+//!                        --sweep the default is incumbent + O8R8.
+//!   --precheck           admit a gfx1100 / gfx1201 card for a CORRECTNESS run
+//!                        (the kernels compile there); a NOTE is printed that
+//!                        timings are not gfx1151 numbers.
+//!
+//! GFX1151 ONLY (unless --precheck on gfx1100/gfx1201): refuses any other arch
+//! (exit 2).
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 [case-name-filter]
-//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --variants=xs4,xs8,xs16 [filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [--variants=xs8] [filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --precheck [filter]
 
 use hip_bridge::KernargBlob;
 use std::borrow::Cow;
@@ -93,38 +124,70 @@ const SRC_TWIN: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r8.gfx1151.hip");
 const SRC_O16: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o16_r16.gfx1151.hip");
+const SRC_XS: &str =
+    include_str!("../../../kernels/src/gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs.gfx1151.hip");
+const MODULE_XS: &str = "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs";
 
 #[derive(Clone, Copy)]
 struct Variant {
     label: &'static str,
+    module: &'static str,
     func: &'static str,
     src: &'static str,
     rows_per_block: usize,
+    block_x: u32,
     grid_z: u32,
 }
 
-const VARIANTS: [Variant; 3] = [
+impl Variant {
+    /// The xs kernels hard-wire K = 640 and need M to tile exactly; the older
+    /// three handle any shape.
+    fn applies(&self, m: usize, k: usize) -> bool {
+        if self.module == MODULE_XS {
+            k == 640 && m % self.rows_per_block == 0
+        } else {
+            true
+        }
+    }
+}
+
+const fn xs(label: &'static str, func: &'static str, rows_per_block: usize, block_x: u32) -> Variant {
+    Variant { label, module: MODULE_XS, func, src: SRC_XS, rows_per_block, block_x, grid_z: 1 }
+}
+
+/// Index 0 is the incumbent (the bitwise reference); the rest are candidates.
+/// Index 1 is the O8R8 twin (the sweep default's second variant).
+const VARIANTS: [Variant; 6] = [
     Variant {
         label: "incumbent o8r16",
+        module: "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
         func: "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151",
         src: SRC_INCUMBENT,
         rows_per_block: 8,
+        block_x: 32,
         grid_z: 1,
     },
     Variant {
         label: "twin o8r8 z2",
+        module: "gemm_mq4g128v2_moe_grouped_top10_o8_r8_gfx1151",
         func: "gemm_mq4g128v2_moe_grouped_top10_o8_r8_gfx1151",
         src: SRC_TWIN,
         rows_per_block: 8,
+        block_x: 32,
         grid_z: 2,
     },
     Variant {
         label: "o16r16",
+        module: "gemm_mq4g128v2_moe_grouped_top10_o16_r16_gfx1151",
         func: "gemm_mq4g128v2_moe_grouped_top10_o16_r16_gfx1151",
         src: SRC_O16,
         rows_per_block: 16,
+        block_x: 32,
         grid_z: 1,
     },
+    xs("xs4", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151", 32, 128),
+    xs("xs8", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs8_gfx1151", 64, 256),
+    xs("xs16", "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs16_gfx1151", 128, 512),
 ];
 
 const K_TOP: usize = 10;
@@ -136,14 +199,6 @@ const WARMUP: usize = 6;
 const SAMPLES: usize = 31; // >= 20 individually timed launches per variant
 const GUARD_ROWS: usize = 16;
 const SENTINEL_BITS: u32 = 0x7fc0_1234;
-const PERMS: [[usize; 3]; 6] = [
-    [0, 1, 2],
-    [1, 2, 0],
-    [2, 0, 1],
-    [2, 1, 0],
-    [0, 2, 1],
-    [1, 0, 2],
-];
 
 // ── RNG ────────────────────────────────────────────────────────────────────
 
@@ -480,20 +535,22 @@ struct CaseOutcome {
     live_tiles: usize,
     launched_tiles: usize,
     ok: bool,
-    median_us: [f64; 3],
-    gbps: [f64; 3],
+    /// Indexed by variant (`VARIANTS`); NaN = not run for this case.
+    median_us: Vec<f64>,
+    gbps: Vec<f64>,
 }
 
-/// `active` lists the variant indices to run; `active[0]` MUST be 0 (the incumbent
-/// reference every other variant is compared against bit-for-bit).
+/// `requested` lists the variant indices to run; `requested[0]` MUST be 0 (the
+/// incumbent reference every other variant is compared against bit-for-bit).
+/// Variants whose `applies(m, k)` is false are skipped for this case.
 fn run_case(
     gpu: &mut Gpu,
     spec: &Spec,
     w: &Weights,
     case_idx: usize,
-    active: &[usize],
+    requested: &[usize],
 ) -> CaseOutcome {
-    assert_eq!(active.first(), Some(&0), "incumbent must be the reference variant");
+    assert_eq!(requested.first(), Some(&0), "incumbent must be the reference variant");
     let (e, m, k) = (spec.e, spec.m, spec.k);
     let mut rng = Rng(SEED ^ ((case_idx as u64 + 1) << 32) ^ 0xA5A5);
     let slots = spec.tokens * K_TOP;
@@ -595,6 +652,19 @@ fn run_case(
         total_bytes as f64 / 1e6,
     );
 
+    let active: Vec<usize> = requested
+        .iter()
+        .copied()
+        .filter(|&i| {
+            let applies = VARIANTS[i].applies(m, k);
+            if !applies {
+                println!("  [{}] skipped (shape)", VARIANTS[i].label);
+            }
+            applies
+        })
+        .collect();
+    assert_eq!(active.first(), Some(&0), "incumbent applies to every shape");
+
     // Kernarg blobs (production argument order and types).
     let blob = |_: &Variant| -> Vec<u8> {
         let mut b = KernargBlob::new();
@@ -613,14 +683,14 @@ fn run_case(
     };
     let mut blobs: Vec<Vec<u8>> = VARIANTS.iter().map(blob).collect();
     let grid = |v: &Variant| [m.div_ceil(v.rows_per_block) as u32, tiles_launched as u32, v.grid_z];
-    let block = [32u32, 1, 1];
+    let block = |v: &Variant| [v.block_x, 1, 1];
 
     // Correctness: one fresh-sentinel run per variant.
     let mut outputs: Vec<Vec<f32>> = Vec::new();
-    for &i in active {
+    for &i in &active {
         let v = &VARIANTS[i];
         gpu.hip.memcpy_htod(&y_t.buf, f32_bytes(&sentinel)).expect("reset y");
-        gpu.launch_kernel_blob(v.func, grid(v), block, 0, &mut blobs[i]).expect("launch");
+        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i]).expect("launch");
         gpu.hip.device_synchronize().expect("sync");
         outputs.push(gpu.download_f32(&y_t).expect("download y"));
     }
@@ -679,25 +749,23 @@ fn run_case(
     let ev0 = gpu.hip.event_create().expect("event");
     let ev1 = gpu.hip.event_create().expect("event");
     let time_one = |gpu: &mut Gpu, i: usize, blobs: &mut Vec<Vec<u8>>| -> f64 {
+        let v = &VARIANTS[i];
         gpu.hip.event_record(&ev0, None).expect("rec");
-        gpu.launch_kernel_blob(VARIANTS[i].func, grid(&VARIANTS[i]), block, 0, &mut blobs[i])
-            .expect("launch");
+        gpu.launch_kernel_blob(v.func, grid(v), block(v), 0, &mut blobs[i]).expect("launch");
         gpu.hip.event_record(&ev1, None).expect("rec");
         gpu.hip.event_synchronize(&ev1).expect("evsync");
         gpu.hip.event_elapsed_ms(&ev0, &ev1).expect("elapsed") as f64 * 1000.0
     };
-    let perms: Vec<Vec<usize>> = match active {
-        [a, b] => vec![vec![*a, *b], vec![*b, *a]],
-        _ => PERMS.iter().map(|p| p.to_vec()).collect(),
-    };
-    for w_i in 0..WARMUP {
-        for &i in &perms[w_i % perms.len()] {
-            time_one(gpu, i, &mut blobs);
+    let n = active.len();
+    for s in 0..WARMUP {
+        for j in 0..n {
+            time_one(gpu, active[(s + j) % n], &mut blobs);
         }
     }
-    let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); VARIANTS.len()];
     for s in 0..SAMPLES {
-        for &i in &perms[s % perms.len()] {
+        for j in 0..n {
+            let i = active[(s + j) % n];
             let t = time_one(gpu, i, &mut blobs);
             samples[i].push(t);
         }
@@ -705,13 +773,13 @@ fn run_case(
     gpu.hip.event_destroy(ev0).expect("destroy");
     gpu.hip.event_destroy(ev1).expect("destroy");
 
-    let mut median_us = [0f64; 3];
-    let mut gbps = [0f64; 3];
+    let mut median_us = vec![f64::NAN; VARIANTS.len()];
+    let mut gbps = vec![f64::NAN; VARIANTS.len()];
     println!(
-        "  timing: {SAMPLES} individual launches/variant after {WARMUP} warmup, order rotated over {} perms",
-        perms.len()
+        "  timing: {SAMPLES} individual launches/variant after {WARMUP} warmup, order cyclically \
+         rotated per sample over {n} variant(s)"
     );
-    for &i in active {
+    for &i in &active {
         let v = &VARIANTS[i];
         let min = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
         let med = median(&mut samples[i]);
@@ -746,7 +814,8 @@ fn run_case(
 /// 145..=497 step 32, plus the 529 control.
 const SWEEP_TOKENS: [usize; 13] =
     [145, 177, 209, 241, 273, 305, 337, 369, 401, 433, 465, 497, 529];
-/// Sweep compares only the incumbent (variant 0) and the O8R8 twin (variant 1).
+/// Sweep default compares only the incumbent (variant 0) and the O8R8 twin
+/// (variant 1); `--variants=` overrides it.
 const SWEEP_ACTIVE: [usize; 2] = [0, 1];
 
 fn sweep_specs(tokens: &[usize]) -> Vec<Spec> {
@@ -759,10 +828,20 @@ fn sweep_specs(tokens: &[usize]) -> Vec<Spec> {
         .collect()
 }
 
+/// Right-aligned fixed-point cell; NaN (variant not run for the case) prints `-`.
+fn cell(x: f64, width: usize, prec: usize) -> String {
+    if x.is_nan() { format!("{:>width$}", "-") } else { format!("{x:>width$.prec$}") }
+}
+
 fn main() {
     let mut sweep = false;
     let mut tokens_override: Option<Vec<usize>> = None;
+    let mut variant_filter: Option<Vec<String>> = None;
     let mut filter: Option<String> = None;
+    // `--precheck`: correctness pre-check on a gfx1100 / gfx1201 card (the same
+    // kernels compile there): bitwise verdicts are meaningful, timings are not
+    // gfx1151 numbers.
+    let mut precheck = false;
     for a in std::env::args().skip(1) {
         if a == "--sweep" {
             sweep = true;
@@ -773,8 +852,16 @@ fn main() {
                 .collect();
             assert!(!v.is_empty() && v.iter().all(|&t| t > 0), "--tokens needs positive counts");
             tokens_override = Some(v);
+        } else if let Some(list) = a.strip_prefix("--variants=") {
+            variant_filter =
+                Some(list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+        } else if a == "--precheck" {
+            precheck = true;
         } else if a.starts_with("--") {
-            eprintln!("unknown flag {a} (supported: --sweep, --tokens=a,b,c with --sweep)");
+            eprintln!(
+                "unknown flag {a} (supported: --sweep, --tokens=a,b,c with --sweep, \
+                 --variants=a,b, --precheck)"
+            );
             std::process::exit(2);
         } else {
             filter = Some(a);
@@ -787,19 +874,52 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("GPU init");
     println!("arch = {}", gpu.arch);
-    if !(gpu.arch_caps.is_gfx1151() && gpu.arch.starts_with("gfx1151")) {
+    let gfx1151 = gpu.arch_caps.is_gfx1151() && gpu.arch.starts_with("gfx1151");
+    if !gfx1151
+        && !(precheck && (gpu.arch.starts_with("gfx1100") || gpu.arch.starts_with("gfx1201")))
+    {
         eprintln!(
-            "REFUSING: test_moe_down_twin_gfx1151 is a gfx1151-only oracle (found {}).",
+            "REFUSING: test_moe_down_twin_gfx1151 is a gfx1151-only oracle (found {}; \
+             --precheck admits a gfx1100/gfx1201 correctness pre-check).",
             gpu.arch
         );
         std::process::exit(2);
     }
-    let active: Vec<usize> =
-        if sweep { SWEEP_ACTIVE.to_vec() } else { (0..VARIANTS.len()).collect() };
+    if !gfx1151 {
+        println!("NOTE: {} correctness pre-check; timings below are NOT gfx1151 numbers", gpu.arch);
+    }
+
+    // The incumbent (index 0) always runs; others are substring-matched on label or symbol.
+    let active: Vec<usize> = if sweep && variant_filter.is_none() {
+        SWEEP_ACTIVE.to_vec()
+    } else {
+        (0..VARIANTS.len())
+            .filter(|&i| {
+                i == 0
+                    || variant_filter.as_ref().map_or(true, |f| {
+                        f.iter().any(|p| {
+                            VARIANTS[i].label.contains(p.as_str())
+                                || VARIANTS[i].func.contains(p.as_str())
+                        })
+                    })
+            })
+            .collect()
+    };
+    if active.len() == 1 && variant_filter.is_some() {
+        eprintln!("--variants matched no non-incumbent variant (by label or symbol)");
+        std::process::exit(2);
+    }
+
+    // Each distinct (module, src) is compiled once by `ensure_kernel`; every
+    // further symbol of an already-loaded module is just bound.
     for &i in &active {
         let v = &VARIANTS[i];
-        gpu.ensure_kernel_public(v.func, v.src, v.func)
+        gpu.ensure_kernel_public(v.module, v.src, v.func)
             .unwrap_or_else(|e| panic!("compile {}: {e:?}", v.func));
+        println!(
+            "  loaded {:<16} {} (module {}, block {})",
+            v.label, v.func, v.module, v.block_x
+        );
     }
 
     println!(
@@ -849,56 +969,79 @@ fn main() {
         old.free(&mut gpu);
     }
 
+    // Summary columns are generated from the active variants.
+    let col_name = |i: usize| if i == 0 { "inc".to_string() } else { VARIANTS[i].label.to_string() };
+    let col_w = |i: usize| (col_name(i).len() + 3).max(9);
     let mut all_ok = !outcomes.is_empty();
     if sweep {
+        let names: Vec<&str> = active.iter().skip(1).map(|&i| VARIANTS[i].label).collect();
         println!(
-            "\n================ SWEEP SUMMARY (incumbent o8r16 vs twin o8r8 z2; median us | eff GB/s) ================"
+            "\n================ SWEEP SUMMARY (incumbent o8r16 vs {}; median us | eff GB/s) ================",
+            names.join(", ")
         );
-        println!(
-            "{:>6} {:<26} {:>7} {:>6} {:>6} | {:>9} {:>7} | {:>9} {:>7} | {:>9} {:>7}",
-            "tokens", "case", "verdict", "live_t", "launch", "inc us", "GB/s", "o8r8 us", "GB/s",
-            "inc-o8r8", "inc/o8r8"
+        print!(
+            "{:>6} {:<26} {:>7} {:>6} {:>6}",
+            "tokens", "case", "verdict", "live_t", "launch"
         );
+        for &i in &active {
+            print!(" | {:>w$} {:>7}", format!("{} us", col_name(i)), "GB/s", w = col_w(i));
+            if i != 0 {
+                print!(" | {:>9} {:>7}", format!("inc-{}", col_name(i)), "inc/var");
+            }
+        }
+        println!();
         for o in &outcomes {
             all_ok &= o.ok;
-            println!(
-                "{:>6} {:<26} {:>7} {:>6} {:>6} | {:>9.2} {:>7.1} | {:>9.2} {:>7.1} | {:>+9.2} {:>7.3}x",
+            print!(
+                "{:>6} {:<26} {:>7} {:>6} {:>6}",
                 o.tokens,
                 o.name,
                 if o.ok { "PASS" } else { "FAIL" },
                 o.live_tiles,
                 o.launched_tiles,
-                o.median_us[0],
-                o.gbps[0],
-                o.median_us[1],
-                o.gbps[1],
-                o.median_us[0] - o.median_us[1],
-                o.median_us[0] / o.median_us[1],
             );
+            for &i in &active {
+                print!(" | {} {}", cell(o.median_us[i], col_w(i), 2), cell(o.gbps[i], 7, 1));
+                if i != 0 {
+                    let diff = o.median_us[0] - o.median_us[i];
+                    let ratio = o.median_us[0] / o.median_us[i];
+                    let diff_s = if diff.is_nan() {
+                        format!("{:>9}", "-")
+                    } else {
+                        format!("{diff:>+9.2}")
+                    };
+                    let ratio_s = if ratio.is_nan() {
+                        format!("{:>7}", "-")
+                    } else {
+                        format!("{ratio:>6.3}x")
+                    };
+                    print!(" | {diff_s} {ratio_s}");
+                }
+            }
+            println!();
         }
     } else {
         println!(
             "\n================ SUMMARY (median us | eff GB/s; ratio vs incumbent) ================"
         );
-        println!(
-            "{:<36} {:>8} | {:>9} {:>7} | {:>9} {:>7} {:>6} | {:>9} {:>7} {:>6}",
-            "case", "verdict", "inc us", "GB/s", "twin us", "GB/s", "x", "o16 us", "GB/s", "x"
-        );
+        print!("{:<36} {:>8}", "case", "verdict");
+        for &i in &active {
+            print!(" | {:>w$} {:>7}", format!("{} us", col_name(i)), "GB/s", w = col_w(i));
+            if i != 0 {
+                print!(" {:>6}", "x");
+            }
+        }
+        println!();
         for o in &outcomes {
             all_ok &= o.ok;
-            println!(
-                "{:<36} {:>8} | {:>9.2} {:>7.1} | {:>9.2} {:>7.1} {:>6.3} | {:>9.2} {:>7.1} {:>6.3}",
-                o.name,
-                if o.ok { "PASS" } else { "FAIL" },
-                o.median_us[0],
-                o.gbps[0],
-                o.median_us[1],
-                o.gbps[1],
-                o.median_us[0] / o.median_us[1],
-                o.median_us[2],
-                o.gbps[2],
-                o.median_us[0] / o.median_us[2],
-            );
+            print!("{:<36} {:>8}", o.name, if o.ok { "PASS" } else { "FAIL" });
+            for &i in &active {
+                print!(" | {} {}", cell(o.median_us[i], col_w(i), 2), cell(o.gbps[i], 7, 1));
+                if i != 0 {
+                    print!(" {}", cell(o.median_us[0] / o.median_us[i], 6, 3));
+                }
+            }
+            println!();
         }
     }
     println!("OVERALL: {}", if all_ok { "PASS (all bitwise identical)" } else { "FAIL" });
