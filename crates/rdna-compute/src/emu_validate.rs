@@ -1437,13 +1437,23 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 ));
                 gpu.free_tensor(t2)?;
 
-                // Drain releases the charge.
+                // Drain releases the charge of every parked buffer: the controlled one
+                // and any buffer an earlier section parked (so compare against the
+                // pre-drain parked bytes, not the section's opening snapshot).
+                let parked_pre = gpu.pool_parked_bytes() as u64;
+                let snap_pre = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
                 gpu.drain_pool();
                 let snap4 = gpu.emu_budget_snapshot().ok_or_else(|| err("budget vanished"))?;
+                let expected_after = snap_pre.committed.device_bytes.checked_sub(parked_pre);
                 checks.push(check(
                     "pool_drain_releases_charge",
-                    snap4.committed == snap0.committed && gpu.pool_parked_bytes() == 0,
-                    format!("committed after drain {:?} vs baseline {:?}", snap4.committed, snap0.committed),
+                    parked_pre >= size
+                        && expected_after == Some(snap4.committed.device_bytes)
+                        && gpu.pool_parked_bytes() == 0,
+                    format!(
+                        "device committed {} -> {} after draining {} parked B (controlled {} B)",
+                        snap_pre.committed.device_bytes, snap4.committed.device_bytes, parked_pre, size
+                    ),
                 ));
             }
         }
