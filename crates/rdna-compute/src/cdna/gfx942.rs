@@ -914,7 +914,11 @@ impl Gfx942Device<'_> {
         if grid_y > u16::MAX as usize {
             return refuse(format!("{WHAT}: mi={mi} needs grid.y={grid_y} > {}", u16::MAX));
         }
-        if gate_up.dtype != DType::F32 || activation.dtype != DType::F32 || sorted.dtype.size() != 4 {
+        // `sorted` is i32 data; the sealed route carries the stable scatter's index scratch as
+        // `DType::Raw` (1 B/elem in byte_size), so accept a 4-byte dtype or Raw — the byte-span check
+        // below is what bounds the read.
+        let sorted_ok = sorted.dtype.size() == 4 || sorted.dtype == DType::Raw;
+        if gate_up.dtype != DType::F32 || activation.dtype != DType::F32 || !sorted_ok {
             return refuse(format!(
                 "{WHAT}: needs F32 gate_up/activation and a 4-byte sorted (got {:?}/{:?}/{:?})",
                 gate_up.dtype, activation.dtype, sorted.dtype
