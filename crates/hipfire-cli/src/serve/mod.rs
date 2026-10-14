@@ -431,7 +431,7 @@ pub(crate) struct ServeShared {
     /// for the process lifetime, like `capabilities`.
     pub(crate) ui_enabled: bool,
     /// Bearer token every route except the minimal `/health` requires. `None`
-    /// (keyless, loopback-only) leaves every route open, as before. Never
+    /// (no API key configured) leaves every route open, as before. Never
     /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
     pub(crate) api_key: Option<BearerToken>,
 }
@@ -1233,18 +1233,21 @@ pub(crate) fn resolve_api_key(
         .with_context(|| format!("failed to load serve API key file {}", path.display()))
 }
 
-/// A non-loopback bind exposes the model to the network; refuse it unless a
-/// bearer token guards the routes.
-pub(crate) fn require_api_key_for_bind(host: &str, api_key: Option<&BearerToken>) -> Result<()> {
-    if api_key.is_none() && !host_is_loopback(host) {
-        bail!(
-            "refusing to serve on non-loopback address {host} without authentication; \
-             set serve.api_key_file (or HIPFIRE_SERVE_API_KEY_FILE), or pass \
-             --api-key-file <absolute path>, to require a bearer token, or bind a \
-             loopback address such as 127.0.0.1"
-        );
+/// Notice for a non-loopback bind with no API key: every client that can
+/// reach the address can use the model. `None` when a key is set or the bind
+/// is loopback. Advisory only; serving is never refused for lack of a key.
+pub(crate) fn unauthenticated_bind_notice(
+    host: &str,
+    port: u16,
+    api_key: Option<&BearerToken>,
+) -> Option<String> {
+    if api_key.is_some() || host_is_loopback(host) {
+        return None;
     }
-    Ok(())
+    Some(format!(
+        "serving on {host}:{port} without authentication; set serve.api_key_file \
+         (or --api-key-file) to require a bearer token"
+    ))
 }
 
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
@@ -1272,7 +1275,6 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
         }
     }
     let api_key = resolve_api_key(&args, &resolved)?;
-    require_api_key_for_bind(&host, api_key.as_ref())?;
     serve_foreground(paths, &args, &host, port, resolved, api_key)
 }
 pub(crate) fn resolve_serve_positionals(
@@ -1431,7 +1433,6 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     let health_host = probe_host(host);
     let (_, resolved) = resolved_global(paths, true)?;
     let api_key = resolve_api_key(args, &resolved)?;
-    require_api_key_for_bind(host, api_key.as_ref())?;
     let has_api_key = api_key.is_some();
     // Credential-aware readiness/identity probe: a keyed server answers the
     // pid/token payload only to a request bearing the token.
@@ -1523,6 +1524,11 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
                 println!("chat UI: {}", serve_ui_url(host, port));
                 if has_api_key {
                     println!("{UI_AUTH_NOTICE}");
+                } else if !host_is_loopback(host) {
+                    println!(
+                        "WARNING: chat UI is unauthenticated and bound to {host} — \
+                         reachable from non-loopback clients"
+                    );
                 }
                 if args.open {
                     open_browser(&serve_ui_url(host, port));
@@ -1734,8 +1740,22 @@ pub(crate) fn serve_foreground(
     // `--open` implies `--ui`: the launcher promise is meaningless without
     // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
     let ui_enabled = args.ui || args.open || config_bool(&global, "serve.ui")?;
-    if ui_enabled && api_key.is_some() {
-        eprintln!("[hipfire] {UI_AUTH_NOTICE}");
+    if ui_enabled {
+        if api_key.is_some() {
+            eprintln!("[hipfire] {UI_AUTH_NOTICE}");
+        } else if !host_is_loopback(host) {
+            // The gateway already answers /v1/chat/completions cross-origin; the
+            // UI flag makes that reachable from any browser on the network.
+            eprintln!(
+                "[hipfire] WARNING: chat UI is unauthenticated and bound to {host} — \
+                 reachable from non-loopback clients"
+            );
+        }
+    }
+    // Foreground only: a detached parent never prints this, its child does
+    // (into serve.log) when it re-enters here as the foreground process.
+    if let Some(notice) = unauthenticated_bind_notice(host, port, api_key.as_ref()) {
+        eprintln!("[hipfire] {notice}");
     }
     let instance_token = serve_instance_token();
     // Admission width: experimental multi-slot projects N concurrent daemon
@@ -4490,19 +4510,31 @@ mod capabilities_tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_loopback_bind_without_an_api_key_is_refused_with_the_fix() {
+    fn unauthenticated_bind_notice_covers_keyless_external_binds_only() {
         let key = test_bearer("bind");
         for host in ["0.0.0.0", "::", "192.168.1.5", "example.local"] {
-            let error = require_api_key_for_bind(host, None)
-                .expect_err(host)
-                .to_string();
-            assert!(error.contains(host), "{error}");
-            assert!(error.contains("serve.api_key_file"), "{error}");
-            assert!(error.contains("--api-key-file"), "{error}");
-            require_api_key_for_bind(host, Some(&key)).expect(host);
+            let notice = unauthenticated_bind_notice(host, 8080, None).expect(host);
+            assert_eq!(
+                notice,
+                format!(
+                    "serving on {host}:8080 without authentication; set serve.api_key_file \
+                     (or --api-key-file) to require a bearer token"
+                )
+            );
+            assert!(
+                unauthenticated_bind_notice(host, 8080, Some(&key)).is_none(),
+                "{host}"
+            );
         }
-        for host in ["localhost", "127.0.0.1", "::1"] {
-            require_api_key_for_bind(host, None).expect(host);
+        for host in ["localhost", "127.0.0.1", "127.1.2.3", "::1"] {
+            assert!(
+                unauthenticated_bind_notice(host, 8080, None).is_none(),
+                "{host}"
+            );
+            assert!(
+                unauthenticated_bind_notice(host, 8080, Some(&key)).is_none(),
+                "{host}"
+            );
         }
     }
 }

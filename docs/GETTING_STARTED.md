@@ -441,7 +441,7 @@ Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pr
 
 `hipfire serve --ui` also serves the embedded chat UI at `/ui` on the same listener (`--open` launches it in the default browser and implies `--ui`).
 
-> **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
+> **Key optional, TLS absent:** the serve HTTP API has **no TLS**, and bearer authentication is **optional** (`serve.api_key_file` / `--api-key-file`; see [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies)). The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves); without a key anyone who can reach it can call every endpoint, so a key is **recommended** on any non-loopback bind. Expose beyond localhost only on a trusted/firewalled network **or** behind a TLS-terminating reverse proxy you control — never publish the raw port to the internet.
 
 Force a one-shot daemon and skip HTTP:
 
@@ -468,7 +468,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
-| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
+| `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no TLS; key optional, recommended off loopback) |
 
 Enable draft-model speculation only when you intend to:
 

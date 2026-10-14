@@ -190,7 +190,8 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 
 | Flag / arg | Purpose |
 |---|---|
-| up to three positionals: `[model]` `[host]` `[port]` or `host:port` | Optional model, then bind (config defaults `127.0.0.1` and `11435`). **No authentication and no TLS** — `0.0.0.0` exposes the API on every interface; do that only on a trusted/firewalled network or behind an **authenticated TLS-terminating reverse proxy**. |
+| up to three positionals: `[model]` `[host]` `[port]` or `host:port` | Optional model, then bind (config defaults `127.0.0.1` and `11435`). **No TLS; authentication is optional** (`--api-key-file`) — `0.0.0.0` exposes the API on every interface; a key is recommended off loopback, and use only a trusted/firewalled network or a **TLS-terminating reverse proxy**. |
+| `--api-key-file <absolute-path>` | Optional UTF-8 bearer key file (overrides `serve.api_key_file`); see [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies). |
 | `--model <tag>` | Model tag/path to pre-warm for this process. |
 | `-d`, `--detach`, `--background` | Background; log `~/.hipfire/serve.log`, pid `~/.hipfire/serve.pid`. |
 | `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |

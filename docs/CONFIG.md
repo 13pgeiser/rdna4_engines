@@ -1728,14 +1728,16 @@ misspelled key is unknown and fails the load with
 
 ## Serve bearer credential file
 
-`serve.api_key_file` is a process-scoped string, empty/unset by default.
-Set an absolute path, never the secret itself. `hipfire serve --api-key-file`
-overrides it for that process; `HIPFIRE_SERVE_API_KEY_FILE` is the environment
-override. CLI/TUI local HTTP calls load the same configured credential.
+`serve.api_key_file` is an optional process-scoped string, empty/unset by default
+(no authentication). Set an absolute path, never the secret itself.
+`hipfire serve --api-key-file` overrides it for that process;
+`HIPFIRE_SERVE_API_KEY_FILE` is the environment override. CLI/TUI local HTTP
+calls load the same configured credential.
 The file must be UTF-8 with at least 32 bytes after trimming trailing whitespace;
 Unix group/other permissions are refused (`chmod 600`). Windows ACLs are not
-checked yet. Non-loopback binds require a key, and remote bearer traffic
-requires an HTTPS proxy for confidentiality. See [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies).
+checked yet, and Windows never auto-generates a key. A key is recommended, not
+required, on a non-loopback bind, and remote bearer traffic requires an HTTPS
+proxy for confidentiality. See [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies).
 
 ## Related
 

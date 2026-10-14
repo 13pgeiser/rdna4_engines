@@ -868,7 +868,7 @@ pub(crate) struct ServeArgs {
     open: bool,
     /// Absolute path of a file holding the bearer token clients must present
     /// (`Authorization: Bearer <token>`); overrides `serve.api_key_file`.
-    /// Required to bind a non-loopback address.
+    /// Optional; recommended when binding a non-loopback address.
     #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = crate::serve::parse_api_key_file_arg)]
     api_key_file: Option<PathBuf>,
     /// Internal marker used by the detached child.

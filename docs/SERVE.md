@@ -22,11 +22,15 @@ implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATI
 
 ## Security (bearer authentication and HTTPS proxies)
 
-Loopback without a key retains the local unauthenticated API. Binding any
-non-loopback address requires a key file; otherwise serve refuses to start.
-Configure `serve.api_key_file` (or `HIPFIRE_SERVE_API_KEY_FILE`), or pass
-`--api-key-file <absolute-path>`. Only the path is stored in configuration.
-Local CLI/TUI clients read the configured file automatically.
+The API key is **optional**. Without one, every route is unauthenticated
+(including on a non-loopback bind, where serve starts and prints one line
+recommending a key); anyone who can reach the bind address can call every
+endpoint, including chat completions. A key is **recommended** whenever you
+bind a non-loopback address. Configure `serve.api_key_file` (or
+`HIPFIRE_SERVE_API_KEY_FILE`), or pass `--api-key-file <absolute-path>`. Only
+the path is stored in configuration. Local CLI/TUI clients read the configured
+file automatically. Native Windows does not generate a key for you: create the
+file yourself.
 
 The UTF-8 file must contain at least 32 bytes after trimming trailing whitespace.
 On Unix, group/other permissions are refused: use `chmod 600`. Windows ACLs are
@@ -37,7 +41,7 @@ For example, create a private random token and persist its **path**, not its con
 umask 077
 openssl rand -hex 32 > "$HOME/.hipfire/api-key"
 hipfire config set serve.api_key_file "$HOME/.hipfire/api-key"
-hipfire serve 127.0.0.1:11435
+hipfire serve 127.0.0.1:11435        # key from serve.api_key_file
 ```
 
 With a key configured, every route requires `Authorization: Bearer <key>`,
@@ -49,9 +53,10 @@ The existing instance token identifies a process; it is not the API credential.
 Authentication runs before routing or request-body reads, including UI assets
 and `OPTIONS` requests. A 401 has an empty body and `WWW-Authenticate: Bearer`.
 The embedded UI cannot supply credentials and therefore receives 401 when a
-key is configured; browser pairing is not implemented. Existing successful
-responses retain permissive CORS (`Access-Control-Allow-Origin: *`), but
-unauthenticated preflight is refused. Native clients do not need CORS.
+key is configured; browser pairing is not implemented. Without a key it works
+unchanged. Existing successful responses retain permissive CORS
+(`Access-Control-Allow-Origin: *`), but an unauthenticated preflight is
+refused when a key is configured. Native clients do not need CORS.
 
 Serve itself has **no TLS**. A bearer on plaintext HTTP can be intercepted.
 Use loopback behind verified HTTPS for remote access; never publish the raw
@@ -60,7 +65,7 @@ port to the internet. Clients support `http://` and verified `https://` URLs
 
 ### Tailscale Serve (tailnet-only HTTPS)
 
-Keep the backend bound to loopback with bearer authentication enabled:
+Keep the backend bound to loopback, with bearer authentication enabled (recommended):
 
 ```bash
 hipfire serve 127.0.0.1:11435 --api-key-file "$HOME/.hipfire/api-key"
@@ -81,7 +86,7 @@ hipfire serve                         # foreground; Ctrl-C stops (default bind 1
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
-hipfire serve 0.0.0.0:11435 --api-key-file /absolute/private/key -d # requires key; see Security
+hipfire serve 0.0.0.0:11435 --api-key-file /absolute/private/key -d # key recommended on a non-loopback bind; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
@@ -297,9 +302,9 @@ redirects to `/ui` only while the UI is enabled.
 
 The UI talks to the same `/v1/chat/completions` gateway as any other
 client and keeps chat history in the browser's IndexedDB — serve stores
-nothing on its behalf. It cannot send a bearer token: on a loopback serve
-without `serve.api_key_file` it works as before, and on a keyed serve
-(required for any non-loopback bind) its assets and requests receive 401
+nothing on its behalf. It cannot send a bearer token: without
+`serve.api_key_file` it works as before (on loopback or any other bind), and on
+a keyed serve its assets and requests receive 401
 (see [Security](#security-bearer-authentication-and-https-proxies)).
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
