@@ -189,25 +189,11 @@ __device__ __forceinline__ void fp8moe_grouped_body(
     unsigned short scc[D][NSUB], scn[D][NSUB];
     uint4 xc[D], xn[D];
 
-    auto load_group = [&](int kb0, uint4 (&w)[D][NSUB][2], unsigned short (&sv)[D][NSUB], uint4 (&xv)[D]) {
+    auto load_x_group = [&](int kb0, uint4 (&xv)[D]) {
 #pragma unroll
         for (int d = 0; d < D; ++d) {
             const int kb = kb0 + d;
             if (kb < nkb) {
-#pragma unroll
-                for (int j = 0; j < NSUB; ++j) {
-                    const unsigned char* wp = wrow[j] + kb * 128;
-                    if constexpr (REFERENCE) {
-                        w[d][j][0] = uint4{*reinterpret_cast<const unsigned*>(wp), *reinterpret_cast<const unsigned*>(wp + 16),
-                                           *reinterpret_cast<const unsigned*>(wp + 32), *reinterpret_cast<const unsigned*>(wp + 48)};
-                        w[d][j][1] = uint4{*reinterpret_cast<const unsigned*>(wp + 64), *reinterpret_cast<const unsigned*>(wp + 80),
-                                           *reinterpret_cast<const unsigned*>(wp + 96), *reinterpret_cast<const unsigned*>(wp + 112)};
-                    } else {
-                        w[d][j][0] = fp8moe_transpose(*reinterpret_cast<const uint4*>(wp), s);
-                        w[d][j][1] = fp8moe_transpose(*reinterpret_cast<const uint4*>(wp + 64), s);
-                    }
-                    sv[d][j] = srow[j][kb];
-                }
                 if (xrow >= 0) {
                     const long long off = xrow * K + kb * 128 + st_k;
                     if constexpr (XBF16) {
@@ -225,7 +211,32 @@ __device__ __forceinline__ void fp8moe_grouped_body(
         }
     };
 
-    load_group(0, wc, scc, xc);
+    // Production keeps W raw (contiguous uint4); transpose happens at consumption.
+    auto load_w_group = [&](int kb0, uint4 (&w)[D][NSUB][2], unsigned short (&sv)[D][NSUB]) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int kb = kb0 + d;
+            if (kb < nkb) {
+#pragma unroll
+                for (int j = 0; j < NSUB; ++j) {
+                    const unsigned char* wp = wrow[j] + kb * 128;
+                    if constexpr (REFERENCE) {
+                        w[d][j][0] = uint4{*reinterpret_cast<const unsigned*>(wp), *reinterpret_cast<const unsigned*>(wp + 16),
+                                           *reinterpret_cast<const unsigned*>(wp + 32), *reinterpret_cast<const unsigned*>(wp + 48)};
+                        w[d][j][1] = uint4{*reinterpret_cast<const unsigned*>(wp + 64), *reinterpret_cast<const unsigned*>(wp + 80),
+                                           *reinterpret_cast<const unsigned*>(wp + 96), *reinterpret_cast<const unsigned*>(wp + 112)};
+                    } else {
+                        w[d][j][0] = *reinterpret_cast<const uint4*>(wp);
+                        w[d][j][1] = *reinterpret_cast<const uint4*>(wp + 64);
+                    }
+                    sv[d][j] = srow[j][kb];
+                }
+            }
+        }
+    };
+
+    load_x_group(0, xc);
+    load_w_group(0, wc, scc);
     for (int kb0 = 0; kb0 < nkb; kb0 += D) {
         __syncthreads();
 #pragma unroll
@@ -233,7 +244,10 @@ __device__ __forceinline__ void fp8moe_grouped_body(
             if (kb0 + d < nkb) *reinterpret_cast<uint4*>(&xl[d][st_slot][st_k / 2]) = xc[d];
         }
         __syncthreads();
-        if (kb0 + D < nkb) load_group(kb0 + D, wn, scn, xn);
+        if (kb0 + D < nkb) {
+            load_x_group(kb0 + D, xn);
+            load_w_group(kb0 + D, wn, scn);
+        }
 #pragma unroll
         for (int d = 0; d < D; ++d) {
             if (kb0 + d < nkb) {
@@ -247,7 +261,12 @@ __device__ __forceinline__ void fp8moe_grouped_body(
 #pragma unroll
                     for (int j = 0; j < NSUB; ++j) {
                         const float s2 = fp8moe_scale2(scc[d][j]);
-                        const uint4 w = wc[d][j][h];
+                        uint4 w;
+                        if constexpr (REFERENCE) {
+                            w = wc[d][j][h];
+                        } else {
+                            w = fp8moe_transpose(wc[d][j][h], s);
+                        }
                         unsigned a0, a1;
                         fp8moe_decode4(w.x, s2, a0, a1);
                         acc[j] = fp8moe_mfma(a0, a1, b0x, b0y, acc[j]);
