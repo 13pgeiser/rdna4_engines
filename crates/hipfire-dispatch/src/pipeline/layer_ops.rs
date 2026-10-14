@@ -1912,17 +1912,27 @@ impl GatedDeltaNetOp<'_> {
     }
 }
 
+/// Whether the GDN mixer takes the batched persistent k4 route for `rows`.
+/// gfx942 takes it at one row too (decode): its persistent recurrence is
+/// pinned to the sequential kernel's arithmetic and the batched convolution,
+/// gate parameters and gate compute each row as the per-row kernels do, so a
+/// decode row is bitwise the per-row route's, and the step runs as one
+/// launch over all value heads instead of the sequential kernel.
+fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
+    gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
+        && (gpu.route_rows(rows) > 1 || gpu.arch_caps.is_gfx942())
+        && op.key_dim == 128
+        && op.value_dim == 128
+        && op.conv_kernel == 4
+}
+
 /// Whether the native GDN mixer stores `op`'s qkv projection as BF16 (the
 /// chunked batched route with a BF16-storing MQ6/MQ4 GEMM), i.e. the dtype of
 /// `op.projection` that [`execute_gated_delta_net`] writes and its convolution
 /// reads. Exported so producers outside the dispatch (the NPU trunk twin) write
 /// the same layout instead of re-deriving it.
 pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
-    let persistent_batch = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
-        && gpu.route_rows(op.rows) > 1
-        && op.key_dim == 128
-        && op.value_dim == 128
-        && op.conv_kernel == 4;
+    let persistent_batch = gdn_persistent_batch(gpu, op, op.rows);
     let dims = GatedDeltaStepBatched {
         projection: op.projection2,
         gate: op.gate,
@@ -2274,11 +2284,7 @@ fn execute_gated_delta_net_hc_impl(
     let mut beta = view(op.beta, 0, rows * op.value_heads);
     let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
-        && gpu.route_rows(rows) > 1
-        && op.key_dim == 128
-        && op.value_dim == 128
-        && op.conv_kernel == 4;
+    let persistent_batch = gdn_persistent_batch(gpu, op, rows);
     if arenas.is_some() && (!persistent_batch || op.row_capture.is_some()) {
         return Err(DispatchError::Hip("GDN trunk arena needs batched k4 without row capture".into()));
     }

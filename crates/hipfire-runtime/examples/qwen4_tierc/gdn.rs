@@ -8,12 +8,13 @@
 //!
 //! Route of record on gfx942 (census: `local://census-gdn.md`):
 //! `execute_gated_delta_net_hc_impl` (`hipfire-dispatch/src/pipeline/layer_ops.rs`)
-//! takes `persistent_batch = has_qwen4_parallel_qsa_gdn() && route_rows(rows) >
-//! 1 && 128x128 heads && conv kernel 4` (`has_gfx11_plus_simt() ||
-//! is_gfx942()`). Decode (one row, outside the prefill scope) runs the per-row
-//! chain `gated_delta_conv_params` -> `gated_delta_step_gated` (unfused on
-//! gfx942: `gated_delta_step` + `gated_delta_gate`): cases 1-4. Autoregressive
-//! prefill (the scope pins `route_rows` to 8192, even for one row) now runs
+//! takes `persistent_batch` (`gdn_persistent_batch`: `has_qwen4_parallel_qsa_gdn()
+//! && (route_rows(rows) > 1 || is_gfx942()) && 128x128 heads && conv kernel 4`,
+//! `has_qwen4_parallel_qsa_gdn() = has_gfx11_plus_simt() || is_gfx942()`). On
+//! gfx942 every GDN step takes it, decode's one row included, so the per-row
+//! chain `gated_delta_conv_params` -> `gated_delta_step_gated` (unfused:
+//! `gated_delta_step` + `gated_delta_gate`; cases 1-4) is the reference the
+//! batched route must equal, no longer a gfx942 route. Prefill and decode run
 //! `gated_delta_conv_params_batched` -> `gated_delta_step_batched` (the F32
 //! persistent256 recurrence) -> `gated_delta_gate_batched`: cases 5-7. Only
 //! that F32 persistent route is covered here: native gfx942 MTP verify / row
