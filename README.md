@@ -59,15 +59,17 @@ For one-shot inference:
 hipfire run qwen3.8:27b-mq4-xts "What is the capital of France?"
 ```
 
-Qwen3.8 Flash-Next is a MoE model with about 125 GB of base weights plus
-sidecars:
+Qwen3.8-Flash (`qwen3.8:flash-next`) is a MoE model with about 125 GB
+(116.7 GiB) of base weights plus sidecars. Its pinned artifact is
+`qwen3.8-flash-next.mq4-xts` (formerly `qwen3.8-flash-next-gptq3.mq4`, same
+bytes):
 
 ```bash
 hipfire pull qwen3.8:flash-next
 hipfire serve qwen3.8:flash-next -d
 ```
 
-A 32 GB card alone is not enough for Flash-Next. It needs a 128 GB Strix Halo
+A 32 GB card alone is not enough for Qwen3.8-Flash. It needs a 128 GB Strix Halo
 system, or an R9700 with enough host RAM for the mapped experts, or two
 R9700s (EP2). Native context is 262K tokens, subject to available memory.
 
@@ -98,38 +100,42 @@ effort. See [docs/SERVE.md](docs/SERVE.md).
 
 ## What's new in 0.4.2
 
-Every figure below comes from the [CHANGELOG](CHANGELOG.md) Unreleased
-(0.4.2) entry that introduced the feature. That entry gives the full fixture,
-the method and the kill switch. Each figure is a measurement on one fixture,
-not a general throughput claim.
+The chart compares the 0.4.1 Strix Halo release-matrix cells published on
+[hipfire.dev](https://hipfire.dev/benchmarks/0.4.1) (measured 2026-10-07)
+with the same lane rerun on v0.4.2 (2026-10-14): same artifact, host and
+method. The 16K NPU bar is new in 0.4.2 and comes from the release
+measurement of the shipped tip. Every figure in the list below comes from
+the [CHANGELOG](CHANGELOG.md) 0.4.2 entry that introduced the feature, which
+gives the full fixture, the method and the kill switch. Each figure is a
+measurement on one fixture, not a general throughput claim.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/gains-042-dark.svg" />
-  <img alt="hipfire 0.4.2 measured before and after: Strix Halo 27B DFlash decode, 27B DFlash-default prefill, Flash-Next NPU TTFT, EP2 prefill" src="docs/assets/readme/gains-042-light.svg" width="880" />
+  <img alt="hipfire 0.4.1 vs 0.4.2 on Strix Halo, Qwen3.8-Flash: synthetic 8K and 32K cold prefill, greedy AR, greedy MTP and sampled MTP decode, and the new 16K NPU prefill" src="docs/assets/readme/gains-042-light.svg" width="880" />
 </picture>
 
-- **Flash-Next EP2.** Owner-routed prefill and long-prefill expert staging
+- **Qwen3.8-Flash EP2.** Owner-routed prefill and long-prefill expert staging
   are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
   expert ownership and native MTP also run under EP. EP4 owner-routed
   prefill is still refused at admission.
-  *Measured on 2x R9700 (gfx1201), pinned Flash-Next XTS, committed prompts,
+  *Measured on 2x R9700 (gfx1201), pinned Qwen3.8-Flash XTS, committed prompts,
   2026-10-13: prefill went from 3,033 to 3,943 tok/s at 8K (1.30x) and from
   3,754 to 4,308 tok/s at 16K (1.15x), one card vs EP2.* See
   [multi-GPU serving](docs/multi-gpu.md).
-- **Flash-Next NPU prefill route on Strix Halo.** `fusions.npu_trunk = "auto"`
+- **Qwen3.8-Flash NPU prefill route on Strix Halo.** `fusions.npu_trunk = "auto"`
   runs the pipelined trunk input projections on the XDNA2 NPU. It needs
   exact gfx1151, an open NPU and a matching calibration. Any other system
   runs GPU-only. `HIPFIRE_QWEN4_NPU_TRUNK=off` disables it.
-  *Measured on gfx1151 + XDNA2, pinned Flash-Next XTS, 16K-token prompt,
+  *Measured on gfx1151 + XDNA2, pinned Qwen3.8-Flash XTS, 16K-token prompt,
   2026-10-13: TTFT went from 7,878 ms to 7,085 ms (−10.1%).*
 - **Engine-level YaRN.** The engine now reads YaRN RoPE scaling from the
   checkpoint. `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR` overrides it,
-  which lets Flash-Next run past its native 262,144-token context.
-  *Measured on gfx1151, Flash-Next GPTQ3 MQ4, `yarn_factor = 4`,
+  which lets Qwen3.8-Flash run past its native 262,144-token context.
+  *Measured on gfx1151, Qwen3.8-Flash GPTQ3 MQ4, `yarn_factor = 4`,
   2026-10-13: a needle placed in a 499,207-token prompt was retrieved at
   10% and at 90% depth.*
 - **Halo sidecars (zab and PLE).** On gfx1151, `hipfire pull` fetches the
-  Flash-Next zab trunk-A4 overlay, verifies it and applies it by default.
+  Qwen3.8-Flash zab trunk-A4 overlay, verifies it and applies it by default.
   The q4 PLE sidecar is also on by default there when present.
   `hipfire ple rebind` reuses a q4 PLE payload after the base is repacked.
   See [configuration](docs/CONFIG.md#qwen4-trunk-overlay-sidecar).
@@ -146,12 +152,12 @@ not a general throughput claim.
   3,809 to 4,921 tok/s (+29%).* See the
   [paired DFlash default](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
 - **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolves to 4 for
-  native Flash-Next MTP on gfx1151 and to 3 everywhere else.
-  *Measured on gfx1151, pinned Flash-Next XTS, code prompts (Rust/Go/Java),
+  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else.
+  *Measured on gfx1151, pinned Qwen3.8-Flash XTS, code prompts (Rust/Go/Java),
   2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).*
 - **Also in 0.4.2:**
   - a faster Qwen35 MTP prompt fill
-  - gfx1201 batched MTP fill for Flash-Next
+  - gfx1201 batched MTP fill for Qwen3.8-Flash
   - device-side sampled DFlash acceptance
   - continuous-batching sampled-lane batching on gfx1201
   - certified PeaceMaker kernels for CPU-AR sampling
@@ -174,7 +180,7 @@ The bundled registry (`registry/v1.json`) contains 90 curated entries
 | Family | Pull tags |
 |---|---|
 | Qwen 3.8 dense | `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-xts` (flagship), `-mq4-xt`, `-mq4-pro`; MQ3, MQ5 and MQ6 `-xt` / base / `-pro` tiers; drafts `qwen3.8:27b-draft-mq3` … `-mq6` |
-| Qwen 3.8 Flash-Next | `qwen3.8:flash-next` (MQ4 XTS) |
+| Qwen 3.8 Flash | `qwen3.8:flash-next` (alias `qwen3.8:flash`; MQ4 XTS) |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq5`, `-mq6` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, drafts `qwen3.6:27b-draft`, `-draft-mq3` |
 | Qwen 3.5 dense | `qwen3.5:0.8b`, `2b`, `4b`, `9b`, `27b`, with `-mq3` / `-mq6` variants and `9b` / `27b` drafts |
@@ -265,7 +271,7 @@ twins for exactness tests, not as runtime fallbacks. Examples from the
 
 - sampled DFlash device acceptance on gfx1201
 - CPU-AR sampled target rows and ordered acceptance on gfx1151 and gfx1201
-- Flash-Next EP owner assignment on gfx1201
+- Qwen3.8-Flash EP owner assignment on gfx1201
 - the gfx1151 MTP prompt-fill projections
 
 The Strix Halo NPU prefill route builds its programs with `peacemaker-npu`.
@@ -289,10 +295,10 @@ notice (see `scripts/mirror_split.py`).
 Linux with ROCm 6 or newer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/install.sh | bash
 
 # Or install the integration branch for testing:
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/install.sh \
   | bash -s -- --branch beta
 ```
 
@@ -308,7 +314,7 @@ and the daemon. To switch revisions, use `hipfire update @beta`,
 uninstall while keeping models and settings:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.2/scripts/uninstall.sh | bash
 ```
 
 `--dry-run` previews the uninstall. `--purge` also deletes `~/.hipfire` and
