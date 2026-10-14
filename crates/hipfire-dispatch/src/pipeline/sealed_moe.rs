@@ -1015,22 +1015,30 @@ impl ExpertTable {
 struct LiveTensorIdentity {
     ptr: usize,
     byte_capacity: usize,
+    /// Allocation bytes past the tensor's logical shape (see
+    /// [`dtype_tag_tail_bytes`]); zero for every other resource.
+    tail: usize,
     shape: Box<[usize]>,
     dtype: DType,
 }
 
 impl LiveTensorIdentity {
     fn capture(tensor: &GpuTensor, name: &str) -> Result<Self, DispatchError> {
+        Self::capture_with_tail(tensor, name, 0)
+    }
+
+    fn capture_with_tail(tensor: &GpuTensor, name: &str, tail: usize) -> Result<Self, DispatchError> {
         let tensor_bytes = tensor_capacity_bytes(tensor)?;
         let byte_capacity = tensor.buf.size();
-        if byte_capacity != tensor_bytes {
+        if byte_capacity != tensor_bytes + tail {
             return Err(invalid(format!(
-                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes}"
+                "{name} buffer capacity {byte_capacity} does not equal tensor capacity {tensor_bytes} + tail {tail}"
             )));
         }
         Ok(Self {
             ptr: tensor.buf.as_ptr() as usize,
             byte_capacity,
+            tail,
             shape: tensor.shape.clone().into_boxed_slice(),
             dtype: tensor.dtype,
         })
@@ -1051,7 +1059,7 @@ impl LiveTensorIdentity {
         if self.ptr != tensor.buf.as_ptr() as usize {
             return Err(invalid(format!("{name} live buffer identity differs")));
         }
-        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes {
+        if self.byte_capacity != byte_capacity || byte_capacity != tensor_bytes + self.tail {
             return Err(invalid(format!(
                 "{name} live buffer capacity {byte_capacity} differs from bound {}",
                 self.byte_capacity
@@ -3786,8 +3794,9 @@ fn build_live_binding(
     let down_awq_identity = down_awq_ptrs
         .map(|table| LiveTensorIdentity::capture(table, "live down AWQ"))
         .transpose()?;
+    let dtype_tag_tail = dtype_tag_tail_bytes(table)?;
     let dtype_tag_identity = dtype_tags
-        .map(|table| LiveTensorIdentity::capture(table, "live dtype tags"))
+        .map(|tags| LiveTensorIdentity::capture_with_tail(tags, "live dtype tags", dtype_tag_tail))
         .transpose()?;
 
     let mut live_experts = Vec::with_capacity(n_experts);
@@ -4219,6 +4228,24 @@ fn resource_dims(
         )));
     }
     Ok((resource.shape()[0], resource.shape()[1]))
+}
+
+/// Extra allocation bytes behind the logical u8 tag table of a mixed layer
+/// that carries a slab codec: the i32 owner table of the codec-masked tile
+/// ids (`slab_route::codec_i32`) rides after the one-byte-per-expert table in
+/// the same allocation. Every other tag table has no tail.
+fn dtype_tag_tail_bytes(table: &ExpertTable) -> Result<usize, DispatchError> {
+    if !table_has_mixed_dtypes(table)? {
+        return Ok(0);
+    }
+    let slab = table.experts().iter().any(|metadata| {
+        let resources = metadata.resources();
+        resources
+            .gate_up()
+            .or_else(|| resources.gate())
+            .is_some_and(|resource| resource.dtype() == DType::MQ3I4G128R256)
+    });
+    Ok(if slab { 4 * table.n_experts() } else { 0 })
 }
 
 fn table_has_mixed_dtypes(table: &ExpertTable) -> Result<bool, DispatchError> {
@@ -5110,6 +5137,54 @@ mod tests {
         assert!(validate_dtype_tag_table(Some(&tags), 3, false).is_err());
         let short_tags = live_tensor(0xa0_1000, 2, &[2], DType::Raw);
         assert!(validate_dtype_tag_table(Some(&short_tags), 3, true).is_err());
+    }
+
+    #[test]
+    fn slab_mixed_tag_allocation_carries_the_i32_owner_table_behind_the_u8_table() {
+        // Regression: the first real-artifact forward refused the 2560 B tag
+        // allocation (u8 table + i32 owner table) against its 512 B logical shape.
+        let expert = |index: usize, gate: DType, down: DType| {
+            ExpertMetadata::new(
+                index,
+                0,
+                index,
+                ExpertResources::fused(
+                    resource(&format!("gu{index}"), gate, &[8, 256]),
+                    resource(&format!("dn{index}"), down, &[4, 256]),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let slab = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&slab).unwrap(), 4 * 2);
+        // A uniform slab layer (no tag table) and a legacy mixed layer have no tail.
+        let uniform = ExpertTable::new(vec![
+            expert(0, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            expert(1, DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&uniform).unwrap(), 0);
+        let legacy = ExpertTable::new(vec![
+            expert(0, DType::MQ4G256V2, DType::MQ4G128V2),
+            expert(1, DType::MQ6G256, DType::MQ6G256),
+        ])
+        .unwrap();
+        assert_eq!(dtype_tag_tail_bytes(&legacy).unwrap(), 0);
+
+        // Allocation 2 + 8 bytes behind a [2] u8 logical table.
+        let tags = live_tensor(0xb0_0000, 2 + 8, &[2], DType::Raw);
+        validate_dtype_tag_table(Some(&tags), 2, true).unwrap();
+        assert!(LiveTensorIdentity::capture(&tags, "tags").is_err());
+        let bound = LiveTensorIdentity::capture_with_tail(&tags, "tags", 8).unwrap();
+        bound.matches(&tags, "tags").unwrap();
+        assert!(bound.matches(&live_tensor(0xb0_0000, 2, &[2], DType::Raw), "tags").is_err());
+        assert!(bound.matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags").is_err());
+        assert!(LiveTensorIdentity::capture_with_tail(&tags, "tags", 4).is_err());
     }
 
     #[test]
