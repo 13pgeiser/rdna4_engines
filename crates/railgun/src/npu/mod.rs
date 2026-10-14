@@ -29,6 +29,7 @@ mod sys {
         pub fn ioctl(fd: i32, request: u64, arg: *mut c_void) -> i32;
         pub fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn lseek(fd: i32, off: i64, whence: i32) -> i64;
         pub fn __errno_location() -> *mut i32;
         pub fn clock_gettime(clock_id: i32, tp: *mut [i64; 2]) -> i32;
@@ -47,6 +48,7 @@ mod sys {
     pub const MAP_FIXED: i32 = 0x10;
     pub const MAP_ANON: i32 = 0x20;
     pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+    pub const MADV_HUGEPAGE: i32 = 14;
     pub const CLOCK_MONOTONIC: i32 = 1;
     pub const RLIMIT_MEMLOCK: i32 = 8;
 }

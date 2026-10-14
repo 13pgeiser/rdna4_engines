@@ -115,13 +115,30 @@ pub fn monotonic_ns() -> u64 {
 }
 
 struct Pages { ptr: *mut u8, len: usize }
+/// Transparent-huge-page size on x86_64.
+const HUGE: usize = 2 << 20;
 impl Pages {
+    /// Arenas of at least one huge page start on a 2 MiB boundary and are `MADV_HUGEPAGE` before first touch, so
+    /// under `transparent_hugepage=madvise` their full 2 MiB extents fault as THPs: fewer IOMMU (SVA) and GPUVM
+    /// translations for the NPU DMA and the GPU arena reads. The length stays 4 KiB-rounded (the tail is 4 KiB
+    /// pages), so pinned_vm / RLIMIT_MEMLOCK accounting is unchanged; the driver pins THP subpages like any page.
     fn new(bytes: usize) -> Result<Self, String> {
+        use super::sys::{madvise, mmap, munmap, MADV_HUGEPAGE, MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_RW};
         let len = bytes.div_ceil(4096) * 4096;
-        let ptr = unsafe { super::sys::mmap(core::ptr::null_mut(), len, super::sys::PROT_RW,
-            super::sys::MAP_PRIVATE | super::sys::MAP_ANON, -1, 0) };
-        if ptr == super::sys::MAP_FAILED { return Err(format!("trunk mmap: errno {}", super::errno())); }
-        Ok(Self { ptr: ptr.cast(), len })
+        let span = if len >= HUGE { len + HUGE } else { len };
+        let raw = unsafe { mmap(core::ptr::null_mut(), span, PROT_RW, MAP_PRIVATE | MAP_ANON, -1, 0) };
+        if raw == MAP_FAILED { return Err(format!("trunk mmap: errno {}", super::errno())); }
+        if span == len { return Ok(Self { ptr: raw.cast(), len }); }
+        let base = raw as usize;
+        let start = base.next_multiple_of(HUGE);
+        let end = start + len;
+        unsafe {
+            if start > base { munmap(raw, start - base); }
+            if base + span > end { munmap(end as *mut _, base + span - end); }
+            // A hint: without THP support the arena keeps 4 KiB pages, which is today's layout.
+            madvise(start as *mut _, len, MADV_HUGEPAGE);
+        }
+        Ok(Self { ptr: start as *mut u8, len })
     }
 }
 impl Drop for Pages { fn drop(&mut self) { unsafe { super::sys::munmap(self.ptr.cast(), self.len); } } }
