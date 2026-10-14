@@ -10,6 +10,15 @@
 //! learned projections consume the resident tensor supplied by the assembled
 //! bundle; MQv2 projections are rotated and dispatched through their native
 //! qt44/qt53 kernels, while recurrent/cache state remains resident on the GPU.
+//!
+//! MoE routing has two sealed families.  QT44/QT53 layers seal the indexed
+//! decode route for one routing row and the grouped prefill route above it.
+//! The stock-FP8 recipe's layers (gfx942) bind the qt=55 `FP8E4M3B128` expert
+//! blocks of the loader's immutable accessor tables into the same expert
+//! runtime ([`Qwen4MoeLayerRuntime`]: per-expert natural-basis `WeightRef`s,
+//! contiguous base, block stride) and declare
+//! [`MoeRouteCapability::Fp8B128Grouped`], which always seals the grouped
+//! prefill route, one row included (`program::seal_moe_for_layer`).
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
@@ -25,7 +34,8 @@ use crate::program::{
 };
 use crate::projection::{row_stride, ProjectionView};
 use crate::weights::{
-    HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights, Qwen4EpPlacement,
+    Fp8MoeExpertTables, HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights,
+    Qwen4EpPlacement,
     Qwen4FfnWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
 };
 use hipfire_dispatch::context::DispatchCtx;
@@ -34,7 +44,7 @@ use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeRouteCapability,
     MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy, MoeRowGather, MoeSharedDecode,
     MoeSharedDtypes, MoeSharedWeights, MoeStageTables, MoeTileExchange, MoeTileExchangeParams,
-    RoutedExpertWeights,
+    RoutedExpertWeights, MOE_GROUPED_BLOCK_M,
 };
 use hipfire_dispatch::pipeline::sealed_moe::{
     retained_body_action, specialized_sealed_moe_retained_admission, RetainedBodyAction,
@@ -539,20 +549,24 @@ pub(crate) fn dense_ref<'a>(
 /// The admitted Qwen4 grouped route is declared by this architecture
 /// constructor and consumed as data by shared sealing/lowering.  The shared
 /// expert's formats are those of the bound weights: BF16, or the Q8_0 decode
-/// copies (`Qwen4GpuForward::decode_q8`). `symmetric` (a prefill chunk over
-/// a layer whose expert headers were verified symmetric) declares the
-/// symmetric variant the opt-in IU4 arm requires.
+/// copies (`Qwen4GpuForward::decode_q8`). `capability` is the layer's
+/// declaration ([`Qwen4MoeLayerRuntime::route_capability`]): the QT44/QT53
+/// grouped route, its symmetric variant (a prefill chunk over a layer whose
+/// expert headers were verified symmetric, which the opt-in IU4 arm
+/// requires), or the gfx942 qt=55 [`MoeRouteCapability::Fp8B128Grouped`]
+/// route, whose routed gate_up and down formats are both `FP8E4M3B128`.
 fn qwen4_route_policy(
     config: &Qwen4Config,
     shared: &MoeSharedWeights<'_>,
-    symmetric: bool,
+    capability: MoeRouteCapability,
 ) -> MoeRoutePolicy {
+    let (routed_gate_up, routed_down) = if capability.is_fp8_grouped() {
+        (DType::FP8E4M3B128, DType::FP8E4M3B128)
+    } else {
+        (DType::MQ4G256V2, DType::MQ4G128V2)
+    };
     MoeRoutePolicy {
-        capability: if symmetric {
-            MoeRouteCapability::Qt44Qt53GroupedSymmetric
-        } else {
-            MoeRouteCapability::Qt44Qt53Grouped
-        },
+        capability,
         geometry: MoeRouteGeometry {
             experts: config.num_experts,
             top_k: config.num_experts_per_tok,
@@ -566,8 +580,8 @@ fn qwen4_route_policy(
             shared_gate: shared.gate.dtype,
             shared_up: shared.up.dtype,
             shared_down: shared.down.dtype,
-            routed_gate_up: DType::MQ4G256V2,
-            routed_down: DType::MQ4G128V2,
+            routed_gate_up,
+            routed_down,
         },
     }
 }
@@ -798,11 +812,7 @@ pub(crate) fn layer_desc<'a>(
                 down: copy(6, &moe.shared_down),
             };
             Qwen4FfnBinding::Moe(Qwen4MoeBinding {
-                route_policy: qwen4_route_policy(
-                    config,
-                    &shared,
-                    moe.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
-                ),
+                route_policy: qwen4_route_policy(config, &shared, moe.route_capability(rows)),
                 table: &moe.table,
                 cache: &moe.cache,
                 routed_experts: moe,
@@ -907,6 +917,12 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// [`MoeRouteCapability::Qt44Qt53GroupedSymmetric`]. False unless the
     /// opt-in route was requested.
     symmetric: bool,
+    /// The layer's routed experts are the stock-FP8 recipe's qt=55
+    /// `FP8E4M3B128` blocks (set by `build` from the immutable accessor
+    /// tables). Such a layer always declares
+    /// [`MoeRouteCapability::Fp8B128Grouped`], never runs the symmetric check
+    /// and is sealed as grouped prefill at every row count, one row included.
+    fp8: bool,
     /// Whether this rank's own (local) resident expert tensors of the layer
     /// are host-mapped: a layer-level property, so an EP rank reports the
     /// same residency single would, never that of a dummy or a peer view.
@@ -1627,7 +1643,130 @@ impl Qwen4ForwardEp {
     }
 }
 
+/// The stock-FP8 layer's two qt=55 expert tables, validated against the
+/// config's fixed expert geometry (`None` for every other recipe).  The
+/// tables come from the loader accessor, which already proved each is one
+/// fully resident, 256-byte-aligned `[E, rows, K]` buffer; only the
+/// single-device layout exists for them (the recipe refuses expert
+/// parallelism at load).
+fn fp8_expert_tables(
+    weights: &Qwen4Weights,
+    moe: &MoeWeights,
+    config: &Qwen4Config,
+    layout: &Qwen4ExpertTableLayout<'_>,
+    layer_label: usize,
+) -> Result<Option<Fp8MoeExpertTables>, Qwen4GpuForwardError> {
+    if !weights.manifest.identity.recipe.is_stock_fp8() {
+        return Ok(None);
+    }
+    if !matches!(layout, Qwen4ExpertTableLayout::Single) {
+        return Err(invalid(format!(
+            "layer {layer_label}: qt=55 FP8 experts bind only the single-device table"
+        )));
+    }
+    let tables = weights.fp8_moe_expert_tables(moe)?;
+    let (gate_up, down) = (tables.gate_up, tables.down);
+    if (gate_up.experts, gate_up.rows, gate_up.k)
+        != (config.num_experts, 2 * config.moe_intermediate_size, config.hidden_size)
+        || (down.experts, down.rows, down.k)
+            != (config.num_experts, config.hidden_size, config.moe_intermediate_size)
+    {
+        return Err(invalid(format!(
+            "layer {layer_label}: qt=55 expert tables [{}, {}, {}] / [{}, {}, {}] disagree with the \
+             config's [{}, {}, {}] / [{}, {}, {}]",
+            gate_up.experts,
+            gate_up.rows,
+            gate_up.k,
+            down.experts,
+            down.rows,
+            down.k,
+            config.num_experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size,
+            config.num_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+        )));
+    }
+    Ok(Some(tables))
+}
+
+/// The gfx942 qt=55 grouped route runs in the `Full` scratch plan's F32
+/// buffers, preallocated at construction (no per-call allocation, no
+/// dependence on WMMA): `G = grouped_rows` is the padded-16 slot bound of
+/// `max_chunk` rows, so the grouped gate_up output is `[G, 2*moe]` F32, the
+/// grouped down output `[G, hidden]` F32, `rot_batch` holds `slots * moe`
+/// F32, and the tile descriptor lives in `moe_gate_batch` (16 bytes per
+/// 16-row tile, `G` bytes). Refuses a plan that would not hold them (the
+/// compact gfx1201 plan, or a changed layout) before the first launch.
+fn check_fp8_grouped_scratch(
+    scratch: &Qwen4GpuForwardScratch,
+    config: &Qwen4Config,
+    max_chunk: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    if scratch.mode != Qwen4ForwardScratchMode::Full {
+        return Err(invalid("the qt=55 FP8 route needs the Full scratch plan"));
+    }
+    let layout = Qwen4ScratchLayout::for_rows(program_dims(config), max_chunk)
+        .map_err(|error| invalid(error.to_string()))?;
+    let f32_bytes = DType::F32.size();
+    let descriptor_bytes = layout.grouped_rows / MOE_GROUPED_BLOCK_M * 16;
+    for (name, tensor, need) in [
+        (
+            "grouped gate_up output",
+            &scratch.moe_y_gate_up_grouped,
+            scratch_mul(scratch_mul(layout.grouped_rows, 2 * config.moe_intermediate_size)?, f32_bytes)?,
+        ),
+        (
+            "grouped down output",
+            &scratch.moe_y_down_grouped,
+            scratch_mul(scratch_mul(layout.grouped_rows, config.hidden_size)?, f32_bytes)?,
+        ),
+        (
+            "rot_batch",
+            &scratch.moe_rot_batch,
+            scratch_mul(layout.routed_rows, f32_bytes)?,
+        ),
+        ("tile descriptor (gate_batch)", &scratch.moe_gate_batch, descriptor_bytes),
+        (
+            "sorted slot index",
+            &scratch.moe_sorted_slot_index,
+            scratch_mul(layout.grouped_rows, std::mem::size_of::<i32>())?,
+        ),
+    ] {
+        if tensor.buf.size() < need {
+            return Err(invalid(format!(
+                "qt=55 FP8 {name} scratch holds {} bytes, {max_chunk} rows need {need}",
+                tensor.buf.size()
+            )));
+        }
+    }
+    for (name, tensor) in [
+        ("grouped gate_up output", &scratch.moe_y_gate_up_grouped),
+        ("grouped down output", &scratch.moe_y_down_grouped),
+    ] {
+        if tensor.dtype != DType::F32 {
+            return Err(invalid(format!("qt=55 FP8 {name} must be F32, not {:?}", tensor.dtype)));
+        }
+    }
+    Ok(())
+}
+
 impl Qwen4MoeLayerRuntime {
+    /// The route this layer declares for a `rows`-row (routing rows) call: a
+    /// stock-FP8 layer is always [`MoeRouteCapability::Fp8B128Grouped`]; a
+    /// QT44/QT53 layer is the symmetric variant only once verified and the
+    /// chunk reaches the IU4 arm's row floor.
+    pub(crate) fn route_capability(&self, rows: usize) -> MoeRouteCapability {
+        if self.fp8 {
+            MoeRouteCapability::Fp8B128Grouped
+        } else if self.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS {
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric
+        } else {
+            MoeRouteCapability::Qt44Qt53Grouped
+        }
+    }
+
     /// Single-device runtime: the layer's resident tensors hold every expert.
     pub(crate) fn from_moe(
         gpu: &mut Gpu,
@@ -1743,8 +1882,24 @@ impl Qwen4MoeLayerRuntime {
         let gate_up_rows = 2 * config.moe_intermediate_size;
         let gate_up_row_stride = row_stride(gate_up_dtype, config.hidden_size);
         let down_row_stride = row_stride(down_dtype, config.moe_intermediate_size);
-        let gate_up_expert_bytes = checked_bytes(gate_up_rows, gate_up_row_stride)?;
-        let down_expert_bytes = checked_bytes(config.hidden_size, down_row_stride)?;
+        // Stock FP8: the loader accessor's immutable qt=55 tables. Expert `e`
+        // is the block at `base + e * stride` (codes, then its BF16 `s_inv`
+        // grid), so an expert's byte extent is the block stride, not rows *
+        // row_stride; the view's `row_stride` is the code row (`k`) and the
+        // block's pad and scale grid ride in its encoded bytes.
+        let fp8_tables = fp8_expert_tables(weights, moe, config, &layout, layer_label)?;
+        let (gate_up_expert_bytes, down_expert_bytes) = match &fp8_tables {
+            Some(tables) => (tables.gate_up.stride, tables.down.stride),
+            None => (
+                checked_bytes(gate_up_rows, gate_up_row_stride)?,
+                checked_bytes(config.hidden_size, down_row_stride)?,
+            ),
+        };
+        let resident_format = if fp8_tables.is_some() {
+            "qwen4-resident-fp8b128-v1"
+        } else {
+            "qwen4-resident-mqv2-v1"
+        };
         let source_experts = layout.local_experts(config.num_experts)?;
         let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
         let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
@@ -1796,19 +1951,34 @@ impl Qwen4MoeLayerRuntime {
             down_base: down_source.buf.as_ptr() as usize,
             down_bytes: down_source.buf.size(),
         };
-        let table_entries = qwen4_expert_table_entries(
-            &layout,
-            local,
-            config.num_experts,
-            gate_up_expert_bytes,
-            down_expert_bytes,
-        )
-        .map_err(|error| match error {
-            Qwen4GpuForwardError::Invalid(message) => {
-                invalid(format!("layer {layer_label}: {message}"))
-            }
-            other => other,
-        })?;
+        let table_entries: Vec<Qwen4ExpertEntry> = match &fp8_tables {
+            // The accessor's per-expert block addresses, in expert order: the
+            // same pointers the grouped launch reads and the views must name.
+            Some(tables) => tables
+                .gate_up
+                .block_entries()
+                .into_iter()
+                .zip(tables.down.block_entries())
+                .map(|(gate_up_ptr, down_ptr)| Qwen4ExpertEntry {
+                    origin: Qwen4ExpertOrigin::Local,
+                    gate_up_ptr,
+                    down_ptr,
+                })
+                .collect(),
+            None => qwen4_expert_table_entries(
+                &layout,
+                local,
+                config.num_experts,
+                gate_up_expert_bytes,
+                down_expert_bytes,
+            )
+            .map_err(|error| match error {
+                Qwen4GpuForwardError::Invalid(message) => {
+                    invalid(format!("layer {layer_label}: {message}"))
+                }
+                other => other,
+            })?,
+        };
         // Whole-tensor windows over each peer rank's compact experts; the
         // per-expert views below are cut from them. `qwen4_expert_table_entries`
         // proved every slot lies inside its window.
@@ -1879,7 +2049,7 @@ impl Qwen4MoeLayerRuntime {
 
             let gate_up_resource = ExpertResource::new(
                 gate_up_source_name,
-                "qwen4-resident-mqv2-v1",
+                resident_format,
                 vec![gate_up_rows, config.hidden_size],
                 gate_up_dtype,
                 gate_up_expert_bytes,
@@ -1892,7 +2062,7 @@ impl Qwen4MoeLayerRuntime {
             })?;
             let down_resource = ExpertResource::new(
                 down_source_name,
-                "qwen4-resident-mqv2-v1",
+                resident_format,
                 vec![config.hidden_size, config.moe_intermediate_size],
                 down_dtype,
                 down_expert_bytes,
@@ -1993,6 +2163,7 @@ impl Qwen4MoeLayerRuntime {
             expert_gate_up_entries: gate_entries,
             expert_down_entries: down_entries,
             symmetric: false,
+            fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
         })
     }
@@ -2005,6 +2176,12 @@ impl Qwen4MoeLayerRuntime {
         gpu: &mut Gpu,
         config: &Qwen4Config,
     ) -> Result<bool, Qwen4GpuForwardError> {
+        if self.fp8 {
+            // qt=55 blocks have no QT44/QT53 headers: nothing to check, and
+            // the layer can never declare the symmetric variant.
+            self.symmetric = false;
+            return Ok(false);
+        }
         let formats = self.experts.iter().all(|expert| {
             expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
         });
@@ -2626,8 +2803,11 @@ pub(crate) struct Qwen4MoeScratch<'a> {
     pub(crate) down_expanded: &'a GpuTensor,
 }
 
-/// Seal the one-row decode MoE of `runtime` for a caller's step list; the
-/// caller clears `output` with a preceding `Step::Clear`.
+/// Seal the one-row decode MoE of a QT44/QT53 `runtime` for a caller's step
+/// list (the MTP head); the caller clears `output` with a preceding
+/// `Step::Clear`. A stock-FP8 runtime has no indexed decode route (its decode
+/// is the grouped prefill route, sealed by `program::seal_moe_for_layer`) and
+/// is refused here.
 pub(crate) fn seal_moe_decode<'a>(
     ctx: &'a DispatchCtx,
     config: &Qwen4Config,
@@ -2638,6 +2818,12 @@ pub(crate) fn seal_moe_decode<'a>(
     scratch: Qwen4MoeScratch<'a>,
     row_gather: Option<&'a dyn MoeRowGather>,
 ) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
+    if runtime.fp8 {
+        return Err(invalid(
+            "qt=55 FP8 experts have no indexed decode route; seal them through \
+             program::seal_moe_for_layer (grouped prefill at every row count)",
+        ));
+    }
     let dtypes = MoeDtypes {
         router: runtime.router.dtype,
         shared: Some(MoeSharedDtypes {
@@ -2678,7 +2864,11 @@ pub(crate) fn seal_moe_decode<'a>(
             shared_after_combine: true,
         },
         // Single-token decode/MTP binding: never the symmetric IU4 prefill arm.
-        route_policy: Some(qwen4_route_policy(config, &shared, false)),
+        route_policy: Some(qwen4_route_policy(
+            config,
+            &shared,
+            MoeRouteCapability::Qt44Qt53Grouped,
+        )),
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: config.hidden_size,
@@ -3047,6 +3237,13 @@ impl Qwen4GpuForwardScratch {
     /// Every field of a `max_chunk`-row scratch in [`ScratchField`] order
     /// (allocation or borrowed view, with its dtype and element count), plus
     /// the host PLE staging bytes.
+    ///
+    /// `Full` buffers are F32 and sized for the padded-16 slot bound of
+    /// `max_chunk` rows with no WMMA dependence, which is the capacity the
+    /// gfx942 qt=55 FP8 route reads in place: sorted slots padded to 16, grouped
+    /// gate/up `[G, 2*moe]` and grouped down `[G, hidden]` F32, `rot_batch`
+    /// `[slots, moe]` F32 and, in `gate_batch`, the tile descriptor
+    /// (16 bytes per tile). `check_fp8_grouped_scratch` proves it at load.
     ///
     /// `Full` is one dedicated allocation per field.  `FnSymGfx1201` applies,
     /// on top of the same field list, with `n = max_chunk`, `c = min(n,
@@ -4261,7 +4458,22 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
-            if ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+            // Stock FP8: no QT44/QT53 headers to verify; the grouped route runs
+            // in the Full plan's preallocated F32 buffers, proved here once.
+            let stock_fp8 = bundle.weights.manifest.identity.recipe.is_stock_fp8();
+            if stock_fp8 && !moe.is_empty() {
+                check_fp8_grouped_scratch(&scratch, &bundle.config, max_chunk)?;
+                // The stable-scatter grouping scratch is reserved here, before any
+                // forward or capture, so no first decode/prefill grows it per call.
+                gpu.try_gfx942()
+                    .ok_or_else(|| invalid("the qt=55 FP8 route needs a gfx942 device"))?
+                    .reserve_fp8b128_moe_group(
+                        max_chunk,
+                        bundle.config.num_experts_per_tok,
+                        bundle.config.num_experts,
+                    )?;
+            }
+            if !stock_fp8 && ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
                 for layer in &mut moe {
                     verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
