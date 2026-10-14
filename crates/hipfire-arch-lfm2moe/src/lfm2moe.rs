@@ -1009,7 +1009,10 @@ impl Lfm2MoeWeights {
             // router/bias/norms) and, separately, its routed experts.
             let layer_target = memory_target(placement.layer(l));
             let expert_target = expert_memory_target(placement.experts(l));
-            if std::env::var("HIPFIRE_LFM2_LOAD_TRACE").is_ok_and(|v| v != "0") {
+            if hipfire_config::developer_var("HIPFIRE_LFM2_LOAD_TRACE")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+            {
                 let free_mib = gpu
                     .hip
                     .get_vram_info()
