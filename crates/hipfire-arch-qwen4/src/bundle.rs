@@ -2885,8 +2885,11 @@ impl Qwen4Bundle {
                     lane.host.status
                 ));
             }
-            if lane.spec.is_some() != bundle.mtp.is_some() {
-                return Err("promotion: the lane's MTP state does not match the bundle".to_string());
+            // An MTP lane needs the resident head to move in. An AR lane takes
+            // the trunk state only: a singleton that ran native MTP keeps its
+            // head resident, and the reset below clears it.
+            if lane.spec.is_some() && bundle.mtp.is_none() {
+                return Err("promotion: an MTP lane needs the resident MTP head".to_string());
             }
             if let Some(rows) = ring_rows {
                 if bundle.state.row_capture_rows() < rows {
