@@ -53,6 +53,10 @@ pub enum Step<'a> {
         k: usize,
         eps: f32,
         rotation: RotationPlan, // FwhtG256 for MQ dtypes, None for HFQ4/others
+        /// Row-major rows of width `k`. `1` is the single-row route (the
+        /// fusion table's producer); more rows take the batched kernels and
+        /// are a fusion barrier. A row norm is row-complete, never head-split.
+        rows: usize,
     },
     /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
     /// (derived once per attention step) and AttnParams (tensor borrows).
@@ -147,7 +151,8 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
     match step {
         Step::Gemv { .. } => Some(PipelineOp::Gemv),
         Step::GemvResidual { .. } => Some(PipelineOp::GemvResidual),
-        Step::RmsnormAutomatic { .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { rows: 1, .. } => Some(PipelineOp::RmsnormAutomatic),
+        Step::RmsnormAutomatic { .. } => None,
         Step::Attend { .. } => Some(PipelineOp::Attend),
         Step::Rope { .. } => Some(PipelineOp::Rope),
         Step::QkNorm { .. } => Some(PipelineOp::QkNorm),
@@ -795,6 +800,21 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::ParallelMoeMlp(op) => op.mlp.validate_for_gpu(gpu)?,
+            // One row keeps the single-row route's contract (`x` may be a wider
+            // buffer whose shape the kernel reads); a batch must hold its rows.
+            Step::RmsnormAutomatic { x, out, k, rows, .. } if *rows != 1 => {
+                let need = rows * k;
+                if *rows == 0 || x.numel() < need || out.numel() < need {
+                    return Err(DispatchError::Hip(format!(
+                        "rmsnorm: {rows} rows of {k} need {need} elements, x has {}, out {}",
+                        x.numel(),
+                        out.numel()
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -1621,8 +1641,16 @@ pub(crate) fn launch_op_rows(
             k,
             eps,
             rotation,
+            rows,
         } => {
-            if *rotation == RotationPlan::None {
+            if *rows > 1 && *rotation == RotationPlan::None {
+                gpu.rmsnorm_batched(x, norm_weight, out, *rows, *k, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else if *rows > 1 && *rotation == RotationPlan::Mq8Internal {
+                Err(DispatchError::Hip(
+                    "rmsnorm: MQ8 internal rotation is single-row only".into(),
+                ))
+            } else if *rotation == RotationPlan::None {
                 // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
                 // x_plain is not written in this path (scratch only for FWHT path).
                 gpu.rmsnorm_f32(x, norm_weight, out, *eps)
@@ -1652,7 +1680,7 @@ pub(crate) fn launch_op_rows(
                             awq_scale: *awq_scale,
                             k: *k,
                             eps: *eps,
-                            batch_size: 1,
+                            batch_size: *rows,
                             variant: RotationVariant::WithRmsnorm,
                             givens_pairs: None,
                             givens_theta: None,
@@ -2334,6 +2362,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2364,6 +2393,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,
@@ -2389,6 +2419,7 @@ mod tests {
                 k: 4096,
                 eps: 1e-6,
                 rotation: RotationPlan::FwhtG256,
+                rows: 1,
             },
             Step::Gemv {
                 w: wr,

@@ -59,6 +59,28 @@ pub use steps::{
     HcFusionCursor, MoeStepHooks, Step,
 };
 
+/// The rows an operation that serves both decode and batched rows runs.
+/// The route alone picks decode or batched kernels; `rows` is only the
+/// extent, so a one-row prefill chunk keeps its batched arithmetic.
+/// Operations whose batched chain needs route-only operands carry a per-op
+/// `XRoute::{Decode { .. }, Batched { .. }}` instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowsRoute {
+    /// One decode row.
+    Decode,
+    /// A prefill chunk.
+    Prefill,
+    /// A speculative-verify block.
+    Verify,
+}
+
+impl RowsRoute {
+    /// Whether the rows take the batched kernels.
+    pub fn batched(self) -> bool {
+        self != Self::Decode
+    }
+}
+
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
