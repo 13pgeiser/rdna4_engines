@@ -1037,7 +1037,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "c150ddb2cb0d30fea4a238637af57384391d0a8ffe0207962197cffb666541d9",
+      "sha256": "366af7dbc662ce1f3ad7985589a3d4275f9d11ddcfbcabae9bf9feafe4ec76bd",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",
