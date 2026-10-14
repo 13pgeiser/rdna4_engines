@@ -25,7 +25,10 @@ pub(crate) fn prepare_after_checks<D, C, T, E>(
 /// Auto refusals are GPU-only, including preparation/open errors: an ineligible model logs one plain
 /// `npu-trunk: off (<reason>)` line, a failure to arm a qualifying model logs it at WARN level. Forced
 /// modes fail, which fails the load.
-pub(crate) fn finish<T, E: std::fmt::Display>(mode: super::NpuTrunkMode, result: Result<Option<T>, Refusal<E>>) -> Result<Option<T>, E> {
+pub(crate) fn finish<T, E: std::fmt::Display>(
+    mode: super::NpuTrunkMode,
+    result: Result<Option<T>, Refusal<E>>,
+) -> Result<Option<T>, E> {
     let (failed, error) = match result {
         Ok(armed) => return Ok(armed),
         Err(Refusal::Ineligible(error)) => (false, error),
@@ -35,7 +38,9 @@ pub(crate) fn finish<T, E: std::fmt::Display>(mode: super::NpuTrunkMode, result:
         return Err(error);
     }
     let rendered = error.to_string();
-    let reason = rendered.split_once("npu-trunk: ").map_or(rendered.as_str(), |(_, reason)| reason);
+    let reason = rendered
+        .split_once("npu-trunk: ")
+        .map_or(rendered.as_str(), |(_, reason)| reason);
     eprintln!("{}", off_line(failed, reason));
     Ok(None)
 }
@@ -50,34 +55,56 @@ fn off_line(failed: bool, reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::NpuTrunkMode;
+    use super::*;
     use std::cell::RefCell;
     #[test]
     fn checks_precede_download_pack_alloc_and_open() {
         for failed in 0..=4 {
             let calls = RefCell::new(Vec::new());
-            let stage = |n| { calls.borrow_mut().push(n); if n == failed { Err("refused") } else { Ok(()) } };
-            let result = prepare_after_checks(|| stage(0), || stage(1), |_| stage(2), |_| {
-                stage(3)?; // download, pack and allocate only beyond the barrier
-                stage(4)  // runtime open
-            });
+            let stage = |n| {
+                calls.borrow_mut().push(n);
+                if n == failed {
+                    Err("refused")
+                } else {
+                    Ok(())
+                }
+            };
+            let result = prepare_after_checks(
+                || stage(0),
+                || stage(1),
+                |_| stage(2),
+                |_| {
+                    stage(3)?; // download, pack and allocate only beyond the barrier
+                    stage(4) // runtime open
+                },
+            );
             match &result {
                 Err(Refusal::Ineligible(_)) => assert_eq!(failed, 0),
                 Err(Refusal::Failed(_)) => assert!(failed > 0),
                 Ok(()) => unreachable!("every iteration refuses"),
             }
             assert_eq!(*calls.borrow(), (0..=failed).collect::<Vec<_>>());
-            assert!(finish(NpuTrunkMode::Auto, result.map(Some)).unwrap().is_none());
+            assert!(finish(NpuTrunkMode::Auto, result.map(Some))
+                .unwrap()
+                .is_none());
         }
         assert!(finish::<(), _>(NpuTrunkMode::On, Err(Refusal::Failed("open failed"))).is_err());
-        assert!(finish::<(), _>(NpuTrunkMode::On, Err(Refusal::Ineligible("not flash-next"))).is_err());
+        assert!(
+            finish::<(), _>(NpuTrunkMode::On, Err(Refusal::Ineligible("not flash-next"))).is_err()
+        );
     }
 
     #[test]
     fn auto_failure_to_arm_is_a_warning_and_ineligible_stays_plain() {
-        assert_eq!(off_line(false, "requires Flash-Next family B"), "npu-trunk: off (requires Flash-Next family B)");
+        assert_eq!(
+            off_line(false, "requires Flash-Next family B"),
+            "npu-trunk: off (requires Flash-Next family B)"
+        );
         let warn = off_line(true, "mmap heap: errno=11");
-        assert!(warn.starts_with("WARN npu-trunk: off (mmap heap: errno=11); npu_trunk=auto"), "{warn}");
+        assert!(
+            warn.starts_with("WARN npu-trunk: off (mmap heap: errno=11); npu_trunk=auto"),
+            "{warn}"
+        );
     }
 }

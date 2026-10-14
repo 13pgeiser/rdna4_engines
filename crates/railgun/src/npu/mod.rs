@@ -490,7 +490,7 @@ pub fn ensure_pin_headroom(need: usize) -> Result<(), String> {
 const CAP_IPC_LOCK: u32 = 14;
 
 /// Host limit for `required` pinned bytes plus 25% margin, rounded up to the MiB: a bounded value, not `infinity`.
-pub fn bounded_memlock_bytes(required: u64) -> u64 {
+fn bounded_memlock_bytes(required: u64) -> u64 {
     (required + required.div_ceil(4)).div_ceil(1 << 20) << 20
 }
 
