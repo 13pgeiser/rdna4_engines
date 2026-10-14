@@ -78,6 +78,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DIR` | Script/harness compatibility | Not read by the native CLI; prefer `HIPFIRE_HOME`. |
 | `HIPFIRE_MODELS_DIR` | Model discovery/lifecycle root | Overrides list/pull/remove/pre-warm and TUI model paths. |
 | `HIPFIRE_MODEL` | Serve/run model tag or path | Also `default_model` config. |
+| `HIPFIRE_SERVE_API_KEY_FILE` | Serve bearer credential file | Absolute path; maps to `serve.api_key_file` (default unset). Contains UTF-8, >=32 bytes after trimming trailing whitespace; Unix mode must exclude group/other (`chmod 600`). Windows ACLs are not checked yet. Required for non-loopback bind; use HTTPS for remote traffic. Only the path, never secret contents, belongs in config/env. See [SERVE.md](SERVE.md#security-bearer-authentication-and-https-proxies). |
 | `HIPFIRE_DAEMON_BIN` | Daemon binary override | |
 | `HIPFIRE_LOCK_DIR` | Shared per-GPU lock directory | Absolute writable path; daemon and `gpu-lock.sh` must use the same setting to contend. Default on Linux/WSL `/run/lock/hipfire` if writable, otherwise `/tmp/hipfire-locks`; on native Windows `%ProgramData%\hipfire\locks`, otherwise `%TEMP%\hipfire-locks` (`LockFileEx`, same file names and holder-PID reporting). Different directories do not see each other's locks. Files are `gpu-GPU-<uuid>.lock`, or `gpu-pci-<dddd:bb:dd.f>.lock` for cards without a UUID. |
 | `HIPFIRE_TUI_BIN` | TUI binary | |
@@ -682,7 +683,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1607
+**Count:** 1608
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2121,6 +2122,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_ALLOW_INCOHERENT` | scripts/serve_harness.py | harness |
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_API_KEY_FILE` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_BATCH_NONEXACT` | crates/hipfire-arch-qwen35/src/forward_slots/vmm.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_BATCH_SAMPLED` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_BATCH_SPEC` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/fn_batch.rs | experimental |

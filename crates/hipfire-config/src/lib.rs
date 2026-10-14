@@ -12,6 +12,7 @@
 pub mod devices;
 pub mod host_memory;
 pub mod rocm;
+pub mod secret;
 
 pub use host_memory::{host_memory, HostMemory};
 
@@ -342,6 +343,7 @@ pub enum ValueRule {
     NonEmptyString,
     Host,
     PathOrEmpty,
+    AbsolutePathOrEmpty,
     Enum(&'static [&'static str]),
     AutoBool,
     NullableString,
@@ -422,6 +424,8 @@ impl ConfigField {
                     expand_tilde(v).is_file()
                 }
             }),
+            ValueRule::AbsolutePathOrEmpty => matches!(value, ConfigValue::String(v)
+                if v.is_empty() || (v.trim() == v && Path::new(v).is_absolute())),
             ValueRule::Enum(values) => {
                 matches!(value, ConfigValue::String(v) if values.contains(&v.as_str()))
             }
@@ -1396,6 +1400,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_SERVE_ALLOW_REQUEST_PATHS",
         "Let a chat request load any readable file it names. Off: requests may name only installed models (models directory, catalog, pre-warm model)."
+    ),
+    field!(
+        "serve.api_key_file",
+        "api_key_file",
+        Serve,
+        Process,
+        DefaultValue::String(""),
+        ValueRule::AbsolutePathOrEmpty,
+        false,
+        false,
+        Some("HIPFIRE_SERVE_API_KEY_FILE"),
+        "Absolute path of a file holding the serve bearer token (at least 32 bytes after trimming trailing whitespace; Unix mode must grant no group/other access). Empty (unset) keeps serve keyless; the token itself is never stored in configuration."
     ),
     // --- Serving cache/scheduler contract keys (spec §9.1) -----------------
     // All experimental: the cache/scheduler route is planned and has not
@@ -7360,6 +7376,55 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn serve_api_key_file_schema_is_an_absolute_path_defaulting_to_unset() {
+        let field = field("serve.api_key_file").unwrap();
+        assert_eq!(field.env_compat, Some("HIPFIRE_SERVE_API_KEY_FILE"));
+        assert_eq!(field.scope, ConfigScope::Process);
+        assert_eq!(field.category, ConfigCategory::Serve);
+        assert!(!field.registry_allowed);
+        assert_eq!(field.default.to_value(), ConfigValue::String(String::new()));
+
+        let absolute = env::temp_dir().join("serve.key");
+        let absolute = absolute.to_str().unwrap();
+        let mut layer = ConfigLayer::default();
+        layer
+            .set("serve.api_key_file", ConfigValue::String(String::new()))
+            .unwrap();
+        layer.set_cli("serve.api_key_file", absolute).unwrap();
+        assert_eq!(
+            layer.get("serve.api_key_file"),
+            Some(&ConfigValue::String(absolute.to_owned()))
+        );
+        // Existence is not a schema concern: the token loader owns file checks.
+        layer
+            .set_cli("serve.api_key_file", &format!("{absolute}.missing"))
+            .unwrap();
+
+        let padded_left = format!(" {absolute}");
+        let padded_right = format!("{absolute} ");
+        for bad in [
+            "serve.key",
+            "./serve.key",
+            "~/serve.key",
+            " ",
+            padded_left.as_str(),
+            padded_right.as_str(),
+        ] {
+            let err = layer.set_cli("serve.api_key_file", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("serve.api_key_file"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(layer
+            .set("serve.api_key_file", ConfigValue::Integer(1))
+            .is_err());
+        assert!(layer
+            .set("serve.api_key_file", ConfigValue::Null)
+            .is_err());
     }
 
     #[test]

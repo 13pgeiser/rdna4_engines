@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+subtle = "2"
 thiserror.workspace = true
 toml = "0.9"
 

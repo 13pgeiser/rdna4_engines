@@ -20,16 +20,59 @@ Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
 below. Branch-only model routes (for example LFM framing details) are not
 implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATION.md).
 
-## Security (no auth / no TLS)
+## Security (bearer authentication and HTTPS proxies)
 
-The native handler implements **no authentication and no TLS**.
-Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `127.0.0.1` (loopback only); set
-`serve.host = "0.0.0.0"` (or pass `0.0.0.0:11435`) to listen on all interfaces.
+Loopback without a key retains the local unauthenticated API. Binding any
+non-loopback address requires a key file; otherwise serve refuses to start.
+Configure `serve.api_key_file` (or `HIPFIRE_SERVE_API_KEY_FILE`), or pass
+`--api-key-file <absolute-path>`. Only the path is stored in configuration.
+Local CLI/TUI clients read the configured file automatically.
 
-- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
-- Expose beyond localhost only behind a trusted network or an authenticated
-  TLS reverse proxy you control. Do not publish the raw port to the internet.
+The UTF-8 file must contain at least 32 bytes after trimming trailing whitespace.
+On Unix, group/other permissions are refused: use `chmod 600`. Windows ACLs are
+not checked yet; restrict access to the account running serve yourself.
+For example, create a private random token and persist its **path**, not its contents:
+
+```bash
+umask 077
+openssl rand -hex 32 > "$HOME/.hipfire/api-key"
+hipfire config set serve.api_key_file "$HOME/.hipfire/api-key"
+hipfire serve 127.0.0.1:11435
+```
+
+With a key configured, every route requires `Authorization: Bearer <key>`,
+except `/health`: without valid credentials it returns only minimal liveness
+and version, not process identity or model details. Authenticated `/health`
+retains detailed diagnostics. Missing/wrong credentials receive the same 401.
+The existing instance token identifies a process; it is not the API credential.
+
+Authentication runs before routing or request-body reads, including UI assets
+and `OPTIONS` requests. A 401 has an empty body and `WWW-Authenticate: Bearer`.
+The embedded UI cannot supply credentials and therefore receives 401 when a
+key is configured; browser pairing is not implemented. Existing successful
+responses retain permissive CORS (`Access-Control-Allow-Origin: *`), but
+unauthenticated preflight is refused. Native clients do not need CORS.
+
+Serve itself has **no TLS**. A bearer on plaintext HTTP can be intercepted.
+Use loopback behind verified HTTPS for remote access; never publish the raw
+port to the internet. Clients support `http://` and verified `https://` URLs
+(including proxy base paths), with no insecure-certificate fallback.
+
+### Tailscale Serve (tailnet-only HTTPS)
+
+Keep the backend bound to loopback with bearer authentication enabled:
+
+```bash
+hipfire serve 127.0.0.1:11435 --api-key-file "$HOME/.hipfire/api-key"
+tailscale serve --bg http://127.0.0.1:11435
+```
+
+Use the HTTPS URL printed by Tailscale Serve and supply the same bearer to
+your client. Retain tailnet ACLs/grants as well as app authentication.
+Do **not** enable public Funnel by default. For a manual LAN proxy, use
+HTTPS with a trusted certificate and forward the Authorization header.
+The embedded browser UI does not provide credential pairing; use a
+bearer-capable API client for protected access.
 
 ## Start and stop
 
@@ -38,7 +81,7 @@ hipfire serve                         # foreground; Ctrl-C stops (default bind 1
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
-hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
+hipfire serve 0.0.0.0:11435 --api-key-file /absolute/private/key -d # requires key; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
@@ -99,6 +142,7 @@ environment variable.
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
 | `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
+| `--api-key-file <absolute-path>` | Protected UTF-8 bearer file; overrides `serve.api_key_file` for this process |
 | `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |

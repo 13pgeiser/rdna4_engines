@@ -10,8 +10,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
-    OpenAiSseEvent,
+    complete_openai_chat, http_get_json, probe_host, service_ready, service_url, stream_openai_chat,
+    Engine, OpenAiSseEvent, ServiceEndpoint,
 };
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
@@ -866,6 +866,11 @@ pub(crate) struct ServeArgs {
     /// Open the chat UI in the default browser once serving (implies --ui).
     #[arg(long)]
     open: bool,
+    /// Absolute path of a file holding the bearer token clients must present
+    /// (`Authorization: Bearer <token>`); overrides `serve.api_key_file`.
+    /// Required to bind a non-loopback address.
+    #[arg(long, value_name = "ABSOLUTE_PATH", value_parser = crate::serve::parse_api_key_file_arg)]
+    api_key_file: Option<PathBuf>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -2612,11 +2617,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     };
     let host = config_string(&resolved, "serve.host")?;
     let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let force_local = run_should_force_local(&args);
-    if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
+    if !force_local && service_ready(&endpoint, Duration::from_millis(150)) {
         return run_via_http(
-            &host,
-            port,
+            &endpoint,
             &args.model,
             &prompt,
             system_prompt.as_deref(),
@@ -3455,8 +3460,7 @@ fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String 
 
 #[allow(clippy::too_many_arguments)]
 fn run_via_http(
-    host: &str,
-    port: u16,
+    endpoint: &ServiceEndpoint,
     model: &str,
     prompt: &str,
     system: Option<&str>,
@@ -3493,7 +3497,7 @@ fn run_via_http(
         body["stream_options"] = serde_json::json!({"include_usage": true});
     }
     if json || no_stream {
-        let response = complete_openai_chat(host, port, body, timeout)?;
+        let response = complete_openai_chat(endpoint, body, timeout)?;
         let content = response
             .pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str)
@@ -3528,8 +3532,7 @@ fn run_via_http(
     let mut tokens = None;
     let mut timings = serde_json::Value::Null;
     stream_openai_chat(
-        host,
-        port,
+        endpoint,
         body,
         timeout,
         |event| {
@@ -3563,6 +3566,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let model = args
         .model
         .unwrap_or(config_string(&resolved, "serve.default_model")?);
@@ -3583,7 +3587,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         }
     }
 
-    if !service_ready(&host, port, Duration::from_millis(150)) {
+    if !service_ready(&endpoint, Duration::from_millis(150)) {
         let serve_args = ServeArgs {
             positionals: vec![host.clone(), port.to_string()],
             model: None,
@@ -3602,10 +3606,10 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             foreground_child: false,
             ui: false,
             open: false,
+            api_key_file: None,
         };
         detach_serve(paths, &serve_args, &host, port)?;
     }
-    let client_host = probe_host(&host);
     eprintln!("Interactive chat with {model}. Commands: /clear, /exit");
     let mut messages = Vec::new();
     if let Some(system) = args.system {
@@ -3650,8 +3654,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         let mut assistant_reasoning = String::new();
         let mut assistant_content = String::new();
         let result = stream_openai_chat(
-            client_host,
-            port,
+            &endpoint,
             body,
             Duration::from_secs(60 * 60),
             |event| {
@@ -5549,14 +5552,15 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
     let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
+    let endpoint = local_service_endpoint(&resolved, &host, port)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = fs::read_to_string(&pid_path)
         .ok()
         .and_then(|raw| parse_pid_record(&raw));
     let pid = pid_record.as_ref().map(|record| record.pid);
     let alive = pid.is_some_and(process_identity::pid_alive);
-    let health = http_get_json(&host, port, "/health");
-    let stats = http_get_json(&host, port, "/stats");
+    let health = http_get_json(&endpoint, "/health", Duration::from_secs(1)).ok();
+    let stats = http_get_json(&endpoint, "/stats", Duration::from_secs(1)).ok();
     let (quantize, uploads, auxiliary_unavailable) = match scan_auxiliary_processes() {
         Ok((quantize, uploads)) => (quantize, uploads, None),
         Err(reason) => (Vec::new(), Vec::new(), Some(reason)),
@@ -5566,7 +5570,7 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "pid": pid,
         "pid_record": pid_record.as_ref().map(ServePidRecord::to_public_json),
         "pid_alive": alive,
-        "endpoint": service_url(&host, port, ""),
+        "endpoint": service_url(&endpoint, ""),
         "health": health,
         "stats": stats,
         "quantize": quantize,
@@ -5631,18 +5635,18 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn http_get_json(host: &str, port: u16, path: &str) -> Option<serde_json::Value> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(1)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let mut response = agent.get(&service_url(host, port, path)).call().ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let text = response.body_mut().read_to_string().ok()?;
-    serde_json::from_str(&text).ok()
+pub(crate) fn local_service_endpoint(
+    resolved: &hipfire_config::ResolvedConfig,
+    host: &str,
+    port: u16,
+) -> Result<ServiceEndpoint> {
+    let key_path = config_string(resolved, "serve.api_key_file")?;
+    let bearer = if key_path.is_empty() {
+        None
+    } else {
+        Some(hipfire_config::secret::BearerToken::load(Path::new(&key_path))?)
+    };
+    Ok(ServiceEndpoint::local(host, port, bearer)?)
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -9227,6 +9231,9 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::PathOrEmpty => {
             serde_json::json!({ "type": "string", "format": "existing-path-or-empty" })
         }
+        ValueRule::AbsolutePathOrEmpty => {
+            serde_json::json!({ "type": "string", "format": "absolute-path-or-empty" })
+        }
         ValueRule::Enum(values) => {
             serde_json::json!({ "type": "string", "enum": values })
         }
@@ -9292,6 +9299,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NonEmptyString => "nonempty-string",
         ValueRule::Host => "host",
         ValueRule::PathOrEmpty => "path-or-empty",
+        ValueRule::AbsolutePathOrEmpty => "absolute-path-or-empty",
         ValueRule::Enum(_) => "enum",
         ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
@@ -14101,15 +14109,25 @@ mod tests {
     #[cfg(unix)]
     impl Task11HttpHarness {
         fn spawn(label: &str) -> Self {
-            Self::spawn_inner(label, false, Duration::from_millis(0))
+            Self::spawn_inner(label, false, Duration::from_millis(0), None)
         }
 
         /// Retry-enabled variant for the Task 15 one-retry scenarios.
         fn spawn_with_retry(label: &str, retry_backoff: Duration) -> Self {
-            Self::spawn_inner(label, true, retry_backoff)
+            Self::spawn_inner(label, true, retry_backoff, None)
         }
 
-        fn spawn_inner(label: &str, retry_enabled: bool, retry_backoff: Duration) -> Self {
+        /// Keyed server: every route but the minimal `/health` needs `api_key`.
+        fn spawn_with_api_key(label: &str, api_key: hipfire_config::secret::BearerToken) -> Self {
+            Self::spawn_inner(label, false, Duration::from_millis(0), Some(api_key))
+        }
+
+        fn spawn_inner(
+            label: &str,
+            retry_enabled: bool,
+            retry_backoff: Duration,
+            api_key: Option<hipfire_config::secret::BearerToken>,
+        ) -> Self {
             let paths = test_paths(label);
             fs::create_dir_all(&paths.models).unwrap();
             fs::create_dir_all(&paths.root).unwrap();
@@ -14221,6 +14239,7 @@ mod tests {
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
                 ui_enabled: false,
+                api_key,
             });
 
             let std_listener =
@@ -14257,15 +14276,16 @@ mod tests {
             });
 
             // Health probe — proves production Hyper service path is live.
+            let endpoint = ServiceEndpoint::local("127.0.0.1", port, None).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
+                if hipfire_client::service_ready(&endpoint, Duration::from_millis(200)) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             assert!(
-                hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(500)),
+                hipfire_client::service_ready(&endpoint, Duration::from_millis(500)),
                 "task11 harness never became ready on port {port}"
             );
 
@@ -14416,6 +14436,193 @@ mod tests {
             .and_then(|start| serde_json::from_str(&text[start..]).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, json, text)
+    }
+
+    /// Writes an owner-only API key file; returns its path and the token text.
+    #[cfg(unix)]
+    fn write_test_api_key(label: &str) -> (PathBuf, String) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!(
+            "hipfire-auth-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.key");
+        let token = format!("hipfire-auth-test-token-{label}-0123456789abcdef");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(format!("{token}\n").as_bytes()).unwrap();
+        (path, token)
+    }
+
+    /// One request with an optional raw `Authorization` header value; returns
+    /// the status, the `WWW-Authenticate` challenge, and the body text.
+    #[cfg(unix)]
+    fn auth_call(
+        port: u16,
+        method: &str,
+        path: &str,
+        authorization: Option<&str>,
+        body: &str,
+    ) -> (u16, Option<String>, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut request = ureq::http::Request::builder()
+            .method(method)
+            .uri(format!("http://127.0.0.1:{port}{path}"))
+            .header("Content-Type", "application/json");
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let body = if method == "POST" {
+            body.to_owned()
+        } else {
+            String::new()
+        };
+        let mut response = agent
+            .run(request.body(body).unwrap())
+            .unwrap_or_else(|error| panic!("{method} {path}: {error}"));
+        let status = response.status().as_u16();
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        (status, challenge, text)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_api_key_gates_every_route_and_redacts_public_health() {
+        let (key_path, token) = write_test_api_key("gate");
+        let bearer = hipfire_config::secret::BearerToken::load(&key_path).unwrap();
+        let h = Task11HttpHarness::spawn_with_api_key("api-key-gate", bearer);
+        let port = h.port();
+        let chat = h.base_body("t11-stop-text", false).to_string();
+        let good = format!("Bearer {token}");
+        let lower = format!("bearer {token}");
+        let wrong = format!("Bearer {token}x");
+        let basic = format!("Basic {token}");
+        let debug = format!("{:?}", h.shared.api_key);
+        assert!(!debug.contains(&token), "{debug}");
+
+        // Unauthenticated and wrong-credential /health: status and version only.
+        for credential in [None, Some(wrong.as_str())] {
+            let (status, challenge, text) = auth_call(port, "GET", "/health", credential, "");
+            assert_eq!(status, 200, "{text}");
+            assert_eq!(challenge, None);
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 2, "{text}");
+            assert_eq!(json["status"], crate::serve::EngineState::Up.as_str());
+            assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+            assert!(!text.contains(&token), "{text}");
+        }
+
+        // Every other route, including the UI namespace and unknown paths,
+        // answers one uniform 401 whatever the credential defect.
+        let routes = [
+            ("GET", "/stats"),
+            ("GET", "/metrics"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/messages"),
+            ("POST", "/v1/responses"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/v1/images/generations"),
+            ("POST", "/v1/systemone"),
+            ("GET", "/ui"),
+            ("GET", "/"),
+            ("GET", "/no-such-route"),
+            ("OPTIONS", "/v1/chat/completions"),
+            ("POST", "/health"),
+            ("GET", "/config"),
+        ];
+        for (method, path) in routes {
+            let mut bodies = Vec::new();
+            for credential in [None, Some(wrong.as_str()), Some(basic.as_str()), Some("Bearer")] {
+                let (status, challenge, text) = auth_call(port, method, path, credential, &chat);
+                assert_eq!(status, 401, "{method} {path} {credential:?}: {text}");
+                assert_eq!(challenge.as_deref(), Some("Bearer"), "{method} {path}");
+                assert!(text.is_empty(), "{method} {path}: {text}");
+                assert!(!text.contains(&token), "{method} {path}: {text}");
+                bodies.push(text);
+            }
+            assert!(
+                bodies.windows(2).all(|pair| pair[0] == pair[1]),
+                "{method} {path} 401 bodies differ: {bodies:?}"
+            );
+        }
+        // Reject before waiting for the advertised body or applying its limit.
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(
+            socket,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999\r\n\r\n"
+        ).unwrap();
+        let mut status_line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(socket), &mut status_line).unwrap();
+        assert!(status_line.starts_with("HTTP/1.1 401"), "{status_line}");
+        let log = h.read_requests_log();
+        assert!(Task11HttpHarness::ops_of_type(&log, "generate").is_empty());
+        assert!(Task11HttpHarness::ops_of_type(&log, "load").is_empty());
+
+        // The right token (scheme is case-insensitive) opens the routes.
+        for credential in [good.as_str(), lower.as_str()] {
+            for path in ["/stats", "/metrics", "/v1/models"] {
+                let (status, challenge, text) = auth_call(port, "GET", path, Some(credential), "");
+                assert_eq!(status, 200, "{path}: {text}");
+                assert_eq!(challenge, None);
+            }
+        }
+        let (status, _, text) =
+            auth_call(port, "POST", "/v1/chat/completions", Some(&good), &chat);
+        assert_eq!(status, 200, "{text}");
+        assert!(!text.contains(&token), "{text}");
+
+        // Authenticated /health keeps the full payload; its instance token is
+        // a different secret from the API key.
+        let (status, _, text) = auth_call(port, "GET", "/health", Some(&good), "");
+        assert_eq!(status, 200, "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(json["pid"].is_u64(), "{text}");
+        assert!(json["capabilities"].is_object(), "{text}");
+        assert_ne!(json["token"], serde_json::json!(token));
+        assert!(!text.contains(&token), "{text}");
+
+        // Keyed preflight is gated too; authenticated native clients can use it.
+        let (status, _, text) = auth_call(port, "OPTIONS", "/v1/chat/completions", Some(&good), "");
+        assert_eq!(status, 204, "{text}");
+
+        let _ = fs::remove_dir_all(key_path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_without_api_key_keeps_routes_and_full_health_open() {
+        let h = Task11HttpHarness::spawn("api-key-none");
+        let port = h.port();
+        for credential in [None, Some("Bearer ignored-by-a-keyless-server")] {
+            let (status, challenge, text) = auth_call(port, "GET", "/stats", credential, "");
+            assert_eq!(status, 200, "{text}");
+            assert_eq!(challenge, None);
+        }
+        let health = serve_health(port).1;
+        assert!(health["pid"].is_u64(), "{health}");
+        assert!(health["capabilities"].is_object(), "{health}");
+        let (status, _, text) = post_status(port, &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
     }
 
     /// An omitted max_tokens (config default 4096 against the fake's 4096
@@ -14858,8 +15065,7 @@ mod tests {
     ) -> std::result::Result<StreamCapture, hipfire_client::ClientError> {
         let mut cap = StreamCapture::default();
         stream_openai_chat(
-            "127.0.0.1",
-            port,
+            &ServiceEndpoint::local("127.0.0.1", port, None)?,
             body,
             Duration::from_secs(10),
             |event| {
@@ -14895,7 +15101,11 @@ mod tests {
         port: u16,
         body: serde_json::Value,
     ) -> std::result::Result<serde_json::Value, hipfire_client::ClientError> {
-        complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
+        complete_openai_chat(
+            &ServiceEndpoint::local("127.0.0.1", port, None)?,
+            body,
+            Duration::from_secs(10),
+        )
     }
 
     /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
