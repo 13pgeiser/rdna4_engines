@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.2.1 — 2026-10-14
+
+- **Strix Halo NPU trunk: the built-in calibration now applies on any Halo kernel and NPU firmware.** `npu_trunk=auto` armed only when the compiled-in Halo calibration matched the host exactly, including the kernel release, NPU firmware and NPU PCI slot of the machine it was measured on, so every stock-kernel Halo logged `npu-trunk: off (calibration key mismatch: kernel.uname_release)` and served GPU-only. For the built-in calibration those three fields are now advisory: when any differs, it is used with its margin raised to 0.05 (the pipe must be predicted at least 5% faster than GPU-only, since the timings were measured on a different kernel/firmware), and the load logs `npu-trunk: built-in calibration measured on <kernel>/<fw>, this host <kernel>/<fw>; using it with margin 0.05`. Arch, build, model-index hash, epilogue and trunk route stay strict, and a user calibration file stays fully strict. Output is exact on either route; the calibration only chooses between them. First-load self-calibration is planned.
+- **The NPU trunk calibration identity is pinned to `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.** It no longer derives from the crate version: it names the NPU serving numerics/transport, which a release bump does not change. Deriving it from the crate version would have orphaned the shipped Halo calibrations and left `npu_trunk=auto` GPU-only on 0.4.2.1.
+
 ## v0.4.2 — 2026-10-14
 
 - **Strix Halo NPU trunk: the fused HC kernels now also run under the NPU pair route (16K Flash-Next TTFT −298 ms, exact).** The pair executor runs each bank layer as prepare, an NPU-fed Core and the output projection, and the interpreter dropped its HC pairing state between those windows. So under the NPU route the attention HC read never handed its gates to the HC write, the `hcw` output-projection epilogue never fired, and the MoE HC row fold was skipped. The GPU-only route took all three. `HcFusionCursor` now carries each bank's pairings across its windows, and `hc_gates` is bank-private (+16 B/row) because those gates now cross the bank switch. The fused kernels are the GPU-only route's byte-exact twins.
