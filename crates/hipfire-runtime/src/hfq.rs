@@ -2041,6 +2041,51 @@ impl HfqFile {
         .map(Some)
     }
 
+    /// A checked positional descriptor over an arbitrary byte span of the
+    /// BASE container (not an index entry). Used for derived views such as a
+    /// layer's contiguous expert slab arena.
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        let source_identity = self.effective_source_identity()?;
+        let file_identity = source_identity
+            .files
+            .first()
+            .ok_or_else(|| SourceError::MissingEffectiveSeal {
+                reason: "HFQ source file index 0 is not sealed".to_string(),
+            })?
+            .clone();
+        let file = self._file.try_clone().map_err(|source| SourceError::Io {
+            offset: offset as u64,
+            source,
+        })?;
+        let reader = SourceReader::from_inner(HfqRangeReader {
+            identity: source_identity.clone(),
+            file,
+            file_identity,
+            evict_after_upload: self.evict_page_cache,
+        });
+        SourceRangeDescriptor::from_parts(
+            source_identity,
+            offset as u64,
+            len as u64,
+            dtype.to_string(),
+            logical_shape,
+            reader,
+        )
+    }
+
+    /// The mapped bytes of `[offset, offset + len)`; `None` when the mapping
+    /// was dropped or the span overruns the file.
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let mmap = self.mmap.as_ref()?;
+        mmap.get(offset..offset.checked_add(len)?)
+    }
+
     /// Full tensor index of this HFQ file, in on-disk order.
     pub fn tensor_infos(&self) -> &[HfqTensorInfo] {
         &self.tensors
@@ -2219,6 +2264,22 @@ impl HfqModelSource {
 
     pub fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
         self.hfq.tensor_range(name)
+    }
+
+    /// See [`HfqFile::span_range`].
+    pub fn span_range(
+        &self,
+        offset: usize,
+        len: usize,
+        dtype: &str,
+        logical_shape: Vec<usize>,
+    ) -> Result<SourceRangeDescriptor, SourceError> {
+        self.hfq.span_range(offset, len, dtype, logical_shape)
+    }
+
+    /// See [`HfqFile::span_bytes`].
+    pub fn span_bytes(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        self.hfq.span_bytes(offset, len)
     }
 }
 

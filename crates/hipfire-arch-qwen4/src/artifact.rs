@@ -260,6 +260,87 @@ fn refuse_expert_slabs(
     Ok(())
 }
 
+/// Set once the real-layer G1 receipts of BOTH gfx1201 slab kernels (K2
+/// prefill and K1 decode) are in `rcpt/`. Until then the sealed slab route is
+/// not admitted by default on any architecture.
+pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = false;
+/// Developer-only switch that admits the slab route on gfx1201 before
+/// [`SLAB_ROUTE_RECEIPTS_LANDED`] flips (G1/G2/G3 development runs).
+pub const SLAB_ROUTE_DEV_ENV: &str = "HIPFIRE_QWEN4_SLAB_ROUTE_DEV";
+
+/// Whether the sealed expert-slab route may load on GPU architecture `arch`.
+/// gfx1201 only; every other architecture keeps refusing.
+pub fn slab_route_admitted(arch: &str) -> bool {
+    arch == "gfx1201"
+        && (SLAB_ROUTE_RECEIPTS_LANDED
+            || hipfire_config::developer_var(SLAB_ROUTE_DEV_ENV).is_ok_and(|value| value == "1"))
+}
+
+/// The arena plan of a version-1 expert-slab artifact when the route is
+/// admitted on `device`; otherwise the unchanged fail-closed refusal
+/// ([`refuse_expert_slabs`]). `Ok(None)` is an ordinary (non-slab) artifact.
+fn expert_slab_plan(
+    metadata_json: &str,
+    tensors: &[HfqTensorInfo],
+    device: Option<&str>,
+) -> Result<Option<Arc<crate::expert_arena::ExpertArenaPlan>>, Qwen4ArtifactError> {
+    if !device.is_some_and(slab_route_admitted) {
+        refuse_expert_slabs(metadata_json, tensors)?;
+        return Ok(None);
+    }
+    let metadata = match expert_slabs::parse(metadata_json) {
+        Ok(metadata) => metadata,
+        Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => None,
+        Err(error) => return Err(Qwen4ArtifactError::ExpertSlabsMetadata(error)),
+    };
+    let Some(metadata) = metadata else {
+        refuse_expert_slabs(metadata_json, tensors)?;
+        return Ok(None);
+    };
+    let table = build_expert_slab_table(&metadata, tensors)
+        .map_err(Qwen4ArtifactError::ExpertSlabTable)?;
+    let counts = table.counts();
+    if counts.w2 != 0 {
+        return Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable {
+            w3: counts.w3,
+            w2: counts.w2,
+            mq4: counts.mq4,
+        });
+    }
+    let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table)
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
+    plan.check_executable()
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
+    Ok(Some(Arc::new(plan)))
+}
+
+/// `manifest` (declared under the packed recipe) re-declared under
+/// [`crate::weights::Qwen4TierRecipe::FlashNextSlab`] with `plan`'s arenas.
+fn slab_manifest(
+    config: &Qwen4Config,
+    manifest: &Qwen4Manifest,
+    plan: &Arc<crate::expert_arena::ExpertArenaPlan>,
+) -> Result<Qwen4Manifest, Qwen4ArtifactError> {
+    let crate::weights::Qwen4TierRecipe::FlashNextPacked {
+        trunk_tier,
+        mtp_source,
+    } = &manifest.identity.recipe
+    else {
+        return Err(Qwen4ArtifactError::new(
+            "qwen4: an expert-slab artifact is admitted under the packed Flash-Next recipe only",
+        ));
+    };
+    Qwen4Manifest::build_with_recipe(
+        config,
+        crate::weights::Qwen4TierRecipe::FlashNextSlab {
+            trunk_tier: *trunk_tier,
+            mtp_source: *mtp_source,
+            arenas: plan.clone(),
+        },
+    )
+    .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: slab manifest admission failed: {error}")))
+}
+
 /// Escape hatch for deliberately loading an artifact whose manifest target is
 /// quantized while its bytes are BF16 (the unpacked decode path).
 fn unpacked_quantized_target_allowed() -> bool {
@@ -1268,6 +1349,17 @@ pub fn admit_developer_inventory_headers(
 /// inferred from geometry), still under its exact inventory and extents.  No
 /// environment variable or config key crosses this boundary.
 pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
+    admit_hfqm_artifact_on(hfq, None)
+}
+
+/// [`admit_hfqm_artifact`] for a known GPU architecture: an expert-slab
+/// artifact is admitted only where [`slab_route_admitted`] holds for `arch`;
+/// every other arch (and `None`) keeps the `ExpertSlabKernelsUnavailable`
+/// refusal.
+pub fn admit_hfqm_artifact_on(
+    hfq: &HfqFile,
+    slab_device: Option<&str>,
+) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: source arch_id={} does not match reserved arch_id={ARCH_ID}",
@@ -1285,9 +1377,12 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
             "qwen4: REAP/head overlays are not admitted for exact HFQM inventory",
         ));
     }
-    refuse_expert_slabs(&hfq.metadata_json, hfq.tensors())?;
+    let slab = expert_slab_plan(&hfq.metadata_json, hfq.tensors(), slab_device)?;
     let config = parse_artifact_config(&hfq.metadata_json)?;
     let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json)?;
+    if let Some(plan) = &slab {
+        manifest = slab_manifest(&config, &manifest, plan)?;
+    }
     let ple_config = config.ple.as_ref();
     let sidecar = hfq.ple_rows().is_some();
     if sidecar && manifest.identity.recipe.is_stock_fp8() {
@@ -1302,9 +1397,34 @@ pub fn admit_hfqm_artifact(hfq: &HfqFile) -> Result<Qwen4HfqmArtifact, Qwen4Arti
     if sidecar {
         manifest = manifest.without_ple_shards();
     }
+    let slab_inventory;
+    let (inventory_tensors, inventory_manifest): (&[HfqTensorInfo], &Qwen4Manifest) =
+        if slab.is_some() {
+            // The 49,152 per-expert entries were validated end to end by the
+            // span table; the manifest declares them as per-layer arenas.
+            // The remaining tensors face the ordinary exact-inventory check
+            // against the manifest with the arenas taken out.
+            slab_inventory = (
+                hfq.tensors()
+                    .iter()
+                    .filter(|info| parse_expert_entry_name(&info.name).is_none())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                {
+                    let mut without_arenas = manifest.clone();
+                    without_arenas
+                        .weights
+                        .retain(|entry| !entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX));
+                    without_arenas
+                },
+            );
+            (&slab_inventory.0, &slab_inventory.1)
+        } else {
+            (hfq.tensors(), &manifest)
+        };
     let source_tensor_count = validate_manifest_inventory(
-        hfq.tensors(),
-        &manifest,
+        inventory_tensors,
+        inventory_manifest,
         shadowed_ple_shards,
         ple_config.map_or(0, |ple| ple.shard_count),
     )?;

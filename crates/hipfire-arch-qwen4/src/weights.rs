@@ -340,7 +340,7 @@ impl Qwen4TierRecipe {
     /// Flash-Next recipes.
     pub const fn synthetic_id(&self) -> Option<&'static str> {
         match self {
-            Self::FlashNextPacked { .. } | Self::StockFp8 => None,
+            Self::FlashNextPacked { .. } | Self::FlashNextSlab { .. } | Self::StockFp8 => None,
             Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
             Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
         }
@@ -389,7 +389,8 @@ impl Qwen4TierRecipe {
     /// exists for them yet.
     pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
         match self {
-            Self::FlashNextPacked { trunk_tier, .. } => reject_expert_slab_dtype(*trunk_tier),
+            Self::FlashNextPacked { trunk_tier, .. }
+            | Self::FlashNextSlab { trunk_tier, .. } => reject_expert_slab_dtype(*trunk_tier),
             Self::SyntheticSourceBf16 | Self::SyntheticPacked | Self::StockFp8 => Ok(()),
         }
     }
@@ -570,6 +571,8 @@ pub enum TensorRole {
     SharedExpertDown,
     RoutedGateUp,
     RoutedDown,
+    /// A trunk layer's contiguous expert slab arena (`FlashNextSlab` recipe).
+    RoutedArena,
     DenseFfnGate,
     DenseFfnUp,
     DenseFfnDown,
@@ -649,6 +652,17 @@ pub enum Qwen4TierRecipe {
     /// Q8 embedding, MQ6 head, Q8F16 PLE rows.  `trunk_tier` and `mtp_source`
     /// are the two producer/loader-shared knobs, resolved once.
     FlashNextPacked { trunk_tier: DType, mtp_source: bool },
+    /// [`Self::FlashNextPacked`] with the 48 trunk layers' routed experts held
+    /// as per-layer slab arenas (version-1 expert-slab artifact): each layer
+    /// declares ONE `slab_arena` entry (raw bytes, resident or host-mapped)
+    /// instead of the two aggregate expert tensors, and `arenas` carries the
+    /// validated per-expert format and offsets. The MTP head's experts stay
+    /// the legacy aggregates.
+    FlashNextSlab {
+        trunk_tier: DType,
+        mtp_source: bool,
+        arenas: std::sync::Arc<crate::expert_arena::ExpertArenaPlan>,
+    },
     /// The stock FP8 checkpoint (rev `236dfdf2`) converted byte-for-byte:
     /// routed experts qt=55 `FP8E4M3B128` (OCP e4m3 codes + BF16 `s_inv`
     /// 128x128 blocks, gate_up `[E, 1280, 2560]`, down `[E, 2560, 640]`),
@@ -760,6 +774,11 @@ impl Qwen4Manifest {
             Qwen4TierRecipe::FlashNextPacked {
                 trunk_tier,
                 mtp_source,
+            }
+            | Qwen4TierRecipe::FlashNextSlab {
+                trunk_tier,
+                mtp_source,
+                ..
             } => (true, *trunk_tier, *mtp_source),
             Qwen4TierRecipe::StockFp8
             | Qwen4TierRecipe::SyntheticSourceBf16
@@ -768,7 +787,7 @@ impl Qwen4Manifest {
         let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
         let stock_fp8 = recipe.is_stock_fp8();
         let profile_admits_recipe = match &recipe {
-            Qwen4TierRecipe::FlashNextPacked { .. } => {
+            Qwen4TierRecipe::FlashNextPacked { .. } | Qwen4TierRecipe::FlashNextSlab { .. } => {
                 matches!(config.profile, Qwen4Profile::FlashNext)
             }
             Qwen4TierRecipe::StockFp8 => config.profile.is_ar_only(),
@@ -1299,6 +1318,9 @@ impl Qwen4Manifest {
         // profile without PLE declares no PLE state.
         if let Some(ple) = ple {
             state.push(StateEntry::new(StateKind::Conv, ple.layer));
+        }
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = &recipe {
+            apply_expert_arenas(&mut weights, arenas)?;
         }
         let identity = Qwen4ManifestIdentity {
             profile_id: config.profile.id().to_string(),
@@ -1971,6 +1993,10 @@ pub struct PleWeights {
 pub struct MoeWeights {
     pub experts_down: TensorRef,
     pub experts_gate_up: TensorRef,
+    /// `Some` on a `FlashNextSlab` trunk layer: the one raw arena holding all
+    /// 512 experts (per-expert format and offsets live in the recipe's plan).
+    /// `experts_gate_up` / `experts_down` then name no fulfilled tensor.
+    pub expert_arena: Option<TensorRef>,
     /// The pinned checkpoint carries one stacked gate/up source.  Gate and up
     /// remain distinct logical projection slices in the sealed runtime plan;
     /// do not rewrite the artifact merely to spell them as separate sources.
@@ -2290,7 +2316,34 @@ impl Qwen4Weights {
                 .push(slot);
         }
         let root = build_root_refs(config)?;
-        let layer_refs = build_layer_refs(config)?;
+        let mut layer_refs = build_layer_refs(config)?;
+        if let Qwen4TierRecipe::FlashNextSlab { arenas, .. } = recipe {
+            for layer in &mut layer_refs {
+                let Qwen4FfnWeights::Moe(moe) = &mut layer.ffn else {
+                    continue;
+                };
+                let plan = arenas.layer(layer.layer).ok_or_else(|| {
+                    WeightError::DescriptorMismatch(format!(
+                        "expert arena plan has no layer {}",
+                        layer.layer
+                    ))
+                })?;
+                let prefix = moe
+                    .experts_gate_up
+                    .name
+                    .strip_suffix(".mlp.experts.gate_up_proj")
+                    .ok_or_else(|| {
+                        WeightError::DescriptorMismatch(moe.experts_gate_up.name.clone())
+                    })?;
+                moe.expert_arena = Some(TensorRef::new(
+                    format!("{prefix}{}", crate::expert_arena::ARENA_SUFFIX),
+                    TensorRole::RoutedArena,
+                    Some(layer.layer),
+                    vec![plan.bytes],
+                    DType::Raw,
+                )?);
+            }
+        }
         let mtp = config
             .mtp
             .is_some()
@@ -3039,6 +3092,60 @@ fn assembly_manifest(
     Qwen4Manifest::build_with_recipe(config, recipe.clone())
 }
 
+/// Replace each trunk layer's two aggregate routed-expert entries with the one
+/// `slab_arena` entry of its [`crate::expert_arena::ExpertArenaLayer`]: raw
+/// bytes (`DType::Raw`, shape `[arena_bytes]`), replicated. The MTP head's
+/// experts (`mtp.…`, not `layers.{L}.`) keep their aggregate entries.
+fn apply_expert_arenas(
+    weights: &mut Vec<WeightEntry>,
+    arenas: &crate::expert_arena::ExpertArenaPlan,
+) -> Result<(), WeightError> {
+    use crate::expert_arena::ARENA_SUFFIX;
+    let mut seen = 0usize;
+    let mut out = Vec::with_capacity(weights.len());
+    for entry in weights.drain(..) {
+        let trunk = entry.layer.filter(|_| entry.name.starts_with("model.language_model.layers."));
+        let projection = if entry.name.ends_with(".mlp.experts.gate_up_proj") {
+            Some(".mlp.experts.gate_up_proj")
+        } else if entry.name.ends_with(".mlp.experts.down_proj") {
+            Some(".mlp.experts.down_proj")
+        } else {
+            None
+        };
+        let (Some(layer), Some(suffix)) = (trunk, projection) else {
+            out.push(entry);
+            continue;
+        };
+        if suffix == ".mlp.experts.down_proj" {
+            continue;
+        }
+        let plan = arenas.layer(layer).ok_or_else(|| {
+            WeightError::DescriptorMismatch(format!("expert arena plan has no layer {layer}"))
+        })?;
+        let prefix = entry
+            .name
+            .strip_suffix(suffix)
+            .expect("suffix checked above");
+        out.push(WeightEntry::layer_with_dtype_constraint(
+            format!("{prefix}{ARENA_SUFFIX}"),
+            layer,
+            vec![plan.bytes],
+            DType::Raw,
+            DTypeConstraint::source_exact(DType::Raw),
+            ShardPolicy::Replicate,
+        ));
+        seen += 1;
+    }
+    *weights = out;
+    if seen != arenas.layers().len() {
+        return Err(WeightError::DescriptorMismatch(format!(
+            "expert arena plan has {} layers but the manifest declares {seen} trunk MoE layers",
+            arenas.layers().len()
+        )));
+    }
+    Ok(())
+}
+
 /// Whether `name` is a routed expert stack (trunk `…mlp.experts.*` or the MTP
 /// head's `mtp.layers.0.mlp.experts.*`): the only tensors expert parallelism
 /// shards.
@@ -3186,6 +3293,7 @@ fn build_ffn_refs(
         } => {
             let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
+                expert_arena: None,
                 experts_down: tr(
                     "experts.down_proj",
                     TensorRole::RoutedDown,

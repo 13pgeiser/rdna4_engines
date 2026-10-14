@@ -23,6 +23,8 @@ pub mod expert_residency;
 pub mod expert_slabs;
 /// Validated CPU-only per-expert payload spans and optional scale validation.
 pub mod expert_slab_table;
+/// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
+pub mod expert_arena;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
