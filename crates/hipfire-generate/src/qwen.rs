@@ -2391,6 +2391,38 @@ fn commit_qwen4_session(model: &mut LoadedModel) {
     }
 }
 
+/// `HIPFIRE_QWEN_CACHE_TRACE=1`: one `[qwen4-session]` line per Qwen4 request
+/// with the reuse the session cache planned against the committed history
+/// (`prior`, the previous turn's consumed tokens) and, on a divergent render,
+/// the token ids around the first difference. Host-only; no device work.
+fn trace_qwen4_session_plan(route: SessionRoute, prior: &[u32], prompt: &[u32], reused: usize) {
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() != Some("1") {
+        return;
+    }
+    let lcp = prior.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+    let source = if reused == 0 {
+        "cold"
+    } else if reused == prior.len() && lcp == prior.len() {
+        "live"
+    } else {
+        "snapshot"
+    };
+    eprintln!(
+        "[qwen4-session] route={route:?} prompt={} prior={} lcp={lcp} reused={reused} new={} source={source}",
+        prompt.len(),
+        prior.len(),
+        prompt.len() - reused,
+    );
+    if lcp < prior.len() {
+        let lo = lcp.saturating_sub(8);
+        eprintln!(
+            "[qwen4-session ids] prior[{lo}..]={:?} prompt[{lo}..]={:?}",
+            &prior[lo..(lcp + 16).min(prior.len())],
+            &prompt[lo..(lcp + 16).min(prompt.len())],
+        );
+    }
+}
+
 /// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
 /// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
 /// so the DFlash path can use it too. Renders the canonical conversation via
@@ -3329,6 +3361,7 @@ pub fn generate_dflash(
             .as_deref()
             .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Mtp))
             .unwrap_or(0);
+        trace_qwen4_session_plan(SessionRoute::Mtp, &m.conversation_tokens, &prompt_tokens, start);
         prefill_start = start;
         prefill_tokens = prompt_tokens[start..].to_vec();
         cache_hit = start > 0;
@@ -8896,6 +8929,7 @@ pub fn generate_qwen4_ar(
         .as_deref()
         .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Ar))
         .unwrap_or(0);
+    trace_qwen4_session_plan(SessionRoute::Ar, &m.conversation_tokens, &prompt_tokens, reused);
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
