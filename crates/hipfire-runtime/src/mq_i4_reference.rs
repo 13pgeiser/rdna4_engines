@@ -558,9 +558,18 @@ pub fn decode_gemv_f32_parts(
         "decode_gemv_f32_parts: x length {} != k = {k}",
         x.len()
     );
-    let q: Vec<i8> = codes.iter().map(|&c| weight_i8(profile.codec, c)).collect();
-    let d: Vec<f32> = scale_bits.iter().map(|&b| scale_f32(b)).collect();
-    gemv_tree_f32_q(profile.rotation, m, k, &q, &d, x)
+    let groups = k / GROUP;
+    (0..m)
+        .map(|r| {
+            tree_row(
+                profile.codec,
+                profile.rotation,
+                &codes[r * k..(r + 1) * k],
+                &scale_bits[r * groups..(r + 1) * groups],
+                x,
+            )
+        })
+        .collect()
 }
 
 /// The frozen F4 decode tree over integer weights `q` (one `i8` per weight,
