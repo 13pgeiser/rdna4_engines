@@ -369,7 +369,7 @@ fn prologue(wg: &mut Wg, end: &End) -> R {
 /// (lanes past `rbc`, and packets of other waves, are masked by the callers).
 fn issue_loads(b: &mut Builder) -> R {
     sop(b, format!("s_lshl_b32 s{T0}, s{TRIP}, 2"), &[T0], &[TRIP])?;
-    sop(b, format!("s_add_i32 s{T0}, s{T0}, s{P0}"), &[T0], &[P0])?;
+    sop(b, format!("s_add_i32 s{T0}, s{T0}, s{P0}"), &[T0], &[T0, P0])?;
     for u in 0..4u8 {
         sop(b, format!("s_add_i32 s{T1}, s{T0}, {u}"), &[T1], &[T0])?;
         sop(b, format!("s_lshl_b32 s{T1}, s{T1}, 7"), &[T1], &[T1])?;
