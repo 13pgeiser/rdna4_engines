@@ -20,6 +20,9 @@ use rdna_compute::tensor_ops::{
     GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen, QsaKvFormat,
     QsaStateLayout,
 };
+use rdna_compute::qsa_pooled_mirror::{
+    qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -278,6 +281,18 @@ pub struct QsaF16Arena {
     pub valid_len: QsaF16ValidLen,
 }
 
+/// A QSA layer's persistent BF16 pooled-index mirror
+/// (`HIPFIRE_QWEN4_QSA_POOLED_BF16`), derived from the F32 `pooled_keys`
+/// (whose values are already BF16-rounded, so the high half of each F32 is
+/// exact). `mirror` is BF16 `[pooled_capacity * index_dim]`. Never
+/// snapshot-copied: `valid_blocks` counts leading pooled blocks whose mirror
+/// equals the canonical pooled keys, and the selector falls back to the F32
+/// keys for any block past it.
+pub struct QsaPooledBf16Arena {
+    pub mirror: GpuTensor,
+    pub valid_blocks: QsaPooledBf16ValidBlocks,
+}
+
 /// A production QSA block.  Full K/V, raw and pooled index buffers have the
 /// max sequence capacity shape; `*_len` fields are active append lengths. The
 /// K/V arenas hold `format`'s rows (`full_row_units` tensor units per token)
@@ -298,6 +313,8 @@ pub struct QsaGpuState {
     pub selected_indices: GpuTensor,
     /// Derived F16 K/V (`None` = the gathered attention converts per launch).
     pub f16_arena: Option<QsaF16Arena>,
+    /// Derived BF16 pooled-index mirror (`None` = score from the F32 keys).
+    pub pooled_bf16: Option<QsaPooledBf16Arena>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -351,24 +368,48 @@ impl QsaGpuState {
             .map_or(0, |arena| arena.valid(self.full_len))
     }
 
-    /// Clamp the arena's valid prefix to the F32 cache's committed rows. Every
-    /// path that rewinds `full_len` calls it: rows past the new mark are
-    /// rewritten later without the arena seeing them.
+    /// The pooled BF16 mirror as the selector reads it, `None` without one.
+    pub fn pooled_bf16_ref(&self) -> Option<QsaPooledBf16MirrorRef<'_>> {
+        self.pooled_bf16.as_ref().map(|arena| QsaPooledBf16MirrorRef {
+            mirror: &arena.mirror,
+            valid_blocks: &arena.valid_blocks,
+        })
+    }
+
+    /// Leading pooled blocks whose BF16 mirror is valid against the F32
+    /// pooled keys (0 without a mirror).
+    pub fn pooled_bf16_valid_blocks(&self) -> usize {
+        self.pooled_bf16_ref()
+            .map_or(0, |mirror| mirror.valid(self.pooled_len))
+    }
+
+    /// Clamp the derived arenas' valid prefixes to the committed rows: the F16
+    /// arena to `full_len` tokens and the pooled BF16 mirror to `pooled_len`
+    /// blocks. Every path that rewinds `full_len`/`pooled_len` calls it: rows
+    /// past the new marks are rewritten later without the arenas seeing them.
     pub(crate) fn clamp_f16_valid(&self) {
         if let Some(arena) = &self.f16_arena {
             arena.valid_len.clamp(self.full_len);
         }
+        if let Some(arena) = &self.pooled_bf16 {
+            arena.valid_blocks.clamp(self.pooled_len);
+        }
     }
 
-    /// Forget every converted row (reset, or the F32 rows were replaced).
+    /// Forget every converted row and mirrored block (reset, or the F32 rows
+    /// and pooled keys were replaced).
     pub(crate) fn invalidate_f16_arena(&self) {
         if let Some(arena) = &self.f16_arena {
             arena.valid_len.invalidate();
         }
+        if let Some(arena) = &self.pooled_bf16 {
+            arena.valid_blocks.invalidate();
+        }
     }
 
     /// The context arenas, in allocation order (full K, full V, raw and
-    /// pooled index keys, then the F16 arena's K and V when present).
+    /// pooled index keys, then the F16 arena's K and V and the pooled BF16
+    /// mirror when present).
     fn context_arenas(&self) -> impl Iterator<Item = &GpuTensor> {
         [
             &self.full_keys,
@@ -382,9 +423,10 @@ impl QsaGpuState {
                 .iter()
                 .flat_map(|arena| [&arena.keys, &arena.values]),
         )
+        .chain(self.pooled_bf16.iter().map(|arena| &arena.mirror))
     }
 
-    fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 6]> {
+    fn context_arenas_mut(&mut self) -> smallvec::SmallVec<[ContextArena<'_>; 7]> {
         let mut arenas = smallvec::smallvec![
             ContextArena {
                 tensor: &mut self.full_keys,
@@ -421,6 +463,14 @@ impl QsaGpuState {
                     blocks: true,
                 });
             }
+        }
+        if let Some(arena) = &mut self.pooled_bf16 {
+            arenas.push(ContextArena {
+                tensor: &mut arena.mirror,
+                rows: self.pooled_capacity,
+                pooled: true,
+                blocks: false,
+            });
         }
         arenas
     }
@@ -649,6 +699,10 @@ pub struct Qwen4StateFormat {
     /// Persistent per-layer F16 K/V arenas for the gathered prefill attention
     /// (`HIPFIRE_QWEN4_QSA_F16_ARENA`, gfx1151; [`resolve_state_format`]).
     pub qsa_f16_arena: bool,
+    /// Persistent per-layer BF16 pooled-index mirrors for the PM scorer
+    /// (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, gfx1151 F32 index_dim 128;
+    /// [`resolve_state_format`]).
+    pub qsa_pooled_bf16: bool,
 }
 
 impl Qwen4StateFormat {
@@ -657,6 +711,7 @@ impl Qwen4StateFormat {
         qsa: QsaKvFormat::F32,
         gdn: GdnStateFormat::F32,
         qsa_f16_arena: false,
+        qsa_pooled_bf16: false,
     };
 
     /// The QSA layers' context storage: what admission accounts and the state
@@ -665,6 +720,7 @@ impl Qwen4StateFormat {
         QsaStateLayout {
             kv: self.qsa,
             f16_arena: self.qsa_f16_arena,
+            pooled_bf16: self.qsa_pooled_bf16,
         }
     }
 }
@@ -683,6 +739,13 @@ pub fn resolve_state_format(
         qsa,
         gdn: resolve_gdn_format(state_request, config)?,
         qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
+        qsa_pooled_bf16: qsa_pooled_bf16_mirror_enabled(
+            gpu,
+            qsa,
+            config
+                .indexer_kv_heads
+                .saturating_mul(config.indexer_head_dim),
+        ),
     })
 }
 
@@ -874,6 +937,10 @@ impl Qwen4StateSnapshotArena {
                 .f16_arena
                 .as_ref()
                 .map_or(0, |arena| arena.keys.numel()));
+            mix(layer
+                .pooled_bf16
+                .as_ref()
+                .map_or(0, |arena| arena.mirror.numel()));
         }
         mix(state.ple_conv.as_ref().map_or(0, GpuTensor::numel));
         mix(state.hyper_feedback.numel());
@@ -1144,6 +1211,16 @@ impl Qwen4State {
             .checked_add(config.indexer_compress_ratio - 1)
             .ok_or(StateError::DimensionOverflow)?
             / config.indexer_compress_ratio;
+        if format.qsa_pooled_bf16
+            && (qsa_format != QsaKvFormat::F32 || raw_width != 128 || !gpu.arch_caps.is_gfx1151())
+        {
+            return Err(StateError::Config(format!(
+                "QSA pooled BF16 mirror needs exact F32 K/V on gfx1151 with index_dim 128, got {} on {} with {}",
+                qsa_format.name(),
+                gpu.arch,
+                raw_width
+            )));
+        }
         let selected_capacity = config.qsa_selected_capacity();
         let mut allocated = Vec::new();
         let allocation = (|| -> Result<(), StateError> {
@@ -1191,7 +1268,7 @@ impl Qwen4State {
                             0
                         };
                         // (elements, dtype, context arena: VMM-owned under the VMM backend).
-                        let specs = [
+                        let mut specs = vec![
                             (full_elements, qsa_format.kv_dtype(), true),
                             (full_elements, qsa_format.kv_dtype(), true),
                             (raw_elements, layout.index_dtype(), true),
@@ -1199,12 +1276,17 @@ impl Qwen4State {
                             (partial_key_elements, DType::F32, false),
                             (partial_value_elements, DType::F32, false),
                             (selected_bytes, DType::Raw, false),
-                            (arena_elements, DType::F16, true),
-                            (arena_elements, DType::F16, true),
                         ];
-                        for &(elements, dtype, context_arena) in
-                            &specs[..7 + 2 * usize::from(layout.f16_arena)]
-                        {
+                        if layout.f16_arena {
+                            specs.push((arena_elements, DType::F16, true));
+                            specs.push((arena_elements, DType::F16, true));
+                        }
+                        // The derived BF16 pooled-key mirror (same row count and
+                        // width as `pooled_keys`).
+                        if layout.pooled_bf16 {
+                            specs.push((pooled_elements, DType::BF16, true));
+                        }
+                        for &(elements, dtype, context_arena) in &specs {
                             let tensor = if context_arena && backend == Qwen4KvBackend::Vmm {
                                 // SAFETY: nothing is mapped; every access is
                                 // bounded by `ensure_mapped_capacity`'s prefix
@@ -1257,7 +1339,9 @@ impl Qwen4State {
             .iter()
             .map(|kind| match kind {
                 LayerType::LinearAttention => 2,
-                LayerType::FullAttention => 7 + 2 * usize::from(layout.f16_arena),
+                LayerType::FullAttention => {
+                    7 + 2 * usize::from(layout.f16_arena) + usize::from(layout.pooled_bf16)
+                }
             })
             .sum::<usize>()
             .checked_add(1 + usize::from(config.ple.is_some()))
@@ -1297,6 +1381,10 @@ impl Qwen4State {
                         values: next_tensor(),
                         valid_len: QsaF16ValidLen::default(),
                     });
+                    let pooled_bf16 = layout.pooled_bf16.then(|| QsaPooledBf16Arena {
+                        mirror: next_tensor(),
+                        valid_blocks: QsaPooledBf16ValidBlocks::default(),
+                    });
                     qsa.push(QsaGpuState {
                         format: qsa_format,
                         full_row_units,
@@ -1308,6 +1396,7 @@ impl Qwen4State {
                         partial_values,
                         selected_indices,
                         f16_arena,
+                        pooled_bf16,
                         full_capacity: max_seq_len,
                         raw_capacity: max_seq_len,
                         pooled_capacity,
@@ -1356,6 +1445,7 @@ impl Qwen4State {
                     ]
                     .into_iter()
                     .chain(layer.f16_arena.into_iter().flat_map(|a| [a.keys, a.values]))
+                    .chain(layer.pooled_bf16.into_iter().map(|a| a.mirror))
                     {
                         let _ = gpu.free_tensor(tensor);
                     }
@@ -2174,6 +2264,9 @@ impl Qwen4State {
                 free(arena.keys);
                 free(arena.values);
             }
+            if let Some(arena) = layer.pooled_bf16 {
+                free(arena.mirror);
+            }
         }
         if let Some(ple_conv) = self.ple_conv {
             free(ple_conv);
@@ -2724,6 +2817,48 @@ mod tests {
             if backend == Qwen4KvBackend::Legacy {
                 assert_eq!(with - plain, logical);
             }
+        }
+    }
+
+    #[test]
+    fn pooled_bf16_mirror_bytes_are_counted_for_legacy_and_vmm_states() {
+        let config = crate::config::compact_test_config();
+        let mirror = Qwen4StateFormat {
+            qsa_pooled_bf16: true,
+            ..Qwen4StateFormat::F32
+        };
+        let layout = mirror.layout();
+        assert_eq!(QsaStateLayout::F32.pooled_bf16_bytes_per_block(128), 0);
+        assert_eq!(layout.pooled_bf16_bytes_per_block(128), 256);
+        for backend in [Qwen4KvBackend::Legacy, Qwen4KvBackend::Vmm] {
+            let context = Qwen4ContextCommit::new(backend, 8193, 1025, 2 << 20);
+            let plain = context
+                .committed_layer_bytes(&config, QsaKvFormat::F32)
+                .unwrap();
+            let with = context.committed_layer_bytes(&config, layout).unwrap();
+            assert!(with > plain);
+            assert_eq!(
+                Qwen4State::device_bytes(&config, mirror, &context).unwrap()
+                    - Qwen4State::device_bytes(&config, Qwen4StateFormat::F32, &context).unwrap(),
+                (with - plain) * config.n_full_layers(),
+            );
+            // One 256-byte BF16 block per `ceil(tokens / 4)` pooled block.
+            let logical = config.qsa_context_arena_bytes(8193, layout).unwrap()
+                - config.qsa_context_arena_bytes(8193, QsaKvFormat::F32).unwrap();
+            assert_eq!(logical, 2049 * 256);
+            if backend == Qwen4KvBackend::Legacy {
+                assert_eq!(with - plain, logical);
+            }
+        }
+        // Per-layer logical deltas at 32K and 256K (x12 QSA layers: 24 MiB and
+        // 192 MiB); the derived mirror is not snapshot payload.
+        for (tokens, per_layer) in [(32_768usize, 2usize << 20), (262_144, 16 << 20)] {
+            assert_eq!(
+                config.qsa_context_arena_bytes(tokens, layout).unwrap()
+                    - config.qsa_context_arena_bytes(tokens, QsaKvFormat::F32).unwrap(),
+                per_layer
+            );
+            assert_eq!(per_layer * config.n_full_layers(), tokens / 4 * 256 * 12);
         }
     }
 

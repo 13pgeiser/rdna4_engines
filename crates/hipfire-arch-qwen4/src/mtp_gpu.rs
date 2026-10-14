@@ -2483,6 +2483,7 @@ impl Qwen4MtpGpu {
                     pooled_keys: &state.pooled_keys,
                     selected_indices: &state.selected_indices,
                     f16_arena: None,
+                    pooled_bf16: None,
                     full_capacity: state.full_capacity,
                     raw_capacity: state.raw_capacity,
                     pooled_capacity: state.pooled_capacity,

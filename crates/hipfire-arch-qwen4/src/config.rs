@@ -1681,8 +1681,10 @@ impl Qwen4Config {
     }
 
     /// Bytes of one QSA layer's context-sized storage, including its
-    /// optional derived F16 arena (four-token-rounded capacity). The MTP
-    /// head passes its plain F32 format and never owns the derived arena.
+    /// optional derived F16 arena (four-token-rounded capacity) and pooled
+    /// BF16 mirror (`ceil(max_seq / compress)` blocks of `index_dim` BF16
+    /// channels). The MTP head passes its plain F32 format and never owns a
+    /// derived arena.
     pub fn qsa_context_arena_bytes(
         &self,
         max_seq: usize,
@@ -1697,6 +1699,7 @@ impl Qwen4Config {
         max_seq
             .checked_mul(kv_row.checked_mul(2)?.checked_add(index_row)?)?
             .checked_add(pooled_rows.checked_mul(index_row)?)?
+            .checked_add(pooled_rows.checked_mul(layout.pooled_bf16_bytes_per_block(raw))?)?
             .checked_add(if layout.f16_arena {
                 max_seq.div_ceil(4).checked_mul(4)?
                     .checked_mul(self.num_key_value_heads)?

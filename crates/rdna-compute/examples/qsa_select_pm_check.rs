@@ -1268,6 +1268,7 @@ mod g3 {
         let c = &case.c;
         IndexedAttentionSelectBatch {
             query: &b.query, pooled: &b.pooled, selected: &b.selected, rows: c.rows, query_row_stride: c.stride,
+            pooled_bf16: None,
             block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
             position_start: c.position_start, capacity: c.capacity, shape_blocks: case.shape_blocks,
         }
@@ -1887,6 +1888,7 @@ mod g3_bf16 {
         let c = &case.c;
         IndexedAttentionSelectBatch {
             query: &d.query, pooled: &d.pooled, selected: &d.selected, rows: c.rows, query_row_stride: c.stride,
+            pooled_bf16: None,
             block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
             position_start: c.position_start, capacity: c.capacity, shape_blocks: shape,
         }

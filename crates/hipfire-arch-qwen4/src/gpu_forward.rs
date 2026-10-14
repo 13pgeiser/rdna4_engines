@@ -6189,6 +6189,8 @@ impl Qwen4GpuForward {
                             selected_indices: &state.selected_indices,
                             // Decode and speculative verify never consume the arena.
                             f16_arena: if self.prefill_scope { state.f16_arena_ref() } else { None },
+                            // The pooled BF16 mirror feeds decode and prefill scoring alike.
+                            pooled_bf16: state.pooled_bf16_ref(),
                             full_capacity: state.full_capacity,
                             raw_capacity: state.raw_capacity,
                             pooled_capacity: state.pooled_capacity,

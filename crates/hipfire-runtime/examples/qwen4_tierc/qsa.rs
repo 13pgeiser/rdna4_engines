@@ -1468,6 +1468,7 @@ fn public_select(
         &IndexedAttentionSelectBatch {
             query: r.query,
             pooled: r.pooled,
+            pooled_bf16: None,
             selected: &selected,
             rows: r.rows,
             query_row_stride: IDX_W,
@@ -3006,6 +3007,7 @@ fn case_fp8_select_attention(gpu: &mut Gpu) -> Result<String, String> {
             &IndexedAttentionSelectBatch {
                 query: &query_t,
                 pooled: &pooled_t,
+                pooled_bf16: None,
                 selected: &selected,
                 rows,
                 query_row_stride: IDX_W,

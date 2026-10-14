@@ -6,6 +6,9 @@
 
 use crate::arch_caps::ArchCaps;
 
+/// Exact sampled-threshold QSA selection with certified compaction and radix repair.
+pub const QSA_FILTER_SELECT_SRC: &str = include_str!("../../../kernels/src/qsa_filter_select.hip");
+
 /// G80 activation producer and exact integer BF16 epilogue (logged PM gaps).
 pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
 /// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.
@@ -7000,6 +7003,12 @@ pub const QWEN4_GEMV_Q8_0_SRC: &str = concat!(
 /// [`QWEN4_GEMV_BF16_XF32_SRC`] and [`QWEN4_GEMV_Q8_0_SRC`].
 pub const QWEN4_DECODE_HEAD_FUSE_SRC: &str =
     include_str!("../../../kernels/src/qwen4_decode_head_fuse.hip");
+/// Module `qsa_pooled_bf16_mirror` (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, exact
+/// gfx1151): `qsa_pooled_f32_to_bf16_mirror`, the lossless high-half copy of
+/// the BF16-rounded F32 pooled index keys, and the lab exactness probe
+/// `qsa_pooled_f32_low_nonzero_count`.
+pub const QSA_POOLED_BF16_MIRROR_SRC: &str =
+    include_str!("../../../kernels/src/qsa_pooled_bf16_mirror.hip");
 /// The MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560`).
 pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
     "#define HIPFIRE_TOPK8_RESCORE 1\n",

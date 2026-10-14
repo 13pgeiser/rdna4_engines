@@ -1396,6 +1396,7 @@ fn forward_lanes_scoped(
                                     pooled_keys: &qsa.pooled_keys,
                                     selected_indices: &qsa.selected_indices,
                                     f16_arena: if prefill { qsa.f16_arena_ref() } else { None },
+                                    pooled_bf16: qsa.pooled_bf16_ref(),
                                     full_capacity: qsa.full_capacity,
                                     raw_capacity: qsa.raw_capacity,
                                     pooled_capacity: qsa.pooled_capacity,

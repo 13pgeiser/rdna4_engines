@@ -2133,6 +2133,7 @@ pub fn execute_indexed_attention_core_rows(
         pooled_keys: op.state.pooled_keys,
         selected_indices: op.state.selected_indices,
         f16_arena: op.state.f16_arena,
+        pooled_bf16: op.state.pooled_bf16,
         full_capacity: op.state.full_capacity,
         raw_capacity: op.state.raw_capacity,
         pooled_capacity: op.state.pooled_capacity,
@@ -2668,6 +2669,7 @@ pub struct IndexedAttentionState<'a> {
     pub pooled_keys: &'a GpuTensor,
     pub selected_indices: &'a GpuTensor,
     pub f16_arena: Option<QsaF16ArenaRef<'a>>,
+    pub pooled_bf16: Option<rdna_compute::qsa_pooled_mirror::QsaPooledBf16MirrorRef<'a>>,
     pub full_capacity: usize,
     pub raw_capacity: usize,
     pub pooled_capacity: usize,
@@ -3006,6 +3008,18 @@ impl IndexedAttentionOp<'_> {
                     "indexed attention F16 arena values",
                 )?;
             }
+            if let Some(mirror) = &self.state.pooled_bf16 {
+                require_tensor(
+                    mirror.mirror,
+                    checked_mul(
+                        self.state.pooled_capacity,
+                        index_kv_width,
+                        "indexed attention pooled BF16 mirror",
+                    )?,
+                    DType::BF16,
+                    "indexed attention pooled BF16 mirror",
+                )?;
+            }
             require_tensor(
                 self.state.selected_indices,
                 checked_mul(
@@ -3336,6 +3350,9 @@ fn execute_indexed_attention_hc_impl(
     if let Some(arena) = &op.state.f16_arena {
         arena.valid_len.clamp(initial_position);
     }
+    if let Some(mirror) = &op.state.pooled_bf16 {
+        mirror.valid_blocks.clamp(initial_position / op.compress);
+    }
     let yarn = op.rope.yarn(op.rotary_dim);
     if let Some(src) = arenas {
         qsa_norm_source(
@@ -3558,6 +3575,16 @@ fn execute_indexed_attention_hc_impl(
             },
         ))?;
     }
+    if let Some(mirror) = &op.state.pooled_bf16 {
+        hip(rdna_compute::qsa_pooled_mirror::qsa_pooled_bf16_sync(
+            gpu,
+            op.state.pooled_keys,
+            mirror.mirror,
+            mirror.valid_blocks,
+            complete,
+            index_kv_width,
+        ))?;
+    }
     let selected_len_out = match op.mode {
         IndexedAttentionMode::Full => None,
         IndexedAttentionMode::AppendOnly => return Ok(()),
@@ -3604,6 +3631,9 @@ fn execute_indexed_attention_hc_impl(
     let select = IndexedAttentionSelectBatch {
         query: &index_batch,
         pooled: op.state.pooled_keys,
+        pooled_bf16: op.state.pooled_bf16.as_ref().and_then(|mirror| {
+            (mirror.valid_blocks.valid(complete) >= complete).then_some(mirror.mirror)
+        }),
         selected: &selected_batch,
         rows: op.rows,
         query_row_stride: index_width,
@@ -4561,6 +4591,7 @@ mod tests {
                 pooled_keys: t,
                 selected_indices: t,
                 f16_arena: None,
+                pooled_bf16: None,
                 full_capacity: 64,
                 raw_capacity: 64,
                 pooled_capacity: 16,

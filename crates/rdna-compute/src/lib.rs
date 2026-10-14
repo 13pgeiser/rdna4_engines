@@ -56,6 +56,7 @@ pub mod prefill_invariant;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
+pub mod qsa_pooled_mirror;
 pub mod qwen35_fa_batch;
 pub mod rdna;
 pub mod railgun_check;

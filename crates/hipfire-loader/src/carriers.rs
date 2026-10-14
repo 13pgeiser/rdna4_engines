@@ -1565,6 +1565,9 @@ pub fn load_qwen4_rank(
     if state_format.qsa_f16_arena {
         eprintln!("  qwen4 QSA F16 arena: on (BF-1, incremental exact prefill; decode F32)");
     }
+    if state_format.qsa_pooled_bf16 {
+        eprintln!("  qwen4 QSA pooled BF16 mirror: on (exact PM score input; selection unchanged)");
+    }
     use hipfire_arch_qwen4::expert_residency as residency;
     const MIB: u64 = 1 << 20;
     // Unified memory dropped the mapping above: size from the index.
@@ -1651,6 +1654,7 @@ pub fn load_qwen4_rank(
                 );
             if !fits {
                 if state_format.qsa_f16_arena
+                    || state_format.qsa_pooled_bf16
                     || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch))
                 {
                     return Err(format!(
