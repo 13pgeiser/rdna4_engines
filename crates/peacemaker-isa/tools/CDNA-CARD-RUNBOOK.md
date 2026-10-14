@@ -1,9 +1,10 @@
 # CDNA card runbook: `cdna_card_tierc` on MI300X (gfx942)
 
 Hardware proof that the three PeaceMaker gfx942 kernels (HIP twins) behave on a
-real MI300X the way the CPU emulator says they do. **Nothing here has been run
-on hardware yet.** Every time and result below is a target or an expectation,
-not a measurement.
+real MI300X the way the CPU emulator says they do. The committed
+[`docs/pm-cdna/card/`](../../../../docs/pm-cdna/card/) receipts cover
+`60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe`: quick 18/18 and full 47/47 pass.
+These are correctness receipts, not throughput certification or runtime admission.
 
 Kernels (twins in `kernels/src/pm_cdna/<name>.gfx942.hip`):
 
@@ -95,16 +96,16 @@ Expected environment: ROCm HIP 7.16, Rust 1.98.1 (the build needs the cargo
 registry/vendor state already present under `/scratch/g942/cargo`; this is
 unverified).
 
-## 4. Targets (UNVERIFIED pending hardware)
+## 4. Recorded card results
 
-| Run | Target wall time | Hard limit | Status |
+| Run | Measured wall time | Hard limit | Status |
 |---|---|---|---|
-| quick | **< 60 s** | `timeout --signal=KILL 600` | **UNVERIFIED** |
-| full | **< 600 s** | `timeout --signal=KILL 600` | **UNVERIFIED** |
+| quick | 4.239929567 s | `timeout --signal=KILL 600` | 18/18 pass |
+| full | 10.782849082 s | `timeout --signal=KILL 600` | 47/47 pass |
 
-These are design goals, not observations. A run that is killed by the timeout
-is a failed run with no receipt to trust; do not report it as a pass. Record the
-actual wall times from the first card run and replace this table then.
+These observations belong to the committed receipts and toolchain above; they
+are not kernel throughput measurements. A run killed by the timeout is failed,
+not a pass. Re-run Tier C when the PM gfx942 code-object bytes change.
 
 ## 5. Receipts
 

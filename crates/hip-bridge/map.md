@@ -360,6 +360,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-pflash`
 - `hipfire-runtime`
 - `hsa-bridge`
+- `peacemaker-isa`
 - `railgun`
 - `rdna-compute`
 - `saddle-core`
