@@ -2138,14 +2138,21 @@ impl Gpu {
             lane_rows_scope: false,
             prefill_invariant_scope: false,
         })
-        .map(|mut gpu| {
+        .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
             // available out of the box. No-op on consumer arches.
             gpu.try_init_rocblas();
-            gpu
+            // The opt-in gfx1100 wavegrid rendezvous kernels are bounded waits
+            // that decode graphs may capture; allocate their error block now.
+            if gpu.arch_caps.is_gfx1100()
+                && (gpu.flags.rdna3_rmsnorm_wavegrid || crate::gemv::awq_norm_wavegrid_requested())
+            {
+                gpu.ensure_device_wait_block()?;
+            }
+            Ok(gpu)
         })
     }
 
@@ -5297,23 +5304,51 @@ impl Gpu {
         self.host_mapped.len()
     }
 
-    /// Device address of this GPU's bounded-wait error block, for the
-    /// `hf_device_wait_block*` kernarg of every bounded spin-wait kernel
-    /// (`crate::device_wait`). The first call allocates the block. Every
-    /// call first reports a timeout an earlier step left unread, so a stale
-    /// code can never make a new wait stop early without failing.
-    pub(crate) fn device_wait_block(&mut self) -> HipResult<*mut c_void> {
-        if let Some(mapping) = &self.device_wait {
-            if let Some(timeout) = mapping.take(self.device_id) {
-                return Err(timeout.to_hip_error());
-            }
-            return Ok(mapping.device_ptr());
+    /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
+    /// if it does not exist yet. Allocation (`hipDeviceGetAttribute`,
+    /// `hipHostMalloc`, `hipHostGetDevicePointer`) is not capture-safe, so
+    /// every route that can capture a bounded-wait kernel calls this before
+    /// capture: `Gpus::prepare_tp_graph_signals` for each TP rank, `Gpu`
+    /// init when a gfx1100 wavegrid route is requested, and the DS4
+    /// `rsqrt_once` control-state setup.
+    pub fn ensure_device_wait_block(&mut self) -> HipResult<()> {
+        if self.device_wait.is_some() {
+            return Ok(());
         }
         self.bind_thread()?;
-        let mapping = crate::device_wait::DeviceWaitMapping::alloc(&self.hip, self.device_id)?;
-        let device = mapping.device_ptr();
-        self.device_wait = Some(mapping);
-        Ok(device)
+        self.device_wait = Some(crate::device_wait::DeviceWaitMapping::alloc(
+            &self.hip,
+            self.device_id,
+        )?);
+        Ok(())
+    }
+
+    /// Device address of this GPU's bounded-wait error block, for the
+    /// `hf_device_wait_block*` kernarg of every bounded spin-wait kernel.
+    /// Outside capture, the first call allocates the block. Under graph
+    /// capture the block must already exist ([`Self::ensure_device_wait_block`]),
+    /// so this fails closed rather than allocate mid-capture. Every call
+    /// first reports a timeout an earlier step left unread, so a stale code
+    /// can never make a new wait stop early without failing.
+    pub(crate) fn device_wait_block(&mut self) -> HipResult<*mut c_void> {
+        if self.device_wait.is_none() {
+            if self.graphs.capture_mode {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "GPU {}: bounded-wait kernel captured before its wait-error block was \
+                         allocated; call Gpu::ensure_device_wait_block before graph capture",
+                        self.device_id
+                    ),
+                ));
+            }
+            self.ensure_device_wait_block()?;
+        }
+        let mapping = self.device_wait.as_ref().expect("allocated above");
+        if let Some(timeout) = mapping.take(self.device_id) {
+            return Err(timeout.to_hip_error());
+        }
+        Ok(mapping.device_ptr())
     }
 
     /// The timeout a bounded device spin wait on this GPU recorded since the

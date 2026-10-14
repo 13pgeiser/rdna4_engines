@@ -13,10 +13,16 @@
 //! costs one bounded step instead of a wave that spins until process teardown.
 //!
 //! The waiting kernel's output after a timeout is garbage. The host must check
-//! the block after the step: [`crate::Gpu::take_device_wait_error`], and the
-//! `Gpu::download_*` reads, which check it automatically. The check turns a
-//! recorded timeout into a `HipError`, so the request fails. Reading the block
-//! clears it.
+//! the block after the step with [`crate::Gpu::take_device_wait_error`]. The
+//! `Gpu::download_*` reads, the batch sampler's D2H and the llama prefill
+//! sample read check it automatically. A raw `hip.memcpy_dtoh` of a step's
+//! result does not: such a reader must call the check itself, or a timeout
+//! surfaces only at the next bounded-wait launch. The check turns a recorded
+//! timeout into a `HipError`, so the request fails. Reading the block clears it.
+//!
+//! The block is allocated outside graph capture
+//! ([`crate::Gpu::ensure_device_wait_block`]); a bounded-wait launch under
+//! capture without one fails closed.
 
 use hip_bridge::{HipError, HipResult, HipRuntime};
 use std::ffi::c_void;
@@ -186,8 +192,9 @@ pub fn timeout_ticks(wall_clock_khz: u64) -> u64 {
 ///
 /// # Safety
 /// `block` must point to a live, aligned `DeviceWaitBlock`. The device may
-/// write it concurrently: a store that lands after this read stays set for
-/// the next check.
+/// write it concurrently. A store that lands after the clear stays set for
+/// the next check; one that lands between the read and the clear is lost,
+/// which only drops a second code while a first is already being reported.
 pub unsafe fn take_block(block: *mut DeviceWaitBlock, device_id: i32) -> Option<DeviceWaitTimeout> {
     use std::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
     // SAFETY: caller guarantees a live block; the device writes it with

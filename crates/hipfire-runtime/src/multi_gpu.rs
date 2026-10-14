@@ -1134,6 +1134,12 @@ impl Gpus {
                 gpu.ensure_tp_graph_signal_gfx1100_kernels()?;
             }
         }
+        // Every barrier kernel takes its rank's bounded-wait error block, and
+        // the barriers are first launched inside relaxed graph capture, where
+        // allocation is not safe. Allocate them all here, at load.
+        for gpu in &mut self.devices {
+            gpu.ensure_device_wait_block()?;
+        }
         let mut signals = Vec::with_capacity(n);
         for rank in 0..n {
             let gpu = &self.devices[rank];
@@ -1251,9 +1257,8 @@ impl Gpus {
     /// timeout means a peer rank stalled, so this step's results are invalid.
     ///
     /// On a timeout, every rank is synchronized and the TP graph signals are
-    /// zeroed before the error returns. The gfx1100 TP2 barrier generations
-    /// live on device, and the rank that timed out has advanced past its
-    /// peer, so without the reset the next replay would start skewed.
+    /// zeroed before the error returns, so the next step starts from a known
+    /// tape whatever the stalled rank left behind.
     pub fn take_device_wait_errors(&mut self) -> HipResult<()> {
         let timeouts: Vec<String> = self
             .devices
@@ -1293,6 +1298,22 @@ impl Gpus {
 
     pub fn tp_graph_captured_signal_count(&self) -> usize {
         self.tp_graph_capture_epoch
+    }
+
+    /// The epoch (gfx1201) or generation (gfx1100) each rank last published
+    /// on its TP graph signal. Synchronous read; for checks after a step.
+    pub fn tp_graph_signal_epochs(&self) -> HipResult<Vec<u32>> {
+        if self.tp_graph_signals.len() != self.devices.len() {
+            return Err(HipError::new(0, "TP graph signal tape is not prepared"));
+        }
+        let mut epochs = Vec::with_capacity(self.devices.len());
+        for (gpu, signal) in self.devices.iter().zip(&self.tp_graph_signals) {
+            gpu.bind_thread()?;
+            let mut bytes = [0u8; 4];
+            gpu.hip.memcpy_dtoh(&mut bytes, signal)?;
+            epochs.push(u32::from_ne_bytes(bytes));
+        }
+        Ok(epochs)
     }
 
     pub fn tp_graph_signals_ready(&self, barriers: usize) -> bool {
