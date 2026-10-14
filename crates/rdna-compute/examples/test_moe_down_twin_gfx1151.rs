@@ -61,12 +61,29 @@
 //! blocks is credited as free, so a kernel re-reading more than this shows up
 //! as a lower number.
 //!
+//! ## Sweep mode (`--sweep`)
+//! Runs the same production scatter, weight and X generators over uniform
+//! E512 M2560 K640 `x_row_div = 1` cases at tokens 145..=497 step 32 plus the 529
+//! control, comparing ONLY incumbent vs O8R8 (O16 is neither compiled nor run).
+//! Weights are built once and reused across cases. Every case still checks every
+//! output bit (padding, guard band, unwritten cells) against the incumbent, with
+//! WARMUP warmup launches and the median of SAMPLES event-timed launches, order
+//! alternating (inc,twin / twin,inc) per sample. Each case is seeded by its token
+//! count, so `--tokens=` reproduces the same routing/X for shared counts.
+//! `--tokens=a,b,c` (requires `--sweep`) replaces the token list, e.g. a dense
+//! pass around the crossover. The summary lists one row per case: tokens, live /
+//! launched tiles, incumbent and O8R8 median us and effective GB/s, the
+//! difference (inc - o8r8, positive = O8R8 faster) and the ratio. A positional
+//! argument still substring-filters case names.
+//!
 //! GFX1151 ONLY: refuses any other arch (exit 2).
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 [case-name-filter]
+//!   cargo run --release -p rdna-compute --example test_moe_down_twin_gfx1151 -- --sweep [--tokens=225,241,257] [filter]
 
 use hip_bridge::KernargBlob;
+use std::borrow::Cow;
 use rdna_compute::{Gpu, GpuTensor};
 
 const SRC_INCUMBENT: &str = include_str!(
@@ -266,7 +283,7 @@ enum XMode {
 }
 
 struct Spec {
-    name: &'static str,
+    name: Cow<'static, str>,
     e: usize,
     m: usize,
     k: usize,
@@ -284,7 +301,7 @@ struct Spec {
 
 const fn spec(name: &'static str, e: usize, m: usize, k: usize, tokens: usize) -> Spec {
     Spec {
-        name,
+        name: Cow::Borrowed(name),
         e,
         m,
         k,
@@ -458,13 +475,25 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 // ── one case ───────────────────────────────────────────────────────────────
 
 struct CaseOutcome {
-    name: &'static str,
+    name: String,
+    tokens: usize,
+    live_tiles: usize,
+    launched_tiles: usize,
     ok: bool,
     median_us: [f64; 3],
     gbps: [f64; 3],
 }
 
-fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOutcome {
+/// `active` lists the variant indices to run; `active[0]` MUST be 0 (the incumbent
+/// reference every other variant is compared against bit-for-bit).
+fn run_case(
+    gpu: &mut Gpu,
+    spec: &Spec,
+    w: &Weights,
+    case_idx: usize,
+    active: &[usize],
+) -> CaseOutcome {
+    assert_eq!(active.first(), Some(&0), "incumbent must be the reference variant");
     let (e, m, k) = (spec.e, spec.m, spec.k);
     let mut rng = Rng(SEED ^ ((case_idx as u64 + 1) << 32) ^ 0xA5A5);
     let slots = spec.tokens * K_TOP;
@@ -588,7 +617,8 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOut
 
     // Correctness: one fresh-sentinel run per variant.
     let mut outputs: Vec<Vec<f32>> = Vec::new();
-    for (i, v) in VARIANTS.iter().enumerate() {
+    for &i in active {
+        let v = &VARIANTS[i];
         gpu.hip.memcpy_htod(&y_t.buf, f32_bytes(&sentinel)).expect("reset y");
         gpu.launch_kernel_blob(v.func, grid(v), block, 0, &mut blobs[i]).expect("launch");
         gpu.hip.device_synchronize().expect("sync");
@@ -597,7 +627,9 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOut
     let mut ok = true;
     let main_cells = gr * m;
     let mut verdicts: Vec<String> = Vec::new();
-    for (i, v) in VARIANTS.iter().enumerate() {
+    for (pos, &vi) in active.iter().enumerate() {
+        let v = &VARIANTS[vi];
+        let i = pos;
         let out = &outputs[i];
         let unwritten = out[..main_cells].iter().filter(|x| x.to_bits() == SENTINEL_BITS).count();
         let guard_bad =
@@ -654,14 +686,18 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOut
         gpu.hip.event_synchronize(&ev1).expect("evsync");
         gpu.hip.event_elapsed_ms(&ev0, &ev1).expect("elapsed") as f64 * 1000.0
     };
+    let perms: Vec<Vec<usize>> = match active {
+        [a, b] => vec![vec![*a, *b], vec![*b, *a]],
+        _ => PERMS.iter().map(|p| p.to_vec()).collect(),
+    };
     for w_i in 0..WARMUP {
-        for &i in &PERMS[w_i % 6] {
+        for &i in &perms[w_i % perms.len()] {
             time_one(gpu, i, &mut blobs);
         }
     }
     let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for s in 0..SAMPLES {
-        for &i in &PERMS[s % 6] {
+        for &i in &perms[s % perms.len()] {
             let t = time_one(gpu, i, &mut blobs);
             samples[i].push(t);
         }
@@ -672,9 +708,11 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOut
     let mut median_us = [0f64; 3];
     let mut gbps = [0f64; 3];
     println!(
-        "  timing: {SAMPLES} individual launches/variant after {WARMUP} warmup, order rotated over 6 perms"
+        "  timing: {SAMPLES} individual launches/variant after {WARMUP} warmup, order rotated over {} perms",
+        perms.len()
     );
-    for (i, v) in VARIANTS.iter().enumerate() {
+    for &i in active {
+        let v = &VARIANTS[i];
         let min = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
         let med = median(&mut samples[i]);
         median_us[i] = med;
@@ -693,10 +731,60 @@ fn run_case(gpu: &mut Gpu, spec: &Spec, w: &Weights, case_idx: usize) -> CaseOut
     for t in [topk_t, counts_t, offsets_t, sorted_t, tiles_t, inverse_t, x_t, y_t] {
         gpu.free_tensor(t).expect("free");
     }
-    CaseOutcome { name: spec.name, ok, median_us, gbps }
+    CaseOutcome {
+        name: spec.name.to_string(),
+        tokens: spec.tokens,
+        live_tiles: live_padded / BLOCK_M,
+        launched_tiles: tiles_launched,
+        ok,
+        median_us,
+        gbps,
+    }
+}
+
+/// Production-crossover sweep token counts (E512 M2560 K640, uniform, xdiv 1):
+/// 145..=497 step 32, plus the 529 control.
+const SWEEP_TOKENS: [usize; 13] =
+    [145, 177, 209, 241, 273, 305, 337, 369, 401, 433, 465, 497, 529];
+/// Sweep compares only the incumbent (variant 0) and the O8R8 twin (variant 1).
+const SWEEP_ACTIVE: [usize; 2] = [0, 1];
+
+fn sweep_specs(tokens: &[usize]) -> Vec<Spec> {
+    tokens
+        .iter()
+        .map(|&t| Spec {
+            name: Cow::Owned(format!("sweep_t{t}_E512_M2560_K640")),
+            ..spec("", 512, 2560, 640, t)
+        })
+        .collect()
 }
 
 fn main() {
+    let mut sweep = false;
+    let mut tokens_override: Option<Vec<usize>> = None;
+    let mut filter: Option<String> = None;
+    for a in std::env::args().skip(1) {
+        if a == "--sweep" {
+            sweep = true;
+        } else if let Some(list) = a.strip_prefix("--tokens=") {
+            let v: Vec<usize> = list
+                .split(',')
+                .map(|s| s.trim().parse().unwrap_or_else(|_| panic!("bad --tokens entry {s:?}")))
+                .collect();
+            assert!(!v.is_empty() && v.iter().all(|&t| t > 0), "--tokens needs positive counts");
+            tokens_override = Some(v);
+        } else if a.starts_with("--") {
+            eprintln!("unknown flag {a} (supported: --sweep, --tokens=a,b,c with --sweep)");
+            std::process::exit(2);
+        } else {
+            filter = Some(a);
+        }
+    }
+    if tokens_override.is_some() && !sweep {
+        eprintln!("--tokens requires --sweep");
+        std::process::exit(2);
+    }
+
     let mut gpu = Gpu::init().expect("GPU init");
     println!("arch = {}", gpu.arch);
     if !(gpu.arch_caps.is_gfx1151() && gpu.arch.starts_with("gfx1151")) {
@@ -706,20 +794,31 @@ fn main() {
         );
         std::process::exit(2);
     }
-    for v in &VARIANTS {
+    let active: Vec<usize> =
+        if sweep { SWEEP_ACTIVE.to_vec() } else { (0..VARIANTS.len()).collect() };
+    for &i in &active {
+        let v = &VARIANTS[i];
         gpu.ensure_kernel_public(v.func, v.src, v.func)
             .unwrap_or_else(|e| panic!("compile {}: {e:?}", v.func));
     }
-    let filter = std::env::args().nth(1);
 
     println!(
         "bytes denominator: W (unique touched experts, once each) + X (unique referenced rows, \
          once each) + Y (grouped_rows*M*4); GB/s = bytes/1e9/median_s"
     );
 
+    // Sweep cases are seeded by token count (not list position), so a dense
+    // follow-up run reproduces the same routing/X for any shared token count.
+    let all_specs: Vec<(u64, Spec)> = if sweep {
+        let toks = tokens_override.clone().unwrap_or_else(|| SWEEP_TOKENS.to_vec());
+        sweep_specs(&toks).into_iter().map(|s| (s.tokens as u64, s)).collect()
+    } else {
+        specs().into_iter().enumerate().map(|(i, s)| (i as u64, s)).collect()
+    };
+
     let mut cache: Option<Weights> = None;
     let mut outcomes = Vec::new();
-    for (idx, sp) in specs().iter().enumerate() {
+    for (idx, sp) in all_specs.iter() {
         if filter.as_deref().is_some_and(|f| !sp.name.contains(f)) {
             continue;
         }
@@ -744,33 +843,63 @@ fn main() {
             ));
         }
         let w = cache.as_ref().unwrap();
-        outcomes.push(run_case(&mut gpu, sp, w, idx));
+        outcomes.push(run_case(&mut gpu, sp, w, *idx as usize, &active));
     }
     if let Some(old) = cache.take() {
         old.free(&mut gpu);
     }
 
-    println!("\n================ SUMMARY (median us | eff GB/s; ratio vs incumbent) ================");
-    println!(
-        "{:<36} {:>8} | {:>9} {:>7} | {:>9} {:>7} {:>6} | {:>9} {:>7} {:>6}",
-        "case", "verdict", "inc us", "GB/s", "twin us", "GB/s", "x", "o16 us", "GB/s", "x"
-    );
     let mut all_ok = !outcomes.is_empty();
-    for o in &outcomes {
-        all_ok &= o.ok;
+    if sweep {
         println!(
-            "{:<36} {:>8} | {:>9.2} {:>7.1} | {:>9.2} {:>7.1} {:>6.3} | {:>9.2} {:>7.1} {:>6.3}",
-            o.name,
-            if o.ok { "PASS" } else { "FAIL" },
-            o.median_us[0],
-            o.gbps[0],
-            o.median_us[1],
-            o.gbps[1],
-            o.median_us[0] / o.median_us[1],
-            o.median_us[2],
-            o.gbps[2],
-            o.median_us[0] / o.median_us[2],
+            "\n================ SWEEP SUMMARY (incumbent o8r16 vs twin o8r8 z2; median us | eff GB/s) ================"
         );
+        println!(
+            "{:>6} {:<26} {:>7} {:>6} {:>6} | {:>9} {:>7} | {:>9} {:>7} | {:>9} {:>7}",
+            "tokens", "case", "verdict", "live_t", "launch", "inc us", "GB/s", "o8r8 us", "GB/s",
+            "inc-o8r8", "inc/o8r8"
+        );
+        for o in &outcomes {
+            all_ok &= o.ok;
+            println!(
+                "{:>6} {:<26} {:>7} {:>6} {:>6} | {:>9.2} {:>7.1} | {:>9.2} {:>7.1} | {:>+9.2} {:>7.3}x",
+                o.tokens,
+                o.name,
+                if o.ok { "PASS" } else { "FAIL" },
+                o.live_tiles,
+                o.launched_tiles,
+                o.median_us[0],
+                o.gbps[0],
+                o.median_us[1],
+                o.gbps[1],
+                o.median_us[0] - o.median_us[1],
+                o.median_us[0] / o.median_us[1],
+            );
+        }
+    } else {
+        println!(
+            "\n================ SUMMARY (median us | eff GB/s; ratio vs incumbent) ================"
+        );
+        println!(
+            "{:<36} {:>8} | {:>9} {:>7} | {:>9} {:>7} {:>6} | {:>9} {:>7} {:>6}",
+            "case", "verdict", "inc us", "GB/s", "twin us", "GB/s", "x", "o16 us", "GB/s", "x"
+        );
+        for o in &outcomes {
+            all_ok &= o.ok;
+            println!(
+                "{:<36} {:>8} | {:>9.2} {:>7.1} | {:>9.2} {:>7.1} {:>6.3} | {:>9.2} {:>7.1} {:>6.3}",
+                o.name,
+                if o.ok { "PASS" } else { "FAIL" },
+                o.median_us[0],
+                o.gbps[0],
+                o.median_us[1],
+                o.gbps[1],
+                o.median_us[0] / o.median_us[1],
+                o.median_us[2],
+                o.gbps[2],
+                o.median_us[0] / o.median_us[2],
+            );
+        }
     }
     println!("OVERALL: {}", if all_ok { "PASS (all bitwise identical)" } else { "FAIL" });
     std::process::exit(if all_ok { 0 } else { 1 });
