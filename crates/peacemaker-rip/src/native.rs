@@ -127,13 +127,19 @@ impl Nat {
 
 // ---- names ----------------------------------------------------------------------
 
-const COMMON_FNS: &[&str] = &[
-    "v", "vr", "s", "sr", "lit", "op", "mem", "sop", "smem", "srd_tail", "add64", "add64_imm", "smem_off", "s_add_u32", "s_addc_u32", "s_add_i32", "bload", "bstore_b128", "gather_offset",
+pub(crate) const COMMON_FNS: &[&str] = &[
+    "v", "vr", "s", "sr", "lit", "op", "mem", "sop", "smem", "srd_tail", "add64", "add64_imm", "smem_off", "s_add_u32", "s_addc_u32", "s_add_i32", "bload", "bstore_b128", "gather_offset", "workgroup_id",
     "ready", "retire", "rotate", "prime", "retire_cur", "join",
 ];
-const ASSOC_FNS: &[&str] = &[
+pub(crate) const ASSOC_FNS: &[&str] = &[
     "Builder::new", "RegPlan::new", "KernargLayout::new", "Instruction::new", "Chain::new", "Live::Between", "Ring::new", "Workgroup::new", "String::new", "String::from", "Vec::new", "Vec::with_capacity",
     "cmp::max", "cmp::min", "mem::swap",
+];
+/// Method names `wg_method` implements on `Workgroup` / `Wave`.
+pub(crate) const WORKGROUP_METHODS: &[&str] = &[
+    "isa", "position", "lds", "relayout", "join", "split", "ring", "ring_steady", "begin_write", "ds_store", "ds_store2", "ds_load", "ds_load_cur", "wait", "wait_all", "barrier", "signal",
+    "wait_arrived", "scmp", "scmp_wg_uniform", "label", "skip_if", "skip_unless", "wg_skip_if", "exec_if", "forward", "if_else", "loop_until", "break_if", "loop_carried", "exit", "exit_if",
+    "wave_exit_unless", "wg_exit_unless", "end", "end_with", "handoff",
 ];
 
 pub fn is_fn(name: &str) -> bool {
@@ -257,6 +263,14 @@ fn insn_of<'a>(it: &Interp<'a>, v: &Value<'a>) -> Res<Instruction> {
         _ => Err("expected an Instruction".into()),
     }
 }
+/// An `Instruction` consumed by the active driver, validated against the
+/// driver's arch before the driver sees it.
+fn checked_insn<'a>(it: &Interp<'a>, v: &Value<'a>, cx: &mut Cx<'_>) -> R<'a, Instruction> {
+    let insn = insn_of(it, v)?;
+    let arch = driver(cx)?.isa().spec.arch;
+    crate::validate::instruction(arch, &insn.text, &insn.defs, &insn.uses)?;
+    Ok(insn)
+}
 fn opt_u8<'a>(it: &Interp<'a>, v: &Value<'a>, what: &str) -> Res<Option<u8>> {
     match it.deref(v.clone()) {
         Value::Enum(t, var, p) if &*t == "Option" => {
@@ -312,6 +326,44 @@ fn with_b<'a, T>(it: &Interp<'a>, v: &Value<'a>, cx: &mut Cx<'_>, f: impl FnOnce
         }
         o => Err(format!("expected a builder (`Builder::new(..)` or `wg.isa()`), found {}", o.type_name()).into()),
     }
+}
+
+/// `workgroup_id(b, axis, dst)`: copy the work-group id of `axis` (0 = x, 1 = y)
+/// into SGPR `dst`, from the architecture's launch state. Axis 2 (z) is always an
+/// error: `KernelSpec` has no z flag and the emitted descriptor always sets
+/// `system_sgpr_workgroup_id_z 0`, so the hardware never fills z.
+///
+/// gfx12 reads the architected TTMPs (`ttmp9` = x, `ttmp7[15:0]` = y); y needs the
+/// descriptor's Y work-group id enabled (`system_sgpr_workgroup_id_y`). gfx11 reads
+/// the system SGPRs that follow the user SGPRs (x at `s{user_sgpr_count}`, y at the
+/// next one when the Y flag is set). The gfx11 source SGPR is a use, so the
+/// register plan must own it.
+fn workgroup_id(b: &mut Builder, axis: i128, dst: u8) -> Res<()> {
+    use peacemaker_isa::arch::WgIdSource;
+    let arch = b.spec.arch;
+    let y_flag = b.spec.system_sgpr_workgroup_id_y;
+    let name = arch.name();
+    let needs_y = || format!("workgroup_id: axis 1 (y) needs the Y work-group id enabled on {name}: set `system_sgpr_workgroup_id_y: true` in the KernelSpec");
+    match axis {
+        0..=1 => {}
+        2 => return Err("workgroup id z is not enabled: KernelSpec has no z flag; fold z into x or y".into()),
+        _ => return Err(format!("workgroup_id: axis must be 0 (x), 1 (y) or 2 (z), got {axis}")),
+    }
+    if arch.gfx12() {
+        let text = match axis {
+            0 => format!("s_mov_b32 s{dst}, ttmp9"),
+            _ if y_flag => format!("s_and_b32 s{dst}, ttmp7, 0xffff"),
+            _ => return Err(needs_y()),
+        };
+        return common::sop(b, text, &[dst], &[]);
+    }
+    let ids = arch.workgroup_ids(b.spec.user_sgpr_count).map_err(|e| format!("workgroup_id: {e}"))?;
+    let src = match (axis, ids.x, ids.y) {
+        (0, WgIdSource::Sgpr(n), _) => n,
+        (_, _, WgIdSource::Sgpr(n)) if y_flag => n,
+        _ => return Err(needs_y()),
+    };
+    common::sop(b, format!("s_mov_b32 s{dst}, s{src}"), &[dst], &[src])
 }
 
 fn driver<'a, 'c, 'x>(cx: &'x mut Cx<'c>) -> R<'a, &'x mut (dyn DynDriver + 'c)> {
@@ -495,18 +547,34 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
         "op" => {
             need(4)?;
             let (text, defs, uses) = (str_of(it, &a[1], "op text")?, regs_of(it, &a[2], "op defs")?, regs_of(it, &a[3], "op uses")?);
-            Ok(done(with_b(it, &a[0], cx, |b| common::op(b, text, &defs, &uses))?))
+            Ok(done(
+                with_b(it, &a[0], cx, |b| -> Res<Res<()>> {
+                    crate::validate::instruction(b.spec.arch, &text, &defs, &uses)?;
+                    Ok(common::op(b, text, &defs, &uses))
+                })??,
+            ))
         }
         "mem" => {
             need(5)?;
             let (text, defs, uses) = (str_of(it, &a[1], "mem text")?, regs_of(it, &a[2], "mem defs")?, regs_of(it, &a[3], "mem uses")?);
             let Some(Nat::Mem(class)) = nat_of(it, &a[4]) else { return Err("mem: the last argument is a MemoryClass".into()) };
-            Ok(done(with_b(it, &a[0], cx, |b| common::mem(b, text, &defs, &uses, class))?))
+            Ok(done(
+                with_b(it, &a[0], cx, |b| -> Res<Res<()>> {
+                    crate::validate::instruction(b.spec.arch, &text, &defs, &uses)?;
+                    Ok(common::mem(b, text, &defs, &uses, class))
+                })??,
+            ))
         }
         "sop" => {
             need(4)?;
             let (text, defs, uses) = (str_of(it, &a[1], "sop text")?, u8s_of(it, &a[2], "sop defs")?, u8s_of(it, &a[3], "sop uses")?);
-            Ok(done(with_b(it, &a[0], cx, |b| common::sop(b, text, &defs, &uses))?))
+            Ok(done(
+                with_b(it, &a[0], cx, |b| -> Res<Res<()>> {
+                    let (vd, vu): (Vec<RegRef>, Vec<RegRef>) = (defs.iter().map(|&n| common::s(n)).collect(), uses.iter().map(|&n| common::s(n)).collect());
+                    crate::validate::instruction(b.spec.arch, &text, &vd, &vu)?;
+                    Ok(common::sop(b, text, &defs, &uses))
+                })??,
+            ))
         }
         "smem" => {
             need(5)?;
@@ -539,6 +607,11 @@ pub fn call_fn<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut C
             let v: Vec<u8> = (1..=3).map(|i| u8_of(it, &a[i], "bstore_b128")).collect::<Res<_>>()?;
             let off = u32_of(it, &a[4], "bstore_b128")?;
             Ok(done(with_b(it, &a[0], cx, |b| common::bstore_b128(b, v[0], v[1], v[2], off))?))
+        }
+        "workgroup_id" => {
+            need(3)?;
+            let (axis, dst) = (int(it, &a[1], "workgroup_id axis")?, u8_of(it, &a[2], "workgroup_id dst")?);
+            Ok(done(with_b(it, &a[0], cx, |b| workgroup_id(b, axis, dst))?))
         }
         "gather_offset" => {
             need(7)?;
@@ -913,22 +986,22 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "ds_store" => {
             need!(2);
-            let (p, insn) = (place_of(it, &a[0])?, insn_of(it, &a[1])?);
+            let (p, insn) = (place_of(it, &a[0])?, checked_insn(it, &a[1], cx)?);
             done_with(driver(cx)?.ds_store(p, insn), |()| Value::Tuple(vec![place_val(p), pend(p)]))
         }
         "ds_store2" => {
             need!(3);
-            let (x, y, insn) = (place_of(it, &a[0])?, place_of(it, &a[1])?, insn_of(it, &a[2])?);
+            let (x, y, insn) = (place_of(it, &a[0])?, place_of(it, &a[1])?, checked_insn(it, &a[2], cx)?);
             done_with(driver(cx)?.ds_store2(x, y, insn), |()| Value::Tuple(vec![Value::Tuple(vec![place_val(x), pend(x)]), Value::Tuple(vec![place_val(y), pend(y)])]))
         }
         "ds_load" => {
             need!(2);
-            let (r, insn) = (region_of(it, &a[0])?, insn_of(it, &a[1])?);
+            let (r, insn) = (region_of(it, &a[0])?, checked_insn(it, &a[1], cx)?);
             done(driver(cx)?.ds_load(r, insn))
         }
         "ds_load_cur" => {
             need!(2);
-            let (g, insn) = (ring_of(it, &a[0])?, insn_of(it, &a[1])?);
+            let (g, insn) = (ring_of(it, &a[0])?, checked_insn(it, &a[1], cx)?);
             done(driver(cx)?.ds_load_cur(g, insn))
         }
         "wait" => {
@@ -958,12 +1031,12 @@ fn wg_method<'a>(it: &Interp<'a>, name: &str, args: Vec<Value<'a>>, cx: &mut Cx<
         }
         "scmp" => {
             need!(1);
-            let insn = insn_of(it, &a[0])?;
+            let insn = checked_insn(it, &a[0], cx)?;
             done_with(driver(cx)?.scmp(insn), |c| nat(Nat::Cond(c)))
         }
         "scmp_wg_uniform" => {
             need!(1);
-            let insn = insn_of(it, &a[0])?;
+            let insn = checked_insn(it, &a[0], cx)?;
             done_with(driver(cx)?.scmp_wg_uniform(insn), |c| nat(Nat::WgCond(c)))
         }
         "label" => {

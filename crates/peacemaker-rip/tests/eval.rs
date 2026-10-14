@@ -171,6 +171,7 @@ fn builder_vocabulary_emits_instructions_and_the_driver_scope_ends_at_the_next_b
 #[test]
 fn lds_handoff_needs_its_wait_before_the_barrier() {
     let store = r#"
+        op(wg.isa(), "v_mov_b32_e32 v1, 0", &[v(1)], &[])?;
         let t = wg.lds::<T>("t", 0, 16)?;
         let (t, st) = wg.ds_store(t, Instruction::new("ds_store_b32 v0, v1", vec![], vec![v(0), v(1)]).memory(MemoryClass::DsStore))?;
     "#;
@@ -185,7 +186,11 @@ fn lds_handoff_needs_its_wait_before_the_barrier() {
 
 #[test]
 fn chains_emit_wmma_with_exact_operands_and_reject_unsupported_shapes() {
-    let ok_src = spec_script(r#"let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
+    let ok_src = spec_script(r#"
+        for i in 8..16u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
+        for i in 16..20u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
+        for i in 24..28u8 { op(wg.isa(), format!("v_mov_b32_e32 v{i}, 0"), &[v(i)], &[])?; }
+        let acc = Chain::new(8, 8, "f16"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
     let e = peacemaker_rip::compile(&ok_src, Arch::Gfx1201, "v").unwrap_or_else(|e| panic!("{e}"));
     assert!(e.s_text.contains("v_wmma_f32_16x16x16_f16 v[8:15], v[16:19], v[24:27], v[8:15]"), "{}", e.s_text);
     let bad = spec_script(r#"let acc = Chain::new(8, 8, "iu4"); acc.step(wg.isa(), 16, 4, 24, 4)?;"#);
@@ -214,6 +219,7 @@ fn shared_helpers_spell_their_instructions_per_arch() {
             let mut wg = Workgroup::new(&mut b, spec.arch)?;
             smem(wg.isa(), 8, 8, 0, 0)?;
             srd_tail(wg.isa(), 12, None)?;
+            sop(wg.isa(), "s_mov_b32 s24, 0", &[24], &[])?;
             add64(wg.isa(), 16, 8, 24)?;
             sop(wg.isa(), format!("{} s17, s17, 1", s_add_i32(spec.arch)), &[17], &[17])?;
             let end = wg.exit(".Lend")?;

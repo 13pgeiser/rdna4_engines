@@ -2680,7 +2680,9 @@ name = "peacemaker-rip"
 version = "0.4.3"
 dependencies = [
  "peacemaker-author",
+ "peacemaker-ir",
  "peacemaker-isa",
+ "peacemaker-lift",
  "proc-macro2",
  "quote",
  "serde_json",

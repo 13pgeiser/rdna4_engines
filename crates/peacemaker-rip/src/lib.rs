@@ -47,6 +47,9 @@
 //! statement that mentions `b` again (typically `b.finish()`).
 
 pub mod builtin;
+pub mod diag;
+pub mod validate;
+pub mod srcfmt;
 pub mod driver;
 pub mod expand;
 pub mod fmt;
@@ -98,31 +101,52 @@ fn spec_value<'a>(it: &Interp<'a>, arch: Arch, variant: &str) -> Value<'a> {
     )
 }
 
-fn emitted_of(v: Value) -> Result<Emitted, String> {
+/// An `emit` failure: the located message, and whether it is the script's own
+/// `Err(..)` (bare when returned, so located here at the name of `fn emit`)
+/// rather than a native error or an entry-contract violation.
+type EmitError = (String, bool);
+
+/// The value `emit` returned as an `Emitted`. A native error that reached the
+/// result through `?` is already located and passes through; the script's own
+/// bare `Err(..)` and every contract violation are located at the name of `fn emit`.
+fn emitted_of(it: &Interp, v: Value) -> Result<Emitted, EmitError> {
+    let at = it.fn_loc("emit");
     match v {
         Value::Enum(t, var, mut p) if &*t == "Result" => {
             let payload = p.pop().unwrap_or(Value::Unit);
             if &*var == "Ok" {
                 match payload {
                     Value::Nat(native::Nat::Emitted(e)) => Ok(std::rc::Rc::try_unwrap(e).unwrap_or_else(|rc| (*rc).clone())),
-                    o => Err(format!("`emit` returned Ok({}), not an Emitted (finish the builder: `b.finish()`)", o.type_name())),
+                    o => Err((format!("{at}: `emit` returned Ok({}), not an Emitted (finish the builder: `b.finish()`)", o.type_name()), false)),
                 }
             } else {
-                Err(fmt::display(&payload).unwrap_or_else(|_| fmt::debug(&payload, false)))
+                let e = fmt::display(&payload).unwrap_or_else(|_| fmt::debug(&payload, false));
+                if e.starts_with(&format!("{}:", it.name)) {
+                    Err((e, false))
+                } else {
+                    Err((format!("{at}: {e}"), true))
+                }
             }
         }
-        o => Err(format!("`emit` must return Result<Emitted, String>, found {}", o.type_name())),
+        o => Err((format!("{at}: `emit` must return Result<Emitted, String>, found {}", o.type_name()), false)),
     }
 }
 
-fn emit_one<'a>(it: &Interp<'a>, arch: Arch, variant: &str) -> Result<Emitted, String> {
+fn emit_one_raw<'a>(it: &Interp<'a>, arch: Arch, variant: &str) -> Result<Emitted, EmitError> {
+    let at = it.fn_loc("emit");
     let args = match it.fn_arity("emit") {
         Some(1) => vec![spec_value(it, arch, variant)],
         Some(2) => vec![Value::Nat(native::Nat::Arch(arch)), Value::str(variant)],
-        Some(n) => return Err(format!("`emit` takes (spec) or (arch, variant), not {n} arguments")),
-        None => return Err("no `fn emit(spec: Spec) -> Result<Emitted, String>` entry point".into()),
+        Some(n) => return Err((format!("{at}: `emit` takes (spec) or (arch, variant), not {n} arguments"), false)),
+        None => return Err((format!("{at}: no `fn emit(spec: Spec) -> Result<Emitted, String>` entry point"), false)),
     };
-    emitted_of(it.call_entry("emit", args)?)
+    emitted_of(it, it.call_entry("emit", args).map_err(|e| (e, false))?)
+}
+
+fn emit_one<'a>(it: &Interp<'a>, arch: Arch, variant: &str) -> Result<Emitted, String> {
+    let emitted = emit_one_raw(it, arch, variant).map_err(|(m, _)| m)?;
+    validate::emitted(arch, &emitted.s_text, it.take_instruction_sites()).map_err(|errors| errors.join("\n"))?;
+    Ok(emitted)
 }
 
 /// Compile one variant of a `.rip` source for `arch`.
@@ -136,6 +160,106 @@ pub fn compile_named(source: &str, name: &str, arch: Arch, variant: &str) -> Res
         let file = parse(source, name)?;
         let it = Interp::load(&file, name);
         emit_one(&it, arch, variant)
+    })
+}
+
+/// Resources of one emitted kernel, read from its descriptor and body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resources {
+    pub vgprs: u32,
+    pub sgprs: u32,
+    pub lds_bytes: u32,
+    /// Instruction lines of the kernel body (waits and hazard guards included).
+    pub instructions: usize,
+}
+
+/// The outcome of [`check`]: the compiled variant and every diagnostic.
+#[derive(Clone, Debug)]
+pub struct Checked {
+    pub arch: Arch,
+    pub variant: String,
+    /// `Some` iff there is no error.
+    pub emitted: Option<Emitted>,
+    /// From the emitted descriptor (`.amdhsa_next_free_vgpr/sgpr`, group segment size).
+    pub resources: Option<Resources>,
+    /// Errors and warnings, in source order.
+    pub diagnostics: Vec<diag::Diagnostic>,
+}
+
+fn descriptor_int(text: &str, key: &str) -> Option<u32> {
+    text.lines().find_map(|l| l.trim().strip_prefix(key)?.trim().parse().ok())
+}
+
+fn resources_of(e: &Emitted) -> Option<Resources> {
+    let symbol = symbol_of(e).ok()?;
+    let label = format!("{symbol}:");
+    let end = format!(".L{symbol}_end:");
+    let mut body = e.s_text.lines().skip_while(|l| l.trim() != label).skip(1).take_while(|l| l.trim() != end);
+    let instructions = body
+        .by_ref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.starts_with(';') && !l.starts_with("//") && !l.ends_with(':'))
+        .count();
+    Some(Resources {
+        vgprs: descriptor_int(&e.s_text, ".amdhsa_next_free_vgpr ")?,
+        sgprs: descriptor_int(&e.s_text, ".amdhsa_next_free_sgpr ")?,
+        lds_bytes: descriptor_int(&e.s_text, ".amdhsa_group_segment_fixed_size ")?,
+        instructions,
+    })
+}
+
+/// Compile one variant and validate its final bytes; all errors come back as diagnostics.
+/// [`compile_named`] enforces the same validation and returns its errors as strings.
+pub fn check(source: &str, name: &str, arch: Arch, variant: &str) -> Checked {
+    let run = big_stack(|| -> Result<(Result<Emitted, EmitError>, Vec<(String, String)>), String> {
+        let file = parse(source, name)?;
+        let it = Interp::load(&file, name);
+        let r = emit_one_raw(&it, arch, variant);
+        Ok((r, it.take_instruction_sites()))
+    });
+    let (result, sites) = match run {
+        Ok(pair) => pair,
+        Err(e) => (Err((e, false)), Vec::new()),
+    };
+    let mut diagnostics = Vec::new();
+    let emitted = match result {
+        Ok(e) => match validate::emitted(arch, &e.s_text, sites) {
+            Ok(()) => Some(e),
+            Err(errors) => {
+                diagnostics.extend(errors.iter().map(|error| diag::Diagnostic::from_raw(error, name, source, diag::Severity::Error)));
+                None
+            }
+        },
+        Err((e, script)) => {
+            let mut d = diag::Diagnostic::from_raw(&e, name, source, diag::Severity::Error);
+            if script {
+                // `from_raw` cannot tell the script's own `Err(..)` from any other bare
+                // message; only the entry plumbing knows it was returned unlocated.
+                d.code = "R0502";
+                d.help = Some("the script's `emit` returned this `Err` itself: fix the condition it reports in the script".into());
+                d.suggestion = None;
+                // `from_raw` widens a bare position to the call there; the position is the
+                // name of `fn emit`, so the span is exactly that identifier.
+                if let Some(s) = d.span {
+                    d.span = Some(diag::Span { line: s.line, col: s.col, end_line: s.line, end_col: s.col + "emit".len() });
+                }
+            }
+            diagnostics.push(d);
+            None
+        }
+    };
+    diagnostics.sort_by_key(|d| d.span.map_or((usize::MAX, 0), |s| (s.line, s.col)));
+    let resources = emitted.as_ref().and_then(resources_of);
+    Checked { arch, variant: variant.to_string(), emitted, resources, diagnostics }
+}
+
+/// The variants declared by the script's `enum Kind`, with the declared
+/// spelling ([`compile`] matches them case-insensitively); empty without one.
+pub fn variants(source: &str, name: &str) -> Result<Vec<String>, String> {
+    big_stack(|| {
+        let file = parse(source, name)?;
+        let it = Interp::load(&file, name);
+        Ok(it.enum_variants("Kind").unwrap_or_default())
     })
 }
 

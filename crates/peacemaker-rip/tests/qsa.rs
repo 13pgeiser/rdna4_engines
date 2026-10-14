@@ -56,18 +56,25 @@ fn standalone_qsa_matches_rust_and_shipped_objects() {
 
 #[test]
 fn race_twins_and_escape_seams_are_rejected() {
+    // (name, negative, fixed control, the hazard code the negative's first error must carry)
     let fixtures = [
-        ("halo_verify_attn_race", include_str!("ui/halo_verify_attn_race.rip"), include_str!("ui/halo_verify_attn_fixed.rip")),
-        ("fa2_mailbox_race", include_str!("ui/fa2_mailbox_race.rip"), include_str!("ui/fa2_mailbox_fixed.rip")),
-        ("raw_escape_barrier", include_str!("ui/raw_escape_barrier.rip"), include_str!("ui/raw_checked_barrier.rip")),
-        ("loop_carried_undrained_store", include_str!("ui/loop_carried_undrained_store.rip"), include_str!("ui/loop_carried_drained_store.rip")),
+        ("halo_verify_attn_race", include_str!("ui/halo_verify_attn_race.rip"), include_str!("ui/halo_verify_attn_fixed.rip"), "R0301"),
+        ("fa2_mailbox_race", include_str!("ui/fa2_mailbox_race.rip"), include_str!("ui/fa2_mailbox_fixed.rip"), "R0302"),
+        ("raw_escape_barrier", include_str!("ui/raw_escape_barrier.rip"), include_str!("ui/raw_checked_barrier.rip"), "R0403"),
+        ("loop_carried_undrained_store", include_str!("ui/loop_carried_undrained_store.rip"), include_str!("ui/loop_carried_drained_store.rip"), "R0404"),
     ];
     for arch in [Arch::Gfx1151, Arch::Gfx1201] {
-        for (name, source, fixed) in fixtures {
+        for (name, source, fixed, code) in fixtures {
+            let control = peacemaker_rip::check(fixed, name, arch, "negative");
+            assert!(control.diagnostics.is_empty(), "{} {name} fixed: {:?}", arch.name(), control.diagnostics);
             let corrected = peacemaker_rip::compile(fixed, arch, "negative").unwrap_or_else(|e| panic!("{name} fixed: {e}"));
             assert!(corrected.s_text.contains(if arch.gfx12() { "s_barrier_signal" } else { "s_barrier" }) || name == "loop_carried_undrained_store");
-            let error = peacemaker_rip::compile(source, arch, "negative").err().expect(name);
-            println!("PASS {} {name}: negative rejected ({error}); fixed control emitted successfully", arch.name());
+            let checked = peacemaker_rip::check(source, name, arch, "negative");
+            let first = checked.diagnostics.first().unwrap_or_else(|| panic!("{} {name}: negative produced no diagnostic", arch.name()));
+            assert_ne!(first.code, "R0603", "{} {name}: {}", arch.name(), first.message);
+            assert_ne!(first.code, "R0604", "{} {name}: {}", arch.name(), first.message);
+            println!("PASS {} {name}: negative rejected with {} ({}); fixed control emitted successfully", arch.name(), first.code, first.message);
+            assert_eq!(first.code, code, "{} {name}: {}", arch.name(), first.message);
         }
     }
 }

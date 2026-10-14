@@ -60,6 +60,14 @@ pub struct EnumDef {
     /// Variant, tuple arity, discriminant.
     pub variants: Vec<(String, usize, Option<i128>)>,
 }
+/// The last `Workgroup` scope that ended at the first statement mentioning its
+/// builder: where it opened, which builder, and the statement that closed it.
+struct ScopeNote {
+    open_line: usize,
+    builder: String,
+    close_line: usize,
+}
+
 struct ConstDef<'a> {
     expr: &'a Expr,
     ty: Ty,
@@ -74,6 +82,10 @@ pub struct Interp<'a> {
     structs: HashMap<String, StructDef>,
     enums: HashMap<String, EnumDef>,
     depth: Cell<usize>,
+    /// `(instruction text, "file:line:col")` for each validated raw instruction, in call order.
+    instruction_sites: RefCell<Vec<(String, String)>>,
+    /// The last scope closed by a builder mention, to explain "no active Workgroup" faults.
+    scope_note: RefCell<Option<ScopeNote>>,
 }
 
 const MAX_DEPTH: usize = 160;
@@ -115,7 +127,11 @@ impl<'a> Interp<'a> {
             structs: HashMap::new(),
             enums: HashMap::new(),
             depth: Cell::new(0),
+            instruction_sites: RefCell::new(Vec::new()),
+            scope_note: RefCell::new(None),
         };
+        // Drop texts a previous evaluation on this thread left queued; this Interp has made no calls yet.
+        let _ = crate::validate::take_texts();
         let mut traits: HashMap<String, Vec<(String, &'a syn::TraitItemFn)>> = HashMap::new();
         it.load_items(&file.items, &mut traits);
         it
@@ -233,18 +249,76 @@ impl<'a> Interp<'a> {
         self.fns.get(name).map(|f| f.params.len())
     }
 
+    /// `name:line:col` of the name of the script function `name` (`emit` in `fn emit`), else `name:1:1`.
+    pub fn fn_loc(&self, name: &str) -> String {
+        match self.fns.get(name) {
+            Some(f) => {
+                let s = f.sig.ident.span().start();
+                format!("{}:{}:{}", self.name, s.line, s.column + 1)
+            }
+            None => format!("{}:1:1", self.name),
+        }
+    }
+
+    /// Explain a "no active Workgroup" fault with the scope that just ended at
+    /// the first statement mentioning its builder, if there was one.
+    fn with_scope_note(&self, m: String) -> String {
+        if !(m.contains("no active Workgroup") || m.contains("outside the Workgroup scope")) {
+            return m;
+        }
+        match &*self.scope_note.borrow() {
+            Some(n) => format!(
+                "{m} (the scope opened by `Workgroup::new(&mut {b}, ..)` at line {} ended at line {}, the first statement mentioning `{b}`; the usual culprit is `let {b} = wg.isa();`, use `wg.isa()` directly)",
+                n.open_line,
+                n.close_line,
+                b = n.builder
+            ),
+            None => m,
+        }
+    }
+
+    /// Validated raw-instruction sites queued by native calls so far, draining the queue.
+    pub(crate) fn take_instruction_sites(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.instruction_sites.borrow_mut())
+    }
+
+    /// Prefix `msg` with `at` (line, col) unless it already starts with this file's name.
+    fn located(&self, at: (usize, usize), msg: &str) -> String {
+        if msg.starts_with(&format!("{}:", self.name)) {
+            msg.to_string()
+        } else {
+            format!("{}:{}:{}: {msg}", self.name, at.0, at.1)
+        }
+    }
+
+    /// Post-process the result of a native call at `at`: queue the raw
+    /// instruction texts `validate` accepted, tagged with this call site, and
+    /// locate an `Err(String)` script value.
+    fn after_native(&self, r: R<'a>, at: (usize, usize)) -> R<'a> {
+        for text in crate::validate::take_texts() {
+            self.instruction_sites.borrow_mut().push((text, format!("{}:{}:{}", self.name, at.0, at.1)));
+        }
+        match r {
+            Ok(Value::Enum(t, var, p)) if &*t == "Result" && &*var == "Err" && matches!(p.as_slice(), [Value::Str(_)]) => {
+                let Some(Value::Str(s)) = p.into_iter().next() else { unreachable!() };
+                Ok(Value::err(self.located(at, &s)))
+            }
+            r => r,
+        }
+    }
+
     /// Call the script function `name`. Hard faults come back as
     /// `Err(located message)`; the script's own `Err(..)` is a normal value.
     pub fn call_entry(&self, name: &str, args: Vec<Value<'a>>) -> Result<Value<'a>, String> {
-        let f = self.fns.get(name).cloned().ok_or_else(|| format!("{}: no `fn {name}` entry point", self.name))?;
+        let f = self.fns.get(name).cloned().ok_or_else(|| format!("{}: no `fn {name}` entry point", self.fn_loc(name)))?;
         let mut cx = Cx::root();
         let r = self.call_fn(&f, args, &mut cx);
         match r {
             Ok(v) => Ok(v),
             Err(Ctl::Return(v)) => Ok(v),
             Err(Ctl::Fatal(m)) => Err(m),
-            Err(Ctl::Err(m)) => Err(format!("{}: {m}", self.name)),
-            Err(Ctl::Break(..)) | Err(Ctl::Continue(_)) => Err(format!("{}: `break`/`continue` outside a loop", self.name)),
+            Err(Ctl::Err(m)) => Err(format!("{}: {m}", self.fn_loc(name))),
+            Err(Ctl::Break(..)) | Err(Ctl::Continue(_)) => Err(format!("{}: `break`/`continue` outside a loop", self.fn_loc(name))),
         }
     }
 
@@ -508,7 +582,7 @@ impl<'a> Interp<'a> {
 
     pub fn eval(&self, e: &'a Expr, env: &mut Env<'a>, cx: &mut Cx<'_>) -> R<'a> {
         match self.eval_inner(e, env, cx) {
-            Err(Ctl::Err(m)) => Err(Ctl::Fatal(format!("{}: {m}", self.loc(e)))),
+            Err(Ctl::Err(m)) => Err(Ctl::Fatal(format!("{}: {}", self.loc(e), self.with_scope_note(m)))),
             r => r,
         }
     }
@@ -980,6 +1054,11 @@ impl<'a> Interp<'a> {
         while i < n {
             if let Some(ws) = workgroup_let(&stmts[i]) {
                 let end = (i + 1..n).find(|&k| mentions(&stmts[k], &ws.builder)).unwrap_or(n);
+                *self.scope_note.borrow_mut() = (end < n).then(|| ScopeNote {
+                    open_line: ws.call.span().start().line,
+                    builder: ws.builder.clone(),
+                    close_line: stmts[end].span().start().line,
+                });
                 let v = self.workgroup_scope(&ws, &stmts[i + 1..end], env, cx)?;
                 last = if end == n { v } else { Value::Unit };
                 i = end;
@@ -1062,7 +1141,10 @@ impl<'a> Interp<'a> {
         match r {
             Ok(r) => r,
             // `Workgroup::new(..)?`: the driver refused the backend.
-            Err(e) => Err(Ctl::Return(Value::err(e))),
+            Err(e) => {
+                let s = ws.call.span().start();
+                Err(Ctl::Return(Value::err(self.located((s.line, s.column + 1), &e))))
+            }
         }
     }
 
@@ -1254,7 +1336,13 @@ impl<'a> Interp<'a> {
         }
         let f = self.eval(&c.func, env, cx)?;
         let args = self.eval_args(&c.args, env, cx)?;
-        self.call_value(&f, args, cx)
+        let native = matches!(self.deref(f.clone()), Value::Func(func) if matches!(&*func, Func::Native(_)));
+        let r = self.call_value(&f, args, cx);
+        if native {
+            let s = c.func.span().start();
+            return self.after_native(r, (s.line, s.column + 1));
+        }
+        r
     }
 
     pub fn call_value(&self, f: &Value<'a>, args: Vec<Value<'a>>, cx: &mut Cx<'_>) -> R<'a> {
@@ -1389,8 +1477,15 @@ impl<'a> Interp<'a> {
             return r.map_err(Ctl::Err);
         }
         if let Value::Nat(n) = &d {
-            if let Some(r) = native::method(self, n, &name, &targs, args.clone(), cx)? {
-                return Ok(r);
+            let r = native::method(self, n, &name, &targs, args.clone(), cx);
+            let s = m.method.span().start();
+            let at = (s.line, s.column + 1);
+            match r {
+                Ok(Some(v)) => return self.after_native(Ok(v), at),
+                Ok(None) => {
+                    self.after_native(Ok(Value::Unit), at)?;
+                }
+                Err(e) => return self.after_native(Err(e), at),
             }
         }
         if let Some(r) = crate::builtin::call(self, &d, &name, &targs, args, cx)? {
