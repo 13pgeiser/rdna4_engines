@@ -25,6 +25,10 @@ pub mod expert_slabs;
 pub mod expert_slab_table;
 /// Per-layer contiguous expert slab arenas (K4 loader plan + fulfillment payload).
 pub mod expert_arena;
+/// Aggregate MQ4-XTS expert tensors to per-expert slab spans (B5-C1 adapter).
+pub mod expert_slab_aggregate;
+/// Pure per-expert device/host-mapped placement plan (B5-C1).
+pub mod expert_tier_plan;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
