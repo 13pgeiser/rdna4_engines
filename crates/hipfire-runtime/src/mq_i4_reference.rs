@@ -433,9 +433,65 @@ pub fn iu4_gemm_f32_parts(
 // F4 decode GEMV tree
 // --------------------------------------------------------------------------
 
+/// The frozen wave tree for one output row over an arbitrary weight source.
+/// `weight(g, j)` is the f32 weight `RN(d_g * q_j)` of row column `j` (in
+/// group `g`). This is the single definition of the tree; everything else
+/// (`tree_row`, [`gemv_tree_f32_q`]) only supplies the weight source.
+#[inline]
+fn tree_row_core(
+    four_chain: bool,
+    groups: usize,
+    x: &[f32],
+    weight: impl Fn(usize, usize) -> f32,
+) -> f32 {
+    let mut lanes = [0.0f32; WAVE];
+    for (lane, slot) in lanes.iter_mut().enumerate() {
+        let mut acc = [0.0f32; 4];
+        for g in 0..groups {
+            let j = g * GROUP + 4 * lane;
+            let mut p = weight(g, j) * x[j];
+            for i in 1..4 {
+                p = weight(g, j + i).mul_add(x[j + i], p);
+            }
+            let chain = if four_chain { g & 3 } else { 0 };
+            acc[chain] += p;
+        }
+        *slot = if four_chain {
+            (acc[0] + acc[1]) + (acc[2] + acc[3])
+        } else {
+            acc[0]
+        };
+    }
+    for off in [16usize, 8, 4, 2, 1] {
+        let snapshot = lanes;
+        for l in 0..WAVE - off {
+            lanes[l] = snapshot[l] + snapshot[l + off];
+        }
+    }
+    lanes[0]
+}
+
 /// One output row of the frozen wave tree. `codes`/`scale_bits` are the
 /// row's `k` codes and `k/128` scales.
 fn tree_row(
+    codec: MqI4Codec,
+    rotation: MqI4Rotation,
+    codes: &[u8],
+    scale_bits: &[u16],
+    x: &[f32],
+) -> f32 {
+    tree_row_core(
+        rotation == MqI4Rotation::R256,
+        scale_bits.len(),
+        x,
+        |g, j| scale_f32(scale_bits[g]) * weight_i8(codec, codes[j]) as f32,
+    )
+}
+
+/// The pre-extraction body of `tree_row`, kept verbatim so a test can prove
+/// the shared tree helper is bit-equal to it.
+#[cfg(test)]
+fn tree_row_pre_refactor(
     codec: MqI4Codec,
     rotation: MqI4Rotation,
     codes: &[u8],
@@ -502,16 +558,53 @@ pub fn decode_gemv_f32_parts(
         "decode_gemv_f32_parts: x length {} != k = {k}",
         x.len()
     );
+    let q: Vec<i8> = codes.iter().map(|&c| weight_i8(profile.codec, c)).collect();
+    let d: Vec<f32> = scale_bits.iter().map(|&b| scale_f32(b)).collect();
+    gemv_tree_f32_q(profile.rotation, m, k, &q, &d, x)
+}
+
+/// The frozen F4 decode tree over integer weights `q` (one `i8` per weight,
+/// row-major `[m, k]`) and one f32 scale `d` per 128-column group (row-major
+/// `[m, k/128]`). The weight is `w = RN(d * q)` exactly as in
+/// [`decode_gemv_f32_parts`] (which is this function on `weight_i8` codes and
+/// f16-widened scales); the tree is selected by `rotation` (`R256` four
+/// chains, `R128` one). Lets other codecs whose weights are `d * integer`
+/// share the one frozen tree. `x` is `k` f32; returns `m` values.
+///
+/// Panics unless `k % 128 == 0`, `k % rotation.width() == 0`, `m, k > 0` and
+/// the three slice lengths match.
+pub fn gemv_tree_f32_q(
+    rotation: MqI4Rotation,
+    m: usize,
+    k: usize,
+    q: &[i8],
+    d: &[f32],
+    x: &[f32],
+) -> Vec<f32> {
+    const WHO: &str = "gemv_tree_f32_q";
+    let shape = MqI4Profile {
+        codec: MqI4Codec::W3,
+        rotation,
+    };
+    if let Err(e) = mq_i4::tensor_bytes(shape, m, k) {
+        panic!("{WHO}: invalid {rotation:?} shape [{m}, {k}]: {e}");
+    }
     let groups = k / GROUP;
+    assert_eq!(q.len(), m * k, "{WHO}: q length {} != m*k = {} for [{m}, {k}]", q.len(), m * k);
+    assert_eq!(
+        d.len(),
+        m * groups,
+        "{WHO}: d length {} != m*(k/128) = {} for [{m}, {k}]",
+        d.len(),
+        m * groups
+    );
+    assert_eq!(x.len(), k, "{WHO}: x length {} != k = {k}", x.len());
+    let four_chain = rotation == MqI4Rotation::R256;
     (0..m)
         .map(|r| {
-            tree_row(
-                profile.codec,
-                profile.rotation,
-                &codes[r * k..(r + 1) * k],
-                &scale_bits[r * groups..(r + 1) * groups],
-                x,
-            )
+            let qr = &q[r * k..(r + 1) * k];
+            let dr = &d[r * groups..(r + 1) * groups];
+            tree_row_core(four_chain, groups, x, |g, j| dr[g] * qr[j] as f32)
         })
         .collect()
 }
@@ -1580,6 +1673,55 @@ mod tests {
             MqI4Rotation::R256 => [256, 512, 768],
             MqI4Rotation::R128 => [128, 384, 640],
         }
+    }
+
+    /// Seeded corpus: the extracted `gemv_tree_f32_q` helper and the
+    /// `decode_gemv_f32_parts` wrapper are bit-equal to the pre-refactor tree
+    /// body ([`tree_row_pre_refactor`]) on every profile and width, including
+    /// extreme scales (`H_MAX`, `H_MIN_SUB`, zero) and zero activations.
+    #[test]
+    fn extracted_tree_helper_bit_equal_pre_refactor_body() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut rows = 0usize;
+        for profile in MqI4Profile::ALL {
+            for k in widths(profile) {
+                for _case in 0..8 {
+                    let m = 5usize;
+                    let levels = u64::from(profile.codec.levels()) + 1;
+                    let codes: Vec<u8> = (0..m * k).map(|_| rng.below(levels) as u8).collect();
+                    let scales: Vec<u16> = (0..m * (k / 128))
+                        .map(|_| match rng.below(8) {
+                            0 => H_MAX,
+                            1 => H_MIN_SUB,
+                            2 => 0,
+                            _ => rng.scale_bits(),
+                        })
+                        .collect();
+                    let x: Vec<f32> =
+                        (0..k).map(|_| if rng.below(16) == 0 { 0.0 } else { rng.x() }).collect();
+                    let groups = k / 128;
+                    let want: Vec<f32> = (0..m)
+                        .map(|r| {
+                            tree_row_pre_refactor(
+                                profile.codec,
+                                profile.rotation,
+                                &codes[r * k..(r + 1) * k],
+                                &scales[r * groups..(r + 1) * groups],
+                                &x,
+                            )
+                        })
+                        .collect();
+                    let got = decode_gemv_f32_parts(profile, m, k, &codes, &scales, &x);
+                    assert_eq!(bits32(&got), bits32(&want), "wrapper {} k={k}", profile.name());
+                    let q: Vec<i8> = codes.iter().map(|&c| weight_i8(profile.codec, c)).collect();
+                    let d: Vec<f32> = scales.iter().map(|&b| scale_f32(b)).collect();
+                    let direct = gemv_tree_f32_q(profile.rotation, m, k, &q, &d, &x);
+                    assert_eq!(bits32(&direct), bits32(&want), "helper {} k={k}", profile.name());
+                    rows += m;
+                }
+            }
+        }
+        assert_eq!(rows, 4 * 3 * 8 * 5);
     }
 
     /// gamma_n = n u / (1 - n u).
