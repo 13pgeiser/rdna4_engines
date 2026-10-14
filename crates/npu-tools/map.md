@@ -1,11 +1,11 @@
 # npu-tools — map
 
 > **Status:** `research` (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
-> **Layer:** NPU research (dark), above `pm-npu` and `railgun`; see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+> **Layer:** NPU research (dark), above `peacemaker-npu` and `railgun`; see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Purpose
 
-All XDNA2 NPU binaries in one crate: `npu-tools` (`aie-status`, `txn-dump`, `soc-metrics`, `m4`, `tblgen2rs`, `gpu-bw`, `fclk` subcommands), `npu-gemm`, `npu-hello`, `npu-experts`, `npu-ring`, `npu-railgun`, `npu-bw`, `npu-coop`, and the lab-only `coop27` GPU+NPU co-op prototype (`--features lab`). Runtime comes from `railgun` with `features = ["npu"]`; programs from `pm-npu`. See [`docs/npu/README.md`](../../docs/npu/README.md).
+All XDNA2 NPU binaries in one crate: `npu-tools` (`aie-status`, `txn-dump`, `soc-metrics`, `m4`, `tblgen2rs`, `gpu-bw`, `fclk` subcommands), `npu-gemm`, `npu-hello`, `npu-experts`, `npu-ring`, `npu-railgun`, `npu-bw`, `npu-coop`, and the lab-only `coop27` GPU+NPU co-op prototype (`--features lab`). Runtime comes from `railgun` with `features = ["npu"]`; programs from `peacemaker-npu`. See [`docs/npu/README.md`](../../docs/npu/README.md).
 
 ## Gotchas
 
