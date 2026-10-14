@@ -908,7 +908,7 @@ fn write_kl_npy(path: &Path, rows: &[f64]) -> Result<(), String> {
 
 fn score_s11ref(
     model: &Path, ref_path: &Path, corpus_path: &Path, output: &Path,
-    decode: bool, ple_hot: Option<u64>,
+    decode: bool, ple_hot: Option<u64>, smoke_seqs: Option<usize>,
 ) -> Result<(), String> {
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
     // SAFETY: a read-only map of the immutable reference; parsing uses LE bytes.
@@ -928,7 +928,7 @@ fn score_s11ref(
     let mut kls = Vec::with_capacity(reference.header.n_rows);
     let mut block = TopKBlock { residual_logprob: 0.0, top: Vec::with_capacity(reference.header.k) };
     let started = Instant::now();
-    for s in &corpus.sequences {
+    for s in corpus.sequences.iter().take(smoke_seqs.unwrap_or(usize::MAX)) {
         if decode {
             m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
             let row = m.logits.sub_offset(0, m.vocab);
@@ -959,7 +959,17 @@ fn score_s11ref(
                     .map_err(|e| e.to_string())?);
             }
         }
-        eprintln!("  {}: {} rows scored, {:.0}s", s.id, kls.len(), started.elapsed().as_secs_f64());
+        let seq_rows = s.score_positions.len();
+        let seq_mean = kls[kls.len() - seq_rows..].iter().sum::<f64>() / seq_rows.max(1) as f64;
+        eprintln!("  {}: {} rows scored, seq mean KLD {:.6}, {:.0}s", s.id, kls.len(), seq_mean, started.elapsed().as_secs_f64());
+    }
+    if smoke_seqs.is_some() {
+        if kls.iter().any(|v| !v.is_finite()) {
+            return Err("non-finite KL rows".into());
+        }
+        eprintln!("qwen4_kld s11ref SMOKE (first {} sequences, not a gate, no receipt): mean KLD = {:.12}  ({} rows)",
+            smoke_seqs.unwrap_or(0), kls.iter().sum::<f64>() / kls.len().max(1) as f64, kls.len());
+        return Ok(());
     }
     if kls.len() != reference.header.n_rows || kls.iter().any(|v| !v.is_finite()) {
         return Err("invalid or incomplete KL rows".into());
@@ -996,6 +1006,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut logits, mut teacher, mut corpus) = (None, None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     let (mut ple_hot, mut append_rows) = (None, Vec::new());
+    let mut smoke_seqs: Option<usize> = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -1020,11 +1031,12 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     }
                 }
             }
+            "--smoke-seqs" => smoke_seqs = Some(number(value()?)?),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
     if mode == "s11ref" && (max_chunks.is_some() || slice.is_some() || logits.is_some() || teacher.is_some()) {
-        return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported".into());
+        return Err("s11ref requires the full corpus; --max-chunks, --slice, --logits and --teacher are not supported (--smoke-seqs scores a prefix and is never a gate)".into());
     }
     if !append_rows.is_empty() && (mode != "eval" || decode) {
         return Err("--append-rows is an eval route and excludes --decode".into());
@@ -1038,7 +1050,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
             let corpus = corpus.ok_or("s11ref requires --corpus CORPUS.json (prefix tokens are not stored in S11REF)")?;
-            score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot)
+            score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot, smoke_seqs)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {
