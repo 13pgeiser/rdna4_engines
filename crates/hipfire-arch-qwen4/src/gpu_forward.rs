@@ -5268,8 +5268,10 @@ impl Qwen4GpuForward {
     /// capture (BF16 stream bits widen, F32 streams copy). The final hyper
     /// reads `streams` into other scratch, so the row is the trunk's output on
     /// the HIP and the retained-replay route alike. `destination` must be F32
-    /// with exactly `hc_count * hidden_size` elements. Calibration only; the
-    /// row is valid until the next forward writes `streams`.
+    /// with exactly `hc_count * hidden_size` elements. Read by the AR floor's
+    /// calibration token and by every retired AR token (whose row the MTP
+    /// head appends later); the row is valid until the next forward writes
+    /// `streams`.
     pub(crate) fn copy_last_wide_hidden_to(
         &self,
         gpu: &mut Gpu,
