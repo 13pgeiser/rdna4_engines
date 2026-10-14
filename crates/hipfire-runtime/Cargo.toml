@@ -149,6 +149,10 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
+# MoE-GEMV byte oracle (certified R1 records via S2's I4ExpertFinalCodeRecord, ExpertFormat/slab
+# geometry). hipfire-quantize depends on this crate as a normal edge; dev-dep cycles are legal.
+hipfire-quantize = { path = "../hipfire-quantize", default-features = false }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
 # Property tests (`ple_q4::tests::props`).

@@ -28,12 +28,22 @@
 //!   target/release/examples/mq_i4_moe_gemv_byte_oracle --codeobject /abs/mq_i4_moe_gemv_pm_gfx1201.hxaco \
 //!     [--artifact /abs/ctl3-hot.hfq --layer 0 [--real-experts 24]] [--old-kernel-parity] \
 //!     [--device N] [--card NAME] [--expect-uuid GPU-… --expect-bdf 0000:… --expect-arch gfx1201] [--only SUBSTR]…
+//! Certified R1 records (real weights, no packed HFQM; cases labelled origin `real_records_layer`):
+//!   … --records-dir …/r1/q/w3-gptq3/L0 --records-manifest …/r1/pack/w3-gptq3/L0/manifest.json \
+//!     --alloc …/alloc.ctl3hot.json [--point ctl3-hot] --xts /models/….mq4 --layer0 \
+//!     [--map …/ctl3-hot.map.json] [--records-manifest-sha256 HEX] [--xts-sha256 HEX] [--real-experts 24]
+//!   Cold = W3 experts imported with `I4ExpertFinalCodeRecord::import_npz_file` (NPZ sha256 and encoded
+//!   gate++down sha256 checked against the manifest); hot = MQ4-XTS per-expert slices of the XTS aggregate
+//!   tensors read through `HfqFile`. Activations stay synthetic. Runs after the 13 synthetic cases.
 //! Timing (separate fabric run after G1 passed; raw device-event samples, R6 takes the median):
 //!   … --codeobject … --timing --reps 30 --warmup 5 [--launches 32] --card NAME \
 //!     --fabric-owner OWNER --fabric-wrapper /path/fabric-run.sh [--fabric-card NAME]
 //!   (`--card`/`--fabric-owner`/`--fabric-wrapper` fall back to env `FABRIC_CARD`/`FABRIC_OWNER`/`FABRIC_WRAPPER`.)
 //! Prints one machine JSON line on stdout; exit code 1 on any mismatch or error.
 use hip_bridge::{DeviceBuffer, Function, HipRuntime};
+use hipfire_arch_qwen4::expert_slabs::{ExpertFormat, ExpertProj};
+use hipfire_quantize::i4_records::{I4ExpertFinalCodeRecord, I4RecordShapes};
+use hipfire_quantize::i4_slabs::{load_allocation, SlabGeometry};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::mq_i4::{self, MqI4Profile};
 use hipfire_runtime::mq_i4_reference::{self, DecodeKind, ExpertTensor};
@@ -41,6 +51,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::rc::Rc;
 
 type Result<T, E = String> = std::result::Result<T, E>;
@@ -915,7 +926,7 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
     Ok(Real { experts, meta, mq4_sym_violations: violations })
 }
 
-fn real_cases(real: &Real) -> Vec<Case> {
+fn real_cases(real: &Real, origin: &'static str, prefix: &str) -> Vec<Case> {
     let all: Vec<u32> = real.experts.keys().copied().collect();
     let by = |c: Codec| -> Vec<u32> { all.iter().copied().filter(|id| real.experts[id].codec == c).collect() };
     let (w3, mq4) = (by(Codec::W3), by(Codec::Mq4));
@@ -935,10 +946,227 @@ fn real_cases(real: &Real) -> Vec<Case> {
     let mut route1 = ids.clone();
     rng.shuffle(&mut route1);
     let sub: BTreeMap<u32, Rc<Expert>> = ids.iter().map(|id| (*id, real.experts[id].clone())).collect();
-    let c1 = build_case("real_c1_mixed", "real", 1, route1, sub, false, false, 0);
+    let c1 = build_case(&format!("{prefix}_c1_mixed"), origin, 1, route1, sub, false, false, 0);
     let route8 = lane_routes(&mut rng, &all, 8);
-    let c8 = build_case("real_c8_union_mixed", "real", 8, route8, real.experts.clone(), false, false, 1);
+    let c8 = build_case(&format!("{prefix}_c8_union_mixed"), origin, 8, route8, real.experts.clone(), false, false, 1);
     vec![c1, c8]
+}
+
+// ---------------------------------------------------------------------------------------
+// Certified R1 records + XTS aggregate (real weights, no packed HFQM)
+// ---------------------------------------------------------------------------------------
+
+/// Origin label of the certified-records cases; deliberately not "packed HFQM".
+const RECORDS_ORIGIN: &str = "real_records_layer";
+
+/// sha256 and length of a whole file, streamed.
+fn file_sha256(path: &str) -> Result<(String, u64)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let (mut h, mut n) = (Sha256::new(), 0u64);
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let k = f.read(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+        if k == 0 {
+            break;
+        }
+        h.update(&buf[..k]);
+        n += k as u64;
+    }
+    Ok((hex(&h.finalize()), n))
+}
+
+/// `layers["<layer>"]` of a `ctl3-hot.map.json`: `"w3"` / `"xts_mq4"` (/`"w2"`) per expert.
+fn hot_map_formats(root: &Value, layer: usize) -> Result<Vec<ExpertFormat>> {
+    let row = root
+        .get("layers")
+        .and_then(|l| l.get(layer.to_string()))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("map has no layers[\"{layer}\"] array"))?;
+    if row.len() != N_EXPERTS {
+        return Err(format!("map layers[\"{layer}\"] has {} experts, expected {N_EXPERTS}", row.len()));
+    }
+    row.iter()
+        .enumerate()
+        .map(|(e, v)| match v.as_str() {
+            Some("w3") => Ok(ExpertFormat::Mq3I4),
+            Some("w2") => Ok(ExpertFormat::Mq2I4),
+            Some("xts_mq4") => Ok(ExpertFormat::Mq4Xts),
+            other => Err(format!("map layers[\"{layer}\"][{e}] = {other:?} is not w3/w2/xts_mq4")),
+        })
+        .collect()
+}
+
+/// How many W3 (cold) and MQ4-XTS (hot) experts to take for `want` total, half each, topping a short
+/// side up from the other.
+fn select_counts(w3_len: usize, mq4_len: usize, want: usize) -> (usize, usize) {
+    let want = want.max(10);
+    let half = want / 2;
+    let mut take_w3 = half.min(w3_len);
+    let mut take_mq4 = (want - half).min(mq4_len);
+    if take_w3 + take_mq4 < want {
+        take_w3 = (want - take_mq4).min(w3_len);
+        take_mq4 = (want - take_w3).min(mq4_len);
+    }
+    (take_w3, take_mq4)
+}
+
+fn spread(v: &[u32], n: usize) -> Vec<u32> {
+    (0..n).map(|i| v[i * v.len() / n]).collect()
+}
+
+/// Strict real weights: cold experts are the certified R1 NPZ records imported through
+/// `I4ExpertFinalCodeRecord::import_npz_file` (S2 encode + round trip), hot experts are the
+/// per-expert gate/down slices of the XTS aggregate tensors, read through `HfqFile` + the source entry span.
+fn load_records(cfg: &Cfg) -> Result<Real> {
+    let layer = cfg.layer;
+    let (dir, manifest_path, alloc_path, xts_path) = match (&cfg.records_dir, &cfg.records_manifest, &cfg.alloc, &cfg.xts) {
+        (Some(d), Some(m), Some(a), Some(x)) => (d.as_str(), m.as_str(), a.as_str(), x.as_str()),
+        _ => return Err("certified-records mode needs --records-dir, --records-manifest, --alloc and --xts".into()),
+    };
+    // Manifest identity.
+    let manifest_bytes = std::fs::read(manifest_path).map_err(|e| format!("{manifest_path}: {e}"))?;
+    let manifest_sha = hex(&sha(&manifest_bytes));
+    if let Some(want) = &cfg.records_manifest_sha256 {
+        if *want != manifest_sha {
+            return Err(format!("manifest sha256 {manifest_sha} != expected {want}"));
+        }
+    }
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|e| format!("{manifest_path}: {e}"))?;
+    let want_expert_bytes = Kind::GateUp.tensor_bytes(Codec::W3) + Kind::Down.tensor_bytes(Codec::W3);
+    let header_ok = manifest.get("layer").and_then(Value::as_u64) == Some(layer as u64)
+        && manifest.get("bits").and_then(Value::as_u64) == Some(3)
+        && manifest.get("grid").and_then(Value::as_str) == Some("uniform")
+        && manifest.get("expert_bytes").and_then(Value::as_u64) == Some(want_expert_bytes as u64);
+    if !header_ok {
+        return Err(format!("{manifest_path}: header is not layer {layer} / bits 3 / grid uniform / expert_bytes {want_expert_bytes}"));
+    }
+    // Allocation (+ optional hot map cross-check).
+    let alloc = load_allocation(Path::new(alloc_path), &cfg.alloc_point, SlabGeometry::FN).map_err(err)?;
+    let formats: Vec<ExpertFormat> = alloc.formats[layer * N_EXPERTS..(layer + 1) * N_EXPERTS].to_vec();
+    let mut map_meta = Value::Null;
+    if let Some(map_path) = &cfg.map {
+        let bytes = std::fs::read(map_path).map_err(|e| format!("{map_path}: {e}"))?;
+        let root: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{map_path}: {e}"))?;
+        let from_map = hot_map_formats(&root, layer)?;
+        if let Some(e) = (0..N_EXPERTS).find(|&e| from_map[e] != formats[e]) {
+            return Err(format!("{map_path} disagrees with allocation point {} at layer {layer} expert {e}: {:?} vs {:?}", alloc.point, from_map[e], formats[e]));
+        }
+        map_meta = json!({"path": map_path, "sha256": hex(&sha(&bytes)), "arm": root.get("arm"), "cross_checked_against_alloc": true});
+    }
+    let (mut cold, mut hot, mut w2) = (Vec::new(), Vec::new(), 0usize);
+    for (e, f) in formats.iter().enumerate() {
+        match f {
+            ExpertFormat::Mq3I4 => cold.push(e as u32),
+            ExpertFormat::Mq4Xts => hot.push(e as u32),
+            ExpertFormat::Mq2I4 => w2 += 1,
+        }
+    }
+    if cold.is_empty() || hot.is_empty() {
+        return Err(format!("layer {layer} allocation has no mixed W3/MQ4 experts (w3={}, mq4={}, w2={w2})", cold.len(), hot.len()));
+    }
+    let (take_w3, take_mq4) = select_counts(cold.len(), hot.len(), cfg.real_experts);
+    let (sel_w3, sel_mq4) = (spread(&cold, take_w3), spread(&hot, take_mq4));
+    if sel_w3.len() + sel_mq4.len() < 10 {
+        return Err(format!("layer {layer}: only {} usable experts; a top-10 lane needs 10", sel_w3.len() + sel_mq4.len()));
+    }
+    // XTS source: identity, aggregate layout, then only the selected spans.
+    let (xts_sha, xts_len) = file_sha256(xts_path)?;
+    if let Some(want) = &cfg.xts_sha256 {
+        if *want != xts_sha {
+            return Err(format!("{xts_path}: sha256 {xts_sha} != expected {want}"));
+        }
+    }
+    let hfq = HfqFile::open_at_offset(Path::new(xts_path), 0).map_err(err)?;
+    let mut aggregates = Vec::new();
+    let mut agg_span: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+    for (kind, proj, qt, group) in [(Kind::GateUp, ExpertProj::GateUp, 44u8, 256u32), (Kind::Down, ExpertProj::Down, 53u8, 128u32)] {
+        let name = SlabGeometry::aggregate_name(layer, proj);
+        let info = hfq.find_tensor_info(&name).ok_or_else(|| format!("{xts_path}: missing aggregate `{name}`"))?;
+        let per = kind.tensor_bytes(Codec::Mq4);
+        let want_shape = vec![N_EXPERTS as u32, kind.m() as u32, kind.k() as u32];
+        if info.quant_type != qt || info.shape != want_shape || info.group_size != group || info.data_size != N_EXPERTS * per {
+            return Err(format!(
+                "aggregate `{name}` is qt{} shape {:?} group {} {} B; expected qt{qt} shape {want_shape:?} group {group} {} B",
+                info.quant_type, info.shape, info.group_size, info.data_size, N_EXPERTS * per
+            ));
+        }
+        aggregates.push(json!({"name": name, "quant_type": qt, "shape": want_shape, "group_size": group,
+            "data_offset": info.data_offset, "data_size": info.data_size, "per_expert_bytes": per}));
+        agg_span.insert(kind.suffix(), (info.data_offset, per));
+    }
+    let xts_slice = |kind: Kind, e: u32| -> Result<(Vec<u8>, usize)> {
+        let (base, per) = agg_span[kind.suffix()];
+        let off = base + e as usize * per;
+        let s = hfq.data_range(off, per).ok_or_else(|| format!("{xts_path}: cannot map {} bytes at {off} (mmap dropped or range past EOF)", per))?;
+        Ok((s.to_vec(), off))
+    };
+    let shapes = I4RecordShapes { gate_up: [GATE_M, GATE_K], down: [DOWN_M, DOWN_K] };
+    let manifest_entry = |e: u32| manifest.get("experts").and_then(|x| x.get(format!("E{e}")));
+    let mut experts = BTreeMap::new();
+    let mut lines = String::new();
+    let mut recs = Vec::new();
+    let mut violations = 0u64;
+    for (codec, ids) in [(Codec::W3, &sel_w3), (Codec::Mq4, &sel_mq4)] {
+        for &id in ids {
+            let (gate, down, rec_meta) = match codec {
+                Codec::W3 => {
+                    let npz = Path::new(dir).join(format!("E{id}.npz"));
+                    let rec = I4ExpertFinalCodeRecord::import_npz_file(&npz, layer, id as usize, ExpertFormat::Mq3I4, shapes)
+                        .map_err(|e| format!("{}: {e}", npz.display()))?;
+                    let entry = manifest_entry(id).ok_or_else(|| format!("{manifest_path}: no experts.E{id}"))?;
+                    if entry.get("npz_sha256").and_then(Value::as_str) != Some(rec.source_npz_sha256.as_str()) {
+                        return Err(format!("{}: npz sha256 {} != manifest {:?}", npz.display(), rec.source_npz_sha256, entry.get("npz_sha256")));
+                    }
+                    let mut pack = rec.gate_up.bytes.clone();
+                    pack.extend_from_slice(&rec.down.bytes);
+                    let pack_sha = hex(&sha(&pack));
+                    if entry.get("sha256").and_then(Value::as_str) != Some(pack_sha.as_str()) {
+                        return Err(format!("{}: encoded gate++down sha256 {pack_sha} != manifest {:?}", npz.display(), entry.get("sha256")));
+                    }
+                    mq_i4::decode_tensor(MqI4Profile::MQ3_R256, GATE_M, GATE_K, &rec.gate_up.bytes).map_err(err)?;
+                    mq_i4::decode_tensor(MqI4Profile::MQ3_R128, DOWN_M, DOWN_K, &rec.down.bytes).map_err(err)?;
+                    let meta = json!({"source": "r1_npz_record", "npz_path": npz.display().to_string(),
+                        "npz_sha256": rec.source_npz_sha256, "manifest_npz_sha256_match": true,
+                        "manifest_pack_sha256": pack_sha, "manifest_pack_sha256_match": true,
+                        "scale_rule": rec.scale_rule, "grid": rec.grid});
+                    (rec.gate_up.bytes, rec.down.bytes, meta)
+                }
+                Codec::Mq4 => {
+                    let (gate, goff) = xts_slice(Kind::GateUp, id)?;
+                    let (down, doff) = xts_slice(Kind::Down, id)?;
+                    violations += mq4_sym_violations(Kind::GateUp, &gate) + mq4_sym_violations(Kind::Down, &down);
+                    let meta = json!({"source": "xts_aggregate_slice", "gate_source_offset": goff, "down_source_offset": doff});
+                    (gate, down, meta)
+                }
+            };
+            let (gs, ds) = (sha(&gate), sha(&down));
+            lines.push_str(&format!("{} {id} {} {}\n", codec.label(), hex(&gs), hex(&ds)));
+            let mut rec_json = json!({"expert": id, "codec": codec.label(), "gate_bytes": gate.len(), "gate_sha256": hex(&gs),
+                "down_bytes": down.len(), "down_sha256": hex(&ds)});
+            rec_json["provenance"] = rec_meta;
+            recs.push(rec_json);
+            experts.insert(id, Rc::new(Expert { codec, gate_sha: gs, down_sha: ds, gate, down }));
+        }
+    }
+    let meta = json!({
+        "origin": RECORDS_ORIGIN, "packed_hfqm": false, "layer": layer,
+        "records_dir": dir,
+        "manifest": {"path": manifest_path, "sha256": manifest_sha, "expected_sha256": cfg.records_manifest_sha256,
+            "script_sha256": manifest.get("script_sha256"), "input_receipts": manifest.get("input_receipts"),
+            "expert_bytes": want_expert_bytes},
+        "alloc": {"path": alloc_path, "sha256": alloc.file_sha256, "point": alloc.point,
+            "layer_formats": {"w3": cold.len(), "mq4_xts": hot.len(), "w2": w2}},
+        "map": map_meta,
+        "xts": {"path": xts_path, "sha256": xts_sha, "expected_sha256": cfg.xts_sha256, "bytes": xts_len,
+            "file_len": hfq.file_len(), "index_sha256": hex(&hfq.index_sha256().map_err(err)?),
+            "aggregates": aggregates},
+        "selected": {"w3_cold": sel_w3.len(), "mq4_hot": sel_mq4.len()},
+        "mq4_sym_header_violations": violations,
+        "selected_input_sha256": hex(&sha(lines.as_bytes())),
+        "experts": recs,
+    });
+    Ok(Real { experts, meta, mq4_sym_violations: violations })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1409,6 +1637,7 @@ struct Totals {
     cases: u64,
     synthetic: u64,
     real: u64,
+    real_records: u64,
     launches: u64,
     mismatches: u64,
     twin_mismatches: u64,
@@ -1441,10 +1670,13 @@ fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCf
         .map(|c| (c.label(), case.experts.values().filter(|e| e.codec == *c).count()))
         .collect();
     t.cases += 1;
-    if case.origin == "real" {
-        t.real += 1;
-    } else {
-        t.synthetic += 1;
+    match case.origin {
+        "synthetic" => t.synthetic += 1,
+        RECORDS_ORIGIN => {
+            t.real += 1;
+            t.real_records += 1;
+        }
+        _ => t.real += 1,
     }
     t.launches += gate.launches + down.launches;
     t.mismatches += gate.mismatches + down.mismatches;
@@ -1480,6 +1712,7 @@ fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCf
 // CLI
 // ---------------------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct Cfg {
     codeobject: String,
     artifact: Option<String>,
@@ -1499,9 +1732,25 @@ struct Cfg {
     fabric_owner: Option<String>,
     fabric_wrapper: Option<String>,
     only: Vec<String>,
+    /// Directory holding the layer's `E{e}.npz` certified R1 records (e.g. `.../q/w3-gptq3/L0`).
+    records_dir: Option<String>,
+    /// The layer's pack `manifest.json` (npz_sha256 / sha256 per expert).
+    records_manifest: Option<String>,
+    records_manifest_sha256: Option<String>,
+    /// R1 allocation JSON and its point (`ctl3-hot`): per-(layer, expert) W3 / MQ4-XTS map.
+    alloc: Option<String>,
+    alloc_point: String,
+    /// Optional `ctl3-hot.map.json`, cross-checked against the allocation.
+    map: Option<String>,
+    /// MQ4-XTS source HFQM holding the aggregate expert tensors of the hot experts.
+    xts: Option<String>,
+    xts_sha256: Option<String>,
+    layer0: bool,
 }
 
 const USAGE: &str = "usage: mq_i4_moe_gemv_byte_oracle --codeobject PATH [--artifact HFQM --layer N [--real-experts N]] \
+[--records-dir DIR --records-manifest FILE --alloc FILE [--point NAME] --xts HFQ [--layer0|--layer N] [--map FILE] \
+[--records-manifest-sha256 HEX] [--xts-sha256 HEX] [--real-experts N]] \
 [--old-kernel-parity] [--timing --reps N(>=20) --warmup N(>=3) [--launches N] --card NAME --fabric-owner OWNER \
 --fabric-wrapper fabric-run.sh [--fabric-card NAME]] [--device N] [--expect-uuid U] [--expect-bdf B] [--expect-arch A] \
 [--only SUBSTR]...  (card/fabric flags fall back to env FABRIC_CARD / FABRIC_OWNER / FABRIC_WRAPPER)";
@@ -1530,8 +1779,18 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         fabric_owner: env_nonempty("FABRIC_OWNER"),
         fabric_wrapper: env_nonempty("FABRIC_WRAPPER"),
         only: Vec::new(),
+        records_dir: None,
+        records_manifest: None,
+        records_manifest_sha256: None,
+        alloc: None,
+        alloc_point: "ctl3-hot".into(),
+        map: None,
+        xts: None,
+        xts_sha256: None,
+        layer0: false,
     };
     let mut i = 0;
+    let mut layer_explicit: Option<usize> = None;
     let value = |i: &mut usize| -> Result<String> {
         *i += 1;
         argv.get(*i).cloned().ok_or_else(|| format!("{} needs a value\n{USAGE}", argv[*i - 1]))
@@ -1544,7 +1803,11 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         match argv[i].as_str() {
             "--codeobject" => cfg.codeobject = value(&mut i)?,
             "--artifact" => cfg.artifact = Some(value(&mut i)?),
-            "--layer" => cfg.layer = number(&mut i)?,
+            "--layer" => {
+                let l = number(&mut i)?;
+                layer_explicit = Some(l);
+                cfg.layer = l;
+            }
             "--real-experts" => cfg.real_experts = number(&mut i)?,
             "--old-kernel-parity" => cfg.old_parity = true,
             "--timing" => cfg.timing = true,
@@ -1560,6 +1823,15 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
             "--fabric-owner" => cfg.fabric_owner = Some(value(&mut i)?),
             "--fabric-wrapper" => cfg.fabric_wrapper = Some(value(&mut i)?),
             "--only" => cfg.only.push(value(&mut i)?),
+            "--records-dir" => cfg.records_dir = Some(value(&mut i)?),
+            "--records-manifest" => cfg.records_manifest = Some(value(&mut i)?),
+            "--records-manifest-sha256" => cfg.records_manifest_sha256 = Some(value(&mut i)?.to_ascii_lowercase()),
+            "--alloc" => cfg.alloc = Some(value(&mut i)?),
+            "--point" => cfg.alloc_point = value(&mut i)?,
+            "--map" => cfg.map = Some(value(&mut i)?),
+            "--xts" => cfg.xts = Some(value(&mut i)?),
+            "--xts-sha256" => cfg.xts_sha256 = Some(value(&mut i)?.to_ascii_lowercase()),
+            "--layer0" => cfg.layer0 = true,
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
         i += 1;
@@ -1585,6 +1857,29 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
                 return Err(format!("--timing requires {what} (or its env fallback): fabric metadata is part of the record"));
             }
         }
+    }
+    if cfg.layer0 {
+        if layer_explicit.is_some_and(|l| l != 0) {
+            return Err("--layer0 conflicts with --layer N (N != 0)".into());
+        }
+        cfg.layer = 0;
+    }
+    let records_flags = [
+        ("--records-dir", cfg.records_dir.is_some()),
+        ("--records-manifest", cfg.records_manifest.is_some()),
+        ("--alloc", cfg.alloc.is_some()),
+        ("--xts", cfg.xts.is_some()),
+    ];
+    let any_records = records_flags.iter().any(|(_, set)| *set);
+    if any_records {
+        if let Some((missing, _)) = records_flags.iter().find(|(_, set)| !*set) {
+            return Err(format!("certified-records mode needs --records-dir, --records-manifest, --alloc and --xts together; {missing} is missing"));
+        }
+        if cfg.timing {
+            return Err("--timing is a separate run: no certified-records flags".into());
+        }
+    } else if cfg.layer0 || cfg.map.is_some() || cfg.xts_sha256.is_some() || cfg.records_manifest_sha256.is_some() {
+        return Err("--layer0/--map/--xts-sha256/--records-manifest-sha256 only apply to certified-records mode".into());
     }
     Ok(cfg)
 }
@@ -1635,6 +1930,8 @@ fn run() -> Result<(Value, bool)> {
     let mut runs: Vec<Value> = Vec::new();
     let mut artifact_meta = Value::Null;
     let mut mq4_violations = 0u64;
+    let mut records_meta = Value::Null;
+    let mut records_violations = 0u64;
 
     if cfg.timing {
         let tcfg = TimingCfg { reps: cfg.reps, warmup: cfg.warmup, launches: cfg.launches };
@@ -1680,7 +1977,18 @@ fn run() -> Result<(Value, bool)> {
             let real = load_real(path, cfg.layer, cfg.real_experts)?;
             mq4_violations = real.mq4_sym_violations;
             artifact_meta = real.meta.clone();
-            for case in real_cases(&real).iter().filter(|c| selected(&cfg, &c.name)) {
+            for case in real_cases(&real, "real", "real").iter().filter(|c| selected(&cfg, &c.name)) {
+                eprintln!("[g1] {}", case.name);
+                let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
+                rows.push(row);
+            }
+        }
+        if cfg.records_dir.is_some() {
+            eprintln!("[g1] loading certified L{} records", cfg.layer);
+            let real = load_records(&cfg)?;
+            records_violations = real.mq4_sym_violations;
+            records_meta = real.meta.clone();
+            for case in real_cases(&real, RECORDS_ORIGIN, "real_records").iter().filter(|c| selected(&cfg, &c.name)) {
                 eprintln!("[g1] {}", case.name);
                 let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
                 rows.push(row);
@@ -1707,19 +2015,23 @@ fn run() -> Result<(Value, bool)> {
         "symbols_loaded": loads,
         "device": device,
         "case_counts": {"total": totals.cases, "synthetic": totals.synthetic, "real": totals.real,
-            "old_kernel_parity": totals.old_kernel_cases},
+            "real_records_layer": totals.real_records, "old_kernel_parity": totals.old_kernel_cases},
         "symbol_launches": totals.launches,
         "cases": rows,
         "mismatch_count": totals.mismatches,
         "twin_selfcheck_mismatch_count": totals.twin_mismatches,
         "old_kernel_mismatch_count": totals.old_kernel_mismatches,
         "mq4_sym_header_violations_real": mq4_violations,
+        "mq4_sym_header_violations_records": records_violations,
         "byte_exact": byte_exact,
         "pass": byte_exact,
         "rc": if byte_exact { 0 } else { 1 },
     });
     if !artifact_meta.is_null() {
         out["artifact"] = artifact_meta;
+    }
+    if !records_meta.is_null() {
+        out["real_records_layer"] = records_meta;
     }
     if cfg.timing {
         out["runs"] = Value::Array(runs);
@@ -1919,5 +2231,87 @@ mod tests {
             let t = gen_tensor(Codec::Mq4, kind, 9, true);
             assert_eq!(mq4_sym_violations(kind, &t), 0);
         }
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    const RECORDS: [&str; 8] = ["--records-dir", "/r/q/w3-gptq3/L0", "--records-manifest", "/r/m.json", "--alloc", "/r/a.json", "--xts", "/x.mq4"];
+
+    fn with(extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["--codeobject", "/co.hxaco"];
+        v.extend_from_slice(&RECORDS);
+        v.extend_from_slice(extra);
+        args(&v)
+    }
+
+    #[test]
+    fn records_flags_parse_and_default_to_layer0_point_ctl3_hot() {
+        let c = parse_args(&with(&["--layer0", "--map", "/r/map.json", "--xts-sha256", "AB12", "--records-manifest-sha256", "CD34"])).unwrap();
+        assert_eq!(c.layer, 0);
+        assert!(c.layer0);
+        assert_eq!(c.alloc_point, "ctl3-hot");
+        assert_eq!(c.records_dir.as_deref(), Some("/r/q/w3-gptq3/L0"));
+        assert_eq!(c.xts_sha256.as_deref(), Some("ab12"));
+        assert_eq!(c.records_manifest_sha256.as_deref(), Some("cd34"));
+        assert_eq!(c.map.as_deref(), Some("/r/map.json"));
+        assert_eq!(c.real_experts, 24);
+        let c = parse_args(&with(&["--point", "other", "--layer", "0"])).unwrap();
+        assert_eq!(c.alloc_point, "other");
+    }
+
+    #[test]
+    fn records_flags_are_all_or_nothing_and_exclusive_of_timing() {
+        let partial = args(&["--codeobject", "/co", "--records-dir", "/d", "--alloc", "/a", "--xts", "/x"]);
+        assert!(parse_args(&partial).unwrap_err().contains("--records-manifest is missing"));
+        assert!(parse_args(&args(&["--codeobject", "/co", "--layer0"])).is_err());
+        assert!(parse_args(&with(&["--layer0", "--layer", "3"])).is_err());
+        let timing = with(&["--timing", "--card", "c", "--fabric-owner", "o", "--fabric-wrapper", "w"]);
+        assert!(parse_args(&timing).is_err());
+        // The old flags are unchanged: --artifact alone still parses.
+        assert!(parse_args(&args(&["--codeobject", "/co", "--artifact", "/a.hfq", "--layer", "5"])).is_ok());
+    }
+
+    #[test]
+    fn hot_map_labels_parse_strictly() {
+        let mut row: Vec<Value> = (0..N_EXPERTS).map(|e| json!(if e % 3 == 0 { "xts_mq4" } else { "w3" })).collect();
+        let root = json!({"arm": "ctl3-hot", "layers": {"0": row.clone()}});
+        let f = hot_map_formats(&root, 0).unwrap();
+        assert_eq!(f[0], ExpertFormat::Mq4Xts);
+        assert_eq!(f[1], ExpertFormat::Mq3I4);
+        assert!(hot_map_formats(&root, 1).is_err());
+        row[7] = json!("mq4");
+        assert!(hot_map_formats(&json!({"layers": {"0": row.clone()}}), 0).is_err());
+        row.pop();
+        assert!(hot_map_formats(&json!({"layers": {"0": row}}), 0).is_err());
+    }
+
+    /// The R1 allocation shape (`profile_indices[48][512]`, 0=MQ2 1=MQ3 2=MQ4-XTS) through S2's loader,
+    /// cross-checked with a map row in the other vocabulary.
+    #[test]
+    fn allocation_layer_slice_matches_map_vocabulary() {
+        let rows: Vec<Vec<u64>> = (0..48).map(|l| (0..N_EXPERTS).map(|e| if (e + l) % 3 == 0 { 2 } else { 1 }).collect()).collect();
+        let root = json!({"schema": "ctl3-hot-allocation-v1", "profiles": ["mq2-i4", "mq3-i4", "mq4-xts"],
+            "allocations": {"ctl3-hot": {"feasible": true, "profile_indices": rows}}});
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("alloc.json");
+        std::fs::write(&p, root.to_string()).unwrap();
+        let a = load_allocation(&p, "ctl3-hot", SlabGeometry::FN).unwrap();
+        let l2 = &a.formats[2 * N_EXPERTS..3 * N_EXPERTS];
+        let map_row: Vec<Value> = (0..N_EXPERTS).map(|e| json!(if (e + 2) % 3 == 0 { "xts_mq4" } else { "w3" })).collect();
+        assert_eq!(l2, &hot_map_formats(&json!({"layers": {"2": map_row}}), 2).unwrap()[..]);
+        assert!(load_allocation(&p, "nope", SlabGeometry::FN).is_err());
+    }
+
+    #[test]
+    fn selection_is_balanced_and_tops_up_the_short_side() {
+        assert_eq!(select_counts(100, 100, 24), (12, 12));
+        assert_eq!(select_counts(100, 4, 24), (20, 4));
+        assert_eq!(select_counts(3, 100, 24), (3, 21));
+        assert_eq!(select_counts(100, 100, 2), (5, 5)); // a top-10 lane needs 10 experts
+        let v: Vec<u32> = (0..100).collect();
+        let s = spread(&v, 12);
+        assert!(s.windows(2).all(|w| w[0] < w[1]) && s[0] == 0 && *s.last().unwrap() < 100);
     }
 }
