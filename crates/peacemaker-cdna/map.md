@@ -1,6 +1,6 @@
 # peacemaker-cdna — map
 
-> **Status:** `research` (default-off: no runtime crate depends on it).
+> **Status:** `research` (default-off: compiled in transitively, never selected at runtime).
 > **Layer:** Kernel authoring (build time / CPU emulation) — the CDNA instruction model beneath the `cdna` arm of [`peacemaker-isa`](../peacemaker-isa/map.md); see the layering table in
 > [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
@@ -10,7 +10,7 @@ CDNA (CDNA3 and later; gfx942 / MI300X first, wave64) instruction model for Peac
 
 ## Gotchas
 
-- Opt-in only: the sole consumer is `peacemaker-isa`'s `cdna` arm (`peacemaker_isa::cdna`, `Arch::Gfx942`), which no runtime crate calls. Nothing here is registered in `rdna-compute`, the dispatch tables or any default kernel set, so builds and serving on every arch are unchanged.
+- Opt-in only: the sole direct consumer is `peacemaker-isa`'s `cdna` arm (`peacemaker_isa::cdna`, `Arch::Gfx942`). `peacemaker-isa` is an unconditional dependency here, and `rdna-compute` depends on `peacemaker-isa` (feature `toolchain`), so this crate is a transitive compile-time dependency of the runtime build. Nothing calls into it at run time: no `rdna-compute` or dispatch-table callsite selects it, it is in no default kernel set, and serving behavior on every arch is unchanged.
 - `oracle` shells out to ROCm `llvm-mc` / `llvm-objdump` for tests only; nothing in the production path runs a ROCm tool.
 - The emulator is a test oracle, not hardware evidence: the on-card harness is `peacemaker-isa`'s `cdna_card_tierc` example ([runbook](../peacemaker-isa/tools/CDNA-CARD-RUNBOOK.md)) and its receipts are under [`docs/pm-cdna/card`](../../docs/pm-cdna/card).
 

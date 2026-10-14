@@ -23,7 +23,7 @@ crates/
 ├── radiowave/                # policy-driven HIP compiler + AMDGPU code-object inspector
 ├── peacemaker-ir/            # typed RDNA machine-code representation, gfx12 instruction tables
 ├── peacemaker-lift/          # ELF/bundle/metadata lifter for typed AMDGPU programs
-├── peacemaker-cdna/          # CDNA3 (gfx942, wave64) instruction model, encoder/decoder, CPU emulator; opt-in, no runtime consumer
+├── peacemaker-cdna/          # CDNA3 (gfx942, wave64) instruction model, encoder/decoder, CPU emulator; transitive via peacemaker-isa, never selected at runtime
 ├── peacemaker-author/        # typed kernel-authoring core (targets, LDS regions, wait tokens)
 ├── peacemaker-isa/           # checked instruction Builder (wait ledger, LDS, hazards) + peacemaker tooling
 ├── peacemaker-rip/           # standalone `.rip` kernel-script front end onto the peacemaker-isa builder
@@ -98,7 +98,7 @@ operator runtime.
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
 | Kernel compile policy | `radiowave` | Policy-driven hipcc invocation and AMDGPU code-object inspection behind `rdna-compute`'s compile path |
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
-| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm; no runtime crate depends on either. Authoring and validation, **not** the retained transport (see railgun below) |
+| Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm. It is a transitive compile-time dependency of `rdna-compute` (which depends on `peacemaker-isa`), but no runtime dispatch, callsite selection or default behavior uses it. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
 | Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
 | NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
