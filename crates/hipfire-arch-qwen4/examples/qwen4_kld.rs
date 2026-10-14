@@ -138,7 +138,7 @@ impl Model {
     /// Same range-loaded path as the serve loader (`hipfire-loader` carriers).
     /// `ple_hot`: bytes of the PLE hot-row pack to prewarm; the store is
     /// attached verified before the first forward.
-    fn load(path: &Path, n_ctx: usize, ple_hot: Option<u64>) -> Result<Self, String> {
+    fn load(path: &Path, n_ctx: usize, logit_rows: usize, ple_hot: Option<u64>) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -335,7 +335,7 @@ impl Model {
                 .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
         }
         let logits = gpu
-            .zeros(&[n_ctx * vocab], DType::F32)
+            .zeros(&[logit_rows * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
         eprintln!(
             "qwen4_kld: loaded {} on {} (vocab {vocab})",
@@ -529,7 +529,7 @@ fn build_ref(
     top_k: usize,
     max_chunks: Option<usize>,
 ) -> Result<(), String> {
-    let mut m = Model::load(model, n_ctx, None)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, None)?;
     let text =
         std::fs::read_to_string(slice).map_err(|e| format!("read {}: {e}", slice.display()))?;
     // Qwen tokenizers add no BOS: chunks are plain n_ctx windows of the stream.
@@ -664,7 +664,7 @@ fn score(
     let (n_ctx, window) = (h.n_ctx, h.window);
     let n_chunk = h.n_chunk.min(max_chunks.unwrap_or(usize::MAX));
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
-    let mut m = Model::load(model, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
     if m.vocab != h.n_vocab {
         return Err(format!(
             "candidate vocab {} != reference vocab {}",
@@ -921,7 +921,7 @@ fn score_s11ref(
     }
     let corpus: S11Corpus = serde_json::from_slice(&corpus_bytes).map_err(|e| e.to_string())?;
     let n_ctx = validate_s11_corpus(&reference, &corpus)?;
-    let mut m = Model::load(model, n_ctx, ple_hot)?;
+    let mut m = Model::load(model, n_ctx, n_ctx, ple_hot)?;
     if m.vocab != reference.header.n_vocab {
         return Err(format!("candidate vocab {} != S11REF vocab {}", m.vocab, reference.header.n_vocab));
     }
@@ -1000,6 +1000,79 @@ fn score_s11ref(
     Ok(())
 }
 
+/// `speed`: TTFT of one chunked prefill of a prompt file (production
+/// `forward_chunk_final`, one logits row) and C1 greedy decode tok/s
+/// (`forward_token_or_argmax`, the serve decode step), `reps` fresh-state
+/// repetitions in one process. Rep 0 absorbs page-cache and kernel-cache
+/// warmup; the receipt keeps every rep.
+fn speed(
+    model: &Path, prompt: &Path, output: &Path, decode_tokens: usize, warmup: usize, reps: usize,
+    max_prompt: Option<usize>,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(prompt).map_err(|e| format!("read {}: {e}", prompt.display()))?;
+    let probe = Tokenizer::from_hfq_metadata(
+        &HfqFile::open(model).map_err(|e| e.to_string())?.metadata_json,
+    )
+    .map_err(|e| format!("tokenizer: {e}"))?;
+    let mut tokens = probe.encode(&text);
+    drop(probe);
+    if let Some(cap) = max_prompt {
+        tokens.truncate(cap);
+    }
+    if tokens.is_empty() {
+        return Err("empty prompt".into());
+    }
+    let n_ctx = tokens.len() + warmup + decode_tokens + 8;
+    let mut m = Model::load(model, n_ctx, 1, None)?;
+    let row = m.logits.sub_offset(0, m.vocab);
+    let mut rep_rows = Vec::new();
+    for rep in 0..reps {
+        m.bundle.reset(&mut m.gpu).map_err(|e| e.to_string())?;
+        let t0 = Instant::now();
+        m.bundle.forward_chunk_final(&mut m.gpu, &tokens, &row, None).map_err(|e| e.to_string())?;
+        let first = m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+        let ttft = t0.elapsed().as_secs_f64();
+        if first.iter().any(|v| !v.is_finite()) {
+            return Err("non-finite prefill logits".into());
+        }
+        let mut ids = Vec::with_capacity(warmup + decode_tokens);
+        let mut t1 = Instant::now();
+        for i in 0..warmup + decode_tokens {
+            if i == warmup {
+                t1 = Instant::now();
+            }
+            let id = m.bundle.forward_token_or_argmax(&mut m.gpu, None, &row).map_err(|e| e.to_string())?;
+            ids.push(id);
+        }
+        m.gpu.download_f32(&row).map_err(|e| e.to_string())?;
+        let decode_s = t1.elapsed().as_secs_f64();
+        let tps = decode_tokens as f64 / decode_s;
+        eprintln!(
+            "qwen4_kld speed rep {rep}: prompt {} tokens, TTFT {:.1} ms, decode {decode_tokens} tok in {:.3} s = {tps:.2} tok/s",
+            tokens.len(), ttft * 1e3, decode_s
+        );
+        rep_rows.push(serde_json::json!({
+            "rep": rep, "ttft_ms": ttft * 1e3, "decode_tok_s": tps,
+            "decode_s": decode_s, "first_ids": ids.iter().take(16).collect::<Vec<_>>(),
+        }));
+    }
+    let binary = std::env::current_exe().map_err(|e| e.to_string())?;
+    let receipt = serde_json::json!({
+        "schema": "hipfire.qwen4.speed.v1",
+        "model": model.display().to_string(),
+        "prompt": prompt.display().to_string(),
+        "prompt_sha256": artifact_id(prompt)?.sha256,
+        "binary_sha256": artifact_id(&binary)?.sha256,
+        "prompt_tokens": tokens.len(), "decode_tokens": decode_tokens, "warmup_tokens": warmup,
+        "expert_vram_layers": std::env::var("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS").ok(),
+        "arch": m.gpu.arch.to_string(),
+        "reps": rep_rows,
+    });
+    std::fs::write(output, serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let mode = args.next().ok_or(USAGE)?;
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
@@ -1007,6 +1080,8 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
     let (mut ple_hot, mut append_rows) = (None, Vec::new());
     let mut smoke_seqs: Option<usize> = None;
+    let mut prompt_file: Option<PathBuf> = None;
+    let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) = (128usize, 8usize, 2usize, None::<usize>);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -1032,6 +1107,11 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                 }
             }
             "--smoke-seqs" => smoke_seqs = Some(number(value()?)?),
+            "--prompt-file" => prompt_file = Some(PathBuf::from(value()?)),
+            "--decode-tokens" => decode_tokens = number(value()?)?,
+            "--speed-warmup" => speed_warmup = number(value()?)?,
+            "--reps" => reps = number(value()?)?,
+            "--max-prompt" => max_prompt = Some(number(value()?)?),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
@@ -1051,6 +1131,10 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         ("s11ref", Some(model), None, Some(ref_path), Some(output)) => {
             let corpus = corpus.ok_or("s11ref requires --corpus CORPUS.json (prefix tokens are not stored in S11REF)")?;
             score_s11ref(&model, &ref_path, &corpus, &output, decode, ple_hot, smoke_seqs)
+        }
+        ("speed", Some(model), None, None, Some(output)) => {
+            let prompt = prompt_file.ok_or("speed requires --prompt-file")?;
+            speed(&model, &prompt, &output, decode_tokens, speed_warmup, reps, max_prompt)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {
