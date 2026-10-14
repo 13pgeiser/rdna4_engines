@@ -17,7 +17,6 @@ clap = { workspace = true, features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 flate2 = "1"
 getrandom = "0.3"
-subtle = "2.6.1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

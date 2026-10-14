@@ -59,10 +59,7 @@ impl BearerToken {
             source,
         })?;
         if !meta.is_file() {
-            return Err(invalid(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
+            return Err(invalid(format!("{} is not a regular file", path.display())));
         }
         check_permissions(path, &meta)?;
         let mut bytes = Vec::new();
@@ -375,7 +372,10 @@ mod tests {
         let mut flipped = TOKEN.to_owned().into_bytes();
         for i in 0..flipped.len() {
             flipped[i] ^= 1;
-            assert!(!token.matches(std::str::from_utf8(&flipped).unwrap()), "{i}");
+            assert!(
+                !token.matches(std::str::from_utf8(&flipped).unwrap()),
+                "{i}"
+            );
             flipped[i] ^= 1;
         }
     }

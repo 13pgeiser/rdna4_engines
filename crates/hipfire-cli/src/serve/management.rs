@@ -21,6 +21,7 @@
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
+use hipfire_config::secret::BearerToken;
 use http_body_util::Full;
 use hyper::{body::Incoming, header, http::HeaderMap, server::conn::http1, Method, Request};
 use hyper::{Response, StatusCode};
@@ -34,7 +35,6 @@ use std::{
     },
     time::Duration,
 };
-use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -59,10 +59,11 @@ const MAX_HEAD_BYTES: usize = 8192;
 /// Pause after a failed `accept`.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Per-process management secret: 32 bytes from the OS CSPRNG, hex encoded.
+/// Per-process management secret: 32 bytes from the OS CSPRNG, hex encoded,
+/// held as a [`BearerToken`] (constant-time comparison, redacted `Debug`).
 ///
 /// `Debug` is redacted so no `{:?}` of a struct holding it can leak it.
-pub(crate) struct ManagementCredential(String);
+pub(crate) struct ManagementCredential(BearerToken);
 
 impl ManagementCredential {
     pub(crate) fn generate() -> Result<Self> {
@@ -74,17 +75,17 @@ impl ManagementCredential {
         for byte in bytes {
             write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
         }
-        Ok(Self(hex))
+        Ok(Self(BearerToken::new(hex)?))
     }
 
     /// The secret, for the owner-only pid record.
     pub(crate) fn expose(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     /// Constant-time comparison against a presented credential.
     fn matches(&self, presented: &str) -> bool {
-        bool::from(self.0.as_bytes().ct_eq(presented.as_bytes()))
+        self.0.matches(presented)
     }
 }
 
@@ -250,7 +251,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn credential() -> ManagementCredential {
-        ManagementCredential("c0ffee".repeat(10))
+        ManagementCredential(BearerToken::new("c0ffee".repeat(10)).unwrap())
     }
 
     fn request(method: &str, path: &str, authorizations: &[&str]) -> Request<()> {
@@ -279,15 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_is_exact() {
-        let credential = ManagementCredential("abc".into());
-        assert!(credential.matches("abc"));
-        assert!(!credential.matches("abd"));
-        assert!(!credential.matches("abcd"));
-        assert!(!credential.matches("abc\0"));
-        let empty = ManagementCredential(String::new());
-        assert!(!empty.matches("a"));
-        assert!(empty.matches(""));
+    fn credential_match_is_exact() {
+        let credential = credential();
+        let token = "c0ffee".repeat(10);
+        assert!(credential.matches(&token));
+        assert!(!credential.matches(&format!("{token}0")));
+        assert!(!credential.matches(&token[..token.len() - 1]));
+        assert!(!credential.matches(&format!("{}f", &token[..token.len() - 1])));
+        assert!(!credential.matches(""));
     }
 
     #[test]

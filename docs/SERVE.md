@@ -297,9 +297,10 @@ redirects to `/ui` only while the UI is enabled.
 
 The UI talks to the same `/v1/chat/completions` gateway as any other
 client and keeps chat history in the browser's IndexedDB — serve stores
-nothing on its behalf. Like every serve endpoint it is **unauthenticated**:
-binding a non-loopback host with the UI enabled prints a warning, since
-that makes the gateway reachable from any browser on the network.
+nothing on its behalf. It cannot send a bearer token: on a loopback serve
+without `serve.api_key_file` it works as before, and on a keyed serve
+(required for any non-loopback bind) its assets and requests receive 401
+(see [Security](#security-bearer-authentication-and-https-proxies)).
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
 Agent / Pi custom-provider configuration, see
