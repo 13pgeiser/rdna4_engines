@@ -868,7 +868,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "e903c9cdda8d03e55aec629e3f66f48542d3532733b787653ab9ec2b43656432",
+      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
       "symbols": [
         "quantize_bf16_q8_0"
       ],
