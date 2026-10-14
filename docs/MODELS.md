@@ -308,6 +308,29 @@ stage, `prompt_probe` emits 36–41 distinct tokens per 48 greedy steps, and
 The same K-hardcoding affected every consumer with `moe_inter != 512` — e.g.
 MiniMax-M2 (`moe_inter` 1536) reads through this kernel too.
 
+**Reasoning + tool calls (arch 11, sequential + VL paths).** LFM2.5 is a pure
+reasoning model — its chat template ends the generation prompt with a literal
+`<think>` opener, so generated tokens begin *inside* the reasoning block and
+only `</think>` is generated. The arch-11 generate paths detect that opener
+(`render_tail_opens_think`) and re-emit `<think>` as display-only text before
+the first generated token, giving downstream consumers a well-formed
+`<think>…</think>…` block: `serve` splits `reasoning_content`/`content`
+(matching vLLM's deepseek_r1-class reasoning parser semantics), the run/chat
+stripper works, and `finish_reason` reports `length` (not `stop`) when a
+turn is still thinking at max_tokens. Tool calls use LFM's dedicated special
+tokens (`\x3C\x7Ctool_call_start\x7C\x3E` / `\x3C\x7Ctool_call_end\x7C\x3E`)
+wrapping a Pythonic `[f(k=v, ...)]` call list. Both generate paths suppress
+the span at the token level (markers and body never reach the client
+stream), parse the body into `tool_calls` on span close
+(`emit_text::parse_lfm_tool_call_body`, mirroring vLLM's `pythonic` tool
+parser: kwargs → JSON object, positional args dropped, malformed body →
+treat-as-text fallback), and emit the calls through the standard
+`{"type":"tool_calls"}` event + `finish_reason: "tool_calls"`. An unclosed
+span at EOS/max_tokens is re-emitted as raw text and never fabricates a
+call. Verified on gfx1100: `serve` returns
+`reasoning_content` + `tool_calls[0].function.arguments =
+"{\"city\":\"Tokyo\"}"` with `finish_reason: "tool_calls"` for a
+system-prompt tool list; streaming emits `reasoning_content` deltas.
 ### Gemma4 (registry — no published artifact yet)
 
 > **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.**
