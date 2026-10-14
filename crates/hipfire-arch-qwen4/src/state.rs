@@ -588,10 +588,28 @@ pub fn resolve_qsa_format(
 /// DeltaNet knob): `auto`/`q8` is Qwen3.5's Q8 state where its kernels apply
 /// (128x128 heads), `fp32` the exact reference state. An explicit request the
 /// model cannot serve is refused, never rewritten.
+///
+/// The AR-only Flash-Next profile is the stock-FP8 recipe's
+/// (`Qwen4TierRecipe::StockFp8` is its only recipe), whose numerical contract
+/// pins the F32 recurrent state: `auto` resolves to F32 there and an explicit
+/// `q8` is refused.
 pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStateFormat, String> {
+    let request = request.trim().to_ascii_lowercase();
+    if config.profile.is_ar_only() {
+        return match request.as_str() {
+            "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
+            "q8" | "int8" => Err(format!(
+                "qwen4: the stock-FP8 artifact pins the F32 GDN recurrent state (its numerical \
+                 contract); state_quant '{request}' is refused, use fp32 or leave it unset"
+            )),
+            other => Err(format!(
+                "qwen4: unsupported GDN state_quant '{other}' (expected auto|fp32)"
+            )),
+        };
+    }
     let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
     let q8 = GdnStateFormat::Q8.supports(key_dim, value_dim);
-    match request.trim().to_ascii_lowercase().as_str() {
+    match request.as_str() {
         "" | "auto" if q8 => Ok(GdnStateFormat::Q8),
         "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
         "q8" | "int8" if q8 => Ok(GdnStateFormat::Q8),
@@ -2631,6 +2649,29 @@ impl std::error::Error for StateError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AR-only (stock-FP8) profile pins the F32 GDN recurrent state:
+    /// `auto`/unset/fp32 resolve to F32 and an explicit q8 is refused; the
+    /// checkpoint profile keeps its Q8 default.
+    #[test]
+    fn stock_fp8_profile_pins_f32_gdn_state() {
+        let flash = crate::config::compact_test_config();
+        assert_eq!(resolve_gdn_format("", &flash).unwrap(), GdnStateFormat::Q8);
+        assert_eq!(resolve_gdn_format("auto", &flash).unwrap(), GdnStateFormat::Q8);
+        let stock = flash.into_ar_only().unwrap();
+        for request in ["", "auto", " AUTO ", "fp32", "f32"] {
+            assert_eq!(
+                resolve_gdn_format(request, &stock).unwrap(),
+                GdnStateFormat::F32,
+                "{request:?}"
+            );
+        }
+        for request in ["q8", "Q8", "int8"] {
+            let error = resolve_gdn_format(request, &stock).unwrap_err();
+            assert!(error.contains("stock-FP8") && error.contains("F32"), "{error}");
+        }
+        assert!(resolve_gdn_format("bf16", &stock).is_err());
+    }
 
     #[test]
     fn f16_arena_bytes_are_counted_for_legacy_and_vmm_states() {
