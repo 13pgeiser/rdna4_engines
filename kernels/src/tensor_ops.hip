@@ -786,7 +786,7 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_canon_
         query_scale, frame);
 }
 
-#if defined(__GFX12__)
+#if defined(__GFX12__) || defined(__gfx942__)
 // Per-row norm factors, decay and beta of the persistent GDN recurrence: the
 // exact expression sequence of gated_delta_step_persistent256_body's
 // parameter pass (one row, the serial kd-order sums the per-row path uses).
@@ -863,7 +863,11 @@ static __device__ __forceinline__ void gdn_pipe128_dot(
         for (int e = 0; e < kGdnPipeGroup; ++e) {
             #pragma unroll
             for (int u = 0; u < 4; ++u) {
+#if defined(__gfx942__)
+                out = __fmaf_rn(s[4 * (g * kGdnPipeGroup + e) + u], (&cur[e].x)[u], out);
+#else
                 out += s[4 * (g * kGdnPipeGroup + e) + u] * (&cur[e].x)[u];
+#endif
             }
             __asm__ volatile("" : "+v"(out));
         }
@@ -894,7 +898,12 @@ static __device__ __forceinline__ void gdn_pipe128_update(
         for (int e = 0; e < kGdnPipeGroup; ++e) {
             #pragma unroll
             for (int u = 0; u < 4; ++u) {
+#if defined(__gfx942__)
+                s[4 * (g * kGdnPipeGroup + e) + u] = __fmaf_rn(
+                    (&cur[e].x)[u], delta, s[4 * (g * kGdnPipeGroup + e) + u]);
+#else
                 s[4 * (g * kGdnPipeGroup + e) + u] += (&cur[e].x)[u] * delta;
+#endif
                 __asm__ volatile("" : "+v"(s[4 * (g * kGdnPipeGroup + e) + u]));
             }
         }
@@ -935,9 +944,15 @@ static __device__ __forceinline__ void gdn_pipe128_out_decay_kv(
             #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 const int kd = 4 * (g * kGdnPipeGroup + e) + u;
+#if defined(__gfx942__)
+                out = __fmaf_rn(s[kd], (&qcur[e].x)[u], out);
+                s[kd] = __fmul_rn(s[kd], decay);
+                kv_mem = __fmaf_rn(s[kd], (&kcur[e].x)[u], kv_mem);
+#else
                 out += s[kd] * (&qcur[e].x)[u];
                 s[kd] *= decay;
                 kv_mem += s[kd] * (&kcur[e].x)[u];
+#endif
                 // Orders out(kd) -> decay(kd) -> kv(kd) -> kd + 1 (see above).
                 __asm__ volatile("" : "+v"(s[kd]), "+v"(out), "+v"(kv_mem));
             }
@@ -953,7 +968,7 @@ static __device__ __forceinline__ void gdn_pipe128_out_decay_kv(
     }
 }
 
-// gfx12 prefill GDN recurrence, exact 128x128 geometry: one value head per
+// gfx12 / gfx942 (F32 only) prefill GDN recurrence, exact 128x128 geometry: one value head per
 // 128-thread block, thread c owns value column c and keeps all 128 state
 // values in registers, so a row needs no cross-thread handoff of kv, delta or
 // out.  The per-row chains are the same serial kd = 0..127 chains as
@@ -964,7 +979,13 @@ static __device__ __forceinline__ void gdn_pipe128_out_decay_kv(
 // decay and kv chain (they are independent serial chains, interleaved per kd
 // for ILP), then row i+1's delta and state update.  Every per-element
 // expression and its operand order is the original's, so state and outputs
-// are bitwise identical.
+// are bitwise identical.  Nothing here depends on the wave size (no shuffles,
+// ballots or lane arithmetic; the LDS ring is synchronized by the block
+// barrier), so the 128-thread block is four waves on gfx12 (wave32) and two
+// on gfx942 (wave64) alike.  Under __gfx942__ every F32 expression is the
+// pinned __fmul_rn / __fmaf_rn / __fsub_rn form of persistent256's gfx942
+// branch (same operand order, serial kd chains), because the register state
+// would otherwise let the compiler contract the decay product.
 template <bool kQ8>
 __device__ __forceinline__ void gated_delta_step_pipe128_body(
     const float* projection,
@@ -1047,8 +1068,13 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
     gdn_lds_barrier();
 
     // Row 0: stage, then decay + kv + delta + update on the loaded state.
+#if defined(__gfx942__)
+    qs[0][c] = __fmul_rn(bf16_to_f32(bf16_round(
+        bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[0][0]))), query_scale);
+#else
     qs[0][c] = bf16_to_f32(bf16_round(
         bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[0][0]))) * query_scale;
+#endif
     kf[0][c] = bf16_to_f32(bf16_round(
         bf16_to_f32(bf16_round(raw_k)) * bf16_to_f32(k_inv_rows[0][0])));
     const float v0 = raw_v;
@@ -1063,10 +1089,21 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
         const float decay = decay_rows[0][0];
         const float beta_value = beta_rows[0][0];
         #pragma unroll
-        for (int kd = 0; kd < 128; ++kd) s[kd] *= decay;
+        for (int kd = 0; kd < 128; ++kd) {
+#if defined(__gfx942__)
+            s[kd] = __fmul_rn(s[kd], decay);
+#else
+            s[kd] *= decay;
+#endif
+        }
         float kv_mem = 0.0f;
         gdn_pipe128_dot(s, &kf[0][0], lane_zero, kv_mem);
+#if defined(__gfx942__)
+        const float delta =
+            __fmul_rn(__fsub_rn(bf16_to_f32(bf16_round(v0)), kv_mem), beta_value);
+#else
         const float delta = (bf16_to_f32(bf16_round(v0)) - kv_mem) * beta_value;
+#endif
         gdn_pipe128_update(s, &kf[0][0], lane_zero, delta);
     }
 
@@ -1087,9 +1124,15 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
         const int row = i + 1;
         const int pbuf = (row >> 8) & 1;
         const int pidx = row & 255;
+#if defined(__gfx942__)
+        qs[nxt][c] = __fmul_rn(bf16_to_f32(bf16_round(
+            bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[pbuf][pidx]))),
+            query_scale);
+#else
         qs[nxt][c] = bf16_to_f32(bf16_round(
             bf16_to_f32(bf16_round(raw_q)) * bf16_to_f32(q_inv_rows[pbuf][pidx])))
             * query_scale;
+#endif
         kf[nxt][c] = bf16_to_f32(bf16_round(
             bf16_to_f32(bf16_round(raw_k)) * bf16_to_f32(k_inv_rows[pbuf][pidx])));
         const float cur_v = raw_v;
@@ -1129,7 +1172,12 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
         float kv_mem = 0.0f;
         gdn_pipe128_out_decay_kv(s, &qs[cur][0], &kf[nxt][0], lane_zero, decay, out, kv_mem);
         output[i * value_width + value_head * 128 + c] = out;
+#if defined(__gfx942__)
+        const float delta =
+            __fmul_rn(__fsub_rn(bf16_to_f32(bf16_round(cur_v)), kv_mem), beta_value);
+#else
         const float delta = (bf16_to_f32(bf16_round(cur_v)) - kv_mem) * beta_value;
+#endif
         gdn_pipe128_update(s, &kf[nxt][0], lane_zero, delta);
         cur = nxt;
         nxt = nxt == 2 ? 0 : nxt + 1;
@@ -1175,6 +1223,7 @@ extern "C" __global__ void gated_delta_step_pipe128_f32(
         qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale);
 }
 
+#if defined(__GFX12__)
 __launch_bounds__(128)
 extern "C" __global__ void gated_delta_step_pipe128_q8(
     const float* projection, const float* gate, const float* beta, signed char* state,
@@ -1183,6 +1232,7 @@ extern "C" __global__ void gated_delta_step_pipe128_q8(
     gated_delta_step_pipe128_body<true>(projection, gate, beta, state, output, rows,
         qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale, frame);
 }
+#endif
 #endif
 
 // Few-row verify rollback: re-run the `keep` kept rows of every GDN layer in

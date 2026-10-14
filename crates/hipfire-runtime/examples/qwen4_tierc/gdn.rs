@@ -843,8 +843,10 @@ fn conv_params_batched(gpu: &mut Gpu) -> Result<String, String> {
 }
 
 /// `gated_delta_step_halves_state128_persistent256_f32` through
-/// `gated_delta_step_batched` (gfx942 takes this arm: `pipe128` is gfx1201
-/// only). The kernel documents bitwise equality with `rows` sequential
+/// `gated_delta_step_batched` (gfx942 takes `gated_delta_step_pipe128_f32` by
+/// default, bytewise this kernel under the same pinned arithmetic;
+/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps persistent256). The kernel documents
+/// bitwise equality with `rows` sequential
 /// `gated_delta_step_f32` launches (`tensor_ops.hip:408-409`): outputs and the
 /// final state are compared exactly against that chain, at the ROW_COUNTS and
 /// at 257 (one past the kernel's 256-row parameter block). The CPU twin

@@ -51,10 +51,11 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
 });
-/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps gfx1201's non-capture batched GDN
-/// recurrence on `gated_delta_step_halves_state128_persistent256_{f32,q8}`
-/// instead of the register-resident `gated_delta_step_pipe128_{f32,q8}`
-/// (bytewise identical results).  Read once.
+/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps the non-capture batched GDN recurrence of
+/// gfx1201 (F32 and Q8 state) and gfx942 (F32 state) on
+/// `gated_delta_step_halves_state128_persistent256_{f32,q8}` instead of the
+/// register-resident `gated_delta_step_pipe128_{f32,q8}` (bytewise identical
+/// results; the Q8 kernel is gfx1201-only).  Read once.
 static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_GDN_PIPE", true)
 });
@@ -547,9 +548,12 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         && format == GdnStateFormat::Q8
         && gpu.qwen4_scope
         && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
-    // gfx1201 non-capture: the register-resident one-thread-per-column
-    // recurrence (bitwise the persistent256 kernel's result), 128 threads.
-    let pipe128 = !canon && p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
+    // gfx1201 (F32 and Q8) and gfx942 (F32 only) non-capture: the
+    // register-resident one-thread-per-column recurrence (bitwise the
+    // persistent256 kernel's result), 128 threads.
+    let pipe128_arch = gpu.arch == "gfx1201"
+        || (gpu.arch == "gfx942" && format == GdnStateFormat::F32);
+    let pipe128 = !canon && p.row_states.is_none() && pipe128_arch && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
         (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
@@ -6607,25 +6611,34 @@ mod tests {
         }
     }
 
-    /// gfx1201's register-resident `gated_delta_step_pipe128_{f32,q8}` must
-    /// equal the persistent256 kernel byte for byte (output, final F32 state,
-    /// and the Q8 codes and scales), across the 256-row parameter-block
-    /// boundary and ragged row counts, on a nonzero random start state at a
-    /// nonzero position.  Both kernels are launched by name, so the
-    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 only.
+    /// The register-resident `gated_delta_step_pipe128_{f32,q8}` must equal
+    /// the persistent256 kernel byte for byte (output, final F32 state, and
+    /// the Q8 codes and scales), across the 256-row parameter-block boundary
+    /// and ragged row counts, on a nonzero random start state at a nonzero
+    /// position.  Both kernels are launched by name, so the
+    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 runs
+    /// the F32 and Q8 kernels over rows 1..=1000; gfx942 has only the F32
+    /// kernel (its persistent256 F32 arithmetic is `__fmaf_rn`-pinned) and
+    /// adds a 1536-row case.  Other archs skip.
     #[test]
     fn gdn_pipe128_is_bytewise_the_persistent256_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
-        if gpu.arch != "gfx1201" {
-            eprintln!("skip: gfx1201 only (arch {})", gpu.arch);
+        let is_gfx942 = gpu.arch == "gfx942";
+        if gpu.arch != "gfx1201" && !is_gfx942 {
+            eprintln!("skip: gfx1201 / gfx942 only (arch {})", gpu.arch);
             return;
         }
         let (key_heads, value_heads, dim) = (16usize, 48usize, 128usize);
-        let row_counts = [1usize, 2, 3, 255, 256, 257, 511, 513, 1000];
-        let max_rows = 1000usize;
+        let row_counts: &[usize] = if is_gfx942 {
+            &[1, 2, 3, 255, 256, 257, 511, 513, 1000, 1536]
+        } else {
+            &[1, 2, 3, 255, 256, 257, 511, 513, 1000]
+        };
+        let max_rows = *row_counts.last().expect("row counts");
+        let q8_arms: &[bool] = if is_gfx942 { &[false] } else { &[false, true] };
         let position = 37usize;
         let qk = key_heads * dim;
         let value = value_heads * dim;
@@ -6648,15 +6661,17 @@ mod tests {
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
-            &mut gpu,
-            "gdn_state_f32_to_q8",
-            state0_gpu.buf.as_ptr(),
-            slot0.buf.as_ptr(),
-            value_heads,
-            Some(7),
-        )
-        .expect("quantize");
+        if !is_gfx942 {
+            gdn_state_convert(
+                &mut gpu,
+                "gdn_state_f32_to_q8",
+                state0_gpu.buf.as_ptr(),
+                slot0.buf.as_ptr(),
+                value_heads,
+                Some(7),
+            )
+            .expect("quantize");
+        }
 
         let launch = |gpu: &mut Gpu,
                       kernel: &str,
@@ -6691,8 +6706,8 @@ mod tests {
             )
             .expect("launch");
         };
-        for &rows in &row_counts {
-            for q8 in [false, true] {
+        for &rows in row_counts {
+            for &q8 in q8_arms {
                 let fresh = |gpu: &mut Gpu| -> GpuTensor {
                     if q8 {
                         let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
