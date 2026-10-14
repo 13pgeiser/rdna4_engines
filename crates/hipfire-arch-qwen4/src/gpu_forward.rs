@@ -66,6 +66,8 @@ use std::time::Instant;
 mod npu_forward;
 
 pub(crate) const EPSILON: f32 = 1.0e-6;
+const GFX942_PREFILL_CHUNK_ROWS: usize = 1536;
+
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
@@ -84,6 +86,7 @@ pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
     match arch {
         "gfx1151" => 8192,
         "gfx1201" => 4096,
+        "gfx942" => GFX942_PREFILL_CHUNK_ROWS,
         _ => 1536,
     }
 }
@@ -127,6 +130,8 @@ pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
 ///
 /// `Full` is the historical plan: one dedicated allocation per field, every
 /// MoE buffer sized for `max_chunk` rows of the widest (F32) route.
+/// gfx942 deliberately uses `Full`: its FP8 MFMA route needs the full F32
+/// scatter/combine buffers, not the gfx1201 symmetric IU4 storage aliases.
 /// `FnSymGfx1201` is the proven-route plan of a gfx1201 Flash-Next artifact
 /// whose routed headers are all symmetric: the MoE buffers are sized for the
 /// symmetric IU4 prefill route plus a [`QWEN4_COMPACT_FALLBACK_ROWS`]-row F32
@@ -143,6 +148,11 @@ pub enum Qwen4ForwardScratchMode {
 /// Identical native trunk padding scope for sequential and paired prefill.
 fn native_trunk_prefill_scope(prefill: bool, iu4: bool, arch: &str, mode: Qwen4ForwardScratchMode) -> bool {
     prefill && iu4 && arch == "gfx1151" && mode == Qwen4ForwardScratchMode::Full
+}
+
+/// gfx942 pins canonical prefill routing; gfx1151 retains its opt-in profile.
+fn trunk_prefill_invariant_scope(prefill: bool, arch: &str, rdna_opt_in: bool) -> bool {
+    prefill && (arch == "gfx942" || (arch == "gfx1151" && rdna_opt_in))
 }
 
 /// Rows the `FnSymGfx1201` plan sizes the F32 fallback MoE buffers for.  A
@@ -212,6 +222,10 @@ pub fn qwen4_forward_scratch_mode(
     source_symmetric: bool,
     ple_key_value_bf16: bool,
 ) -> Qwen4ForwardScratchMode {
+    // Freeze the gfx942 storage rung independently of row count or IU4 knobs.
+    if gpu.arch == "gfx942" {
+        return Qwen4ForwardScratchMode::Full;
+    }
     static KNOB: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| hipfire_config::developer_bool(QWEN4_COMPACT_SCRATCH_ENV, false));
     CompactScratchTerms {
@@ -3840,8 +3854,8 @@ pub struct Qwen4GpuForward {
     pub(crate) lane_scope: bool,
     /// Set only by the bundle's prefill entries (`forward_chunk*`,
     /// `spec_prefill_rows*`, `lane_prefill_tile`) around their forward call:
-    /// with `HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151 the forward then runs the
-    /// batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`]). Never
+    /// the batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`])
+    /// runs always on gfx942 and with `HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151. Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
     #[cfg(target_os = "linux")]
@@ -4288,12 +4302,10 @@ impl Qwen4GpuForward {
             }
             #[cfg(target_os = "linux")]
             { npu_trunk = npu_forward::NpuForward::load(gpu, bundle, &scratch, max_chunk, mode, npu_prepared)?; }
-            // The Q8_0 decode copies are the Flash-Next decode recipe (they
-            // re-quantize its shared-expert and HC matrices); a developer
-            // profile decodes the source BF16 weights, so decode and prefill
-            // share one numeric.
+            // Stock-FP8 always reads source BF16 for decode and prefill.
+            // Q8 copies remain the gfx1151 packed Flash-Next bandwidth recipe.
             let mut source_refs = Vec::new();
-            if flash_next {
+            if flash_next && !bundle.weights.manifest.identity.recipe.is_stock_fp8() {
                 for layer in &bundle.weights.layer_refs {
                     let moe = layer
                         .ffn
@@ -5374,9 +5386,12 @@ impl Qwen4GpuForward {
         // every row-count routing decision of this forward sees the canonical
         // chunk size; launches keep the real row count. Restored below on every
         // return path.
-        let invariant = self.prefill_scope
-            && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
-            && gpu.arch == "gfx1151";
+        let invariant = trunk_prefill_invariant_scope(
+            self.prefill_scope,
+            &gpu.arch,
+            gpu.arch == "gfx1151"
+                && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
+        );
         let prior_invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
         // The ordinary plan dedicates HcMixed/GdnZ/GdnA/GdnB to max_chunk
         // rows (plan allocations at 2677/2682/2683/2688). Only [0,n)
@@ -7240,6 +7255,19 @@ mod ep_table_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gfx942_trunk_profile_is_pinned_without_changing_rdna() {
+        for knob in [false, true] {
+            assert!(super::trunk_prefill_invariant_scope(true, "gfx942", knob));
+            assert!(!super::trunk_prefill_invariant_scope(false, "gfx942", knob));
+            assert_eq!(super::trunk_prefill_invariant_scope(true, "gfx1151", knob), knob);
+            assert!(!super::trunk_prefill_invariant_scope(true, "gfx1201", knob));
+        }
+        assert_eq!(super::qwen4_prefill_chunk_default("gfx942"), 1536);
+        assert_eq!(super::qwen4_prefill_chunk_default("gfx1151"), 8192);
+        assert_eq!(super::qwen4_prefill_chunk_default("gfx1201"), 4096);
+    }
+
     use super::{
         owner_pitch_extent, qwen4_forward_device_bytes, qwen4_spec_logit_rows, uploaded_ids_range,
         CompactScratchTerms, Qwen4ForwardScratchMode as Mode, Qwen4GpuForwardScratch as Scratch,

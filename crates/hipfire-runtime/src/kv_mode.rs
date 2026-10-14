@@ -545,6 +545,8 @@ pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
 /// is refused before the generic [`resolve`] fallback can rewrite it. The
 /// model's head geometry is checked where the state is built
 /// (`hipfire_arch_qwen4::resolve_qsa_format`).
+/// Qwen4's `Bf16` mode denotes F32 state, not BF16 KV storage. On gfx942,
+/// unset/`auto`/`bf16` select that F32 state; no reduced-KV mode is supported.
 pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
     let fp8_arch = arch == "gfx1201";
     let q8_arch = arch.starts_with("gfx11") || arch.starts_with("gfx12");
@@ -1217,6 +1219,26 @@ mod tests {
         assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
         assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
         assert_eq!(resolve("fp8", &QWEN35_SLOTS_POLICY).mode, KvMode::Fp8);
+    }
+
+    #[test]
+    fn qwen4_gfx942_uses_f32_state_and_refuses_reduced_kv() {
+        for raw in ["", "auto", "bf16"] {
+            let resolved = resolve_qwen4(raw, "gfx942").expect("gfx942 F32 state mode");
+            assert_eq!(resolved.mode, KvMode::Bf16, "{raw:?} on gfx942");
+            assert!(resolved.warning.is_none());
+        }
+        for raw in ["fp8", "q8"] {
+            let Err(error) = resolve_qwen4(raw, "gfx942") else {
+                panic!("{raw} reduced KV must be refused on gfx942");
+            };
+            assert!(
+                error.contains(raw)
+                    && error.contains("gfx942")
+                    && error.contains("use bf16 or auto"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

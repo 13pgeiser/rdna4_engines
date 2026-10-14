@@ -14,6 +14,10 @@
 //! No operation owns a tensor or allocates execution-local storage.
 
 use crate::families::gemv::WeightRef;
+use crate::context::DispatchCtx;
+use crate::families::gemm::{GemmFamily, GemmParams};
+use crate::types::KernelKey;
+use std::sync::LazyLock;
 use crate::types::DispatchError;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
@@ -133,6 +137,12 @@ fn view(source: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
 /// basis, not the natural input, so the activation is rotated into `rotation`
 /// (`rows * weight.k` elements) first — the same basis the routed experts and the
 /// MTP head consume.  BF16 and Q8F16 payloads read the input as it stands.
+///
+/// gfx942 BF16 weights (every row count, one row included) take the BF16 MFMA
+/// GEMM (`KernelKey::GemmBf16Mfma`, `Gpu::gemm_bf16_mfma_gfx942`) on a BF16
+/// copy of the activation instead of the GEMV / multirow GEMM arms; see
+/// [`g942_trunk_mfma_route`]. `HIPFIRE_G942_TRUNK_GEMV=1` restores the one-row
+/// GEMV arm (rows > 1 stay on MFMA).
 pub fn project_weight(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
@@ -246,6 +256,38 @@ fn project_weights_inner(
                 } else {
                     gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
                 })?;
+                done[j] = true;
+            }
+        }
+    }
+    // gfx942 BF16 weights of one K: the input is staged to BF16 once (or used
+    // as is when it already is BF16) and every member runs the MFMA GEMM, one
+    // output row-tile = 32 batch rows with the kernel masking the tail, so
+    // each output row is independent of `rows` (one row included). Ahead of
+    // the BF16-activation refusal below: a BF16 input is a valid MFMA operand.
+    let g942 = gpu.arch_caps.is_gfx942();
+    if g942 {
+        let gemv_opt_out = g942_trunk_gemv();
+        let route = |j: usize| {
+            g942_trunk_mfma_route(
+                true,
+                gemv_opt_out,
+                rows,
+                input.dtype,
+                projections[j].0.dtype,
+                projections[j].1.dtype,
+            )
+        };
+        for i in 0..projections.len() {
+            if done[i] || !route(i) {
+                continue;
+            }
+            let k = projections[i].0.k;
+            let group: SmallVec<[usize; 4]> = (i..projections.len())
+                .filter(|&j| !done[j] && projections[j].0.k == k && route(j))
+                .collect();
+            project_g942_mfma(gpu, input, rows, rotation, projections, &group, k)?;
+            for j in group {
                 done[j] = true;
             }
         }
@@ -628,6 +670,11 @@ fn rotate_input(
 }
 
 /// Run one projection on an input already in the weight's basis.
+///
+/// gfx942 BF16 weights never reach this on the MFMA route
+/// ([`project_weights_inner`] takes them first); the BF16 arms below are
+/// the non-gfx942 arms and, on gfx942, the `HIPFIRE_G942_TRUNK_GEMV=1` one-row
+/// GEMV.
 fn project_rotated(
     gpu: &mut Gpu,
     weight: &WeightRef<'_>,
@@ -725,6 +772,123 @@ fn project_rotated(
         )),
     };
     hip(result)
+}
+
+/// `HIPFIRE_G942_TRUNK_GEMV=1` (read once): on gfx942, one-row BF16 trunk
+/// projections keep the legacy GEMV arm instead of the MFMA GEMM.
+fn g942_trunk_gemv() -> bool {
+    static OPT_OUT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_G942_TRUNK_GEMV", false)
+    });
+    *OPT_OUT
+}
+
+/// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
+/// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
+///
+/// gfx942 only, at every row count including one: the kernel's 32-row batch
+/// tile masks the tail, each output element is one fixed-order K walk of its
+/// own activation row (128-wide K chunks ascending, MFMA 16-wide steps
+/// ascending, no split-K, no atomics), so a row's bytes do not depend on
+/// `rows`. The activation is F32 (staged to BF16) or already BF16; the output
+/// is F32, or BF16 via an F32 landing in the op's rotation scratch. The one
+/// exception is `gemv_opt_out` (`HIPFIRE_G942_TRUNK_GEMV=1`) at `rows == 1`,
+/// which keeps the legacy GEMV arm.
+fn g942_trunk_mfma_route(
+    gfx942: bool,
+    gemv_opt_out: bool,
+    rows: usize,
+    input: DType,
+    weight: DType,
+    output: DType,
+) -> bool {
+    gfx942
+        && rows > 0
+        && weight == DType::BF16
+        && matches!(input, DType::F32 | DType::BF16)
+        && matches!(output, DType::F32 | DType::BF16)
+        && !(gemv_opt_out && rows == 1)
+}
+
+/// The gfx942 MFMA arm of [`project_weights_inner`] for the `group` (indices
+/// into `projections`) of BF16 weights sharing `input` and `k`: one F32 -> BF16
+/// staging of the activation in the shared 2-byte activation scratch (no
+/// per-call allocation; none when `input` is BF16), then one
+/// `gemm_bf16_mfma_gfx942` per member. The launch extent is the real `rows`;
+/// the kernel pads its batch tile internally, so nothing is padded or copied
+/// here. A BF16 output lands as F32 in `rotation` (`rows * m` elements; BF16
+/// weights need no rotation, so the scratch is free) and is rounded RNE into
+/// the output.
+/// The calibration tap sees the original F32 `input`, never the staged copy.
+fn project_g942_mfma(
+    gpu: &mut Gpu,
+    input: &GpuTensor,
+    rows: usize,
+    rotation: Option<&GpuTensor>,
+    projections: &[(&WeightRef<'_>, &GpuTensor)],
+    group: &[usize],
+    k: usize,
+) -> Result<(), DispatchError> {
+    let n = checked_mul(rows, k, "gfx942 trunk activation")?;
+    require_tensor(input, n, input.dtype, "gfx942 trunk activation")?;
+    // Calibration tap: the true F32 activation, before the BF16 staging (the
+    // `GemmBf16Mfma` family arm skips BF16 inputs, so it would never see it).
+    if input.dtype == DType::F32 {
+        for &j in group {
+            gpu.maybe_capture_activation(projections[j].0.buf, input, rows, k);
+        }
+    }
+    let staged = if input.dtype == DType::BF16 {
+        view(input, 0, n)
+    } else {
+        let mut staged = hip(gpu.qwen4_f16_x_scratch(n))?;
+        staged.dtype = DType::BF16;
+        hip(gpu.convert_f32_to_bf16(input, &staged, n))?;
+        staged
+    };
+    // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
+    // the registry; refuses a non-BF16 activation), not a direct launch.
+    let ctx = DispatchCtx::new(gpu);
+    for &j in group {
+        let (w, out) = projections[j];
+        let elements = checked_mul(rows, w.m, "gfx942 trunk output")?;
+        require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
+        if out.dtype == DType::BF16 {
+            let landing = rotation
+                .filter(|r| r.dtype == DType::F32 && r.numel() >= elements)
+                .ok_or(DispatchError::UnsupportedVariant {
+                    family: "layer-operations",
+                    variant: "bf16-output-f32-landing-absent",
+                    arch: "gfx942",
+                    quant: "BF16",
+                })?;
+            let landing = view(landing, 0, elements);
+            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, &landing, rows)?;
+            hip(gpu.convert_f32_to_bf16(&landing, out, elements))?;
+        } else {
+            g942_gemm_bf16_mfma(gpu, &ctx, w, &staged, out, rows)?;
+        }
+    }
+    Ok(())
+}
+
+/// One `KernelKey::GemmBf16Mfma` launch through the GEMM family (`x` BF16,
+/// `y` F32).
+fn g942_gemm_bf16_mfma(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    static GEMM: LazyLock<GemmFamily> = LazyLock::new(GemmFamily::new);
+    GEMM.run_key(
+        KernelKey::GemmBf16Mfma,
+        ctx,
+        gpu,
+        &GemmParams { w, x, y, batch_size: rows },
+    )
 }
 
 /// Hyper-connection read: grouped RMSNorm, low-rank down/up projections,
@@ -4180,6 +4344,11 @@ pub fn execute_lm_head(
     } else if requested_rows == 1 {
         let input = view(hidden_batch, (rows - 1) * weight.k, weight.k);
         match weight.dtype {
+            // gfx942: the one-row MFMA route (or the `HIPFIRE_G942_TRUNK_GEMV=1`
+            // GEMV inside it); elsewhere the final-row GEMV stays.
+            DType::BF16 if gpu.arch_caps.is_gfx942() => {
+                project_weight(gpu, weight, &input, logits, 1, None)
+            }
             DType::BF16 => hip(gpu.gemv_bf16_xf32(weight.buf, &input, logits, weight.m, weight.k)),
             DType::F32 => {
                 hip(gpu.gemm_f32_batched(weight.buf, &input, logits, weight.m, weight.k, 1))
@@ -5057,5 +5226,32 @@ mod trunk_arena_dispatch_tests {
             assert_eq!(core_arena::<u8>(phase, None), None);
             assert_eq!(core_arena(phase, Some(1)), (phase == MixerPhase::Core).then_some(1));
         }
+    }
+    #[test]
+    fn g942_trunk_bf16_projection_route_is_every_row_mfma() {
+        use DType::{BF16, F16, F32, MQ4G256V2};
+        // Every row count, one row included, on gfx942.
+        for rows in [1, 2, 7, 8, 9, 31, 32, 33, 8192] {
+            assert!(g942_trunk_mfma_route(true, false, rows, F32, BF16, F32), "rows {rows}");
+            assert!(g942_trunk_mfma_route(true, false, rows, BF16, BF16, F32), "rows {rows}");
+            assert!(g942_trunk_mfma_route(true, false, rows, F32, BF16, BF16), "rows {rows}");
+        }
+        // Never off gfx942, never without rows.
+        assert!(!g942_trunk_mfma_route(false, false, 64, F32, BF16, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 0, F32, BF16, F32));
+        // Only BF16 weights, F32/BF16 activations and outputs.
+        assert!(!g942_trunk_mfma_route(true, false, 64, F32, MQ4G256V2, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 64, F16, BF16, F32));
+        assert!(!g942_trunk_mfma_route(true, false, 64, F32, BF16, F16));
+    }
+    #[test]
+    fn g942_trunk_gemv_opt_out_restores_only_the_one_row_arm() {
+        use DType::{BF16, F32};
+        assert!(!g942_trunk_mfma_route(true, true, 1, F32, BF16, F32));
+        for rows in [2, 8, 9, 32, 33, 8192] {
+            assert!(g942_trunk_mfma_route(true, true, rows, F32, BF16, F32), "rows {rows}");
+        }
+        // The opt-out is a gfx942 lever: elsewhere the route is already off.
+        assert!(!g942_trunk_mfma_route(false, true, 1, F32, BF16, F32));
     }
 }
