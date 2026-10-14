@@ -105,6 +105,11 @@ fn verified_hot_store(
 
 const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
 
+/// Reuse the backing allocation, but expose exactly this cold window's rows.
+fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
+    backing.sub_offset(0, tokens * vocab)
+}
+
 struct Model {
     gpu: Gpu,
     bundle: Qwen4Bundle,
@@ -294,15 +299,16 @@ impl Model {
 
     /// All-row logits for one chunk from a fresh state.
     fn chunk_logits(&mut self, chunk: &[u32]) -> Result<Vec<f32>, String> {
+        let logits = all_logits_view(&self.logits, chunk.len(), self.vocab);
         self.bundle
             .reset(&mut self.gpu)
             .map_err(|e| e.to_string())?;
         self.bundle
-            .forward_chunk(&mut self.gpu, chunk, &self.logits, None)
+            .forward_chunk(&mut self.gpu, chunk, &logits, None)
             .map_err(|e| e.to_string())?;
         let rows = self
             .gpu
-            .download_f32(&self.logits.sub_offset(0, chunk.len() * self.vocab))
+            .download_f32(&logits)
             .map_err(|e| e.to_string())?;
         if rows.iter().any(|v| !v.is_finite()) {
             return Err("non-finite logits".into());
@@ -960,6 +966,26 @@ fn main() {
 #[cfg(test)]
 mod s11_tests {
     use super::*;
+    #[test]
+    fn all_output_view_matches_each_unequal_sequence() {
+        let mut storage = [0.0f32; 1479 * 8];
+        let backing = GpuTensor {
+            // CPU storage used only for tensor metadata, never a GPU call.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(
+                storage.as_mut_ptr().cast(), std::mem::size_of_val(&storage)) },
+            shape: vec![storage.len()],
+            dtype: DType::F32,
+        };
+        for tokens in [166, 1479] {
+            let view = all_logits_view(&backing, tokens, 8);
+            assert_eq!(view.numel(), tokens * 8);
+            assert_eq!(view.byte_size(), tokens * 8 * 4);
+            assert_eq!(view.buf.size(), tokens * 8 * 4);
+            assert_eq!(view.buf.as_ptr(), backing.buf.as_ptr());
+        }
+        assert_eq!(backing.numel(), 1479 * 8);
+    }
+
 
     #[test]
     fn cli_rejects_missing_corpus_and_partial_rows() {
