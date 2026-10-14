@@ -200,6 +200,21 @@ fn mq_i4_a4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=mq_i4_a4::emit(spec)?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// gfx1201 pointer-addressed F4 read-once C8 lane-union decode GEMVs (`kernels::mq_i4_moe_gemv`):
+/// `--epi <mq3i4|mq4sym>_<r256_gate_up|r128_down>` one entry, `all` (default) the four-entry module.
+fn mq_i4_moe_gemv_specs(epi:&str,arch:Arch)->Result<Vec<peacemaker_isa::kernels::mq_i4_moe_gemv::Spec>,String>{
+ use peacemaker_isa::kernels::mq_i4_moe_gemv;
+ let all=mq_i4_moe_gemv::module_specs(arch);
+ if epi=="all"{return Ok(all)}
+ all.into_iter().find(|s|s.tag()==epi).map(|s|vec![s]).ok_or_else(||format!("mq_i4_moe_gemv --epi {epi} (mq3i4_r256_gate_up|mq3i4_r128_down|mq4sym_r256_gate_up|mq4sym_r128_down|all)"))
+}
+fn mq_i4_moe_gemv(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use peacemaker_isa::kernels::mq_i4_moe_gemv;
+ if epi=="all"{let (_,text,proof)=mq_i4_moe_gemv::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let [spec]=mq_i4_moe_gemv_specs(epi,arch)?[..] else {return Err("mq_i4_moe_gemv: one entry expected".into())};
+ let e=mq_i4_moe_gemv::emit(spec)?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 /// gfx1151 Flash-Next shared-expert gate/up (fused GEMM + BF16-recipe SwiGLU + selector sigmoid + F16 hidden):
 /// `--epi w8|w4` one entry, `all` the module.
 fn qwen4_shared_gu_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -374,6 +389,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "mq_i4_rows"=>mq_i4_rows(epi.as_deref().unwrap_or("all"),arch)?,
   "mq_i4_a4"=>mq_i4_a4(epi.as_deref().unwrap_or("all"),arch)?,
+  "mq_i4_moe_gemv"=>mq_i4_moe_gemv(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_shared_gu_gfx11"=>qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mtp_dense_det_gfx11"=>mtp_dense_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "mtp_q8_det_gfx11"=>mtp_q8_det_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
@@ -385,7 +401,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
  let pm_module=kernel.strip_prefix("pm_decode_");
  let mq4v=kernel=="mq4_verify";
  let mq4f8=kernel=="mq4_fp8_verify";
- let mqi4=kernel=="mq_i4_rows";
+let mqi4=kernel=="mq_i4_rows"||kernel=="mq_i4_moe_gemv";
 let mqia4=kernel=="mq_i4_a4";
  let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk"||kernel=="npu_trunk_arena";
  let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm";
@@ -400,7 +416,7 @@ if pm_module.is_none()&&!mq4v&&!mq4f8&&!mqi4&&!mqia4&&!lane_rows&&!spec_pm&&!mtp
  if pm_module.is_some()&&co.is_none() {return Err("pm_decode emission requires --co (M7 certifies the linked object)".into())}
  if mq4v&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if mq4f8&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
- if mqi4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_rows --shape/--m7 require --co (M7 certifies the linked object)".into())}
+if mqi4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err(format!("{kernel} --shape/--m7 require --co (M7 certifies the linked object)"))}
 if mqia4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_a4 --shape/--m7 require --co (M7 certifies the linked object)".into())}
  // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
  if co.is_some()||bundle.is_some(){
@@ -491,7 +507,7 @@ if mqia4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_a4 --
  #[cfg(not(feature="toolchain"))]
  if mq4f8&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
  #[cfg(not(feature="toolchain"))]
- if mqi4&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_rows --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
+if mqi4&&(shape.is_some()||m7.is_some()) {return Err(format!("{kernel} --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain"))}
 #[cfg(not(feature="toolchain"))]
 if mqia4&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_a4 --shape/--m7 certify with M7: build peacemaker-isa with --features toolchain".into())}
  #[cfg(feature="toolchain")]
@@ -515,7 +531,7 @@ if mqia4&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_a4 --shape/--m7 cer
  // mq_i4_rows: with --co, M7 on every selected export of the linked object, plus each
  // export's shape contract (--shape DIR).
  #[cfg(feature="toolchain")]
- if mqi4&&co.is_some() {
+if kernel=="mq_i4_rows"&&co.is_some() {
   let path=co.as_deref().ok_or("missing --co")?;
   let mut receipts=serde_json::Map::new();
   for spec in mq_i4_rows_specs(epi.as_deref().unwrap_or("all"),arch)? {
@@ -544,6 +560,25 @@ if mqia4&&co.is_some() {
    let e=peacemaker_isa::kernels::mq_i4_a4::emit(spec)?;
    let file=format!("{dir}/mq_i4_a4.{}.{}.contract.json",arch.name(),spec.tag());
    fs::write(&file,serde_json::to_vec_pretty(&peacemaker_isa::kernels::mq_i4_a4::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
+  }
+  receipts.insert(symbol,m7);
+ }
+ let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+ println!("{}",String::from_utf8_lossy(&receipts));
+ if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
+}
+// mq_i4_moe_gemv: the same for the four F4 lane-union decode GEMV entries.
+#[cfg(feature="toolchain")]
+if kernel=="mq_i4_moe_gemv"&&co.is_some() {
+ let path=co.as_deref().ok_or("missing --co")?;
+ let mut receipts=serde_json::Map::new();
+ for spec in mq_i4_moe_gemv_specs(epi.as_deref().unwrap_or("all"),arch)? {
+  let symbol=spec.symbol();
+  let m7=peacemaker_isa::pm_check::m7(std::path::Path::new(path),arch.name(),&symbol)?;
+  if let Some(dir)=&shape {
+   let e=peacemaker_isa::kernels::mq_i4_moe_gemv::emit(spec)?;
+   let file=format!("{dir}/mq_i4_moe_gemv.{}.{}.contract.json",arch.name(),spec.tag());
+   fs::write(&file,serde_json::to_vec_pretty(&peacemaker_isa::kernels::mq_i4_moe_gemv::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
   }
   receipts.insert(symbol,m7);
  }

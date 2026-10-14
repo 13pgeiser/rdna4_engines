@@ -176,6 +176,11 @@ required-features = ["lab"]
 name = "mq_i4_a4_byte_oracle"
 required-features = ["lab"]
 
+# Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_byte_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "coherence_probe"
 required-features = []
