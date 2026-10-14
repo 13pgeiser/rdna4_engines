@@ -2709,6 +2709,10 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
                 })
                 .unwrap_or(11435);
             if let Err(error) = validate_serve_pid(&record, probe_host(&host), fallback_port) {
+                #[cfg(windows)]
+                if pid_alive(record.pid) {
+                    bail!("{error}; serve.pid left in place. Stop the original serve with Ctrl-C, then restart it with this hipfire");
+                }
                 fs::remove_file(&pid_path)?;
                 if !args.force {
                     bail!("{error}; removed stale pidfile without signaling");
