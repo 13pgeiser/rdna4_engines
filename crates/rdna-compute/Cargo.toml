@@ -90,6 +90,10 @@ name = "test_qsa_hg12_twin_gfx1151"
 required-features = ["lab"]
 
 [[example]]
+name = "test_fp8_moe_gfx942"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_moe_sym"
 required-features = ["lab"]
 

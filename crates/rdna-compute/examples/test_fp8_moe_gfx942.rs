@@ -40,7 +40,7 @@
 //!    top-10 routes over 512 experts at the real 1280x2560 / 2560x640 shapes,
 //!    compared on every live output with no F64 oracle at those sizes.
 //!
-//! Run: `cargo run --release -p rdna-compute --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
+//! Run: `cargo run --release -p rdna-compute --features lab --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
 
 use rdna_compute::fp8_e4m3::{b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block};
 use rdna_compute::{DType, Gpu, GpuTensor};
