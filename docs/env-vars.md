@@ -2097,7 +2097,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROCPROF_OUTPUT_DIR` | scripts/rocprof-daemon-wrap.sh | harness |
 | `HIPFIRE_ROOT` | crates/hipfire-arch-deepseek4/scripts/ds4_gate6_teacher_kld.sh, crates/hipfire-arch-deepseek4/scripts/ds4_mq2r_cap_campaign.sh | harness |
 | `HIPFIRE_ROPE_HALFSPLIT` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+| `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/sandwich.rs | experimental |
 | `HIPFIRE_ROTATE_AWQ` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROTATE_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROTATE_FP8_GATE_IL` | crates/rdna-compute/src/kernels.rs | developer |

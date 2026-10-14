@@ -61,8 +61,9 @@ pub enum Step<'a> {
         plan: crate::families::kv_tier::KvTierPlan,
         io: crate::families::attention::AttnParams<'a>,
     },
-    /// In-place RoPE on Q and K. Per-op only (no fused entry) — present so the
-    /// attention block can be one contiguous step list (future fusion seam).
+    /// In-place RoPE on Q and K with an explicit channel pairing. Per-op only
+    /// (no fused entry) — present so the attention block can be one contiguous
+    /// step list (future fusion seam).
     Rope {
         q: &'a GpuTensor,
         k: &'a GpuTensor,
@@ -70,7 +71,7 @@ pub enum Step<'a> {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
-        theta: f32,
+        rope: crate::pipeline::sandwich::Rope,
     },
     /// Per-head rmsnorm on one tensor (Qwen3-style qk-norm). One step per tensor.
     QkNorm {
@@ -1675,10 +1676,8 @@ pub(crate) fn launch_op_rows(
             n_heads,
             n_kv_heads,
             head_dim,
-            theta,
-        } => gpu
-            .rope_f32(q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim, *theta)
-            .map_err(|e| DispatchError::Hip(e.to_string())),
+            rope,
+        } => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
         Step::QkNorm {
             x,
             weight,

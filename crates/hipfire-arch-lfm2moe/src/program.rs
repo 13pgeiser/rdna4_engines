@@ -18,6 +18,7 @@ use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::moe::{
     MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoeRecipe, MoeSelectionBias,
 };
+use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
 use hipfire_dispatch::pipeline::{
     seal_decode, BoundMoeExperts, GatedShortConvOp, GemvInput, Step,
 };
@@ -146,7 +147,10 @@ impl<'a> LayerRefs<'a> {
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
-                        theta: cfg.rope_theta,
+                        rope: Rope {
+                            kind: RopeKind::RotateHalf,
+                            theta: cfg.rope_theta,
+                        },
                     },
                     Step::Attend {
                         plan,

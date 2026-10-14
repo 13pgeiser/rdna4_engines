@@ -4338,6 +4338,15 @@ fn decode_activation_stage(
         // silu_mul is elementwise, so one launch over the whole
         // [k_top * mi] buffer covers every selected expert.
         hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
+    } else if let (_, Some(awq)) = no_shared_routed_awq(p) {
+        hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
+            p.gate_batch,
+            p.up_batch,
+            awq,
+            p.rot_batch,
+            p.mi,
+            p.k
+        ))?;
     } else {
         // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
         hip!(gpu.fused_silu_mul_rotate_mq_batched(
@@ -4686,11 +4695,24 @@ fn decode_input_basis_stage(
             } else {
                 hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
             }
+        } else if let (Some(awq), _) = no_shared_routed_awq(p) {
+            hip!(gpu.rotate_x_mq_awq(p.x_norm, awq, p.x_rot_local, p.hidden))?;
         } else {
             hip!(gpu.rotate_x_mq(p.x_norm, p.x_rot_local, p.hidden))?;
         }
     }
     Ok(())
+}
+
+/// `(gate_up, down)` per-layer AWQ activation scales of the routed experts
+/// (`(W·s)·(x/s) = W·x`). Only a no-shared recipe owns its input rotation.
+fn no_shared_routed_awq<'a>(
+    p: &crate::families::moe::MoeParams<'a>,
+) -> (Option<&'a GpuTensor>, Option<&'a GpuTensor>) {
+    match p.routed_experts.get(0) {
+        Some((gate_up, down)) if p.shared.is_none() => (gate_up.awq_scale, down.awq_scale),
+        _ => (None, None),
+    }
 }
 
 fn decode_route_cpu_stage(

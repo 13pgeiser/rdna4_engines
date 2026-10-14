@@ -24,6 +24,7 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use rdna_compute::{Gpu, GpuTensor};
@@ -218,7 +219,10 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             n_heads: k.n_heads,
             n_kv_heads: k.n_kv_heads,
             head_dim: k.head_dim,
-            theta: k.rope_theta,
+            rope: Rope {
+                kind: RopeKind::RotateHalf,
+                theta: k.rope_theta,
+            },
         });
 
         let o_proj = Step::GemvResidual {

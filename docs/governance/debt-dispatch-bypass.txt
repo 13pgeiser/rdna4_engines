@@ -47,7 +47,7 @@ hipfire-arch-qwen35        partial   188   191   migrate last; MTP routed MoE no
 hipfire-arch-deepseek4     debt       39     0   cheapest full conversion; no registry use to reconcile
 hipfire-arch-gemma4        partial     1     4
 hipfire-arch-lfm2moe       debt        9     0   -8 = single-lane decode moved onto dispatch steps (#666 G10); the rest is the continuous-batching decode (forward_batch.rs) and load-time uploads
-hipfire-arch-minimax       debt       19     0
+hipfire-arch-minimax       debt       15     0
 hipfire-arch-muse-glimmer  partial    23    17
 hipfire-arch-llama         debt       10     0
 hipfire-arch-dots-ocr      partial     7     4
