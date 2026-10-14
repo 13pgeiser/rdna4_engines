@@ -820,17 +820,17 @@ per group; dispatch and column maps support independent family views.
 
 `on` requires the full 8192-row scratch plan and single-device placement.
 Bank B is a load-time view of bank A's layer-local buffers, with only the
-three persistent fields allocated privately. Bank A's ownership/capacities
+four fields that cross a bank switch allocated privately. Bank A's ownership/capacities
 and all `off` allocations remain unchanged.
 
 | Bank-B fields | Storage | Why |
 | --- | --- | --- |
 | `streams` | Private | HC residual rows persist through every layer and final capture/head; B must not overwrite A's rows. |
 | `hc_mixed` | Private | Prepared mixer input survives the other bank's prepare/fragment. Uncovered native projections also read it in Core. |
+| `hc_gates` | Private | The attention HC write's gates, produced by prepare's paired HC read (or by the bank's previous fragment's MoE HC row fold), survive the other bank's prepare/fragment until this bank's OutProj, whose `hcw` epilogue (or pregated BF16-stream write) consumes them. |
 | `ple_rows` | Private | Initialized token-dependent PLE input survives until its layer's prepare. |
 | `token_ids`, `embedding_rot`, `embeddings`, `ple_staged` | Shared | Each bank's initialization consumes these completely before the next initialization on the same stream. MTP uploads its own prompt IDs. |
 | `hc_normalized`, `hc_low`, `hc_up`, `rotation`, `gdn_bf16` | Shared | Each prepare/fragment/head consumes its own values before returning; no value is handed across their boundaries. |
-| `hc_gates` | Shared | Prepare ends before the mixer, so its HC read cannot fuse with the later HC write. That write computes its gates; MLP HC read/write fusions remain entirely inside one fragment. |
 | `projection`, `projection2`, `gdn_a`, `gdn_b`, `gdn_gate`, `gdn_beta`, `gdn_recurrent_output`, `gdn_z`, `gdn_output` | Shared | Native uncovered projections, GDN Core and OutProj finish every use inside G(l,bank). |
 | `qsa_index`, `qsa_qgate`, `qsa_k`, `qsa_v`, `qsa_output`, `qsa_selected`, `attention_output` | Shared | QSA transform/cache/index/attention and the attention HC write finish inside the fragment. |
 | `ple_key`, `ple_value`, `ple_query`, `ple_gated`, `ple_normed`, `ple_output` | Shared | The PLE prepare consumes these before the bank switch. `ple_normed` is retained for ordinary verify rollback, not prompt pairs; pair snapshots copy fixed convolution state instead. |
@@ -869,15 +869,15 @@ allocate none of them:
 
 | Removed allocation | Bytes |
 | --- | ---: |
-| Bank-B layer-local scratch (`Full` plan 8,957,998,980 minus private 503,316,480) | 8,454,682,500 |
+| Bank-B layer-local scratch (`Full` plan 8,957,998,980 minus private 503,447,552) | 8,454,551,428 |
 | GPU W8 twin (`(36*16640+12*14080)*2560`) | 1,966,080,000 |
 | Twin weight Sm/Se (`(36*16640+12*14080)*4`) | 3,072,000 |
 | Twin int32 accumulator, `emulate` only (`8192*16640*4`) | 545,259,520 |
 | Twin packed A (`4*32*40*4608`) | 23,592,960 |
-| **Total** | **10,992,686,980 (10.237738 GiB)** |
+| **Total** | **10,992,555,908 (10.237615 GiB)** |
 
 The twin-only subtotal is 2,538,004,480 bytes (2.363701 GiB); bank-B sharing
-saves 7.874037 GiB and leaves 480 MiB private. Subset panel/twin savings are
+saves 7.873915 GiB and leaves 480.1 MiB private. Subset panel/twin savings are
 additional and mask-dependent; the log reflects the actual selected mask.
 These are allocation-plan bytes, not a GTT residency measurement (the changelog's measured peak GTT delta is +0.8 GiB at 56K).
 CPU tests `npu_bank_sharing_covers_every_field_and_never_crosses_a_bank_switch`
@@ -885,10 +885,14 @@ and `npu_private_bank_bytes_are_pinned_at_full_and_partial_rows` enumerate all
 58 fields, check produced-value lifetimes against the actual A/B event order,
 and pin private bytes for 8192, 8151 and 512 rows.
 
-Sharing is unsafe if a future change spans a prepare/mixer boundary with an
-HC fusion, stages projections before the other bank's fragment, adds a
+Sharing is unsafe if a future change hands another layer-local value across
+a prepare/mixer boundary, stages projections before the other bank's fragment, adds a
 cross-bank stream, or retains a layer-local value for later capture/rollback.
 Such a change must update the exhaustive lifetime table and private set.
+The pair executor carries each bank's HC fusion pairings across its prepare,
+Core and OutProj windows (`HcFusionCursor`), so the fused HC kernels the
+GPU-only route takes (paired read gates, `hcw` out-projection epilogue, MoE
+HC row fold) also run under the NPU route; only `hc_gates` crosses the switch.
 Partial B changes its view metadata only; A's tensor extents and capacities
 stay intact. Numerical operations/order and external capture offsets are
 unchanged, but full-model `on`/`emulate` byte parity and GTT savings still
