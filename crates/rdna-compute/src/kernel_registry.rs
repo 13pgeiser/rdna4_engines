@@ -794,6 +794,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "qwen4_moe_group_prefix", "qwen4_moe_group_ranks", "qwen4_moe_group_scatter",
         ]);
         add!("qwen4_moe_sym_check_gfx1201", kernels::QWEN4_MOE_SYM_CHECK_GFX1201_SRC, ["qwen4_moe_sym_check_gfx1201"]);
+        add!("qwen4_slab_union_plan", kernels::QWEN4_SLAB_UNION_PLAN_GFX1201_SRC, ["qwen4_slab_union_plan"]);
     }
     if arch == "gfx1100" {
         add!("add", kernels::ADD_SRC, ["add_f32", "broadcast_add_rows_f32"]);

@@ -4422,6 +4422,15 @@ pub const QWEN4_MOE_SYM_CHECK_GFX1201_SRC: &str =
 /// the same six outputs as [`MOE_SCATTER_FUSED_TOP10_SRC`].
 pub const QWEN4_MOE_SCATTER_STABLE_TOP10_SRC: &str =
     include_str!("../../../kernels/src/qwen4_moe_scatter_stable_top10.hip");
+/// Sealed expert-slab decode lane-union planner (gfx1201): routed ids ->
+/// fixed-capacity per-codec-bucket K1 descriptors, no host readback.
+pub const QWEN4_SLAB_UNION_PLAN_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_slab_union_plan.gfx1201.hip");
+/// K1 (`mq_i4_moe_gemv`) certified builder module, gfx1201 only: the four
+/// F4 read-once C8 decode GEMV entries over pointer-addressed MQ3-I4 / MQ4
+/// expert tensors (`peacemaker-isa emit --kernel mq_i4_moe_gemv`).
+pub const MQ_I4_MOE_GEMV_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco");
 /// Down A4 producer: grouped BF16 SwiGLU rows -> FWHT128 -> the shared
 /// `quantize_block_i4_128_wave<true>` (candidate set from the host flags,
 /// C2 by default) into a compact flat-slot `block_i4_128` sidecar.
