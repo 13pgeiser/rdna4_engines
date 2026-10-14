@@ -834,7 +834,10 @@ impl NpuForward {
         // No tape can contain relay/host operations. Decode retains its old route.
         gpu.replay.set_forward_eligible(false);
         owner.uploaded_id_rows=0;
-        drop(owner.ple_ahead.take());
+        // Bank A adopts the first-tile PLE ticket started at admission; bank
+        // B's rows are enqueued once A's fetch owns the epoch and adopted by
+        // B's initialization (rows are a pure function of their ids).
+        let ple_ahead=owner.ple_ahead.take();
         // Bank B binds its live rows; a partial bank A does too (`pair` restores its full extents).
         if rows[0] != owner.scratch.max_chunk { bind_bank_rows(&mut owner.scratch, &bundle.config, rows[0])?; }
         bind_bank_rows(self.bank_b.as_mut().expect("on bank B"), &bundle.config, rows[1])?;
@@ -851,7 +854,7 @@ impl NpuForward {
         let mut history=bundle.state.ple_history;
         // Bank A only: bank B initializes after kick(0, A) (L1 fill reorder),
         // so NPU(0, A) does not wait behind bank B's embedding/PLE staging.
-        initialize(gpu,bundle,&owner.scratch,&tokens[..rows[0]],&history,programs[0].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple)?;
+        let mut ple_next=initialize(gpu,bundle,&owner.scratch,&tokens[..rows[0]],&history,programs[0].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple,ple_ahead,Some(&tokens[rows[0]..]))?;
         for &token in &tokens[..rows[0]] { history.push(token); }
         if let (Some(stage), Some(cut)) = (&mut stage, shape.cut) {
             let (cut_bank, cut_row) = match site {
@@ -897,7 +900,7 @@ impl NpuForward {
             // Same stream: prepare(0, A) is enqueued before bank B's
             // initialization overwrites the shared init buffers (Footprint table).
             let bank_b_tokens=&tokens[rows[0]..];
-            initialize(gpu,bundle,b,bank_b_tokens,&history,programs[1].ple_rows_f16,&mut host_tokens,&mut host_ple)?;
+            initialize(gpu,bundle,b,bank_b_tokens,&history,programs[1].ple_rows_f16,&mut host_tokens,&mut host_ple,ple_next.take(),None)?;
             for &token in bank_b_tokens { history.push(token); }
             seq[1]=self.prepare(gpu,&ctx,&programs[1],0,1,&mut records,snapshot)?;
             let mut last_seq = seq;
@@ -988,7 +991,24 @@ impl NpuForward {
     }
 }
 
-fn initialize(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, tokens: &[u32], history: &crate::ple::PleHistory, ple_f16: bool, ids: &mut [u8], ple_bytes: &mut [u8]) -> Result<(),Qwen4GpuForwardError> {
+/// Stages one bank's embedding and PLE rows. `ahead` is adopted when it names
+/// exactly this bank's rows. With `next`, the following bank's rows are
+/// enqueued (best effort) once this fetch owns the epoch; the returned ticket
+/// is that bank's `ahead`.
+#[allow(clippy::too_many_arguments)]
+fn initialize(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, tokens: &[u32], history: &crate::ple::PleHistory, ple_f16: bool, ids: &mut [u8], ple_bytes: &mut [u8], ahead: Option<hipfire_runtime::external_rows::RowTicket>, next: Option<&[u32]>) -> Result<Option<hipfire_runtime::external_rows::RowTicket>,Qwen4GpuForwardError> {
+    let mut fetch=match &bundle.ple {
+        Some(ple)=>Some(RowFetch::begin_or_adopt(&ple.rows,ahead,history.row_ids(&ple.metadata,tokens)).map_err(fail)?),
+        None=>{ drop(ahead); None }
+    };
+    let next_ticket=match (&bundle.ple,next) {
+        (Some(ple),Some(next)) if !next.is_empty()=>{
+            let mut next_history=*history;
+            for &token in tokens { next_history.push(token); }
+            ple.rows.prefetch(ple.rows.current_epoch(),next_history.row_ids(&ple.metadata,next)).ok()
+        }
+        _=>None,
+    };
     let n=tokens.len(); let config=&bundle.config;
     for (dst,&token) in ids[..n*4].chunks_exact_mut(4).zip(tokens) { dst.copy_from_slice(&(token as i32).to_ne_bytes()); }
     gpu.memcpy_htod_auto(&scratch.token_ids.buf,&ids[..n*4])?;
@@ -1000,8 +1020,7 @@ fn initialize(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScra
     } else {
         gpu.hc_streams_init_from_embed_batched(&embeddings,&scratch.streams,config.hidden_size as i32,config.hc_count as i32,n as i32)?;
     }
-    if let Some(ple)=&bundle.ple {
-        let mut fetch=RowFetch::begin_or_adopt(&ple.rows,None,history.row_ids(&ple.metadata,tokens)).map_err(fail)?;
+    if let Some(fetch)=fetch.as_mut() {
         let lease=fetch.wait().map_err(fail)?;
         let bytes=&mut ple_bytes[..lease.as_bytes().map_err(fail)?.len()];
         lease.stage_into(bytes).map_err(fail)?;
@@ -1012,7 +1031,7 @@ fn initialize(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScra
         else { gpu.grouped_gather_convert_bf16(&scratch.ple_staged,&scratch.ple_rows,n,geometry.head_count,geometry.row_width)?; }
         fetch.complete();
     }
-    Ok(())
+    Ok(next_ticket)
 }
 
 fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, bank: usize, row0: usize, n: usize, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
