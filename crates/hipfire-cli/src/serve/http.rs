@@ -701,7 +701,7 @@ const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// After shutdown, how long in-flight requests get to finish.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+pub(crate) const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
 
 /// Accept loop. A failed `accept` (out of descriptors, a connection reset
 /// before it was accepted) is logged and retried, never fatal. When

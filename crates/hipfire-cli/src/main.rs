@@ -54,6 +54,7 @@ mod bench_power;
 mod kernel_pack;
 mod npu_trunk;
 mod ple;
+mod process_identity;
 mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
@@ -891,17 +892,18 @@ pub(crate) struct Paths {
 }
 
 impl Paths {
-    fn discover() -> Self {
-        let config = ConfigPaths::discover();
+    /// A missing home directory is a clean CLI error, not a panic.
+    fn discover() -> Result<Self> {
+        let config = ConfigPaths::try_discover()?;
         let root = config.root.clone();
-        Self {
+        Ok(Self {
             models: config.models.clone(),
             registry: RegistryPaths {
                 cache: root.join("registry.cache.json"),
             },
             root,
             config,
-        }
+        })
     }
 }
 
@@ -923,6 +925,7 @@ fn run() -> Result<()> {
     // head -1`) like any Unix filter instead of panicking in `println!`.
     // Commands that drive a daemon, server or child over pipes keep Rust's
     // ignored SIGPIPE so a dead peer is an EPIPE error, not a silent exit.
+    #[cfg(unix)]
     if matches!(
         cli.command,
         Some(
@@ -937,7 +940,7 @@ fn run() -> Result<()> {
         // SAFETY: restores the default disposition before any thread starts.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
-    let paths = Paths::discover();
+    let paths = Paths::discover()?;
     match cli.command {
         None => launch_tui(&paths, &[]),
         Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
@@ -2881,8 +2884,8 @@ fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
         let Ok(pid) = raw.trim().parse::<i32>() else {
             continue;
         };
-        // Safety: signal 0 only probes for existence and permission.
-        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+        let alive = process_identity::pid_signalable(pid);
+        if alive {
             live.push(pid);
         }
     }
@@ -5519,60 +5522,27 @@ struct ProcessRecord {
     command: String,
 }
 
-fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
+fn scan_auxiliary_processes() -> Result<(Vec<ProcessRecord>, Vec<ProcessRecord>), String> {
+    let snapshots = process_identity::scan_processes(|command| {
+        command.contains("hf upload")
+            || command.contains("hipfire-quantize")
+            || command.contains("hipfire quantize")
+    })?;
     let mut quantize = Vec::new();
     let mut uploads = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return (quantize, uploads);
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == std::process::id() {
-            continue;
-        }
-        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let command = String::from_utf8_lossy(&raw)
-            .replace('\0', " ")
-            .trim()
-            .to_owned();
-        if command.is_empty() {
-            continue;
-        }
-        let rss_mb = fs::read_to_string(entry.path().join("status"))
-            .ok()
-            .and_then(|status| {
-                status.lines().find_map(|line| {
-                    line.strip_prefix("VmRSS:")?
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()
-                })
-            })
-            .unwrap_or(0)
-            / 1024;
+    for snapshot in snapshots {
         let record = ProcessRecord {
-            pid,
-            rss_mb,
-            command,
+            pid: snapshot.pid,
+            rss_mb: snapshot.rss_mb,
+            command: snapshot.command,
         };
         if record.command.contains("hf upload") {
             uploads.push(record);
-        } else if record.command.contains("hipfire-quantize")
-            || record.command.contains("hipfire quantize")
-        {
+        } else {
             quantize.push(record);
         }
     }
-    (quantize, uploads)
+    Ok((quantize, uploads))
 }
 
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
@@ -5584,14 +5554,17 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         .ok()
         .and_then(|raw| parse_pid_record(&raw));
     let pid = pid_record.as_ref().map(|record| record.pid);
-    let alive = pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+    let alive = pid.is_some_and(process_identity::pid_alive);
     let health = http_get_json(&host, port, "/health");
     let stats = http_get_json(&host, port, "/stats");
-    let (quantize, uploads) = scan_auxiliary_processes();
-    let report = serde_json::json!({
+    let (quantize, uploads, auxiliary_unavailable) = match scan_auxiliary_processes() {
+        Ok((quantize, uploads)) => (quantize, uploads, None),
+        Err(reason) => (Vec::new(), Vec::new(), Some(reason)),
+    };
+    let mut report = serde_json::json!({
         "running": health.is_some(),
         "pid": pid,
-        "pid_record": pid_record,
+        "pid_record": pid_record.as_ref().map(ServePidRecord::to_public_json),
         "pid_alive": alive,
         "endpoint": service_url(&host, port, ""),
         "health": health,
@@ -5599,6 +5572,9 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "quantize": quantize,
         "uploads": uploads,
     });
+    if let Some(reason) = &auxiliary_unavailable {
+        report["auxiliary_scan_unavailable"] = serde_json::json!(reason);
+    }
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report["running"].as_bool() == Some(true) {
@@ -5646,6 +5622,9 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 process.pid, process.rss_mb, process.command
             );
         }
+    }
+    if let Some(reason) = &auxiliary_unavailable {
+        println!("note: {reason}");
     }
     Ok(())
 }
@@ -7314,11 +7293,30 @@ fn ensure_update_not_interrupted() -> Result<()> {
     Ok(())
 }
 
+/// Why `hipfire update` cannot run on `os` (a `std::env::consts::OS` value);
+/// `None` where it is supported. Pure so the policy is testable on any host.
+fn update_unsupported_message(os: &str, version: &str) -> Option<String> {
+    match os {
+        "linux" => None,
+        "windows" => Some(format!(
+            "hipfire update is not available on Windows (installed hipfire {version}); no files were changed. \
+             Windows updates require re-running scripts/install.ps1 after stopping the engine. \
+             For current master run in PowerShell:\n\
+             iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)\n\
+             For a specific revision, use the reviewed, pinned install in docs/GETTING_STARTED.md."
+        )),
+        other => Some(format!(
+            "hipfire update is Linux-only (installed hipfire {version}, running on {other}); \
+             re-run the platform installer with a revision selector on this OS"
+        )),
+    }
+}
+
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!(
-            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
-        );
+    if let Some(message) =
+        update_unsupported_message(std::env::consts::OS, env!("CARGO_PKG_VERSION"))
+    {
+        bail!("{message}");
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -8730,52 +8728,39 @@ fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> 
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// The hipfire home a process runs under, read from its environment with the
-/// `ConfigPaths::discover` rule (`HIPFIRE_HOME`, else `$HOME/.hipfire`).
-/// `None` when the environment is unreadable (another user's process).
-fn process_hipfire_home(pid: u32) -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
-    let mut hipfire_home = None;
-    let mut home = None;
-    for var in environ.split(|byte| *byte == 0) {
-        if let Some(value) = var.strip_prefix(b"HIPFIRE_HOME=") {
-            hipfire_home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
-        } else if let Some(value) = var.strip_prefix(b"HOME=") {
-            home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
-        }
-    }
-    hipfire_home.or_else(|| home.map(|home| home.join(".hipfire")))
-}
-
-fn same_file_path(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// A live (non-zombie) process whose `argv[0]` is `daemon` (this install's
-/// daemon binary) and whose hipfire home is `root`.
+/// A process whose `argv[0]` is `daemon` (this install's daemon binary) and
+/// whose hipfire home is `root`. Linux only: other OSes cannot read another
+/// process's environment, so ownership is unprovable there.
+#[cfg(target_os = "linux")]
 fn is_install_daemon(pid: u32, daemon: &Path, root: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
-        return false;
-    };
-    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
-    !argv0.is_empty()
-        && same_file_path(Path::new(std::ffi::OsStr::from_bytes(argv0)), daemon)
-        && process_hipfire_home(pid).is_some_and(|home| same_file_path(&home, root))
+    process_identity::process_image_matches(pid, daemon)
+        && process_identity::process_hipfire_home(pid)
+            .is_some_and(|home| process_identity::same_file_path(&home, root))
 }
 
-fn process_gone(pid: u32) -> bool {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        // The state follows the parenthesised command name; `Z` is a zombie.
-        Ok(stat) => stat
-            .rsplit_once(") ")
-            .is_some_and(|(_, rest)| rest.starts_with('Z')),
-        Err(_) => true,
+/// Explanation for daemon candidates `stop --force` refuses to terminate on an
+/// OS that cannot prove a process's `HIPFIRE_HOME`: `matching` are live PIDs
+/// whose image is this install's daemon binary. `None` when there are none.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn unproven_reap_notice(root: &Path, matching: &[u32], windows: bool) -> Option<String> {
+    if matching.is_empty() {
+        return None;
     }
+    let pids = matching
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let stop = if windows {
+        "stop it yourself after confirming it belongs to this install (e.g. `Stop-Process -Id <pid>`)"
+    } else {
+        "stop it yourself after confirming it belongs to this install"
+    };
+    Some(format!(
+        "not terminating daemon PID(s) {pids}: the image matches this install's daemon, but this OS \
+         cannot prove the process's HIPFIRE_HOME is {}, so it could belong to another install; {stop}",
+        root.display()
+    ))
 }
 
 /// PIDs this install may own a daemon under: the daemon pidfiles
@@ -8819,20 +8804,13 @@ fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
     for dir in &lock_dirs {
         scan(dir, "gpu-", ".lock", &mut candidates);
     }
-    if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
-        .ok()
-        .and_then(|raw| parse_pid_record(&raw))
+    #[cfg(target_os = "linux")]
     {
-        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", serve.pid)) {
-            for task in tasks.flatten() {
-                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
-                    candidates.extend(
-                        children
-                            .split_whitespace()
-                            .filter_map(|pid| pid.parse::<u32>().ok()),
-                    );
-                }
-            }
+        if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
+            .ok()
+            .and_then(|raw| parse_pid_record(&raw))
+        {
+            candidates.extend(process_identity::child_pids(serve.pid));
         }
     }
     candidates
@@ -8842,6 +8820,7 @@ fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
 /// its pidfiles/GPU locks whose `argv[0]` is this install's daemon binary and
 /// whose hipfire home is this home. SIGTERM, then SIGKILL after 5 s for the
 /// ones still running (re-verified first). Returns the signalled PIDs.
+#[cfg(target_os = "linux")]
 pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
     let Some(daemon) = find_daemon(paths) else {
         return Ok(Vec::new());
@@ -8856,17 +8835,42 @@ pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !targets.iter().all(|&pid| process_gone(pid)) {
+    while Instant::now() < deadline && !targets.iter().all(|&pid| process_identity::process_gone(pid))
+    {
         thread::sleep(Duration::from_millis(100));
     }
     for &pid in &targets {
-        if !process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
+        if !process_identity::process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
             eprintln!("daemon PID {pid} ignored SIGTERM for 5 s; sending SIGKILL");
             // SAFETY: as above, re-verified immediately before signalling.
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
     }
     Ok(targets)
+}
+
+/// `stop --force` off Linux terminates nothing: a process's `HIPFIRE_HOME`
+/// cannot be proven here, and an image match alone may be another install's
+/// daemon. Live candidates matching this install's daemon image are reported
+/// with the reason instead.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
+    let Some(daemon) = find_daemon(paths) else {
+        return Ok(Vec::new());
+    };
+    let own = std::process::id();
+    let matching = install_daemon_candidates(paths)
+        .into_iter()
+        .filter(|&pid| {
+            pid != own
+                && process_identity::pid_alive(pid)
+                && process_identity::process_image_matches(pid, &daemon)
+        })
+        .collect::<Vec<_>>();
+    if let Some(notice) = unproven_reap_notice(&paths.root, &matching, cfg!(windows)) {
+        eprintln!("{notice}");
+    }
+    Ok(Vec::new())
 }
 
 /// Something accepts TCP connections on `host:port`.
@@ -8886,7 +8890,7 @@ fn serve_probe_port(paths: &Paths, configured: u16) -> u16 {
     fs::read_to_string(paths.root.join("serve.pid"))
         .ok()
         .and_then(|raw| parse_pid_record(&raw))
-        .filter(|record| Path::new(&format!("/proc/{}", record.pid)).exists())
+        .filter(|record| process_identity::pid_alive(record.pid))
         .and_then(|record| record.port)
         .unwrap_or(configured)
 }
@@ -9659,6 +9663,32 @@ mod tests {
         // A missing root is empty, not a panic.
         let _ = std::fs::remove_dir_all(&paths.root);
         assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    #[test]
+    fn update_policy_is_linux_only_with_windows_guidance() {
+        assert_eq!(update_unsupported_message("linux", "0.4.3"), None);
+        let windows = update_unsupported_message("windows", "0.4.3").unwrap();
+        assert!(windows.contains("hipfire 0.4.3"));
+        assert!(windows.contains("no files were changed"));
+        assert!(windows.contains(
+            "iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)"
+        ));
+        let other = update_unsupported_message("macos", "0.4.3").unwrap();
+        assert!(other.contains("Linux-only") && other.contains("0.4.3") && other.contains("macos"));
+    }
+
+    #[test]
+    fn unproven_reap_notice_names_pids_and_refuses_to_kill() {
+        let root = Path::new("/h/.hipfire");
+        assert_eq!(unproven_reap_notice(root, &[], true), None);
+        let notice = unproven_reap_notice(root, &[11, 22], true).unwrap();
+        assert!(notice.contains("11, 22"));
+        assert!(notice.contains("not terminating"));
+        assert!(notice.contains("HIPFIRE_HOME"));
+        assert!(notice.contains("Stop-Process"));
+        let unix = unproven_reap_notice(root, &[5], false).unwrap();
+        assert!(!unix.contains("Stop-Process"));
     }
 
     /// The recommendation a user pins: a singleton when one format was measured,
@@ -14337,6 +14367,23 @@ mod tests {
             // ServeShared is held only by the server thread which has exited.
             let _ = fs::remove_dir_all(&self.paths.root);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inference_router_cannot_shutdown_serve() {
+        let harness = Task11HttpHarness::spawn("management-isolation");
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let response = agent.post(&format!("http://127.0.0.1:{}/api/v1/shutdown", harness.port()))
+            .header("Authorization", "Bearer unrelated-management-token")
+            .send_empty().unwrap();
+        assert_eq!(response.status().as_u16(), 404);
+        assert!(!harness.shutdown.is_cancelled());
+        assert_eq!(serve_health(harness.port()).0, 200);
     }
 
     // ── 0.4.0 serve lifecycle: max_tokens fit, respawn, request policy ──

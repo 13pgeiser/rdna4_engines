@@ -266,9 +266,15 @@ notepad "$env:TEMP\hipfire-install.ps1"
 ```
 
 PowerShell also accepts `-Branch beta`, `-Tag v0.4.1`, and `-Commit <sha>`.
-The native `hipfire update` command remains Linux-only because Windows cannot
-atomically replace the running executable; re-run `install.ps1` with the
-desired selector instead.
+On Windows, `hipfire update` reports the installed version and exits non-zero
+without changing files: Windows updates require re-running `scripts/install.ps1`
+after stopping the engine. For current master:
+
+```powershell
+iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1)
+```
+
+Use the reviewed, pinned command above when selecting a specific revision.
 
 Builds `daemon.exe` and the native CLI from the same selected source revision
 under `~\.hipfire\src`. With `-Tag` (or a tag-named `-Ref`) on an admitted GPU
@@ -299,11 +305,16 @@ narrower than WSL2 on the same card. Known limits:
 - GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
   (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
   holder PID, as on Linux.
-- hipfire resolves its home and kernel cache from `HOME`; when `HOME` is not
-  set they land in the current directory. Set it once with
-  `setx HOME "%USERPROFILE%"`.
-- `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
-  cannot find a native `serve` process; stop it with Ctrl-C.
+- hipfire uses `HIPFIRE_HOME` when set; otherwise `%USERPROFILE%\.hipfire`,
+  then `%HOME%\.hipfire`. Windows requires an absolute home path and reports an
+  actionable error rather than creating a home in the current directory.
+- `hipfire stop` authenticates to a separate loopback management listener and
+  waits for graceful shutdown. Older `serve.pid` records lack the management
+  credential: stop those servers with Ctrl-C, then restart with the updated CLI.
+  `stop --force` / `--all` never kill processes whose install ownership cannot be
+  proven; Windows cannot prove ownership from another process's environment.
+- `hipfire update` does not replace a running Windows executable; re-run
+  `scripts/install.ps1` as described above.
 
 #### CI developer artifact
 

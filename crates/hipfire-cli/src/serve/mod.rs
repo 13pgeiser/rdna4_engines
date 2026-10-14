@@ -15,6 +15,9 @@ use crate::{
     resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
     Paths, PullArgs, ServeArgs, StopArgs,
 };
+use crate::process_identity::{
+    pid_alive, pid_owns_listen_port, process_start_time, serve_process_matches,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
 use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
@@ -22,7 +25,7 @@ use hipfire_registry::{load as load_registry, RegistryV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -35,6 +38,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod anthropic;
+pub(crate) mod management;
 pub(crate) mod metrics;
 
 pub mod complete;
@@ -208,7 +212,13 @@ pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bo
         && meta.last_activity.elapsed() >= idle_timeout
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `serve.pid`: which process is serve and how to reach it.
+///
+/// `token` is the `/health` instance token and is not a secret. `manage_token`
+/// is the management credential (see [`management`]); it is a secret, so this
+/// type's `Debug` redacts it and [`ServePidRecord::to_public_json`] omits it.
+/// Records written before management existed lack the `manage_*` fields.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ServePidRecord {
     pub(crate) pid: u32,
     #[serde(default)]
@@ -217,8 +227,46 @@ pub(crate) struct ServePidRecord {
     pub(crate) port: Option<u16>,
     #[serde(default)]
     pub(crate) token: Option<String>,
+    /// Loopback port of the authenticated management listener.
+    #[serde(default)]
+    pub(crate) manage_port: Option<u16>,
+    /// Management bearer credential. Secret: never log, print, or `Debug` it.
+    #[serde(default)]
+    pub(crate) manage_token: Option<String>,
     #[serde(skip)]
     pub(crate) legacy: bool,
+}
+
+impl ServePidRecord {
+    /// The record as shown to users (`hipfire ps`): every field except the
+    /// management credential, which is replaced by a presence flag.
+    pub(crate) fn to_public_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pid": self.pid,
+            "start_time": self.start_time,
+            "port": self.port,
+            "token": self.token,
+            "manage_port": self.manage_port,
+            "manage_token_present": self.manage_token.is_some(),
+        })
+    }
+}
+
+impl std::fmt::Debug for ServePidRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServePidRecord")
+            .field("pid", &self.pid)
+            .field("start_time", &self.start_time)
+            .field("port", &self.port)
+            .field("token", &self.token)
+            .field("manage_port", &self.manage_port)
+            .field(
+                "manage_token",
+                &self.manage_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("legacy", &self.legacy)
+            .finish()
+    }
 }
 
 /// Facts about the resident model taken from the daemon's load ack.
@@ -1712,23 +1760,39 @@ pub(crate) fn serve_foreground(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(&bind))
         .map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
+    // Management listener: separate loopback port and credential, owned only
+    // by `management::serve_management`; `ServeShared` and the inference
+    // listener never see either.
+    let manage_listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .context("failed to bind serve management listener")?;
+    let manage_port = manage_listener
+        .local_addr()
+        .context("management listener address")?
+        .port();
+    let manage_credential = Arc::new(management::ManagementCredential::generate()?);
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = ServePidRecord {
         pid: std::process::id(),
-        start_time: proc_start_time(std::process::id()),
+        start_time: process_start_time(std::process::id()),
         port: Some(port),
         token: Some(instance_token),
+        manage_port: Some(manage_port),
+        manage_token: Some(manage_credential.expose().to_owned()),
         legacy: false,
     };
-    fs::write(
-        &pid_path,
-        format!("{}\n", serde_json::to_string(&pid_record)?),
-    )?;
+    write_pid_record(&pid_path, &pid_record)?;
     let cleanup = pid_path.clone();
-    // SIGINT/SIGTERM stops accepting and lets requests in flight finish
-    // (bounded, see http::serve_listener_until); a second signal exits now.
+    // SIGINT/SIGTERM (and an authenticated management shutdown) stops
+    // accepting and lets requests in flight finish (bounded, see
+    // http::serve_listener_until); a second signal exits now.
     let shutdown = CancellationToken::new();
+    runtime.spawn(management::serve_management(
+        manage_listener,
+        manage_credential,
+        shutdown.clone(),
+    ));
     let signal_shutdown = shutdown.clone();
     ctrlc::set_handler(move || {
         if signal_shutdown.is_cancelled() {
@@ -1845,6 +1909,51 @@ pub(crate) fn serve_foreground(
     // A request still inside the daemon after the drain bound must not hold
     // the exit: Runtime::drop would wait for its blocking worker.
     runtime.shutdown_timeout(Duration::from_secs(1));
+    Ok(())
+}
+
+/// Write `serve.pid` owner-only without a window in which it is readable by
+/// others and without following a symlink planted at its name.
+///
+/// The record carries the management credential, so it is written to a fresh
+/// temp file created exclusively (`O_EXCL`: never follows a symlink, never
+/// reuses an existing file) with mode 0600 on Unix, then renamed over
+/// `serve.pid` (rename replaces the name itself, even if it is a symlink or
+/// an older, more permissive file). On Windows the file inherits the ACL of
+/// the hipfire home directory, which is the user's profile.
+fn write_pid_record(pid_path: &Path, record: &ServePidRecord) -> Result<()> {
+    let tmp_path = pid_path.with_file_name(format!("serve.pid.{}.tmp", std::process::id()));
+    let body = format!("{}\n", serde_json::to_string(record)?);
+    let create = || {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        options.open(&tmp_path)
+    };
+    let mut file = match create() {
+        Ok(file) => file,
+        // A leftover from a crashed serve with this PID; remove (the name
+        // itself, never a symlink target) and retry once.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(&tmp_path)
+                .with_context(|| format!("failed to clear stale {}", tmp_path.display()))?;
+            create().with_context(|| format!("failed to create {}", tmp_path.display()))?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to create {}", tmp_path.display()))
+        }
+    };
+    let written = (|| -> std::io::Result<()> {
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, pid_path)
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error).with_context(|| format!("failed to write {}", pid_path.display()));
+    }
     Ok(())
 }
 
@@ -2440,74 +2549,28 @@ pub(crate) fn serve_instance_token() -> String {
     format!("{:x}", digest.finalize())
 }
 
-pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    after_comm.split_whitespace().nth(19)?.parse().ok()
-}
-
-pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
-    let mut listen_inodes = BTreeSet::new();
-    let port_hex = format!("{port:04X}");
-    let mut read_any = false;
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(raw) = fs::read_to_string(table) else {
-            continue;
-        };
-        read_any = true;
-        for line in raw.lines().skip(1) {
-            let columns = line.split_whitespace().collect::<Vec<_>>();
-            if columns.len() < 10 || columns[3] != "0A" {
-                continue;
-            }
-            let Some((_, local_port)) = columns[1].rsplit_once(':') else {
-                continue;
-            };
-            if local_port.eq_ignore_ascii_case(&port_hex) {
-                listen_inodes.insert(columns[9].to_owned());
-            }
-        }
-    }
-    if !read_any {
-        return None;
-    }
-    if listen_inodes.is_empty() {
-        return Some(false);
-    }
-    let entries = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
-    for entry in entries.flatten() {
-        let Ok(target) = fs::read_link(entry.path()) else {
-            continue;
-        };
-        let target = target.to_string_lossy();
-        if let Some(inode) = target
-            .strip_prefix("socket:[")
-            .and_then(|value| value.strip_suffix(']'))
-        {
-            if listen_inodes.contains(inode) {
-                return Some(true);
-            }
-        }
-    }
-    Some(false)
-}
-
 pub(crate) fn validate_serve_pid(
     record: &ServePidRecord,
     host: &str,
     fallback_port: u16,
 ) -> Result<()> {
-    let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
-    if !proc_dir.is_dir() {
+    if !pid_alive(record.pid) {
         bail!("tracked serve PID {} is no longer alive", record.pid);
     }
-    let cmdline = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
-    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-    if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
+    if !serve_process_matches(record.pid) {
         bail!("PID {} is not a hipfire serve process", record.pid);
     }
+    // Windows has no cmdline/legacy fallback: the process creation time is
+    // the identity that survives PID reuse, so a record without one cannot be
+    // trusted there.
+    if cfg!(windows) && record.start_time.is_none() {
+        bail!(
+            "serve.pid has no process creation identity for PID {}; cannot prove it is the recorded serve",
+            record.pid
+        );
+    }
     if let Some(expected) = record.start_time {
-        if proc_start_time(record.pid) != Some(expected) {
+        if process_start_time(record.pid) != Some(expected) {
             bail!("PID {} was reused after serve.pid was written", record.pid);
         }
     }
@@ -2520,19 +2583,105 @@ pub(crate) fn validate_serve_pid(
             record.pid
         );
     }
-    let health_matches = record.token.as_deref().is_some_and(|expected| {
-        http_get_json(host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
-                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-    });
-    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
+    // Windows accepts only an owned listen port: no health-token or legacy
+    // fallback. Elsewhere a matching /health token (or a legacy record on a
+    // host that cannot enumerate sockets) also proves ownership.
+    let proven = owns_port == Some(true)
+        || !cfg!(windows)
+            && (record.token.as_deref().is_some_and(|expected| {
+                http_get_json(host, port, "/health").is_some_and(|health| {
+                    health.get("pid").and_then(serde_json::Value::as_u64)
+                        == Some(record.pid as u64)
+                        && health.get("token").and_then(serde_json::Value::as_str)
+                            == Some(expected)
+                })
+            }) || record.legacy && owns_port.is_none());
+    if proven {
         Ok(())
     } else {
         bail!(
             "could not prove ownership of PID {} with port or health token",
             record.pid
         )
+    }
+}
+
+/// Stop a serve whose identity `validate_serve_pid` has proven: SIGTERM, then
+/// wait up to 5 s for the process to disappear.
+#[cfg(unix)]
+fn stop_validated_serve(record: &ServePidRecord) -> Result<()> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(record.pid.to_string())
+        .status()
+        .context("failed to invoke kill")?;
+    if !status.success() {
+        bail!("failed to stop native serve PID {}", record.pid);
+    }
+    for _ in 0..50 {
+        if !pid_alive(record.pid) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// How long `hipfire stop` waits for a management-requested shutdown: serve's
+/// listener drain (30 s) plus a 5 s margin for exit.
+#[cfg(windows)]
+const MANAGED_STOP_WAIT: Duration = http::SHUTDOWN_DRAIN.saturating_add(Duration::from_secs(5));
+
+/// Stop a validated serve through its authenticated management endpoint.
+/// Windows never terminates a process: a record without management fields
+/// (written by an older serve) cannot be stopped from here.
+#[cfg(windows)]
+fn stop_validated_serve(record: &ServePidRecord) -> Result<()> {
+    let (Some(manage_port), Some(credential)) =
+        (record.manage_port, record.manage_token.as_deref())
+    else {
+        bail!(
+            "serve PID {} was started by a hipfire without authenticated management, so this \
+             version will not terminate it; press Ctrl-C in its console to stop it, then start \
+             serve again with this hipfire (serve.pid left in place)",
+            record.pid
+        );
+    };
+    // Never hand the credential to a socket the recorded serve does not own.
+    if pid_owns_listen_port(record.pid, manage_port) != Some(true) {
+        bail!(
+            "PID {} does not own its recorded management port {manage_port}; not sending the \
+             management credential (serve.pid left in place)",
+            record.pid
+        );
+    }
+    management::request_shutdown(manage_port, credential)?;
+    wait_for_serve_exit(record, MANAGED_STOP_WAIT, Duration::from_millis(100))
+}
+
+/// Wait until the recorded serve is gone (or its PID now belongs to a process
+/// with a different creation time). If it is still running at `timeout`,
+/// report that instead of claiming it stopped.
+#[cfg(any(windows, test))]
+fn wait_for_serve_exit(record: &ServePidRecord, timeout: Duration, poll: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let gone = !pid_alive(record.pid)
+            || record
+                .start_time
+                .is_some_and(|expected| process_start_time(record.pid).is_some_and(|actual| actual != expected));
+        if gone {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "serve PID {} accepted the shutdown request but is still running after {} s; \
+                 serve.pid left in place",
+                record.pid,
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(poll);
     }
 }
 
@@ -2568,20 +2717,7 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
                     "warning: {error}; refusing direct PID signal and continuing forced reap"
                 );
             } else {
-                let status = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(record.pid.to_string())
-                    .status()
-                    .context("failed to invoke kill")?;
-                if !status.success() {
-                    bail!("failed to stop native serve PID {}", record.pid);
-                }
-                for _ in 0..50 {
-                    if !Path::new(&format!("/proc/{}", record.pid)).exists() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
+                stop_validated_serve(&record)?;
                 let _ = fs::remove_file(&pid_path);
                 println!("hipfire serve stopped (PID {})", record.pid);
             }
@@ -2600,6 +2736,7 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
         // this install's daemon binary and whose HIPFIRE_HOME is this home);
         // never `pkill -x daemon`, which hit every user's process named daemon.
         let reaped = reap_install_daemons(paths)?;
+        #[cfg(unix)]
         if args.all {
             let _ = Command::new("pkill")
                 .args(["-f", "target/release/hipfire-quantize"])
@@ -2631,6 +2768,8 @@ pub(crate) fn parse_pid_record(raw: &str) -> Option<ServePidRecord> {
             start_time: None,
             port: None,
             token: None,
+            manage_port: None,
+            manage_token: None,
             legacy: true,
         });
     }
@@ -2716,6 +2855,35 @@ mod tests {
         assert_eq!(json.pid, 43);
         assert_eq!(json.token.as_deref(), Some("old"));
         assert!(!json.legacy);
+    }
+
+    #[test]
+    fn management_pid_record_roundtrip_redacts_public_output() {
+        let legacy = parse_pid_record("42").unwrap();
+        assert!(legacy.manage_port.is_none());
+        assert!(legacy.manage_token.is_none());
+        let record = parse_pid_record(r#"{"pid":43,"start_time":7,"port":8080,"token":"instance","manage_port":8081,"manage_token":"secret"}"#).unwrap();
+        assert_eq!(parse_pid_record(&serde_json::to_string(&record).unwrap()), Some(record.clone()));
+        let public = record.to_public_json();
+        assert_eq!(public["manage_token_present"], true);
+        assert!(public.get("manage_token").is_none());
+        assert!(!public.to_string().contains("secret"));
+        assert!(!format!("{record:?}").contains("secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_record_replaces_permissive_file_with_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hipfire-pid-mode-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("serve.pid");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let record = parse_pid_record("42").unwrap();
+        write_pid_record(&path, &record).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

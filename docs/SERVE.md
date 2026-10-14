@@ -45,8 +45,8 @@ hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
 hipfire serve --spec off -d           # plain AR (no MTP/DFlash) for every load, e.g. an A/B
 hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memory.max_seq)
 
-hipfire ps                            # daemons / quantize / uploads + port state (Linux)
-hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
+hipfire ps                            # tracked process liveness + port state
+hipfire stop                          # tracked serve only: SIGTERM (Unix), graceful HTTP (Windows)
 # Forceful — inspect first (hipfire ps, curl /health):
 hipfire stop --force                  # also kill this install's untracked daemons (TERM, KILL after 5s)
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
@@ -60,15 +60,34 @@ process answering on the port, exits 1 with that reason. Readiness requires
 the `/health` `pid` to be the child it just spawned, and if the child exits
 early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
-**Forceful lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
-pid after ownership checks — use that by default. `--force`, `--all`, and
-`restart` also stop this install's other daemons: PIDs from the pidfile and
+**Forceful lifecycle flags (Unix).** Plain `hipfire stop` only SIGTERMs the
+tracked pid after ownership checks — use that by default. `--force`, `--all`,
+and `restart` also stop this install's other daemons: PIDs from the pidfile and
 the GPU lock, each verified by command line (this install's daemon binary)
 and matching `HIPFIRE_HOME`, sent SIGTERM and then SIGKILL after 5 s. They no
 longer kill processes by name or by port; if something else still holds the
 port, the CLI prints `port N is still in use by a process that is not this
 install's hipfire; not killing it`. `--all` also runs `pkill -f` against
 release quantize binaries.
+
+**Local management (all platforms).** Each serve process binds a separate
+`127.0.0.1` listener on an OS-assigned port. Only that listener accepts
+`POST /api/v1/shutdown`, authenticated with its own random 32-byte bearer
+credential. The inference listener never serves this route, including requests
+forwarded by a localhost reverse proxy. Management and inference credentials
+are separate; the public instance-identity token is not authorization.
+`serve.pid` stores `manage_port` and `manage_token`. Keep this file private:
+Unix mode is `0600`; Windows inherits ACLs from the user's hipfire home.
+Never share its contents or forward the management listener through a proxy.
+
+**Windows stop.** After checking image, creation time, and port ownership,
+`hipfire stop` sends the local management request and waits up to 35 seconds
+for exit. Shutdown cancels the existing token and drains inference requests
+for at most 30 seconds. If exit times out, the command reports an error rather
+than force-terminating the process. Old pid records without management fields
+require Ctrl-C and a restart with the updated CLI. Windows `--force` / `--all`
+do not reap daemons when ownership cannot be proven from process environment;
+the CLI explains this conservative skip and never kills by name or port.
 
 Flags (also accepted by `restart`). In detached mode (`-d`) the parent forwards
 these to the foreground child as CLI arguments; none of them is turned into an

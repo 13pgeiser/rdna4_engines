@@ -61,6 +61,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{0}")]
+    Home(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -4172,7 +4174,7 @@ pub fn active_process_config() -> Option<&'static ProcessConfig> {
 /// and developer-tool invocation. Native CLI launches install their already
 /// resolved policy explicitly and never take this fallback.
 pub fn load_local_process_config() -> Result<ProcessConfig> {
-    let paths = ConfigPaths::discover();
+    let paths = ConfigPaths::try_discover()?;
     let loaded = load_global(&paths)?;
     let mut layers = vec![NamedLayer {
         source: ConfigSource::GlobalUser { path: loaded.path },
@@ -4872,17 +4874,89 @@ pub struct ConfigPaths {
     pub legacy_per_model_json: PathBuf,
 }
 
-impl ConfigPaths {
-    pub fn discover() -> Self {
-        let root = env::var_os("HIPFIRE_HOME")
+/// The hipfire state root every crate shares (`ConfigPaths::root`,
+/// `RegistryPaths::cache`'s parent). Selection order:
+///
+/// - Unix: `HIPFIRE_HOME`, else `$HOME/.hipfire`, else the relative `.hipfire`.
+/// - Windows: `HIPFIRE_HOME`, else `%USERPROFILE%\.hipfire` (the root
+///   `scripts/install.ps1` installs into), else `%HOME%\.hipfire`. A Windows
+///   root is never CWD-relative: a missing home or a non-absolute value is an
+///   actionable [`ConfigError::Home`].
+pub fn hipfire_home() -> Result<PathBuf> {
+    hipfire_home_from(cfg!(windows), |name| env::var_os(name))
+}
+
+/// Pure core of [`hipfire_home`]: `windows` selects the rule set and `get`
+/// supplies environment values, so tests inject both without touching the
+/// process environment.
+fn hipfire_home_from(
+    windows: bool,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if !windows {
+        return Ok(get("HIPFIRE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
-            .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        let mut paths = Self::under(root);
+            .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .unwrap_or_else(|| PathBuf::from(".hipfire")));
+    }
+    if let Some(raw) = get("HIPFIRE_HOME") {
+        return require_windows_absolute("HIPFIRE_HOME", PathBuf::from(raw));
+    }
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(profile) = get(var).filter(|value| !value.is_empty()) {
+            return require_windows_absolute(var, PathBuf::from(profile))
+                .map(|profile| profile.join(".hipfire"));
+        }
+    }
+    Err(ConfigError::Home(
+        "cannot locate the hipfire home: neither HIPFIRE_HOME nor USERPROFILE is set \
+         (and HOME is unset); set HIPFIRE_HOME to an absolute directory such as \
+         C:\\Users\\<you>\\.hipfire"
+            .to_string(),
+    ))
+}
+
+fn require_windows_absolute(var: &str, path: PathBuf) -> Result<PathBuf> {
+    if is_windows_absolute(&path) {
+        Ok(path)
+    } else {
+        Err(ConfigError::Home(format!(
+            "{var}={} is not an absolute Windows path; hipfire will not use a \
+             current-directory-relative home. Set {var} to a full path such as \
+             C:\\Users\\<you>\\.hipfire",
+            path.display()
+        )))
+    }
+}
+
+/// Windows absoluteness decided textually so it is the same on every host:
+/// `C:\` / `C:/` drive roots, or `\\server\share` / `\\?\` style prefixes.
+/// Drive-relative (`C:foo`) and rooted-without-drive (`\foo`) paths are not
+/// absolute.
+fn is_windows_absolute(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let is_sep = |b: u8| b == b'\\' || b == b'/';
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && is_sep(bytes[2]) {
+        return true;
+    }
+    bytes.len() >= 3 && is_sep(bytes[0]) && is_sep(bytes[1]) && !is_sep(bytes[2])
+}
+
+impl ConfigPaths {
+    /// Infallible form of [`ConfigPaths::try_discover`]; panics with the
+    /// actionable message when no usable Windows home exists. Fallible callers
+    /// use `try_discover`.
+    pub fn discover() -> Self {
+        Self::try_discover().unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_discover() -> Result<Self> {
+        let mut paths = Self::under(hipfire_home()?);
         if let Some(models) = env::var_os("HIPFIRE_MODELS_DIR") {
             paths.models = PathBuf::from(models);
         }
-        paths
+        Ok(paths)
     }
 
     pub fn under(root: impl Into<PathBuf>) -> Self {
@@ -5919,6 +5993,109 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))
+    }
+
+    fn home_env<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn unix_home_selection_is_unchanged() {
+        let both = [("HIPFIRE_HOME", "/srv/hf"), ("HOME", "/home/u")];
+        assert_eq!(
+            hipfire_home_from(false, home_env(&both)).unwrap(),
+            PathBuf::from("/srv/hf")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("HOME", "/home/u")])).unwrap(),
+            PathBuf::from("/home/u/.hipfire")
+        );
+        // USERPROFILE is a Windows-only input.
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[("USERPROFILE", "C:\\Users\\u")])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(false, home_env(&[])).unwrap(),
+            PathBuf::from(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_selection_order() {
+        let all = [
+            ("HIPFIRE_HOME", "D:\\hf"),
+            ("USERPROFILE", "C:\\Users\\u"),
+            ("HOME", "E:\\home"),
+        ];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&all)).unwrap(),
+            PathBuf::from("D:\\hf")
+        );
+        let no_override = [("USERPROFILE", "C:\\Users\\u"), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&no_override)).unwrap(),
+            PathBuf::from("C:\\Users\\u").join(".hipfire")
+        );
+        assert_eq!(
+            hipfire_home_from(true, home_env(&[("HOME", "E:\\home")])).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+        // An empty USERPROFILE falls through to HOME.
+        let empty_profile = [("USERPROFILE", ""), ("HOME", "E:\\home")];
+        assert_eq!(
+            hipfire_home_from(true, home_env(&empty_profile)).unwrap(),
+            PathBuf::from("E:\\home").join(".hipfire")
+        );
+    }
+
+    #[test]
+    fn windows_home_never_falls_back_to_relative() {
+        let missing = hipfire_home_from(true, home_env(&[])).unwrap_err().to_string();
+        assert!(missing.contains("HIPFIRE_HOME") && missing.contains("USERPROFILE"));
+        for bad in [
+            ("HIPFIRE_HOME", ".hipfire"),
+            ("HIPFIRE_HOME", ""),
+            ("HIPFIRE_HOME", "\\rooted"),
+            ("HIPFIRE_HOME", "C:drive-relative"),
+            ("USERPROFILE", "Users\\u"),
+            ("HOME", "/c/Users/u"),
+        ] {
+            let pairs = [bad];
+            let error = hipfire_home_from(true, home_env(&pairs)).unwrap_err();
+            assert!(
+                error.to_string().contains(bad.0),
+                "{bad:?} must name its variable: {error}"
+            );
+        }
+        // A bad HIPFIRE_HOME or USERPROFILE does not silently fall through.
+        let bad_override = [("HIPFIRE_HOME", "rel"), ("USERPROFILE", "C:\\Users\\u")];
+        assert!(hipfire_home_from(true, home_env(&bad_override)).is_err());
+        let bad_profile = [("USERPROFILE", "rel"), ("HOME", "E:\\home")];
+        assert!(hipfire_home_from(true, home_env(&bad_profile)).is_err());
+    }
+
+    #[test]
+    fn windows_absolute_classification() {
+        for ok in [
+            "C:\\",
+            "c:/Users/u",
+            "\\\\server\\share\\hf",
+            "//server/share",
+            "\\\\?\\C:\\Users\\u",
+        ] {
+            assert!(is_windows_absolute(Path::new(ok)), "{ok}");
+        }
+        for bad in ["", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x"] {
+            assert!(!is_windows_absolute(Path::new(bad)), "{bad}");
+        }
     }
 
     #[test]
