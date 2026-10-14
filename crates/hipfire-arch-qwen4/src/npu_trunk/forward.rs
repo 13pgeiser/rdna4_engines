@@ -272,7 +272,8 @@ impl NpuForward {
     pub(super) fn load(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let mode = NpuTrunkMode::from_env().map_err(fail)?.resolve(&gpu.arch);
         if mode.is_off() { return Ok(None); }
-        trunk::admission::finish(mode, Self::load_admitted(gpu, bundle, scratch, rows, scratch_mode, prepared))
+        // Eligibility was settled in `prepare_stock`; anything failing here failed to arm a qualifying model.
+        trunk::admission::finish(mode, Self::load_admitted(gpu, bundle, scratch, rows, scratch_mode, prepared).map_err(trunk::admission::Refusal::Failed))
     }
 
     fn load_admitted(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScratch, rows: usize, scratch_mode: Qwen4ForwardScratchMode, prepared: Option<Option<PreparedTrunk>>) -> Result<Option<Self>, Qwen4GpuForwardError> {

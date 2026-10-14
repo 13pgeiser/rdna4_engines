@@ -289,19 +289,22 @@ impl NpuTrunkRuntime {
             keys.push((l.layer, l.shape));
         }
         if keys.is_empty() { return Err("no resident B panels".into()); }
+        // Arena bytes of one bank, `[a_in, a_out, c GdnIn, c QsaIn, c GdnOut, c QsaO]`. An absent shape (or A class)
+        // keeps only one registration page for the fixed binding table, never a full arena.
+        let (has_in, has_out) = (shapes.iter().any(|s| !s.is_out()), shapes.iter().any(|s| s.is_out()));
+        let c = |shape: Shape| layout.c_bytes(shape).max(4096);
+        let sizes = [if has_in { layout.a_bytes } else { 0 }.max(4096), if has_out { layout.a_out_bytes } else { 0 }.max(4096),
+            c(Shape::GdnIn), c(Shape::QsaIn), c(Shape::GdnOut), c(Shape::QsaO)];
+        // Every arena becomes a userptr BO whose pages the driver pins against RLIMIT_MEMLOCK; settle the limit
+        // before any HIP load, allocation or registration.
+        super::ensure_pin_headroom(banks * sizes.iter().map(|&n| n.div_ceil(4096) * 4096).sum::<usize>())?;
         let hip = HipRuntime::load_for_pci(pci)?;
         if hip.device_arch()? != "gfx1151" { return Err("trunk transport currently requires gfx1151".into()); }
         let api = hip.relay_api()?;
         let mut storage = Vec::with_capacity(banks);
-        let (has_in, has_out) = (shapes.iter().any(|s| !s.is_out()), shapes.iter().any(|s| s.is_out()));
         for _ in 0..banks {
-            // An absent shape (or A class) keeps only one registration page for the fixed binding table, never a full arena.
-            let a_in = if has_in { layout.a_bytes } else { 0 }.max(4096);
-            let a_out = if has_out { layout.a_out_bytes } else { 0 }.max(4096);
-            let c = |shape: Shape| layout.c_bytes(shape).max(4096);
-            storage.push(Bank { a: [Arena::new(&hip, a_in)?, Arena::new(&hip, a_out)?],
-                c: [Arena::new(&hip, c(Shape::GdnIn))?, Arena::new(&hip, c(Shape::QsaIn))?,
-                    Arena::new(&hip, c(Shape::GdnOut))?, Arena::new(&hip, c(Shape::QsaO))?],
+            storage.push(Bank { a: [Arena::new(&hip, sizes[0])?, Arena::new(&hip, sizes[1])?],
+                c: [Arena::new(&hip, sizes[2])?, Arena::new(&hip, sizes[3])?, Arena::new(&hip, sizes[4])?, Arena::new(&hip, sizes[5])?],
                 control: Arena::new(&hip, 4096)?, ready: hip.system_event()?, acquire: hip.system_event()?, retired: hip.system_event()? });
         }
         let pages = storage.iter().map(|b| BankPages { a: [b.a[0].pages.ptr as usize, b.a[1].pages.ptr as usize],
