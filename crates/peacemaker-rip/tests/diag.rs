@@ -470,6 +470,44 @@ fn published_reuse_and_loop_ledger_refusals_have_specific_fix_its() {
     assert!(help.contains(".Lloop") && help.contains("wg.wait(store)?") && help.contains("before the back edge"), "{help}");
 }
 
+#[test]
+fn non_inline_operand_help_uses_the_number_from_the_message() {
+    for (number, mnemonic) in [("128", "v_add_nc_u32_e32"), ("512", "v_sub_nc_u32_e32")] {
+        let raw = format!("t.rip:12:5: malformed operands for `{mnemonic}` on gfx1201: bad operand \"{number}\" for {mnemonic}: not an inline constant");
+        let d = Diagnostic::from_raw(&raw, "t.rip", "x\n", Severity::Error);
+        assert_eq!(d.code, "R0602", "{raw}");
+        let help = d.help.as_deref().unwrap();
+        assert!(help.contains(&format!("`{number}` is not an inline constant")), "{help}");
+        assert!(help.contains("-16..64"), "{help}");
+        assert!(help.contains(&format!("lit({number})")), "{help}");
+        assert!(help.contains("`0x..`"), "{help}");
+        assert!(help.contains("one literal per instruction"), "{help}");
+        assert!(help.contains("src0") && help.contains("_e32") && help.contains("_e64"), "{help}");
+        assert!(!help.contains("operand order, register widths"), "{help}");
+    }
+}
+
+#[test]
+fn gfx1201_buffer_soffset_help_says_null_and_other_operand_errors_stay_generic() {
+    let raw = "t.rip:12:5: malformed operands for `buffer_load_b32` on gfx1201: unrecognized machine instruction at byte offset 0: SOFFSET does not fit its encoding field";
+    let d = Diagnostic::from_raw(raw, "t.rip", "x\n", Severity::Error);
+    assert_eq!(d.code, "R0602");
+    let help = d.help.as_deref().unwrap();
+    assert!(help.contains("On gfx12 a zero buffer soffset is spelled `null`, not `0`."), "{help}");
+    assert!(!help.contains("lit("), "{help}");
+
+    let generic = "Use the selected architecture's operand order, register widths and legal inline constants for this instruction.";
+    for raw in [
+        "t.rip:12:5: malformed operands for `buffer_load_b32` on gfx1151: unrecognized machine instruction at byte offset 0: SOFFSET does not fit its encoding field",
+        "t.rip:12:5: malformed operands for `v_mov_b32_e32` on gfx1201: SOFFSET does not fit its encoding field",
+        "t.rip:12:5: malformed operands for `v_mov_b32_e32` on gfx1201: expected 2 operands",
+    ] {
+        let d = Diagnostic::from_raw(raw, "t.rip", "x\n", Severity::Error);
+        assert_eq!(d.code, "R0602", "{raw}");
+        assert_eq!(d.help.as_deref(), Some(generic), "{raw}");
+    }
+}
+
 // ---- golden render and JSON ----------------------------------------------------------------
 
 fn diag(code: &'static str, severity: Severity, message: &str, span: Option<Span>, help: Option<&str>, suggestion: Option<&str>, notes: &[&str]) -> Diagnostic {

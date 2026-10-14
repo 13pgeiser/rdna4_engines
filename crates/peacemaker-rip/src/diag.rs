@@ -49,7 +49,7 @@ const RULES: &[Rule] = &[
     rule!("R0501", ["no `fn emit", "no `fn main", "`emit` takes (spec)", "`emit` returned Ok(", "`emit` must return"], |_| Some("Define `fn emit(spec: Spec) -> Result<Emitted, String>` and return `b.finish()` after ending the kernel.".into())),
     rule!("R0207", ["panic:", "assertion failed", "the evaluator panicked"], |_| Some("Fix the failed assertion or panic condition in the script; use the reported operand values to correct the computation.".into())),
     rule!("R0601", ["unknown mnemonic", "unsupported mnemonic"], mnemonic_help),
-    rule!("R0602", ["malformed operands", "bad operand", "missing operand", "too many operands"], |_| Some("Use the selected architecture's operand order, register widths and legal inline constants for this instruction.".into())),
+    rule!("R0602", ["malformed operands", "bad operand", "missing operand", "too many operands"], operand_help),
     rule!("R0603", ["op declares defs", "defs/uses disagree", "missing declared defs", "missing declared uses"], effects_help),
     rule!("R0604", ["read before it is defined"], definedness_help),
     rule!("R0301", ["with an undrained LDS store", "publish with undrained LDS stores"], undrained_help),
@@ -132,6 +132,23 @@ fn effects_help(m: &str) -> Option<String> {
 fn definedness_help(m: &str) -> Option<String> {
     let registers = between(m, "register read before it is defined: ", " in `").unwrap_or("each source register");
     Some(format!("Define {registers} on every incoming path before reading it; the workgroup X id is `ttmp9` on gfx12, but `s2` (declared in the register plan) on gfx11."))
+}
+fn operand_help(m: &str) -> Option<String> {
+    if m.contains("not an inline constant") {
+        let number = between(m, "bad operand \"", "\"")
+            .or_else(|| between(m, "bad operand `", "`"))
+            .or_else(|| m.split_once("not an inline constant").and_then(|(before, _)| {
+                before.split_whitespace().rev().map(|word| word.trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ':' | ',' | '(' | ')')))
+                    .find(|word| word.parse::<i128>().is_ok())
+            }));
+        if let Some(number) = number {
+            return Some(format!("`{number}` is not an inline constant (inline integers are -16..64). Write it as a literal with `lit({number})`, which prints `0x..` (one literal per instruction). For VOP2 `_e32` the literal must be src0, or use `_e64`."));
+        }
+    }
+    if m.contains("buffer_") && m.contains("gfx1201") && m.contains("SOFFSET does not fit") {
+        return Some("On gfx12 a zero buffer soffset is spelled `null`, not `0`.".into());
+    }
+    Some("Use the selected architecture's operand order, register widths and legal inline constants for this instruction.".into())
 }
 fn mnemonic_help(m: &str) -> Option<String> {
     let suggestion = between(m, "did you mean `", "`").or_else(|| between(m, "did-you-mean `", "`"));

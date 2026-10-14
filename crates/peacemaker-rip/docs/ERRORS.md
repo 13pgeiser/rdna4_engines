@@ -1357,6 +1357,8 @@ Typical message: `` malformed operands for `v_mov_b32_e32` on gfx1201: ... `` fo
 
 Write the operands in the architecture's order and with legal widths and constants. The text the script hands the builder is exactly what is encoded, so the fix is in the string.
 
+Two operand mistakes get a specific fix. A decimal that is not an inline constant (for example `bad operand "128" ... not an inline constant`) is reported with the actual number: inline integers are -16..64, so write it as a literal with `lit(128)`, which prints `0x..` (one literal per instruction). For a VOP2 `_e32` instruction the literal must be src0, or use `_e64`. On gfx1201 a `buffer_*` instruction whose SOFFSET does not fit gets: a zero buffer soffset is spelled `null`, not `0`.
+
 Fails:
 
 ```rip fails=R0602
