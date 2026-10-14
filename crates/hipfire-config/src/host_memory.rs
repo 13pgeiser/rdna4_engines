@@ -30,8 +30,7 @@ pub const SOURCE_GLOBAL_MEMORY_STATUS_EX: &str =
     "GlobalMemoryStatusEx (calling process commit limit)";
 
 /// Provenance of every [`DxgiAdapterBudget`] (and its [`SegmentBudget`]s).
-pub const DXGI_BUDGET_SOURCE: &str =
-    "DXGI QueryVideoMemoryInfo (calling process, node 0)";
+pub const DXGI_BUDGET_SOURCE: &str = "DXGI QueryVideoMemoryInfo (calling process, node 0)";
 
 /// PCI vendor id of AMD adapters as reported by DXGI.
 pub const AMD_VENDOR_ID: u32 = 0x1002;
@@ -290,9 +289,7 @@ impl DxgiAdapterBudget {
 }
 
 /// The AMD adapters (`vendor_id == 0x1002`) of `adapters`, in input order.
-pub fn amd_adapters(
-    adapters: &[DxgiAdapterBudget],
-) -> impl Iterator<Item = &DxgiAdapterBudget> {
+pub fn amd_adapters(adapters: &[DxgiAdapterBudget]) -> impl Iterator<Item = &DxgiAdapterBudget> {
     adapters
         .iter()
         .filter(|adapter| adapter.vendor_id == AMD_VENDOR_ID)
@@ -312,7 +309,10 @@ fn luid_bytes(low_part: u32, high_part: i32) -> [u8; 8] {
 /// unterminated); invalid UTF-16 is replaced with U+FFFD.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn description_from_utf16(wide: &[u16]) -> String {
-    let end = wide.iter().position(|&unit| unit == 0).unwrap_or(wide.len());
+    let end = wide
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
 }
 
@@ -388,11 +388,10 @@ pub fn dxgi_adapter_budgets() -> Result<Vec<DxgiAdapterBudget>, DxgiError> {
     }
 
     // SAFETY: plain COM factory creation; the returned interface is owned.
-    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|e| {
-        DxgiError::CreateFactory {
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|e| DxgiError::CreateFactory {
             detail: e.to_string(),
-        }
-    })?;
+        })?;
 
     let mut budgets = Vec::new();
     let mut index = 0u32;
@@ -504,10 +503,22 @@ mod tests {
         assert_eq!(parse_meminfo(""), None);
         assert_eq!(parse_meminfo("MemTotal: 100 kB\n"), None);
         assert_eq!(parse_meminfo("MemAvailable: 100 kB\n"), None);
-        assert_eq!(parse_meminfo("MemTotal: abc kB\nMemAvailable: 1 kB\n"), None);
-        assert_eq!(parse_meminfo("MemTotal: 100 kB\nMemAvailable: -1 kB\n"), None);
-        assert_eq!(parse_meminfo("MemTotal: 100 MB\nMemAvailable: 1 kB\n"), None);
-        assert_eq!(parse_meminfo("MemTotal: 100 kB extra\nMemAvailable: 1 kB\n"), None);
+        assert_eq!(
+            parse_meminfo("MemTotal: abc kB\nMemAvailable: 1 kB\n"),
+            None
+        );
+        assert_eq!(
+            parse_meminfo("MemTotal: 100 kB\nMemAvailable: -1 kB\n"),
+            None
+        );
+        assert_eq!(
+            parse_meminfo("MemTotal: 100 MB\nMemAvailable: 1 kB\n"),
+            None
+        );
+        assert_eq!(
+            parse_meminfo("MemTotal: 100 kB extra\nMemAvailable: 1 kB\n"),
+            None
+        );
         assert_eq!(parse_meminfo("MemTotal:\nMemAvailable: 1 kB\n"), None);
     }
 
@@ -539,19 +550,28 @@ mod tests {
     fn kb_to_bytes_overflow_is_malformed() {
         let max_kb = u64::MAX / 1024;
         let ok = format!("MemTotal: {max_kb} kB\nMemAvailable: 1 kB\n");
-        assert_eq!(parse_meminfo(&ok).unwrap().total_physical_bytes, max_kb * 1024);
+        assert_eq!(
+            parse_meminfo(&ok).unwrap().total_physical_bytes,
+            max_kb * 1024
+        );
         let over = format!("MemTotal: {} kB\nMemAvailable: 1 kB\n", max_kb + 1);
         assert_eq!(parse_meminfo(&over), None);
-        let optional_over =
-            format!("MemTotal: 1 kB\nMemAvailable: 1 kB\nSwapTotal: {} kB\n", max_kb + 1);
-        assert_eq!(parse_meminfo(&optional_over).unwrap().swap_total_bytes, None);
+        let optional_over = format!(
+            "MemTotal: 1 kB\nMemAvailable: 1 kB\nSwapTotal: {} kB\n",
+            max_kb + 1
+        );
+        assert_eq!(
+            parse_meminfo(&optional_over).unwrap().swap_total_bytes,
+            None
+        );
         let wider = "MemTotal: 99999999999999999999999 kB\nMemAvailable: 1 kB\n";
         assert_eq!(parse_meminfo(wider), None);
     }
 
     #[test]
     fn commit_available_saturates_at_zero_when_overcommitted() {
-        let body = "MemTotal: 10 kB\nMemAvailable: 5 kB\nCommitLimit: 100 kB\nCommitted_AS: 250 kB\n";
+        let body =
+            "MemTotal: 10 kB\nMemAvailable: 5 kB\nCommitLimit: 100 kB\nCommitted_AS: 250 kB\n";
         let m = parse_meminfo(body).unwrap();
         assert_eq!(m.commit_available_bytes, Some(0));
     }
@@ -560,7 +580,10 @@ mod tests {
     fn first_duplicate_key_wins_and_prefixed_keys_do_not_match() {
         let body = "MemTotal: 10 kB\nMemTotalFoo: 99 kB\nMemTotal: 77 kB\nMemAvailable: 5 kB\n";
         assert_eq!(parse_meminfo(body).unwrap().total_physical_bytes, 10 * 1024);
-        assert_eq!(meminfo_field("MemTotalFoo: 1 kB\n", "MemTotal"), MeminfoField::Missing);
+        assert_eq!(
+            meminfo_field("MemTotalFoo: 1 kB\n", "MemTotal"),
+            MeminfoField::Missing
+        );
     }
 
     #[test]

@@ -5,9 +5,12 @@
 //! Authenticated serve management endpoint.
 //!
 //! Concern: a stop channel that exists independently of the inference
-//! listener. Every serve process binds a second loopback listener on an
-//! ephemeral port, authenticated by a per-process 32-byte random credential
-//! recorded (owner-only) in `serve.pid`. The only route is
+//! listener. On Windows, where `hipfire stop` has no signal to send, every
+//! serve binds a second loopback listener on an ephemeral port, authenticated
+//! by a per-process 32-byte random credential recorded in `serve.pid` (the
+//! file inherits the user-profile ACL of the hipfire home). Unix serves keep
+//! SIGTERM and do not bind it; the module compiles everywhere so its tests run
+//! on Linux. The only route is
 //! `POST /api/v1/shutdown`, which cancels the same `CancellationToken` that
 //! SIGINT/SIGTERM cancel, so the existing bounded drain applies unchanged.
 //!
@@ -22,7 +25,6 @@ use http_body_util::Full;
 use hyper::{body::Incoming, header, http::HeaderMap, server::conn::http1, Method, Request};
 use hyper::{Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use subtle::ConstantTimeEq;
 use std::{
     convert::Infallible,
     fmt::Write as _,
@@ -32,6 +34,7 @@ use std::{
     },
     time::Duration,
 };
+use subtle::ConstantTimeEq;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -64,8 +67,9 @@ pub(crate) struct ManagementCredential(String);
 impl ManagementCredential {
     pub(crate) fn generate() -> Result<Self> {
         let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes)
-            .map_err(|error| anyhow!("OS random source unavailable for management credential: {error}"))?;
+        getrandom::fill(&mut bytes).map_err(|error| {
+            anyhow!("OS random source unavailable for management credential: {error}")
+        })?;
         let mut hex = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
             write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
@@ -89,7 +93,6 @@ impl std::fmt::Debug for ManagementCredential {
         f.write_str("ManagementCredential(<redacted>)")
     }
 }
-
 
 /// Accept loop. Stops accepting (and releases the port) when `shutdown` is
 /// cancelled, whether by a signal or by an authenticated shutdown request.
@@ -250,11 +253,7 @@ mod tests {
         ManagementCredential("c0ffee".repeat(10))
     }
 
-    fn request(
-        method: &str,
-        path: &str,
-        authorizations: &[&str],
-    ) -> Request<()> {
+    fn request(method: &str, path: &str, authorizations: &[&str]) -> Request<()> {
         let mut builder = Request::builder().method(method).uri(path);
         for value in authorizations {
             builder = builder.header(header::AUTHORIZATION, *value);
@@ -330,7 +329,11 @@ mod tests {
         let auth = [good.as_str()];
 
         let requested = AtomicBool::new(false);
-        let response = route(&request("GET", SHUTDOWN_PATH, &auth), &credential, &requested);
+        let response = route(
+            &request("GET", SHUTDOWN_PATH, &auth),
+            &credential,
+            &requested,
+        );
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(response.headers()[header::ALLOW], "POST");
         assert!(!requested.load(Ordering::SeqCst));
@@ -341,7 +344,11 @@ mod tests {
             assert!(!requested.load(Ordering::SeqCst), "{path}");
         }
 
-        let response = route(&request("POST", SHUTDOWN_PATH, &auth), &credential, &requested);
+        let response = route(
+            &request("POST", SHUTDOWN_PATH, &auth),
+            &credential,
+            &requested,
+        );
         assert_eq!(response.status(), StatusCode::OK);
         assert!(requested.load(Ordering::SeqCst));
     }

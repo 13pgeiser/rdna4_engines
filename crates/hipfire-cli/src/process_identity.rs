@@ -490,9 +490,8 @@ mod platform {
         let mut kernel = FileTime::default();
         let mut user = FileTime::default();
         // SAFETY: the handle is live and every out-pointer is a valid FILETIME.
-        let ok = unsafe {
-            GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user)
-        };
+        let ok =
+            unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) };
         (ok != 0).then_some((creation, exit))
     }
 
@@ -548,7 +547,8 @@ mod platform {
         let Ok(handle) = open_query(pid) else {
             return false;
         };
-        handle_running(&handle) && image_path(&handle).is_some_and(|image| windows_image_is_hipfire(&image))
+        handle_running(&handle)
+            && image_path(&handle).is_some_and(|image| windows_image_is_hipfire(&image))
     }
 
     /// Listener owners on `port` for one address family; `None` when the table
@@ -592,7 +592,10 @@ mod platform {
     pub(super) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
         combine_listener_results(
             pid,
-            &[listener_table(AF_INET, port), listener_table(AF_INET6, port)],
+            &[
+                listener_table(AF_INET, port),
+                listener_table(AF_INET6, port),
+            ],
         )
     }
 
@@ -728,7 +731,10 @@ mod tests {
         assert_eq!(dword_port(0x5000u32.to_le_bytes()), 80);
         // The high half is padding and ignored.
         assert_eq!(dword_port(0xABCD_1F90u32.to_le_bytes()), 0x901F);
-        assert_eq!(dword_port(u32::from(8080u16.swap_bytes()).to_le_bytes()), 8080);
+        assert_eq!(
+            dword_port(u32::from(8080u16.swap_bytes()).to_le_bytes()),
+            8080
+        );
     }
 
     #[test]
@@ -769,10 +775,7 @@ mod tests {
             r"\\?\UNC\srv\share\bin\daemon.exe"
         ));
         // Same basename in another directory is not this daemon.
-        assert!(!windows_image_matches(
-            r"C:\Other\bin\daemon.exe",
-            daemon
-        ));
+        assert!(!windows_image_matches(r"C:\Other\bin\daemon.exe", daemon));
         // A relative expectation never matches, even textually equal.
         assert!(!windows_image_matches(r"bin\daemon.exe", r"bin\daemon.exe"));
         assert!(!windows_image_matches("daemon.exe", "daemon.exe"));
@@ -780,7 +783,9 @@ mod tests {
 
     #[test]
     fn windows_serve_image_requires_hipfire_basename() {
-        assert!(windows_image_is_hipfire(r"C:\Users\k\.hipfire\bin\hipfire.exe"));
+        assert!(windows_image_is_hipfire(
+            r"C:\Users\k\.hipfire\bin\hipfire.exe"
+        ));
         assert!(windows_image_is_hipfire(r"C:\x\HIPFIRE.EXE"));
         assert!(windows_image_is_hipfire("/opt/hipfire"));
         assert!(!windows_image_is_hipfire(r"C:\x\hipfire-tui.exe"));
@@ -800,7 +805,9 @@ mod tests {
 
     #[test]
     fn cmdline_rules_match_the_serve_validation_condition() {
-        assert!(cmdline_is_serve(b"/home/u/.hipfire/bin/hipfire\0serve\0-d\0"));
+        assert!(cmdline_is_serve(
+            b"/home/u/.hipfire/bin/hipfire\0serve\0-d\0"
+        ));
         assert!(!cmdline_is_serve(b"/home/u/.hipfire/bin/hipfire\0ps\0"));
         assert!(!cmdline_is_serve(b"/usr/bin/nginx\0serve\0"));
         assert!(!cmdline_is_serve(b""));
@@ -841,7 +848,10 @@ mod tests {
         assert_eq!(process_start_time(absent), None);
         assert!(!process_image_matches(absent, Path::new("/bin/sh")));
         assert!(!serve_process_matches(absent));
-        assert!(matches!(pid_owns_listen_port(absent, 1), Some(false) | None));
+        assert!(matches!(
+            pid_owns_listen_port(absent, 1),
+            Some(false) | None
+        ));
     }
 
     #[cfg(target_os = "linux")]

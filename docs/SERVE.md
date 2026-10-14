@@ -70,15 +70,17 @@ port, the CLI prints `port N is still in use by a process that is not this
 install's hipfire; not killing it`. `--all` also runs `pkill -f` against
 release quantize binaries.
 
-**Local management (all platforms).** Each serve process binds a separate
-`127.0.0.1` listener on an OS-assigned port. Only that listener accepts
-`POST /api/v1/shutdown`, authenticated with its own random 32-byte bearer
-credential. The inference listener never serves this route, including requests
-forwarded by a localhost reverse proxy. Management and inference credentials
-are separate; the public instance-identity token is not authorization.
-`serve.pid` stores `manage_port` and `manage_token`. Keep this file private:
-Unix mode is `0600`; Windows inherits ACLs from the user's hipfire home.
-Never share its contents or forward the management listener through a proxy.
+**Local management (Windows).** Windows has no signal `hipfire stop` can
+send, so each Windows serve process binds a separate `127.0.0.1` listener on
+an OS-assigned port. Only that listener accepts `POST /api/v1/shutdown`,
+authenticated with its own random 32-byte bearer credential. The inference
+listener never serves this route, including requests forwarded by a
+localhost reverse proxy. The management credential is separate from the
+public instance-identity token, which is not authorization. A Windows
+`serve.pid` stores `manage_port` and `manage_token` and inherits ACLs from the
+user's hipfire home. Keep it private: never share its contents or forward the
+management listener through a proxy. Unix serves bind no management listener
+and their `serve.pid` is unchanged.
 
 **Windows stop.** After checking image, creation time, and port ownership,
 `hipfire stop` sends the local management request and waits up to 35 seconds

@@ -38,6 +38,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) mod anthropic;
+// Windows-only at runtime; compiled everywhere so its tests run on Linux.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod management;
 pub(crate) mod metrics;
 
@@ -215,9 +217,10 @@ pub(crate) fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bo
 /// `serve.pid`: which process is serve and how to reach it.
 ///
 /// `token` is the `/health` instance token and is not a secret. `manage_token`
-/// is the management credential (see [`management`]); it is a secret, so this
-/// type's `Debug` redacts it and [`ServePidRecord::to_public_json`] omits it.
-/// Records written before management existed lack the `manage_*` fields.
+/// is the Windows management credential (see [`management`]); it is a secret,
+/// so this type's `Debug` redacts it and [`ServePidRecord::to_public_json`]
+/// omits it. Unix serves and records written before management existed have
+/// no `manage_*` fields, and none are serialized when absent.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ServePidRecord {
     pub(crate) pid: u32,
@@ -227,28 +230,34 @@ pub(crate) struct ServePidRecord {
     pub(crate) port: Option<u16>,
     #[serde(default)]
     pub(crate) token: Option<String>,
-    /// Loopback port of the authenticated management listener.
-    #[serde(default)]
+    /// Loopback port of the authenticated management listener (Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manage_port: Option<u16>,
     /// Management bearer credential. Secret: never log, print, or `Debug` it.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) manage_token: Option<String>,
     #[serde(skip)]
     pub(crate) legacy: bool,
 }
 
 impl ServePidRecord {
-    /// The record as shown to users (`hipfire ps`): every field except the
-    /// management credential, which is replaced by a presence flag.
+    /// The record as shown to users (`hipfire ps`): every serialized field
+    /// except the management credential, which is replaced by a presence flag.
+    /// A record without management fields renders exactly as it serializes.
     pub(crate) fn to_public_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut public = serde_json::json!({
             "pid": self.pid,
             "start_time": self.start_time,
             "port": self.port,
             "token": self.token,
-            "manage_port": self.manage_port,
-            "manage_token_present": self.manage_token.is_some(),
-        })
+        });
+        if let Some(port) = self.manage_port {
+            public["manage_port"] = port.into();
+        }
+        if self.manage_token.is_some() {
+            public["manage_token_present"] = true.into();
+        }
+        public
     }
 }
 
@@ -1760,17 +1769,30 @@ pub(crate) fn serve_foreground(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(&bind))
         .map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
-    // Management listener: separate loopback port and credential, owned only
-    // by `management::serve_management`; `ServeShared` and the inference
-    // listener never see either.
-    let manage_listener = runtime
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .context("failed to bind serve management listener")?;
-    let manage_port = manage_listener
-        .local_addr()
-        .context("management listener address")?
-        .port();
-    let manage_credential = Arc::new(management::ManagementCredential::generate()?);
+    // Windows management listener: a separate loopback port and credential,
+    // owned only by `management::serve_management`; `ServeShared` and the
+    // inference listener never see either. Windows has no signal `hipfire
+    // stop` can deliver, so stop reaches the shutdown token through it. Unix
+    // keeps SIGTERM and binds nothing extra.
+    #[cfg(windows)]
+    let (manage_listener, manage_credential) = (
+        runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .context("failed to bind serve management listener")?,
+        Arc::new(management::ManagementCredential::generate()?),
+    );
+    #[cfg(windows)]
+    let (manage_port, manage_token) = (
+        Some(
+            manage_listener
+                .local_addr()
+                .context("management listener address")?
+                .port(),
+        ),
+        Some(manage_credential.expose().to_owned()),
+    );
+    #[cfg(not(windows))]
+    let (manage_port, manage_token) = (None, None);
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = ServePidRecord {
@@ -1778,16 +1800,23 @@ pub(crate) fn serve_foreground(
         start_time: process_start_time(std::process::id()),
         port: Some(port),
         token: Some(instance_token),
-        manage_port: Some(manage_port),
-        manage_token: Some(manage_credential.expose().to_owned()),
+        manage_port,
+        manage_token,
         legacy: false,
     };
+    #[cfg(windows)]
     write_pid_record(&pid_path, &pid_record)?;
+    #[cfg(not(windows))]
+    fs::write(
+        &pid_path,
+        format!("{}\n", serde_json::to_string(&pid_record)?),
+    )?;
     let cleanup = pid_path.clone();
-    // SIGINT/SIGTERM (and an authenticated management shutdown) stops
-    // accepting and lets requests in flight finish (bounded, see
+    // SIGINT/SIGTERM (and on Windows an authenticated management shutdown)
+    // stops accepting and lets requests in flight finish (bounded, see
     // http::serve_listener_until); a second signal exits now.
     let shutdown = CancellationToken::new();
+    #[cfg(windows)]
     runtime.spawn(management::serve_management(
         manage_listener,
         manage_credential,
@@ -1912,24 +1941,22 @@ pub(crate) fn serve_foreground(
     Ok(())
 }
 
-/// Write `serve.pid` owner-only without a window in which it is readable by
-/// others and without following a symlink planted at its name.
+/// Write the Windows `serve.pid`, which carries the management credential,
+/// without following a file planted at its name.
 ///
-/// The record carries the management credential, so it is written to a fresh
-/// temp file created exclusively (`O_EXCL`: never follows a symlink, never
-/// reuses an existing file) with mode 0600 on Unix, then renamed over
-/// `serve.pid` (rename replaces the name itself, even if it is a symlink or
-/// an older, more permissive file). On Windows the file inherits the ACL of
-/// the hipfire home directory, which is the user's profile.
+/// The record goes to a fresh temp file created exclusively (never reuses an
+/// existing file), then renamed over `serve.pid` (rename replaces the name
+/// itself). The file inherits the ACL of the hipfire home directory, which is
+/// the user's profile. Unix records carry no secret and are written as before.
+#[cfg(windows)]
 fn write_pid_record(pid_path: &Path, record: &ServePidRecord) -> Result<()> {
     let tmp_path = pid_path.with_file_name(format!("serve.pid.{}.tmp", std::process::id()));
     let body = format!("{}\n", serde_json::to_string(record)?);
     let create = || {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        options.open(&tmp_path)
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
     };
     let mut file = match create() {
         Ok(file) => file,
@@ -2873,21 +2900,14 @@ mod tests {
         assert!(public.get("manage_token").is_none());
         assert!(!public.to_string().contains("secret"));
         assert!(!format!("{record:?}").contains("secret"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pid_record_replaces_permissive_file_with_owner_only_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("hipfire-pid-mode-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("serve.pid");
-        fs::write(&path, "old").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        let record = parse_pid_record("42").unwrap();
-        write_pid_record(&path, &record).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        fs::remove_dir_all(dir).unwrap();
+        // A unix record (no management) serializes and renders as before.
+        let unix = r#"{"pid":44,"start_time":9,"port":8080,"token":"instance"}"#;
+        let unix_record = parse_pid_record(unix).unwrap();
+        assert_eq!(serde_json::to_string(&unix_record).unwrap(), unix);
+        assert_eq!(
+            unix_record.to_public_json(),
+            serde_json::to_value(&unix_record).unwrap()
+        );
     }
 
     #[test]
