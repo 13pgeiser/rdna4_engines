@@ -175,7 +175,9 @@ fn parse_expert_vram_layers(value: &str) -> Result<ExpertVramLayers, String> {
 }
 
 fn is_routed_expert(name: &str) -> bool {
-    name.ends_with(".mlp.experts.gate_up_proj") || name.ends_with(".mlp.experts.down_proj")
+    name.ends_with(".mlp.experts.gate_up_proj")
+        || name.ends_with(".mlp.experts.down_proj")
+        || name.ends_with(crate::expert_arena::ARENA_SUFFIX)
 }
 
 /// Resident bytes outside the routed experts, and the routed-expert bytes of
@@ -198,6 +200,9 @@ pub fn resident_split_ranks(
 ) -> Result<(u64, u64), String> {
     let mut non_expert = 0u64;
     let mut layer_experts = 0u64;
+    // Slab arenas differ in size from layer to layer (the hot set is not
+    // uniform), so the per-layer charge is the largest arena, never layer 0.
+    let mut layer_arena_max = 0u64;
     for entry in weights {
         if entry.residency.is_external() || matches!(entry.policy, ShardPolicy::Tied { .. }) {
             continue;
@@ -205,11 +210,13 @@ pub fn resident_split_ranks(
         let bytes = bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
+        } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
+            layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
             layer_experts += rank_share(entry, bytes, ranks)?;
         }
     }
-    Ok((non_expert, layer_experts))
+    Ok((non_expert, layer_experts + layer_arena_max))
 }
 
 /// Stored dtype of the language head, which the native MTP draft head ranks
@@ -674,6 +681,55 @@ mod tests {
             WeightEntry::model(name, vec![4, 4, 256], DType::MQ4G256V2, ShardPolicy::Replicate);
         entry.layer = Some(layer);
         entry
+    }
+
+    fn arena_entry(layer: usize, bytes: usize) -> WeightEntry {
+        let mut entry = WeightEntry::model(
+            format!("model.language_model.layers.{layer}.mlp.experts.slab_arena"),
+            vec![bytes],
+            DType::Raw,
+            ShardPolicy::Replicate,
+        );
+        entry.layer = Some(layer);
+        entry
+    }
+
+    #[test]
+    fn slab_arenas_are_routed_experts_and_the_layer_charge_is_the_largest_arena() {
+        // Non-uniform arenas (the hot set is not spread evenly): layer 0 is the
+        // smallest, layer 2 the largest. `element_bytes` doubles the shape product.
+        let mut weights = vec![
+            arena_entry(0, 100),
+            arena_entry(1, 300),
+            arena_entry(2, 700),
+            arena_entry(3, 200),
+            entry("model.language_model.layers.0.self_attn.q_proj.weight", 0),
+        ];
+        assert!(weights[..4].iter().all(|entry| is_routed_expert(&entry.name)));
+        let (non_expert, layer_experts) =
+            resident_split(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2))
+                .expect("split");
+        assert_eq!(layer_experts, 700 * 2, "the charge is the max arena, never layer 0's");
+        assert_eq!(non_expert, 4 * 4 * 256 * 2);
+        // Admission totals every arena's physical bytes.
+        assert_eq!(
+            routed_expert_bytes(&weights, |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2)),
+            Ok((100 + 300 + 700 + 200) * 2)
+        );
+        // Per-rank shares of a max arena split the same way.
+        let (_, per_rank) = resident_split_ranks(
+            &weights,
+            |entry| Some(entry.logical_shape.iter().product::<usize>() as u64 * 2),
+            2,
+        )
+        .expect("split");
+        assert_eq!(per_rank, 700);
+        // Layers past the budget host-map their arenas.
+        assert_eq!(place_routed_experts(&mut weights, 2), 2);
+        assert_eq!(weights[0].residency, WeightResidency::Resident);
+        assert_eq!(weights[1].residency, WeightResidency::Resident);
+        assert_eq!(weights[2].residency, WeightResidency::HostMapped);
+        assert_eq!(weights[3].residency, WeightResidency::HostMapped);
     }
 
     #[test]
