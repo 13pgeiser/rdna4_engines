@@ -305,6 +305,32 @@ narrower than WSL2 on the same card. Known limits:
 - `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
   cannot find a native `serve` process; stop it with Ctrl-C.
 
+#### CI developer artifact
+
+The advisory `Windows MSVC (advisory, no GPU)` job in
+[CI](../.github/workflows/ci.yml) builds the native CLI and daemon, tests the
+config/registry/client libraries, and checks `hipfire --version` and parseable
+`hipfire diag --json` output without an AMD HIP runtime. It is promoted to a
+required check after its first green run on `beta`; adding the job is not
+evidence of a passing Windows run or GPU certification.
+
+After successful packaging, that run's `hipfire-windows-msvc` artifact contains
+`hipfire-<version>-x86_64-pc-windows-msvc.zip` and its `.zip.sha256` checksum.
+The ZIP includes `hipfire.exe`, `daemon.exe`, licenses/NOTICE,
+`README-windows.txt`, and a provenance/checksum `manifest.json`. To package
+already-built release binaries locally, use
+`.\scripts\package-windows.ps1` (defaults: `target\release` to `dist`).
+This is an **unsigned developer artifact**, not an installer or signed update:
+no HIP runtime, driver, or kernel packs are bundled. A user-installed AMD HIP
+runtime is required; runtime tuple certification and signing ownership remain
+pending M0. Checksums detect corruption, not publisher authenticity. These
+artifacts do not change the installation instructions above.
+
+The Windows build does not imply support for Unix-only PLE conversion,
+hot-row/direct-read or hot-pack I/O, cache-residency probing, or prewarm paths;
+those I/O entry points report unsupported on Windows. POSIX-FD VMM sharing,
+Redline, and VMM KV are not native Windows capabilities.
+
 ### Source checkout
 
 ```bash

@@ -60,6 +60,16 @@ for the surfaces it touches. The author or reviewer may gather that evidence
 with the manual harnesses below and/or optional automation; the maintainer
 who approves judges that the evidence matches the claim.
 
+The `Windows MSVC (advisory, no GPU)` job in the same workflow is initially
+advisory (`continue-on-error: true`), to be promoted to required after its first
+green run on `beta`. It builds the native CLI/daemon, runs config/registry/client
+library tests, smoke-checks version and parseable JSON diagnostics without HIP,
+and packages/uploads an unsigned developer ZIP plus SHA-256. It does not run
+inference or certify an AMD GPU, driver, runtime tuple, kernel pack, signed
+installer, or update path. Until a GitHub run exercises it, the Windows job and
+PowerShell packaging are unverified; see
+[the artifact description](GETTING_STARTED.md#ci-developer-artifact).
+
 ## hw-gate (optional evidence automation)
 
 [`hw-gate`](../.github/workflows/hw-gate.yml) is optional automation that can
@@ -233,6 +243,7 @@ not a separate required GitHub check beyond the [merge bar](#merge-bar-required)
 | Class | When it runs | Authority |
 |---|---|---|
 | **Automatic (no GPU CI, required)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | **Required** merge bar: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, `gates (ratchets, layering, registers)`. **Not** model coherence, serve semantics, or perf admission. |
+| **Automatic (Windows MSVC, advisory)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on `windows-latest` | Native build, selected CPU library tests, no-HIP version/JSON smoke, unsigned ZIP packaging. Initially advisory; promote after the first green `beta` run. **Not** GPU/runtime certification. |
 | **Automatic (hw-gate, optional)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) when that automation runs; hardware run after `hw-run` when buckets need it | **Optional** evidence delivery. Not a required status check; not automatic acceptance or promotion. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
@@ -248,6 +259,7 @@ claim-specific oracles named below, or replace the approving review.
 | Route | Path | Role |
 |---|---|---|
 | No-GPU CI (required jobs) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (+ [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) body) | **Required** automatic CI: workspace build, lib unit tests, ratchets/layering/registers gates. |
+| Windows MSVC (advisory) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) + [`scripts/package-windows.ps1`](../scripts/package-windows.ps1) | Native Windows CPU build/tests/smoke and unsigned developer artifact; no GPU certification. |
 | **hw-gate (optional)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Optional** evidence automation: path → buckets, pinned fixtures, hardware run, seat commentary. See [§ hw-gate](#hw-gate-optional-evidence-automation). |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |
