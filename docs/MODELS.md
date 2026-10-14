@@ -274,13 +274,21 @@ HIPFIRE_GPU_LAYER_BUDGET=auto HIPFIRE_MOE_EXPERT_BUDGET=auto \
 # weights 9781 MiB of 9947 MiB available", 3366 MiB pinned host RAM.
 ```
 
-**Verified on this branch** (gfx1101, HIP 7.16): the 24B-A2B loads and generates
-through the production `run` path with that placement; a spill changes no
-numerics — greedy decode is byte-identical across placements on the fixtures
-where a non-degenerate comparison is possible (see
-`crates/hipfire-arch-lfm2moe/tests/offload_parity.rs`: 2.6B dense and 8B-A1B MoE
-both match a resident baseline byte-for-byte, whole-layer and routed-expert
-tiers, with a prompt-variety guard that rejects a saturated oracle).
+**Verified on this branch** (gfx1100 RX 7900 XT, HIP 7.15): a locally quantized
+`lfm2.5-24b-a2b.mq4` (12,758,948,048 B, md5 `542f7998…f422`, quantized with
+`--format mq4` from `LiquidAI/LFM2.5-24B-A2B` bf16 safetensors) loads fully
+resident and generates coherently — `serve_harness battery` passes all five
+turns (think-disabled, ~78 tok/s decode, daemon md5 `b9c04329…ab05`), and a
+forced expert-tier spill (`HIPFIRE_MOE_EXPERT_BUDGET=16`, 24 MoE layers
+host-placed, 6,732 MiB pinned host) stays coherent. Earlier gfx1101 work on
+this branch also ran the model under `gpu_layer_budget=auto` +
+`moe_expert_budget=auto` on a 12.9 GB card. A spill changes no numerics —
+greedy decode is byte-identical across placements on the fixtures where a
+non-degenerate comparison is possible (see
+`crates/hipfire-arch-lfm2moe/tests/offload_parity.rs`: 2.6B dense and 8B-A1B
+MoE both match a resident baseline byte-for-byte, whole-layer and
+routed-expert tiers, with a prompt-variety guard that rejects a saturated
+oracle).
 
 **Resolved blocker — LFM2.5 MoE incoherence.** On gfx1100/gfx1101 the published
 `lfm2.5:8b-a1b` artifact used to emit degenerate text (saturated to 1–3 distinct
