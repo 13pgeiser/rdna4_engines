@@ -1788,22 +1788,8 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_PREWARM_BYTES",
-        "Budget of the PLE prewarm: bytes of the q4 PLE table (`<model>.ple-q4`) read into the page cache as part of model load (a rank-ordered table hottest rows first, then tier 0 again; distinct from the model weights prewarm). It starts with the load and runs concurrently with the weight upload; once the upload is done it re-reads any of its pages the upload evicted, and the model is ready only when both the weights and this budget are resident, so nothing of it runs while requests are served (load time becomes the longer of the upload and the prewarm). Default `auto` = 15 GiB (the hottest rows), capped at the table and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns the prewarm off; an explicit N is that many bytes (capped at the table). The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
     ),
-    process_field!(
-        "memory.ple_prewarm_bytes_per_sec",
-        "ple_prewarm_bytes_per_sec",
-        Memory,
-        DefaultValue::Integer(0),
-        ValueRule::Integer {
-            min: 0,
-            max: 1099511627776
-        },
-        false,
-        "HIPFIRE_PLE_PREWARM_BYTES_PER_SEC",
-        "Read-rate cap of the PLE prewarm during model load (`memory.ple_prewarm_bytes`), in bytes per second. Default 0 = unthrottled: the prewarm and the weight upload share the drive, and load time is the longer of the two. Set a cap (0.4.1 used 200000000) to leave the drive to the weight upload when the upload is the longer phase."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — the in-load PLE fill is folded into the PLE prewarm (memory.ple_prewarm_bytes), which is part of model load since 0.4.2; this key is read by nothing
     process_field!(
         "memory.ple_load_fill_bytes",
         "ple_load_fill_bytes",
@@ -1815,7 +1801,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_LOAD_FILL_BYTES",
-        "Deprecated (removal in 0.5.0); ignored. The PLE prewarm (`memory.ple_prewarm_bytes`) is part of model load since 0.4.2 and replaces the separate in-load fill this key sized; set `memory.ple_prewarm_bytes` (budget) and `memory.ple_prewarm_bytes_per_sec` (rate cap) instead."
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
     ),
     process_field!(
         "memory.session_cache_disk_bytes",
@@ -7651,22 +7637,22 @@ pub mod memory {
         }
     }
 
-    /// Budget of the PLE prewarm, part of model load
+    /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
     /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
-    /// `Auto` (default) = 15 GiB, capped at the host RAM left for it at load
-    /// start minus 8 GiB and at the table's data bytes; `Bytes(0)` = off;
-    /// `Bytes(n)` = that many bytes.
+    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus 8 GiB at ready
+    /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
     pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
         parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
     }
 
-    /// Read-rate cap of the PLE prewarm during model load
-    /// (`memory.ple_prewarm_bytes_per_sec`, compat env
-    /// `HIPFIRE_PLE_PREWARM_BYTES_PER_SEC`); 0 (default) = unthrottled.
-    pub fn ple_prewarm_bytes_per_sec() -> u64 {
-        process_value("HIPFIRE_PLE_PREWARM_BYTES_PER_SEC")
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0)
+    /// Bytes of the rank-ordered q4 PLE table read during model load
+    /// (`memory.ple_load_fill_bytes`, compat env `HIPFIRE_PLE_LOAD_FILL_BYTES`;
+    /// parsed like [`parse_ple_prewarm_bytes`]): `Auto` (default) = 14 GiB,
+    /// `Bytes(0)` = off, `Bytes(n)` = that many bytes.  The loader caps it at
+    /// the table, an explicit prewarm budget and the host memory left after
+    /// the weights.
+    pub fn ple_load_fill_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_LOAD_FILL_BYTES").as_deref())
     }
 
     /// Path of the PLE sidecar of `model`: `<model file name>.ple-q4` /

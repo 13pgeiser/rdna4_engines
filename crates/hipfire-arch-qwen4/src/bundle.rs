@@ -113,7 +113,7 @@ const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
 
 /// The PLE rows owner of a bundle: present exactly when the profile declares
 /// PLE (`config.ple`), so a profile without it holds no row store, hash
-/// metadata or hot store — and no placeholder for them.
+/// metadata, hot store or prewarm — and no placeholder for them.
 pub(crate) struct Qwen4BundlePle {
     /// Bounded model-owned PLE reader/cache.  It must quiesce before source
     /// descriptors and the attached transaction are dropped.
@@ -127,6 +127,10 @@ pub(crate) struct Qwen4BundlePle {
     /// `None` = off. Dropping it stops and joins the worker; `free_gpu` does
     /// so before the row store unloads.
     hot: Option<PleHotWorker>,
+    /// Page-cache prewarm of a Q4LM PLE sidecar (`attach_ple_prewarm`); `None`
+    /// = off.  Like `hot` it reads the sidecar, so dropping it stops and
+    /// joins its thread, and `free_gpu` does so before the row store unloads.
+    prewarm: Option<hipfire_runtime::ple_prewarm::PleRowsPrewarm>,
 }
 
 /// Published Qwen4 architecture owner.
@@ -533,6 +537,7 @@ impl Qwen4Bundle {
                         metadata: inputs.metadata,
                         source: inputs.source,
                         hot: None,
+                        prewarm: None,
                     }),
                     Err(error) => {
                         let weight_result = weights.free_gpu(gpu);
@@ -2405,8 +2410,8 @@ impl Qwen4Bundle {
 
     /// Attach the PLE hot-row store and its worker thread: the row store reads
     /// the rows its pack holds from the pack.  A geometry mismatch is logged
-    /// and the store is dropped (stopped and joined).  The hot store and the
-    /// rank table are Flash-Next-only: a profile without PLE
+    /// and the store is dropped (stopped and joined).  The hot store, the
+    /// prewarm and the rank table are Flash-Next-only: a profile without PLE
     /// or a developer profile refuses (and drops the worker).
     pub fn attach_ple_hot_store(&mut self, hot: PleHotWorker) -> Result<(), BundleError> {
         let ple = self.ple_attachment_owner("hot-row store")?;
@@ -2423,6 +2428,22 @@ impl Qwen4Bundle {
         self.ple.as_ref()?.hot.as_ref().map(PleHotWorker::store)
     }
 
+    /// Attach the page-cache prewarm of a Q4LM PLE sidecar (see
+    /// `hipfire_runtime::ple_prewarm`).  The bundle owns it from here:
+    /// `free_gpu` stops and joins it before the row store unloads.
+    pub fn attach_ple_prewarm(
+        &mut self,
+        prewarm: hipfire_runtime::ple_prewarm::PleRowsPrewarm,
+    ) -> Result<(), BundleError> {
+        self.ple_attachment_owner("sidecar prewarm")?.prewarm = Some(prewarm);
+        Ok(())
+    }
+
+    /// The attached PLE sidecar prewarm, if any.
+    pub fn ple_prewarm(&self) -> Option<&hipfire_runtime::ple_prewarm::PleRowsPrewarm> {
+        self.ple.as_ref()?.prewarm.as_ref()
+    }
+
     /// Keep the prewarm worker of a rank-order PLE table
     /// (`HotRowStore::spawn_table_worker`, wrapped with
     /// [`PleHotWorker::new`]) with the bundle.  Unlike
@@ -2434,7 +2455,7 @@ impl Qwen4Bundle {
         Ok(())
     }
 
-    /// The PLE owner an attachment (hot store, rank-table worker)
+    /// The PLE owner an attachment (hot store, prewarm, rank-table worker)
     /// hangs from, or the refusal for a bundle that cannot carry one.
     fn ple_attachment_owner(&mut self, what: &str) -> Result<&mut Qwen4BundlePle, BundleError> {
         if !self.config.profile.is_flash_next() {
@@ -3180,11 +3201,13 @@ impl Qwen4Bundle {
         } = self;
         let ple_rows = ple.map(|ple| {
             let Qwen4BundlePle {
-                rows, hot, ..
+                rows, hot, prewarm, ..
             } = ple;
             // The hot-row store's worker reads the pack and the model file:
             // stop and join it before the row store unloads.
             drop(hot);
+            // The sidecar prewarm reads the sidecar the row store also reads.
+            drop(prewarm);
             rows
         });
         if let Some(mut session) = session {

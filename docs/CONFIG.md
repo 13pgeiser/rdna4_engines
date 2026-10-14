@@ -865,9 +865,8 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.session_cache_dir` | `""` | Directory of the session cache's disk tier; empty = `$HIPFIRE_HOME/session-cache`. One process uses it at a time (a second one runs without the disk tier). Env: `HIPFIRE_SESSION_CACHE_DIR`. |
 | `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, derived from the Q8 rows on first load when missing (about 1 minute, progress on stderr; `hipfire ple derive --format q4 <model>` does it ahead of time). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
-| `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; budget of the **PLE prewarm** (distinct from the model weights prewarm): bytes of the q4 PLE table `<model>.ple-q4` read into the page cache **as part of model load** (a rank-ordered table: hottest rows first, then tier 0 again; a row-ordered one: sequentially). It starts with the load, on its own thread, and runs concurrently with the weight upload; the upload streams the model file through the same cache and evicts the oldest pages first, so the prewarm re-reads evicted pages of its budget (found with `mincore`), hottest first, and once more after the upload. The model is ready only when both the weights and this budget are resident: the first request finds those rows warm, nothing of the prewarm runs while requests are served, and load time becomes the longer of the upload and the prewarm. `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at the table and at the host RAM available at load start (`MemAvailable` plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB; `0` = off (kill switch); an explicit N is that many bytes (capped at the table). The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
-| `memory.ple_prewarm_bytes_per_sec` | `0` | int 0–1 TiB; read-rate cap of the PLE prewarm during model load, in bytes per second. `0` (default) = unthrottled: the prewarm and the weight upload share the drive. A cap (0.4.1's in-load fill used 200000000) leaves the drive to the upload, at the cost of a longer load when the prewarm becomes the longer phase. Env: `HIPFIRE_PLE_PREWARM_BYTES_PER_SEC`. |
-| `memory.ple_load_fill_bytes` | `auto` | **Deprecated** (removal in 0.5.0); ignored. The separate in-load fill this key sized is folded into the PLE prewarm, part of model load since 0.4.2: set `memory.ple_prewarm_bytes` (budget) and `memory.ple_prewarm_bytes_per_sec` (rate cap). Env: `HIPFIRE_PLE_LOAD_FILL_BYTES`. |
+| `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
 
 Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -934,24 +933,18 @@ sidecar for the selected format.
 
 `memory.ple_hot_store_bytes` (above) also applies to the sidecars: the
 hot-row pack is cut from, and verified against, the rows file in use.
-With the q4 sidecar and no hot-row pack attached, the **PLE prewarm** (not
-to be confused with the model weights prewarm) reads the sidecar's hottest
-data into the page cache **as part of model load**: it starts with the
-load on its own thread and runs concurrently with the weight upload (a
-rank-ordered table hottest rows first, a row-ordered one sequentially),
-re-reads whatever of it the upload evicted once the upload is done, and
-logs `ple prewarm complete` before the model is ready. Ready waits for it,
-so the first request does not pay PLE page faults, nothing of it runs
-while requests are served, and load time becomes the longer of the
-upload and the prewarm. `memory.ple_prewarm_bytes` (env
+With the q4 sidecar and no hot-row pack attached, the sidecar's data is
+read into the page cache after the model is ready, while no request runs
+(a rank-ordered table hottest tier first); `memory.ple_prewarm_bytes` (env
 `HIPFIRE_PLE_PREWARM_BYTES`) sets the budget: `auto` (default) = 15 GiB,
-capped at the sidecar's data bytes and at the host RAM available at load
-start minus the weights the load puts in host RAM minus 8 GiB; `0` = off;
-an integer = that many bytes. `memory.ple_prewarm_bytes_per_sec` (env
-`HIPFIRE_PLE_PREWARM_BYTES_PER_SEC`) caps its read rate; `0` (default) =
-unthrottled. `memory.ple_load_fill_bytes` is deprecated and ignored. The
-pages are ordinary clean page cache, dropped (never swapped) under memory
-pressure and not charged in admission.
+capped at `MemAvailable` minus 8 GiB at ready and at the sidecar's data
+bytes, `0` = off, an integer = that many bytes. A rank-ordered table's
+hottest prefix is already read during the load, throttled, by
+`memory.ple_load_fill_bytes` (env `HIPFIRE_PLE_LOAD_FILL_BYTES`, `auto` =
+14 GiB, `0` = off), so the first request after ready finds those rows
+warm; the prewarm continues after it. The pages are ordinary clean page
+cache, dropped (never swapped) under memory pressure and not charged in
+admission.
 
 ### Qwen4 trunk overlay sidecar
 
@@ -1324,9 +1317,8 @@ uses ambient variables in engine hot paths.
 | `session_cache_bytes` | `memory.session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | 8589934592 (8 GiB; `0` off) |
 | `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − 4 GiB of the hot-row pack) |
 | `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
-| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (PLE prewarm of 15 GiB of the q4 PLE table during model load, capped at the host RAM left at load start − 8 GiB; ready waits for it; `0` off) |
-| `ple_prewarm_bytes_per_sec` | `memory.ple_prewarm_bytes_per_sec` | `HIPFIRE_PLE_PREWARM_BYTES_PER_SEC` | 0 (unthrottled) |
-| `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | deprecated, ignored |
+| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − 8 GiB; `0` off) |
+| `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
 | `session_cache_disk_bytes` | `memory.session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | 0 (off) |
 | `session_cache_dir` | `memory.session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | `$HIPFIRE_HOME/session-cache` |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
@@ -1382,7 +1374,7 @@ misspelled key is unknown and fails the load with
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 300 schema keys, plus the `developer.<name>` namespace.
+**Count:** 299 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1596,9 +1588,8 @@ misspelled key is unknown and fails the load with
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
 | `memory.ple_format` | `ple_format` | `HIPFIRE_PLE_FORMAT` | stable |
 | `memory.ple_hot_store_bytes` | `ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | stable |
-| `memory.ple_load_fill_bytes` | `ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | deprecated |
+| `memory.ple_load_fill_bytes` | `ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | stable |
 | `memory.ple_prewarm_bytes` | `ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | stable |
-| `memory.ple_prewarm_bytes_per_sec` | `ple_prewarm_bytes_per_sec` | `HIPFIRE_PLE_PREWARM_BYTES_PER_SEC` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |

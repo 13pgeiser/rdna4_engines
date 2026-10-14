@@ -71,8 +71,6 @@ DEPRECATED_TUNING = {
     "speculation.prefill.sparse_threshold",
     "speculation.prefill.drafter_kv",
     "diagnostic.pflash.score_layer",
-    # Read by nothing since the PLE prewarm became part of model load (0.4.2).
-    "memory.ple_load_fill_bytes",
 }
 # Deprecated env knobs that are not schema aliases (developer namespace or
 # unread harness exports). Their unset default is the supported behaviour.
