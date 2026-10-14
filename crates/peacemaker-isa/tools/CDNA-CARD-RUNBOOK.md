@@ -62,7 +62,7 @@ bash card_run.sh
 2. extract the tar into `/scratch/g942/pmcdna/<sha>/` (`--strip-components=1`)
 3. record `cargo`/`rustc`/`hipcc`/`/opt/rocm/lib/llvm/bin/clang` versions to `/scratch/g942/pmcdna/<sha>/toolchain.txt`
 4. build with
-   `RUSTUP_HOME=/scratch/g942/rustup CARGO_HOME=/scratch/g942/cargo PATH=/scratch/g942/cargo/bin:/opt/rocm/bin:$PATH CARGO_TARGET_DIR=/scratch/g942/target-pmcdna ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 nice -n 10 cargo build --release -p peacemaker-isa --example cdna_card_tierc -j 8`
+   `RUSTUP_HOME=/scratch/g942/rustup CARGO_HOME=/scratch/g942/cargo PATH=/scratch/g942/cargo/bin:/opt/rocm/bin:$PATH CARGO_TARGET_DIR=/scratch/g942/target-pmcdna ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 nice -n 10 cargo build --release -p peacemaker-isa --features lab --example cdna_card_tierc -j 8`
 5. compile each twin with
    `ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 nice -n 10 /opt/rocm/bin/hipcc --genco --offload-arch=gfx942 -O3 <twin>.gfx942.hip -o /scratch/g942/pmcdna/<sha>/hsaco/<name>.hsaco`
 6. **quick** gate, one `g942run.sh` call, own receipt:

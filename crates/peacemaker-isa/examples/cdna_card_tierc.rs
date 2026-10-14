@@ -27,7 +27,7 @@
 //! * `--quick`: small shapes, every kernel. Default is the full set (MoE R=1280 K=2560, act K=2560).
 //!
 //! ```text
-//! cargo run --release --example cdna_card_tierc -- [--dry-run] [--quick] [--receipt PATH] [--hsaco-dir DIR]
+//! cargo run --release -p peacemaker-isa --features lab --example cdna_card_tierc -- [--dry-run] [--quick] [--receipt PATH] [--hsaco-dir DIR]
 //! ```
 //!
 //! Exit status: nonzero when any case has an (a), (b-default) or (c-default) mismatch, an execution error,

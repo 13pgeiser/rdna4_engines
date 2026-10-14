@@ -153,11 +153,11 @@ step "toolchain versions (-> $WORK/toolchain.txt)"
   env ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 /opt/rocm/lib/llvm/bin/clang --version
 } 2>&1 | tee "$WORK/toolchain.txt"
 
-step "cargo build --release -p peacemaker-isa --example cdna_card_tierc"
+step "cargo build --release -p peacemaker-isa --features lab --example cdna_card_tierc"
 # CPU-only build: hide GPUs from this one cargo process (not exported), so GPU
 # processes started later by g942run.sh still see the card.
 (cd "$WORK" && ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 \
-  nice -n 10 cargo build --release -p peacemaker-isa --example cdna_card_tierc -j 8)
+  nice -n 10 cargo build --release -p peacemaker-isa --features lab --example cdna_card_tierc -j 8)
 BIN="$CARGO_TARGET_DIR/release/examples/cdna_card_tierc"
 [[ -x "$BIN" ]] || die "build produced no $BIN"
 
