@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Arch { Gfx1201, Gfx1100, Gfx1151 }
+pub enum Arch { Gfx1201, Gfx1100, Gfx1151, Gfx942 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WgIdSource { Ttmp7, Ttmp9, Sgpr(u8) }
@@ -15,7 +15,9 @@ pub enum WgIdSource { Ttmp7, Ttmp9, Sgpr(u8) }
 pub struct WgIds { pub x: WgIdSource, pub y: WgIdSource }
 
 impl Arch {
-    pub fn name(self) -> &'static str { match self { Self::Gfx1201 => "gfx1201", Self::Gfx1100 => "gfx1100", Self::Gfx1151 => "gfx1151" } }
+    pub fn name(self) -> &'static str { match self { Self::Gfx1201 => "gfx1201", Self::Gfx1100 => "gfx1100", Self::Gfx1151 => "gfx1151", Self::Gfx942 => "gfx942" } }
+    /// The CDNA instruction-model variant (wave64, `peacemaker_cdna`), `None` on RDNA.
+    pub fn cdna(self) -> Option<peacemaker_cdna::Arch> { match self { Self::Gfx942 => Some(peacemaker_cdna::Arch::Gfx942), _ => None } }
     pub fn gfx12(self) -> bool { matches!(self, Self::Gfx1201) }
     pub fn buffer_offset_max(self) -> u32 { if self.gfx12() { (1 << 23) - 1 } else { 4095 } }
     pub fn wmma_iu4(self) -> &'static str { if self.gfx12() { "v_wmma_i32_16x16x32_iu4" } else { "v_wmma_i32_16x16x16_iu4" } }
@@ -39,5 +41,5 @@ impl Arch {
 }
 impl std::str::FromStr for Arch {
     type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> { match s { "gfx1201" => Ok(Self::Gfx1201), "gfx1100" => Ok(Self::Gfx1100), "gfx1151" => Ok(Self::Gfx1151), _ => Err(format!("unsupported architecture {s}")) } }
+    fn from_str(s: &str) -> Result<Self, Self::Err> { match s { "gfx1201" => Ok(Self::Gfx1201), "gfx1100" => Ok(Self::Gfx1100), "gfx1151" => Ok(Self::Gfx1151), "gfx942" => Ok(Self::Gfx942), _ => Err(format!("unsupported architecture {s}")) } }
 }

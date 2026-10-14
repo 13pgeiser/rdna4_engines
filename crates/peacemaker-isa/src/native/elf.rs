@@ -70,7 +70,7 @@ fn sysv_hash(name: &str) -> u32 {
 
 fn e_flags(arch: Arch) -> u32 {
     // EF_AMDGPU_MACH_AMDGCN_*; gfx11/gfx12 have neither XNACK nor SRAMECC.
-    match arch { Arch::Gfx1100 => 0x41, Arch::Gfx1151 => 0x4a, Arch::Gfx1201 => 0x4e }
+    match arch { Arch::Gfx1100 => 0x41, Arch::Gfx1151 => 0x4a, Arch::Gfx1201 => 0x4e, Arch::Gfx942 => 0x4c }
 }
 
 #[derive(Default)]

@@ -28,14 +28,18 @@ pub const VERSION: &str = concat!("peacemaker-isa ", env!("CARGO_PKG_VERSION"), 
 /// committed `.hxaco` bundles) use the trailing-hyphen form instead.
 pub const DEFAULT_HOST_TARGET: &str = "host-x86_64-unknown-linux-gnu";
 
-fn ir_arch(arch: Arch) -> IrArch {
-    match arch { Arch::Gfx1100 => IrArch::Gfx1100, Arch::Gfx1151 => IrArch::Gfx1151, Arch::Gfx1201 => IrArch::Gfx1201 }
+/// The RDNA codec architecture; CDNA kernels are typed (`crate::cdna`) and never take the text path.
+fn ir_arch(arch: Arch) -> Result<IrArch, String> {
+    match arch {
+        Arch::Gfx1100 => Ok(IrArch::Gfx1100), Arch::Gfx1151 => Ok(IrArch::Gfx1151), Arch::Gfx1201 => Ok(IrArch::Gfx1201),
+        Arch::Gfx942 => Err("gfx942 code is emitted by the typed cdna builder, not the RDNA text assembler".into()),
+    }
 }
 
 /// Encode one instruction line (no label operands) onto `out`; returns its dword count.
 fn encode_into(line: &str, arch: Arch, out: &mut Vec<u32>) -> Result<usize, String> {
-    let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)).map_err(|e| format!("{line}: {e}"))?;
-    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch), &inst) }
+    let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)?).map_err(|e| format!("{line}: {e}"))?;
+    let words = if arch.gfx12() { peacemaker_ir::codec::gfx12::encode(&inst) } else { peacemaker_ir::codec::gfx11::encode(ir_arch(arch)?, &inst) }
         .map_err(|e| format!("{line}: {e}"))?;
     out.extend_from_slice(&words);
     Ok(words.len())
