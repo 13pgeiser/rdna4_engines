@@ -565,8 +565,20 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             const float decay = decay_rows[r];
             const float beta_value = beta_rows[r];
 
+            // gfx942 F32 (!kQ8): pin the recurrence to the sequential kernel's
+            // exact arithmetic. The sequential path rounds state*decay through
+            // its global state store, so the decay product is rounded here with
+            // __fmul_rn (register-resident state would otherwise let the
+            // compiler contract it into the following FMAs). The kv_mem and
+            // out accumulators stay serial __fmaf_rn chains in kd order
+            // (half 0 then half 1 via the LDS handoff); delta, the state
+            // update and the qv scaling use the same explicit roundings.
+            // Q8 and every other architecture keep the original expressions.
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
+#if defined(__gfx942__)
+                if constexpr (!kQ8) state_half[kd] = __fmul_rn(state_half[kd], decay); else
+#endif
                 state_half[kd] *= decay;
             }
 
@@ -574,6 +586,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
                 const float kv = bf16_to_f32(k_norm[buf][kd_base + kd]);
+#if defined(__gfx942__)
+                if constexpr (!kQ8) kv_mem = __fmaf_rn(state_half[kd], kv, kv_mem); else
+#endif
                 kv_mem += state_half[kd] * kv;
             }
             if (half == 0) {
@@ -586,11 +601,20 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
                     const float kv = bf16_to_f32(k_norm[buf][64 + kd]);
+#if defined(__gfx942__)
+                    if constexpr (!kQ8) kv_mem = __fmaf_rn(state_half[kd], kv, kv_mem); else
+#endif
                     kv_mem += state_half[kd] * kv;
                 }
                 const __hip_bfloat16 v_value = bf16_round(cur_a);
+#if defined(__gfx942__)
+                const float delta = kQ8
+                    ? (bf16_to_f32(v_value) - kv_mem) * beta_value
+                    : __fmul_rn(__fsub_rn(bf16_to_f32(v_value), kv_mem), beta_value);
+#else
                 const float delta =
                     (bf16_to_f32(v_value) - kv_mem) * beta_value;
+#endif
                 handoff_delta[value_index] = delta;
             }
             gdn_lds_barrier();
@@ -599,6 +623,9 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
                 const float kv = bf16_to_f32(k_norm[buf][kd_base + kd]);
+#if defined(__gfx942__)
+                if constexpr (!kQ8) state_half[kd] = __fmaf_rn(kv, delta, state_half[kd]); else
+#endif
                 state_half[kd] += kv * delta;
             }
 
@@ -606,8 +633,17 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             #pragma unroll
             for (int kd = 0; kd < 64; ++kd) {
                 float qv = bf16_to_f32(q_norm[buf][kd_base + kd]);
+#if defined(__gfx942__)
+                if constexpr (!kQ8) {
+                    qv = __fmul_rn(qv, query_scale);
+                    out = __fmaf_rn(state_half[kd], qv, out);
+                } else {
+#endif
                 qv *= query_scale;
                 out += state_half[kd] * qv;
+#if defined(__gfx942__)
+                }
+#endif
             }
             if (half == 0) {
                 handoff_out[value_index] = out;
@@ -625,8 +661,17 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                 #pragma unroll
                 for (int kd = 0; kd < 64; ++kd) {
                     float qv = bf16_to_f32(q_norm[buf][64 + kd]);
+#if defined(__gfx942__)
+                    if constexpr (!kQ8) {
+                        qv = __fmul_rn(qv, query_scale);
+                        out = __fmaf_rn(state_half[kd], qv, out);
+                    } else {
+#endif
                     qv *= query_scale;
                     out += state_half[kd] * qv;
+#if defined(__gfx942__)
+                    }
+#endif
                 }
                 output[row * value_width + value_head * 128 + value_index] = out;
             }
@@ -4724,8 +4769,16 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
     // Token indices are block-uniform: read them as scalars and fetch each
     // value row through a scalar buffer offset (invalid rows read row 0 and
     // select 0.0, exactly the value the skipped row contributed).
+#if defined(__gfx942__)
+    // gfx9 raw buffer descriptor dword3 (CK_TILE_BUFFER_RESOURCE_3RD_DWORD for
+    // __gfx9__): DATA_FORMAT = 4 (BUF_DATA_FORMAT_32, bits 18:15), DST_SEL_* = 0,
+    // NUM_FORMAT = 0. 0x31004000 is the RDNA3/RDNA4 layout, not valid on CDNA.
+    const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)values, 0, 0x7FFFFFFF, 0x00020000);
+#else
     const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
         (void*)values, 0, 0x7FFFFFFF, 0x31004000);
+#endif
     const int voff = channel * 4;
     auto value_at = [&](int index) {
         const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
@@ -4888,8 +4941,16 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
         denominator[h] = 0.0f;
         numerator[h] = 0.0f;
     }
+#if defined(__gfx942__)
+    // gfx9 raw buffer descriptor dword3 (CK_TILE_BUFFER_RESOURCE_3RD_DWORD for
+    // __gfx9__): DATA_FORMAT = 4 (BUF_DATA_FORMAT_32, bits 18:15), DST_SEL_* = 0,
+    // NUM_FORMAT = 0. 0x31004000 is the RDNA3/RDNA4 layout, not valid on CDNA.
+    const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)values, 0, 0x7FFFFFFF, 0x00020000);
+#else
     const __amdgpu_buffer_rsrc_t vrsrc = __builtin_amdgcn_make_buffer_rsrc(
         (void*)values, 0, 0x7FFFFFFF, 0x31004000);
+#endif
     const int voff = channel * 4;
     auto value_at = [&](int index) {
         const int token = __builtin_amdgcn_readfirstlane(row_selected[index]);
