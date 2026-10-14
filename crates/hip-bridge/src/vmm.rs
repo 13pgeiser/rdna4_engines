@@ -18,6 +18,7 @@ use crate::{
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 use crate::ffi::{HipMemLocation, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM};
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -450,6 +451,7 @@ enum VmmArenaKind {
     /// Exportable arena after [`VmmArena::publish_read_only`]: owner access is RO.
     ExportPublished,
     /// Arena mapping an imported POSIX-FD allocation: always RO.
+    #[cfg_attr(not(unix), allow(dead_code))]
     ImportedReadOnly,
 }
 
@@ -526,6 +528,7 @@ impl VmmArena {
     /// [`Self::release`]. On failure nothing is returned to retry: the VA is
     /// retired, and a handle whose release failed stays in the granule table
     /// pending [`retry_pending_granule_releases`].
+    #[cfg(unix)]
     pub fn import_posix(
         hip: &HipRuntime,
         device: i32,
@@ -580,6 +583,7 @@ impl VmmArena {
     /// Failure cleanup for [`Self::import_posix`]: undo what was done, retire
     /// the reservation (VA is never freed), and keep any handle that could not
     /// be released owned by the granule table. Returns the error to report.
+    #[cfg(unix)]
     fn abort_import(
         mut self,
         hip: &HipRuntime,
@@ -1411,6 +1415,7 @@ impl VmmArena {
     /// Export the published arena's physical allocation as a new POSIX FD
     /// (an independent reference; the caller owns it and may call this more
     /// than once). Requires [`Self::publish_read_only`] first.
+    #[cfg(unix)]
     pub fn export_posix(&self, hip: &HipRuntime) -> HipResult<OwnedFd> {
         if self.kind != VmmArenaKind::ExportPublished {
             return Err(HipError::new(

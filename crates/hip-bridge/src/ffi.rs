@@ -524,10 +524,12 @@ pub struct HipRuntime {
         Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
     fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
     /// `hipMemExportToShareableHandle(void *out, handle, type, flags)`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn_mem_export_to_shareable_handle: Option<
         unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32,
     >,
     /// `hipMemImportFromShareableHandle(handle *out, void *osHandle, type)`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn_mem_import_from_shareable_handle: Option<
         unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32,
     >,
@@ -1842,6 +1844,7 @@ impl HipRuntime {
     /// `handle` with `HipMemAllocationProp::device_pinned_posix_fd`.
     ///
     /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[cfg(unix)]
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn mem_export_posix(
         &self,
@@ -1882,6 +1885,7 @@ impl HipRuntime {
     /// the caller keeps ownership and may close it after import. The returned
     /// handle is owned by the caller and must be released with `mem_release`
     /// after every mapping of it is unmapped.
+    #[cfg(unix)]
     pub fn mem_import_posix(
         &self,
         fd: std::os::fd::BorrowedFd<'_>,

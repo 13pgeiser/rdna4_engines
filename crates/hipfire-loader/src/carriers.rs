@@ -176,8 +176,17 @@ fn start_ple_hot_store(
         pack.display(),
         started.elapsed().as_millis()
     );
-    let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
-    Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+    #[cfg(unix)]
+    {
+        let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
+        Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+    }
+    #[cfg(not(unix))]
+    {
+        // Unreachable: the non-Unix `HotRowStore::open` above always returns
+        // Err, and that match arm returns None before this point.
+        unreachable!("PLE hot-row packs are unsupported on Windows; run on Linux")
+    }
 }
 
 /// Bytes of the PLE hot-row pack to prewarm now that the model is ready: an
@@ -243,10 +252,12 @@ fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
 /// `plehot/hcurve_q4.py`): the smallest prefix whose modelled held-out prose
 /// and agentic 8K prefill (TTFT = 4,177 + (1 − h) × 1,135 ms) is within 1% of
 /// the 15 GiB prewarm's (prose h 0.923 vs 0.937, agentic 0.809 vs 0.836).
+#[cfg_attr(not(unix), allow(dead_code))]
 const PLE_LOAD_FILL_AUTO_BYTES: u64 = 14 << 30;
 
 /// Read rate cap of the in-load fill: a small share of the NVMe's sequential
 /// bandwidth, so the weight upload keeps the drive.
+#[cfg_attr(not(unix), allow(dead_code))]
 const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
 
 /// Bytes of a rank-ordered q4 PLE table to read while the model loads: the
@@ -255,6 +266,7 @@ const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
 /// host RAM available now (`MemAvailable` plus TTM's page pool, which the
 /// weights' GTT allocations take first) minus the weights still to load into
 /// host RAM minus [`PLE_PREWARM_RESERVE_BYTES`] (0 when unknown).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn ple_load_fill_bytes(
     requested: hipfire_config::memory::PleHotStoreBudget,
     prewarm: hipfire_config::memory::PleHotStoreBudget,
@@ -283,6 +295,7 @@ fn ple_load_fill_bytes(
 /// with an in-load fill of its hottest prefix when
 /// [`ple_load_fill_bytes`] allows one. The worker prewarms on from there
 /// once the model is ready; dropping it stops and joins it.
+#[cfg(unix)]
 fn start_ple_table_worker(
     store: &std::sync::Arc<hipfire_runtime::ple_hot_store::HotRowStore>,
     host_weight_bytes: u64,
@@ -1856,6 +1869,7 @@ pub fn load_qwen4_rank(
     // in hand); its worker verifies the pack meanwhile and prewarms it
     // once the model is ready. Dropping either on an error path stops and
     // joins its worker.
+    #[cfg(unix)]
     let ple_table_worker = rank_table.as_ref().map(|store| {
         // What the sweep puts in host RAM: on unified memory every
         // uploaded weight (external PLE rows stay on disk), on a discrete
@@ -1874,6 +1888,13 @@ pub fn load_qwen4_rank(
         };
         start_ple_table_worker(store, host_weight_bytes)
     });
+    #[cfg(not(unix))]
+    let ple_table_worker = {
+        if rank_table.is_some() {
+            return Err("qwen4: rank-ordered PLE table workers are unsupported on Windows; run on Linux".into());
+        }
+        None::<hipfire_arch_qwen4::bundle::PleHotWorker>
+    };
     let ple_hot = match (&metadata, ple_descriptors.as_deref()) {
         (Some(metadata), Some(descriptors)) if config.profile.is_flash_next() => {
             start_ple_hot_store(

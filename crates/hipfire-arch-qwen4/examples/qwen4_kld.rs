@@ -62,6 +62,16 @@ use std::time::Instant;
 /// `<rows source>.plehotrows` pack (`plan.source_path` is the model file or
 /// its PLE sidecar), wait until its worker verified the pack, prewarm
 /// `prewarm` bytes of it, and return it ready to attach.
+#[cfg(not(unix))]
+fn verified_hot_store(
+    _model: &Path,
+    _plan: PleHotPlan,
+    _prewarm: u64,
+) -> Result<PleHotWorker, String> {
+    Err("--ple-hot: PLE hot-row verification and prewarm are unsupported on Windows; run this diagnostic on a Unix host".into())
+}
+
+#[cfg(unix)]
 fn verified_hot_store(
     model: &Path,
     plan: PleHotPlan,
