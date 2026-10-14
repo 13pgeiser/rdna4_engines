@@ -143,6 +143,42 @@ pub enum Step<'a> {
         crate::pipeline::moe_program::SealedMoeOp<'a>,
         crate::pipeline::moe_program::MoeStage,
     ),
+    /// Manifold hyper-connection pre step: control vector and layer input.
+    HcPre(crate::pipeline::mla::hc::HcPreOp<'a>),
+    /// Manifold hyper-connection mix of a sublayer output into the streams.
+    HcPost(crate::pipeline::mla::hc::HcPostOp<'a>),
+    /// Hyper-connection head prologue: stream combine and final norm.
+    HcHead(crate::pipeline::mla::hc::HcHeadOp<'a>),
+    /// Attention-side RMSNorm of the HC layer input (plain and FWHT-rotated).
+    QLoraPrepare(crate::pipeline::mla::query_kv::QLoraPrepareOp<'a>),
+    /// Several projections of one shared activation in one mixed-row launch.
+    PackedProjections(crate::pipeline::mla::query_kv::PackedProjectionsOp<'a>),
+    /// Low-rank query: A projection, q_norm, B projection, per-head norm.
+    QLoraProject(crate::pipeline::mla::query_kv::QLoraProjectOp<'a>),
+    /// Joint latent KV projection and kv_norm.
+    KvJoint(crate::pipeline::mla::query_kv::KvJointOp<'a>),
+    /// Tail-only YaRN RoPE of Q and the latent KV.
+    ApplyTailRope(crate::pipeline::mla::query_kv::ApplyTailRopeOp<'a>),
+    /// Shared-plus-routed expert FFN of one decode row.
+    ExpertFfn(crate::pipeline::mla::expert_ffn::ExpertFfnOp<'a>),
+    /// Ratio-4 sparse indexer: query, head weights, scores, top-k.
+    SparseIndex(crate::pipeline::mla::attention::SparseIndexOp<'a>),
+    /// Strided KV compressor (main or indexer flavor) of one row.
+    KvCompress(crate::pipeline::mla::compressor::KvCompressOp<'a>),
+    /// One-row projection of an architecture-prepared (plain + rotated) input.
+    PreparedProjection(crate::pipeline::mla::project::PreparedProjectionOp<'a>),
+    /// Write the step's KV rows into the SWA rings.
+    SwaRingWrite(crate::pipeline::mla::attention::SwaRingWriteOp<'a>),
+    /// In-order gather of the active compressed rows (compress ratio 128).
+    IdentityGather(crate::pipeline::mla::attention::IdentityGatherOp<'a>),
+    /// Sliding-window attention (compress ratio 0).
+    SwaAttention(crate::pipeline::mla::attention::SwaAttentionOp<'a>),
+    /// Joint attention over the SWA window and the compressed top-k rows.
+    SparseAttention(crate::pipeline::mla::attention::SparseAttentionOp<'a>),
+    /// Grouped O-LoRA output projection of the attention.
+    OLora(crate::pipeline::mla::attention::OLoraOp<'a>),
+    /// Compressor `wkv` / `wgate` projections of the prepared input.
+    CompressorProject(crate::pipeline::mla::compressor::CompressorProjectOp<'a>),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -177,7 +213,25 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::ParallelMoeMlp(_)
         | Step::PerLayerInput(_)
         | Step::Scale(_)
-        | Step::Softcap(_) => None,
+        | Step::Softcap(_)
+        | Step::HcPre(_)
+        | Step::HcPost(_)
+        | Step::HcHead(_)
+        | Step::QLoraPrepare(_)
+        | Step::PackedProjections(_)
+        | Step::QLoraProject(_)
+        | Step::KvJoint(_)
+        | Step::ApplyTailRope(_)
+        | Step::ExpertFfn(_)
+        | Step::SparseIndex(_)
+        | Step::KvCompress(_)
+        | Step::PreparedProjection(_)
+        | Step::SwaRingWrite(_)
+        | Step::IdentityGather(_)
+        | Step::SwaAttention(_)
+        | Step::SparseAttention(_)
+        | Step::OLora(_)
+        | Step::CompressorProject(_) => None,
     }
 }
 
@@ -815,6 +869,24 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
                     )));
                 }
             }
+            Step::HcPre(op) => op.validate_for_gpu(gpu)?,
+            Step::HcPost(op) => op.validate_for_gpu(gpu)?,
+            Step::HcHead(op) => op.validate_for_gpu(gpu)?,
+            Step::QLoraPrepare(op) => op.validate_for_gpu(gpu)?,
+            Step::PackedProjections(op) => op.validate_for_gpu(gpu)?,
+            Step::QLoraProject(op) => op.validate_for_gpu(gpu)?,
+            Step::KvJoint(op) => op.validate_for_gpu(gpu)?,
+            Step::ApplyTailRope(op) => op.validate_for_gpu(gpu)?,
+            Step::ExpertFfn(op) => op.validate_for_gpu(gpu)?,
+            Step::SparseIndex(op) => op.validate_for_gpu(gpu)?,
+            Step::KvCompress(op) => op.validate_for_gpu(gpu)?,
+            Step::PreparedProjection(op) => op.validate_for_gpu(gpu)?,
+            Step::SwaRingWrite(op) => op.validate_for_gpu(gpu)?,
+            Step::IdentityGather(op) => op.validate_for_gpu(gpu)?,
+            Step::SwaAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::SparseAttention(op) => op.validate_for_gpu(gpu)?,
+            Step::OLora(op) => op.validate_for_gpu(gpu)?,
+            Step::CompressorProject(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -1749,6 +1821,34 @@ pub(crate) fn launch_op_rows(
         Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
         Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
         Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
+        Step::HcPre(op) => crate::pipeline::mla::hc::execute_hc_pre(gpu, op),
+        Step::HcPost(op) => crate::pipeline::mla::hc::execute_hc_post(gpu, op),
+        Step::HcHead(op) => crate::pipeline::mla::hc::execute_hc_head(gpu, op),
+        Step::QLoraPrepare(op) => crate::pipeline::mla::query_kv::execute_q_lora_prepare(gpu, op),
+        Step::PackedProjections(op) => {
+            crate::pipeline::mla::query_kv::execute_packed_projections(gpu, op)
+        }
+        Step::QLoraProject(op) => crate::pipeline::mla::query_kv::execute_q_lora_project(gpu, op),
+        Step::KvJoint(op) => crate::pipeline::mla::query_kv::execute_kv_joint(gpu, op),
+        Step::ApplyTailRope(op) => crate::pipeline::mla::query_kv::execute_apply_tail_rope(gpu, op),
+        Step::ExpertFfn(op) => crate::pipeline::mla::expert_ffn::execute_expert_ffn(gpu, op),
+        Step::SparseIndex(op) => crate::pipeline::mla::attention::execute_sparse_index(gpu, op),
+        Step::KvCompress(op) => crate::pipeline::mla::compressor::execute_kv_compress(gpu, op),
+        Step::PreparedProjection(op) => {
+            crate::pipeline::mla::project::execute_prepared_projection(gpu, op)
+        }
+        Step::SwaRingWrite(op) => crate::pipeline::mla::attention::execute_swa_ring_write(gpu, op),
+        Step::IdentityGather(op) => {
+            crate::pipeline::mla::attention::execute_identity_gather(gpu, op)
+        }
+        Step::SwaAttention(op) => crate::pipeline::mla::attention::execute_swa_attention(gpu, op),
+        Step::SparseAttention(op) => {
+            crate::pipeline::mla::attention::execute_sparse_attention(gpu, op)
+        }
+        Step::OLora(op) => crate::pipeline::mla::attention::execute_o_lora(gpu, op),
+        Step::CompressorProject(op) => {
+            crate::pipeline::mla::compressor::execute_compressor_project(gpu, op)
+        }
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

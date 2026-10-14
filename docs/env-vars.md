@@ -827,7 +827,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_COHERENCE_TIMEOUT` | scripts/coherence-gate-deepseek4-mtp.sh, scripts/coherence-gate-deepseek4-recall.sh | deprecated |
 | `HIPFIRE_COHERE_DEBUG` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
 | `HIPFIRE_COMPILER_FLAGS` | autoresearch/ar/certify/cross_arch.py, crates/rdna-compute/src/attention.rs | developer |
-| `HIPFIRE_COMP_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
+| `HIPFIRE_COMP_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/pipeline/mla/compressor.rs | developer |
 | `HIPFIRE_CONTAINER` | scripts/container-gate.sh, scripts/test_container_gate.py | harness |
 | `HIPFIRE_CONTINUOUS_BATCH` | crates/hipfire-arch-qwen35/src/carrier.rs | developer |
 | `HIPFIRE_CONTINUOUS_BATCH_SIZE` | crates/hipfire-config/src/lib.rs | stable |
@@ -882,7 +882,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH_BATCH` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_PM4` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
-| `HIPFIRE_DEEPSEEK4_DUMP_INDEXER` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
+| `HIPFIRE_DEEPSEEK4_DUMP_INDEXER` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DUMP_INDEXER_LAYERS` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | crates/hipfire-generate/src/dense.rs, crates/hipfire-generate/src/qwen.rs | developer |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
@@ -968,7 +968,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_DEEPSEEK4_SPEC_K` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | developer |
 | `HIPFIRE_DEEPSEEK4_STAGE_LAYERS` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
-| `HIPFIRE_DEEPSEEK4_STAGE_NORM` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
+| `HIPFIRE_DEEPSEEK4_STAGE_NORM` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_TEMP` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_TOP_K` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | developer |
 | `HIPFIRE_DEEPSEEK4_TOP_P` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | harness |
@@ -1059,7 +1059,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DS4_QUANT_PLOG_ALLOW_NON_GFX942` | crates/hipfire-arch-deepseek4/examples/ds4_quant_plog.rs, crates/hipfire-arch-deepseek4/examples/ds4_quant_plog_multi.rs | harness |
 | `HIPFIRE_DS4_REPLAY_INVENTORY` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
 | `HIPFIRE_DS4_REPLAY_SEQUENCE` | crates/hipfire-arch-deepseek4/src/spec_impl.rs | developer |
-| `HIPFIRE_DS4_ROUTE_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
+| `HIPFIRE_DS4_ROUTE_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-deepseek4/src/program.rs | developer |
 | `HIPFIRE_DSA_HW_TRIALS` | crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | harness |
 | `HIPFIRE_DSA_HW_VOCAB` | crates/hipfire-arch-qwen35/tests/sampled_dflash_device_accept_hw.rs | harness |
 | `HIPFIRE_DSPARK_ADAPTIVE_BLOCK` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/src/dflash_adaptive_block.rs | developer |
@@ -1176,7 +1176,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh | harness |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs | developer |
 | `HIPFIRE_FORCE_UNFUSED` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
-| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-deepseek4/examples/ds4_longctx_probe.rs, crates/hipfire-arch-deepseek4/examples/ds4_prod_vs_parent_trace.rs | developer |
+| `HIPFIRE_FORWARD_LOWERED` | crates/hipfire-arch-qwen2/src/qwen2.rs, crates/hipfire-arch-qwen35/src/forward_slots/vmm/exact.rs | developer |
 | `HIPFIRE_FORWARD_ORACLE` | crates/hipfire-dispatch/src/pipeline/superop.rs | developer |
 | `HIPFIRE_FP16` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | stable |
 | `HIPFIRE_FP16_LAYER_MAX` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |

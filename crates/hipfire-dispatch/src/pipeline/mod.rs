@@ -32,6 +32,7 @@ pub mod moe_dump;
 pub(crate) mod draft_head;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
+pub mod mla;
 pub mod sandwich;
 pub(crate) mod steps;
 pub mod step_graph;
