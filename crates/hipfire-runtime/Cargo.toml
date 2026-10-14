@@ -171,6 +171,11 @@ required-features = ["lab"]
 name = "qwen4_moe_sym_w3_g1_oracle"
 required-features = ["lab"]
 
+# Raw PM K3 (R128 / K640 A4 producer) GPU runner for the byte oracle (no production dispatch wiring).
+[[example]]
+name = "mq_i4_a4_byte_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "coherence_probe"
 required-features = []

@@ -14,7 +14,7 @@
 //! shared with `peacemaker-rip`'s `qsa` test; the strict whole-file comparison is
 //! kept there as `strict_whole_file_difference`.
 #![cfg(feature = "toolchain")]
-use peacemaker_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4, mq_i4_rows, mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_mq4_x4_gfx11, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
+use peacemaker_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4, mq_i4_a4, mq_i4_rows, mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_mq4_x4_gfx11, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
 use peacemaker_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
 use peacemaker_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use peacemaker_isa::{native, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, reg::Live};
@@ -108,6 +108,9 @@ fn corpus() -> Vec<Unit> {
         // MQ3-I4 / MQ2-I4 planar one-row decode GEMV (gfx1201): the four entries and their module.
         for spec in mq_i4_rows::module_specs(arch) { if let Ok(e) = mq_i4_rows::emit(spec) { single(&mut units, e) } }
         if let Ok((_, text, proof)) = mq_i4_rows::emit_module(arch) { module(&mut units, proof.module, arch, text) }
+        // Row-local R128 / K640 A4 producer (gfx1201): the entry and its module.
+        for spec in mq_i4_a4::module_specs(arch) { if let Ok(e) = mq_i4_a4::emit(spec) { single(&mut units, e) } }
+        if let Ok((_, text, proof)) = mq_i4_a4::emit_module(arch) { module(&mut units, proof.module, arch, text) }
         // MTP append DET dense F16 WMMA GEMM (gfx1151 only): the entry and its module.
         if let Ok(e) = mtp_dense_det_gfx11::emit(mtp_dense_det_gfx11::Spec { arch }) { single(&mut units, e) }
         if let Ok((_, text, proof)) = mtp_dense_det_gfx11::emit_module(arch) { module(&mut units, proof.module, arch, text) }
