@@ -1245,6 +1245,42 @@ impl Gpus {
         Ok(())
     }
 
+    /// Fail if a bounded device wait on any rank stopped on its deadline
+    /// since the last check (`rdna_compute::device_wait`), clearing every
+    /// rank's record. Call once the step's work has completed. A recorded
+    /// timeout means a peer rank stalled, so this step's results are invalid.
+    ///
+    /// On a timeout, every rank is synchronized and the TP graph signals are
+    /// zeroed before the error returns. The gfx1100 TP2 barrier generations
+    /// live on device, and the rank that timed out has advanced past its
+    /// peer, so without the reset the next replay would start skewed.
+    pub fn take_device_wait_errors(&mut self) -> HipResult<()> {
+        let timeouts: Vec<String> = self
+            .devices
+            .iter()
+            .filter_map(|gpu| gpu.take_device_wait_timeout())
+            .map(|timeout| timeout.to_string())
+            .collect();
+        if timeouts.is_empty() {
+            return Ok(());
+        }
+        let mut message = timeouts.join("; ");
+        if self.tp_graph_signals.len() == self.devices.len() && self.tp_graph_barrier_count > 0 {
+            let reset = self
+                .devices
+                .iter()
+                .try_for_each(|gpu| {
+                    gpu.bind_thread()?;
+                    gpu.hip.device_synchronize()
+                })
+                .and_then(|()| self.reset_tp_graph_signals());
+            if let Err(error) = reset {
+                message.push_str(&format!("; TP graph signal reset after the timeout failed: {error}"));
+            }
+        }
+        Err(HipError::new(0, &message))
+    }
+
     /// Rewind the capture-time barrier cursor. The next 86 DS4 boundaries map
     /// deterministically to signal slots 0..85 in every rank graph.
     pub fn begin_tp_graph_signal_capture(&mut self) -> HipResult<()> {

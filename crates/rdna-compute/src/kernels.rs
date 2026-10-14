@@ -1080,8 +1080,11 @@ pub const GEMM_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_mq6g2
 pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
-pub const FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_wavegrid.gfx1100.hip");
+/// Prepends `device_wait_deadline.h` (bounded ready wait); see [`DEVICE_WAIT_DEADLINE_H`].
+pub const FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_wavegrid.gfx1100.hip")
+);
 pub const RMSNORM_REDUCE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx1100.hip");
 pub const ROTATE_WITH_RMS_GFX1100_SRC: &str =
@@ -1122,9 +1125,11 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
 /// gfx1100 AWQ wavegrid twin (`HIPFIRE_AWQ_NORM_WAVEGRID`, kept opt-in after a
 /// null result): K/256 workgroups × wave32 spread the FWHT groups across CUs
 /// so the reduction and rotation overlap VRAM latency instead of serializing
-/// on one workgroup.
-pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
+/// on one workgroup. Prepends `device_wait_deadline.h` (bounded rendezvous).
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip")
+);
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -9588,9 +9593,20 @@ pub const INDEXER_TOPK_TWOSTAGE_SRC: &str =
 
 pub const INDEXER_KV_GATHER_SRC: &str = include_str!("../../../kernels/src/indexer_kv_gather.hip");
 
-// Phase 3 — Hyper-Connections:
-pub const HC_COMPUTE_CONTROL_SRC: &str =
-    include_str!("../../../kernels/src/hc_compute_control.hip");
+/// Device-clock bound for flag spin waits, with its host-read error block
+/// (`crate::device_wait`). Every source that spins on a flag written by
+/// another workgroup, GPU or the host has this header prepended. The runtime
+/// hipcc compile has no `-I` to `kernels/src`, so each such `.hip` wraps its
+/// `#include` in `#ifndef HF_DEVICE_WAIT_DEADLINE_H`.
+pub const DEVICE_WAIT_DEADLINE_H: &str =
+    include_str!("../../../kernels/src/device_wait_deadline.h");
+
+// Phase 3 — Hyper-Connections. The finalize kernel's rsqrt_once wait is
+// bounded, so the source prepends `device_wait_deadline.h`.
+pub const HC_COMPUTE_CONTROL_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/hc_compute_control.hip")
+);
 
 /// Wide-block `hc_compute_control_vec4_finalize`: 1024 threads instead of 256.
 ///
@@ -9611,6 +9627,7 @@ pub const HC_COMPUTE_CONTROL_SRC: &str =
 pub const HC_COMPUTE_CONTROL_T1024_SRC: &str = concat!(
     "#define THREADS_PER_BLOCK 1024\n",
     "#define HC_CTRL_FINALIZE_KERNEL hc_compute_control_vec4_finalize_t1024\n",
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
     include_str!("../../../kernels/src/hc_compute_control.hip")
 );
 
@@ -9622,13 +9639,17 @@ pub const HC_MIX_4STREAM_SRC: &str = include_str!("../../../kernels/src/hc_mix_4
 pub const HC_MIX_4STREAM_PEER4_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hc_mix_4stream_peer4.gfx1201.hip");
 
-/// gfx1201 TP3/TP4 graph-resident system-scope producer barrier.
-pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/tp4_graph_signal.gfx1201.hip");
+/// gfx1201 TP3/TP4 graph-resident system-scope producer barrier (bounded waits).
+pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp4_graph_signal.gfx1201.hip")
+);
 
-/// gfx1100 TP2 graph-resident system-scope producer barrier.
-pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str =
-    include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip");
+/// gfx1100 TP2 graph-resident system-scope producer barrier (bounded waits).
+pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip")
+);
 
 pub const HC_INPUT_MAP_SRC: &str = include_str!("../../../kernels/src/hc_input_map.hip");
 

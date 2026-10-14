@@ -329,6 +329,11 @@ pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
 /// enough for offloaded weights — the GEMV/GEMM kernels read them directly.
 pub const HIP_HOST_MALLOC_MAPPED: u32 = 0x2;
 
+/// `hipHostMalloc` flag: fine-grained, coherent host memory. Overrides
+/// `HIP_HOST_COHERENT` for this allocation, so device system-scope stores are
+/// visible to the host without waiting for a kernel-boundary release.
+pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
+
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 

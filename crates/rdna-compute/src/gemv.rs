@@ -2764,6 +2764,7 @@ impl Gpu {
             .as_ptr();
         let kv = k as i32;
         let eps_v = eps;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -2773,6 +2774,7 @@ impl Gpu {
             &scratch as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
             &eps_v as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
 
         let bytes = k * 4 * 3 + 2 * 256 * 4;
@@ -2787,6 +2789,7 @@ impl Gpu {
             b.push_ptr(scratch);
             b.push_i32(kv);
             b.push_f32(eps_v);
+            b.push_ptr(wait_block);
             b
         });
         if let Some(t) = timer {
@@ -2928,6 +2931,7 @@ impl Gpu {
             .as_ptr();
         let kv = k as i32;
         let eps_v = eps;
+        let wait_block = self.device_wait_block()?;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -2938,6 +2942,7 @@ impl Gpu {
             &scratch as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
             &eps_v as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
         ];
 
         let groups = (k / 256) as u32;
@@ -2960,6 +2965,7 @@ impl Gpu {
                 b.push_ptr(scratch);
                 b.push_i32(kv);
                 b.push_f32(eps_v);
+                b.push_ptr(wait_block);
                 b
             },
         );

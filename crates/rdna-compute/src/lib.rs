@@ -15,6 +15,7 @@ pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
 pub mod dflash_hidden_scatter;
 pub mod dflash_state_copy;
+pub mod device_wait;
 mod dispatch;
 pub mod embedding;
 pub mod feature_flags;

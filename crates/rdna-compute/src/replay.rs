@@ -1120,6 +1120,13 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
+        // The bounded-wait kernels (these two wavegrids and
+        // `hc_compute_control_vec4_finalize`) end with an `hf_device_wait_block*`
+        // that is deliberately not listed. It points at the Gpu-lifetime,
+        // host-mapped wait-error block (`crate::device_wait`), whose address never
+        // moves, so the snapshot bytes replay unchanged. Its only readers are the
+        // host after the step and the fail-fast check of later waits, so launch
+        // order needs no hazard edge.
         "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1128,7 +1135,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(32),
             write(40),
         ]),
-        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous scratch.
+        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous
+        // scratch, then the unlisted wait-error block at 64 (after K and eps).
         "fused_rmsnorm_mq_rotate_awq_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1207,6 +1215,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "hc_compute_control" | "hc_compute_control_vec4" | "hc_head_compute_pre" => {
             Some(vec![read(0), read(8), read(16), write(24)])
         }
+        // The trailing wait-error block (null unless rsqrt_once) is unlisted; see
+        // `fused_rmsnorm_mq_rotate_wavegrid`.
         "hc_compute_control_vec4_finalize" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
@@ -1549,8 +1559,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if kernel == "hc_finalize_input_map" {
         return Some(56);
     }
+    // 5 pointers + 6 scalars + the wait-error block pointer = 72, padded to 16 B.
     if kernel == "hc_compute_control_vec4_finalize" {
-        return Some(64);
+        return Some(80);
     }
     if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed" {
         return Some(56);
@@ -1901,8 +1912,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
+        // 6 pointers + K + eps + the wait-error block pointer = 64 explicit bytes.
         | "fused_rmsnorm_mq_rotate_wavegrid"
-        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
         // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
@@ -1921,6 +1932,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
+        // 7 pointers + K + eps + the wait-error block pointer = 72, padded to 16 B.
+        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
@@ -9166,6 +9179,9 @@ mod tests {
         }
         blob.push_i32(2_048);
         blob.push_f32(0.0);
+        // Wait-error block (crate::device_wait): stable, deliberately unlisted.
+        blob.push_ptr(std::ptr::null());
+        assert_eq!(blob.len(), 72);
         blob.pad_to(16);
         assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
         let modes: Vec<_> = pointer_effects(awq)
@@ -9177,6 +9193,27 @@ mod tests {
             modes,
             vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
         );
+
+        // The other bounded-wait kernels' explicit layouts end with the block too.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_f32(0.0);
+        blob.push_ptr(std::ptr::null());
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes("fused_rmsnorm_mq_rotate_wavegrid"), Some(blob.len()));
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..6 {
+            blob.push_i32(0);
+        }
+        blob.push_ptr(std::ptr::null());
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes("hc_compute_control_vec4_finalize"), Some(blob.len()));
     }
 
     #[test]

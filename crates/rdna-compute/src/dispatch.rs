@@ -1186,6 +1186,12 @@ pub struct Gpu {
     /// reconstructed. Stored as `usize` (not a raw pointer) to leave `Gpu`'s
     /// auto-traits exactly as they were for the VMM arena map.
     host_mapped: HashMap<usize, usize>,
+    /// Host-mapped error block of the bounded device spin waits
+    /// (`crate::device_wait`). Allocated by the first launch of such a kernel
+    /// and kept for the `Gpu`'s lifetime, because captured graphs bake in its
+    /// device address. Read after each step by
+    /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
+    device_wait: Option<crate::device_wait::DeviceWaitMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
@@ -2002,6 +2008,7 @@ impl Gpu {
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
+            device_wait: None,
             active_stream: None,
             last_kernel: None,
             scratch: crate::scratch::ScratchState {
@@ -5290,6 +5297,49 @@ impl Gpu {
         self.host_mapped.len()
     }
 
+    /// Device address of this GPU's bounded-wait error block, for the
+    /// `hf_device_wait_block*` kernarg of every bounded spin-wait kernel
+    /// (`crate::device_wait`). The first call allocates the block. Every
+    /// call first reports a timeout an earlier step left unread, so a stale
+    /// code can never make a new wait stop early without failing.
+    pub(crate) fn device_wait_block(&mut self) -> HipResult<*mut c_void> {
+        if let Some(mapping) = &self.device_wait {
+            if let Some(timeout) = mapping.take(self.device_id) {
+                return Err(timeout.to_hip_error());
+            }
+            return Ok(mapping.device_ptr());
+        }
+        self.bind_thread()?;
+        let mapping = crate::device_wait::DeviceWaitMapping::alloc(&self.hip, self.device_id)?;
+        let device = mapping.device_ptr();
+        self.device_wait = Some(mapping);
+        Ok(device)
+    }
+
+    /// The timeout a bounded device spin wait on this GPU recorded since the
+    /// last check, if any, clearing the record. See
+    /// [`Self::take_device_wait_error`]; multi-GPU callers combine ranks
+    /// with this.
+    pub fn take_device_wait_timeout(&self) -> Option<crate::device_wait::DeviceWaitTimeout> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.device_wait
+            .as_ref()
+            .and_then(|mapping| mapping.take(self.device_id))
+    }
+
+    /// Fail if a bounded device spin wait on this GPU stopped on its deadline
+    /// since the last check, and clear the record. Call after the step's work
+    /// has completed: a stalled peer GPU or non-co-resident workgroups
+    /// invalidate that step's results. The `download_*` readers call this
+    /// after their copy. This is a single host-memory read, and a no-op on a
+    /// GPU that never launched a bounded wait.
+    pub fn take_device_wait_error(&self) -> HipResult<()> {
+        match self.take_device_wait_timeout() {
+            Some(timeout) => Err(timeout.to_hip_error()),
+            None => Ok(()),
+        }
+    }
+
     /// Release every registered host-mapped allocation, mirroring
     /// [`Self::release_registered_vmm`]. Returns the number still registered.
     fn release_registered_host_mapped(&mut self) -> HipResult<usize> {
@@ -6231,6 +6281,9 @@ impl Gpu {
     /// caller can compare device bytes bit-for-bit (the streaming weight
     /// upload's parity harness does exactly that against the f32-upload +
     /// device-cast path it replaced).
+    ///
+    /// Like every `download_*` reader, this fails once the copy completes if a
+    /// bounded device wait timed out ([`Self::take_device_wait_error`]).
     pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
         self.bind_thread()?;
         if tensor.dtype != DType::F16 {
@@ -6244,9 +6297,15 @@ impl Gpu {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 2) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
+    /// Synchronous device-to-host copy. Like every `download_*` reader, this
+    /// fails once the copy completes if a bounded device wait on this GPU
+    /// timed out ([`Self::take_device_wait_error`]). The copy follows the
+    /// step that produced `tensor`, so a stalled peer or rendezvous fails
+    /// the request here rather than handing back garbage.
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -6254,6 +6313,7 @@ impl Gpu {
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
@@ -6266,7 +6326,8 @@ impl Gpu {
         // SAFETY: `out` holds exactly `numel` f32s; any byte pattern is a valid f32.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, numel * 4) };
-        self.hip.memcpy_dtoh(bytes, &tensor.buf)
+        self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        self.take_device_wait_error()
     }
 
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
@@ -6280,6 +6341,7 @@ impl Gpu {
         let n = tensor.byte_size();
         let mut data = vec![0u8; n];
         self.hip.memcpy_dtoh(&mut data, &tensor.buf)?;
+        self.take_device_wait_error()?;
         Ok(data)
     }
 
@@ -7658,6 +7720,16 @@ impl Drop for Gpu {
             } else if let Some(scratch) = self.scratch.mq_rmsnorm_awq_wavegrid_scratch.take() {
                 if let Err(err) = self.hip.free(scratch) {
                     eprintln!("[rdna-compute] failed to release AWQ wavegrid scratch during Gpu drop: {err}");
+                }
+            }
+        }
+        if self.device_wait.is_some() {
+            // Queued bounded waits may still store into the error block.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize the device wait-error block during Gpu drop: {err}");
+            } else if let Some(mapping) = self.device_wait.take() {
+                if let Err(err) = mapping.free(&self.hip) {
+                    eprintln!("[rdna-compute] failed to release the device wait-error block during Gpu drop: {err}");
                 }
             }
         }
