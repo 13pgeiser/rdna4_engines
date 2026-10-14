@@ -840,7 +840,14 @@ fn is_vision_tensor(name: &str) -> bool {
     .any(|prefix| name.starts_with(prefix))
 }
 
-fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4ArtifactError> {
+/// `slab`: the artifact's per-expert entries (qt 44/53/131/132, named
+/// `...experts.{N}.gate_up_proj`) are validated end to end by the span table
+/// and read as layer arenas; the per-tensor identity loop skips them (it knows
+/// only the dtypes of the ordinary source tensors).
+fn validate_source_identity(
+    hfq: &HfqFile,
+    slab: bool,
+) -> Result<Arc<SourceIdentity>, Qwen4ArtifactError> {
     let effective = hfq.source_identity().map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: source identity seal failed: {error}"))
     })?;
@@ -884,6 +891,9 @@ fn validate_source_identity(hfq: &HfqFile) -> Result<Arc<SourceIdentity>, Qwen4A
         ));
     }
     for (index, info) in hfq.tensors().iter().enumerate() {
+        if slab && parse_expert_entry_name(&info.name).is_some() {
+            continue;
+        }
         let range_identity = &effective.manifest[index];
         let loaded_identity = &loaded.manifest[index];
         let expected_dtype = source_dtype_name(info.quant_type).ok_or_else(|| {
@@ -1431,7 +1441,7 @@ pub fn admit_hfqm_artifact_on(
     // Seal every descriptor before reading the three tiny records.  This
     // keeps the bounded host reads tied to the same source identity as all
     // later external-row reads.
-    let source_identity = validate_source_identity(hfq)?;
+    let source_identity = validate_source_identity(hfq, slab.is_some())?;
     let ple_rows = match (ple_config, &ple) {
         (Some(ple_config), Some(ple)) => {
             validate_ple_records(hfq, ple_config, ple)?;

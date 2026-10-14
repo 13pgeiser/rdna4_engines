@@ -48,7 +48,7 @@ use hipfire_arch_qwen4::admit_hfqm_artifact;
 use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
-use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::model_source::{ModelSource, SourcePayload};
 use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
 use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -244,8 +244,32 @@ impl Model {
             };
         let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
+        // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
+        // and host-maps the rest (a slab artifact larger than one card).
+        let weights = {
+            let mut weights = receipt.manifest.weights.clone();
+            match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
+                None => {}
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+                    if gpu.is_uma() {
+                        return Err("host-mapped experts are only for discrete GPUs".into());
+                    }
+                    let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+                        &mut weights,
+                        layers,
+                    );
+                    eprintln!(
+                        "qwen4_kld: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                    );
+                }
+                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
+                    return Err("qwen4_kld takes a fixed expert layer count, not auto".into());
+                }
+            }
+            weights
+        };
         let transaction = fulfill_manifest_from_payloads(
-            &receipt.manifest.weights,
+            &weights,
             &mesh,
             receipt.config.num_hidden_layers,
             &mut gpu,
@@ -257,6 +281,14 @@ impl Model {
                     entry,
                 ) {
                     return payload;
+                }
+                // The store rejects a host-mapped entry as a range: borrow it
+                // from the resident source bytes, as the product loader does.
+                if entry.residency == hipfire_runtime::weight_manifest::WeightResidency::HostMapped {
+                    let (info, bytes) = source
+                        .tensor_data(&entry.name)
+                        .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
+                    return Ok(SourcePayload::Borrowed { info, bytes });
                 }
                 source
                     .tensor_range(&entry.name)

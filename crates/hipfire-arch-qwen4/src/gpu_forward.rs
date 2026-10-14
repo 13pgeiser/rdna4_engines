@@ -941,6 +941,9 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// `Some` on a trunk layer of an expert-slab artifact: the layer's experts
     /// are views into its one slab arena with a codec each.
     slab: Option<Qwen4SlabLayer>,
+    /// The layer's label (`layer.layer`): what its sealed calls carry as
+    /// `layer_idx`, and so what its retained-route identities name.
+    label: usize,
 }
 
 /// Per-layer state of a sealed expert-slab layer ([`crate::expert_arena`]).
@@ -2216,6 +2219,7 @@ impl Qwen4MoeLayerRuntime {
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
             slab: None,
+            label: layer_label,
         })
     }
 
@@ -2330,7 +2334,7 @@ impl Qwen4MoeLayerRuntime {
             let resource = |name: &str, shape: Vec<usize>, dtype: DType, bytes: usize, k: usize| {
                 ExpertResource::new(
                     name,
-                    "qwen4-resident-slab-v1",
+                    hipfire_dispatch::pipeline::sealed_moe::SLAB_RESOURCE_FORMAT,
                     shape,
                     dtype,
                     bytes,
@@ -2341,8 +2345,10 @@ impl Qwen4MoeLayerRuntime {
                 .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert resource: {error:?}")))
             };
             let resources = ExpertResources::fused(
-                resource(&gate_up_source_name, vec![rows_gate_up, hidden], gate_up_dtype, gate_up_bytes, hidden)?,
-                resource(&down_source_name, vec![hidden, mi], down_dtype, down_bytes, mi)?,
+                // One source name per distinct representation: the table refuses a
+                // name repeated with different metadata.
+                resource(&format!("{gate_up_source_name}#{gate_up_dtype:?}"), vec![rows_gate_up, hidden], gate_up_dtype, gate_up_bytes, hidden)?,
+                resource(&format!("{down_source_name}#{down_dtype:?}"), vec![hidden, mi], down_dtype, down_bytes, mi)?,
             )
             .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert resources: {error:?}")))?;
             metadata.push(
@@ -2455,6 +2461,7 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: false,
             host_mapped,
+            label: layer_label,
             slab: Some(Qwen4SlabLayer {
                 codecs,
                 gate_up_dtypes,
@@ -2499,6 +2506,14 @@ impl Qwen4MoeLayerRuntime {
                 68,
             )?;
         Ok(self.symmetric)
+    }
+
+    /// The `(key, identity)` pairs a retained replay must find bound for this
+    /// layer ([`hipfire_dispatch::pipeline::sealed_moe::retained_route_identities`]).
+    pub(crate) fn retained_route_identities(&self) -> Result<Vec<(u64, String)>, Qwen4GpuForwardError> {
+        self.cache
+            .retained_route_identities(&self.table, self.label as u32)
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("retained route identity: {error:?}")))
     }
 
     /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
@@ -7054,6 +7069,19 @@ impl Qwen4GpuForward {
             };
             if ple_split.is_some() && (pm4_route || aql_route || shadow_route.is_some()) {
                 return Err(invalid("Qwen4 retained body with deferred PLE staging"));
+            }
+            if pm4_route || aql_route {
+                // The replayed tape never runs the HIP body's per-call identity
+                // notes: validate the complete captured binding (tables, codec
+                // digests, arena generations) here, before any retained submit.
+                let mut observed = Vec::new();
+                for layer in self.moe.iter() {
+                    observed.extend(layer.retained_route_identities()?);
+                }
+                if let Err(reason) = gpu.replay.validate_route_identities(&observed) {
+                    gpu.replay.poison(format!("Qwen4 retained route binding changed: {reason}"));
+                    return Err(invalid(format!("Qwen4 retained replay refused: {reason}")));
+                }
             }
             let routed = if pm4_route {
                 // Forced non-default retained route: HIP PLE staging (evidence

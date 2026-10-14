@@ -1165,6 +1165,71 @@ pub struct CompactLiveWeight<'a> {
     pub down: crate::families::gemv::WeightRef<'a>,
 }
 
+/// `ExpertResource::source_fingerprint` of an expert-slab layer's resident views.
+pub const SLAB_RESOURCE_FORMAT: &str = "qwen4-resident-slab-v1";
+
+/// Neutral plain data a layer's retained-route identities derive from (no
+/// arch-private types, so loaders outside this crate can build it too).
+#[derive(Clone, Debug)]
+pub struct RetainedRouteInputs<'a> {
+    pub layer: u32,
+    /// Stable id of the layer's expert table (`ExpertTable` identity).
+    pub table_identity: u64,
+    /// The live binding's pointer-level mapping fingerprint.
+    pub mapping_fingerprint: &'a str,
+    /// `Some` on an expert-slab layer: the codec byte of every expert
+    /// (`0` = MQ4, `1` = W3, `2` = W2 reserved, `255` = unknown).
+    pub codecs: Option<&'a [u8]>,
+    /// `(device address, bytes)` of the gate/up and down pointer tables and of
+    /// the layer's codec-tag tensor, when it has one.
+    pub gate_up_table: (u64, u64),
+    pub down_table: (u64, u64),
+    pub tag_table: Option<(u64, u64)>,
+    /// Generation of the bound expert set (the arena set); `0` when none.
+    pub owner_generation: u64,
+}
+
+/// The exact `(key, identity)` pairs a layer passes to
+/// `ReplayController::note_route_identity` (and that the top-level validation
+/// before a retained replay compares). A legacy layer yields its one
+/// `(table identity, mapping fingerprint)` pair, byte-identical to before; a
+/// slab layer's pair also carries the route profile, the per-expert codec
+/// digest and the arena generation, and a second pair keyed by the layer binds
+/// the tables, codec digest and generation separately.
+pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, String)> {
+    let Some(codecs) = input.codecs else {
+        return vec![(input.table_identity, input.mapping_fingerprint.to_owned())];
+    };
+    let codec = fnv1a_u64(codecs);
+    let tags = input
+        .tag_table
+        .map_or_else(|| "none".to_owned(), |(ptr, bytes)| format!("{ptr:x}:{bytes}"));
+    let layer_key = fnv1a_u64(
+        format!("slab-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes(),
+    ) | (1 << 63);
+    vec![
+        (
+            input.table_identity,
+            format!(
+                "{}|slab-v1|codec={codec:016x}|gen={}",
+                input.mapping_fingerprint, input.owner_generation
+            ),
+        ),
+        (
+            layer_key,
+            format!(
+                "slab-layer/v1|layer={}|profile=slab-codec-grouped|codec={codec:016x}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}",
+                input.layer,
+                input.gate_up_table.0,
+                input.gate_up_table.1,
+                input.down_table.0,
+                input.down_table.1,
+                input.owner_generation
+            ),
+        ),
+    ]
+}
+
 /// Reject a cache/table generation mismatch before any bind work.
 fn check_cache_table(cache: &ExpertBindingCache, table: &ExpertTable) -> Result<(), DispatchError> {
     if cache.table_identity != table.identity
@@ -1220,6 +1285,53 @@ pub struct ExpertBindingCache {
 }
 
 impl ExpertBindingCache {
+    /// The retained-route `(key, identity)` pairs of this live binding for
+    /// `layer` ([`retained_route_identities`]), derived from the table's
+    /// per-expert dtypes and the live tensor identities. The one derivation
+    /// both the per-call note and the top-level replay validation use.
+    pub fn retained_route_identities(
+        &self,
+        table: &ExpertTable,
+        layer: u32,
+    ) -> Result<Vec<(u64, String)>, DispatchError> {
+        check_cache_table(self, table)?;
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| invalid("expert binding cache has no live resource binding"))?;
+        let slab = table.experts().first().is_some_and(|expert| {
+            expert
+                .resources()
+                .gate_up()
+                .is_some_and(|resource| resource.source_fingerprint() == SLAB_RESOURCE_FORMAT)
+        });
+        let codecs: Option<Vec<u8>> = slab.then(|| {
+            table
+                .experts()
+                .iter()
+                .map(|expert| match expert.resources().down().dtype() {
+                    DType::MQ4G128V2 => 0u8,
+                    DType::MQ3I4G128R128 => 1,
+                    DType::MQ2I4G128R128 => 2,
+                    _ => 255,
+                })
+                .collect()
+        });
+        Ok(retained_route_identities(&RetainedRouteInputs {
+            layer,
+            table_identity: live.table_identity,
+            mapping_fingerprint: &live.mapping_fingerprint,
+            codecs: codecs.as_deref(),
+            gate_up_table: (live.gate_up_ptrs.ptr as u64, live.gate_up_ptrs.byte_capacity as u64),
+            down_table: (live.down_ptrs.ptr as u64, live.down_ptrs.byte_capacity as u64),
+            tag_table: live
+                .dtype_tags
+                .as_ref()
+                .map(|tags| (tags.ptr as u64, tags.byte_capacity as u64)),
+            owner_generation: live.source_identity.unwrap_or(0),
+        }))
+    }
+
     pub fn new(
         table: &ExpertTable,
         local_rank: usize,
@@ -2235,16 +2347,25 @@ impl SealedMoeCall<'_> {
         if !specialized {
             return Ok(());
         }
-        let Some(live) = self.experts.cache.live.as_ref() else {
+        if self.experts.cache.live.is_none() {
             return Err(invalid(
                 "specialized sealed MoE retained body requires a live expert binding",
             ));
+        }
+        let layer = match &self.params {
+            SealedParams::Decode(params) => params.layer_idx as u32,
+            SealedParams::Prefill(params) => params.ep_layer_idx as u32,
         };
-        let identity = live.mapping_fingerprint.clone();
-        let key = live.table_identity;
-        gpu.replay
-            .note_route_identity(key, &identity)
-            .map_err(|reason| invalid(reason))
+        for (key, identity) in self
+            .experts
+            .cache
+            .retained_route_identities(self.experts.table, layer)?
+        {
+            gpu.replay
+                .note_route_identity(key, &identity)
+                .map_err(|reason| invalid(reason))?;
+        }
+        Ok(())
     }
 }
 
@@ -7274,5 +7395,38 @@ mod tests {
         assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
         let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
         assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+    }
+}
+
+#[cfg(test)]
+mod retained_route_identity_tests {
+    use super::*;
+
+    fn input<'a>(codecs: Option<&'a [u8]>, generation: u64) -> RetainedRouteInputs<'a> {
+        RetainedRouteInputs {
+            layer: 3,
+            table_identity: 7,
+            mapping_fingerprint: "fp",
+            codecs,
+            gate_up_table: (0x1000, 8),
+            down_table: (0x2000, 8),
+            tag_table: codecs.map(|_| (0x3000, 512)),
+            owner_generation: generation,
+        }
+    }
+
+    #[test]
+    fn legacy_layers_keep_their_one_pair() {
+        assert_eq!(retained_route_identities(&input(None, 9)), vec![(7, "fp".to_owned())]);
+    }
+
+    #[test]
+    fn slab_identity_moves_with_codec_arena_generation_and_layer() {
+        let base = retained_route_identities(&input(Some(&[0, 1, 1]), 1));
+        assert_eq!(base.len(), 2);
+        assert_ne!(base[1].0, 7, "the layer key never collides with a table id");
+        assert_ne!(base, retained_route_identities(&input(Some(&[1, 1, 1]), 1)), "codec");
+        assert_ne!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 2)), "generation");
+        assert_eq!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 1)));
     }
 }
