@@ -260,20 +260,18 @@ fn refuse_expert_slabs(
     Ok(())
 }
 
-/// Set once the real-layer G1 receipts of BOTH gfx1201 slab kernels (K2
-/// prefill and K1 decode) are in `rcpt/`. Until then the sealed slab route is
-/// not admitted by default on any architecture.
-pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = false;
-/// Developer-only switch that admits the slab route on gfx1201 before
-/// [`SLAB_ROUTE_RECEIPTS_LANDED`] flips (G1/G2/G3 development runs).
-pub const SLAB_ROUTE_DEV_ENV: &str = "HIPFIRE_QWEN4_SLAB_ROUTE_DEV";
+/// Set because the real-layer G1 receipts of BOTH gfx1201 slab kernels are in
+/// `rcpt/`, both with 0 mismatches: K1 decode
+/// (`r5.k1.g1.L0-records.raw.json`, sha256 `2bb0cfa1…8239`) and K2 prefill
+/// (`g1.k2.real.json`, sha256 `bb1bde6b…c226`, with the A4 identity
+/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). gfx1201 only; every other
+/// architecture keeps refusing in [`slab_route_admitted`].
+pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
 
 /// Whether the sealed expert-slab route may load on GPU architecture `arch`.
 /// gfx1201 only; every other architecture keeps refusing.
 pub fn slab_route_admitted(arch: &str) -> bool {
-    arch == "gfx1201"
-        && (SLAB_ROUTE_RECEIPTS_LANDED
-            || hipfire_config::developer_var(SLAB_ROUTE_DEV_ENV).is_ok_and(|value| value == "1"))
+    arch == "gfx1201" && SLAB_ROUTE_RECEIPTS_LANDED
 }
 
 /// The arena plan of a version-1 expert-slab artifact when the route is

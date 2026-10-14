@@ -160,7 +160,8 @@ impl Model {
             },
         )
         .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
-        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+            .map_err(|e| format!("qwen4 admission: {e}"))?;
         // `<model>.trunk-overlay` (QT44 trunk tensors + the A4 default), bound
         // to this base while it is open and applied by `attach_forward`.
         let trunk_overlay =
@@ -250,6 +251,13 @@ impl Model {
             &mut gpu,
             expected,
             |entry| {
+                if let Some(payload) = hipfire_arch_qwen4::expert_arena::recipe_arena_payload(
+                    &source,
+                    &receipt.manifest.identity.recipe,
+                    entry,
+                ) {
+                    return payload;
+                }
                 source
                     .tensor_range(&entry.name)
                     .map_err(|e| e.to_string())?

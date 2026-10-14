@@ -56,7 +56,7 @@ pub use admission::{
     RequestKind,
 };
 pub use artifact::{
-    admit_hfqm_artifact, admit_inventory_headers, Qwen4ArtifactError, Qwen4HfqmArtifact,
+    admit_hfqm_artifact, admit_hfqm_artifact_on, admit_inventory_headers, Qwen4ArtifactError, Qwen4HfqmArtifact,
     Qwen4InventoryReceipt, Qwen4PleRows, SidecarRows,
 };
 #[cfg(feature = "qwen4-dev-profiles")]

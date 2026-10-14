@@ -189,6 +189,23 @@ impl ExpertArenaPlan {
     }
 }
 
+/// [`arena_payload`] under a manifest's recipe: `None` unless the recipe is
+/// [`crate::weights::Qwen4TierRecipe::FlashNextSlab`] and `entry` is one of its
+/// layer arenas. The one call every fulfillment callback of a slab-capable
+/// loader makes before its ordinary tensor read.
+pub fn recipe_arena_payload<'a>(
+    source: &'a hipfire_runtime::hfq::HfqModelSource,
+    recipe: &crate::weights::Qwen4TierRecipe,
+    entry: &hipfire_runtime::weight_manifest::WeightEntry,
+) -> Option<Result<hipfire_runtime::model_source::SourcePayload<'a>, String>> {
+    match recipe {
+        crate::weights::Qwen4TierRecipe::FlashNextSlab { arenas, .. } => {
+            arena_payload(source, arenas, entry)
+        }
+        _ => None,
+    }
+}
+
 /// The fulfillment payload of a manifest entry that is a layer slab arena, or
 /// `None` when `entry` is an ordinary index tensor (the caller then reads it by
 /// name as before).

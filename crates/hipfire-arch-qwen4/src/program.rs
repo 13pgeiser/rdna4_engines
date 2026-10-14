@@ -275,6 +275,12 @@ pub struct Qwen4MoeBinding<'a> {
     pub route_policy: MoeRoutePolicy,
     pub intermediate: usize,
     pub experts_all_gate_up_mq4: bool,
+    /// Expert-slab layers whose experts mix codecs: every expert's gate/up and
+    /// down dtype, and the codec-tag tensor. `None` on every other layer (a
+    /// slab layer of one codec carries no table; its dtype names the codec).
+    pub expert_gate_up_dtypes: Option<&'a [DType]>,
+    pub expert_down_dtypes: Option<&'a [DType]>,
+    pub expert_codec_tags: Option<&'a GpuTensor>,
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
     pub expert_stage_ptrs: Option<hipfire_dispatch::families::moe::MoeStageTables<'a>>,
@@ -922,10 +928,10 @@ fn build_moe_decode<'a>(
         experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     Ok(MoeParams {
         dtypes,
@@ -970,7 +976,7 @@ fn build_moe_decode<'a>(
             down: moe.expert_down_entries,
         }),
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         routed_gate_up_k: dims.hidden,
         routed_down_m: dims.hidden,
         routed_down_k: moe_dims.intermediate,
@@ -1030,10 +1036,10 @@ fn build_moe_prefill<'a>(
         experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
         routed_gate_up: first_gate_up.dtype,
         routed_down: first_down.dtype,
-        routed_has_mixed_experts: false,
+        routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
-        per_expert_gate_up: None,
-        per_expert_down: None,
+        per_expert_gate_up: moe.expert_gate_up_dtypes,
+        per_expert_down: moe.expert_down_dtypes,
     };
     let prelude = MoePrefillPrelude {
         normalization: MoeNormalization::Provided,
@@ -1073,7 +1079,7 @@ fn build_moe_prefill<'a>(
         expert_stage_ptrs: moe.expert_stage_ptrs,
         routed_experts: moe.routed_experts,
         expert_down_awq_ptrs: None,
-        expert_dtype_tags: None,
+        expert_dtype_tags: moe.expert_codec_tags,
         gate_batch: scratch.moe_gate_batch,
         up_batch: scratch.moe_up_batch,
         rot_batch: scratch.moe_rot_batch,

@@ -2215,6 +2215,26 @@ pub(super) fn select_prefill(
     let (host_gate_up, host_down) = params.routed_experts.host_mapped_projections();
     let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify, host_gate_up || host_down);
     resolution.check_generic_route(route)?;
+    if route.is_some_and(MoeRouteCapability::is_slab) {
+        // The slab route is a replicated, single-device, resident-expert
+        // lowering whose K2 arm is the grouped protocol: nothing else may
+        // ride on it, and a device without grouped GEMM refuses.
+        if !resolution.use_path2
+            || params.cpu_deferred_experts
+            || params.routed_out.is_some()
+            || params.expert_stage_ptrs.is_some()
+            || params.ep_row_gather.is_some()
+            || params.ep_tile_exchange.is_some()
+            || !matches!(params.prelude.route, super::sealed_moe::PrefillRouteMode::Replicated)
+        {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "slab-sealed-replicated-grouped-only",
+                arch: "gfx1201",
+                quant: "MQ3-I4/MQ4 slab",
+            });
+        }
+    }
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)

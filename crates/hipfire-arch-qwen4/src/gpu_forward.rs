@@ -825,6 +825,17 @@ pub(crate) fn layer_desc<'a>(
                     .unwrap_or_default()
                     / 2,
                 experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
+                expert_gate_up_dtypes: moe
+                    .slab
+                    .as_ref()
+                    .filter(|slab| slab.mixed())
+                    .map(|slab| slab.gate_up_dtypes.as_slice()),
+                expert_down_dtypes: moe
+                    .slab
+                    .as_ref()
+                    .filter(|slab| slab.mixed())
+                    .map(|slab| slab.down_dtypes.as_slice()),
+                expert_codec_tags: moe.slab.as_ref().and_then(|slab| slab.codec_tags.as_ref()),
                 expert_gate_up_ptrs: &moe.expert_gate_up_ptrs,
                 expert_down_ptrs: &moe.expert_down_ptrs,
                 expert_stage_ptrs: stage
@@ -927,6 +938,32 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// are host-mapped: a layer-level property, so an EP rank reports the
     /// same residency single would, never that of a dummy or a peer view.
     host_mapped: bool,
+    /// `Some` on a trunk layer of an expert-slab artifact: the layer's experts
+    /// are views into its one slab arena with a codec each.
+    slab: Option<Qwen4SlabLayer>,
+}
+
+/// Per-layer state of a sealed expert-slab layer ([`crate::expert_arena`]).
+pub(crate) struct Qwen4SlabLayer {
+    /// Codec byte of every expert (`0` = MQ4, `1` = W3), from the validated
+    /// span table; never inferred from any single expert.
+    codecs: Vec<u8>,
+    /// Per-expert gate/up and down dtypes (parallel to `codecs`).
+    gate_up_dtypes: Vec<DType>,
+    down_dtypes: Vec<DType>,
+    /// Mixed layers only: the layer's dtype-tag tensor, `[512]` u8 codec bytes
+    /// followed by `[512]` i32 (`hipfire_dispatch::pipeline::slab_route`).
+    codec_tags: Option<GpuTensor>,
+    /// Base device address of the layer's arena and its byte length: part of the
+    /// layer's arena generation (replay keys).
+    arena_base: usize,
+    arena_bytes: usize,
+}
+
+impl Qwen4SlabLayer {
+    pub(crate) fn mixed(&self) -> bool {
+        self.codec_tags.is_some()
+    }
 }
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
@@ -1758,7 +1795,9 @@ impl Qwen4MoeLayerRuntime {
     /// QT44/QT53 layer is the symmetric variant only once verified and the
     /// chunk reaches the IU4 arm's row floor.
     pub(crate) fn route_capability(&self, rows: usize) -> MoeRouteCapability {
-        if self.fp8 {
+        if self.slab.is_some() {
+            MoeRouteCapability::SlabCodecGrouped
+        } else if self.fp8 {
             MoeRouteCapability::Fp8B128Grouped
         } else if self.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS {
             MoeRouteCapability::Qt44Qt53GroupedSymmetric
@@ -1875,6 +1914,17 @@ impl Qwen4MoeLayerRuntime {
             config.shared_expert_intermediate_size,
         );
 
+        if let Some(arena_ref) = moe.expert_arena.as_ref() {
+            return Self::build_slab(
+                gpu,
+                weights,
+                arena_ref,
+                layer_label,
+                config,
+                &layout,
+                [router, shared_scalar, shared_gate, shared_up, shared_down],
+            );
+        }
         let gate_up_source = weights.resident(&moe.experts_gate_up)?;
         let down_source = weights.resident(&moe.experts_down)?;
         let gate_up_dtype = gate_up_source.dtype;
@@ -2165,6 +2215,254 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
+            slab: None,
+        })
+    }
+
+    /// Single-device runtime of a trunk layer of an expert-slab artifact: every
+    /// expert is a view into the layer's one arena (resident or host-mapped) at
+    /// the offsets of the validated span table, with its own dtype, and the
+    /// pointer tables name those views. Residency and codec come from the
+    /// layer's own arena and per-expert table, never from expert 0.
+    fn build_slab(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        arena_ref: &TensorRef,
+        layer_label: usize,
+        config: &Qwen4Config,
+        layout: &Qwen4ExpertTableLayout<'_>,
+        [router, shared_scalar, shared_gate, shared_up, shared_down]: [ProjectionView; 5],
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        use crate::expert_arena::{ARENA_TAIL_PAD_BYTES, CODEC_MQ4, CODEC_W3};
+        use crate::expert_slabs::ExpertFormat;
+        if !matches!(layout, Qwen4ExpertTableLayout::Single) {
+            return Err(invalid(format!(
+                "layer {layer_label}: slab arenas are single-device only (no EP route)"
+            )));
+        }
+        if gpu.arch != "gfx1201" {
+            return Err(invalid(format!(
+                "layer {layer_label}: the expert-slab route is gfx1201-only, device is {}",
+                gpu.arch
+            )));
+        }
+        let plan = match &weights.manifest.identity.recipe {
+            crate::weights::Qwen4TierRecipe::FlashNextSlab { arenas, .. } => arenas
+                .layer(layer_label)
+                .ok_or_else(|| invalid(format!("expert arena plan has no layer {layer_label}")))?,
+            _ => {
+                return Err(invalid(format!(
+                    "layer {layer_label} declares an expert arena under a non-slab recipe"
+                )))
+            }
+        };
+        let (rows_gate_up, hidden, mi) = (2 * config.moe_intermediate_size, config.hidden_size, config.moe_intermediate_size);
+        if config.num_experts != plan.experts.len()
+            || [rows_gate_up, hidden, mi] != [1280, 2560, 640]
+        {
+            return Err(invalid(format!(
+                "layer {layer_label}: the expert slab geometry is 512 experts of [1280,2560] / [2560,640]"
+            )));
+        }
+        let arena = weights.resident(arena_ref)?;
+        let host_mapped = arena.buf.is_host_mapped();
+        if arena.buf.size() < plan.bytes {
+            return Err(invalid(format!(
+                "layer {layer_label} arena holds {} bytes, plan needs {}",
+                arena.buf.size(),
+                plan.bytes
+            )));
+        }
+        // A resident arena is exact-fit plus its zeroed pad; a host-mapped one
+        // carries `upload_raw_host_mapped`'s own larger zeroed tail.
+        if !host_mapped && arena.buf.size() < plan.bytes + ARENA_TAIL_PAD_BYTES {
+            return Err(invalid(format!(
+                "layer {layer_label} resident arena has no zeroed {ARENA_TAIL_PAD_BYTES}-byte tail pad"
+            )));
+        }
+        let codecs = plan.codec_table().map_err(|error| invalid(format!("layer {layer_label}: {error}")))?;
+        let formats: Vec<ExpertFormat> = plan.experts.iter().map(|expert| expert.format).collect();
+        let dtypes_of = |format: ExpertFormat| match format {
+            ExpertFormat::Mq4Xts => (DType::MQ4G256V2, DType::MQ4G128V2),
+            ExpertFormat::Mq3I4 => (DType::MQ3I4G128R256, DType::MQ3I4G128R128),
+            ExpertFormat::Mq2I4 => (DType::MQ2I4G128R256, DType::MQ2I4G128R128),
+        };
+        let (gate_up_source_name, down_source_name) = match &weights.layer_refs
+            .get(layer_label)
+            .and_then(|layer| layer.ffn.moe())
+            .map(|moe| &moe.expert_source_layout)
+        {
+            Some(ExpertSourceLayout::PackedFused { gate_up, down, .. }) => {
+                (gate_up.clone(), down.clone())
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "layer {layer_label} uses an unsupported expert source layout"
+                )))
+            }
+        };
+        let mut experts = Vec::with_capacity(config.num_experts);
+        let mut metadata = Vec::with_capacity(config.num_experts);
+        let mut gate_up_dtypes = Vec::with_capacity(config.num_experts);
+        let mut down_dtypes = Vec::with_capacity(config.num_experts);
+        for (expert, (entry, format)) in plan.experts.iter().zip(&formats).enumerate() {
+            let (gate_up_dtype, down_dtype) = dtypes_of(*format);
+            let (gate_up_bytes, down_bytes) = (format.gate_up_bytes(), format.down_bytes());
+            if entry.gate_up_offset + gate_up_bytes != entry.down_offset
+                || entry.down_offset + down_bytes > plan.bytes
+            {
+                return Err(invalid(format!(
+                    "layer {layer_label} expert {expert} extents leave the arena"
+                )));
+            }
+            let gate_up = ProjectionView::from_packed(
+                arena, entry.gate_up_offset, gate_up_bytes, gate_up_dtype, rows_gate_up, hidden,
+            );
+            let down = ProjectionView::from_packed(
+                arena, entry.down_offset, down_bytes, down_dtype, hidden, mi,
+            );
+            // Planar MQ3-I4 has no per-row stride in the dtype; its resource
+            // header takes the codes row (k * 3 / 8), the strided MQ4 its group rows.
+            let stride = |dtype: DType, k: usize| match dtype {
+                DType::MQ3I4G128R256 | DType::MQ3I4G128R128 => k * 3 / 8,
+                other => row_stride(other, k),
+            };
+            let resource = |name: &str, shape: Vec<usize>, dtype: DType, bytes: usize, k: usize| {
+                ExpertResource::new(
+                    name,
+                    "qwen4-resident-slab-v1",
+                    shape,
+                    dtype,
+                    bytes,
+                    stride(dtype, k),
+                    16,
+                    dtype_rotation_plan(dtype),
+                )
+                .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert resource: {error:?}")))
+            };
+            let resources = ExpertResources::fused(
+                resource(&gate_up_source_name, vec![rows_gate_up, hidden], gate_up_dtype, gate_up_bytes, hidden)?,
+                resource(&down_source_name, vec![hidden, mi], down_dtype, down_bytes, mi)?,
+            )
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert resources: {error:?}")))?;
+            metadata.push(
+                ExpertMetadata::new(expert, 0, expert, resources)
+                    .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert metadata: {error:?}")))?,
+            );
+            gate_up_dtypes.push(gate_up_dtype);
+            down_dtypes.push(down_dtype);
+            experts.push(Qwen4ExpertView { gate_up, down });
+        }
+        let table = ExpertTable::new(metadata)
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert table: {error:?}")))?;
+        let mut cache = table
+            .prepare_binding(0, 1, gpu.device_id)
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("expert binding: {error:?}")))?;
+        let gate_entries = experts
+            .iter()
+            .map(|expert| expert.gate_up.tensor.buf.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        let down_entries = experts
+            .iter()
+            .map(|expert| expert.down.tensor.buf.as_ptr() as usize)
+            .collect::<Vec<_>>();
+        let mixed = codecs.iter().any(|codec| *codec != codecs[0]);
+        // The tag tensor of a mixed layer: u8 codec bytes then the same codes
+        // as i32 (the table-driven tile mask's owner table); its logical shape
+        // is the u8 table the sealed validator sizes.
+        let codec_tags = if mixed {
+            let mut bytes = Vec::with_capacity(hipfire_dispatch::pipeline::slab_route::CODEC_TAG_ALLOC_BYTES);
+            bytes.extend_from_slice(&codecs);
+            for codec in &codecs {
+                bytes.extend_from_slice(&i32::from(*codec).to_le_bytes());
+            }
+            debug_assert!(codecs.iter().all(|codec| matches!(*codec, CODEC_MQ4 | CODEC_W3)));
+            let mut tags = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            tags.shape = vec![codecs.len()];
+            Some(tags)
+        } else {
+            None
+        };
+        let free_tags = |gpu: &mut Gpu, tags: Option<GpuTensor>| {
+            if let Some(tags) = tags {
+                let _ = gpu.free_tensor(tags);
+            }
+        };
+        let to_bytes = |entries: &[usize]| entries.iter().flat_map(|entry| entry.to_ne_bytes()).collect::<Vec<u8>>();
+        let expert_gate_up_ptrs = match gpu.alloc_tensor(&[2 * config.num_experts], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                free_tags(gpu, codec_tags);
+                return Err(error.into());
+            }
+        };
+        let expert_down_ptrs = match gpu.alloc_tensor(&[2 * config.num_experts], DType::F32) {
+            Ok(tensor) => tensor,
+            Err(error) => {
+                free_tags(gpu, codec_tags);
+                let _ = gpu.free_tensor(expert_gate_up_ptrs);
+                return Err(error.into());
+            }
+        };
+        let upload = gpu
+            .memcpy_htod_auto(&expert_gate_up_ptrs.buf, &to_bytes(&gate_entries))
+            .and_then(|()| gpu.memcpy_htod_auto(&expert_down_ptrs.buf, &to_bytes(&down_entries)));
+        if let Err(error) = upload {
+            free_tags(gpu, codec_tags);
+            let _ = gpu.free_tensor(expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(expert_down_ptrs);
+            return Err(error.into());
+        }
+        let identity = NEXT_EXPERT_SET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let expert_views = ExpertViewSet {
+            experts: &experts,
+            identity,
+            host_mapped,
+        };
+        if let Err(error) = cache.bind_live(
+            &table,
+            &expert_views,
+            &expert_gate_up_ptrs,
+            &expert_down_ptrs,
+            None,
+            codec_tags.as_ref(),
+        ) {
+            free_tags(gpu, codec_tags);
+            let _ = gpu.free_tensor(expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(expert_down_ptrs);
+            return Err(Qwen4GpuForwardError::Dispatch(format!(
+                "expert live binding: {error:?}"
+            )));
+        }
+        // The K1 planner and entries load before any capture.
+        gpu.ensure_qwen4_slab_kernels()?;
+        gpu.reserve_qwen4_slab(0)?;
+        Ok(Self {
+            table,
+            cache,
+            router,
+            shared_scalar,
+            shared_gate,
+            shared_up,
+            shared_down,
+            experts_all_gate_up_mq4: gate_up_dtypes.iter().all(|dtype| *dtype == DType::MQ4G256V2),
+            experts,
+            identity,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            expert_gate_up_entries: gate_entries,
+            expert_down_entries: down_entries,
+            symmetric: false,
+            fp8: false,
+            host_mapped,
+            slab: Some(Qwen4SlabLayer {
+                codecs,
+                gate_up_dtypes,
+                down_dtypes,
+                codec_tags,
+                arena_base: arena.buf.as_ptr() as usize,
+                arena_bytes: plan.bytes,
+            }),
         })
     }
 
@@ -2213,7 +2511,11 @@ impl Qwen4MoeLayerRuntime {
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
-        for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs] {
+        let tags = self.slab.and_then(|slab| slab.codec_tags);
+        for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs]
+            .into_iter()
+            .chain(tags)
+        {
             if let Err(error) = gpu.free_tensor(tensor) {
                 if first.is_none() {
                     first = Some(error);
@@ -2316,6 +2618,11 @@ impl Qwen4ExpertStage {
         let Some(first_host) = moe.iter().position(RoutedExpertWeights::host_mapped) else {
             return Ok(None);
         };
+        // The donor mirrors are the legacy aggregate expert tensors; a slab
+        // layer's host-mapped arena is read in place.
+        if moe.iter().any(|layer| layer.slab.is_some()) {
+            return Ok(None);
+        }
         let config = &bundle.config;
         // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
         // Other quantized artifacts keep their existing mapped path.
@@ -4411,6 +4718,11 @@ impl Qwen4GpuForward {
                 }
             }
             let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
+            if compact && moe.iter().any(|layer| layer.slab.is_some()) {
+                return Err(invalid(
+                    "the compact scratch plan has no expert-slab route (K1 decode needs the F32 MoE buffers)",
+                ));
+            }
             if compact {
                 // The compact plan was admitted before any weight was
                 // loaded; it is valid only for the exact route it sized.
