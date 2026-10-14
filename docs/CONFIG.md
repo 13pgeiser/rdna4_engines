@@ -450,14 +450,13 @@ rows (2 × 516 = 1,032 B; a row is 2 KV heads × (256 E4M3 codes + one f16
 scale)), the F32 raw index key (512 B) and the F32 pooled key (one 512 B row
 per four tokens, 128 B); the index state is the same F32 state as `bf16`.
 gfx942 uses legacy (fully allocated) context storage, so admission charges
-the whole `max_seq`. The gfx942 FNUZ hardware encoder stores the
-OCP-equivalent code bytes with one f16 scale per head and token (the decoder
-doubles the scale for the FNUZ bias), so decoded values equal the gfx1201 fp8
-row's. FNUZ has no negative zero (`0x80` is its NaN), so a stored K/V row never
-contains `0x80`: the sole deviation from the OCP code is that the quantized
-negative-zero code `0x80` is stored as `0x00` (+0). That covers an input of
-exactly −0 and a negative nonzero input that rounds to zero; every other finite
-code is stored unchanged. The
+the whole `max_seq`. The gfx942 FNUZ hardware encoder stores code bytes with
+one f16 scale per head and token (the decoder doubles the scale for the FNUZ
+bias). Stored bytes equal gfx1201's except that `0x80` is stored as `0x00`
+(+0) for both input negative zero and negative underflow to zero. FNUZ has no
+negative zero (`0x80` is its NaN), so a stored K/V row never contains `0x80`;
+every other finite code is stored unchanged. Decoded values equal the gfx1201
+fp8 row's up to the sign of zero; full byte identity is not claimed. The
 Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
 native 262,144. Index keys hold the same values in every format, so
 selection is unchanged; only the attention over the selected K/V rows sees
