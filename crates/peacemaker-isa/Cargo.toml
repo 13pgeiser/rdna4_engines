@@ -33,3 +33,4 @@ peacemaker-author = { path = "../peacemaker-author" }
 radiowave = { path = "../radiowave", optional = true }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-cdna = { path = "../peacemaker-cdna" }
