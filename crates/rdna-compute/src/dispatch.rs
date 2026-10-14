@@ -821,6 +821,21 @@ pub enum DType {
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
     // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
+    /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
+    /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
+    /// row-major, then `s_inv bf16[ceil(R/128)*ceil(K/128)]` row-major (raw bits),
+    /// zero-padded to a multiple of 256 bytes. Decode:
+    /// `bf16_rne(f32(e4m3(q)) * f32(bf16 s_inv))`. NOT FWHT-rotated (natural
+    /// basis). Generic GPU consumers must reject it; only the gfx942 FP8 MoE
+    /// route reads it. See `docs/quant-formats/fp8-e4m3.md`.
+    FP8E4M3B128,
+    /// OCP FP8 E4M3 (e4m3fn) with ONE bf16 scale per tensor (qt=56 `FP8E4M3PT`):
+    /// logical `[rows, K]`; payload = 16-byte header (bf16 scale bits LE at byte 0,
+    /// bytes 2..16 zero) then `codes u8[rows*K]` row-major. Row `r` at `16 + r*K`.
+    /// Arch-loaded (Qwen4 PLE row store); `row_bytes(k)` is the code bytes of one
+    /// row, the header is the reader's. See `docs/quant-formats/fp8-e4m3.md`.
+    FP8E4M3PT,
     Raw, // raw bytes, no element interpretation
 }
 
@@ -848,6 +863,8 @@ impl DType {
             | DType::MQ4G256V2
             | DType::MQ4G128V2
             | DType::MQ4G256V2Lloyd
+            | DType::FP8E4M3B128
+            | DType::FP8E4M3PT
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -897,6 +914,10 @@ impl DType {
             DType::Q8_0 => grouped(32, 34),
             DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => grouped(256, 136),
             DType::MQ4G128V2 => grouped(128, 68),
+            // qt=56: one byte per code; the 16-byte tensor header is not per-row.
+            // qt=55 (`FP8E4M3B128`) is expert-blocked, not row-strided: `None`;
+            // use `crate::fp8_e4m3::b128_tensor_bytes`.
+            DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
             DType::MQ2G256 | DType::MQ2G256Lloyd => grouped(256, 72),

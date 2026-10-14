@@ -18,6 +18,7 @@ pub mod dflash_state_copy;
 mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
+pub mod fp8_e4m3;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
