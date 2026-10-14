@@ -41,9 +41,9 @@
 // h = 0, 1; inside a half four MFMA steps t = 0..3, step t contracting the 16
 // contiguous physical k = 128*kb + 64*h + 16*t + (0..15) into the F32
 // accumulator (initial value +0); within a step lane group s = lane/16 supplies
-// k offsets 4*s + r (r = 0..3) for both operands. Each lane therefore reads
-// four-byte code groups at k offsets 0, 16, 32, 48 of each 64-wide half
-// (row start 4*s) and the matching dword pairs from LDS.
+// k offsets 4*s+r (r = 0..3). Contiguous 16-byte code loads are transposed
+// across the four strip lanes before decode; this changes only transport,
+// never the BF16 operands or the ascending MFMA contraction sequence.
 //
 // Geometry: block 256 = 4 wave64; grid [ceil(R / (64*NSUB)), n_tiles].
 // Wave w of workgroup x owns output rows x*64*NSUB + w*16*NSUB + j*16 + (0..15)
@@ -56,6 +56,8 @@
 // stride is a multiple of 256), X rows 32-byte aligned (K % 128 == 0).
 
 #include <hip/hip_runtime.h>
+
+#if defined(__gfx942__)
 
 // 16-row subtiles per wave (rows per workgroup = 64 * NSUB; the launcher's
 // FP8B128_MOE_ROWS_PER_WG is pinned to this by a unit test) and K-blocks per
@@ -110,7 +112,26 @@ __device__ __forceinline__ fp8moe_f32x4 fp8moe_mfma(unsigned a0, unsigned a1, un
         __builtin_bit_cast(fp8moe_s16x4, a), __builtin_bit_cast(fp8moe_s16x4, b), c, 0, 0, 0);
 }
 
-template <bool XBF16>
+// Raw-code 4x4 transpose: source strip s holds L_s[j], destination strip s
+// needs L_t[s] in register t. Exchange matrix-index bit 0, then bit 1.
+// Every shuffle executes with the full wave64 (including xor32); selecting
+// before shuffling would incorrectly use the source lane's register index.
+__device__ __forceinline__ uint4 fp8moe_transpose(uint4 v, int s) {
+    const unsigned x1 = __shfl_xor(v.y, 16, 64);
+    const unsigned y1 = __shfl_xor(v.x, 16, 64);
+    const unsigned z1 = __shfl_xor(v.w, 16, 64);
+    const unsigned w1 = __shfl_xor(v.z, 16, 64);
+    const uint4 a = (s & 1) ? uint4{x1, v.y, z1, v.w}
+                            : uint4{v.x, y1, v.z, w1};
+    const unsigned x2 = __shfl_xor(a.z, 32, 64);
+    const unsigned y2 = __shfl_xor(a.w, 32, 64);
+    const unsigned z2 = __shfl_xor(a.x, 32, 64);
+    const unsigned w2 = __shfl_xor(a.y, 32, 64);
+    return (s & 2) ? uint4{x2, y2, a.z, a.w}
+                   : uint4{a.x, a.y, z2, w2};
+}
+
+template <bool XBF16, bool REFERENCE = false>
 __device__ __forceinline__ void fp8moe_grouped_body(
     const unsigned char* __restrict__ W,
     unsigned long long expert_stride,
@@ -151,7 +172,7 @@ __device__ __forceinline__ void fp8moe_grouped_body(
 #pragma unroll
     for (int j = 0; j < NSUB; ++j) {
         const int r = min(row_base + j * 16 + n, R - 1);
-        wrow[j] = blk + (size_t)r * K + 4 * s;
+        wrow[j] = blk + (size_t)r * K + (REFERENCE ? 4 : 16) * s;
         srow[j] = sc + (min(row_base + j * 16, R - 1) >> 7) * nkb;
     }
 
@@ -171,10 +192,15 @@ __device__ __forceinline__ void fp8moe_grouped_body(
 #pragma unroll
                 for (int j = 0; j < NSUB; ++j) {
                     const unsigned char* wp = wrow[j] + kb * 128;
-                    w[d][j][0] = uint4{*reinterpret_cast<const unsigned*>(wp), *reinterpret_cast<const unsigned*>(wp + 16),
-                                       *reinterpret_cast<const unsigned*>(wp + 32), *reinterpret_cast<const unsigned*>(wp + 48)};
-                    w[d][j][1] = uint4{*reinterpret_cast<const unsigned*>(wp + 64), *reinterpret_cast<const unsigned*>(wp + 80),
-                                       *reinterpret_cast<const unsigned*>(wp + 96), *reinterpret_cast<const unsigned*>(wp + 112)};
+                    if constexpr (REFERENCE) {
+                        w[d][j][0] = uint4{*reinterpret_cast<const unsigned*>(wp), *reinterpret_cast<const unsigned*>(wp + 16),
+                                           *reinterpret_cast<const unsigned*>(wp + 32), *reinterpret_cast<const unsigned*>(wp + 48)};
+                        w[d][j][1] = uint4{*reinterpret_cast<const unsigned*>(wp + 64), *reinterpret_cast<const unsigned*>(wp + 80),
+                                           *reinterpret_cast<const unsigned*>(wp + 96), *reinterpret_cast<const unsigned*>(wp + 112)};
+                    } else {
+                        w[d][j][0] = fp8moe_transpose(*reinterpret_cast<const uint4*>(wp), s);
+                        w[d][j][1] = fp8moe_transpose(*reinterpret_cast<const uint4*>(wp + 64), s);
+                    }
                     sv[d][j] = srow[j][kb];
                 }
                 if (xrow >= 0) {
@@ -280,6 +306,23 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16m
     fp8moe_grouped_body<true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
 }
 
+// Retained cdc37659a transport/order for exact F32 A/B, absent from production
+// code objects. The diagnostic harness alone defines FP8MOE_TEST_REFERENCE.
+#if defined(FP8MOE_TEST_REFERENCE)
+extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16mfma_reference(
+    const unsigned char* __restrict__ W, unsigned long long expert_stride,
+    const int4* __restrict__ tile_desc, const int* __restrict__ sorted_rows,
+    const float* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div) {
+    fp8moe_grouped_body<false, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+}
+extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16(
+    const unsigned char* __restrict__ W, unsigned long long expert_stride,
+    const int4* __restrict__ tile_desc, const int* __restrict__ sorted_rows,
+    const unsigned short* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div) {
+    fp8moe_grouped_body<true, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+}
+#endif
+
 // Tile descriptors for the padded-16 grouped layout (the stable scatter's
 // `tiles` output: expert per 16-row tile, -1 tail): tile_desc[t] =
 // {tile_ids[t], 16*t, 16, 0}. Grid [ceil(n_tiles/256)], block 256; one
@@ -291,3 +334,5 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_tile_desc_pad
     const int t = blockIdx.x * 256 + threadIdx.x;
     if (t < n_tiles) tile_desc[t] = int4{tile_ids[t], 16 * t, 16, 0};
 }
+
+#endif // __gfx942__

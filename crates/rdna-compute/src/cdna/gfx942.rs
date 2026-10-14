@@ -52,9 +52,24 @@ const FP8B128_MOE_GROUPED_SRC: &str =
 const FP8B128_MOE_GROUPED_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_xbf16";
+/// Test-only retained P1 baseline (`-DFP8MOE_TEST_REFERENCE=1`): its own JIT
+/// module and symbols, never selected by a production route.
+const FP8B128_MOE_GROUPED_REFERENCE_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
+const FP8B128_MOE_GROUPED_REFERENCE_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
+const FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16";
+/// Output rows per workgroup of the retained baseline: frozen at P1's 64, so
+/// a candidate geometry change never moves the reference launch.
+const FP8B128_MOE_REFERENCE_ROWS_PER_WG: usize = 64;
 /// Output rows per workgroup of the FP8 grouped kernel: `64 * FP8MOE_NSUB`
 /// (pinned against the source by a unit test below).
 const FP8B128_MOE_ROWS_PER_WG: usize = 64;
+
+/// The production kernel source behind a per-module flag line: the compiler
+/// turns `// HIPFIRE_COMPILER_FLAGS:` comments into hipcc arguments for this
+/// module only, so no production flag, source or cache key changes.
+static FP8B128_MOE_GROUPED_REFERENCE_SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!("// HIPFIRE_COMPILER_FLAGS: -DFP8MOE_TEST_REFERENCE=1\n{FP8B128_MOE_GROUPED_SRC}")
+});
 const DEQUANT_FP8B128_TO_BF16_SRC: &str =
     include_str!("../../../../kernels/src/dequant_fp8b128_to_bf16.gfx942.hip");
 const DEQUANT_FP8B128_TO_BF16_KERNEL: &str = "dequant_fp8b128_to_bf16_gfx942";
@@ -648,9 +663,70 @@ impl Gfx942Device<'_> {
     /// only on its X row and its expert's block — not on the other rows of the
     /// launch, its position inside a tile, or the tile index. Tile descriptors
     /// and row ids are not range-checked on the device.
+    ///
+    /// Any kernel change is gated by exact F32-byte A/B against the retained P1
+    /// baseline (`test_fp8_moe_gfx942 --byte-identity`, hidden
+    /// `gemm_fp8b128_moe_grouped_bf16mfma_reference`); the baseline's bytes are
+    /// never re-pinned to a candidate.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_fp8b128_moe_grouped_bf16mfma(
         &mut self,
+        w: &GpuTensor,
+        expert_stride: usize,
+        n_exp: usize,
+        tile_desc: &GpuTensor,
+        n_tiles: usize,
+        sorted_rows: &GpuTensor,
+        x: &GpuTensor,
+        x_row_div: usize,
+        x_rows: usize,
+        y: &GpuTensor,
+        n_sorted: usize,
+        r: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemm_fp8b128_moe_grouped_launch(
+            false, w, expert_stride, n_exp, tile_desc, n_tiles, sorted_rows, x, x_row_div, x_rows, y, n_sorted, r, k,
+        )
+    }
+
+    /// Hidden, diagnostic-only: the retained P1 baseline body of
+    /// [`Self::gemm_fp8b128_moe_grouped_bf16mfma`], same arguments and contract,
+    /// for the exact-byte A/B gate (`test_fp8_moe_gfx942 --byte-identity`).
+    /// It is the production kernel source compiled as its own JIT module
+    /// (`gemm_fp8b128_moe_grouped_bf16mfma_reference`) behind a per-module
+    /// `// HIPFIRE_COMPILER_FLAGS: -DFP8MOE_TEST_REFERENCE=1` line, with its
+    /// own frozen launch geometry (64 rows / 256 threads per workgroup).
+    /// Production source, module name, flags and geometry are untouched, and
+    /// nothing on a model route calls this. Reachable only through the
+    /// exact-gfx942 device proof.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8b128_moe_grouped_bf16mfma_reference(
+        &mut self,
+        w: &GpuTensor,
+        expert_stride: usize,
+        n_exp: usize,
+        tile_desc: &GpuTensor,
+        n_tiles: usize,
+        sorted_rows: &GpuTensor,
+        x: &GpuTensor,
+        x_row_div: usize,
+        x_rows: usize,
+        y: &GpuTensor,
+        n_sorted: usize,
+        r: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemm_fp8b128_moe_grouped_launch(
+            true, w, expert_stride, n_exp, tile_desc, n_tiles, sorted_rows, x, x_row_div, x_rows, y, n_sorted, r, k,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8b128_moe_grouped_launch(
+        &mut self,
+        reference: bool,
         w: &GpuTensor,
         expert_stride: usize,
         n_exp: usize,
@@ -679,10 +755,12 @@ impl Gfx942Device<'_> {
         if expert_stride % 16 != 0 || expert_stride < min_stride {
             return refuse(format!("expert_stride {expert_stride} must be a multiple of 16 and >= {min_stride}"));
         }
-        let (func, x_elem) = match x.dtype {
-            DType::F32 => (FP8B128_MOE_GROUPED_KERNEL, 4),
-            DType::BF16 => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
-            other => return refuse(format!("x must be F32 or BF16, got {other:?}")),
+        let (func, x_elem) = match (x.dtype, reference) {
+            (DType::F32, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
+            (DType::BF16, false) => (FP8B128_MOE_GROUPED_XBF16_KERNEL, 2),
+            (DType::F32, true) => (FP8B128_MOE_GROUPED_REFERENCE_KERNEL, 4),
+            (DType::BF16, true) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
+            (other, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
         };
         crate::moe::require_span(w, &[n_exp, expert_stride], "gemm_fp8b128_moe_grouped_bf16mfma w")?;
         crate::moe::require_span(tile_desc, &[n_tiles, 16], "gemm_fp8b128_moe_grouped_bf16mfma tile_desc")?;
@@ -693,8 +771,18 @@ impl Gfx942Device<'_> {
             return Ok(());
         }
         self.gpu.bind_thread()?;
-        self.gpu
-            .ensure_kernel(FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC, func)?;
+        let rows_per_wg = if reference {
+            self.gpu.ensure_kernel(
+                FP8B128_MOE_GROUPED_REFERENCE_MODULE,
+                FP8B128_MOE_GROUPED_REFERENCE_SRC.as_str(),
+                func,
+            )?;
+            FP8B128_MOE_REFERENCE_ROWS_PER_WG
+        } else {
+            self.gpu
+                .ensure_kernel(FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC, func)?;
+            FP8B128_MOE_ROWS_PER_WG
+        };
         let wp = w.buf.as_ptr();
         let stride = expert_stride as u64;
         let tp = tile_desc.buf.as_ptr();
@@ -720,7 +808,7 @@ impl Gfx942Device<'_> {
         let timer = crate::profile::begin_timer(&self.gpu.hip, "gemm", func, bytes);
         let result = self.gpu.launch_maybe_blob(
             func,
-            [r.div_ceil(FP8B128_MOE_ROWS_PER_WG) as u32, n_tiles as u32, 1],
+            [r.div_ceil(rows_per_wg) as u32, n_tiles as u32, 1],
             [256, 1, 1],
             0,
             &mut params,

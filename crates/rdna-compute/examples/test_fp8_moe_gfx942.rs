@@ -21,11 +21,30 @@
 //!    every row; every row of the grouped launch == its single-row launch; and
 //!    tile-position independence (a row at each of the 16 tile positions, tile
 //!    index 0 and 5, == bytes(M=1)).
+//! 5. `--byte-identity` (exact-byte A/B gate for any kernel candidate): the whole
+//!    suite above runs with every grouped launch executed twice per X dtype,
+//!    once through the retained P1 baseline (`cdc37659a` body, compiled as the
+//!    test-only module behind `-DFP8MOE_TEST_REFERENCE=1`; hidden launcher
+//!    `gemm_fp8b128_moe_grouped_bf16mfma_reference`, never a production
+//!    selection) and once through the production entry, over the same
+//!    descriptors/X/POISON-filled Y; the raw F32 bits of the WHOLE Y (live,
+//!    padding, skipped-tile and guard sentinel rows, signed zeros) must be
+//!    identical, zero mismatches. The baseline's bytes stay the reference: it
+//!    is never re-pinned to the candidate. The mode adds (a) the R in
+//!    {16,48,80} x K in {128,384} output-wave/prefetch-tail shapes through the
+//!    full existing case, (b) finite-FP8 +/-0/subnormal/max/sign codes over
+//!    extreme/zero/negative/subnormal scales, (c) BF16 X with +/-0, subnormals,
+//!    extreme exponents and cancellation-heavy (exactly mirrored W/X, so the
+//!    result is pure accumulation-order residue) rows, and (d) the C1 route
+//!    (10 distinct experts, one token) plus 16/512/2048-token Zipf-like
+//!    top-10 routes over 512 experts at the real 1280x2560 / 2560x640 shapes,
+//!    compared on every live output with no F64 oracle at those sizes.
 //!
-//! Run: `cargo run --release -p rdna-compute --example test_fp8_moe_gfx942 -- [--fixtures DIR]`
+//! Run: `cargo run --release -p rdna-compute --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
 
 use rdna_compute::fp8_e4m3::{b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::{Cell, RefCell};
 
 const POISON: f32 = 12345.625;
 
@@ -135,42 +154,62 @@ struct Launch<'a> {
     x_rows: usize,
     x_f32: &'a GpuTensor,
     x_bf16: &'a GpuTensor,
+    /// `--byte-identity`: every launch is also run through the retained P1
+    /// baseline and compared bit-for-bit.
+    ab: Option<&'a Ab>,
+    tag: &'a str,
 }
 
 type Tile = [i32; 4]; // {expert, row0, nrows, 0}
 
 impl Launch<'_> {
-    /// Run one grouped launch over `rows` (sorted row ids); returns Y
-    /// [rows.len(), r] (POISON where the kernel wrote nothing).
-    fn run(&self, gpu: &mut Gpu, tiles: &[Tile], rows: &[i32], bf16_x: bool) -> Vec<f32> {
+    /// One grouped launch (candidate = production entry, or the retained P1
+    /// baseline when `reference`); returns Y [rows.len(), r] (POISON where the
+    /// kernel wrote nothing).
+    fn raw(&self, gpu: &mut Gpu, tiles: &[Tile], rows: &[i32], bf16_x: bool, reference: bool) -> Vec<f32> {
         let stride = b128_block_stride(self.ex.r, self.ex.k).unwrap();
         let flat: Vec<i32> = tiles.iter().flatten().copied().collect();
         let d_tiles = upload_i32(gpu, &flat);
         let d_rows = upload_i32(gpu, rows);
         let n = rows.len();
         let y = gpu.upload_f32(&vec![POISON; n * self.ex.r], &[n * self.ex.r]).expect("y");
-        gpu.try_gfx942()
-            .expect("exact gfx942")
-            .gemm_fp8b128_moe_grouped_bf16mfma(
-                self.d_payload,
-                stride,
-                self.ex.n,
-                &d_tiles,
-                tiles.len(),
-                &d_rows,
-                if bf16_x { self.x_bf16 } else { self.x_f32 },
-                self.x_row_div,
-                self.x_rows,
-                &y,
-                n,
-                self.ex.r,
-                self.ex.k,
+        let x = if bf16_x { self.x_bf16 } else { self.x_f32 };
+        let mut dev = gpu.try_gfx942().expect("exact gfx942");
+        let res = if reference {
+            dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
+                self.d_payload, stride, self.ex.n, &d_tiles, tiles.len(), &d_rows, x, self.x_row_div, self.x_rows, &y, n,
+                self.ex.r, self.ex.k,
             )
-            .expect("gemm_fp8b128_moe_grouped_bf16mfma");
+        } else {
+            dev.gemm_fp8b128_moe_grouped_bf16mfma(
+                self.d_payload, stride, self.ex.n, &d_tiles, tiles.len(), &d_rows, x, self.x_row_div, self.x_rows, &y, n,
+                self.ex.r, self.ex.k,
+            )
+        };
+        res.unwrap_or_else(|e| {
+            panic!("{}: {e:?}", if reference { "gemm_fp8b128_moe_grouped_bf16mfma_reference" } else { "gemm_fp8b128_moe_grouped_bf16mfma" })
+        });
         gpu.hip.device_synchronize().expect("sync");
         let out = gpu.download_f32(&y).expect("download y");
         for t in [y, d_rows, d_tiles] {
             gpu.free_tensor(t).ok();
+        }
+        out
+    }
+
+    /// Run one grouped launch over `rows` (sorted row ids); returns the
+    /// candidate's Y. In `--byte-identity` mode the retained P1 baseline runs
+    /// the same launch for BOTH X dtypes and the candidate's bytes must equal it
+    /// exactly (whole Y, sentinel rows included).
+    fn run(&self, gpu: &mut Gpu, tiles: &[Tile], rows: &[i32], bf16_x: bool) -> Vec<f32> {
+        let out = self.raw(gpu, tiles, rows, bf16_x, false);
+        if let Some(ab) = self.ab {
+            let base = self.raw(gpu, tiles, rows, bf16_x, true);
+            ab.compare(self.tag, if bf16_x { "bf16-x" } else { "f32-x" }, &base, &out, self.ex.r);
+            drop(base);
+            let other = self.raw(gpu, tiles, rows, !bf16_x, false);
+            let other_base = self.raw(gpu, tiles, rows, !bf16_x, true);
+            ab.compare(self.tag, if bf16_x { "f32-x" } else { "bf16-x" }, &other_base, &other, self.ex.r);
         }
         out
     }
@@ -208,7 +247,377 @@ fn bits_eq(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
-fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div: usize, tokens: usize) {
+// ── Byte A/B (`--byte-identity`) ─────────────────────────────────────────
+
+/// Raw-bit comparison of baseline vs candidate Y over a whole case.
+struct Ab {
+    launches: Cell<usize>,
+    values: Cell<u64>,
+    mismatched: Cell<u64>,
+    first: RefCell<Vec<String>>,
+}
+
+impl Ab {
+    fn new() -> Self {
+        Ab { launches: Cell::new(0), values: Cell::new(0), mismatched: Cell::new(0), first: RefCell::new(Vec::new()) }
+    }
+
+    fn compare(&self, tag: &str, what: &str, base: &[f32], cand: &[f32], r: usize) {
+        self.launches.set(self.launches.get() + 1);
+        self.values.set(self.values.get() + base.len().max(cand.len()) as u64);
+        let mut bad = base.len().abs_diff(cand.len()) as u64;
+        let mut first = None;
+        for (i, (b, c)) in base.iter().zip(cand).enumerate() {
+            if b.to_bits() != c.to_bits() {
+                bad += 1;
+                first.get_or_insert((i, b.to_bits(), c.to_bits()));
+            }
+        }
+        if bad > 0 {
+            self.mismatched.set(self.mismatched.get() + bad);
+            let mut f = self.first.borrow_mut();
+            if f.len() < 8 {
+                f.push(match first {
+                    Some((i, b, c)) => format!(
+                        "{tag} [{what}] row {} col {}: baseline {b:#010x} candidate {c:#010x} ({bad} mismatched)",
+                        i / r,
+                        i % r
+                    ),
+                    None => format!("{tag} [{what}]: length baseline {} candidate {}", base.len(), cand.len()),
+                });
+            }
+        }
+    }
+
+    fn check(&self, fail: &mut Fail, name: &str) {
+        let mm = self.mismatched.get();
+        fail.check(
+            mm == 0,
+            format!(
+                "{name}: byte A/B retained P1 baseline == candidate, raw F32 bits incl. padding/skipped/guard sentinel rows, both X dtypes ({} compared launches, {} values, {mm} mismatched)",
+                self.launches.get(),
+                self.values.get()
+            ),
+        );
+        for line in self.first.borrow().iter() {
+            println!("  first mismatch: {line}");
+        }
+    }
+}
+
+impl Experts {
+    /// Byte-A/B-only pool: no CPU-decoded W (the F64 oracle is not run on it),
+    /// so 512-expert real-shape pools stay cheap. `make(e)` -> (codes, scales).
+    fn ab_only(r: usize, k: usize, n: usize, make: impl Fn(usize) -> (Vec<u8>, Vec<u16>)) -> Self {
+        let mut payload = Vec::with_capacity(n * b128_block_stride(r, k).unwrap());
+        for e in 0..n {
+            let (codes, scales) = make(e);
+            assert_eq!((codes.len(), scales.len()), (r * k, b128_scale_count(r, k).unwrap()));
+            payload.extend(block_bytes(&codes, &scales, r, k));
+        }
+        Experts { r, k, n, payload, w: Vec::new() }
+    }
+}
+
+/// Every finite E4M3 code is `b & 0x7F != 0x7F`; map the two NaNs to +/-0.
+fn finite_code(c: usize) -> u8 {
+    let b = (c % 256) as u8;
+    if b & 0x7F == 0x7F { b & 0x80 } else { b }
+}
+
+/// Four random finite codes per LCG draw (fast enough for 512 x 3.3 MB).
+fn rand_codes4(n: usize, st: &mut u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 4);
+    while v.len() < n {
+        for b in lcg(st).to_le_bytes() {
+            v.push(if b & 0x7F == 0x7F { b ^ 1 } else { b });
+        }
+    }
+    v.truncate(n);
+    v
+}
+
+fn expert_seed(seed: u64, e: usize) -> u64 {
+    seed ^ (e as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// Block scales that stress the decode: 1.0 and neighbours, checkpoint-range,
+/// large, negative, BF16-subnormal / min-normal / +0 / -0 (decoded W is +/-0 or
+/// BF16-subnormal-underflowed). All finite; none can overflow F32 with the X
+/// generators below.
+const SPECIAL_SCALES: [u16; 16] = [
+    0x3F80, 0x3F81, 0x3FFF, 0x3C00, 0x3800, 0x2F80, 0x3B7F, 0x4321, 0xBF80, 0xBA83, 0x0D80, 0x0001, 0x0080, 0x0000,
+    0x8000, 0x3A83,
+];
+
+/// Finite-FP8 stress codes per expert kind: +0, -0, subnormals with sign, +/-max
+/// magnitude by K16 block, every finite code cycling, random.
+fn special_codes(e: usize, r: usize, k: usize) -> Vec<u8> {
+    let mut st = expert_seed(0xc0de_0000, e);
+    (0..r * k)
+        .map(|i| {
+            let (o, kk) = (i / k, i % k);
+            match e % 6 {
+                0 => 0x00,
+                1 => 0x80,
+                2 => {
+                    let m = (kk % 7 + 1) as u8; // 0x01..0x07: the E4M3 subnormals
+                    if (kk / 7 + o) & 1 == 1 { 0x80 | m } else { m }
+                }
+                3 => if (kk / 16 + o) & 1 == 1 { 0xFE } else { 0x7E },
+                4 => finite_code(kk + o * 17 + e * 5),
+                _ => finite_code((lcg(&mut st) >> 8) as usize),
+            }
+        })
+        .collect()
+}
+
+fn special_scales(e: usize, r: usize, k: usize) -> Vec<u16> {
+    (0..b128_scale_count(r, k).unwrap()).map(|i| SPECIAL_SCALES[(i * 5 + e * 3) % SPECIAL_SCALES.len()]).collect()
+}
+
+/// Cancellation-heavy W: every scale equal and the codes mirrored (kind e%3:
+/// half-shift w[k+K/2] = w[k]; reverse w[K-1-k] = w[k]; both), paired with
+/// `cancel_x_row` (antisymmetric under both), so the exact sum is 0 and the
+/// F32 result is purely accumulation-order residue.
+fn cancel_codes(e: usize, r: usize, k: usize) -> Vec<u8> {
+    let seed = expert_seed(0xca9c_e100, e);
+    (0..r * k)
+        .map(|i| {
+            let (o, kk) = (i / k, i % k);
+            let c = match e % 3 {
+                0 => kk % (k / 2),
+                1 => kk.min(k - 1 - kk),
+                _ => {
+                    let h = kk % (k / 2);
+                    h.min(k / 2 - 1 - h)
+                }
+            };
+            let mut s = seed ^ ((o * k + c) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            lcg(&mut s);
+            finite_code((lcg(&mut s) >> 8) as usize)
+        })
+        .collect()
+}
+
+fn cancel_scales(e: usize, r: usize, k: usize) -> Vec<u16> {
+    vec![[0x3C00u16, 0x3A80, 0x3F80][(e / 3) % 3]; b128_scale_count(r, k).unwrap()]
+}
+
+/// BF16 with a wide exponent (2^-30 .. 2^30), random sign/mantissa.
+fn wide_bf16(st: &mut u64) -> u16 {
+    let (s, e, m) = (lcg(st) & 1, 97 + lcg(st) % 61, lcg(st) & 0x7F);
+    ((s << 15) | (e << 7) | m) as u16
+}
+
+/// Exactly antisymmetric X row (x[k+K/2] = -x[k], first half palindromic so
+/// x[K-1-k] = -x[k]) with wide-exponent entries; odd rows get one 1-ulp bump so
+/// the residue is a large-partial-sum rounding result rather than 0.
+fn cancel_x_row(k: usize, row: usize, st: &mut u64) -> Vec<u16> {
+    let v: Vec<u16> = (0..k / 4).map(|_| wide_bf16(st)).collect();
+    let half: Vec<u16> = v.iter().copied().chain(v.iter().rev().copied()).collect();
+    let mut x = half.clone();
+    x.extend(half.iter().map(|b| b ^ 0x8000));
+    if row % 2 == 1 {
+        x[(row * 7 + 3) % k] ^= 1;
+    }
+    x
+}
+
+/// X rows of BF16 finite stress kinds: +0, -0, subnormals, huge/tiny
+/// alternating, wide random, one-hot (position moves with the row), +/-0
+/// interleaved, K16-block sign flips, plain random.
+fn special_x_row(k: usize, row: usize, st: &mut u64) -> Vec<u16> {
+    let sgn = |st: &mut u64| ((lcg(st) & 1) << 15) as u16;
+    match row % 9 {
+        0 => vec![0x0000; k],
+        1 => vec![0x8000; k],
+        2 => (0..k).map(|_| sgn(st) | ((lcg(st) % 0x7F) as u16 + 1)).collect(),
+        3 => (0..k).map(|i| sgn(st) | if i % 2 == 0 { 0x4E80 } else { 0x3080 }).collect(),
+        4 => (0..k).map(|_| wide_bf16(st)).collect(),
+        5 => {
+            let hot = (row * 37 + 11) % k;
+            (0..k).map(|i| if i == hot { 0x3F80 | sgn(st) } else if i % 2 == 0 { 0x0000 } else { 0x8000 }).collect()
+        }
+        6 => (0..k).map(|i| if i % 3 == 0 { sgn(st) } else { f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0) }).collect(),
+        7 => (0..k).map(|i| if (i / 16) % 2 == 0 { 0x3F80 } else { 0xBF80 }).collect(),
+        _ => (0..k).map(|_| f32_to_bf16(((lcg(st) as f32 / u32::MAX as f32) - 0.5) * 4.0)).collect(),
+    }
+}
+
+/// Plain BF16-exact random X (signed zeros sprinkled) for the target routes.
+fn random_x(x_rows: usize, k: usize, seed: u64) -> Vec<u16> {
+    let mut st = seed;
+    (0..x_rows * k)
+        .map(|i| match i % 97 {
+            0 => 0x0000,
+            1 => 0x8000,
+            _ => f32_to_bf16(((lcg(&mut st) as f32 / u32::MAX as f32) - 0.5) * 4.0),
+        })
+        .collect()
+}
+
+/// Top-10 distinct experts per token. Skewed (cubic, Zipf-like); with
+/// `uniform_mix` every other token is uniform so tiny pools reach all experts.
+fn zipf_slots(tokens: usize, n_exp: usize, st: &mut u64, uniform_mix: bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(tokens * 10);
+    for t in 0..tokens {
+        let mut chosen: Vec<usize> = Vec::with_capacity(10);
+        while chosen.len() < 10 {
+            let u = lcg(st) as f64 / 4294967296.0;
+            let f = if uniform_mix && t % 2 == 0 { u } else { u * u * u };
+            let e = ((f * n_exp as f64) as usize).min(n_exp - 1);
+            if !chosen.contains(&e) {
+                chosen.push(e);
+            }
+        }
+        out.extend(chosen);
+    }
+    out
+}
+
+/// Slots whose M=1 launch is also A/B'd and compared to the grouped bytes:
+/// first/last few plus an even stride through the route (tile and expert
+/// boundaries included by the stride on large routes, every slot on small ones).
+fn sample_flats(n: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..n).step_by((n / 48).max(1)).collect();
+    v.extend(0..4.min(n));
+    v.extend(n.saturating_sub(4)..n);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn upload_x(gpu: &mut Gpu, xb: &[u16]) -> (GpuTensor, GpuTensor) {
+    let xf: Vec<f32> = xb.iter().map(|&b| bf16_to_f32(b)).collect();
+    let x_f32 = gpu.upload_f32(&xf, &[xb.len()]).expect("x f32");
+    let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    x_bf16.shape = vec![xb.len()];
+    x_bf16.dtype = DType::BF16;
+    (x_f32, x_bf16)
+}
+
+/// Byte A/B of one route over an arbitrary expert pool / X (no F64 oracle):
+/// padded layout + a skipped tile, compact layout + guard rows, and M=1
+/// launches of sampled slots. Every launch is A/B'd against the retained P1
+/// baseline for both X dtypes; on the candidate the padding/skipped/guard
+/// sentinels, compact == padded and M=1 == grouped bytes are also checked.
+fn ab_route(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, xb: &[u16], x_row_div: usize, slot_expert: &[usize]) {
+    let (r, k) = (ex.r, ex.k);
+    assert!(xb.len() % k == 0 && !slot_expert.is_empty() && (slot_expert.len() - 1) / x_row_div < xb.len() / k, "{name}: route/X geometry");
+    let x_rows = xb.len() / k;
+    let d_payload = upload_bytes(gpu, &ex.payload);
+    let (x_f32, x_bf16) = upload_x(gpu, xb);
+    let ab = Ab::new();
+    let l = Launch { ex, d_payload: &d_payload, x_row_div, x_rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: Some(&ab), tag: name };
+
+    let live = slot_expert.len();
+    let (mut tiles, mut rows) = scatter(slot_expert, ex.n, true);
+    let live_rows = rows.len();
+    tiles.push([-1, live_rows as i32, 16, 0]);
+    rows.extend(std::iter::repeat_n(0, 16));
+    let y = l.run(gpu, &tiles, &rows, false);
+
+    let mut flat_g = vec![usize::MAX; live];
+    let (mut pad_ok, mut skip_ok) = (true, true);
+    for (g, &flat) in rows[..live_rows].iter().enumerate() {
+        let yrow = &y[g * r..(g + 1) * r];
+        if flat < 0 {
+            pad_ok &= yrow.iter().all(|v| v.to_bits() == 0);
+        } else {
+            flat_g[flat as usize] = g;
+        }
+    }
+    skip_ok &= y[live_rows * r..].iter().all(|v| v.to_bits() == POISON.to_bits());
+    let row_of = |y: &[f32], g: usize| -> Vec<f32> { y[g * r..(g + 1) * r].to_vec() };
+
+    let (ct, cr) = scatter(slot_expert, ex.n, false);
+    let mut cr_guard = cr.clone();
+    cr_guard.extend(std::iter::repeat_n(0, 16));
+    let yc = l.run(gpu, &ct, &cr_guard, true);
+    let compact_ok = cr.iter().enumerate().all(|(g, &flat)| bits_eq(&yc[g * r..(g + 1) * r], &y[flat_g[flat as usize] * r..][..r]));
+    let guard_ok = yc[cr.len() * r..].iter().all(|v| v.to_bits() == POISON.to_bits());
+
+    let sample = sample_flats(live);
+    let mut bad_single = 0usize;
+    for &flat in &sample {
+        let y1 = l.single(gpu, slot_expert[flat] as i32, flat as i32);
+        bad_single += !bits_eq(&y1, &row_of(&y, flat_g[flat])) as usize;
+    }
+    drop(y);
+    drop(yc);
+
+    ab.check(fail, name);
+    fail.check(pad_ok && skip_ok && guard_ok, format!("{name}: candidate padding rows +0, skipped tile and guard rows untouched"));
+    fail.check(compact_ok, format!("{name}: candidate compact tiles byte-identical to padded layout ({live} slots)"));
+    fail.check(bad_single == 0, format!("{name}: candidate sampled M=1 launches byte-identical to grouped rows ({} sampled, {bad_single} mismatched)", sample.len()));
+    for t in [x_bf16, x_f32, d_payload] {
+        gpu.free_tensor(t).ok();
+    }
+}
+
+/// Mandatory `--byte-identity` additions (everything else is the full existing
+/// suite with A/B enabled on every grouped launch).
+fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
+    // (a) R in {16,48,80} (output-wave tails) x K in {128,384} (prefetch
+    // tails) through the FULL existing case (F64 oracle, both X dtypes,
+    // padded/compact/skipped tiles, M-invariance, tile positions).
+    for (r, k) in [(16usize, 128usize), (16, 384), (48, 128), (48, 384), (80, 128), (80, 384)] {
+        let ex = Experts::synthetic(r, k, 12, 0x7a11_0000 ^ (r * 1000 + k) as u64);
+        for (div, tokens) in [(10usize, 37usize), (1, 13)] {
+            gemm_case(gpu, fail, &format!("tail r={r} k={k} x_row_div={div}"), &ex, div, tokens, true);
+        }
+    }
+
+    let shapes = [(16usize, 128usize, 10usize), (48, 128, 1), (80, 384, 10), (80, 384, 1), (1280, 2560, 10), (2560, 640, 1)];
+    let tokens = 37usize;
+    for (r, k, div) in shapes {
+        let x_rows = if div == 1 { tokens * 10 } else { tokens };
+        let mut st = 0x57ec_1a10_u64 ^ (r * 7919 + k) as u64;
+        let slots = zipf_slots(tokens, 12, &mut st, true);
+
+        // (b) finite-FP8 +/-0/subnormal/max/sign codes x extreme scales; (c) BF16 X stress.
+        let ex = Experts::ab_only(r, k, 12, |e| (special_codes(e, r, k), special_scales(e, r, k)));
+        let xb: Vec<u16> = (0..x_rows).flat_map(|row| special_x_row(k, row, &mut st)).collect();
+        ab_route(gpu, fail, &format!("fp8-special r={r} k={k} x_row_div={div}"), &ex, &xb, div, &slots);
+
+        // BF16 X stress against ordinary random weights.
+        let rnd = Experts::ab_only(r, k, 12, |e| {
+            let mut s = expert_seed(0x4a4d_0000, e);
+            let codes = rand_codes4(r * k, &mut s);
+            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+        });
+        ab_route(gpu, fail, &format!("bf16-x-special r={r} k={k} x_row_div={div}"), &rnd, &xb, div, &slots);
+        drop(rnd);
+        drop(ex);
+
+        // Cancellation-heavy: mirrored W against antisymmetric wide-exponent X.
+        let canc = Experts::ab_only(r, k, 12, |e| (cancel_codes(e, r, k), cancel_scales(e, r, k)));
+        let xc: Vec<u16> = (0..x_rows).flat_map(|row| cancel_x_row(k, row, &mut st)).collect();
+        ab_route(gpu, fail, &format!("cancellation r={r} k={k} x_row_div={div}"), &canc, &xc, div, &slots);
+    }
+
+    // (d) Target routes at the real shapes: C1 (one token, 10 distinct
+    // experts, 10 one-row tiles) and 16/512/2048-token Zipf-like top-10 over
+    // 512 experts. Baseline vs candidate on every live output; no F64 oracle.
+    for (label, r, k, div) in [("gate_up", 1280usize, 2560usize, 10usize), ("down", 2560, 640, 1)] {
+        let ex = Experts::ab_only(r, k, 512, |e| {
+            let mut s = expert_seed(0x7a46_e700 ^ r as u64, e);
+            let codes = rand_codes4(r * k, &mut s);
+            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+        });
+        for tokens in [1usize, 16, 512, 2048] {
+            let mut st = 0x7a46_0000_u64 ^ tokens as u64 ^ (r as u64) << 24;
+            let slots = if tokens == 1 { (0..10).map(|j| j * 51 + 7).collect() } else { zipf_slots(tokens, 512, &mut st, false) };
+            let x_rows = if div == 1 { slots.len() } else { tokens };
+            let xb = random_x(x_rows, k, 0x7a46_5eed ^ tokens as u64);
+            let tag = if tokens == 1 { "C1 (10 experts)".to_string() } else { format!("{tokens}-token route") };
+            ab_route(gpu, fail, &format!("target {label} r={r} k={k} {tag}"), &ex, &xb, div, &slots);
+        }
+    }
+}
+
+fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div: usize, tokens: usize, byte_ab: bool) {
     let (r, k) = (ex.r, ex.k);
     // x: BF16-exact values, including signed zeros. At least 128 rows so the
     // M-invariance sweep can reach n = 128.
@@ -227,7 +636,8 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
     let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     x_bf16.shape = vec![x_rows * k];
     x_bf16.dtype = DType::BF16;
-    let l = Launch { ex, d_payload: &d_payload, x_row_div, x_rows, x_f32: &x_f32, x_bf16: &x_bf16 };
+    let ab = byte_ab.then(Ab::new);
+    let l = Launch { ex, d_payload: &d_payload, x_row_div, x_rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: ab.as_ref(), tag: name };
 
     // Top-10 distinct experts per token (deterministic, skewed).
     let mut slot_expert = Vec::with_capacity(tokens * 10);
@@ -382,6 +792,10 @@ fn gemm_case(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, x_row_div
         format!("{name}: tile-position independence, rows {checked_rows:?} x 16 positions x tile index {{0,5}} == bytes(M=1) ({bad_pos} mismatched)"),
     );
 
+    if let Some(ab) = &ab {
+        ab.check(fail, name);
+    }
+
     for t in [x_bf16, x_f32, d_payload] {
         gpu.free_tensor(t).ok();
     }
@@ -394,6 +808,7 @@ fn read(dir: &str, f: &str) -> Vec<u8> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fixtures = args.iter().position(|a| a == "--fixtures").map(|i| args[i + 1].clone());
+    let byte = args.iter().any(|a| a == "--byte-identity");
     let mut gpu = Gpu::init().expect("Gpu::init");
     println!("detected arch: {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx942", "this Tier C gate requires gfx942");
@@ -465,16 +880,22 @@ fn main() {
             let ex = Experts { r, k, n: 1, payload: blk, w: vec![w] };
             // Reuse the synthetic driver with a single-expert pool: tokens=1 slot row per
             // flat index, every slot on expert 0.
-            real_gemm(&mut gpu, &mut fail, name, &ex);
+            real_gemm(&mut gpu, &mut fail, name, &ex, byte);
         }
     }
 
     // 2-4. Grouped GEMM Tier C at the Qwen4 shapes.
     let gate_up = Experts::synthetic(1280, 2560, 12, 0x6a7e_0001);
-    gemm_case(&mut gpu, &mut fail, "gate_up r=1280 k=2560", &gate_up, 10, 37);
+    gemm_case(&mut gpu, &mut fail, "gate_up r=1280 k=2560", &gate_up, 10, 37, byte);
     drop(gate_up);
     let down = Experts::synthetic(2560, 640, 12, 0xd0e1_0002);
-    gemm_case(&mut gpu, &mut fail, "down r=2560 k=640", &down, 1, 13);
+    gemm_case(&mut gpu, &mut fail, "down r=2560 k=640", &down, 1, 13, byte);
+    drop(down);
+
+    if byte {
+        println!("byte-identity: baseline = retained P1 reference module (-DFP8MOE_TEST_REFERENCE=1), candidate = production entry");
+        byte_cases(&mut gpu, &mut fail);
+    }
 
     if fail.0.is_empty() {
         println!("ALL PASS test_fp8_moe_gfx942 (arch {})", gpu.arch);
@@ -489,7 +910,7 @@ fn main() {
 
 /// Real checkpoint expert: 64 BF16 x rows through one expert vs F64 on the
 /// Python-teacher W.
-fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts) {
+fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, byte_ab: bool) {
     let (r, k) = (ex.r, ex.k);
     let rows = 64usize;
     let mut st = 0x7ea1_u64;
@@ -500,7 +921,8 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts) {
     let mut x_bf16 = upload_bytes(gpu, &xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
     x_bf16.shape = vec![rows * k];
     x_bf16.dtype = DType::BF16;
-    let l = Launch { ex, d_payload: &d_payload, x_row_div: 1, x_rows: rows, x_f32: &x_f32, x_bf16: &x_bf16 };
+    let ab = byte_ab.then(Ab::new);
+    let l = Launch { ex, d_payload: &d_payload, x_row_div: 1, x_rows: rows, x_f32: &x_f32, x_bf16: &x_bf16, ab: ab.as_ref(), tag: name };
     let (t, s) = scatter(&vec![0usize; rows], 1, true);
     let y = l.run(gpu, &t, &s, false);
     let bound_k = k as f64 * (2f64).powi(-24);
@@ -521,6 +943,9 @@ fn real_gemm(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts) {
         }
     }
     fail.check(bad == 0, format!("real {name}: GEMM vs F64 on teacher W, {rows} rows, max err/sum|wx| = {worst:.3e}, violations {bad}"));
+    if let Some(ab) = &ab {
+        ab.check(fail, &format!("real {name}"));
+    }
     for t in [x_bf16, x_f32, d_payload] {
         gpu.free_tensor(t).ok();
     }
