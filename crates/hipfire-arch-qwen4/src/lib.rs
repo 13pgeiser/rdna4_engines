@@ -29,6 +29,7 @@ pub mod expert_arena;
 pub mod expert_slab_aggregate;
 /// Pure per-expert device/host-mapped placement plan (B5-C1).
 pub mod expert_tier_plan;
+pub mod expert_tier_owners;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 pub mod kv_backend;
