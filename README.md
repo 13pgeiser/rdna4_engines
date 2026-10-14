@@ -114,6 +114,11 @@ measurement on one fixture, not a general throughput claim.
   <img alt="hipfire 0.4.1 vs 0.4.2 on Strix Halo, Qwen3.8-Flash: synthetic 8K and 32K cold prefill, greedy AR, greedy MTP and sampled MTP decode, and the new 16K NPU prefill" src="docs/assets/readme/gains-042-light.svg" width="880" />
 </picture>
 
+The sampled-MTP row is not reproducible token for token: with seed 123, 0.4.2
+gives different token streams across fresh processes on three of the eight
+prompts (a known issue in the wall-time route chooser). Greedy AR and greedy
+MTP are bit-identical across processes.
+
 - **Qwen3.8-Flash EP2.** Owner-routed prefill and long-prefill expert staging
   are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
   expert ownership and native MTP also run under EP. EP4 owner-routed
