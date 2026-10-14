@@ -5623,8 +5623,10 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             );
         }
     }
-    if let Some(reason) = &auxiliary_unavailable {
-        println!("note: {reason}");
+    if !output.json {
+        if let Some(reason) = &auxiliary_unavailable {
+            println!("note: {reason}");
+        }
     }
     Ok(())
 }
