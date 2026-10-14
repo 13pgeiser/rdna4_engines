@@ -2979,12 +2979,13 @@ extern "C" __global__ void indexed_attention_norm_rope_f32(
 // sum of q * code; a value is scale * code. Every attention kernel goes
 // through the helpers below, so for each format the per-head, grouped and
 // serial kernels stay bitwise equal. The indexer's raw and pooled keys are
-// BF16 values in every format; the quantized formats store them as BF16,
-// which holds the same values as the F32 arenas.
+// BF16 values in every format. RDNA quantized formats store them as BF16;
+// gfx942 FP8 FNUZ keeps the F32 index arenas and the reference pool/select.
 #define QSA_KV_F32 0
 #define QSA_KV_FP8 1
 #define QSA_KV_Q8 2
-#if defined(__GFX12__)
+#define QSA_KV_FP8_FNUZ 3
+#if defined(__GFX12__) || defined(__gfx942__)
 #define QSA_HAS_FP8 1
 #endif
 #if defined(__GFX11__) || defined(__GFX12__)
@@ -2997,7 +2998,7 @@ template <int F>
 static __device__ __forceinline__ int qsa_kv_row_bytes(int kv_heads, int head_dim) {
     if constexpr (F == QSA_KV_F32) {
         return kv_heads * head_dim * 4;
-    } else if constexpr (F == QSA_KV_FP8) {
+    } else if constexpr (F == QSA_KV_FP8 || F == QSA_KV_FP8_FNUZ) {
         return kv_heads * (head_dim + 2);
     } else {
         return kv_heads * (head_dim / 32) * 34;
@@ -3037,7 +3038,11 @@ static __device__ __forceinline__ float qsa_kv_value(
 #if defined(QSA_HAS_FP8)
     const float scale = qsa_half_bits(*reinterpret_cast<const unsigned short*>(
         row + kv_heads * head_dim + 2 * kv_head));
+#if defined(__gfx942__)
+    return qsa_fp8_code(row[kv_head * head_dim + channel]) * (2.0f * scale);
+#else
     return qsa_fp8_code(row[kv_head * head_dim + channel]) * scale;
+#endif
 #else
     return 0.0f;
 #endif
@@ -3056,6 +3061,11 @@ static __device__ __forceinline__ void qsa_kv_key_dots(
     int head_dim,
     int kv_head,
     float (&score)[HEADS]) {
+#if defined(__gfx942__)
+#pragma clang fp contract(off)
+    // Keep one-head and grouped-head instantiations on the same rounded
+    // multiply/add chain; the compiler otherwise contracts only the latter.
+#endif
     static_assert(F != QSA_KV_F32, "F32 keys keep each kernel's own loop");
     if constexpr (F == QSA_KV_Q8) {
         // A pair of blocks is 68 bytes, 4-byte aligned (the host admits q8 for
@@ -3128,7 +3138,11 @@ static __device__ __forceinline__ void qsa_kv_key_dots(
         }
     }
 #pragma unroll
+#if defined(__gfx942__)
+    for (int h = 0; h < HEADS; ++h) score[h] += dot[h] * (2.0f * scale);
+#else
     for (int h = 0; h < HEADS; ++h) score[h] += dot[h] * scale;
+#endif
 #endif
     }
 }
@@ -3136,9 +3150,9 @@ static __device__ __forceinline__ void qsa_kv_key_dots(
 // Store one channel of a K or V row in a quantized format. Every thread of
 // the block calls it (block 256 over one KV head, `channel` = threadIdx.x;
 // lanes at or past head_dim pass any value and store nothing). fp8: the
-// head's absmax is reduced through wave shuffles and `amax_lds` (one float
-// per wave), which synchronizes. q8: each wave32 is one 32-channel Q8_0
-// block, reduced and encoded as kv_cache_write_q8_0 does (no barrier).
+// head's absmax is reduced through width-32 shuffles and `amax_lds` (one float
+// per 32-lane group, including both halves of a gfx942 wave64), which
+// synchronizes. q8: each wave32 is one 32-channel Q8_0 block (no barrier).
 template <int F>
 static __device__ __forceinline__ void qsa_kv_store(
     unsigned char* row,
@@ -3189,8 +3203,16 @@ static __device__ __forceinline__ void qsa_kv_store(
         sf = (float)s16;
     }
     if (!active) return;
+#if defined(__gfx942__)
+    // FNUZ uses 0x80 for NaN, so every quantized negative zero (including
+    // nonzero negative underflow) becomes 0x00. All other finite OCP codes
+    // are identical after this exact half-range fold.
+    row[kv_head * head_dim + channel] =
+        (unsigned char)__builtin_amdgcn_cvt_pk_fp8_f32((value / sf) * 0.5f, 0.0f, 0u, false);
+#else
     row[kv_head * head_dim + channel] =
         (unsigned char)__builtin_amdgcn_cvt_pk_fp8_f32(value / sf, 0.0f, 0u, false);
+#endif
     if (channel == 0) {
         *reinterpret_cast<_Float16*>(row + kv_heads * head_dim + 2 * kv_head) = s16;
     }
@@ -3373,7 +3395,7 @@ static __device__ __forceinline__ void qsa_decode_prologue(
                                 & 0xFFFF0000u);
             index_row[index_q_width + i] = v;
         }
-        if constexpr (F == QSA_KV_F32) {
+        if constexpr (F == QSA_KV_F32 || F == QSA_KV_FP8_FNUZ) {
             raw_index_keys[position * index_kv_width + i] = v;
         } else {
             raw_index_keys[(size_t)position * index_kv_width + i] = bf16_round(v);
@@ -3395,9 +3417,13 @@ static __device__ __forceinline__ void qsa_decode_prologue(
             head_dim, position_start, yarn);                                               \
     }
 QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_f32, QSA_KV_F32, float, float)
-#if defined(QSA_HAS_FP8)
+#if defined(__GFX12__)
 QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_fp8, QSA_KV_FP8, unsigned char,
                     __hip_bfloat16)
+#endif
+#if defined(__gfx942__)
+QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char,
+                    float)
 #endif
 #if defined(QSA_HAS_Q8)
 QSA_DECODE_PROLOGUE(indexed_attention_decode_prologue_q8, QSA_KV_Q8, unsigned char,
@@ -3462,12 +3488,20 @@ static __device__ __forceinline__ void qsa_cache_append_batched(
     qsa_kv_store<F>(full_values + offset, v, kv_heads, head_dim, head, c, kv_amax);
 }
 
-#if defined(QSA_HAS_FP8)
+#if defined(__GFX12__)
 extern "C" __global__ __launch_bounds__(256) void indexed_attention_cache_append_fp8_batched(
     const float* key, const float* value, unsigned char* full_keys, unsigned char* full_values,
     int rows, int position_start, int kv_heads, int head_dim) {
     qsa_cache_append_batched<QSA_KV_FP8>(key, value, full_keys, full_values, rows,
                                          position_start, kv_heads, head_dim);
+}
+#endif
+#if defined(__gfx942__)
+extern "C" __global__ __launch_bounds__(256) void indexed_attention_cache_append_fp8_fnuz_batched(
+    const float* key, const float* value, unsigned char* full_keys, unsigned char* full_values,
+    int rows, int position_start, int kv_heads, int head_dim) {
+    qsa_cache_append_batched<QSA_KV_FP8_FNUZ>(key, value, full_keys, full_values, rows,
+                                              position_start, kv_heads, head_dim);
 }
 #endif
 #if defined(QSA_HAS_Q8)
@@ -4459,6 +4493,31 @@ static __device__ __forceinline__ void qsa_attention_batched_serial(
         denominator > 0.0f ? numerator / denominator / (1.0f + expf(-gate)) : 0.0f;
 }
 
+// gfx942 pins for the parallel attention kernels below (qsa_attention_row_parallel,
+// _hg4, _hg12). gfx942 hipcc -O3 packs independent multiplies into
+// v_pk_mul_f32 (SLP) and then adds them unfused, and fuses others into
+// v_pk_fma_f32, so a bare `acc += a * b` does not compile to the same
+// rounding as the serial kernel's. Observed in the gfx942 ISA of
+// indexed_attention_attention_f32_batched_serial: the key-dot chain is a
+// fused v_fmac chain in d order, while `numerator += weight * value` is a
+// v_mul_f32 followed by a packed add (product rounded, then added).
+// QSA_DOT_ACC / QSA_SUM_ACC pin exactly those two roundings in the parallel
+// kernels. __fadd_rn/__fmul_rn are plain operators in this HIP toolchain
+// (__clang_hip_math.h), so the unfused sum needs contract(off) to keep the
+// compiler from fusing it back into an fma. Every other architecture keeps
+// the bare expressions.
+#if defined(__gfx942__)
+static __device__ __forceinline__ float qsa_sum_acc_unfused(float acc, float w, float v) {
+#pragma clang fp contract(off)
+    return acc + w * v;
+}
+#define QSA_DOT_ACC(acc, a, b) ((acc) = __fmaf_rn((a), (b), (acc)))
+#define QSA_SUM_ACC(acc, w, v) ((acc) = qsa_sum_acc_unfused((acc), (w), (v)))
+#else
+#define QSA_DOT_ACC(acc, a, b) ((acc) += (a) * (b))
+#define QSA_SUM_ACC(acc, w, v) ((acc) += (w) * (v))
+#endif
+
 // One query row of the parallel attention below against `selected_len`
 // entries of `row_selected`; rows at or past `visible` count as invalid.
 template <int F>
@@ -4507,22 +4566,22 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
 #pragma unroll
                         for (int u = 0; u < 32; ++u) {
                             const float4 qv = q4[c + u];
-                            score += qv.x * k4[u].x;
-                            score += qv.y * k4[u].y;
-                            score += qv.z * k4[u].z;
-                            score += qv.w * k4[u].w;
+                            QSA_DOT_ACC(score, qv.x, k4[u].x);
+                            QSA_DOT_ACC(score, qv.y, k4[u].y);
+                            QSA_DOT_ACC(score, qv.z, k4[u].z);
+                            QSA_DOT_ACC(score, qv.w, k4[u].w);
                         }
                     }
                 } else if ((head_dim & 3) == 0) {
                     for (int d = 0; d < head_dim; d += 4) {
                         const float4 k4 = *reinterpret_cast<const float4*>(key + d);
-                        score += q[d] * k4.x;
-                        score += q[d + 1] * k4.y;
-                        score += q[d + 2] * k4.z;
-                        score += q[d + 3] * k4.w;
+                        QSA_DOT_ACC(score, q[d], k4.x);
+                        QSA_DOT_ACC(score, q[d + 1], k4.y);
+                        QSA_DOT_ACC(score, q[d + 2], k4.z);
+                        QSA_DOT_ACC(score, q[d + 3], k4.w);
                     }
                 } else {
-                    for (int d = 0; d < head_dim; ++d) score += q[d] * key[d];
+                    for (int d = 0; d < head_dim; ++d) QSA_DOT_ACC(score, q[d], key[d]);
                 }
             } else {
                 float dots[1] = {0.0f};
@@ -4586,7 +4645,7 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
         for (int u = 0; u < UNROLL; ++u) {
             const float weight = row_scores[i + u];
             denominator += weight;
-            numerator += weight * (row_tokens[i + u] < 0 ? 0.0f : value[u]);
+            QSA_SUM_ACC(numerator, weight, (row_tokens[i + u] < 0 ? 0.0f : value[u]));
         }
 #pragma unroll
         for (int u = 0; u < UNROLL; ++u) value[u] = next[u];
@@ -4596,7 +4655,7 @@ static __device__ __forceinline__ void qsa_attention_row_parallel(
         const float weight = row_scores[i];
         const float value = token < 0 ? 0.0f : load(token);
         denominator += weight;
-        numerator += weight * value;
+        QSA_SUM_ACC(numerator, weight, value);
     }
     float gate = q[head_dim + channel];
     output_row[head * head_dim + channel] =
@@ -4719,10 +4778,10 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
 #pragma unroll
                     for (int h = 0; h < QSA_HG; ++h) {
                         const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
-                        score[h] += q4.x * k4.x;
-                        score[h] += q4.y * k4.y;
-                        score[h] += q4.z * k4.z;
-                        score[h] += q4.w * k4.w;
+                        QSA_DOT_ACC(score[h], q4.x, k4.x);
+                        QSA_DOT_ACC(score[h], q4.y, k4.y);
+                        QSA_DOT_ACC(score[h], q4.z, k4.z);
+                        QSA_DOT_ACC(score[h], q4.w, k4.w);
                     }
                 }
             } else {
@@ -4802,26 +4861,26 @@ static __device__ __forceinline__ void qsa_attention_batched_hg4(
         for (int u = 0; u < 16; ++u) {
             const float4 w4 = *reinterpret_cast<const float4*>(weights + (i + u) * QSA_HG);
             denominator[0] += w4.x;
-            numerator[0] += w4.x * value[u];
+            QSA_SUM_ACC(numerator[0], w4.x, value[u]);
             denominator[1] += w4.y;
-            numerator[1] += w4.y * value[u];
+            QSA_SUM_ACC(numerator[1], w4.y, value[u]);
             denominator[2] += w4.z;
-            numerator[2] += w4.z * value[u];
+            QSA_SUM_ACC(numerator[2], w4.z, value[u]);
             denominator[3] += w4.w;
-            numerator[3] += w4.w * value[u];
+            QSA_SUM_ACC(numerator[3], w4.w, value[u]);
         }
     }
     for (; i < selected_len; ++i) {
         const float value = value_at(i);
         const float4 w4 = *reinterpret_cast<const float4*>(weights + i * QSA_HG);
         denominator[0] += w4.x;
-        numerator[0] += w4.x * value;
+        QSA_SUM_ACC(numerator[0], w4.x, value);
         denominator[1] += w4.y;
-        numerator[1] += w4.y * value;
+        QSA_SUM_ACC(numerator[1], w4.y, value);
         denominator[2] += w4.z;
-        numerator[2] += w4.z * value;
+        QSA_SUM_ACC(numerator[2], w4.z, value);
         denominator[3] += w4.w;
-        numerator[3] += w4.w * value;
+        QSA_SUM_ACC(numerator[3], w4.w, value);
     }
 #pragma unroll
     for (int h = 0; h < QSA_HG; ++h) {
@@ -4900,10 +4959,10 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
 #pragma unroll
                 for (int h = 0; h < QSA_G; ++h) {
                     const float4 q4 = reinterpret_cast<const float4*>(qg + h * QSA_HD * 2)[d4];
-                    scores[t][h] += q4.x * k4.x;
-                    scores[t][h] += q4.y * k4.y;
-                    scores[t][h] += q4.z * k4.z;
-                    scores[t][h] += q4.w * k4.w;
+                    QSA_DOT_ACC(scores[t][h], q4.x, k4.x);
+                    QSA_DOT_ACC(scores[t][h], q4.y, k4.y);
+                    QSA_DOT_ACC(scores[t][h], q4.z, k4.z);
+                    QSA_DOT_ACC(scores[t][h], q4.w, k4.w);
                 }
             }
         }
@@ -4982,13 +5041,13 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
                 for (int q = 0; q < QSA_G / 4; ++q) {
                     const float4 w = w4[q];
                     denominator[4 * q] += w.x;
-                    numerator[4 * q] += w.x * value[k];
+                    QSA_SUM_ACC(numerator[4 * q], w.x, value[k]);
                     denominator[4 * q + 1] += w.y;
-                    numerator[4 * q + 1] += w.y * value[k];
+                    QSA_SUM_ACC(numerator[4 * q + 1], w.y, value[k]);
                     denominator[4 * q + 2] += w.z;
-                    numerator[4 * q + 2] += w.z * value[k];
+                    QSA_SUM_ACC(numerator[4 * q + 2], w.z, value[k]);
                     denominator[4 * q + 3] += w.w;
-                    numerator[4 * q + 3] += w.w * value[k];
+                    QSA_SUM_ACC(numerator[4 * q + 3], w.w, value[k]);
                 }
             }
         }
@@ -4999,13 +5058,13 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
             for (int q = 0; q < QSA_G / 4; ++q) {
                 const float4 w = w4[q];
                 denominator[4 * q] += w.x;
-                numerator[4 * q] += w.x * value;
+                QSA_SUM_ACC(numerator[4 * q], w.x, value);
                 denominator[4 * q + 1] += w.y;
-                numerator[4 * q + 1] += w.y * value;
+                QSA_SUM_ACC(numerator[4 * q + 1], w.y, value);
                 denominator[4 * q + 2] += w.z;
-                numerator[4 * q + 2] += w.z * value;
+                QSA_SUM_ACC(numerator[4 * q + 2], w.z, value);
                 denominator[4 * q + 3] += w.w;
-                numerator[4 * q + 3] += w.w * value;
+                QSA_SUM_ACC(numerator[4 * q + 3], w.w, value);
             }
         }
         __syncthreads();
@@ -5020,6 +5079,8 @@ extern "C" __global__ __launch_bounds__(256) void indexed_attention_attention_f3
     }
 }
 #undef QSA_G
+#undef QSA_DOT_ACC
+#undef QSA_SUM_ACC
 #undef QSA_T
 #undef QSA_HD
 
@@ -5144,8 +5205,11 @@ static __device__ __forceinline__ void qsa_attention_single(
     QSA_ATTENTION_SINGLE(indexed_attention_attention_##TAG, qsa_attention_single,           \
                          __launch_bounds__(256), FORMAT, CACHE)
 QSA_ATTENTION_KERNELS(f32, QSA_KV_F32, float)
-#if defined(QSA_HAS_FP8)
+#if defined(__GFX12__)
 QSA_ATTENTION_KERNELS(fp8, QSA_KV_FP8, unsigned char)
+#endif
+#if defined(__gfx942__)
+QSA_ATTENTION_KERNELS(fp8_fnuz, QSA_KV_FP8_FNUZ, unsigned char)
 #endif
 #if defined(QSA_HAS_Q8)
 QSA_ATTENTION_KERNELS(q8, QSA_KV_Q8, unsigned char)

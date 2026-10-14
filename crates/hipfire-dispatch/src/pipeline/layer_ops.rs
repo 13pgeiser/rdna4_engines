@@ -1945,7 +1945,7 @@ impl GatedDeltaNetOp<'_> {
 /// reads. Exported so producers outside the dispatch (the NPU trunk twin) write
 /// the same layout instead of re-deriving it.
 pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
-    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
+    let persistent_batch = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && gpu.route_rows(op.rows) > 1
         && op.key_dim == 128
         && op.value_dim == 128
@@ -2301,7 +2301,7 @@ fn execute_gated_delta_net_hc_impl(
     let mut beta = view(op.beta, 0, rows * op.value_heads);
     let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
+    let persistent_batch = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && gpu.route_rows(rows) > 1
         && op.key_dim == 128
         && op.value_dim == 128

@@ -2577,6 +2577,10 @@ pub enum QsaKvFormat {
     /// Q8_0 K/V (32-element blocks of one f16 scale and 32 int8 codes, the
     /// dense q8 KV row; gfx11 and gfx12), BF16 index keys.
     Q8,
+    /// E4M3 FNUZ K/V with one f16 scale per head and token (the [`Self::Fp8`]
+    /// row layout with the gfx942 FNUZ code points; gfx942 only), F32 index
+    /// keys.
+    Fp8Fnuz,
 }
 
 impl QsaKvFormat {
@@ -2585,6 +2589,7 @@ impl QsaKvFormat {
             Self::F32 => "f32",
             Self::Fp8 => "fp8",
             Self::Q8 => "q8",
+            Self::Fp8Fnuz => "fp8_fnuz",
         }
     }
 
@@ -2594,7 +2599,7 @@ impl QsaKvFormat {
             Self::F32 => head_dim > 0,
             // Whole-head scales over one 256-thread block, and 4-byte aligned
             // code rows (`kv_heads * 258` bytes).
-            Self::Fp8 => head_dim == 256 && kv_heads % 2 == 0,
+            Self::Fp8 | Self::Fp8Fnuz => head_dim == 256 && kv_heads % 2 == 0,
             // One 256-thread block per head, eight 32-lane Q8_0 blocks, and
             // 4-byte aligned block pairs (272-byte heads).
             Self::Q8 => head_dim == 256 && kv_heads > 0,
@@ -2605,7 +2610,7 @@ impl QsaKvFormat {
     pub const fn kv_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 | Self::Q8 => DType::Raw,
+            Self::Fp8 | Self::Q8 | Self::Fp8Fnuz => DType::Raw,
         }
     }
 
@@ -2613,7 +2618,7 @@ impl QsaKvFormat {
     pub const fn kv_row_units(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim,
-            Self::Fp8 => kv_heads * (head_dim + 2),
+            Self::Fp8 | Self::Fp8Fnuz => kv_heads * (head_dim + 2),
             Self::Q8 => kv_heads * (head_dim / 32) * 34,
         }
     }
@@ -2622,20 +2627,20 @@ impl QsaKvFormat {
     pub const fn kv_row_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim * 4,
-            Self::Fp8 | Self::Q8 => self.kv_row_units(kv_heads, head_dim),
+            Self::Fp8 | Self::Q8 | Self::Fp8Fnuz => self.kv_row_units(kv_heads, head_dim),
         }
     }
 
     /// Dtype of the raw and pooled index-key arenas.
     pub const fn index_dtype(self) -> DType {
         match self {
-            Self::F32 => DType::F32,
+            Self::F32 | Self::Fp8Fnuz => DType::F32,
             Self::Fp8 | Self::Q8 => DType::BF16,
         }
     }
 
-    /// This format's entry of a `[f32, fp8, q8]` kernel-name table.
-    fn kernel(self, names: [&'static str; 3]) -> &'static str {
+    /// This format's entry of a `[f32, fp8, q8, fp8_fnuz]` kernel-name table.
+    fn kernel(self, names: [&'static str; 4]) -> &'static str {
         names[self as usize]
     }
 }
@@ -2784,6 +2789,9 @@ fn check_qsa_format(
     if format == QsaKvFormat::Fp8 && !(gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201()) {
         return Err(HipError::new(0, "QSA fp8 K/V needs a gfx12 device"));
     }
+    if format == QsaKvFormat::Fp8Fnuz && !gpu.arch_caps.is_gfx942() {
+        return Err(HipError::new(0, "QSA fp8 FNUZ K/V needs a gfx942 device"));
+    }
     if format == QsaKvFormat::Q8 && !gpu.arch_caps.has_gfx11_plus_simt() {
         return Err(HipError::new(0, "QSA q8 K/V needs a gfx11 or gfx12 device"));
     }
@@ -2875,6 +2883,7 @@ pub fn indexed_attention_decode_prologue(
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
         "indexed_attention_decode_prologue_q8",
+        "indexed_attention_decode_prologue_fp8_fnuz",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3002,6 +3011,7 @@ pub fn indexed_attention_append_prologue(
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
         "indexed_attention_decode_prologue_q8",
+        "indexed_attention_decode_prologue_fp8_fnuz",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3240,6 +3250,7 @@ pub fn indexed_attention_cache_append_batch(
         "indexed_attention_cache_append_f32_batched",
         "indexed_attention_cache_append_fp8_batched",
         "indexed_attention_cache_append_q8_batched",
+        "indexed_attention_cache_append_fp8_fnuz_batched",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -3591,7 +3602,7 @@ fn indexed_attention_select_batch_impl(
     shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
-    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+    let parallel = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && shape_blocks > 0
         && !select_forced_serial();
     // Live F32 launches use the score/select pair. Covered BF16 prefill
@@ -3646,7 +3657,7 @@ fn indexed_attention_select_fused(
     let lds_bytes = shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
-    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+    let parallel = gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && shape_blocks > 0
         && !select_forced_serial();
     // Past the LDS row the scores go to global rows (one per workgroup, at
@@ -3727,7 +3738,8 @@ fn indexed_attention_select_fused(
     } else {
         p.block_count.saturating_mul(std::mem::size_of::<f32>())
     });
-    let launch_exact = *QWEN4_QSA_SELECT_EXACT
+    let launch_exact = qsa_select_exact_arch(&gpu.arch_caps)
+        && *QWEN4_QSA_SELECT_EXACT
         && kernel_name == parallel_kernel
         && p.block_count <= QSA_SELECT_EXACT_MAX_BLOCKS
         && p.budget_blocks <= QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS
@@ -3832,6 +3844,13 @@ impl QsaSelectPmArm {
 const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
 /// Prefill admission remains independent of the decode kill switch.
 const QSA_SELECT_PM_MIN_ROWS: usize = 512;
+
+/// The exact selector (`indexed_attention_select_exact.hip`) is `mov_dpp8`
+/// code, gfx11+ ISA only: gfx942 gets the parallel incumbent selector, never
+/// this one, even under `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1`.
+fn qsa_select_exact_arch(caps: &crate::arch_caps::ArchCaps) -> bool {
+    caps.has_gfx11_plus_simt()
+}
 
 /// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
 /// admitted rows, the fixed four-head / 128-dim F32-query geometry with F32 or
@@ -4451,11 +4470,13 @@ pub fn indexed_attention_attention(
             "indexed_attention_attention_f32",
             "indexed_attention_attention_fp8",
             "indexed_attention_attention_q8",
+            "indexed_attention_attention_fp8_fnuz",
         ]),
         p.format.kernel([
             "indexed_attention_attention_f32_serial",
             "indexed_attention_attention_fp8_serial",
             "indexed_attention_attention_q8_serial",
+            "indexed_attention_attention_fp8_fnuz_serial",
         ]),
     ];
     let (kernel_name, shared_mem) =
@@ -4550,7 +4571,7 @@ fn qsa_attention_hg4_lds_bytes(
     shape_selected: usize,
 ) -> Option<u32> {
     let group = p.n_heads / p.n_kv_heads;
-    if !gpu.arch_caps.has_gfx11_plus_simt()
+    if !gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
         || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
@@ -4724,7 +4745,7 @@ fn indexed_attention_attention_batch_arena(
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
     let hg12 = allow_fast
         && p.format == QsaKvFormat::F32
-        && gpu.arch_caps.has_gfx11_plus_simt()
+        && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && p.head_dim == 256
         && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
         && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
@@ -4748,6 +4769,7 @@ fn indexed_attention_attention_batch_arena(
                 "indexed_attention_attention_f32_batched_hg4",
                 "indexed_attention_attention_fp8_batched_hg4",
                 "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_fp8_fnuz_batched_hg4",
             ]),
             [
                 checked_u32(
@@ -4764,7 +4786,7 @@ fn indexed_attention_attention_batch_arena(
         let dim_grid = blocks(p.head_dim)?;
         match shape_selected.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
+                if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
                     && shape_selected > 0
                     // The kernel adds 32 bytes of static LDS (per-wave maxes).
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
@@ -4775,6 +4797,7 @@ fn indexed_attention_attention_batch_arena(
                         "indexed_attention_attention_f32_batched",
                         "indexed_attention_attention_fp8_batched",
                         "indexed_attention_attention_q8_batched",
+                        "indexed_attention_attention_fp8_fnuz_batched",
                     ]),
                     [head_grid, dim_grid, row_grid],
                     bytes as u32,
@@ -4785,6 +4808,7 @@ fn indexed_attention_attention_batch_arena(
                     "indexed_attention_attention_f32_batched_serial",
                     "indexed_attention_attention_fp8_batched_serial",
                     "indexed_attention_attention_q8_batched_serial",
+                    "indexed_attention_attention_fp8_fnuz_batched_serial",
                 ]),
                 [head_grid, dim_grid, row_grid],
                 0,
@@ -4951,6 +4975,7 @@ pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
             QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
             QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
             QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
+            QsaKvFormat::Fp8Fnuz => false,
         }
 }
 
@@ -5136,6 +5161,9 @@ fn qsa_gathered_wmma_launch_with(
             built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_kv_f16vb_fp8_pm_gfx1201"),
             built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_gathered_wmma_f16_pm_gfx1201"),
         ),
+        (QsaKvFormat::Fp8Fnuz, _) => {
+            return Err(HipError::new(0, "QSA fp8 FNUZ K/V has no gathered WMMA route"));
+        }
     };
     let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
     // The persistent arena has no per-launch convert kernel to ensure.
@@ -5479,6 +5507,24 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_exact_selector_stays_gfx11_plus_only() {
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx1100"));
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            assert!(qsa_select_exact_arch(&caps), "{arch}");
+            assert!(caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        // gfx942 gets the parallel incumbent selector, never the mov_dpp8 one.
+        let gfx942 = crate::arch_caps::ArchCaps::new("gfx942", flags.clone());
+        assert!(gfx942.has_qwen4_parallel_qsa_gdn());
+        assert!(!qsa_select_exact_arch(&gfx942));
+        for arch in ["gfx940", "gfx941"] {
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            assert!(!qsa_select_exact_arch(&caps) && !caps.has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+    }
 
     #[test]
     fn qsa_f16_arena_sizing_and_alignment() {
@@ -10213,18 +10259,21 @@ mod tests {
         gpu.free_tensor(norm).expect("free norm");
     }
 
-    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only;
-    /// q8: gfx11 and gfx12).
+    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12;
+    /// fp8 FNUZ: gfx942; q8: gfx11 and gfx12).
     fn quantized_qsa_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
         let mut formats = Vec::new();
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
             formats.push(QsaKvFormat::Fp8);
         }
+        if gpu.arch_caps.is_gfx942() {
+            formats.push(QsaKvFormat::Fp8Fnuz);
+        }
         if gpu.arch_caps.has_gfx11_plus_simt() {
             formats.push(QsaKvFormat::Q8);
         }
         if formats.is_empty() {
-            eprintln!("skip: quantized QSA K/V needs a gfx11 or gfx12 GPU");
+            eprintln!("skip: quantized QSA K/V needs a gfx11, gfx12 or gfx942 GPU");
         }
         formats
     }
@@ -10280,7 +10329,7 @@ mod tests {
             let base = token * row;
             for element in 0..kv_heads * head_dim {
                 values.push(match format {
-                    QsaKvFormat::Fp8 => {
+                    QsaKvFormat::Fp8 | QsaKvFormat::Fp8Fnuz => {
                         let scale = half(base + kv_heads * head_dim + element / head_dim * 2);
                         e4m3_to_f32(bytes[base + element]) * scale
                     }

@@ -8,15 +8,22 @@
 //!
 //! Route of record on gfx942 (census: `local://census-gdn.md`):
 //! `execute_gated_delta_net_hc_impl` (`hipfire-dispatch/src/pipeline/layer_ops.rs`)
-//! takes `persistent_batch = has_gfx11_plus_simt() && ...`, false on gfx942, so
-//! BOTH prefill and decode run the per-row chain
-//!   `gated_delta_conv_params` -> `gated_delta_step_gated` (unfused:
-//!   `gated_delta_step` + `gated_delta_gate`), one row at a time. Cases 1-4
-//! cover exactly those kernels. Cases 5-7 cover the batched/persistent kernels
-//! (`gated_delta_{conv_params,step,gate}_batched`) that the gfx942 route does
-//! NOT launch today (they compile and run on gfx942; they are the route's
-//! rows > 1 kernels on gfx11+): they pin the kernels' own claim that a
-//! batched launch is bitwise `rows` sequential single-row launches.
+//! takes `persistent_batch = has_qwen4_parallel_qsa_gdn() && route_rows(rows) >
+//! 1 && 128x128 heads && conv kernel 4` (`has_gfx11_plus_simt() ||
+//! is_gfx942()`). Decode (one row, outside the prefill scope) runs the per-row
+//! chain `gated_delta_conv_params` -> `gated_delta_step_gated` (unfused on
+//! gfx942: `gated_delta_step` + `gated_delta_gate`): cases 1-4. Autoregressive
+//! prefill (the scope pins `route_rows` to 8192, even for one row) now runs
+//! `gated_delta_conv_params_batched` -> `gated_delta_step_batched` (the F32
+//! persistent256 recurrence) -> `gated_delta_gate_batched`: cases 5-7. Only
+//! that F32 persistent route is covered here: native gfx942 MTP verify / row
+//! capture is not claimed (its gate is the original gfx11+ one) and the
+//! Q8-state persistent kernels are not covered by these cases. The WMMA chunk
+//! route is gfx11 only (`has_wmma_w32`), so gfx942 never takes it. On gfx942
+//! the F32 persistent256 body pins the sequential kernels' expression order
+//! with explicit `__fmul_rn` / `__fmaf_rn` chains (hipcc otherwise packs
+//! independent multiplies), so a batched F32 launch must equal `rows`
+//! sequential single-row launches bit for bit.
 //!
 //! CPU twin: the kernels' math transcribed from `kernels/src/tensor_ops.hip`
 //! (cited per function). `hipfire-arch-qwen4/src/ops.rs:391 gdn_step` and
@@ -399,8 +406,9 @@ struct ConvOut {
     beta: Vec<f32>,
 }
 
-/// The gfx942 route's per-row launch (`layer_ops.rs`, `gated_delta_conv_params`
-/// with `history == next_history`). `fused == false` runs the two standalone
+/// The gfx942 decode route's per-row launch (`layer_ops.rs`, `gated_delta_conv_params`
+/// with `history == next_history`; also the sequential baseline the batched
+/// kernels are compared with). `fused == false` runs the two standalone
 /// kernels (`gated_delta_conv_bf16_f32`, `gated_delta_params_bf16_f32`) the
 /// fused kernel claims to be bitwise equal to.
 fn gpu_conv_params_rows(gpu: &mut Gpu, rows: usize, c: &ConvIn, fused: bool) -> Result<ConvOut, String> {
@@ -455,8 +463,8 @@ fn gpu_conv_params_rows(gpu: &mut Gpu, rows: usize, c: &ConvIn, fused: bool) -> 
     Ok(result)
 }
 
-/// Kernels: `gated_delta_conv_params_bf16_f32` (the route's per-row launch,
-/// decode and prefill) plus, cross-checked bitwise, `gated_delta_conv_bf16_f32`
+/// Kernels: `gated_delta_conv_params_bf16_f32` (the decode route's per-row
+/// launch: one row outside the prefill scope) plus, cross-checked bitwise, `gated_delta_conv_bf16_f32`
 /// and `gated_delta_params_bf16_f32`. `ROW_COUNTS` sequential rows carry the
 /// conv ring state in and out (start cursor 2, so the ring wraps), aliasing
 /// `history` and `next_history` exactly like the route.
@@ -553,7 +561,9 @@ fn gate_decode(gpu: &mut Gpu) -> Result<String, String> {
 
 // ═══════════════════ decode step + gate (route: gated_delta_step_gated) ═══════
 
-/// Route launch `gated_delta_step_gated` on an F32 state. gfx942 branch
+/// Decode route launch (one row outside the prefill scope; the single-row
+/// `gated_delta_step_gated` keeps its gfx11+ fused gate, so it stays unfused on
+/// gfx942) `gated_delta_step_gated` on an F32 state. gfx942 branch
 /// (`has_gfx11_plus_simt()` false): `gated_delta_step_f32` (block 256, grid
 /// [48, 1]) then `gated_delta_gate_bf16_f32`; the gfx11+ fused kernel
 /// (`..._gate_norm128_gfx1151`, atomics) is not taken, and when it is (other
@@ -777,7 +787,7 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
     Ok(format!("{rows} sequential Q8 steps ok; last: {last}"))
 }
 
-// ══════════ batched / persistent kernels (NOT launched by the gfx942 route) ═════
+// ══════════ batched / persistent kernels (the gfx942 AR prefill route) ═════════════
 
 /// `gated_delta_conv_bf16_f32_batched_k4` + the parameter blocks
 /// (`gated_delta_conv_params_batched`, F32 in/out) against the per-row launch
