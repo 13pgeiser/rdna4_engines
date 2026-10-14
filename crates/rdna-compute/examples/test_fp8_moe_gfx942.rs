@@ -23,15 +23,17 @@
 //!    index 0 and 5, == bytes(M=1)).
 //! 5. `--byte-identity` (exact-byte A/B gate for any kernel candidate): the whole
 //!    suite above runs with every grouped launch executed twice per X dtype,
-//!    once through the retained P1 baseline (`cdc37659a` body, compiled as the
-//!    test-only module behind `-DFP8MOE_TEST_REFERENCE=1`; hidden launcher
+//!    once through the retained P1 baseline (`cdc37659a` body, compiled from the
+//!    standalone SHA-pinned snapshot
+//!    `tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip`, no code
+//!    shared with the production kernel; hidden launcher
 //!    `gemm_fp8b128_moe_grouped_bf16mfma_reference`, never a production
 //!    selection) and once through the production entry, over the same
 //!    descriptors/X/POISON-filled Y; the raw F32 bits of the WHOLE Y (live,
 //!    padding, skipped-tile and guard sentinel rows, signed zeros) must be
 //!    identical, zero mismatches. The baseline's bytes stay the reference: it
 //!    is never re-pinned to the candidate. The mode adds (a) the R in
-//!    {16,48,80} x K in {128,384} output-wave/prefetch-tail shapes through the
+//!    {16,48,80} x K in {128,256,384} (K=256 = one full D=2 group) output-wave/prefetch-tail shapes through the
 //!    full existing case, (b) finite-FP8 +/-0/subnormal/max/sign codes over
 //!    extreme/zero/negative/subnormal scales, (c) BF16 X with +/-0, subnormals,
 //!    extreme exponents and cancellation-heavy (exactly mirrored W/X, so the
@@ -40,7 +42,14 @@
 //!    top-10 routes over 512 experts at the real 1280x2560 / 2560x640 shapes,
 //!    compared on every live output with no F64 oracle at those sizes.
 //!
+//! 6. `--time` (exclusive of the suite; needs no fixtures): reference-vs-production
+//!    kernel timing, see [`time_mode`]: per X dtype x {gate_up, down} x tokens
+//!    {1,16,512,2048} (top-10-of-512 routes; 1 token = C1), 5 warmups + 60
+//!    alternating event-timed launches into reused buffers, whole-Y raw-bit
+//!    mismatch counts, JSON with source/object/compiler hashes.
+//!
 //! Run: `cargo run --release -p rdna-compute --features lab --example test_fp8_moe_gfx942 -- [--fixtures DIR] [--byte-identity]`
+//! Time: `... -- --time [--time-out PATH.json] [--time-tokens 1,16,512,2048] [--time-shapes gate_up,down] [--time-xdt f32|bf16|both]`
 
 use rdna_compute::fp8_e4m3::{b128_block_stride, b128_scale_count, bf16_to_f32, dequant_b128_block};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -559,17 +568,28 @@ fn ab_route(gpu: &mut Gpu, fail: &mut Fail, name: &str, ex: &Experts, xb: &[u16]
 /// Mandatory `--byte-identity` additions (everything else is the full existing
 /// suite with A/B enabled on every grouped launch).
 fn byte_cases(gpu: &mut Gpu, fail: &mut Fail) {
-    // (a) R in {16,48,80} (output-wave tails) x K in {128,384} (prefetch
-    // tails) through the FULL existing case (F64 oracle, both X dtypes,
-    // padded/compact/skipped tiles, M-invariance, tile positions).
-    for (r, k) in [(16usize, 128usize), (16, 384), (48, 128), (48, 384), (80, 128), (80, 384)] {
+    // (a) R in {16,48,80} (output-wave tails) x K in {128,256,384} (K=256: exactly
+    // one full D=2 prefetch group; 128/384: odd/tail groups) through the FULL
+    // existing case (F64 oracle, both X dtypes, padded/compact/skipped tiles,
+    // M-invariance, tile positions).
+    for (r, k) in [(16usize, 128usize), (16, 256), (16, 384), (48, 128), (48, 256), (48, 384), (80, 128), (80, 256), (80, 384)] {
         let ex = Experts::synthetic(r, k, 12, 0x7a11_0000 ^ (r * 1000 + k) as u64);
         for (div, tokens) in [(10usize, 37usize), (1, 13)] {
             gemm_case(gpu, fail, &format!("tail r={r} k={k} x_row_div={div}"), &ex, div, tokens, true);
         }
     }
 
-    let shapes = [(16usize, 128usize, 10usize), (48, 128, 1), (80, 384, 10), (80, 384, 1), (1280, 2560, 10), (2560, 640, 1)];
+    let shapes = [
+        (16usize, 128usize, 10usize),
+        (16, 256, 10),
+        (48, 128, 1),
+        (48, 256, 1),
+        (80, 256, 10),
+        (80, 384, 10),
+        (80, 384, 1),
+        (1280, 2560, 10),
+        (2560, 640, 1),
+    ];
     let tokens = 37usize;
     for (r, k, div) in shapes {
         let x_rows = if div == 1 { tokens * 10 } else { tokens };
@@ -805,6 +825,314 @@ fn read(dir: &str, f: &str) -> Vec<u8> {
     std::fs::read(format!("{dir}/{f}")).unwrap_or_else(|e| panic!("read {dir}/{f}: {e}"))
 }
 
+// ── Timing (`--time`) ────────────────────────────────────────────────────
+
+const TIME_WARMUPS: usize = 5;
+const TIME_LAUNCHES: usize = 60;
+const TIME_CACHE_POLICY: &str = "warm: no L2/MALL flush or eviction between launches; every launch re-reads the same \
+                                 weight/X/descriptor buffers; reference and candidate alternate (order swapped every \
+                                 iteration) over identical buffers";
+
+/// Device buffers of one timed route, allocated once and reused by every launch.
+struct TimedRoute<'a> {
+    r: usize,
+    k: usize,
+    n_exp: usize,
+    stride: usize,
+    d_payload: &'a GpuTensor,
+    d_tiles: &'a GpuTensor,
+    n_tiles: usize,
+    d_rows: &'a GpuTensor,
+    n_sorted: usize,
+    x_f32: &'a GpuTensor,
+    x_bf16: &'a GpuTensor,
+    x_row_div: usize,
+    x_rows: usize,
+}
+
+/// One launch into caller-owned `y`: no allocation, sync or download.
+fn timed_launch(gpu: &mut Gpu, rt: &TimedRoute, bf16_x: bool, reference: bool, y: &GpuTensor) {
+    let x = if bf16_x { rt.x_bf16 } else { rt.x_f32 };
+    let mut dev = gpu.try_gfx942().expect("exact gfx942");
+    let res = if reference {
+        dev.gemm_fp8b128_moe_grouped_bf16mfma_reference(
+            rt.d_payload, rt.stride, rt.n_exp, rt.d_tiles, rt.n_tiles, rt.d_rows, x, rt.x_row_div, rt.x_rows, y,
+            rt.n_sorted, rt.r, rt.k,
+        )
+    } else {
+        dev.gemm_fp8b128_moe_grouped_bf16mfma(
+            rt.d_payload, rt.stride, rt.n_exp, rt.d_tiles, rt.n_tiles, rt.d_rows, x, rt.x_row_div, rt.x_rows, y,
+            rt.n_sorted, rt.r, rt.k,
+        )
+    };
+    res.unwrap_or_else(|e| panic!("timed grouped launch (reference={reference}): {e:?}"));
+}
+
+/// Event-timed span (microseconds) of `n` back-to-back runs of `f`, synchronized
+/// on the stop event only.
+fn event_span_us(gpu: &mut Gpu, e0: &hip_bridge::Event, e1: &hip_bridge::Event, n: usize, mut f: impl FnMut(&mut Gpu)) -> f64 {
+    gpu.hip.event_record(e0, gpu.active_stream.as_ref()).expect("record start");
+    for _ in 0..n {
+        f(gpu);
+    }
+    gpu.hip.event_record(e1, gpu.active_stream.as_ref()).expect("record stop");
+    gpu.hip.event_synchronize(e1).expect("sync stop");
+    gpu.hip.event_elapsed_ms(e0, e1).expect("elapsed") as f64 * 1000.0
+}
+
+fn median_us(samples: &[f64]) -> f64 {
+    let mut v = samples.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
+fn samples_json(samples: &[f64], burst_mean_us: f64, useful_flops: f64) -> serde_json::Value {
+    let med = median_us(samples);
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    serde_json::json!({
+        "median_us": med,
+        "min_us": min,
+        "max_us": samples.iter().copied().fold(0.0, f64::max),
+        "useful_tflops_at_median": useful_flops / (med * 1e-6) / 1e12,
+        "burst_mean_us": burst_mean_us,
+        "useful_tflops_at_burst_mean": useful_flops / (burst_mean_us * 1e-6) / 1e12,
+        "samples_us": samples,
+    })
+}
+
+fn sha_hex(parts: &[&[u8]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn i32_bytes(v: &[i32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn identity_json(id: &rdna_compute::cdna::gfx942::Fp8MoeBuildIdentity) -> serde_json::Value {
+    serde_json::json!({
+        "module": id.module,
+        "source_sha256": id.source_sha256,
+        "jit_cache_key": id.jit_cache_key,
+        "object_sha256": id.object_sha256,
+        "object_path": id.object_path,
+        "compiler": id.toolchain_id,
+    })
+}
+
+/// `--time [--time-out PATH] [--time-tokens 1,16,512,2048] [--time-shapes gate_up,down]
+/// [--time-xdt f32|bf16|both]`: reference-vs-production kernel timing at the real
+/// shapes (gate_up r=1280 k=2560 x_row_div=10, down r=2560 k=640 x_row_div=1),
+/// synthetic top-10-of-512 routes (the byte gate's routes: tokens=1 is C1, ten
+/// distinct experts), padded-16 tiles. Per (X dtype, shape, tokens) the
+/// reference and the production entry run 5 warmups each, then 60 event-timed
+/// single launches alternating (order swapped each iteration) into reused
+/// buffers, plus one back-to-back burst of 60 per side (launch-gap-free mean).
+/// After timing, the WHOLE Y of both sides is downloaded and compared on raw
+/// F32 bits; any mismatch fails the run (exit 1) after the JSON is written.
+fn time_mode(gpu: &mut Gpu, args: &[String]) {
+    let opt = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
+    let out_path = opt("--time-out").unwrap_or_else(|| "fp8_moe_time.json".to_string());
+    let tokens_sel: Vec<usize> = opt("--time-tokens")
+        .map(|s| s.split(',').map(|t| t.trim().parse().expect("--time-tokens")).collect())
+        .unwrap_or_else(|| vec![1, 16, 512, 2048]);
+    let shapes_sel = opt("--time-shapes").unwrap_or_else(|| "gate_up,down".to_string());
+    let xdt = opt("--time-xdt").unwrap_or_else(|| "both".to_string());
+    let dtypes: Vec<bool> = match xdt.as_str() {
+        "f32" => vec![false],
+        "bf16" => vec![true],
+        "both" => vec![false, true],
+        other => panic!("--time-xdt must be f32|bf16|both, got {other}"),
+    };
+    let shapes: Vec<(&str, usize, usize, usize)> = [("gate_up", 1280usize, 2560usize, 10usize), ("down", 2560, 640, 1)]
+        .into_iter()
+        .filter(|(l, ..)| shapes_sel.split(',').any(|s| s.trim() == *l))
+        .collect();
+    assert!(!shapes.is_empty(), "--time-shapes selects no shape");
+
+    let e0 = gpu.hip.event_create().expect("start event");
+    let e1 = gpu.hip.event_create().expect("stop event");
+    let mut records = Vec::new();
+    let mut total_mismatch = 0u64;
+    let mut identities = None;
+
+    for &(label, r, k, div) in &shapes {
+        let ex = Experts::ab_only(r, k, 512, |e| {
+            let mut s = expert_seed(0x7a46_e700 ^ r as u64, e);
+            let codes = rand_codes4(r * k, &mut s);
+            (codes, (0..b128_scale_count(r, k).unwrap()).map(|_| rand_scale(&mut s)).collect())
+        });
+        let stride = b128_block_stride(r, k).unwrap();
+        let weights_digest = sha_hex(&[&ex.payload]);
+        let d_payload = upload_bytes(gpu, &ex.payload);
+        for &tokens in &tokens_sel {
+            let mut st = 0x7a46_0000_u64 ^ tokens as u64 ^ (r as u64) << 24;
+            let slots: Vec<usize> =
+                if tokens == 1 { (0..10).map(|j| j * 51 + 7).collect() } else { zipf_slots(tokens, 512, &mut st, false) };
+            let x_rows = if div == 1 { slots.len() } else { tokens };
+            let xb = random_x(x_rows, k, 0x7a46_5eed ^ tokens as u64);
+            let (tiles, rows) = scatter(&slots, ex.n, true);
+            let flat_tiles: Vec<i32> = tiles.iter().flatten().copied().collect();
+            let mut uniq: Vec<usize> = slots.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let route_digest = sha_hex(&[
+                &(r as u64).to_le_bytes(),
+                &(k as u64).to_le_bytes(),
+                &(div as u64).to_le_bytes(),
+                &(ex.n as u64).to_le_bytes(),
+                &i32_bytes(&flat_tiles),
+                &i32_bytes(&rows),
+            ]);
+            let x_digest = sha_hex(&[&xb.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()]);
+            let useful_flops = 2.0 * slots.len() as f64 * r as f64 * k as f64;
+
+            let d_tiles = upload_i32(gpu, &flat_tiles);
+            let d_rows = upload_i32(gpu, &rows);
+            let (x_f32, x_bf16) = upload_x(gpu, &xb);
+            let rt = TimedRoute {
+                r,
+                k,
+                n_exp: ex.n,
+                stride,
+                d_payload: &d_payload,
+                d_tiles: &d_tiles,
+                n_tiles: tiles.len(),
+                d_rows: &d_rows,
+                n_sorted: rows.len(),
+                x_f32: &x_f32,
+                x_bf16: &x_bf16,
+                x_row_div: div,
+                x_rows,
+            };
+
+            for &bf16_x in &dtypes {
+                let y_ref = gpu.upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r]).expect("y ref");
+                let y_cand = gpu.upload_f32(&vec![POISON; rows.len() * r], &[rows.len() * r]).expect("y cand");
+                if identities.is_none() {
+                    let mut dev = gpu.try_gfx942().expect("exact gfx942");
+                    let rid = dev.fp8b128_moe_grouped_build_identity(true).expect("reference identity");
+                    let pid = dev.fp8b128_moe_grouped_build_identity(false).expect("production identity");
+                    identities = Some((identity_json(&rid), identity_json(&pid)));
+                }
+                for _ in 0..TIME_WARMUPS {
+                    timed_launch(gpu, &rt, bf16_x, true, &y_ref);
+                    timed_launch(gpu, &rt, bf16_x, false, &y_cand);
+                }
+                gpu.hip.device_synchronize().expect("sync warmup");
+                let (mut t_ref, mut t_cand) = (Vec::with_capacity(TIME_LAUNCHES), Vec::with_capacity(TIME_LAUNCHES));
+                for i in 0..TIME_LAUNCHES {
+                    let one = |gpu: &mut Gpu, reference: bool| {
+                        let y = if reference { &y_ref } else { &y_cand };
+                        event_span_us(gpu, &e0, &e1, 1, |g| timed_launch(g, &rt, bf16_x, reference, y))
+                    };
+                    if i % 2 == 0 {
+                        t_ref.push(one(gpu, true));
+                        t_cand.push(one(gpu, false));
+                    } else {
+                        t_cand.push(one(gpu, false));
+                        t_ref.push(one(gpu, true));
+                    }
+                }
+                let burst_ref = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| timed_launch(g, &rt, bf16_x, true, &y_ref))
+                    / TIME_LAUNCHES as f64;
+                let burst_cand = event_span_us(gpu, &e0, &e1, TIME_LAUNCHES, |g| timed_launch(g, &rt, bf16_x, false, &y_cand))
+                    / TIME_LAUNCHES as f64;
+
+                // Whole-Y raw-bit comparison (live, padding rows, every element).
+                gpu.hip.device_synchronize().expect("sync compare");
+                let a = gpu.download_f32(&y_ref).expect("download ref");
+                let b = gpu.download_f32(&y_cand).expect("download cand");
+                let mismatches = a.len().abs_diff(b.len()) as u64
+                    + a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() as u64;
+                let unwritten = b.iter().filter(|v| v.to_bits() == POISON.to_bits()).count();
+                total_mismatch += mismatches;
+                for t in [y_ref, y_cand] {
+                    gpu.free_tensor(t).ok();
+                }
+
+                let dtype = if bf16_x { "bf16" } else { "f32" };
+                let (rm, cm) = (median_us(&t_ref), median_us(&t_cand));
+                println!(
+                    "{} x={dtype} {label} r={r} k={k} tokens={tokens} slots={} tiles={} experts={}: reference {rm:.2} us ({:.2} TFLOPS) candidate {cm:.2} us ({:.2} TFLOPS) speedup {:.3}x burst {:.2}/{:.2} us mismatches={mismatches}",
+                    if mismatches == 0 { "OK  " } else { "FAIL" },
+                    slots.len(),
+                    tiles.len(),
+                    uniq.len(),
+                    useful_flops / (rm * 1e-6) / 1e12,
+                    useful_flops / (cm * 1e-6) / 1e12,
+                    rm / cm,
+                    burst_ref,
+                    burst_cand,
+                );
+                records.push(serde_json::json!({
+                    "x_dtype": dtype,
+                    "shape": label,
+                    "r": r,
+                    "k": k,
+                    "x_row_div": div,
+                    "tokens": tokens,
+                    "x_rows": x_rows,
+                    "n_experts_pool": ex.n,
+                    "unique_experts": uniq.len(),
+                    "live_slots": slots.len(),
+                    "tiles": tiles.len(),
+                    "padded_rows": rows.len(),
+                    "layout": "padded-16 (stable scatter; expert ascending, flat ascending)",
+                    "route_digest": route_digest,
+                    "x_digest": x_digest,
+                    "weights_digest": weights_digest,
+                    "useful_flops": useful_flops,
+                    "y_values_compared": a.len(),
+                    "raw_f32_bit_mismatches": mismatches,
+                    "candidate_unwritten_poison_values": unwritten,
+                    "reference": samples_json(&t_ref, burst_ref, useful_flops),
+                    "candidate": samples_json(&t_cand, burst_cand, useful_flops),
+                    "speedup_median": rm / cm,
+                    "speedup_burst_mean": burst_ref / burst_cand,
+                }));
+            }
+            for t in [x_bf16, x_f32, d_rows, d_tiles] {
+                gpu.free_tensor(t).ok();
+            }
+        }
+        gpu.free_tensor(d_payload).ok();
+    }
+
+    let (reference, production) = identities.expect("no timed record");
+    let doc = serde_json::json!({
+        "tool": "test_fp8_moe_gfx942 --time",
+        "arch": gpu.arch,
+        "args": args,
+        "protocol": {
+            "warmups": TIME_WARMUPS,
+            "timed_launches": TIME_LAUNCHES,
+            "timing": "per launch: event record, launch, event record, sync on stop; reference/candidate alternate with order swapped each iteration; median = sorted[n/2]",
+            "burst": "one event span over 60 back-to-back launches / 60 (excludes host launch gaps); diagnostic",
+            "cache_policy": TIME_CACHE_POLICY,
+            "useful_flops": "2 * live_slots * r * k",
+        },
+        "reference_fixture": "crates/rdna-compute/tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip",
+        "reference": reference,
+        "production": production,
+        "total_raw_f32_bit_mismatches": total_mismatch,
+        "records": records,
+    });
+    std::fs::write(&out_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap_or_else(|e| panic!("write {out_path}: {e}"));
+    println!("timing JSON: {out_path}");
+    for ev in [e0, e1] {
+        gpu.hip.event_destroy(ev).ok();
+    }
+    if total_mismatch != 0 {
+        println!("FAILED: {total_mismatch} raw F32 bit mismatches between reference and production");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fixtures = args.iter().position(|a| a == "--fixtures").map(|i| args[i + 1].clone());
@@ -812,6 +1140,10 @@ fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     println!("detected arch: {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx942", "this Tier C gate requires gfx942");
+    if args.iter().any(|a| a == "--time") {
+        time_mode(&mut gpu, &args);
+        return;
+    }
     let mut fail = Fail(Vec::new());
 
     // 1a. All 256 codes x scale sweep vs CPU teacher twin. One [128, 256] block
@@ -893,7 +1225,7 @@ fn main() {
     drop(down);
 
     if byte {
-        println!("byte-identity: baseline = retained P1 reference module (-DFP8MOE_TEST_REFERENCE=1), candidate = production entry");
+        println!("byte-identity: baseline = retained P1 reference (standalone SHA-pinned snapshot), candidate = production entry");
         byte_cases(&mut gpu, &mut fail);
     }
 

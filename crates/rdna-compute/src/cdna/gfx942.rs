@@ -52,24 +52,35 @@ const FP8B128_MOE_GROUPED_SRC: &str =
 const FP8B128_MOE_GROUPED_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma";
 const FP8B128_MOE_GROUPED_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_xbf16";
-/// Test-only retained P1 baseline (`-DFP8MOE_TEST_REFERENCE=1`): its own JIT
-/// module and symbols, never selected by a production route.
+/// Test-only retained P1 baseline: its own JIT module and symbols, never
+/// selected by a production route. Compiled from an immutable standalone
+/// snapshot of the P1 (cdc37659a) kernel (SHA-256 pinned by a unit test), not
+/// from the production source, so edits to the production kernel cannot move it.
+const FP8B128_MOE_GROUPED_REFERENCE_SRC: &str =
+    include_str!("../../tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip");
 const FP8B128_MOE_GROUPED_REFERENCE_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
 const FP8B128_MOE_GROUPED_REFERENCE_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
 const FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16";
 /// Output rows per workgroup of the retained baseline: frozen at P1's 64, so
-/// a candidate geometry change never moves the reference launch.
+/// a candidate geometry change never moves the reference launch (pinned
+/// against the snapshot's `FP8REF_NSUB` by a unit test below).
 const FP8B128_MOE_REFERENCE_ROWS_PER_WG: usize = 64;
 /// Output rows per workgroup of the FP8 grouped kernel: `64 * FP8MOE_NSUB`
 /// (pinned against the source by a unit test below).
 const FP8B128_MOE_ROWS_PER_WG: usize = 64;
 
-/// The production kernel source behind a per-module flag line: the compiler
-/// turns `// HIPFIRE_COMPILER_FLAGS:` comments into hipcc arguments for this
-/// module only, so no production flag, source or cache key changes.
-static FP8B128_MOE_GROUPED_REFERENCE_SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("// HIPFIRE_COMPILER_FLAGS: -DFP8MOE_TEST_REFERENCE=1\n{FP8B128_MOE_GROUPED_SRC}")
-});
+/// Build identity of one FP8 grouped GEMM JIT module as this process loads it
+/// (benchmark provenance; see `test_fp8_moe_gfx942 --time`).
+#[doc(hidden)]
+pub struct Fp8MoeBuildIdentity {
+    pub module: &'static str,
+    pub source_sha256: String,
+    /// The compiler's content key: source + flags + arch + toolchain + ABI.
+    pub jit_cache_key: String,
+    pub toolchain_id: String,
+    pub object_path: String,
+    pub object_sha256: String,
+}
 const DEQUANT_FP8B128_TO_BF16_SRC: &str =
     include_str!("../../../../kernels/src/dequant_fp8b128_to_bf16.gfx942.hip");
 const DEQUANT_FP8B128_TO_BF16_KERNEL: &str = "dequant_fp8b128_to_bf16_gfx942";
@@ -666,8 +677,9 @@ impl Gfx942Device<'_> {
     ///
     /// Any kernel change is gated by exact F32-byte A/B against the retained P1
     /// baseline (`test_fp8_moe_gfx942 --byte-identity`, hidden
-    /// `gemm_fp8b128_moe_grouped_bf16mfma_reference`); the baseline's bytes are
-    /// never re-pinned to a candidate.
+    /// `gemm_fp8b128_moe_grouped_bf16mfma_reference`, compiled from the
+    /// SHA-pinned standalone snapshot under `tests/fixtures/`); the baseline's
+    /// bytes are never re-pinned to a candidate.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_fp8b128_moe_grouped_bf16mfma(
         &mut self,
@@ -690,16 +702,17 @@ impl Gfx942Device<'_> {
         )
     }
 
-    /// Hidden, diagnostic-only: the retained P1 baseline body of
+    /// Hidden, diagnostic-only: the retained P1 baseline of
     /// [`Self::gemm_fp8b128_moe_grouped_bf16mfma`], same arguments and contract,
     /// for the exact-byte A/B gate (`test_fp8_moe_gfx942 --byte-identity`).
-    /// It is the production kernel source compiled as its own JIT module
-    /// (`gemm_fp8b128_moe_grouped_bf16mfma_reference`) behind a per-module
-    /// `// HIPFIRE_COMPILER_FLAGS: -DFP8MOE_TEST_REFERENCE=1` line, with its
-    /// own frozen launch geometry (64 rows / 256 threads per workgroup).
-    /// Production source, module name, flags and geometry are untouched, and
-    /// nothing on a model route calls this. Reachable only through the
-    /// exact-gfx942 device proof.
+    /// It is compiled from an immutable standalone source snapshot
+    /// (`tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip`, no
+    /// shared helper or flag with the production kernel) as its own JIT module
+    /// (`gemm_fp8b128_moe_grouped_bf16mfma_reference`), with its own frozen
+    /// launch geometry (64 rows / 256 threads per workgroup). Production
+    /// source, module name, flags and geometry are untouched, and nothing on a
+    /// model route calls this. Reachable only through the exact-gfx942 device
+    /// proof.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_fp8b128_moe_grouped_bf16mfma_reference(
@@ -721,6 +734,33 @@ impl Gfx942Device<'_> {
         self.gemm_fp8b128_moe_grouped_launch(
             true, w, expert_stride, n_exp, tile_desc, n_tiles, sorted_rows, x, x_row_div, x_rows, y, n_sorted, r, k,
         )
+    }
+
+    /// Hidden, diagnostic-only: provenance of the loaded FP8 grouped GEMM
+    /// module (`reference`: the retained P1 snapshot; otherwise production):
+    /// source SHA-256, compiler content key, toolchain id and the SHA-256 of
+    /// the code object the compiler resolves for it. Compiles (or hits the
+    /// kernel cache) as a side effect.
+    #[doc(hidden)]
+    pub fn fp8b128_moe_grouped_build_identity(&mut self, reference: bool) -> HipResult<Fp8MoeBuildIdentity> {
+        use sha2::{Digest, Sha256};
+        let (module, src) = if reference {
+            (FP8B128_MOE_GROUPED_REFERENCE_MODULE, FP8B128_MOE_GROUPED_REFERENCE_SRC)
+        } else {
+            (FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC)
+        };
+        self.gpu.bind_thread()?;
+        let object = self.gpu.compiler.compile(module, src)?.to_path_buf();
+        let bytes = std::fs::read(&object)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("{module}: read {}: {e}", object.display())))?;
+        Ok(Fp8MoeBuildIdentity {
+            module,
+            source_sha256: format!("{:x}", Sha256::digest(src.as_bytes())),
+            jit_cache_key: self.gpu.compiler.jit_cache_key(module, src),
+            toolchain_id: self.gpu.compiler.toolchain_id().to_owned(),
+            object_path: object.display().to_string(),
+            object_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,7 +814,7 @@ impl Gfx942Device<'_> {
         let rows_per_wg = if reference {
             self.gpu.ensure_kernel(
                 FP8B128_MOE_GROUPED_REFERENCE_MODULE,
-                FP8B128_MOE_GROUPED_REFERENCE_SRC.as_str(),
+                FP8B128_MOE_GROUPED_REFERENCE_SRC,
                 func,
             )?;
             FP8B128_MOE_REFERENCE_ROWS_PER_WG
@@ -1194,5 +1234,40 @@ mod tests {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .expect("FP8MOE_NSUB define in the FP8 grouped kernel source");
         assert_eq!(super::FP8B128_MOE_ROWS_PER_WG, 64 * nsub);
+    }
+
+    /// The retained P1 oracle is an immutable standalone source: any byte change
+    /// is an oracle repin (forbidden) and fails here.
+    #[test]
+    fn fp8b128_moe_reference_snapshot_is_pinned() {
+        use sha2::{Digest, Sha256};
+        const PIN: &str = "98edc4e17a855270f2b1c74bf1d5f34b3f743a93179bdfe3d7252b274920a0cc";
+        let got = format!("{:x}", Sha256::digest(super::FP8B128_MOE_GROUPED_REFERENCE_SRC.as_bytes()));
+        assert_eq!(
+            got, PIN,
+            "tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip changed: the retained \
+             P1 oracle must never be edited or re-pinned to a candidate"
+        );
+    }
+
+    #[test]
+    fn fp8b128_moe_reference_is_independent_of_production_source() {
+        let src = super::FP8B128_MOE_GROUPED_REFERENCE_SRC;
+        // Geometry pin: 64 * FP8REF_NSUB output rows per workgroup, 256 threads.
+        let nsub = src
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("#define FP8REF_NSUB "))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .expect("FP8REF_NSUB define in the reference snapshot");
+        assert_eq!(super::FP8B128_MOE_REFERENCE_ROWS_PER_WG, 64 * nsub);
+        assert_eq!(src.matches("__launch_bounds__(256)").count(), 2);
+        // Same exports as the launcher selects; nothing from the production
+        // kernel's helpers, flags or module.
+        for k in [super::FP8B128_MOE_GROUPED_REFERENCE_KERNEL, super::FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL] {
+            assert!(src.contains(&format!("void {k}(")), "reference snapshot lacks export {k}");
+        }
+        assert!(!src.contains("fp8moe_") && !src.contains("FP8MOE_"));
+        assert!(!src.contains("HIPFIRE_COMPILER_FLAGS"));
+        assert!(src.contains("#error"));
     }
 }
