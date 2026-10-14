@@ -390,7 +390,7 @@ impl Qwen4TierRecipe {
     pub fn reject_expert_slab_dtypes(&self) -> Result<(), WeightError> {
         match self {
             Self::FlashNextPacked { trunk_tier, .. } => reject_expert_slab_dtype(*trunk_tier),
-            Self::SyntheticSourceBf16 | Self::SyntheticPacked => Ok(()),
+            Self::SyntheticSourceBf16 | Self::SyntheticPacked | Self::StockFp8 => Ok(()),
         }
     }
 }
