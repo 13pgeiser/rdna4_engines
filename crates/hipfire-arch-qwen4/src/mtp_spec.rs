@@ -865,8 +865,7 @@ pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FloorRoute {
-    /// Ordinary target-only token, no head work (after sticky retirement).
+pub(crate) enum FloorRoute {    /// Ordinary target-only token, no head work (after sticky retirement).
     Ar,
     /// Ordinary target-only token timed for the floor, head kept synced (an
     /// AR probe of a would-be retirement).
@@ -1128,7 +1127,8 @@ impl MtpFloor {
         }
         if self.probe_left == 0 {
             if !self.probe_samples.is_empty() {
-                self.ar_us = self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
+                self.ar_us =
+                    self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
             }
             self.decide(agreement);
         }
@@ -1250,9 +1250,9 @@ impl MtpFloor {
         self.probe_tokens > 0
             && self.probe_left == 0
             && valid_us(self.ar_us)
-            && self
-                .probed_at
-                .map_or(true, |at| self.observed >= at.saturating_add(self.retire_after))
+            && self.probed_at.map_or(true, |at| {
+                self.observed >= at.saturating_add(self.retire_after)
+            })
     }
 
     /// A losing verdict past the grace: sticky retirement, unless AR has not
@@ -7330,13 +7330,25 @@ mod tests {
             let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
             floor.observe_calibration(19_600.0, &poor);
             for _ in 0..5 {
-                floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 60_000.0, 3, &poor);
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    60_000.0,
+                    3,
+                    &poor,
+                );
             }
             for _ in 0..8 {
                 floor.observe_external(4, 55_000.0, 3, &poor);
             }
             for _ in 0..4 {
-                floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 70_000.0, 3, &poor);
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    70_000.0,
+                    3,
+                    &poor,
+                );
             }
             floor
         };
@@ -7346,7 +7358,10 @@ mod tests {
         assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
         // With evidence the verdict first asks for the probes.
         let mut floor = run(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
-        assert!(!floor.retired, "a verdict on one early token must not retire");
+        assert!(
+            !floor.retired,
+            "a verdict on one early token must not retire"
+        );
         assert_eq!(floor.route(&poor, 3, 3), FloorRoute::ArSample);
         assert!(floor.needs_ar_sample());
         let probes = MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS;
@@ -7354,8 +7369,14 @@ mod tests {
         assert!(floor.needs_ar_sample());
         floor.observe_calibration(30_000.0, &poor);
         assert!(!floor.needs_ar_sample());
-        assert_eq!(floor.ar_us, 30_000.0, "the probe mean replaces the calibration price");
-        assert!(!floor.retired, "the realized mixture (~27 ms/token) beats 30 ms");
+        assert_eq!(
+            floor.ar_us, 30_000.0,
+            "the probe mean replaces the calibration price"
+        );
+        assert!(
+            !floor.retired,
+            "the realized mixture (~27 ms/token) beats 30 ms"
+        );
         assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Batched(3));
         // Probes ask for nothing while the verdict stays a win.
         assert!(!floor.needs_ar_sample());
@@ -7372,10 +7393,22 @@ mod tests {
             let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(evidence);
             floor.observe_calibration(25_000.0, &poor);
             for _ in 0..11 {
-                floor.observe_native(NativeWindow::Batched, &emitted_window(4, 3), 60_000.0, 3, &poor);
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(4, 3),
+                    60_000.0,
+                    3,
+                    &poor,
+                );
             }
             for _ in 0..5 {
-                floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 62_000.0, 3, &poor);
+                floor.observe_native(
+                    NativeWindow::Batched,
+                    &emitted_window(1, 3),
+                    62_000.0,
+                    3,
+                    &poor,
+                );
             }
             floor
         };
@@ -7398,17 +7431,35 @@ mod tests {
         let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(6);
         floor.observe_calibration(25_000.0, &poor);
         for observed in 1..=15 {
-            floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 70_000.0, 3, &poor);
-            assert!(!floor.retired && !floor.needs_ar_sample(), "grace window {observed}");
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                70_000.0,
+                3,
+                &poor,
+            );
+            assert!(
+                !floor.retired && !floor.needs_ar_sample(),
+                "grace window {observed}"
+            );
         }
-        floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 70_000.0, 3, &poor);
+        floor.observe_native(
+            NativeWindow::Batched,
+            &emitted_window(1, 3),
+            70_000.0,
+            3,
+            &poor,
+        );
         assert!(!floor.retired);
         assert!(floor.needs_ar_sample());
         run_probes(&mut floor, &poor, 5, 24_000.0);
         // The probes are not windows: nothing observed, nothing decayed.
         assert_eq!(floor.observed, 16);
         floor.observe_calibration(f32::NAN, &poor);
-        assert!(floor.retired, "an invalid probe is skipped, the rest price AR");
+        assert!(
+            floor.retired,
+            "an invalid probe is skipped, the rest price AR"
+        );
         assert_eq!(floor.ar_us, 24_000.0);
         assert!(!floor.needs_ar_sample());
         assert_eq!(floor.route(&poor, 3, 3), FloorRoute::Ar);
@@ -7424,7 +7475,13 @@ mod tests {
         let mut floor = MtpFloor::with_retire_after(16).with_retire_evidence(2);
         floor.observe_calibration(10_000.0, &poor);
         for _ in 0..16 {
-            floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 60_000.0, 3, &poor);
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                60_000.0,
+                3,
+                &poor,
+            );
         }
         assert!(floor.needs_ar_sample() && !floor.retired);
         let started = floor.probed_at;
@@ -7435,13 +7492,25 @@ mod tests {
         assert!(!floor.retired);
         // The same windows keep winning against 70 ms: no new probe.
         for _ in 0..15 {
-            floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 60_000.0, 3, &poor);
+            floor.observe_native(
+                NativeWindow::Batched,
+                &emitted_window(1, 3),
+                60_000.0,
+                3,
+                &poor,
+            );
             assert!(!floor.needs_ar_sample() && !floor.retired);
         }
         // AR gets cheap again; the verdict loses, but only once 16 windows
         // passed since the last probe does it ask for fresh evidence first.
         floor.ar_us = 10_000.0;
-        floor.observe_native(NativeWindow::Batched, &emitted_window(1, 3), 60_000.0, 3, &poor);
+        floor.observe_native(
+            NativeWindow::Batched,
+            &emitted_window(1, 3),
+            60_000.0,
+            3,
+            &poor,
+        );
         assert_eq!(floor.observed, 32);
         assert!(floor.needs_ar_sample() && !floor.retired);
         assert_eq!(floor.probed_at, Some(32));
@@ -7455,14 +7524,23 @@ mod tests {
         assert_eq!(MtpFloor::new().probe_tokens, 0);
         let mut drafter = floor_drafter(true);
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
-        assert_eq!(drafter.floor.probe_tokens, singleton_floor_ar_probe_tokens());
-        assert_eq!(drafter.floor.probe_tokens, MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
+        assert_eq!(
+            drafter.floor.probe_tokens,
+            singleton_floor_ar_probe_tokens()
+        );
+        assert_eq!(
+            drafter.floor.probe_tokens,
+            MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS
+        );
         drafter.floor.calibrated = true;
         drafter.floor.ar_us = 30_000.0;
         drafter.floor.probe_left = 2;
         assert!(drafter.floor_needs_calibration());
         assert!(drafter.floor_takeover_blocked());
-        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArCalibrate);
+        assert_eq!(
+            plan_of(&mut drafter, 3, None).route,
+            WindowRoute::ArCalibrate
+        );
         drafter.floor.probe_left = 0;
         assert!(!drafter.floor_needs_calibration());
         assert!(!drafter.floor_takeover_blocked());
