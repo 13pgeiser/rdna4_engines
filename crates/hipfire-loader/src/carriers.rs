@@ -1673,21 +1673,38 @@ pub fn load_qwen4_rank(
         .transpose()?;
     let hotset_plan = if let Some(sidecar) = &hotset {
         let (free, non_expert, _, reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
-        let budget = residency::expert_hotset_budget(free, non_expert, reserve)?;
+        let total = residency::expert_hotset_budget(free, non_expert, reserve)?;
         let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
             &hfq, &config, &manifest,
         )?;
-        let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
-            &slabs, sidecar.rank(), budget,
-        )
-        .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
+        // Long-prefill staging allocates two VRAM stage buffers sized by the
+        // plan's largest host-tier layer per parity: plan, size them, and
+        // re-plan with that much less until the plan's own need fits. A
+        // smaller budget only moves experts to host, so the need never shrinks
+        // and the loop ends at the first plan whose stage fits its reserve.
+        let stage_enabled = residency::expert_stage_enabled(&ctx.gpu.arch);
+        let mut stage = 0u64;
+        let (plan, budget) = loop {
+            let budget = total.checked_sub(stage).ok_or_else(|| {
+                format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {} MiB budget cannot hold {} MiB of long-prefill stage buffers", total / MIB, stage / MIB)
+            })?;
+            let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
+                &slabs, sidecar.rank(), budget,
+            )
+            .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
+            let need = if stage_enabled { residency::expert_tier_stage_bytes(&plan) } else { 0 };
+            if need <= stage {
+                break (plan, budget);
+            }
+            stage = need;
+        };
         plan.check_executable(&ctx.gpu.arch)
             .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
         eprintln!(
-            "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables = {} MiB",
+            "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables - {} MiB long-prefill stage buffers = {} MiB",
             free / MIB, non_expert / MIB, reserve / MIB,
             mtp_bytes.unwrap_or(0) / MIB, gather_bytes.unwrap_or(0) / MIB,
-            residency::EXPERT_TIER_TABLE_BYTES, budget / MIB,
+            residency::EXPERT_TIER_TABLE_BYTES, stage / MIB, budget / MIB,
         );
         Some((std::sync::Arc::new(plan), budget))
     } else {

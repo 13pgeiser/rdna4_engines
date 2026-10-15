@@ -574,6 +574,24 @@ mod tests {
     }
 
     #[test]
+    fn tier_stage_bytes_is_the_largest_host_payload_per_parity_plus_pad() {
+        use crate::expert_residency::expert_tier_stage_bytes;
+        let pad = crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64;
+        // Nothing in VRAM: both parity buffers hold a full host layer.
+        let all_host = plan_expert_tiers_from_slabs(&uniform(), &[], 0).unwrap();
+        assert_eq!(expert_tier_stage_bytes(&all_host), 2 * (512 * PADDED + pad));
+        // Experts 0..256 of every layer resident: each buffer holds 256 host experts.
+        let rank: Vec<u32> = (0..48u32).flat_map(|layer| (0..256).map(move |e| layer * 512 + e)).collect();
+        let half = plan_expert_tiers_from_slabs(&uniform(), &rank, u64::MAX).unwrap();
+        assert_eq!(expert_tier_stage_bytes(&half), 2 * (256 * PADDED + pad));
+        // Layer 1 additionally all resident: layer 3 still sizes the odd buffer.
+        let mut more = rank.clone();
+        more.extend((256..512).map(|e| 512 + e));
+        let more = plan_expert_tiers_from_slabs(&uniform(), &more, u64::MAX).unwrap();
+        assert_eq!(expert_tier_stage_bytes(&more), 2 * (256 * PADDED + pad));
+    }
+
+    #[test]
     fn exact_fit_and_one_byte_short() {
         let rank = [10u32, 5, 700, 3];
         let n = rank.len() as u64;

@@ -358,6 +358,33 @@ pub fn expert_hotset_budget(
         })
 }
 
+/// Whether a load on `arch` builds the long-prefill expert stage (the same
+/// switch `Qwen4ExpertStage::new` reads), so its buffers need a budget.
+pub fn expert_stage_enabled(arch: &str) -> bool {
+    hipfire_config::developer_bool(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV, arch == "gfx1201")
+}
+
+/// Device bytes the tier long-prefill staging allocates for `plan`: one VRAM
+/// stage buffer per layer parity, each the largest host-tier payload of a
+/// layer of that parity (projections 256-byte aligned) plus the zeroed tail
+/// pad, as `gpu_forward::slab_stage` sizes them. An upper bound of what it
+/// allocates, so the hot set budget can hold it.
+pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -> u64 {
+    use crate::expert_slabs::{EXPERTS_PER_LAYER, TRUNK_LAYERS};
+    use crate::expert_tier_plan::Placement;
+    let align = |len: u64| len.div_ceil(256) * 256;
+    let mut largest = [0u64; 2];
+    for layer in 0..TRUNK_LAYERS as usize {
+        let host: u64 = (0..EXPERTS_PER_LAYER as usize)
+            .filter_map(|expert| plan.entry(layer, expert))
+            .filter(|entry| entry.tier == Placement::HostMapped)
+            .map(|entry| align(entry.gate_up_len) + align(entry.down_len))
+            .sum();
+        largest[layer % 2] = largest[layer % 2].max(host);
+    }
+    largest.iter().map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).sum()
+}
+
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
 /// the MTP layer, [`WeightResidency::HostMapped`]. Returns the number of
 /// entries moved to host RAM.
