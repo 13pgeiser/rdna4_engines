@@ -20419,15 +20419,16 @@ impl Gpu {
         )
     }
 
-    /// Resolve the gfx1100 TP2 graph-signal module before graph capture. JIT
-    /// compilation is not capture-safe, so model load calls this once per rank.
+    /// Resolve the exact gfx1100/gfx1201 TP2 graph-signal module before graph
+    /// capture. JIT compilation is not capture-safe, so model load calls this
+    /// once per rank.
     pub fn ensure_tp_graph_signal_gfx1100_kernels(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100, got {}",
+                    "ensure_tp_graph_signal_gfx1100_kernels requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -20444,10 +20445,11 @@ impl Gpu {
         )
     }
 
-    /// Advance this rank's gfx1100 TP2 graph generation and wait until the
-    /// peer reaches the same barrier. The generation is device-resident, so a
-    /// captured graph can replay without host-side signal resets. The wait is
-    /// bounded; a timeout lands in this GPU's wait-error block
+    /// Advance this rank's exact gfx1100/gfx1201 TP2 graph generation and wait
+    /// until the peer reaches the same barrier. The generation is
+    /// device-resident, so a captured graph can replay without host-side
+    /// signal resets. The wait is bounded; a timeout lands in this GPU's
+    /// wait-error block
     /// ([`Gpu::take_device_wait_error`]).
     pub fn tp_graph_signal_barrier_gfx1100(
         &mut self,
@@ -20455,11 +20457,11 @@ impl Gpu {
         peer_signal: &DeviceBuffer,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp_graph_signal_barrier_gfx1100 requires gfx1100, got {}",
+                    "tp_graph_signal_barrier_gfx1100 requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -20511,11 +20513,11 @@ impl Gpu {
         count: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "tp_graph_signal_reduce_gfx1100 requires gfx1100, got {}",
+                    "tp_graph_signal_reduce_gfx1100 requires gfx1100 or gfx1201, got {}",
                     self.arch
                 ),
             ));

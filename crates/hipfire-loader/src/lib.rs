@@ -4639,16 +4639,18 @@ fn load_model_tp_qwen35_dense(
         .can_access_peer_all()
         .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
     if peer {
-        // Opt-in gfx1100 TP2 whole-token decode graph: the runtime admits it
-        // and prepares its signal tape before peer access is enabled.
+        // TP2 whole-token decode graph (exact gfx1201 pair by default, gfx1100
+        // pair with `HIPFIRE_TP_FULL_GRAPH=1`): the runtime admits it and
+        // prepares its signal tape before peer access is enabled.
         let barriers = config.n_layers * 2;
         let whole_token_graph = staging
             .gpus_mut()
             .prepare_tp2_whole_token_graph(barriers, config.dim * std::mem::size_of::<f32>())
-            .map_err(|e| format!("prepare gfx1100 TP2 whole-token graph: {e:?}"))?;
+            .map_err(|e| format!("prepare TP2 whole-token graph: {e:?}"))?;
         if whole_token_graph {
+            let arch = staging.gpus_mut().devices[0].arch.clone();
             eprintln!(
-                "[loader] dense qwen gfx1100 TP2 whole-token graph signal tape: {barriers} barriers"
+                "[loader] dense qwen {arch} TP2 whole-token graph signal tape: {barriers} barriers"
             );
         }
         let enabled = staging

@@ -9654,7 +9654,9 @@ pub const TP_GRAPH_SIGNAL_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/tp4_graph_signal.gfx1201.hip")
 );
 
-/// gfx1100 TP2 graph-resident system-scope producer barrier (bounded waits).
+/// Exact gfx1100/gfx1201 TP2 graph-resident system-scope producer barrier
+/// and rank-ordered reduce (bounded waits). The source file and symbol names
+/// keep their original `gfx1100` spelling.
 pub const TP_GRAPH_SIGNAL_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/device_wait_deadline.h"),
     include_str!("../../../kernels/src/tp2_graph_signal.gfx1100.hip")

@@ -1028,7 +1028,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp-graph-capture-barrier",
         predicates: &[CaptureMode],
-        condition: "barrier_rank_streams_reuse: all ranks of an admitted signal topology (gfx1201 TP3/TP4, gfx1100 TP2) capturing → capture_tp_graph_barrier (hipfire-runtime multi_gpu.rs)",
+        condition: "barrier_rank_streams_reuse: all ranks of an admitted signal topology (gfx1100 or gfx1201 TP2, gfx1201 TP3/TP4) capturing → capture_tp_graph_barrier (hipfire-runtime multi_gpu.rs)",
         effect: LaunchMechanism,
         switches: "captured cross-rank signal barrier vs event barrier",
         kernels: &[],
@@ -1039,7 +1039,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp2-graph-fused-reduce",
         predicates: &[CaptureMode],
-        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both gfx1100 TP2 ranks capturing (the opt-in `HIPFIRE_TP_FULL_GRAPH=1` whole-token graph) → `tp_graph_signal_reduce_gfx1100` (hipfire-runtime multi_gpu.rs)",
+        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp_graph_signal_reduce_gfx1100` (hipfire-runtime multi_gpu.rs)",
         effect: KernelSelection,
         switches: "captured: one fused signal barrier + coherent payload exchange + residual add kernel per rank; eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
         kernels: &["tp_graph_signal_reduce_gfx1100", "add_peer_residual_f32"],
