@@ -786,5 +786,9 @@ name = "ep_row_gather_probe"
 required-features = ["lab"]
 
 [[example]]
+name = "ep_transport_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "ep2_boundary_micro"
 required-features = ["lab"]
