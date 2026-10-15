@@ -613,22 +613,39 @@ impl Carrier for Qwen4Carrier {
         options: crate::admission::SourceAdmissionOptions,
     ) -> Result<(), String> {
         let spec = options.spec;
-        if draft_path.is_some()
-            || options.eagle_drafter
-            || options.kv_adaptive
-            || spec.dflash.is_some_and(|enabled| enabled)
-            || spec.dspark.is_some_and(|enabled| enabled)
-            || spec.ngram_draft.is_some_and(|enabled| enabled)
-            || qwen4_ddtree_requested(spec)
-            || options.cask
-            || options.non_single_compute
-            || options.expert_count_override
-            || options.pflash
-        {
-            return Err(
-                "qwen4: requested DFlash, DSpark, n-gram, DDTree, adaptive-KV, EAGLE, CASK, PFlash, or DeepSeek4/non-Single option is unsupported"
-                    .into(),
-            );
+        let unsupported = [
+            (draft_path.is_some(), "draft model (draft_path)"),
+            (options.eagle_drafter, "EAGLE drafter"),
+            (options.kv_adaptive, "adaptive KV"),
+            (
+                spec.dflash.is_some_and(|enabled| enabled),
+                "DFlash (speculation.dflash)",
+            ),
+            (
+                spec.dspark.is_some_and(|enabled| enabled),
+                "DSpark (speculation.dspark)",
+            ),
+            (
+                spec.ngram_draft.is_some_and(|enabled| enabled),
+                "n-gram draft (speculation.ngram_draft)",
+            ),
+            (qwen4_ddtree_requested(spec), "DDTree"),
+            (options.cask, "CASK (memory.cask)"),
+            (options.non_single_compute, "non-single compute placement"),
+            (options.expert_count_override, "expert-count override"),
+            (
+                options.pflash,
+                "PFlash (prefill_compression; set it to off)",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "qwen4: unsupported option(s): {}; turn them off to load Flash-Next",
+                unsupported.join(", ")
+            ));
         }
         Ok(())
     }
@@ -5511,6 +5528,34 @@ mod qwen4_admission_tests {
         assert!(Qwen4Carrier
             .admit_options(Some("draft.hfq"), defaults)
             .is_err());
+    }
+
+    #[test]
+    fn pflash_alone_refusal_names_only_pflash() {
+        let options = SourceAdmissionOptions {
+            spec: resolved_ar_spec(),
+            pflash: true,
+            ..Default::default()
+        };
+        let error = Qwen4Carrier.admit_options(None, options).unwrap_err();
+        assert_eq!(
+            error,
+            "qwen4: unsupported option(s): PFlash (prefill_compression; set it to off); turn them off to load Flash-Next"
+        );
+        for other in [
+            "draft model",
+            "EAGLE",
+            "adaptive KV",
+            "DFlash",
+            "DSpark",
+            "n-gram",
+            "DDTree",
+            "CASK",
+            "non-single",
+            "expert-count",
+        ] {
+            assert!(!error.contains(other), "{other}: {error}");
+        }
     }
 
     #[test]
