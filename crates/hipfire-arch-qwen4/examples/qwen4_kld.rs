@@ -1136,6 +1136,21 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let prompt = prompt_file.ok_or("speed requires --prompt-file")?;
             speed(&model, &prompt, &output, decode_tokens, speed_warmup, reps, max_prompt)
         }
+        ("ple-derive", Some(model), None, None, None) => {
+            // CPU-only: writes `<model>.ple-q4` (row order) from the embedded
+            // Q8 rows, bound to this exact base file; refuses an existing one.
+            let report = hipfire_runtime::ple_convert::derive_q4(&model, None, &mut |p| {
+                if p.total_bytes > 0 && p.done_bytes % (4 << 30) < (32 << 20) {
+                    eprintln!("qwen4_kld ple-derive {}: {}/{} bytes", p.phase, p.done_bytes, p.total_bytes);
+                }
+            })?;
+            eprintln!(
+                "qwen4_kld ple-derive: wrote {} ({} bytes), payload sha256 {}, rows sha256 {}, {:.1} s",
+                report.output.display(), report.bytes, report.payload_sha256,
+                report.source_rows_sha256, report.elapsed.as_secs_f64()
+            );
+            Ok(())
+        }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {
                 import_ref(&logits, &template, &teacher, &output, top_k)
