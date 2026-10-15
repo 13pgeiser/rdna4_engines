@@ -3092,7 +3092,7 @@ fn finish_route_kernels(
         eprintln!("  kernels: {:?} route preloaded and sealed", planned.spec);
     } else {
         eprintln!(
-            "  kernels: {:?} route preloaded (open: an unplanned kernel loads lazily with a warning)",
+            "  kernels: {:?} route preloaded (open: off-plan loads stay lazy and warn)",
             planned.spec
         );
     }

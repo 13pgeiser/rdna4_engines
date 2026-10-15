@@ -43,6 +43,11 @@ PROMPTS = [
 ]
 FILLER = ("The lighthouse keeper logged the tide, the wind, the passing ships and the colour of the "
           "evening sky in a ledger that had outlived three keepers before him. ")
+# 125K-130K-token request: the walker measures tokens per FILLER repeat with a probe and sizes the
+# prompt to the window midpoint; FIT_GUESS_REPS only seeds the recorded plan.
+FIT_LO, FIT_HI = 125000, 130000
+FIT_GUESS_REPS = 3700
+FIT_PROBE_REPS = 1000
 
 
 def prefill_rows():
@@ -52,7 +57,8 @@ def prefill_rows():
     rows.update(range(301, 1101, 7))
     for base in range(128, 4225, 128):
         rows.update(base + d for d in (-2, -1, 0, 1, 2))
-    rows.update([2047, 2048, 2049, 3000, 5000, 6143, 6144, 6145, 8191, 8192, 8193, 8200, 12289, 16385, 33000])
+    rows.update([2047, 2048, 2049, 3000, 5000, 6143, 6144, 6145, 8191, 8192, 8193, 8200, 12289, 16385, 33000,
+                 125000, 131000])
     return sorted(r for r in rows if r >= 1)
 
 
@@ -68,6 +74,17 @@ def walk_plan(route, prompt_dir, max_seq):
         text = (prompt_dir / name).read_text()
         plan.append({"type": "generate", "prompt": text, "max_tokens": 96, "temperature": 0.7, "top_p": 0.9,
                      "_name": name})
+    # Thinking-on generates (greedy and sampled, uncapped and capped think budget). The runner
+    # defaults every generate to max_think_tokens=1 (thinking off); these entries carry their own
+    # max_think_tokens, which the runner's setdefault leaves alone, plus the typed thinking flag
+    # the daemon treats as authoritative.
+    think_short = "Is 391 prime? Reason step by step, then answer."
+    for prompt, tag in ((think_short, "think-short"), (medium, "think-medium")):
+        for cap, max_tokens in ((0, 128), (24, 96)):
+            for s in ({"temperature": 0}, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}):
+                plan.append(dict({"type": "generate", "prompt": prompt, "max_tokens": max_tokens,
+                                  "thinking_enabled": True, "max_think_tokens": cap,
+                                  "_name": f"{tag}-cap{cap}"}, **s))
     # n-gram takeover: long verbatim copies, greedy and sampled.
     copy = "Repeat the following text exactly, twice:\n\n" + FILLER * 12
     plan.append({"type": "generate", "prompt": copy, "max_tokens": 192, "temperature": 0})
@@ -88,11 +105,19 @@ def walk_plan(route, prompt_dir, max_seq):
     if max_seq > 110000:
         plan.append({"type": "generate", "prompt": "Summarize this ledger.\n\n" + FILLER * 2900,
                      "max_tokens": 24, "temperature": 0.7, "top_p": 0.9, "_name": "100k-sampled"})
+    if max_seq >= 131072:
+        # 125K-130K-token prompt: the walker calibrates the filler repeat count against the
+        # daemon's own prompt-token count (done.prompt_tokens) and fails the request if the
+        # measured prompt lands outside the window. Prefill plus a short decode at full context.
+        plan.append({"type": "generate", "prompt": "Summarize this ledger.\n\n" + FILLER * FIT_GUESS_REPS,
+                     "max_tokens": 16, "temperature": 0, "_name": "128k",
+                     "_fit": {"lo": FIT_LO, "hi": FIT_HI, "head": "Summarize this ledger.\n\n"}})
     if route == "ar":
         for rows in prefill_rows():
             if rows < max_seq:
                 plan.append({"type": "bench_prefill", "tokens": rows})
-        for ctx in (1, 2, 127, 128, 1000, 2047, 2048, 4095, 4096, 8192, 9000, 16400, 33000, 65536, 120000):
+        for ctx in (1, 2, 127, 128, 1000, 2047, 2048, 4095, 4096, 8192, 9000, 16400, 33000, 65536, 120000,
+                    125000, 131000):
             if ctx + 8 < max_seq:
                 plan.append({"type": "bench_decode", "context_tokens": ctx, "iterations": 3})
     else:
@@ -181,6 +206,14 @@ def main():
                 return obj, time.monotonic() - t
         raise SystemExit("walk timeout")
 
+    def prompt_tokens_of(done_obj):
+        """Prompt length the daemon reports on `done` (prompt_tokens, else prefill + cached)."""
+        if done_obj.get("prompt_tokens") is not None:
+            return done_obj["prompt_tokens"]
+        if done_obj.get("prefill_tokens") is None and done_obj.get("cached_tokens") is None:
+            return None
+        return (done_obj.get("prefill_tokens") or 0) + (done_obj.get("cached_tokens") or 0)
+
     results, errors = [], 0
     obj, dt = send(load, ("loaded", "error"))
     results.append({"req": "load", "resp": obj, "s": round(dt, 2)})
@@ -188,7 +221,25 @@ def main():
     if obj.get("type") == "loaded":
         history = []
         for i, msg in enumerate(plan):
+            fit = msg.get("_fit")
             msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+            if fit is not None:
+                # Size the prompt from the daemon's own token count: probe a fixed repeat count,
+                # take tokens per repeat, aim at the window midpoint.
+                probe = {"type": "generate", "id": f"fit{i}", "attempt_id": 1000000 + i,
+                        "prompt": fit["head"] + FILLER * FIT_PROBE_REPS, "max_tokens": 1,
+                        "temperature": 0, "max_think_tokens": 1}
+                print(f"ROUTE_WALK_REQ\t{i}\t{json.dumps({k: v for k, v in probe.items() if k != 'prompt'})}",
+                      file=err, flush=True)
+                pobj, pdt = send(probe, ("done", "error"))
+                probe_tokens = prompt_tokens_of(pobj)
+                if pobj.get("type") == "error" or not probe_tokens:
+                    errors += 1
+                    print(json.dumps({"i": i, "fit_probe_error": pobj})[:400], flush=True)
+                else:
+                    reps = round((fit["lo"] + fit["hi"]) / 2 * FIT_PROBE_REPS / probe_tokens)
+                    msg["prompt"] = fit["head"] + FILLER * reps
+                    print(json.dumps({"i": i, "fit_probe_tokens": probe_tokens, "reps": reps}), flush=True)
             if msg["type"] == "generate":
                 msg.setdefault("id", f"g{i}")
                 msg.setdefault("attempt_id", i + 1)
@@ -208,11 +259,19 @@ def main():
             print(f"ROUTE_WALK_REQ\t{i}\t{json.dumps({k: v for k, v in msg.items() if k not in ('prompt', 'messages')})}",
                   file=err, flush=True)
             obj, dt = send(msg, done)
-            results.append({"i": i, "type": msg["type"], "resp_type": obj.get("type"), "s": round(dt, 3),
-                            "error": obj if obj.get("type") == "error" else None})
+            res = {"i": i, "type": msg["type"], "resp_type": obj.get("type"), "s": round(dt, 3),
+                   "error": obj if obj.get("type") == "error" else None}
+            if msg["type"] == "generate":
+                res["prompt_tokens"] = prompt_tokens_of(obj)
+            results.append(res)
             if obj.get("type") == "error":
                 errors += 1
                 print(json.dumps({"i": i, "error": obj})[:400], flush=True)
+            elif fit is not None and not fit["lo"] <= (res["prompt_tokens"] or 0) <= fit["hi"]:
+                errors += 1
+                res["error"] = {"type": "error", "message": f"prompt tokens {res['prompt_tokens']} outside "
+                                f"[{fit['lo']}, {fit['hi']}]"}
+                print(json.dumps({"i": i, "error": res["error"]}), flush=True)
     try:
         proc.stdin.write(json.dumps({"type": "unload"}) + "\n")
         proc.stdin.close()
