@@ -3204,23 +3204,53 @@ pub fn qwen4_ep_owner_assign_pm_arch(arch: &str) -> bool {
     arch == "gfx1201"
 }
 
-/// Module key of the embedded certified builder (PeaceMaker) image of
-/// [`Gpu::ep_tile_mask`] (`peacemaker-isa emit --kernel ep_tile_mask_pm --arch gfx1201`).
-pub const EP_TILE_MASK_PM_MODULE: &str = "ep_tile_mask_pm_gfx1201";
-/// Device symbol of the tile mask kernel.
-pub const EP_TILE_MASK_PM_SYMBOL: &str = "ep_tile_mask_pm_gfx1201";
-/// Module key of the embedded certified builder (PeaceMaker) image of the two-rank
-/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
-/// ep_gather_grouped_rows_by_tile_owner_pm --arch gfx1201`).
-pub const EP_TILE_PULL_PM_MODULE: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
-/// Device symbol of the two-rank tile pull kernel (one peer base, 48-byte kernarg).
-pub const EP_TILE_PULL_PM_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
-/// Module key of the embedded certified builder (PeaceMaker) image of the rank-generic
-/// specialization of [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
-/// ep_gather_grouped_rows_by_tile_owner_n4_pm --arch gfx1201`).
-pub const EP_TILE_PULL_N4_PM_MODULE: &str = "ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201";
-/// Device symbol of the rank-generic tile pull kernel (four source bases, 72-byte kernarg).
-pub const EP_TILE_PULL_N4_PM_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201";
+/// Module key (and device symbol: the builder names both alike) of the embedded certified
+/// builder (PeaceMaker) image of [`Gpu::ep_tile_mask`] (`peacemaker-isa emit --kernel
+/// ep_tile_mask_pm --arch gfx1201|gfx1100`).
+pub const EP_TILE_MASK_PM_GFX1201_SYMBOL: &str = "ep_tile_mask_pm_gfx1201";
+pub const EP_TILE_MASK_PM_GFX1100_SYMBOL: &str = "ep_tile_mask_pm_gfx1100";
+/// Module key / device symbol of the two-rank specialization of
+/// [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
+/// ep_gather_grouped_rows_by_tile_owner_pm --arch gfx1201|gfx1100`; one peer base, 48-byte
+/// kernarg).
+pub const EP_TILE_PULL_PM_GFX1201_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1201";
+pub const EP_TILE_PULL_PM_GFX1100_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_pm_gfx1100";
+/// Module key / device symbol of the rank-generic specialization of
+/// [`Gpu::ep_gather_grouped_rows_by_tile_owner`] (`peacemaker-isa emit --kernel
+/// ep_gather_grouped_rows_by_tile_owner_n8_pm --arch gfx1201|gfx1100`; eight source bases,
+/// 104-byte kernarg).
+pub const EP_TILE_PULL_N8_PM_GFX1201_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201";
+pub const EP_TILE_PULL_N8_PM_GFX1100_SYMBOL: &str = "ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100";
+/// Largest rank count of the tile pull (the N8 kernarg's source slots).
+pub const EP_TILE_PULL_MAX_RANKS: usize = 8;
+
+/// The tile mask/pull builder kernels exist for exactly gfx1100 and gfx1201. The balanced
+/// owner assignment stays gfx1201-only ([`qwen4_ep_owner_assign_pm_arch`]).
+pub fn ep_tile_pm_arch(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1201")
+}
+
+/// Embedded image and device symbol (also the module key) of the tile mask for `arch`.
+fn ep_tile_mask_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
+    match arch {
+        "gfx1201" => Some((kernels::EP_TILE_MASK_PM_GFX1201, EP_TILE_MASK_PM_GFX1201_SYMBOL)),
+        "gfx1100" => Some((kernels::EP_TILE_MASK_PM_GFX1100, EP_TILE_MASK_PM_GFX1100_SYMBOL)),
+        _ => None,
+    }
+}
+
+/// Embedded image and device symbol (also the module key) of the tile pull for `arch`:
+/// the two-rank kernel for `ranks == 2`, the eight-slot rank-generic one for `3..=8`.
+fn ep_tile_pull_kernel(arch: &str, ranks: usize) -> Option<(&'static [u8], &'static str)> {
+    match (arch, ranks == 2) {
+        ("gfx1201", true) => Some((kernels::EP_TILE_PULL_PM_GFX1201, EP_TILE_PULL_PM_GFX1201_SYMBOL)),
+        ("gfx1100", true) => Some((kernels::EP_TILE_PULL_PM_GFX1100, EP_TILE_PULL_PM_GFX1100_SYMBOL)),
+        ("gfx1201", false) => Some((kernels::EP_TILE_PULL_N8_PM_GFX1201, EP_TILE_PULL_N8_PM_GFX1201_SYMBOL)),
+        ("gfx1100", false) => Some((kernels::EP_TILE_PULL_N8_PM_GFX1100, EP_TILE_PULL_N8_PM_GFX1100_SYMBOL)),
+        _ => None,
+    }
+}
+
 /// Grouped rows of one tile (the symmetric IU4 GEMMs' `m` tile).
 pub const EP_TILE_ROWS: usize = 16;
 /// Threads (tiles) per workgroup of the mask kernel.
@@ -3233,7 +3263,8 @@ impl Gpu {
     /// the grouped-GEMM tile ids, `tile_ids_owned[t] = tile_ids[t]` when the tile's expert is
     /// owned by `rank` (`owner_table[tile_ids[t]] == rank`, an i32 per expert) and `-1`
     /// otherwise (the padding sentinel included). `tile_ids` is never written. One thread per
-    /// tile over `tiles`, the certified builder kernel [`EP_TILE_MASK_PM_SYMBOL`]; gfx1201 only
+    /// tile over `tiles`, the certified builder kernel ([`EP_TILE_MASK_PM_GFX1201_SYMBOL`] /
+    /// [`EP_TILE_MASK_PM_GFX1100_SYMBOL`]); gfx1100 and gfx1201 only
     /// (there is no hipcc fallback). Stream-ordered on the active stream.
     pub fn ep_tile_mask(
         &mut self,
@@ -3248,12 +3279,12 @@ impl Gpu {
         let refuse = |what: &str| {
             Err(hip_bridge::HipError::new(0, &format!("ep_tile_mask: {what}")))
         };
-        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+        let Some((mask_image, mask_symbol)) = ep_tile_mask_kernel(&self.arch).filter(|_| ep_tile_pm_arch(&self.arch)) else {
             return refuse(&format!(
-                "the tile mask is a gfx1201 builder module (device is {}); no hipcc fallback",
+                "the tile mask is a gfx1100/gfx1201 builder module (device is {}); no hipcc fallback",
                 self.arch
             ));
-        }
+        };
         let word = std::mem::size_of::<i32>();
         if tiles == 0 || i32::try_from(tiles).is_err() || n_experts == 0 || i32::try_from(n_experts).is_err() {
             return refuse("need 0 < tiles and 0 < n_experts, both within i32");
@@ -3270,11 +3301,7 @@ impl Gpu {
         if tile_ids.buf.as_ptr() == tile_ids_owned.buf.as_ptr() {
             return refuse("the owned copy must not alias the source tile ids");
         }
-        self.ensure_embedded_kernel(
-            EP_TILE_MASK_PM_MODULE,
-            kernels::EP_TILE_MASK_PM_GFX1201,
-            EP_TILE_MASK_PM_SYMBOL,
-        )?;
+        self.ensure_embedded_kernel(mask_symbol, mask_image, mask_symbol)?;
         let ids = tile_ids.buf.as_ptr();
         let owned = tile_ids_owned.buf.as_ptr();
         let table = owner_table.buf.as_ptr();
@@ -3287,9 +3314,9 @@ impl Gpu {
             &experts_i32 as *const _ as *mut c_void,
             &rank_i32 as *const _ as *mut c_void,
         ];
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", EP_TILE_MASK_PM_SYMBOL, tiles * word * 2);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", mask_symbol, tiles * word * 2);
         let result = self.launch_maybe_blob(
-            EP_TILE_MASK_PM_SYMBOL,
+            mask_symbol,
             [(tiles as u32).div_ceil(EP_TILE_MASK_BLOCK), 1, 1],
             [EP_TILE_MASK_BLOCK, 1, 1],
             0,
@@ -3315,23 +3342,25 @@ impl Gpu {
     /// (`0 <= tile_ids[t] < n_experts` and `owner_table[tile_ids[t]] != rank`), copy the
     /// tile's [`EP_TILE_ROWS`] grouped rows (`row_u4` uint4 each) of the OWNER's grouped-rows
     /// buffer, the virtual address `sources[owner_table[tile_ids[t]]]` (peer-mapped device
-    /// memory), onto the same rows of `dst`. `ranks` (2 or 4, host validation only, not a
+    /// memory), onto the same rows of `dst`. `ranks` (2..=8, host validation only, not a
     /// kernel argument) bounds the slots in use; `sources[rank]` may be `dst`'s own address
     /// (the local slot is never read), every other slot below `ranks` must be a mapped peer
-    /// base. Two certified specializations behind this one API, selected by `ranks` inside the
-    /// launcher: `ranks == 2` launches the original two-rank kernel [`EP_TILE_PULL_PM_SYMBOL`]
+    /// base; slots from `ranks` up are passed as zero. Two certified specializations behind
+    /// this one API, selected by `ranks` inside the launcher: `ranks == 2` launches the
+    /// two-rank kernel ([`EP_TILE_PULL_PM_GFX1201_SYMBOL`] / [`EP_TILE_PULL_PM_GFX1100_SYMBOL`])
     /// with the one peer base `sources[1 - rank]` (the only other valid owner; 48-byte kernarg,
-    /// no owner range check); `ranks == 4` launches the rank-generic kernel
-    /// [`EP_TILE_PULL_N4_PM_SYMBOL`] with all four slots. Rows of owned tiles, of the padding
-    /// tail and of workgroups past `tiles` are never written. Bit-exact uint4 copy, gfx1201
-    /// only. Stream-ordered on the active stream; the caller orders it after every peer's
-    /// producer event.
+    /// no owner range check); `ranks` in `3..=8` launches the rank-generic kernel
+    /// ([`EP_TILE_PULL_N8_PM_GFX1201_SYMBOL`] / [`EP_TILE_PULL_N8_PM_GFX1100_SYMBOL`], 104-byte
+    /// kernarg) with all eight slots. Rows of owned tiles, of the padding
+    /// tail and of workgroups past `tiles` are never written. Bit-exact uint4 copy, gfx1100
+    /// and gfx1201 only. Stream-ordered on the active stream; the caller orders it after every
+    /// peer's producer event.
     #[allow(clippy::too_many_arguments)]
     pub fn ep_gather_grouped_rows_by_tile_owner(
         &mut self,
         tile_ids: &GpuTensor,
         owner_table: &GpuTensor,
-        sources: [usize; 4],
+        sources: [usize; EP_TILE_PULL_MAX_RANKS],
         dst: &GpuTensor,
         tiles: usize,
         n_experts: usize,
@@ -3346,15 +3375,15 @@ impl Gpu {
                 &format!("ep_gather_grouped_rows_by_tile_owner: {what}"),
             ))
         };
-        if !qwen4_ep_owner_assign_pm_arch(&self.arch) {
+        if !ep_tile_pm_arch(&self.arch) {
             return refuse(&format!(
-                "the tile pull is a gfx1201 builder module (device is {}); no hipcc fallback",
+                "the tile pull is a gfx1100/gfx1201 builder module (device is {}); no hipcc fallback",
                 self.arch
             ));
         }
         let word = std::mem::size_of::<i32>();
-        if !matches!(ranks, 2 | 4) || rank >= ranks {
-            return refuse("ranks must be 2 or 4 and rank below ranks");
+        if !(2..=EP_TILE_PULL_MAX_RANKS).contains(&ranks) || rank >= ranks {
+            return refuse("ranks must be 2..=8 and rank below ranks");
         }
         if tiles == 0 || n_experts == 0 || sources.iter().enumerate().any(|(r, &base)| r < ranks && r != rank && base == 0) {
             return refuse("need tiles > 0, n_experts > 0 and a base for every peer rank");
@@ -3385,25 +3414,24 @@ impl Gpu {
                 return refuse("a peer source is this rank's own buffer");
             }
         }
-        let (module, image, symbol) = if ranks == 2 {
-            (EP_TILE_PULL_PM_MODULE, kernels::EP_TILE_PULL_PM_GFX1201, EP_TILE_PULL_PM_SYMBOL)
-        } else {
-            (EP_TILE_PULL_N4_PM_MODULE, kernels::EP_TILE_PULL_N4_PM_GFX1201, EP_TILE_PULL_N4_PM_SYMBOL)
+        let Some((image, symbol)) = ep_tile_pull_kernel(&self.arch, ranks) else {
+            return refuse("no tile pull kernel for this device");
         };
-        self.ensure_embedded_kernel(module, image, symbol)?;
+        self.ensure_embedded_kernel(symbol, image, symbol)?;
         let ids = tile_ids.buf.as_ptr();
         let table = owner_table.buf.as_ptr();
-        // N4: slots past `ranks` are never named by a valid owner table: pass them as null.
+        // N8: slots past `ranks` are never named by a valid owner table: pass them as null.
         // EP2: the only other valid owner is the peer, `sources[1 - rank]`.
-        let srcs: [*mut c_void; 4] =
+        let srcs: [*mut c_void; EP_TILE_PULL_MAX_RANKS] =
             std::array::from_fn(|r| if r < ranks { sources[r] as *mut c_void } else { std::ptr::null_mut() });
         let peer = srcs[rank ^ 1];
         let out = dst.buf.as_ptr();
         let (experts_i32, rank_i32, tile_u4_i32, tiles_i32) =
             (n_experts as i32, rank as i32, tile_u4 as i32, tiles as i32);
         // EP2 kernarg (48 B): ids, table, peer, dst, n_experts, rank, tile_u4, tiles (params[..8]).
-        // N4 kernarg (72 B): ids, table, src0..src3, dst, n_experts, rank, tile_u4, tiles (params[..11]).
-        let mut params = [std::ptr::null_mut::<c_void>(); 11];
+        // N8 kernarg (104 B): ids@0, table@8, src0..src7@16..72, dst@80, n_experts@88, rank@92,
+        // tile_u4@96, tiles@100 (params[..15]).
+        let mut params = [std::ptr::null_mut::<c_void>(); 15];
         let used = if ranks == 2 {
             params[..8].copy_from_slice(&[
                 &ids as *const _ as *mut c_void,
@@ -3417,20 +3445,17 @@ impl Gpu {
             ]);
             8
         } else {
-            params.copy_from_slice(&[
-                &ids as *const _ as *mut c_void,
-                &table as *const _ as *mut c_void,
-                &srcs[0] as *const _ as *mut c_void,
-                &srcs[1] as *const _ as *mut c_void,
-                &srcs[2] as *const _ as *mut c_void,
-                &srcs[3] as *const _ as *mut c_void,
-                &out as *const _ as *mut c_void,
-                &experts_i32 as *const _ as *mut c_void,
-                &rank_i32 as *const _ as *mut c_void,
-                &tile_u4_i32 as *const _ as *mut c_void,
-                &tiles_i32 as *const _ as *mut c_void,
-            ]);
-            11
+            params[0] = &ids as *const _ as *mut c_void;
+            params[1] = &table as *const _ as *mut c_void;
+            for (slot, src) in params[2..10].iter_mut().zip(srcs.iter()) {
+                *slot = src as *const _ as *mut c_void;
+            }
+            params[10] = &out as *const _ as *mut c_void;
+            params[11] = &experts_i32 as *const _ as *mut c_void;
+            params[12] = &rank_i32 as *const _ as *mut c_void;
+            params[13] = &tile_u4_i32 as *const _ as *mut c_void;
+            params[14] = &tiles_i32 as *const _ as *mut c_void;
+            15
         };
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", symbol, span);
         let result = self.launch_maybe_blob(
@@ -4344,28 +4369,53 @@ mod ep_tile_tests {
 
     #[test]
     fn the_embedded_images_export_their_launcher_symbols() {
-        for (image, symbol, module) in [
-            (kernels::EP_TILE_MASK_PM_GFX1201, EP_TILE_MASK_PM_SYMBOL, EP_TILE_MASK_PM_MODULE),
-            (kernels::EP_TILE_PULL_PM_GFX1201, EP_TILE_PULL_PM_SYMBOL, EP_TILE_PULL_PM_MODULE),
-            (kernels::EP_TILE_PULL_N4_PM_GFX1201, EP_TILE_PULL_N4_PM_SYMBOL, EP_TILE_PULL_N4_PM_MODULE),
+        for (image, symbol) in [
+            (kernels::EP_TILE_MASK_PM_GFX1201, EP_TILE_MASK_PM_GFX1201_SYMBOL),
+            (kernels::EP_TILE_MASK_PM_GFX1100, EP_TILE_MASK_PM_GFX1100_SYMBOL),
+            (kernels::EP_TILE_PULL_PM_GFX1201, EP_TILE_PULL_PM_GFX1201_SYMBOL),
+            (kernels::EP_TILE_PULL_PM_GFX1100, EP_TILE_PULL_PM_GFX1100_SYMBOL),
+            (kernels::EP_TILE_PULL_N8_PM_GFX1201, EP_TILE_PULL_N8_PM_GFX1201_SYMBOL),
+            (kernels::EP_TILE_PULL_N8_PM_GFX1100, EP_TILE_PULL_N8_PM_GFX1100_SYMBOL),
         ] {
             assert!(image.windows(4).any(|w| w == b"\x7fELF"), "no device ELF in the {symbol} bundle");
             assert!(image.windows(symbol.len()).any(|w| w == symbol.as_bytes()), "{symbol} missing from its image");
-            assert_eq!(module, symbol);
+        }
+    }
+
+    #[test]
+    fn arch_gate_and_kernel_selection() {
+        assert!(ep_tile_pm_arch("gfx1100") && ep_tile_pm_arch("gfx1201"));
+        for arch in ["gfx1200", "gfx1151", "gfx1101", "gfx942", "gfx11", ""] {
+            assert!(!ep_tile_pm_arch(arch), "{arch:?}");
+            assert!(ep_tile_mask_kernel(arch).is_none() && ep_tile_pull_kernel(arch, 2).is_none(), "{arch:?}");
+        }
+        // The owner assignment stays gfx1201-only.
+        assert!(qwen4_ep_owner_assign_pm_arch("gfx1201") && !qwen4_ep_owner_assign_pm_arch("gfx1100"));
+        for (arch, mask, two, n8) in [
+            ("gfx1201", EP_TILE_MASK_PM_GFX1201_SYMBOL, EP_TILE_PULL_PM_GFX1201_SYMBOL, EP_TILE_PULL_N8_PM_GFX1201_SYMBOL),
+            ("gfx1100", EP_TILE_MASK_PM_GFX1100_SYMBOL, EP_TILE_PULL_PM_GFX1100_SYMBOL, EP_TILE_PULL_N8_PM_GFX1100_SYMBOL),
+        ] {
+            assert_eq!(ep_tile_mask_kernel(arch).unwrap().1, mask);
+            assert_eq!(ep_tile_pull_kernel(arch, 2).unwrap().1, two);
+            for ranks in 3..=EP_TILE_PULL_MAX_RANKS {
+                assert_eq!(ep_tile_pull_kernel(arch, ranks).unwrap().1, n8, "{arch} ranks {ranks}");
+            }
+            assert!(two.ends_with(arch) && n8.ends_with(arch) && mask.ends_with(arch));
+            assert_eq!(n8, two.replace("_pm_", "_n8_pm_"));
         }
     }
 
     /// Device check of the production launchers (the embedded certified builder kernels): the
     /// mask equals the host law, the source ids are untouched, and the pull copies exactly the
     /// non-owned live tiles of a second device buffer (standing in for the peer's) onto the
-    /// destination. Needs a gfx1201 GPU; never run by the CPU-only gate.
+    /// destination. Needs a gfx1100 or gfx1201 GPU; never run by the CPU-only gate.
     #[test]
-    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    #[ignore = "requires a gfx1100/gfx1201 GPU and working HIP toolchain"]
     fn mask_and_pull_match_the_host_reference() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if qwen4_ep_owner_assign_pm_arch(&gpu.arch) => gpu,
+            Ok(gpu) if ep_tile_pm_arch(&gpu.arch) => gpu,
             _ => {
-                eprintln!("skip: the tile kernels are gfx1201 only");
+                eprintln!("skip: the tile kernels are gfx1100/gfx1201 only");
                 return;
             }
         };
@@ -4374,9 +4424,9 @@ mod ep_tile_tests {
         let tile_bytes = EP_TILE_ROWS * ROW_U4 * 16;
         let upload = |gpu: &mut Gpu, bytes: &[u8]| gpu.upload_raw(bytes, &[bytes.len()]).expect("upload");
         let words = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        // 2 ranks launch the two-rank specialization, 4 ranks the rank-generic one; every non-local
+        // 2 ranks launch the two-rank specialization, 3..=8 the rank-generic one; every non-local
         // slot is the one stand-in peer buffer.
-        for ranks in [2usize, 4] {
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
             let owner: Vec<i32> = (0..EXPERTS as i32).map(|e| e % ranks as i32).collect();
             let owner_gpu = upload(&mut gpu, &words(&owner));
             let mut state = 0x9E37_79B9_7F4A_7C15u64;
@@ -4396,7 +4446,7 @@ mod ep_tile_tests {
                     let dst_gpu = upload(&mut gpu, &vec![0xC3u8; tiles * tile_bytes]);
                     gpu.ep_tile_mask(&ids_gpu, &owned_gpu, &owner_gpu, tiles, EXPERTS, rank).expect("mask");
                     // The local slot is this rank's destination, every other used slot the stand-in peer.
-                    let mut sources = [0usize; 4];
+                    let mut sources = [0usize; EP_TILE_PULL_MAX_RANKS];
                     for slot in sources.iter_mut().take(ranks) {
                         *slot = peer_gpu.buf.as_ptr() as usize;
                     }

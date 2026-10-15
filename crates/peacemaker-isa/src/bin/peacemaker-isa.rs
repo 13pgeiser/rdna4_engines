@@ -102,13 +102,13 @@ fn qwen4_ep_owner_assign(arch:Arch)->Result<(String,Vec<u8>),String>{
  let (_,text,proof)=peacemaker_isa::kernels::qwen4_ep_owner_assign_pm::emit_module(arch)?;
  Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
 }
-/// The PM tile-ownership mask of the owner-routed EP chunk MoE (`ep_tile_mask_pm_gfx1201`), one symbol per module.
+/// The PM tile-ownership mask of the owner-routed EP chunk MoE (`ep_tile_mask_pm_gfx1100` / `ep_tile_mask_pm_gfx1201`), one symbol per module.
 fn ep_tile_mask(arch:Arch)->Result<(String,Vec<u8>),String>{
  let (_,text,proof)=peacemaker_isa::kernels::ep_tile_mask::emit_module(arch)?;
  Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
 }
-/// The PM tile pull of the owner-routed EP chunk MoE, one symbol per module: `ep_gather_grouped_rows_by_tile_owner_pm_gfx1201`
-/// (`Variant::Ep2`, the 48-byte two-rank kernel) or `ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201` (`Variant::N4`, the 72-byte rank-generic kernel).
+/// The PM tile pull of the owner-routed EP chunk MoE, one symbol per module: `ep_gather_grouped_rows_by_tile_owner_pm_<arch>`
+/// (`Variant::Ep2`, the 48-byte two-rank kernel) or `ep_gather_grouped_rows_by_tile_owner_n8_pm_<arch>` (`Variant::N8`, the 104-byte rank-generic kernel, 2..=8 ranks); `<arch>` is gfx1100 or gfx1201.
 fn ep_tile_pull(variant:peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant,arch:Arch)->Result<(String,Vec<u8>),String>{
  let (_,text,proof)=peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::emit_module(variant,arch)?;
  Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
@@ -379,7 +379,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qwen4_ep_owner_assign_pm"=>qwen4_ep_owner_assign(arch)?,
   "ep_tile_mask_pm"=>ep_tile_mask(arch)?,
   "ep_gather_grouped_rows_by_tile_owner_pm"=>ep_tile_pull(peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,arch)?,
-  "ep_gather_grouped_rows_by_tile_owner_n4_pm"=>ep_tile_pull(peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::N4,arch)?,
+  "ep_gather_grouped_rows_by_tile_owner_n8_pm"=>ep_tile_pull(peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::N8,arch)?,
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
   "npu_trunk"=>{if arch!=Arch::Gfx1151{return Err("npu_trunk is gfx1151 only".into())} let (_,text,proof)=peacemaker_isa::npu_trunk::emit_module()?;(text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?)},
@@ -404,10 +404,10 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
 let mqi4=kernel=="mq_i4_rows"||kernel=="mq_i4_moe_gemv";
 let mqia4=kernel=="mq_i4_a4";
  let lane_rows=kernel=="qwen4_lane_rows"||kernel=="npu_trunk"||kernel=="npu_trunk_arena";
- let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm";
+ let spec_pm=kernel=="spec_sampling_rows_pm"||kernel=="spec_accept_pm"||kernel=="qwen4_ep_owner_assign_pm"||kernel=="ep_tile_mask_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n8_pm";
  let mtp_q8=kernel=="mtp_q8_det_gfx11";
  let mtp_det=kernel=="mtp_dense_det_gfx11"||mtp_q8;
-if pm_module.is_none()&&!mq4v&&!mq4f8&&!mqi4&&!mqia4&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n4_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
+if pm_module.is_none()&&!mq4v&&!mq4f8&&!mqi4&&!mqia4&&!lane_rows&&!spec_pm&&!mtp_det&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into())}
  if spec_pm&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into())}
  if lane_rows&&shape.is_some() {return Err("qwen4_lane_rows has no --shape contract (use --m7)".into())}
  if lane_rows&&co.is_none() {return Err("qwen4_lane_rows emission requires --co (M7 certifies the linked object)".into())}
@@ -483,9 +483,9 @@ if mqia4&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq_i4_a4 --
   } else if kernel=="ep_tile_mask_pm" {
    let e=peacemaker_isa::kernels::ep_tile_mask::emit(arch)?;
    (peacemaker_isa::kernels::ep_tile_mask::symbol(arch),peacemaker_isa::kernels::ep_tile_mask::contract(arch,&e))
-  } else if kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n4_pm" {
+  } else if kernel=="ep_gather_grouped_rows_by_tile_owner_pm"||kernel=="ep_gather_grouped_rows_by_tile_owner_n8_pm" {
    use peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner as pull;
-   let variant=if kernel=="ep_gather_grouped_rows_by_tile_owner_pm" {pull::Variant::Ep2} else {pull::Variant::N4};
+   let variant=if kernel=="ep_gather_grouped_rows_by_tile_owner_pm" {pull::Variant::Ep2} else {pull::Variant::N8};
    let e=pull::emit(variant,arch)?;
    (pull::symbol(variant,arch),pull::contract(variant,arch,&e))
   } else {

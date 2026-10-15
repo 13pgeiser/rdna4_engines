@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Builder-emitted (PeaceMaker) gfx1201 tile-ownership mask of the Flash-Next
+//! Builder-emitted (PeaceMaker) gfx1100 / gfx1201 tile-ownership mask of the Flash-Next
 //! owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`):
-//! `ep_tile_mask_pm_gfx1201`. One integer compare/select over the padded tile
+//! `ep_tile_mask_pm_<arch>`. One integer compare/select over the padded tile
 //! capacity, writing a COPY of the grouped-GEMM tile ids in which every tile of
 //! an expert this rank does not own is the sentinel `-1` (the symmetric IU4
 //! GEMMs return on that sentinel before any weight or activation load). The
@@ -29,11 +29,10 @@
 //! Schedule: lane `t = 256 wg + tid` (clamped to the last tile for the loads,
 //! so no load is out of range; the store is exec-masked to `t < tiles`) loads
 //! its id, the owner of `live ? id : 0`, and selects with two lane masks.
-use super::common::{bload, op, s, smem, sop, sr, srd_tail, v, vr};
-use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::{Instruction, MemoryClass}, plan::Access, reg::{Kind, Live, RegRef}};
-use peacemaker_author::{Gfx1201, Workgroup};
+use super::common::{bload, op, s, smem, sop, sr, srd_tail, v};
+use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::MemoryClass, plan::Access, reg::{Kind, Live, RegRef}};
+use peacemaker_author::{Gfx1100, Gfx1201, Target, Workgroup};
 
-type Wg<'b> = Workgroup<'b, Gfx1201, Builder>;
 type R = Result<(), String>;
 
 /// Threads (tiles) per workgroup.
@@ -46,6 +45,8 @@ pub fn module(arch: Arch) -> String { format!("ep_tile_mask_pm_{}", arch.name())
 
 // ---- SGPRs ------------------------------------------------------------------
 const KARG: u8 = 0;
+/// gfx11 system SGPR right after the two user SGPRs: workgroup id x (gfx12 reads `ttmp9`).
+const WGX_IN: u8 = 2;
 // kernarg words 0..8 -> s8..s15 (ids 8:9, owned 10:11, table 12:13, tiles 14, n_experts 15), rank s16.
 const IDS: u8 = 8; const OWNED: u8 = 10; const TABLE: u8 = 12;
 const TILES: u8 = 14; const NEXP: u8 = 15; const RANK: u8 = 16;
@@ -72,24 +73,28 @@ fn kernargs() -> KernargLayout {
         .hidden("rank", 32, 4, "by_value")
 }
 
-fn plan() -> Result<RegPlan, String> {
+fn plan(arch: Arch) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(V_END), 104)?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
+    if !arch.gfx12() { p.s::<1>("wg_x_in", WGX_IN, Live::Whole)?; }
     for base in (8u8..S_END).step_by(8) { p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?; }
     for base in (0u8..V_END).step_by(8) { p.add_range(&format!("v_blk{base}"), Kind::V, base, 8, Live::Whole)?; }
     Ok(p)
 }
 
-/// The builder-emitted kernel (gfx1201 only; every other target is refused).
+/// The builder-emitted kernel (gfx1100 and gfx1201; every other target is refused).
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
-    if arch != Arch::Gfx1201 { return Err(format!("ep_tile_mask_pm: built for gfx1201 only, not {}", arch.name())) }
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) { return Err(format!("ep_tile_mask_pm: built for gfx1100 and gfx1201 only, not {}", arch.name())) }
     let kspec = KernelSpec {
         kernel_id: "ep_tile_mask_pm".into(), variant: "owner".into(), arch, symbol: symbol(arch), kernargs: kernargs(),
         user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: BLOCK as u16, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan()?);
+    let mut b = Builder::new(kspec, plan(arch)?);
     b.enable_delay_alu();
-    kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?)?;
+    match arch {
+        Arch::Gfx1100 => kernel(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, arch)?,
+        _ => kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?, arch)?,
+    }
     b.finish()
 }
 
@@ -108,21 +113,25 @@ fn srd(b: &mut Builder, dst: u8, ptr: u8, records: u8) -> R {
     sop(b, format!("s_mov_b32 s{}, s{}", dst + 1, ptr + 1), &[dst + 1], &[ptr + 1])?;
     srd_tail(b, dst, Some(records))
 }
+/// Raw buffer store of one dword at `v{voff}` (soffset zero: `null` on gfx12, `0` on gfx11).
 fn bstore(b: &mut Builder, data: u8, voff: u8, desc: u8) -> R {
-    super::common::mem(b, format!("buffer_store_b32 v{data}, v{voff}, s[{desc}:{}], null offen", desc + 3), &[], &[v(voff), v(data), sr(desc, 4)], MemoryClass::VmemStore)
+    let soffset = if b.spec.arch.gfx12() { "null" } else { "0" };
+    super::common::mem(b, format!("buffer_store_b32 v{data}, v{voff}, s[{desc}:{}], {soffset} offen", desc + 3), &[], &[v(voff), v(data), sr(desc, 4)], MemoryClass::VmemStore)
 }
 
+fn s_sub_i32(a: Arch) -> &'static str { if a.gfx12() { "s_sub_co_i32" } else { "s_sub_i32" } }
+
 // ---- kernel -----------------------------------------------------------------
-fn kernel(wg: &mut Wg) -> R {
+fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     let end = wg.exit(".Lmask_end")?;
     let b = wg.isa();
     smem(b, IDS, 8, KARG, 0x00)?;
     smem(b, RANK, 1, KARG, 0x20)?;
-    // Workgroup id x (gfx12: ttmp9).
-    sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
+    // Workgroup id x: gfx12 `ttmp9`, gfx11 the system SGPR after the user SGPRs.
+    if arch.gfx12() { sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?; } else { sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?; }
     for mk in MASKS { sop(b, format!("s_mov_b32 s{}, 0", mk + 1), &[mk + 1], &[])? }
     // Last tile (the load clamp), extents, descriptors.
-    sop(b, format!("s_sub_co_i32 s{TLM1}, s{TILES}, 1"), &[TLM1], &[TILES])?;
+    sop(b, format!("{} s{TLM1}, s{TILES}, 1", s_sub_i32(arch)), &[TLM1], &[TILES])?;
     sop(b, format!("s_lshl_b32 s{BYTES}, s{TILES}, 2"), &[BYTES], &[TILES])?;
     srd(b, SRD_IDS, IDS, BYTES)?;
     srd(b, SRD_OWNED, OWNED, BYTES)?;

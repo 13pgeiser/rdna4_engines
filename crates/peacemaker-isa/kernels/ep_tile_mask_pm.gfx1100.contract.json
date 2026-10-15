@@ -1,13 +1,13 @@
 {
   "counts": {
-    "buffer_load_b128": 4,
-    "buffer_store_b128": 4,
+    "buffer_load_b32": 2,
+    "buffer_store_b32": 1,
     "s_barrier_signal": 0,
     "s_barrier_wait": 0,
     "s_endpgm": 1,
-    "s_load_b128": 2,
-    "s_load_b256": 0,
-    "s_load_b32": 2
+    "s_load_b256": 1,
+    "s_load_b32": 1,
+    "s_load_b64": 0
   },
   "forbidden": [
     "scratch_*",
@@ -25,6 +25,6 @@
   "require_zero_private": true,
   "require_zero_spills": true,
   "sgpr_max": 104,
-  "symbol": "ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201",
-  "vgpr_max": 24
+  "symbol": "ep_tile_mask_pm_gfx1100",
+  "vgpr_max": 16
 }

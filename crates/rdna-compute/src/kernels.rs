@@ -9920,26 +9920,39 @@ pub const QWEN4_EP_OWNER_ASSIGN_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_ep_owner_assign_pm_gfx1201.hxaco");
 
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile mask
-/// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 only (`peacemaker-isa emit --kernel
+/// (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`), gfx1201 (`peacemaker-isa emit --kernel
 /// ep_tile_mask_pm --arch gfx1201`, M7 obligation-free): a copy of the grouped-GEMM tile
 /// ids with every tile of a non-owned expert set to the -1 sentinel.
 pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1201.hxaco");
 
+/// gfx1100 build of [`EP_TILE_MASK_PM_GFX1201`] (`peacemaker-isa emit --kernel ep_tile_mask_pm
+/// --arch gfx1100`).
+pub const EP_TILE_MASK_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1100.hxaco");
+
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, two-rank
-/// specialization, gfx1201 only (`peacemaker-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm
+/// specialization, gfx1201 (`peacemaker-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm
 /// --arch gfx1201`, M7 obligation-free, 48-byte kernarg): copies the rows of every non-owned live
 /// tile from the one peer's `y_down_grouped` onto the local buffer.
 pub const EP_TILE_PULL_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco");
 
+/// gfx1100 build of [`EP_TILE_PULL_PM_GFX1201`] (`--arch gfx1100`).
+pub const EP_TILE_PULL_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1100.hxaco");
+
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, rank-generic
-/// specialization, gfx1201 only (`peacemaker-isa emit --kernel
-/// ep_gather_grouped_rows_by_tile_owner_n4_pm --arch gfx1201`, M7 obligation-free, 72-byte
-/// kernarg): copies the rows of every non-owned live tile from the owner rank's
-/// `y_down_grouped` (one of four source bases, 2 or 4 ranks) onto the local buffer.
-pub const EP_TILE_PULL_N4_PM_GFX1201: &[u8] =
-    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_n4_pm_gfx1201.hxaco");
+/// specialization, gfx1201 (`peacemaker-isa emit --kernel
+/// ep_gather_grouped_rows_by_tile_owner_n8_pm --arch gfx1201`, 104-byte kernarg): copies the rows
+/// of every non-owned live tile from the owner rank's `y_down_grouped` (one of eight source
+/// bases, 3..=8 ranks) onto the local buffer.
+pub const EP_TILE_PULL_N8_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco");
+
+/// gfx1100 build of [`EP_TILE_PULL_N8_PM_GFX1201`] (`--arch gfx1100`).
+pub const EP_TILE_PULL_N8_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100.hxaco");
 
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
