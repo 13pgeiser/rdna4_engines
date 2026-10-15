@@ -1283,6 +1283,9 @@ layer program; target projections are not merged across requests. This first
 route supports AR lanes only: cross-request DFlash/MTP verification is not
 installed, while the existing singleton speculative path remains available.
 gfx1201 retains its batched projection and speculative-lane routes.
+Q8 recurrent state requires the default-on error feedback; with it disabled,
+gfx1100 Exact serve staging keeps the existing singleton route because the
+legacy stochastic state's singleton hipGraph is not byte-stable.
 
 ### Architecture-gated default-on kernel routes
 

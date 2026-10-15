@@ -658,6 +658,16 @@ fn stage_qwen_vmm_batch(
         );
         return out;
     };
+    if gpu.arch_caps.is_gfx1100()
+        && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        && !b.dn_state.s_scales.is_empty()
+        && b.dn_state.s_ef_residual.is_empty()
+    {
+        // Legacy stochastic Q8 state is not singleton-exact under hipGraph:
+        // replay freezes the captured requant frame, unlike eager AR lanes.
+        eprintln!("[daemon] gfx1100 Exact VMM requires Q8 error feedback (HIPFIRE_DN_STATE_EF=1); stochastic EF-off singleton graph parity is unproven — existing route");
+        return out;
+    }
     // The executor's own coverage predicate (embedding/lm_head dtypes,
     // slots-body layer coverage, VMM KV route and flash plan) — not the
     // fixed-lane `qwen_batch_weight_formats_supported` gate.
