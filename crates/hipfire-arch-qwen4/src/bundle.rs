@@ -823,7 +823,7 @@ impl Qwen4Bundle {
         // keeps its score / filter scratch in the selector slot. Reserve the
         // route's constant upper bound now, before any capture or record, so
         // no retained decode tape ever sees that slot grow or move. A no-op
-        // unless the route can run (switch on, gfx1201, BF16 pooled keys).
+        // unless the route can run (not killed with `=0`, gfx1201, BF16 pooled keys).
         if let Some(qsa) = self.state.qsa.first() {
             let reserved = rdna_compute::tensor_ops::reserve_qsa_bf16_split_scratch(
                 gpu,

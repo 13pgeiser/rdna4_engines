@@ -4190,18 +4190,20 @@ fn indexed_attention_select_rows8_core(
     Ok(mirror.is_some())
 }
 
-/// `HIPFIRE_QWEN4_QSA_BF16_SPLIT=1` routes BF16-pooled QSA selection on exact
+/// `HIPFIRE_QWEN4_QSA_BF16_SPLIT` (on unless `0`) routes BF16-pooled QSA selection on exact
 /// gfx1201 through the split score / select pair
 /// ([`indexed_attention_select_bf16_split`]): the exact hipcc BF16 score kernels
 /// of `kernels/src/qsa_bf16_scores.hip`, then the exact filter trio
 /// (`qsa_filter_select.hip`), both from the dedicated
 /// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
 /// blocks. Selected indices and the mirror are byte-identical to the fused
-/// `indexed_attention_select_bf16_batched` incumbent. Default off; `0` always
+/// `indexed_attention_select_bf16_batched` incumbent. Default on, and only on
+/// exact gfx1201 ([`qsa_bf16_split_arch`]; the other architectures keep the
+/// incumbent whatever the switch says); `0` is the kill switch and always
 /// keeps the incumbent, as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
 /// select-from-scores arm never beats the filter on gfx1201). Read once.
 static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_BF16_SPLIT", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_BF16_SPLIT", true)
 });
 
 /// Pooled blocks from which the split route replaces the fused BF16 selector

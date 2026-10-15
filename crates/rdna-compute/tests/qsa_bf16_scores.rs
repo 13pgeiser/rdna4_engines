@@ -37,15 +37,16 @@
 //!   position (blocks past the visible prefix are rewritten as huge keys per
 //!   position). The tape's kernels and grids must not depend on the capture
 //!   position.
-//! * Production route (`HIPFIRE_QWEN4_QSA_BF16_SPLIT=1`, exact gfx1201): the
-//!   public mirrored select eager and recorded, below and above the crossover.
+//! * Production route (default on for exact gfx1201; `HIPFIRE_QWEN4_QSA_BF16_SPLIT=0`
+//!   must force the incumbent): the public mirrored select eager and recorded,
+//!   below and above the crossover.
 //! * `#[ignore]`d `qsa_bf16_split_crossover_table`: graph-replayed GPU time of
 //!   the fused incumbent, split select and split filter.
 //!
 //! Every GPU test skips without a gfx11+/gfx12 device.
 //!
 //!   cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture
-//!   HIPFIRE_QWEN4_QSA_BF16_SPLIT=1 cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture
+//!   HIPFIRE_QWEN4_QSA_BF16_SPLIT=0 cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture
 //!   cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --ignored --nocapture qsa_bf16_split_crossover_table
 #![cfg(feature = "lab")]
 
@@ -918,22 +919,16 @@ fn qsa_bf16_split_recorded_replay_matches_fused_at_positions() {
 // ---------------------------------------------------------------------------
 // production route
 
-/// `Some(true)`: `HIPFIRE_QWEN4_QSA_BF16_SPLIT=1`; `Some(false)`: `=0` (must force
-/// the incumbent); `None`: unset (the production route is not under test).
-fn split_switch() -> Option<bool> {
-    match std::env::var("HIPFIRE_QWEN4_QSA_BF16_SPLIT").as_deref() {
-        Ok("1") => Some(true),
-        Ok("0") => Some(false),
-        _ => None,
-    }
+/// `false`: `HIPFIRE_QWEN4_QSA_BF16_SPLIT=0` (the kill switch; must force the
+/// incumbent); `true`: unset or any other value (the default route on exact
+/// gfx1201).
+fn split_switch() -> bool {
+    std::env::var("HIPFIRE_QWEN4_QSA_BF16_SPLIT").as_deref() != Ok("0")
 }
 
 #[test]
 fn qsa_bf16_split_production_route_matches_fused() {
-    let Some(split_on) = split_switch() else {
-        eprintln!("skip: set HIPFIRE_QWEN4_QSA_BF16_SPLIT=1 (or 0) to run the production-route test");
-        return;
-    };
+    let split_on = split_switch();
     let Some(mut gpu) = gpu_or_skip() else { return };
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("skip: the production route is exact gfx1201 only (got {})", gpu.arch);
