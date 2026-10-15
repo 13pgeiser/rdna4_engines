@@ -25,6 +25,11 @@
 //!                    [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]
 //!   qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref \
 //!                    --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]
+//!   qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json \
+//!                    [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2]
+//! `--product-prompt` uses the product's cold, single-user answer-mode prompt
+//! renderer (no system, tools or history). Speed receipts retain prompt ids,
+//! full generated ids (including warmup), and the product's terminator ids.
 //! `s11ref` writes F64 KL(ref || candidate), in the reference score-index order,
 //! and OUT.npy.json with model/ref/corpus/binary SHA256. S11 refs contain no
 //! prefix tokens: --corpus must be the exact corpus bound by the header SHA.
@@ -118,7 +123,7 @@ fn verified_hot_store(
     Ok(hot)
 }
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]";
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode | --append-rows R[,R...]] [--ple-hot BYTES]\n  qwen4_kld s11ref --model CANDIDATE.hfq --ref REF.s11ref --corpus CORPUS.json --output OUT.npy [--decode] [--ple-hot BYTES]\n  qwen4_kld speed --model MODEL.hfq --prompt-file PROMPT.txt --output OUT.json [--product-prompt] [--decode-tokens 128] [--speed-warmup 8] [--reps 2] [--max-prompt N]";
 
 /// Reuse the backing allocation, but expose exactly this cold window's rows.
 fn all_logits_view(backing: &GpuTensor, tokens: usize, vocab: usize) -> GpuTensor {
@@ -1009,14 +1014,50 @@ fn score_s11ref(
 /// warmup; the receipt keeps every rep.
 fn speed(
     model: &Path, prompt: &Path, output: &Path, decode_tokens: usize, warmup: usize, reps: usize,
-    max_prompt: Option<usize>,
+    max_prompt: Option<usize>, product_prompt: bool,
 ) -> Result<(), String> {
     let text = std::fs::read_to_string(prompt).map_err(|e| format!("read {}: {e}", prompt.display()))?;
-    let probe = Tokenizer::from_hfq_metadata(
-        &HfqFile::open(model).map_err(|e| e.to_string())?.metadata_json,
-    )
-    .map_err(|e| format!("tokenizer: {e}"))?;
-    let mut tokens = probe.encode(&text);
+    let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+    let probe = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer: {e}"))?;
+    let mut terminator_ids = vec![probe.eos_id];
+    if let Some(id) = probe.eot_id {
+        terminator_ids.push(id);
+    }
+    let mut tokens = if product_prompt {
+        // Match render_qwen4_prompt_cold's AR answer-mode branch. A template
+        // render error is fatal, never silently replaced by a raw completion.
+        let text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&text);
+        let template = hfq.chat_template();
+        let jinja = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok().as_deref() != Some("0");
+        if let Some(template) = template.as_ref().filter(|_| jinja) {
+            let rendered = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer: &probe,
+                template,
+                system: None,
+                user: &text,
+                enable_thinking: false,
+                bos_token: None,
+                reasoning_strength: None,
+                // qwen_jinja_reasoning disables thinking AND omits effort
+                // for the product's answer-mode request.
+                reasoning_effort: None,
+            }.render().map_err(|e| format!("qwen4 Jinja render failed: {e}"))?;
+            probe.encode(&rendered)
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer: &probe,
+                system: None,
+                user: &text,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+                raw: false,
+            }.build()
+        }
+    } else {
+        probe.encode(&text)
+    };
+    drop(hfq);
     drop(probe);
     if let Some(cap) = max_prompt {
         tokens.truncate(cap);
@@ -1026,6 +1067,9 @@ fn speed(
     }
     let n_ctx = tokens.len() + warmup + decode_tokens + 8;
     let mut m = Model::load(model, n_ctx, 1, None)?;
+    terminator_ids.push(m.bundle.config.eos_token_id);
+    terminator_ids.sort_unstable();
+    terminator_ids.dedup();
     let row = m.logits.sub_offset(0, m.vocab);
     let mut rep_rows = Vec::new();
     for rep in 0..reps {
@@ -1063,6 +1107,7 @@ fn speed(
         rep_rows.push(serde_json::json!({
             "rep": rep, "ttft_ms": ttft * 1e3, "decode_tok_s": tps,
             "decode_s": decode_s, "first_ids": ids.iter().take(16).collect::<Vec<_>>(),
+            "generated_ids": ids,
             "prefill_logits_sha256": logits_sha,
         }));
     }
@@ -1074,6 +1119,7 @@ fn speed(
         "prompt_sha256": artifact_id(prompt)?.sha256,
         "binary_sha256": artifact_id(&binary)?.sha256,
         "prompt_tokens": tokens.len(), "decode_tokens": decode_tokens, "warmup_tokens": warmup,
+        "product_prompt": product_prompt, "prompt_ids": tokens, "terminator_ids": terminator_ids,
         "expert_vram_layers": std::env::var("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS").ok(),
         "arch": m.gpu.arch.to_string(),
         "reps": rep_rows,
@@ -1091,6 +1137,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let (mut ple_hot, mut append_rows) = (None, Vec::new());
     let mut smoke_seqs: Option<usize> = None;
     let mut prompt_file: Option<PathBuf> = None;
+    let mut product_prompt = false;
     let (mut decode_tokens, mut speed_warmup, mut reps, mut max_prompt) = (128usize, 8usize, 2usize, None::<usize>);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -1118,6 +1165,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             }
             "--smoke-seqs" => smoke_seqs = Some(number(value()?)?),
             "--prompt-file" => prompt_file = Some(PathBuf::from(value()?)),
+            "--product-prompt" => product_prompt = true,
             "--decode-tokens" => decode_tokens = number(value()?)?,
             "--speed-warmup" => speed_warmup = number(value()?)?,
             "--reps" => reps = number(value()?)?,
@@ -1144,7 +1192,7 @@ fn run_args(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         ("speed", Some(model), None, None, Some(output)) => {
             let prompt = prompt_file.ok_or("speed requires --prompt-file")?;
-            speed(&model, &prompt, &output, decode_tokens, speed_warmup, reps, max_prompt)
+            speed(&model, &prompt, &output, decode_tokens, speed_warmup, reps, max_prompt, product_prompt)
         }
         ("ple-derive", Some(model), None, None, None) => {
             // CPU-only: writes `<model>.ple-q4` (row order) from the embedded

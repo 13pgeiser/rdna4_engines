@@ -16,7 +16,6 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::model_source::ModelSource as _;
-use hipfire_runtime::model_source::SourcePayload;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use std::any::Any;
@@ -1251,8 +1250,9 @@ pub fn qwen4_ep_vram_layers(
     if gpu.is_uma() {
         return Err("qwen4: expert parallelism needs discrete GPUs".into());
     }
-    let receipt =
-        hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
+        .map_err(|error| error.to_string())?;
+    let recipe = receipt.recipe().clone();
     let config = receipt.config;
     let manifest = receipt
         .manifest
@@ -1270,8 +1270,10 @@ pub fn qwen4_ep_vram_layers(
         hipfire_arch_qwen4::artifact::source_forward_scratch_mode(gpu, hfq, &config, &manifest)
             .map_err(|error| error.to_string())?;
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-        hfq.tensor_data(&entry.name)
-            .map(|(_, bytes)| bytes.len() as u64)
+        crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
+            hfq.tensor_data(&entry.name)
+                .map(|(_, bytes)| bytes.len() as u64)
+        })
     };
     let (non_expert, layer_experts, reserve, ..) = qwen4_placement_inputs(
         gpu,
@@ -1375,8 +1377,10 @@ pub fn load_qwen4_rank(
     // profile's embedded rows (or a profile without PLE) have no sidecar
     // to resolve: `None`.
     let choice = crate::admission::resolve_qwen4_ple_rows_hfq(&mut hfq, ctx.path, &ctx.gpu.arch)?;
-    let receipt =
-        hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
+    // GPU-arch admission: an artifact the device cannot run is refused here,
+    // before any allocation or mapping drop.
+    let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&ctx.gpu.arch))
+        .map_err(|error| error.to_string())?;
     // Refused before any allocation (source admission applies the same
     // check): an inventory-valid developer profile the executor cannot
     // run would otherwise fail after the weights were fulfilled.
@@ -1594,13 +1598,17 @@ pub fn load_qwen4_rank(
     const MIB: u64 = 1 << 20;
     // Unified memory dropped the mapping above: size from the index.
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-        if use_ranges {
-            hfq.find_tensor_info(&entry.name)
-                .map(|info| info.data_size as u64)
-        } else {
-            hfq.tensor_data(&entry.name)
-                .map(|(_, bytes)| bytes.len() as u64)
-        }
+        // A slab layer arena is sized from the recipe's plan, never looked up
+        // in the tensor index.
+        crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
+            if use_ranges {
+                hfq.find_tensor_info(&entry.name)
+                    .map(|info| info.data_size as u64)
+            } else {
+                hfq.tensor_data(&entry.name)
+                    .map(|(_, bytes)| bytes.len() as u64)
+            }
+        })
     };
     // What `auto` sizes its placement from: free VRAM, the non-expert and
     // per-layer expert bytes, and the reserve (with its native MTP and
@@ -1963,23 +1971,14 @@ pub fn load_qwen4_rank(
             ranks: placement.ranks,
         }),
         |entry| {
-            if qwen4_use_range_payload(use_ranges, entry.residency) {
-                return source
-                    .tensor_range(&entry.name)
-                    .map_err(|error| error.to_string())?
-                    .map(SourcePayload::Range)
-                    .ok_or_else(|| {
-                        if entry.residency.is_external() {
-                            format!("missing external tensor '{}'", entry.name)
-                        } else {
-                            format!("missing resident tensor '{}'", entry.name)
-                        }
-                    });
-            }
-            let (info, bytes) = source
-                .tensor_data(&entry.name)
-                .ok_or_else(|| format!("missing resident tensor '{}'", entry.name))?;
-            Ok(SourcePayload::Borrowed { info, bytes })
+            // A slab layer arena is one span of the container, not a tensor:
+            // the recipe resolves it before the by-name read.
+            crate::qwen4_slab::qwen4_fulfillment_payload(
+                &source,
+                &recipe,
+                entry,
+                qwen4_use_range_payload(use_ranges, entry.residency),
+            )
         },
     )
     .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
