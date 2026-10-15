@@ -525,6 +525,14 @@ context then tracks the tokens touched, not `max_seq`: the load logs
 growth logs `qwen4 QSA context mapped for N tokens`. Mapped pages stay owned
 until unload, and VMM is not eviction.
 
+On gfx1151 two exact QSA selection levers are on by default (kill switches in
+[env-vars](env-vars.md)): each layer keeps a BF16 mirror of its pooled index
+keys (`HIPFIRE_QWEN4_QSA_POOLED_BF16`; 256 bytes per pooled block, i.e.
+16 MiB per QSA layer at 256K, charged in admission and never snapshotted),
+and long-context score/select calls use the sampled filter select
+(`HIPFIRE_QWEN4_QSA_FILTER_SELECT`). Selection, attention and logits are
+byte-identical with either off.
+
 Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
 **automatic** under VMM (legacy storage refuses it and needs an explicit
 value). The context is the model's `max_position_embeddings` (at most

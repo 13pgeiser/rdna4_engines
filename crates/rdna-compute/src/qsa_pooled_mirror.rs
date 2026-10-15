@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Derived BF16 mirror of the QSA pooled index keys
-//! (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, default off).
+//! (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, on unless `0`; admitted only on exact gfx1151).
 //!
 //! `qsa_pool_rope` rounds every pooled key to BF16 before it stores the value
 //! as F32, so the high 16 bits of each canonical F32 element are exactly its
@@ -34,9 +34,9 @@ const THREADS: usize = 256;
 /// Elements per thread of both kernels.
 const PER_THREAD: usize = 4;
 
-/// `HIPFIRE_QWEN4_QSA_POOLED_BF16` (developer bool, default off), read once.
+/// `HIPFIRE_QWEN4_QSA_POOLED_BF16` (developer bool, on unless `0`), read once.
 static QWEN4_QSA_POOLED_BF16: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_POOLED_BF16", false)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_POOLED_BF16", true)
 });
 /// The same switch `tensor_ops` reads for the PM score kernels
 /// (`HIPFIRE_QWEN4_QSA_SCORE_PM`, on unless `0`): the mirror is only consumed

@@ -4198,12 +4198,18 @@ const QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS: usize = 24576;
 const QSA_FILTER_MIN_BLOCKS_PM: usize = 49152;
 /// Calls of at most this many rows (decode, verify) use the few-row crossover.
 const QSA_FILTER_FEW_ROWS: usize = 16;
-/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT=1` runs eager gfx11+ calls of more than
+/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT` routes eager gfx11+ calls of more than
 /// [`qsa_filter_min_blocks`] blocks and at most
 /// [`QSA_SELECT_FROM_SCORES_MAX_BUDGET`] budget blocks through the filter
-/// trio instead of select-from-scores. Default off. Read once.
-static QWEN4_QSA_FILTER_SELECT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_FILTER_SELECT", false)
+/// trio instead of select-from-scores. Unset: on for exact gfx1151 (where it
+/// was measured), off elsewhere; `1` forces it on for any gfx11+, `0` is the
+/// kill switch. Read once.
+static QWEN4_QSA_FILTER_SELECT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+    match hipfire_config::process_value("HIPFIRE_QWEN4_QSA_FILTER_SELECT").as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
 });
 
 #[derive(Clone, Copy, Debug)]
@@ -4247,7 +4253,7 @@ fn qsa_filter_min_blocks(rows: usize, pm_select: bool) -> usize {
 }
 
 /// Production admission of the filter route for a call the score/select
-/// route already admitted: env on, gfx11+ SIMT, eager, more than
+/// route already admitted: switch on (default: exact gfx1151), gfx11+ SIMT, eager, more than
 /// [`qsa_filter_min_blocks`] blocks for the select it replaces, budget within
 /// the select bound.
 fn qsa_filter_production(
@@ -4255,7 +4261,7 @@ fn qsa_filter_production(
     p: &IndexedAttentionSelectBatch<'_>,
     pm: QsaSelectPmArm,
 ) -> Option<QsaFilterCfg> {
-    (*QWEN4_QSA_FILTER_SELECT
+    (QWEN4_QSA_FILTER_SELECT.unwrap_or(gpu.arch_caps.is_gfx1151())
         && gpu.arch_caps.has_gfx11_plus_simt()
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
