@@ -1966,7 +1966,9 @@ mod tests {
         cache.commit();
         assert_eq!(cache.stored_bytes(), pool_bytes);
         assert!(!cache.resident.as_ref().unwrap().cold_exact);
-        assert_eq!(cache.tail.as_ref().unwrap().key.1, (tail + 2 * STRIDE) as u64);
+        // A tail-restored turn does not split at its own tail: A's tail stays
+        // (rows below it are unchanged) and serves a retry of this turn too.
+        assert_eq!(cache.tail.as_ref().unwrap().key.1, tail as u64);
 
         // A lineage-derived chunk restore also cannot publish to the pool.
         let reused = cache.resident.as_ref().unwrap().key.1 as usize;
