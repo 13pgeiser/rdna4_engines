@@ -514,7 +514,7 @@ impl NpuForward {
     }
     pub(super) fn note_pair(&mut self, rows: [usize; 2], position: usize) {
         if !self.pair_logged && self.mode != NpuTrunkMode::Auto {
-            eprintln!("npu-trunk: pair rows={}+{} position={position}",rows[0],rows[1]);
+            eprintln!("npu-trunk: pair rows={}+{} position={position} families={}",rows[0],rows[1],family_names(self.request_families));
             self.pair_logged=true;
         }
     }

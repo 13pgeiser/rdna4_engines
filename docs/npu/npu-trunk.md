@@ -1084,9 +1084,9 @@ A/B subchunks with the original fill-row boundaries and prompt-ID uploads:
 bank B reads hidden rows starting at its bank offset in every mode.
 Pending hidden names the last row of B.
 Only the final bank of a prompt-ending pair runs the target pick; other pairs
-capture silently. Forced modes log their first scheduled pair once:
-`npu-trunk: pair rows=8192+8151 position=0` for a 16343-row fresh prompt, and
-`rows=4672+4647` for a 9,319-row one (the rebalanced pair). With a matched
+capture silently. Forced modes log their first scheduled pair once, with the request's
+family groups: `npu-trunk: pair rows=8192+8151 position=0 families=qkv,zab,q,kvidx` for a
+16343-row fresh prompt, and `rows=4672+4647` for a 9,319-row one (the rebalanced pair). With a matched
 calibration `on` and `emulate` run the same executable plan as `auto` (natural and
 rebalanced pairs), armed from the first row instead of the crossover n*, so
 `emulate` exercises exactly the pairs `on` runs; without a matched calibration
