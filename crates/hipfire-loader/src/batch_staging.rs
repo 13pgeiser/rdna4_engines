@@ -722,7 +722,15 @@ fn stage_qwen_vmm_batch(
         }
     }
     if out.vmm && req.spec {
-        stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        if gpu.arch_caps.is_gfx1100()
+            && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
+        {
+            // gfx1100 exact AR uses singleton layers per request. Shared
+            // speculative verify has a separate numerical/state contract.
+            eprintln!("[daemon] gfx1100 Exact VMM: AR lanes only; batched speculative verification is not admitted");
+        } else {
+            stage_qwen_vmm_spec(m, gpu, requested, out.row_budget);
+        }
     }
     out
 }
