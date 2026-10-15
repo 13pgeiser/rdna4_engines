@@ -188,6 +188,63 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
         })
 }
 
+/// Content identity of one expert-hotset sidecar and of the exact base
+/// artifact it is bound to.
+///
+/// The pin lives in the client instead of a registry field, like
+/// [`TrunkOverlayPin`], so that older clients' strict `deny_unknown_fields` v1
+/// parser keeps accepting the published registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertHotsetPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the hotset file.
+    pub repo: &'static str,
+    /// Hotset file name: the canonical base file name plus `.expert-hotset`.
+    pub file: &'static str,
+    /// SHA-256 of the hotset file.
+    pub sha256: &'static str,
+    /// Size in bytes of the hotset file.
+    pub size_bytes: u64,
+}
+
+/// Expert hotsets known to this client, keyed by exact base artifact identity.
+pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+    base_sha256: FLASH_NEXT_XTS_SHA256,
+    base_size: FLASH_NEXT_XTS_SIZE,
+    repo: FLASH_NEXT_XTS_REPO,
+    file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
+    sha256: "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
+    size_bytes: 217_676,
+}];
+
+/// A resolved expert hotset: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpertHotset {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as an [`ExpertHotset`]. An entry without a pinned digest and
+/// size never matches.
+pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<ExpertHotset> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| ExpertHotset {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingDefaults {
@@ -400,6 +457,12 @@ impl ModelEntry {
     /// the compiled-in [`TRUNK_OVERLAY_PINS`]; `None` for every other entry.
     pub fn trunk_overlay(&self) -> Option<TrunkOverlay> {
         trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
+    }
+
+    /// The Flash-Next expert-hotset sidecar of this entry's base artifact, from
+    /// the compiled-in [`EXPERT_HOTSET_PINS`]; `None` for every other entry.
+    pub fn expert_hotset(&self) -> Option<ExpertHotset> {
+        expert_hotset_in(self, EXPERT_HOTSET_PINS)
     }
 
     /// True when this entry is a split base that publishes PLE row sidecars.
@@ -1393,6 +1456,119 @@ mod tests {
         let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
         assert_eq!(alias_tag, "qwen3.8:flash-next");
         assert_eq!(aliased.trunk_overlay().as_ref(), Some(&first));
+    }
+
+    const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
+
+    #[test]
+    fn expert_hotset_pin_has_exact_metadata_and_canonical_name() {
+        assert_eq!(EXPERT_HOTSET_PINS.len(), 1);
+        let pin = &EXPERT_HOTSET_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!("{FLASH_NEXT_XTS_CANONICAL_FILE}.expert-hotset")
+        );
+        assert_eq!(pin.file, EXPERT_HOTSET_FILE);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086"
+        );
+        assert_eq!(pin.size_bytes, 217_676);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn expert_hotset_lookup_matches_the_base_identity_only() {
+        let entry = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        let hotset = entry.expert_hotset().unwrap();
+        assert_eq!(hotset.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            hotset.sidecar,
+            Sidecar {
+                file: EXPERT_HOTSET_FILE.into(),
+                sha256: Some(EXPERT_HOTSET_PINS[0].sha256.into()),
+                size_bytes: Some(217_676),
+            }
+        );
+        // The legacy spelling of the same pinned bytes resolves to the canonical hotset name.
+        let legacy = pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE);
+        assert_eq!(legacy.expert_hotset(), Some(hotset));
+
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = Some(digest('a'));
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1);
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = None;
+        assert!(other.expert_hotset().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = None;
+        assert!(other.expert_hotset().is_none());
+    }
+
+    #[test]
+    fn expert_hotset_in_uses_the_supplied_pin_table() {
+        let mut entry = pinned_flash_next_entry("custom.mq4");
+        entry.sha256 = Some(digest('b'));
+        entry.size_bytes = Some(123);
+        assert!(expert_hotset_in(&entry, EXPERT_HOTSET_PINS).is_none());
+        let pins = [ExpertHotsetPin {
+            base_sha256: "b".repeat(64).leak(),
+            base_size: 123,
+            repo: "test/repo",
+            file: "custom.mq4.expert-hotset",
+            sha256: "c".repeat(64).leak(),
+            size_bytes: 7,
+        }];
+        let hotset = expert_hotset_in(&entry, &pins).unwrap();
+        assert_eq!(hotset.repo, "test/repo");
+        assert_eq!(hotset.sidecar.file, "custom.mq4.expert-hotset");
+        assert_eq!(hotset.sidecar.sha256, Some(digest('c')));
+        assert_eq!(hotset.sidecar.size_bytes, Some(7));
+        assert!(expert_hotset_in(&entry, &[]).is_none());
+    }
+
+    #[test]
+    fn bundled_registry_resolves_the_expert_hotset_on_exactly_the_stock_xts_tags() {
+        let parsed = bundled().unwrap();
+        let mut resolved: Vec<&str> = parsed
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.expert_hotset().is_some())
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        resolved.sort_unstable();
+        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(resolved, expected);
+        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
+            .expert_hotset()
+            .is_none());
+        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
+            .expert_hotset()
+            .is_none());
+        let first = parsed.models["qwen3.8:flash-next"].expert_hotset().unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            assert_eq!(
+                parsed.models[tag].expert_hotset().as_ref(),
+                Some(&first),
+                "{tag}"
+            );
+        }
+        let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(alias_tag, "qwen3.8:flash-next");
+        assert_eq!(aliased.expert_hotset().as_ref(), Some(&first));
+        assert!(!BUNDLED_REGISTRY.contains("expert_hotset"));
+        assert!(!include_str!("../../../registry/models.json").contains("expert_hotset"));
     }
 
     #[test]
