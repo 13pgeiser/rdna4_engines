@@ -1347,6 +1347,13 @@ pub fn load_qwen4_rank(
     let vmm_granularity = shared.vmm_granularity;
     let max_k = shared.max_k;
     let mut native_mtp = shared.native_mtp;
+    let hotset_path = hipfire_arch_qwen4::expert_hotset::enabled_hotset_path()?;
+    if hotset_path.is_some() && (ep.is_some() || expert_vram_layers.is_some()) {
+        return Err("HIPFIRE_QWEN4_EXPERT_HOTSET refuses expert-parallel placement or an agreed expert VRAM layer split".into());
+    }
+    if hotset_path.is_some() && gpu.is_uma() {
+        return Err("HIPFIRE_QWEN4_EXPERT_HOTSET refuses use_ranges (APU/unified-memory loading)".into());
+    }
     if let Some(placement) = ep {
         if placement.ranks < 2 || placement.rank >= placement.ranks {
             return Err(format!(
@@ -1370,6 +1377,9 @@ pub fn load_qwen4_rank(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
         );
     };
+    if hotset_path.is_some() {
+        hipfire_arch_qwen4::artifact::hotset_source_preflight(&hfq)?;
+    }
     // The PLE rows source (`memory.ple_format`).  Admission already
     // resolved and attached a sidecar on this source; resolving again is
     // idempotent and yields the choice for the load log (and covers a
@@ -1529,7 +1539,7 @@ pub fn load_qwen4_rank(
     // A dense FFN has no routed experts: its gate/up/down are ordinary
     // resident weights and the host-expert placement does not apply.
     let routed_experts = !config.ffn.is_dense();
-    let placements = receipt.placements;
+    let mut placements = receipt.placements;
     let ple_rows = receipt.ple_rows;
     // Only the rank that serves requests' session cache (rank 0 / single)
     // carries a seed; its cache domain keys the snapshots.
@@ -1650,6 +1660,39 @@ pub fn load_qwen4_rank(
     };
     let explicit =
         residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
+    let hotset = hotset_path
+        .as_deref()
+        .map(|path| {
+            hipfire_arch_qwen4::expert_hotset::HotsetSidecar::load(
+                path,
+                config.num_hidden_layers,
+                config.num_experts,
+                config.num_experts_per_tok,
+            )
+        })
+        .transpose()?;
+    let hotset_plan = if let Some(sidecar) = &hotset {
+        let (free, non_expert, _, reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
+        let budget = residency::expert_hotset_budget(free, non_expert, reserve)?;
+        let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
+            &hfq, &config, &manifest,
+        )?;
+        let plan = hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs(
+            &slabs, sidecar.rank(), budget,
+        )
+        .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
+        plan.check_executable(&ctx.gpu.arch)
+            .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
+        eprintln!(
+            "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables = {} MiB",
+            free / MIB, non_expert / MIB, reserve / MIB,
+            mtp_bytes.unwrap_or(0) / MIB, gather_bytes.unwrap_or(0) / MIB,
+            residency::EXPERT_TIER_TABLE_BYTES, budget / MIB,
+        );
+        Some((std::sync::Arc::new(plan), budget))
+    } else {
+        None
+    };
     if !routed_experts {
         residency::refuse_host_expert_request(explicit, config.profile.id())
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -1663,7 +1706,9 @@ pub fn load_qwen4_rank(
     // reaches the global OOM killer.
     let mut measured = None;
     let mut unset_note = String::new();
-    let placement = if let Some(layers) = expert_vram_layers {
+    let placement = if hotset_plan.is_some() {
+        None
+    } else if let Some(layers) = expert_vram_layers {
         // The split an expert-parallel load agreed on (minimum over
         // ranks): applied as is, never re-derived per rank.
         Some(residency::ExpertVramLayers::Layers(layers))
@@ -1745,6 +1790,7 @@ pub fn load_qwen4_rank(
                 config.profile.id()
             ));
     }
+    if hotset_plan.is_none() {
     eprintln!(
         "  qwen4 expert placement: {}{unset_note}",
         match (explicit, placement) {
@@ -1763,6 +1809,7 @@ pub fn load_qwen4_rank(
             (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
         }
     );
+    }
     // Host memory is kept out of reclaim only by a process started for a
     // Qwen4 model (`prepare_host_memory_for`) or with the placement set;
     // one started for another model (serve switching models) can no
@@ -1868,6 +1915,42 @@ pub fn load_qwen4_rank(
                 );
         }
     }
+    if let Some((plan, _)) = &hotset_plan {
+        use hipfire_arch_qwen4::expert_tier_plan::Placement;
+        // Trunk payloads are tier-owned; the unchanged MTP entries still use
+        // their ordinary host-mapped WeightEntries.
+        let mtp_tensors = residency::place_routed_experts(
+            &mut manifest.weights, config.num_hidden_layers,
+        );
+        manifest = manifest.with_expert_tiers().map_err(|error| error.to_string())?;
+        let expected: std::collections::BTreeSet<_> = manifest
+            .resident_keys()
+            .collect();
+        placements.retain(|placement| expected.contains(&(placement.name.as_str(), placement.layer)));
+        let (mtp_host_bytes, _) =
+            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, 1)?;
+        let host_bytes = plan.owner_bytes(Placement::HostMapped)
+            .checked_add(mtp_host_bytes)
+            .ok_or("HIPFIRE_QWEN4_EXPERT_HOTSET: host byte accounting overflow")?;
+        residency::check_host_ram(
+            host_bytes,
+            rdna_compute::kv_slots::mem_available_bytes(),
+            residency::ttm_pool_estimate(),
+        )?;
+        residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
+        let host_experts = 48 * 512 - plan.device_experts();
+        let host_projections = host_experts * 2 + mtp_tensors;
+        if native_mtp
+            && !crate::admission::qwen4_mtp_with_host_mapped_experts(
+                ctx.spec, &ctx.gpu.arch, host_projections,
+            )
+        {
+            native_mtp = false;
+            eprintln!("{}", hipfire_config::mtp_host_spill_decline_line(
+                "qwen4 native", host_projections, host_bytes, &format!("on {}", ctx.gpu.arch),
+            ));
+        }
+    }
     // Expert parallelism: this rank's fit line, at the split it applied.
     if let (Some(placement), Some((free, non_expert, layer_experts, reserve, ..))) =
         (ep, fit_inputs)
@@ -1923,7 +2006,11 @@ pub fn load_qwen4_rank(
                 .sum()
         } else {
             residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
-                .map(|(per_rank, _)| per_rank)
+                .map(|(per_rank, _)| {
+                    per_rank + hotset_plan.as_ref().map_or(0, |(plan, _)| {
+                        plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
+                    })
+                })
                 .unwrap_or(0)
         };
         start_ple_table_worker(store, host_weight_bytes)
@@ -1954,12 +2041,60 @@ pub fn load_qwen4_rank(
         }
         _ => None,
     };
-    let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
-    let source = HfqModelSource::from_hfq(hfq);
     // Every allocation of the weight sweep is immutable model data: railgun
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
     let weights_role =
         hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+    let expert_tiers = if let Some((plan, budget)) = hotset_plan {
+        use hipfire_arch_qwen4::expert_tier_plan::Placement;
+        let (free, _) = ctx.gpu.device_mem_info()
+            .map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: memory re-query: {error}"))?;
+        let required = plan.owner_bytes(Placement::Device)
+            .checked_add(residency::EXPERT_TIER_TABLE_BYTES)
+            .ok_or("HIPFIRE_QWEN4_EXPERT_HOTSET: device byte accounting overflow")?;
+        if (free as u64) < required {
+            return Err(format!(
+                "HIPFIRE_QWEN4_EXPERT_HOTSET: free VRAM dropped to {} MiB before materialize, below {} MiB device owner plus tables; free VRAM and retry",
+                free as u64 / MIB, required / MIB,
+            ));
+        }
+        let device_experts = plan.device_experts();
+        let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
+            ctx.gpu,
+            plan,
+            &|offset, len| {
+                let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow")?;
+                let len = usize::try_from(len).map_err(|_| "hotset source length overflow")?;
+                hfq.data_range(offset, len)
+                    .ok_or_else(|| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: source span {offset}+{len} is outside the artifact mmap"))
+            },
+        ).map_err(|error| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {error}"))?;
+        let digest = lease.logical_digest();
+        use std::fmt::Write as _;
+        let mut digest_hex = String::with_capacity(16);
+        for byte in &digest[..8] {
+            write!(&mut digest_hex, "{byte:02x}").expect("writing to a String");
+        }
+        let sidecar = hotset.as_ref().expect("a hotset plan has a sidecar");
+        eprintln!(
+            "  qwen4 expert hot set: {} sha256 {}, budget {} MiB, {} experts in VRAM ({} MiB), {} host-mapped ({} MiB), generation {}, digest {}",
+            hotset_path.as_ref().expect("a hotset has a path").display(),
+            sidecar.sha256(),
+            budget / MIB,
+            device_experts, lease.owner_bytes(Placement::Device) / MIB,
+            48 * 512 - device_experts, lease.owner_bytes(Placement::HostMapped) / MIB,
+            lease.generation(), digest_hex,
+        );
+        eprintln!(
+            "  qwen4 expert hot set identity: aggregate-MQ4 structure validated (no full artifact digest held by this loader; artifact not rehashed); model_sha256 {}, counts_sha256 {}, format_map {}, format_map_sha256 {}",
+            sidecar.model_sha256(), sidecar.counts_sha256(), sidecar.format_map(), sidecar.format_map_sha256(),
+        );
+        Some(lease)
+    } else {
+        None
+    };
+    let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
+    let source = HfqModelSource::from_hfq(hfq);
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
         &manifest.weights,
         &mesh,
@@ -1994,6 +2129,7 @@ pub fn load_qwen4_rank(
             ple_rows,
             state_format,
             backend,
+            expert_tiers,
         )
         .map_err(|error| match backend {
             hipfire_arch_qwen4::Qwen4KvBackend::Legacy => format!(

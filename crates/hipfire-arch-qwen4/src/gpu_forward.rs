@@ -874,6 +874,7 @@ struct ExpertViewSet<'a> {
     experts: &'a [Qwen4ExpertView],
     identity: u64,
     host_mapped: bool,
+    tier_identity: Option<&'a hipfire_dispatch::families::moe::ExpertTierIdentity>,
 }
 
 impl RoutedExpertWeights for ExpertViewSet<'_> {
@@ -893,6 +894,10 @@ impl RoutedExpertWeights for ExpertViewSet<'_> {
 
     fn host_mapped(&self) -> bool {
         self.host_mapped
+    }
+
+    fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
+        self.tier_identity
     }
 }
 
@@ -934,10 +939,13 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// [`MoeRouteCapability::Fp8B128Grouped`], never runs the symmetric check
     /// and is sealed as grouped prefill at every row count, one row included.
     fp8: bool,
-    /// Whether this rank's own (local) resident expert tensors of the layer
-    /// are host-mapped: a layer-level property, so an EP rank reports the
-    /// same residency single would, never that of a dummy or a peer view.
+    /// Tier layers use `view.any_host()`. Legacy/EP layers report their
+    /// local owning tensor's residency, never a dummy or peer view's bit.
+    /// Residency changes weight-stream reuse, not each output's fold order.
     host_mapped: bool,
+    /// Keeps the frozen payload owners and borrowed pointer tables alive.
+    tier: Option<crate::expert_tier_owners::ExpertTierLease>,
+    tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
     /// `Some` on a trunk layer of an expert-slab artifact: the layer's experts
     /// are views into its one slab arena with a codec each.
     slab: Option<Qwen4SlabLayer>,
@@ -990,6 +998,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn host_mapped(&self) -> bool {
         self.host_mapped
     }
+
+    fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
+        self.tier_identity.as_ref()
+    }
 }
 
 /// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers and
@@ -1028,6 +1040,8 @@ pub struct Qwen4PeerExpertSource {
 pub(crate) enum Qwen4ExpertTableLayout<'a> {
     /// Every expert from the layer's resident tensors (one device).
     Single,
+    /// Frozen absolute pointers into the two model-level tier owners.
+    Tier { gate_up: &'a [usize], down: &'a [usize] },
     /// EP decode table: owned experts name the compact local tensors,
     /// every other expert names the rank's zero dummy expert.
     Ep {
@@ -1048,6 +1062,8 @@ pub(crate) enum Qwen4ExpertTableLayout<'a> {
 pub(crate) enum Qwen4ExpertOrigin {
     /// This rank's resident (compact) expert tensors.
     Local,
+    /// A checked projection in one of the immutable model-level owners.
+    Tier,
     /// This rank's zero dummy expert.
     Dummy,
     /// The compact expert tensors of the named peer rank.
@@ -1085,7 +1101,7 @@ impl Qwen4ExpertTableLayout<'_> {
     /// Experts the layer's own resident tensors hold under this layout.
     fn local_experts(&self, num_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
         match self {
-            Self::Single => Ok(num_experts),
+            Self::Single | Self::Tier { .. } => Ok(num_experts),
             Self::Ep { placement, .. } | Self::Full { placement, .. } => {
                 validate_ep_placement(*placement, num_experts)?;
                 Ok(num_experts / placement.ranks)
@@ -1122,6 +1138,31 @@ fn expert_slot_ptr(
         .ok_or_else(|| invalid(format!("{what} expert {index} address overflows")))
 }
 
+/// Prove both the logical owner-relative span and its absolute table address.
+/// This never derives an owner base from an expert pointer.
+fn tier_expert_extent(
+    what: &str,
+    owner: Option<(usize, usize)>,
+    offset: u64,
+    len: u64,
+    expected_len: usize,
+    pointer: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    let (base, bytes) = owner.ok_or_else(|| invalid(format!("{what}: missing tier owner")))?;
+    let offset = usize::try_from(offset).map_err(|_| invalid(format!("{what}: offset overflow")))?;
+    let len = usize::try_from(len).map_err(|_| invalid(format!("{what}: length overflow")))?;
+    let end = offset.checked_add(len).ok_or_else(|| invalid(format!("{what}: extent overflow")))?;
+    let address = base.checked_add(offset).ok_or_else(|| invalid(format!("{what}: address overflow")))?;
+    if base == 0 || len != expected_len || end > bytes
+        || base.checked_add(bytes).is_none() || pointer != address || pointer % 256 != 0
+    {
+        return Err(invalid(format!(
+            "{what}: tier span {offset}+{len} / {bytes} or pointer {pointer:#x} is invalid"
+        )));
+    }
+    Ok(())
+}
+
 /// Pure arithmetic behind every expert pointer table: the host entry of each
 /// global expert under `layout`. `local` names this rank's own resident
 /// tensors (all experts under `Single`, the compact `num_experts / ranks`
@@ -1153,6 +1194,21 @@ pub(crate) fn qwen4_expert_table_entries(
                         expert,
                         down_expert_bytes,
                     )?,
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::Tier { gate_up, down } => {
+            if gate_up.len() != num_experts || down.len() != num_experts {
+                return Err(invalid("tier pointer table has the wrong expert count"));
+            }
+            for (&gate_up_ptr, &down_ptr) in gate_up.iter().zip(*down) {
+                if gate_up_ptr == 0 || down_ptr == 0 {
+                    return Err(invalid("tier pointer table contains a null expert"));
+                }
+                entries.push(Qwen4ExpertEntry {
+                    origin: Qwen4ExpertOrigin::Tier,
+                    gate_up_ptr,
+                    down_ptr,
                 });
             }
         }
@@ -1288,12 +1344,12 @@ fn check_exact_compact(
     Ok(())
 }
 
-/// A non-owning whole-allocation window over a peer rank's expert tensor,
-/// only ever cut into per-expert views (never freed by this rank).
+/// A non-owning byte window over a live peer or tier payload allocation.
+/// It is only cut into per-expert views and is never freed here.
 fn foreign_packed_source(base: usize, bytes: usize, dtype: DType) -> GpuTensor {
     GpuTensor {
-        // SAFETY: `base` names a live peer allocation of `bytes` bytes (the
-        // peer's resident expert tensor, P2P-mapped before any launch), and
+        // SAFETY: `base` names a live device-visible allocation of `bytes`
+        // bytes, whose owner is retained by the peer or tier lease, and
         // the wrapper is `Borrowed`, so neither this rank's `free_tensor`
         // nor a drop releases it.
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(base as *mut std::ffi::c_void, bytes) },
@@ -1828,7 +1884,24 @@ impl Qwen4MoeLayerRuntime {
             config,
             Qwen4ExpertTableLayout::Single,
             None,
+            true,
         )
+    }
+
+    /// MTP head labels are not trunk indices; its named payload stays untiered.
+    pub(crate) fn from_moe_untiered(
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        moe: &MoeWeights,
+        layer_label: usize,
+        config: &Qwen4Config,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        Self::build(gpu, weights, moe, layer_label, config,
+            Qwen4ExpertTableLayout::Single, None, false)
+    }
+
+    pub(crate) fn tier_lease(&self) -> Option<&crate::expert_tier_owners::ExpertTierLease> {
+        self.tier.as_ref()
     }
 
     /// EP decode runtime: the resident expert tensors are this rank's compact
@@ -1854,6 +1927,7 @@ impl Qwen4MoeLayerRuntime {
                 dummy: dummy.source(),
             },
             Some(dummy),
+            true,
         )
     }
 
@@ -1880,6 +1954,7 @@ impl Qwen4MoeLayerRuntime {
                 peers: peers_for_layer,
             },
             None,
+            true,
         )
     }
 
@@ -1895,6 +1970,7 @@ impl Qwen4MoeLayerRuntime {
         config: &Qwen4Config,
         layout: Qwen4ExpertTableLayout<'_>,
         dummy: Option<&Qwen4EpDummyExpert>,
+        allow_tiers: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -1920,6 +1996,22 @@ impl Qwen4MoeLayerRuntime {
             config.shared_expert_intermediate_size,
         );
 
+        let tier_layer = if allow_tiers { weights.expert_tier_layer(layer_label) } else { None };
+        if tier_layer.is_some()
+            && (!matches!(layout, Qwen4ExpertTableLayout::Single)
+                || moe.expert_arena.is_some() || weights.manifest.identity.recipe.is_stock_fp8())
+        {
+            return Err(invalid(format!(
+                "layer {layer_label}: expert tiers require the single-device aggregate MQ4 route (no EP, slab arena or stock FP8)"
+            )));
+        }
+        let layout = match tier_layer.as_ref() {
+            Some(view) => Qwen4ExpertTableLayout::Tier {
+                gate_up: view.gate_up_ptrs(),
+                down: view.down_ptrs(),
+            },
+            None => layout,
+        };
         if let Some(arena_ref) = moe.expert_arena.as_ref() {
             return Self::build_slab(
                 gpu,
@@ -1931,8 +2023,26 @@ impl Qwen4MoeLayerRuntime {
                 [router, shared_scalar, shared_gate, shared_up, shared_down],
             );
         }
-        let gate_up_source = weights.resident(&moe.experts_gate_up)?;
-        let down_source = weights.resident(&moe.experts_down)?;
+        // Tier loads deliberately have no resident aggregate expert tensors.
+        // Whole-owner descriptors supply the fixed MQ4 dtype only. Tier
+        // entries below always use their own checked absolute addresses.
+        let tier_source_range = tier_layer.as_ref().map(|view| {
+            use crate::expert_tier_plan::Placement;
+            view.owner_range(Placement::Device).or_else(|| view.owner_range(Placement::HostMapped))
+                .ok_or_else(|| invalid("expert tiers have no payload owner"))
+        }).transpose()?;
+        let tier_gate_source = tier_source_range.map(|(base, bytes)|
+            foreign_packed_source(base, bytes, DType::MQ4G256V2));
+        let tier_down_source = tier_source_range.map(|(base, bytes)|
+            foreign_packed_source(base, bytes, DType::MQ4G128V2));
+        let gate_up_source = match tier_gate_source.as_ref() {
+            Some(source) => source,
+            None => weights.resident(&moe.experts_gate_up)?,
+        };
+        let down_source = match tier_down_source.as_ref() {
+            Some(source) => source,
+            None => weights.resident(&moe.experts_down)?,
+        };
         let gate_up_dtype = gate_up_source.dtype;
         let down_dtype = down_source.dtype;
         let gate_up_rows = 2 * config.moe_intermediate_size;
@@ -1943,7 +2053,9 @@ impl Qwen4MoeLayerRuntime {
         // grid), so an expert's byte extent is the block stride, not rows *
         // row_stride; the view's `row_stride` is the code row (`k`) and the
         // block's pad and scale grid ride in its encoded bytes.
-        let fp8_tables = fp8_expert_tables(weights, moe, config, &layout, layer_label)?;
+        let fp8_tables = if tier_layer.is_some() { None } else {
+            fp8_expert_tables(weights, moe, config, &layout, layer_label)?
+        };
         let (gate_up_expert_bytes, down_expert_bytes) = match &fp8_tables {
             Some(tables) => (tables.gate_up.stride, tables.down.stride),
             None => (
@@ -1959,7 +2071,7 @@ impl Qwen4MoeLayerRuntime {
         let source_experts = layout.local_experts(config.num_experts)?;
         let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
         let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
-        if gate_up_source.buf.size() < expected_gate_up_bytes {
+        if tier_layer.is_none() && gate_up_source.buf.size() < expected_gate_up_bytes {
             return Err(invalid(format!(
                 "layer {} gate/up packed bytes {} < expected {}",
                 layer_label,
@@ -1967,7 +2079,7 @@ impl Qwen4MoeLayerRuntime {
                 expected_gate_up_bytes
             )));
         }
-        if down_source.buf.size() < expected_down_bytes {
+        if tier_layer.is_none() && down_source.buf.size() < expected_down_bytes {
             return Err(invalid(format!(
                 "layer {} down packed bytes {} < expected {}",
                 layer_label,
@@ -1975,13 +2087,34 @@ impl Qwen4MoeLayerRuntime {
                 expected_down_bytes
             )));
         }
+        if let Some(view) = tier_layer.as_ref() {
+            if config.num_experts != view.gate_up_ptrs().len()
+                || config.num_experts != view.down_ptrs().len()
+                || config.num_experts != view.codec_table().len()
+                || config.hidden_size != 2560 || config.moe_intermediate_size != 640
+            {
+                return Err(invalid("expert tiers require Flash-Next MQ4 geometry"));
+            }
+            for eid in 0..config.num_experts {
+                let entry = view.entry(eid).ok_or_else(|| invalid("missing tier expert entry"))?;
+                if entry.format != crate::expert_slabs::ExpertFormat::Mq4Xts {
+                    return Err(invalid("aggregate expert tiers require MQ4 entries"));
+                }
+                let owner = view.owner_range(entry.tier);
+                tier_expert_extent("gate/up", owner, entry.gate_up_offset, entry.gate_up_len,
+                    gate_up_expert_bytes, view.gate_up_ptrs()[eid])?;
+                tier_expert_extent("down", owner, entry.down_offset, entry.down_len,
+                    down_expert_bytes, view.down_ptrs()[eid])?;
+            }
+        }
         // EP: owned experts keep this rank's residency. A host-mapped compact
         // tensor is device-visible exactly as in the single route, a non-owned
         // expert names the device dummy (decode) or the owner's compact tensor
         // (chunk). Peer pointers into pinned host memory rely on ROCm's UVA:
         // pinned host allocations are device-visible from every GPU, so a
         // peer's host-mapped compact tensor is read through the same address.
-        let local_host_mapped = gate_up_source.buf.is_host_mapped();
+        let local_host_mapped = tier_layer.as_ref()
+            .map_or_else(|| gate_up_source.buf.is_host_mapped(), |view| view.any_host());
         if matches!(layout, Qwen4ExpertTableLayout::Ep { .. })
             && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
         {
@@ -2053,12 +2186,20 @@ impl Qwen4MoeLayerRuntime {
         let mut experts = Vec::with_capacity(config.num_experts);
         let mut metadata = Vec::with_capacity(config.num_experts);
         for (expert, entry) in table_entries.iter().enumerate() {
+            let tier_gate = matches!(entry.origin, Qwen4ExpertOrigin::Tier)
+                .then(|| foreign_packed_source(entry.gate_up_ptr, gate_up_expert_bytes, gate_up_dtype));
+            let tier_down = matches!(entry.origin, Qwen4ExpertOrigin::Tier)
+                .then(|| foreign_packed_source(entry.down_ptr, down_expert_bytes, down_dtype));
             let (gate_up_backing, gate_up_offset, down_backing, down_offset) = match entry.origin {
                 Qwen4ExpertOrigin::Local => (
                     gate_up_source,
                     entry.gate_up_ptr - local.gate_up_base,
                     down_source,
                     entry.down_ptr - local.down_base,
+                ),
+                Qwen4ExpertOrigin::Tier => (
+                    tier_gate.as_ref().expect("tier gate descriptor"), 0,
+                    tier_down.as_ref().expect("tier down descriptor"), 0,
                 ),
                 Qwen4ExpertOrigin::Dummy => {
                     let dummy = dummy.ok_or_else(|| {
@@ -2078,7 +2219,7 @@ impl Qwen4MoeLayerRuntime {
                     )
                 }
             };
-            let gate_up = ProjectionView::from_packed(
+            let mut gate_up = ProjectionView::from_packed(
                 gate_up_backing,
                 gate_up_offset,
                 gate_up_expert_bytes,
@@ -2086,7 +2227,7 @@ impl Qwen4MoeLayerRuntime {
                 gate_up_rows,
                 config.hidden_size,
             );
-            let down = ProjectionView::from_packed(
+            let mut down = ProjectionView::from_packed(
                 down_backing,
                 down_offset,
                 down_expert_bytes,
@@ -2094,6 +2235,11 @@ impl Qwen4MoeLayerRuntime {
                 config.hidden_size,
                 config.moe_intermediate_size,
             );
+            if let Some(view) = tier_layer.as_ref() {
+                let host = view.placement(expert) == Some(crate::expert_tier_plan::Placement::HostMapped);
+                gate_up.host_mapped = host;
+                down.host_mapped = host;
+            }
             if gate_up.tensor.buf.as_ptr() as usize != entry.gate_up_ptr
                 || down.tensor.buf.as_ptr() as usize != entry.down_ptr
             {
@@ -2155,6 +2301,9 @@ impl Qwen4MoeLayerRuntime {
             .iter()
             .map(|expert| expert.down.tensor.buf.as_ptr() as usize)
             .collect::<Vec<_>>();
+        let (expert_gate_up_ptrs, expert_down_ptrs) = if let Some(view) = tier_layer.as_ref() {
+            (view.gate_up_ptrs_device(), view.down_ptrs_device())
+        } else {
         let gate_ptrs = gate_entries
             .iter()
             .flat_map(|entry| entry.to_ne_bytes())
@@ -2183,11 +2332,27 @@ impl Qwen4MoeLayerRuntime {
             let _ = gpu.free_tensor(expert_down_ptrs);
             return Err(error.into());
         }
+            (expert_gate_up_ptrs, expert_down_ptrs)
+        };
+        let tier_identity = tier_layer.as_ref().map(|view| {
+            let lease = view.lease();
+            let placement: Vec<u8> = (0..config.num_experts).map(|eid| {
+                match view.placement(eid).expect("validated tier entry") {
+                    crate::expert_tier_plan::Placement::Device => 0,
+                    crate::expert_tier_plan::Placement::HostMapped => 1,
+                }
+            }).collect();
+            hipfire_dispatch::families::moe::ExpertTierIdentity::new(
+                lease.generation(), lease.logical_digest(), &placement,
+                view.codec_table(), view.gate_up_ptrs(), view.down_ptrs(), lease.keepalive(),
+            ).map_err(|message| invalid(format!("tier identity: {message}")))
+        }).transpose()?;
         let identity = NEXT_EXPERT_SET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let expert_views = ExpertViewSet {
             experts: &experts,
             identity,
             host_mapped: local_host_mapped,
+            tier_identity: tier_identity.as_ref(),
         };
         if let Err(error) = cache.bind_live(
             &table,
@@ -2197,8 +2362,10 @@ impl Qwen4MoeLayerRuntime {
             None,
             None,
         ) {
-            let _ = gpu.free_tensor(expert_gate_up_ptrs);
-            let _ = gpu.free_tensor(expert_down_ptrs);
+            if tier_layer.is_none() {
+                let _ = gpu.free_tensor(expert_gate_up_ptrs);
+                let _ = gpu.free_tensor(expert_down_ptrs);
+            }
             return Err(Qwen4GpuForwardError::Dispatch(format!(
                 "expert live binding: {error:?}"
             )));
@@ -2221,6 +2388,8 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
+            tier: tier_layer.as_ref().map(|view| view.lease()),
+            tier_identity,
             slab: None,
             label: layer_label,
             retained_identities: Vec::new(),
@@ -2429,6 +2598,7 @@ impl Qwen4MoeLayerRuntime {
             experts: &experts,
             identity,
             host_mapped,
+            tier_identity: None,
         };
         if let Err(error) = cache.bind_live(
             &table,
@@ -2466,6 +2636,8 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: false,
             host_mapped,
+            tier: None,
+            tier_identity: None,
             label: layer_label,
             retained_identities: Vec::new(),
             slab: Some(Qwen4SlabLayer {
@@ -2534,6 +2706,10 @@ impl Qwen4MoeLayerRuntime {
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        // Tier tables are frozen borrowed sub-views; only the lease frees them.
+        if self.tier.is_some() {
+            return None;
+        }
         let mut first = None;
         let tags = self.slab.and_then(|slab| slab.codec_tags);
         for tensor in [self.expert_gate_up_ptrs, self.expert_down_ptrs]
@@ -2648,10 +2824,9 @@ impl Qwen4ExpertStage {
         let Some(first_host) = moe.iter().position(RoutedExpertWeights::host_mapped) else {
             return Ok(None);
         };
-        // A slab layer's host-mapped arena stages through dedicated VRAM
-        // buffers (`slab_stage`); the donor mirrors below are the legacy
-        // aggregate expert tensors.
-        if moe.iter().any(|layer| layer.slab.is_some()) {
+        // Slab arenas and tier layers use dedicated VRAM stage buffers.
+        // Only legacy aggregate placement may borrow resident donor layers.
+        if moe.iter().any(|layer| layer.slab.is_some()) || bundle.weights.expert_tiers().is_some() {
             return Self::new_slab(gpu, bundle, moe, first_host);
         }
         let config = &bundle.config;
@@ -2829,12 +3004,7 @@ impl Qwen4ExpertStage {
     /// The stage tables a host `layer` reads from on a staged forward.
     fn tables(&self, layer: usize) -> MoeStageTables<'_> {
         if self.slab.is_some() {
-            let index = layer - self.first_host;
-            return MoeStageTables {
-                gate_up: &self.tables[2 * index],
-                down: &self.tables[2 * index + 1],
-                free: &self.free[layer % 2],
-            };
+            return self.slab_tables(layer);
         }
         let parity = layer % 2;
         if self.placement.is_some() && self.compact_bound[layer].get() {
@@ -7744,6 +7914,51 @@ mod ep_table_tests {
         local.down_bytes -= 1;
         let text = message(entries(&Qwen4ExpertTableLayout::Single, local));
         assert!(text.contains("down expert slot 511") && text.contains("exceeds"), "{text}");
+    }
+
+    #[test]
+    fn tier_table_preserves_arbitrary_owner_addresses_and_local_ids() {
+        let local = compact(0, 0, 0); // No aggregate allocation on a tier load.
+        for host_zero in [false, true] {
+            let gate: Vec<usize> = (0..EXPERTS).map(|eid| {
+                let base = if (eid % 2 == 0) == host_zero { 0x8000_0000 } else { 0x1000_0000 };
+                base + (EXPERTS - eid) * GATE_UP
+            }).collect();
+            let down: Vec<usize> = gate.iter().map(|ptr| ptr + 0x1_0000_0000).collect();
+            let table = entries(&Qwen4ExpertTableLayout::Tier { gate_up: &gate, down: &down }, local).unwrap();
+            for (eid, entry) in table.iter().enumerate() {
+                assert_eq!(entry.origin, Qwen4ExpertOrigin::Tier);
+                assert_eq!((entry.gate_up_ptr, entry.down_ptr), (gate[eid], down[eid]));
+            }
+        }
+    }
+
+    #[test]
+    fn tier_table_refuses_bad_dimensions_and_null_entries() {
+        let gate = vec![0x1000; EXPERTS];
+        let mut down = vec![0x2000; EXPERTS];
+        let local = compact(0, 0, 0);
+        assert!(entries(&Qwen4ExpertTableLayout::Tier { gate_up: &gate[..EXPERTS-1], down: &down }, local).is_err());
+        down[EXPERTS-1] = 0;
+        assert!(entries(&Qwen4ExpertTableLayout::Tier { gate_up: &gate, down: &down }, local).is_err());
+    }
+
+    #[test]
+    fn tier_extent_checks_each_owner_span_and_absolute_pointer() {
+        use super::tier_expert_extent as check;
+        // The shared owner and offset may exceed 4 GiB.
+        let base = 0x1_0000_0000usize;
+        let offset = 0x2_0000_0000u64;
+        let bytes = offset as usize + GATE_UP;
+        let ptr = base + offset as usize;
+        assert!(check("gate", Some((base, bytes)), offset, GATE_UP as u64, GATE_UP, ptr).is_ok());
+        assert!(check("gate", Some((base, bytes-1)), offset, GATE_UP as u64, GATE_UP, ptr).is_err());
+        assert!(check("gate", Some((base, bytes)), offset, GATE_UP as u64-1, GATE_UP, ptr).is_err());
+        assert!(check("gate", Some((base, bytes)), offset, GATE_UP as u64, GATE_UP, ptr+256).is_err());
+        assert!(check("gate", None, offset, GATE_UP as u64, GATE_UP, ptr).is_err());
+        assert!(check("gate", Some((base, bytes)), u64::MAX, 1, 1, ptr).is_err());
+        assert!(check("gate", Some((usize::MAX-255, 512)), 0, 256, 256, usize::MAX-255).is_err());
+        assert!(check("gate", Some((base+1, bytes)), 0, 256, 256, base+1).is_err());
     }
 
     #[test]

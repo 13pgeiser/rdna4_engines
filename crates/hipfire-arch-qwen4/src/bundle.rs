@@ -471,6 +471,7 @@ impl Qwen4Bundle {
             ple_source,
             state_format,
             backend,
+            None,
         )
     }
 
@@ -499,6 +500,7 @@ impl Qwen4Bundle {
         ple_source: Qwen4PleRows,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
     ) -> Result<Self, BundleError> {
         let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
             Ok(inputs) => inputs,
@@ -506,7 +508,13 @@ impl Qwen4Bundle {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
-        let weights = match Qwen4Weights::assemble(&mut transaction, &config, recipe, placements) {
+        let assembled = match expert_tiers {
+            Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
+                &mut transaction, &config, recipe, placements, lease,
+            ),
+            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements),
+        };
+        let weights = match assembled {
             Ok(weights) => weights,
             Err(error) => {
                 return Err(cleanup_transaction(

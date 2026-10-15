@@ -249,6 +249,8 @@ The EP2 owner-routed prefill and the expert-staging levers have no typed schema 
 | `developer.qwen4_expert_stage_min_rows` | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | `2048` | Forwards with at least this many rows stage (integer ≥ 2); smaller ones, decode and verify keep the mapped reads. |
 | `developer.qwen4_expert_stage_capture` | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | on | `0` keeps the native-MTP prompt-fill tiles on the mapped reads. |
 | `developer.qwen4_expert_vram_layers` | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | unset (automatic placement) | `N` keeps the routed experts of trunk layers before `N` in VRAM and places layers at or past `N` in pinned host RAM. |
+| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset (off) | Absolute path of a Lever1 expert hotset sidecar (`kind` `hipfire.qwen4.expert_hotset`, version 1; see `docs/env-vars.md`). Only this key enables the hotset. A relative or empty path is refused, and so is setting it together with an explicit `developer.qwen4_expert_vram_layers`. |
+| `developer.qwen4_expert_hotcache` | `HIPFIRE_QWEN4_EXPERT_HOTCACHE` | on | Kill switch for the hotset: exactly `0` bypasses `developer.qwen4_expert_hotset` entirely and keeps today's per-layer placement; unset or `1` leaves it in charge. With `developer.qwen4_expert_hotset` unset the value is not examined; with it set, any other value is refused. |
 | `developer.ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | unset (canonical) | `1` selects the legacy unrooted peer all-reduce diagnostic, `0` selects RCCL. |
 
 ---

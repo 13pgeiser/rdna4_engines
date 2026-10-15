@@ -15,7 +15,6 @@ use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
-#[cfg(test)]
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::tp_shard::ExpertAssign;
 use hipfire_runtime::weight_manifest::{
@@ -1462,6 +1461,115 @@ impl Qwen4Manifest {
         }
         Ok(self)
     }
+
+    /// This manifest declared for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the
+    /// 48 trunk layers' aggregate routed `gate_up`/`down` entries are owned by
+    /// the expert-tier lease instead of the weight store, so they are removed
+    /// (and so leave [`Self::resident_keys`]).  Everything else, the MTP
+    /// head's aggregate experts included, is unchanged.
+    ///
+    /// Only the dense-aggregate Flash-Next declaration qualifies: exactly the
+    /// expected 96 trunk entries (`[512,1280,2560]` MQ4G256V2 gate_up and
+    /// `[512,2560,640]` MQ4G128V2 down, replicated, resident, one pair per
+    /// layer) must be present.  The slab-arena and stock-FP8 recipes, a
+    /// dense FFN, synthetic profiles and expert-parallel shards are refused.
+    pub fn with_expert_tiers(mut self) -> Result<Self, WeightError> {
+        let refuse = |why: &str| {
+            WeightError::Config(format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {why}"))
+        };
+        match &self.identity.recipe {
+            Qwen4TierRecipe::FlashNextPacked { .. } => {}
+            Qwen4TierRecipe::FlashNextSlab { .. } => {
+                return Err(refuse(
+                    "the slab-arena recipe already holds its experts in per-layer arenas",
+                ))
+            }
+            Qwen4TierRecipe::StockFp8 => {
+                return Err(refuse("the stock-FP8 recipe's qt=55 experts have no tier owner"))
+            }
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                return Err(refuse("synthetic profiles have no Flash-Next expert tiers"))
+            }
+        }
+        if self.identity.ffn_kind != "moe" {
+            return Err(refuse("the dense FFN declares no routed experts"));
+        }
+        let layers = crate::expert_slabs::TRUNK_LAYERS as usize;
+        let trunk_routed = self
+            .weights
+            .iter()
+            .filter(|entry| is_trunk_routed_expert_entry(entry))
+            .count();
+        if trunk_routed != 2 * layers {
+            return Err(refuse(&format!(
+                "the manifest declares {trunk_routed} trunk routed expert entries, expected {}",
+                2 * layers
+            )));
+        }
+        for layer in 0..layers {
+            for (suffix, shape, dtype) in [
+                (
+                    "gate_up_proj",
+                    crate::expert_slab_aggregate::GATE_UP_SHAPE,
+                    ROUTED_GATE_UP_DTYPE,
+                ),
+                (
+                    "down_proj",
+                    crate::expert_slab_aggregate::DOWN_SHAPE,
+                    ROUTED_DOWN_DTYPE,
+                ),
+            ] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
+                let Some(entry) = self.entry(&name, Some(layer)) else {
+                    return Err(refuse(&format!("the manifest lacks {name}")));
+                };
+                if entry.logical_shape != shape
+                    || entry.dtype != dtype
+                    || entry.policy != ShardPolicy::Replicate
+                    || entry.residency != WeightResidency::Resident
+                {
+                    return Err(refuse(&format!(
+                        "{name} is not the dense aggregate {shape:?} {dtype:?} replicated \
+                         resident entry (expert-parallel, host-mapped or reshaped declarations \
+                         are refused)"
+                    )));
+                }
+            }
+        }
+        self.weights
+            .retain(|entry| !is_trunk_routed_expert_entry(entry));
+        Ok(self)
+    }
+}
+
+/// A trunk layer's aggregate routed expert entry (`layers.{L}.mlp.experts.*`);
+/// the MTP head's (`mtp.…`, no layer) is not one.
+fn is_trunk_routed_expert_entry(entry: &WeightEntry) -> bool {
+    entry.layer.is_some()
+        && entry.name.starts_with("model.language_model.layers.")
+        && is_routed_expert_tensor(&entry.name)
+}
+
+/// The placement set must be exactly the manifest's resident keys.
+fn check_placement_set(
+    manifest: &Qwen4Manifest,
+    placements: &[Qwen4Placement],
+) -> Result<(), WeightError> {
+    let expected = manifest
+        .resident_keys()
+        .map(|(name, layer)| (name.to_string(), layer))
+        .collect::<BTreeSet<_>>();
+    let provided = placements
+        .iter()
+        .map(|placement| (placement.name.clone(), placement.layer))
+        .collect::<BTreeSet<_>>();
+    if expected != provided {
+        return Err(WeightError::PlacementSetMismatch {
+            expected: expected.len(),
+            actual: provided.len(),
+        });
+    }
+    Ok(())
 }
 
 fn mtp_entry(
@@ -2231,6 +2339,7 @@ pub struct Qwen4Weights {
     /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
+    pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
 }
 
 impl Qwen4Weights {
@@ -2249,21 +2358,36 @@ impl Qwen4Weights {
         recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
     ) -> Result<Self, WeightError> {
-        let manifest = assembly_manifest(config, recipe)?;
-        let expected = manifest
-            .resident_keys()
-            .map(|(name, layer)| (name.to_string(), layer))
-            .collect::<BTreeSet<_>>();
-        let provided = placements
-            .iter()
-            .map(|placement| (placement.name.clone(), placement.layer))
-            .collect::<BTreeSet<_>>();
-        if expected != provided {
-            return Err(WeightError::PlacementSetMismatch {
-                expected: expected.len(),
-                actual: provided.len(),
-            });
+        Self::assemble_impl(tx, config, recipe, placements, None)
+    }
+
+    /// [`Self::assemble`] for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the trunk
+    /// layers' aggregate routed experts are owned by `lease`, not the
+    /// transaction, so the manifest is [`Qwen4Manifest::with_expert_tiers`]
+    /// and `placements` must cover exactly its remaining resident keys.  The
+    /// lease is retained by the returned weights ([`Self::expert_tiers`]).
+    pub fn assemble_with_expert_tiers(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        lease: crate::expert_tier_owners::ExpertTierLease,
+    ) -> Result<Self, WeightError> {
+        Self::assemble_impl(tx, config, recipe, placements, Some(lease))
+    }
+
+    fn assemble_impl(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    ) -> Result<Self, WeightError> {
+        let mut manifest = assembly_manifest(config, recipe)?;
+        if expert_tiers.is_some() {
+            manifest = manifest.with_expert_tiers()?;
         }
+        check_placement_set(&manifest, placements)?;
         let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, 0))?;
         if recipe.is_stock_fp8() {
             // Checked before anything is taken, so a refusal leaves every
@@ -2357,7 +2481,19 @@ impl Qwen4Weights {
             layer_refs,
             mtp,
             ep,
+            expert_tiers,
         })
+    }
+
+    pub fn expert_tiers(&self) -> Option<&crate::expert_tier_owners::ExpertTierLease> {
+        self.expert_tiers.as_ref()
+    }
+
+    pub fn expert_tier_layer(
+        &self,
+        layer: usize,
+    ) -> Option<crate::expert_tier_owners::LayerExpertTierView<'_>> {
+        self.expert_tiers.as_ref()?.layer(layer)
     }
 
     /// The expert-parallel placement these weights were assembled for, or
@@ -4855,6 +4991,109 @@ mod tests {
             matches!(error, WeightError::UnsupportedProfile { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn expert_tier_manifest_removes_only_trunk_routed_entries() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        assert_eq!(tiered.identity, base.identity);
+        assert_eq!(tiered.weights.len() + 96, base.weights.len());
+        assert_eq!(tiered.state, base.state);
+        assert_eq!(tiered.metadata, base.metadata);
+        let removed = |name: &str, layer: Option<usize>| {
+            layer.is_some()
+                && name.starts_with("model.language_model.layers.")
+                && (name.ends_with(".mlp.experts.gate_up_proj")
+                    || name.ends_with(".mlp.experts.down_proj"))
+        };
+        let kept = base
+            .resident_keys()
+            .filter(|(name, layer)| !removed(name, *layer))
+            .collect::<Vec<_>>();
+        assert_eq!(tiered.resident_keys().collect::<Vec<_>>(), kept);
+        // The MTP head's aggregate experts stay declared.
+        for name in [
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "mtp.layers.0.mlp.experts.down_proj",
+        ] {
+            assert!(tiered.entry(name, None).is_some(), "{name}");
+        }
+        // A second application, expert parallelism and a stock/synthetic/dense
+        // declaration are each refused under the HOTSET name.
+        let refused = [
+            tiered.clone().with_expert_tiers(),
+            base.clone()
+                .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+                .and_then(Qwen4Manifest::with_expert_tiers),
+            Qwen4Manifest::build(&synthetic(dense_ffn(), 256, 4, true, true))
+                .and_then(Qwen4Manifest::with_expert_tiers),
+        ];
+        for result in refused {
+            let error = result.expect_err("tier manifest refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_set_accepts_missing_tier_entries_but_not_missing_nonexpert() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let placements = |manifest: &Qwen4Manifest| {
+            manifest
+                .resident_keys()
+                .map(|(name, layer)| Qwen4Placement {
+                    name: name.to_string(),
+                    layer,
+                    device: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        // The tier-owned entries are absent from the tier placement set.
+        let tier_placements = placements(&tiered);
+        check_placement_set(&tiered, &tier_placements).expect("tier set accepted");
+        // A regular load still requires them.
+        assert!(matches!(
+            check_placement_set(&base, &tier_placements),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // And a missing non-expert tensor is rejected under the tier manifest.
+        let mut missing = tier_placements.clone();
+        let at = missing
+            .iter()
+            .position(|placement| {
+                !placement.name.contains(".mlp.experts.") && placement.layer.is_some()
+            })
+            .expect("a trunk non-expert placement");
+        missing.remove(at);
+        assert!(matches!(
+            check_placement_set(&tiered, &missing),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
+        // A tier-owned tensor offered as a placement is not expected either.
+        let mut extra = tier_placements;
+        extra.push(Qwen4Placement {
+            name: "model.language_model.layers.0.mlp.experts.gate_up_proj".to_string(),
+            layer: Some(0),
+            device: 0,
+        });
+        assert!(matches!(
+            check_placement_set(&tiered, &extra),
+            Err(WeightError::PlacementSetMismatch { .. })
+        ));
     }
 
     #[test]

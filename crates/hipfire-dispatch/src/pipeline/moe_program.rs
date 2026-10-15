@@ -2108,10 +2108,12 @@ fn validate_fp8_expert_blocks(params: &MoePrefillParams<'_>) -> Result<(), Dispa
 /// Resolve all grouped-prefill choices without a GPU or an instruction list.
 ///
 /// The prefill [`MoePrefillResolution`] reads owner-derived residency via
-/// `routed_experts.host_mapped_projections()`. A narrow MTP verify window over
+/// `routed_host_mapped_projections` (tier identity first, then
+/// `routed_experts.host_mapped_projections()`). A narrow MTP verify window over
 /// host-mapped experts takes the indexed Path 1, except a host-mapped uniform
 /// MQ4 gate_up+down on gfx1201, which is re-admitted to Path 2 (grouped-WMMA).
-/// Residency comes from the packed weight owners — never inferred from
+/// Residency comes from the packed weight owners or an explicit tier identity
+/// (its layer-wide `any_host`, never expert 0) — never inferred from
 /// borrowed tensor kinds — and resident experts keep the legacy route.
 pub(super) fn select_prefill(
     ctx: &DispatchCtx,
@@ -2149,7 +2151,7 @@ pub(super) fn select_prefill(
             || params.ep_row_gather.is_some()
             || params.ep_tile_exchange.is_some()
             || !matches!(params.prelude.route, super::sealed_moe::PrefillRouteMode::Replicated)
-            || params.routed_experts.host_mapped()
+            || crate::families::moe::routed_host_mapped(params.routed_experts)
         {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
@@ -2212,7 +2214,7 @@ pub(super) fn select_prefill(
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
     }
-    let (host_gate_up, host_down) = params.routed_experts.host_mapped_projections();
+    let (host_gate_up, host_down) = crate::families::moe::routed_host_mapped_projections(params.routed_experts);
     let resolution = MoePrefillResolution::resolve_with_batch_ctx(&params.dtypes, &ctx.arch, &ctx.flags, ctx.batch_size, ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify, host_gate_up || host_down);
     resolution.check_generic_route(route)?;
     if route.is_some_and(MoeRouteCapability::is_slab) {

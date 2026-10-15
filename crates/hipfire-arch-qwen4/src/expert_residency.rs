@@ -328,6 +328,36 @@ pub fn auto_vram_layers(
     }
 }
 
+/// Device bytes an expert-tier lease's frozen tables take beyond the payload:
+/// the gate/up and down pointer tables (8 bytes per expert each) and the
+/// 1-byte-per-expert codec table, over every trunk expert
+/// (`expert_tier_owners::materialize`).
+pub const EXPERT_TIER_TABLE_BYTES: u64 = crate::expert_slabs::TRUNK_LAYERS as u64
+    * crate::expert_slabs::EXPERTS_PER_LAYER as u64
+    * (2 * 8 + 1);
+
+/// Device bytes the `HIPFIRE_QWEN4_EXPERT_HOTSET` payload may take:
+/// `free_vram` less the non-expert weights, `reserve` ([`auto_vram_reserve`],
+/// the caller's own value, not recomputed here) and the lease's frozen tables
+/// ([`EXPERT_TIER_TABLE_BYTES`]). Every subtraction is checked.
+pub fn expert_hotset_budget(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    reserve: u64,
+) -> Result<u64, String> {
+    free_vram
+        .checked_sub(non_expert_bytes)
+        .and_then(|bytes| bytes.checked_sub(reserve))
+        .and_then(|bytes| bytes.checked_sub(EXPERT_TIER_TABLE_BYTES))
+        .ok_or_else(|| {
+            format!(
+                "expert hotset has no device budget: free VRAM {free_vram} bytes is below the \
+                 non-expert weights {non_expert_bytes} + reserve {reserve} + expert tier tables \
+                 {EXPERT_TIER_TABLE_BYTES}"
+            )
+        })
+}
+
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
 /// the MTP layer, [`WeightResidency::HostMapped`]. Returns the number of
 /// entries moved to host RAM.
@@ -754,6 +784,22 @@ mod tests {
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
         );
+    }
+
+    #[test]
+    fn expert_hotset_budget_subtracts_weights_reserve_and_tables_checked() {
+        assert_eq!(EXPERT_TIER_TABLE_BYTES, 2 * 24576 * 8 + 24576);
+        let (free, non_expert, reserve) = (30u64 << 30, 5_364_000_000u64, 6_656u64 << 20);
+        assert_eq!(
+            expert_hotset_budget(free, non_expert, reserve).unwrap(),
+            free - non_expert - reserve - EXPERT_TIER_TABLE_BYTES
+        );
+        // Exactly zero left is a (useless but valid) budget; one byte short is not.
+        let exact = non_expert + reserve + EXPERT_TIER_TABLE_BYTES;
+        assert_eq!(expert_hotset_budget(exact, non_expert, reserve).unwrap(), 0);
+        assert!(expert_hotset_budget(exact - 1, non_expert, reserve).is_err());
+        assert!(expert_hotset_budget(0, 1, 0).is_err());
+        assert!(expert_hotset_budget(u64::MAX, u64::MAX, u64::MAX).is_err());
     }
 
     #[test]

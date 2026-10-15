@@ -2054,6 +2054,18 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // The MTP head is never an expert-tier layer: its experts are the
+        // separately loaded `mtp.` tensors (host-mapped by name), and its
+        // runtime label 0 must never resolve trunk layer 0's tier view.
+        // Tiers are single-device only, so an EP head cannot coexist with a
+        // tier lease at all.
+        if ep.is_some() && weights.expert_tiers().is_some() {
+            let _ = state.free_gpu(gpu);
+            let _ = scratch.free_gpu(gpu);
+            return Err(invalid(
+                "expert tiers are single-device: an EP MTP head cannot attach to tiered weights",
+            ));
+        }
         let moe = match head.ffn.moe() {
             Some(moe_weights) => {
                 let built = match ep {
@@ -2066,9 +2078,23 @@ impl Qwen4MtpGpu {
                         placement,
                         dummy,
                     ),
-                    None => Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config),
+                    None => Qwen4MoeLayerRuntime::from_moe_untiered(
+                        gpu,
+                        weights,
+                        moe_weights,
+                        0,
+                        config,
+                    ),
                 };
                 match built {
+                    Ok(moe) if moe.tier_lease().is_some() => {
+                        let _ = moe.free_gpu(gpu);
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(invalid(
+                            "the MTP head's MoE runtime must be untiered (its experts are the `mtp.` tensors)",
+                        ));
+                    }
                     Ok(moe) => Some(moe),
                     Err(error) => {
                         let _ = state.free_gpu(gpu);

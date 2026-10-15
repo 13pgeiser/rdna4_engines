@@ -194,6 +194,12 @@ pub struct ExpertTierBinding {
     gate_up_table_base: usize,
     down_table_base: usize,
     codec_table_base: usize,
+    /// `(device-visible base, bytes)` per tier, indexed by `tier_index`; the
+    /// host entry is the mapped device alias. `None` for an empty owner.
+    owner_ranges: [Option<(usize, usize)>; 2],
+    /// `(CPU address, bytes)` of the one pinned host owner, for CPU reads and
+    /// staging; `None` when no host payload exists.
+    host_cpu_range: Option<(usize, usize)>,
     generation: u64,
     logical_digest: [u8; 32],
 }
@@ -220,6 +226,20 @@ impl ExpertTierLease {
 
     pub fn owner_bytes(&self, tier: Placement) -> u64 {
         self.binding.plan.owner_bytes(tier)
+    }
+
+    /// Immutable `(device-visible base, bytes)` of the tier's one owner, read
+    /// without locking. The host range is the mapped device alias. `None`
+    /// when the tier holds no payload.
+    pub fn owner_range(&self, tier: Placement) -> Option<(usize, usize)> {
+        self.binding.owner_ranges[tier_index(tier)]
+    }
+
+    /// Immutable `(CPU address, bytes)` of the pinned host owner, read without
+    /// locking; valid while this lease (or its keepalive) is retained. `None`
+    /// when the plan places nothing in host memory.
+    pub fn host_cpu_range(&self) -> Option<(usize, usize)> {
+        self.binding.host_cpu_range
     }
 
     pub fn keepalive(&self) -> Arc<dyn Any + Send + Sync> {
@@ -289,6 +309,16 @@ impl<'a> LayerExpertTierView<'a> {
 
     pub fn lease(&self) -> ExpertTierLease {
         self.lease.clone()
+    }
+
+    /// Forwards [`ExpertTierLease::owner_range`].
+    pub fn owner_range(&self, tier: Placement) -> Option<(usize, usize)> {
+        self.lease.owner_range(tier)
+    }
+
+    /// Forwards [`ExpertTierLease::host_cpu_range`].
+    pub fn host_cpu_range(&self) -> Option<(usize, usize)> {
+        self.lease.host_cpu_range()
     }
 
     fn pointer_table_view(&self, base: usize) -> GpuTensor {
@@ -519,7 +549,23 @@ pub fn materialize<'src>(
     });
     owners.hip.memcpy_htod(&owners.codec_table.as_ref().expect("allocated above").buf, &tables.codecs).map_err(runtime_error)?;
     owners.hip.device_synchronize().map_err(runtime_error)?;
+    let mut owner_ranges = [None; 2];
+    for (tier, base) in [
+        (Placement::Device, owners.device.as_ref().map(|owner| owner.as_ptr() as usize as u64)),
+        (Placement::HostMapped, owners.host.as_ref().map(|owner| owner.device_alias)),
+    ] {
+        let bytes = owners.plan.owner_bytes(tier);
+        if bytes != 0 {
+            let base = base.ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+            owner_ranges[tier_index(tier)] = Some((
+                usize::try_from(base).map_err(|_| ExpertTierOwnerError::Overflow)?,
+                usize::try_from(bytes).map_err(|_| ExpertTierOwnerError::Overflow)?,
+            ));
+        }
+    }
     let binding = Arc::new(ExpertTierBinding {
+        owner_ranges,
+        host_cpu_range: owners.host.as_ref().map(|host| (host.cpu_address, host.bytes)),
         logical_digest: owners.plan.logical_digest(),
         plan: owners.plan.clone(),
         tables,

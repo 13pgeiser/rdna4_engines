@@ -1335,9 +1335,13 @@ fn gateup_silu(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     gateup_bf16(gpu, p) && down_wmma(gpu, p) && p.mi % 128 == 0
 }
 
-/// Whether this layer's routed experts live in host-mapped memory (spilled
+/// Whether this layer's routed experts are read from host-mapped memory (spilled
 /// past the VRAM budget); the symmetric IU4 GEMMs then take a wider expert-run
-/// tile. A layer's experts share one residency, so expert 0 decides.
+/// tile. This is the layer-level bit the caller derives from the expert set's
+/// own residency (a per-expert tier layer: true iff ANY expert is host-tier;
+/// never inferred from expert 0). A staged layer reads only VRAM (host-tier
+/// experts copied to the stage, device-tier entries at their owner address),
+/// so staging clears the bit.
 fn experts_host_mapped(p: &MoePrefillParams<'_>) -> bool {
     p.expert_stage_ptrs.is_none() && p.routed_experts.host_mapped()
 }

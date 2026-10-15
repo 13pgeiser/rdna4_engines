@@ -19,6 +19,8 @@ pub mod chunk_dump;
 pub mod config;
 pub mod ep;
 pub mod expert_residency;
+/// Lever1 expert hotset sidecar parser and `HIPFIRE_QWEN4_EXPERT_HOTSET` policy.
+pub mod expert_hotset;
 /// Version-1 expert-slab container schema (qt=131..=134 / `(44,53)` per-expert entries).
 pub mod expert_slabs;
 /// Validated CPU-only per-expert payload spans and optional scale validation.

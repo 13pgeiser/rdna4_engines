@@ -56,6 +56,172 @@ pub struct MoePointerEntries<'a> {
     pub down: &'a [usize],
 }
 
+/// Placement byte: the expert's projections live in a device (VRAM) owner.
+pub const EXPERT_TIER_DEVICE: u8 = 0;
+/// Placement byte: the expert's projections live in a host-mapped owner.
+pub const EXPERT_TIER_HOST: u8 = 1;
+
+/// Neutral per-layer metadata of an explicit per-expert tier placement
+/// (model-level device + host-mapped payload owners). Plain data only: the
+/// loader that owns the tier converts its own view/lease into this, so no
+/// arch-private type crosses the dispatch boundary.
+///
+/// `placement` and `codecs` hold one byte per layer-local expert id (the id the
+/// kernels index with; model ids never reach dispatch). `any_host` is derived
+/// from `placement`, never from a representative expert, and is for
+/// conservative capability/path decisions only: it carries no arithmetic
+/// meaning. `generation` is the owner-binding generation (a reload gets a new
+/// one), `logical_digest` the placement plan's logical digest, and `keepalive`
+/// the owner retention every captured or retained resource must hold until its
+/// GPU work is retired.
+#[derive(Clone)]
+pub struct ExpertTierIdentity {
+    generation: u64,
+    logical_digest: [u8; 32],
+    any_host: bool,
+    placement: Box<[u8]>,
+    codecs: Box<[u8]>,
+    gate_up_entries: Box<[usize]>,
+    down_entries: Box<[usize]>,
+    keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl ExpertTierIdentity {
+    /// `placement` entries must be [`EXPERT_TIER_DEVICE`] or
+    /// [`EXPERT_TIER_HOST`]. Every table has one entry per layer-local expert
+    /// and the same non-zero length; pointer entries are non-null absolute
+    /// addresses (the frozen CPU mirrors of the uploaded device tables).
+    pub fn new(
+        generation: u64,
+        logical_digest: [u8; 32],
+        placement: &[u8],
+        codecs: &[u8],
+        gate_up_entries: &[usize],
+        down_entries: &[usize],
+        keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, String> {
+        let n = placement.len();
+        if n == 0 || n != codecs.len() || n != gate_up_entries.len() || n != down_entries.len() {
+            return Err(format!(
+                "expert tier identity tables must be non-empty and equal length \
+                 (placement {n}, codecs {}, gate/up entries {}, down entries {})",
+                codecs.len(),
+                gate_up_entries.len(),
+                down_entries.len()
+            ));
+        }
+        if let Some(index) = (0..n).find(|&i| gate_up_entries[i] == 0 || down_entries[i] == 0) {
+            return Err(format!("expert tier identity has a null pointer entry for expert {index}"));
+        }
+        if let Some(index) = placement
+            .iter()
+            .position(|&tier| tier != EXPERT_TIER_DEVICE && tier != EXPERT_TIER_HOST)
+        {
+            return Err(format!(
+                "expert tier identity placement byte {} for expert {index} is neither device nor host",
+                placement[index]
+            ));
+        }
+        Ok(Self {
+            generation,
+            logical_digest,
+            any_host: placement.iter().any(|&tier| tier == EXPERT_TIER_HOST),
+            placement: placement.into(),
+            codecs: codecs.into(),
+            gate_up_entries: gate_up_entries.into(),
+            down_entries: down_entries.into(),
+            keepalive,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn logical_digest(&self) -> &[u8; 32] {
+        &self.logical_digest
+    }
+
+    /// True when at least one expert of the layer is host-mapped. Capability
+    /// checks only; never select arithmetic from it.
+    pub fn any_host(&self) -> bool {
+        self.any_host
+    }
+
+    /// `(gate_up, down)` host-mapped residency of the layer's projections.
+    /// Both are the layer-wide `any_host` bit: a tier places a pair together.
+    pub fn host_projections(&self) -> (bool, bool) {
+        (self.any_host, self.any_host)
+    }
+
+    pub fn placement(&self) -> &[u8] {
+        &self.placement
+    }
+
+    pub fn codecs(&self) -> &[u8] {
+        &self.codecs
+    }
+
+    /// Absolute GPU-visible gate/up projection addresses per layer-local
+    /// expert: the frozen CPU mirror of the uploaded pointer table.
+    pub fn gate_up_entries(&self) -> &[usize] {
+        &self.gate_up_entries
+    }
+
+    /// Absolute GPU-visible down projection addresses (see
+    /// [`Self::gate_up_entries`]).
+    pub fn down_entries(&self) -> &[usize] {
+        &self.down_entries
+    }
+
+    pub fn keepalive(&self) -> &std::sync::Arc<dyn std::any::Any + Send + Sync> {
+        &self.keepalive
+    }
+}
+
+impl PartialEq for ExpertTierIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.logical_digest == other.logical_digest
+            && self.any_host == other.any_host
+            && self.placement == other.placement
+            && self.codecs == other.codecs
+            && self.gate_up_entries == other.gate_up_entries
+            && self.down_entries == other.down_entries
+            && std::sync::Arc::ptr_eq(&self.keepalive, &other.keepalive)
+    }
+}
+
+impl Eq for ExpertTierIdentity {}
+
+impl std::fmt::Debug for ExpertTierIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpertTierIdentity")
+            .field("generation", &self.generation)
+            .field("logical_digest", &self.logical_digest)
+            .field("any_host", &self.any_host)
+            .field("experts", &self.placement.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `(gate_up, down)` host-mapped residency of a layer's routed experts.
+/// An explicit tier binding wins over every adapter override: its answer is
+/// the layer's `any_host`, never a representative expert's residency.
+pub fn routed_host_mapped_projections(experts: &dyn RoutedExpertWeights) -> (bool, bool) {
+    experts
+        .tier_identity()
+        .map_or_else(|| experts.host_mapped_projections(), ExpertTierIdentity::host_projections)
+}
+
+/// Layer-wide host-mapped bit of a layer's routed experts; tier-first like
+/// [`routed_host_mapped_projections`].
+pub fn routed_host_mapped(experts: &dyn RoutedExpertWeights) -> bool {
+    experts
+        .tier_identity()
+        .map_or_else(|| experts.host_mapped(), ExpertTierIdentity::any_host)
+}
+
 /// The complete semantic recipe selected by an architecture binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeRecipe {
@@ -980,6 +1146,9 @@ pub trait RoutedExpertWeights {
     /// empty sets and borrowed views. Packed adapters must override this using
     /// their allocation owners: a borrowed buffer is not residency metadata.
     fn host_mapped_projections(&self) -> (bool, bool) {
+        if let Some(tier) = self.tier_identity() {
+            return tier.host_projections();
+        }
         self.get(0).map_or((false, false), |(gate_up, down)| {
             (
                 gate_up.buf.buf.is_host_mapped(),
@@ -1018,9 +1187,17 @@ pub trait RoutedExpertWeights {
 
     /// Whether the routed experts live in host-mapped memory. Expert views are
     /// borrowed byte views, so the owner's placement must be carried here; a
-    /// layer's experts share one residency. `false` by default.
+    /// layer's experts share one residency. `false` by default; an explicit
+    /// tier binding answers `any_host`.
     fn host_mapped(&self) -> bool {
-        false
+        self.tier_identity().is_some_and(ExpertTierIdentity::any_host)
+    }
+
+    /// Explicit per-expert tier placement of this layer (`None` for every
+    /// legacy layer). When `Some`, residency is never inferred from expert 0,
+    /// and the live binding retains and revalidates this identity.
+    fn tier_identity(&self) -> Option<&ExpertTierIdentity> {
+        None
     }
 }
 

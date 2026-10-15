@@ -5033,7 +5033,7 @@ fn prefill_gate_up_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && p.routed_experts.host_mapped_projections().0,
+            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).0,
         )?;
         // The explicit unscatter stage follows this grouped GEMM.
     } else {
@@ -5409,7 +5409,7 @@ fn prefill_down_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && p.routed_experts.host_mapped_projections().1,
+            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {

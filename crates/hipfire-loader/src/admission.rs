@@ -791,6 +791,29 @@ fn qwen4_ple_rows_fp8(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
     })
 }
 
+/// Host-mapped routed tensors every hotset load has at minimum: the MTP
+/// layer's `experts.gate_up_proj` and `experts.down_proj`, which stay ordinary
+/// host-mapped `WeightEntry`s while the trunk experts move to tier owners.
+const QWEN4_HOTSET_MIN_HOST_TENSORS: usize = 2;
+
+/// Whether `HIPFIRE_QWEN4_EXPERT_HOTSET` is in force
+/// ([`hipfire_arch_qwen4::expert_hotset::enabled_hotset_path`], which also
+/// refuses its conflict with `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`).  When it
+/// is, an HFQ source is header-checked
+/// ([`hipfire_arch_qwen4::artifact::hotset_source_preflight`]: slab-arena,
+/// K4, stock-FP8 and non-MQ4 routed layouts are refused naming the env)
+/// without reading any payload. A non-HFQ source is left to the caller's own
+/// refusal.
+fn qwen4_hotset_source_gate(source: &ModelSource) -> Result<bool, String> {
+    if hipfire_arch_qwen4::expert_hotset::enabled_hotset_path()?.is_none() {
+        return Ok(false);
+    }
+    if let ModelSource::Hfq(hfq) = source {
+        hipfire_arch_qwen4::artifact::hotset_source_preflight(hfq)?;
+    }
+    Ok(true)
+}
+
 /// Validate a reserved arch-16 HFQM source without allocating weights.
 ///
 /// The architecture crate owns the complete source/index contract.  Loader
@@ -805,6 +828,9 @@ pub fn admit_qwen4_source(
     gpu_arch: &str,
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
+    // `HIPFIRE_QWEN4_EXPERT_HOTSET`: refuse a source the hotset cannot back,
+    // by name, before the generic artifact admission below.
+    let hotset = qwen4_hotset_source_gate(source)?;
     let ModelSource::Hfq(hfq) = source else {
         return Err(
             "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
@@ -825,11 +851,30 @@ pub fn admit_qwen4_source(
         receipt.config.mtp.is_some(),
         receipt.config.profile.id(),
     )?;
+    // A hotset load owns the trunk experts through tier owners, so no
+    // `WeightEntry` is marked host and the carrier's moved-tensor count is
+    // not the whole story; but the MTP layer's experts are always
+    // host-mapped. Count them (>= 1 host-mapped tensor) so the shared
+    // host-spill policy decides here exactly as the carrier's exact count
+    // will later (`auto` keeps the head on gfx1201 only).
+    let native_mtp = if hotset && native_mtp {
+        qwen4_mtp_with_host_mapped_experts(
+            SpecLoadCfg {
+                mtp: spec_mtp,
+                ..SpecLoadCfg::default()
+            },
+            gpu_arch,
+            QWEN4_HOTSET_MIN_HOST_TENSORS,
+        )
+    } else {
+        native_mtp
+    };
     // The recipe's device admission: a stock-FP8 artifact needs FP8 expert
     // kernels (gfx942 only), one device and every routed expert resident.
-    let host_mapped_experts = hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
-        .map_err(|error| format!("qwen4: {error}"))?
-        .is_some();
+    let host_mapped_experts = hotset
+        || hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()
+            .map_err(|error| format!("qwen4: {error}"))?
+            .is_some();
     hipfire_arch_qwen4::admission::admit_recipe_on_device(
         receipt.recipe(),
         gpu_arch,
@@ -1591,6 +1636,10 @@ pub fn admit_source_with_options(
         if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
             return Err(refusal);
         }
+        // `HIPFIRE_QWEN4_EXPERT_HOTSET` refuses a non-aggregate / stock-FP8
+        // source here, by name, before the PLE derive (which can write a
+        // sidecar) and before the generic admission refusals.
+        qwen4_hotset_source_gate(&source)?;
         // The PLE rows source is chosen (and a missing q4 derived from the
         // q8 rows or the embedded shards) here, before the resident model is
         // torn down: a refusal (missing sidecar, binding mismatch, no space)

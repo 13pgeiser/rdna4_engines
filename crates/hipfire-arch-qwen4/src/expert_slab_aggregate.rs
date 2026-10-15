@@ -49,10 +49,11 @@ pub fn slabs_from_aggregate_mq4(
             got: layers.len().saturating_mul(experts),
         });
     }
+    let (gate_up_qt, down_qt) = ExpertFormat::Mq4Xts.pair();
     let mut slabs = Vec::with_capacity(layers.len() * experts);
     for (layer, agg) in layers.iter().enumerate() {
-        let gate_up_stride = stride(layer, &agg.gate_up, ExpertFormat::Mq4Xts.pair().0)?;
-        let down_stride = stride(layer, &agg.down, ExpertFormat::Mq4Xts.pair().1)?;
+        let gate_up_stride = stride(layer, &agg.gate_up, gate_up_qt, &GATE_UP_SHAPE, GATE_UP_BYTES)?;
+        let down_stride = stride(layer, &agg.down, down_qt, &DOWN_SHAPE, DOWN_BYTES)?;
         for expert in 0..experts {
             slabs.push(ExpertSlab {
                 format: ExpertFormat::Mq4Xts,
@@ -64,11 +65,21 @@ pub fn slabs_from_aggregate_mq4(
     Ok(slabs)
 }
 
-/// Validate one aggregate projection and return its per-expert byte stride.
+/// Real aggregate geometry (module docs): the only shapes and byte lengths
+/// the adapter admits.
+pub(crate) const GATE_UP_SHAPE: [usize; 3] = [512, 1280, 2560];
+pub(crate) const DOWN_SHAPE: [usize; 3] = [512, 2560, 640];
+const GATE_UP_BYTES: u64 = 891_289_600;
+const DOWN_BYTES: u64 = 445_644_800;
+
+/// Validate one aggregate projection against its exact quant type, shape and
+/// byte length, and return its per-expert byte stride.
 fn stride(
     layer: usize,
     proj: &AggregateProjection,
     expected_qt: u8,
+    expected_shape: &[usize; 3],
+    expected_bytes: u64,
 ) -> Result<u64, ExpertTierError> {
     let bad = |reason| ExpertTierError::Aggregate { layer, reason };
     if proj.quant_type != expected_qt {
@@ -78,11 +89,21 @@ fn stride(
     if proj.shape.first().copied() != Some(experts as usize) {
         return Err(bad("leading shape dimension is not 512"));
     }
+    if proj.shape != expected_shape {
+        return Err(bad(
+            "shape is not [512,1280,2560] (gate_up) / [512,2560,640] (down)",
+        ));
+    }
     if proj.len == 0 {
         return Err(bad("empty projection"));
     }
     if proj.len % experts != 0 {
         return Err(bad("length is not divisible by 512"));
+    }
+    if proj.len != expected_bytes {
+        return Err(bad(
+            "length is not 891289600 (gate_up) / 445644800 (down) bytes",
+        ));
     }
     let end = proj
         .offset
@@ -253,6 +274,42 @@ mod tests {
         assert!(matches!(
             slabs_from_aggregate_mq4(&t),
             Err(ExpertTierError::Aggregate { layer: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn full_shape_and_exact_byte_length_are_required() {
+        // Trailing dimensions, rank, and a 512-divisible but wrong length
+        // are all refused, for both projections.
+        let mut t = table();
+        t[1].gate_up.shape[1] = 1281;
+        assert!(matches!(
+            slabs_from_aggregate_mq4(&t),
+            Err(ExpertTierError::Aggregate { layer: 1, .. })
+        ));
+        let mut t = table();
+        t[2].down.shape = vec![512, 640, 2560];
+        assert!(matches!(
+            slabs_from_aggregate_mq4(&t),
+            Err(ExpertTierError::Aggregate { layer: 2, .. })
+        ));
+        let mut t = table();
+        t[3].gate_up.shape.push(1);
+        assert!(matches!(
+            slabs_from_aggregate_mq4(&t),
+            Err(ExpertTierError::Aggregate { layer: 3, .. })
+        ));
+        let mut t = table();
+        t[4].gate_up.len += 512;
+        assert!(matches!(
+            slabs_from_aggregate_mq4(&t),
+            Err(ExpertTierError::Aggregate { layer: 4, .. })
+        ));
+        let mut t = table();
+        t[5].down.len -= 512;
+        assert!(matches!(
+            slabs_from_aggregate_mq4(&t),
+            Err(ExpertTierError::Aggregate { layer: 5, .. })
         ));
     }
 }

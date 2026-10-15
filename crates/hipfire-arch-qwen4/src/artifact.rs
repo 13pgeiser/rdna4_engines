@@ -13,6 +13,7 @@
 use crate::gpu_forward::{qwen4_forward_scratch_mode, Qwen4ForwardScratchMode};
 use crate::config::{Qwen4Config, Qwen4PleConfig, ARCH_ID};
 use crate::expert_slab_table::{build_expert_slab_table, ExpertSlabTableError};
+use crate::expert_hotset::HOTSET_ENV;
 use crate::expert_slabs::{self, parse_expert_entry_name, ExpertSlabsError};
 use crate::ple::PleHashMetadata;
 use crate::weights::{
@@ -1634,6 +1635,212 @@ pub fn routed_headers_symmetric(
         .map(|entry| entry.name.as_str())
         .collect::<Vec<_>>();
     routed_tensors_symmetric(hfq, &names)
+}
+
+fn hotset_refusal(reason: impl fmt::Display) -> String {
+    format!(
+        "qwen4: {HOTSET_ENV} requires the packed Flash-Next aggregate MQ4-XTS routed experts \
+         (48 trunk layers x 512 experts, top-10, qt44 gate_up + qt53 down): {reason}; \
+         unset {HOTSET_ENV} to load this artifact"
+    )
+}
+
+/// Header-only check, with no payload read, that the artifact's layout can
+/// back [`hotset_aggregate_slabs`]: the legacy aggregate routed tensors of
+/// the packed recipe.  Refuses (naming [`HOTSET_ENV`]) an expert-slab
+/// artifact (qwen4.expert_slabs metadata, per-expert entry names, qt131..134
+/// planar I4 experts, i.e. the slab arena / K4 route), a stock-FP8 artifact
+/// (qt55 routed experts), any trunk routed tensor that is not qt44/qt53, and
+/// an overlaid source.  Run it before [`admit_hfqm_artifact_on`], whose
+/// generic refusals do not mention the hotset.
+pub fn hotset_source_preflight(hfq: &HfqFile) -> Result<(), String> {
+    if hfq.arch_id != ARCH_ID {
+        return Err(hotset_refusal(format!(
+            "source arch_id={} is not the Qwen4 arch_id={ARCH_ID}",
+            hfq.arch_id
+        )));
+    }
+    if hfq.has_overlay() {
+        return Err(hotset_refusal(
+            "REAP/head overlays are not admitted (the hotset reads the base mmap directly)",
+        ));
+    }
+    match expert_slabs::parse(&hfq.metadata_json) {
+        Ok(None) | Err(ExpertSlabsError::InvalidJson(_) | ExpertSlabsError::MetadataNotObject) => {}
+        Ok(Some(_)) => {
+            return Err(hotset_refusal(
+                "this is a per-expert slab artifact (qwen4.expert_slabs v1 metadata: slab arena / \
+                 K4 route), not an aggregate artifact",
+            ));
+        }
+        Err(error) => {
+            return Err(hotset_refusal(format!(
+                "the artifact carries invalid qwen4.expert_slabs metadata ({error})"
+            )));
+        }
+    }
+    for info in hfq.tensors() {
+        if parse_expert_entry_name(&info.name).is_some() {
+            return Err(hotset_refusal(format!(
+                "per-expert slab entry {} is present (slab arena / K4 route), not an aggregate \
+                 artifact",
+                info.name
+            )));
+        }
+        if matches!(info.quant_type, 131..=134) {
+            return Err(hotset_refusal(format!(
+                "tensor {} is a planar I4 expert type (qt={}), not aggregate MQ4-XTS",
+                info.name, info.quant_type
+            )));
+        }
+        let routed_gate_up = info.name.ends_with(ROUTED_GATE_UP_SUFFIX);
+        let routed_down = info.name.ends_with(ROUTED_DOWN_SUFFIX);
+        if !(routed_gate_up || routed_down) {
+            continue;
+        }
+        if info.quant_type == QWEN4_QT_FP8E4M3B128 {
+            return Err(hotset_refusal(format!(
+                "routed tensor {} is qt=55 FP8E4M3B128 (the stock-FP8 artifact keeps every \
+                 routed expert resident on gfx942 and has no MQ4 experts)",
+                info.name
+            )));
+        }
+        if !info.name.starts_with("model.language_model.layers.") {
+            // The MTP head's experts stay host-mapped legacy tensors, outside the hotset.
+            continue;
+        }
+        let expected = if routed_gate_up {
+            QWEN4_QT_MQ4G256V2
+        } else {
+            QWEN4_QT_MQ4G128V2
+        };
+        if info.quant_type != expected {
+            return Err(hotset_refusal(format!(
+                "trunk routed tensor {} is qt={}, expected qt={expected}",
+                info.name, info.quant_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The per-expert `(layer * 512 + expert)` source slabs of the artifact's
+/// aggregate MQ4-XTS routed experts, for the load-time hotset.  Each span is
+/// an **absolute** artifact mmap offset (`HfqTensorInfo::data_offset` plus
+/// the expert stride), readable through [`HfqFile::data_range`]; no payload
+/// is read, hashed or copied.
+///
+/// Strict contract: the packed Flash-Next recipe (not stock FP8, not the
+/// slab arena), `config.num_hidden_layers == 48`, 512 experts, top-10 (the
+/// authoritative `config.ffn` and its scalar mirrors); every trunk layer has
+/// qt44 `[512, 1280, 2560]` gate_up and qt53 `[512, 2560, 640]` down of the
+/// exact byte length, fully inside the mapping.  Every violation is a
+/// refusal naming [`HOTSET_ENV`].  `hfq` and `manifest` must be the admitted
+/// artifact (`admit_hfqm_artifact_on`) the slabs are used with: the slab
+/// list is bound to the source by structure (names, qt, shape, length,
+/// absolute offsets of the sealed index), not by a payload digest.
+pub fn hotset_aggregate_slabs(
+    hfq: &HfqFile,
+    config: &Qwen4Config,
+    manifest: &Qwen4Manifest,
+) -> Result<Vec<crate::expert_slab_table::ExpertSlab>, String> {
+    use crate::expert_slab_aggregate::{slabs_from_aggregate_mq4, AggregateLayer, AggregateProjection};
+    use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
+
+    hotset_source_preflight(hfq)?;
+    if !matches!(config.profile, crate::config::Qwen4Profile::FlashNext) {
+        return Err(hotset_refusal(format!(
+            "profile {} is not the packed Flash-Next profile",
+            config.profile.id()
+        )));
+    }
+    if !matches!(manifest.identity.recipe, Qwen4TierRecipe::FlashNextPacked { .. }) {
+        return Err(hotset_refusal(
+            "the manifest recipe is not the packed Flash-Next recipe (stock-FP8 and slab-arena \
+             recipes are not aggregate MQ4)",
+        ));
+    }
+    let layers = TRUNK_LAYERS as usize;
+    let experts = EXPERTS_PER_LAYER as usize;
+    if config.num_hidden_layers != layers
+        || config.num_experts != experts
+        || config.num_experts_per_tok != 10
+        || !matches!(
+            config.ffn,
+            crate::config::Qwen4FfnConfig::Moe { num_experts: 512, top_k: 10, .. }
+        )
+    {
+        return Err(hotset_refusal(format!(
+            "config has {} layers / {} experts / top-{} (need {layers} / {experts} / top-10)",
+            config.num_hidden_layers, config.num_experts, config.num_experts_per_tok
+        )));
+    }
+
+    let (gate_up_qt, down_qt) = ExpertFormat::Mq4Xts.pair();
+    let gate_up_len = ExpertFormat::Mq4Xts.gate_up_bytes() * experts;
+    let down_len = ExpertFormat::Mq4Xts.down_bytes() * experts;
+    let projection = |layer: usize,
+                      suffix: &str,
+                      qt: u8,
+                      shape: [u32; 3],
+                      len: usize|
+     -> Result<AggregateProjection, String> {
+        let name = format!("model.language_model.layers.{layer}.mlp{suffix}");
+        if !manifest.weights.iter().any(|entry| entry.name == name && entry.layer == Some(layer)) {
+            return Err(hotset_refusal(format!(
+                "the manifest declares no aggregate routed tensor {name} (nonaggregate layout)"
+            )));
+        }
+        let info = hfq
+            .find_tensor_info(&name)
+            .ok_or_else(|| hotset_refusal(format!("routed tensor {name} is missing")))?;
+        if info.quant_type != qt {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} is qt={}, expected qt={qt}",
+                info.quant_type
+            )));
+        }
+        if info.shape != shape {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} shape {:?}, expected {shape:?}",
+                info.shape
+            )));
+        }
+        if info.data_size != len {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} is {} bytes, expected {len}",
+                info.data_size
+            )));
+        }
+        if hfq.data_range(info.data_offset, info.data_size).is_none() {
+            return Err(hotset_refusal(format!(
+                "routed tensor {name} bytes [{}, +{}) are not inside the artifact mmap",
+                info.data_offset, info.data_size
+            )));
+        }
+        Ok(AggregateProjection {
+            offset: info.data_offset as u64,
+            len: info.data_size as u64,
+            quant_type: info.quant_type,
+            shape: info.shape.iter().map(|&dim| dim as usize).collect(),
+        })
+    };
+    let aggregates = (0..layers)
+        .map(|layer| -> Result<AggregateLayer, String> {
+            Ok(AggregateLayer {
+                gate_up: projection(
+                    layer,
+                    ROUTED_GATE_UP_SUFFIX,
+                    gate_up_qt,
+                    [512, 1280, 2560],
+                    gate_up_len,
+                )?,
+                down: projection(layer, ROUTED_DOWN_SUFFIX, down_qt, [512, 2560, 640], down_len)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    slabs_from_aggregate_mq4(&aggregates)
+        .map_err(|error| hotset_refusal(format!("aggregate adapter: {error}")))
 }
 
 /// Whether every PLE key/value projection runs as BF16 weights: the manifest
