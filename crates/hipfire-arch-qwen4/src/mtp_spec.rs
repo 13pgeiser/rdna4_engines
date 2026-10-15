@@ -768,12 +768,42 @@ pub(crate) const MTP_AGREEMENT_DECAY: f32 = 0.875;
 const MTP_AGREEMENT_DECAY_GFX1151: f32 = 0.97;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
 pub(crate) const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
-/// Per-window relaxation of a depth the window did not compare toward
-/// `MTP_AGREEMENT_PRIOR`. An unobserved depth must drift back to the prior so
+/// Per-window relaxation of a depth the window did not compare toward the
+/// agreement of the next-shallower depth (depth 0: `MTP_AGREEMENT_PRIOR`),
+/// at the prior's weight, while that agreement is below the depth's own
+/// (see [`MTP_AGREEMENT_RELAX_UP`]). An unobserved depth must drift back so
 /// the chooser re-explores it: a ratio frozen below the depth's threshold
 /// (one rejected depth-3 draft) keeps that depth out of every later window,
-/// so it is never observed again.
+/// so it is never observed again. It drifts toward the request's own
+/// deepest observed acceptance rather than a fixed 0.8 because the
+/// conditional acceptance is flat in depth past the first draft
+/// (Flash-Next, forced K=5: Halo code 0.89-0.96 and prose 0.68-0.76 at
+/// depths 2-5; forced K=5/7 on the R9700: 0.70-0.86 at depths 2-7), so a
+/// fixed prior under-prices every deeper draft of a code request and
+/// over-prices a prose one.
 const MTP_AGREEMENT_RELAX: f32 = 0.95;
+/// [`MTP_AGREEMENT_RELAX`] while the shallower depth's agreement is above
+/// the uncompared depth's own (~5-window memory instead of ~20), so the
+/// depths past the one a request runs catch up with its body's acceptance
+/// after the early rejections a response's first windows often take
+/// ([`MTP_SINGLETON_FLOOR_MIN_WINDOWS`]); falling stays slow, so a depth's
+/// own rejections are not forgotten.  On the deterministic CPU streams of
+/// the `chooser_*` tests (16 seeds, Halo window costs, code acceptance) it
+/// emits ~1% more tokens per ms than 0.95 both ways; prose and R9700
+/// streams move by less than 1%.
+const MTP_AGREEMENT_RELAX_UP: f32 = 0.8;
+/// Window cost of one more drafted row, in AR steps, that the chooser's
+/// per-request cost fit assumes until the request has priced windows at two
+/// drafted depths ([`MtpFloor::modeled_us`]): gfx1151 Flash-Next mq4-xts,
+/// 6.43 ms of verify plus ~1.3 ms of draft step per row against a 28.45 ms
+/// AR step (`release-0.4.3/device-sample/VERIFY-BREAKDOWN.md` §7). The
+/// R9700's row is ~0.52 AR steps (§3); the prior only prices the first
+/// one-depth exploration, after which the request's own slope takes over.
+const MTP_ROW_COST_PRIOR: f64 = 0.27;
+/// Ridge weight of [`MTP_ROW_COST_PRIOR`] in the per-request cost fit, in
+/// the fit's depth-spread units (`Σw(d - d̄)²`): two windows one depth
+/// apart, so a handful of windows at two depths outweigh it.
+const MTP_ROW_COST_PRIOR_WEIGHT: f64 = 0.5;
 /// Emitted tokens a request's first takeover is assumed to yield (one
 /// pseudo-window): the offline 5/3/3 TC/Hermes accepted-prefix-plus-bonus on
 /// a pool hit was 2.9-3.2 (`release-0.4.1/mtp-ngram-plan.md` §1).
@@ -933,23 +963,34 @@ pub(crate) fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
 /// depth measures the agreement conditional on its prefix being accepted
 /// (the same quantity on both routes). Compared depths decay by `decay` and
 /// take the observation; depths the window did not compare relax toward
-/// `MTP_AGREEMENT_PRIOR` (`MTP_AGREEMENT_RELAX`) instead of decaying, so a
-/// depth rejected once is re-explored rather than frozen below its
-/// threshold.
+/// the next-shallower depth's agreement at the weight of
+/// `MTP_AGREEMENT_PRIOR` (depth 0 toward the prior itself) instead of
+/// decaying: up at `MTP_AGREEMENT_RELAX_UP`, down at `MTP_AGREEMENT_RELAX`.
+/// A depth rejected once is re-explored rather than frozen below its
+/// threshold, and depths no window reached are priced at the request's
+/// deepest observed acceptance.
 pub(crate) fn observe_agreement(agreement: &mut Agreement, window: &MtpWindow, decay: f32) {
     let compared = (window.accepted + 1).min(window.drafts_generated);
-    let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
-    for (depth, (accepted, total)) in agreement.iter_mut().enumerate() {
+    let prior_total = MTP_AGREEMENT_PRIOR.1;
+    let mut shallower = MTP_AGREEMENT_PRIOR;
+    for (depth, entry) in agreement.iter_mut().enumerate() {
+        let (accepted, total) = entry;
         if depth < compared {
             *accepted *= decay;
             *total *= decay;
             *total += 1.0;
             *accepted += f32::from(u8::from(depth < window.accepted));
         } else {
-            *accepted =
-                *accepted * MTP_AGREEMENT_RELAX + prior_accepted * (1.0 - MTP_AGREEMENT_RELAX);
-            *total = *total * MTP_AGREEMENT_RELAX + prior_total * (1.0 - MTP_AGREEMENT_RELAX);
+            let target = shallower.0 / shallower.1.max(f32::MIN_POSITIVE);
+            let relax = if target > *accepted / total.max(f32::MIN_POSITIVE) {
+                MTP_AGREEMENT_RELAX_UP
+            } else {
+                MTP_AGREEMENT_RELAX
+            };
+            *accepted = *accepted * relax + prior_total * target * (1.0 - relax);
+            *total = *total * relax + prior_total * (1.0 - relax);
         }
+        shallower = *entry;
     }
 }
 
@@ -983,11 +1024,23 @@ pub(crate) fn batched_depth(agreement: &Agreement, k: usize) -> usize {
 /// divided by the agreement-predicted tokens it emits; the interleaved route
 /// by its decayed wall time per emitted token.  The Halo cost table only
 /// orders the options while fewer than [`MTP_FLOOR_PROBE_WINDOWS`] windows
-/// have been observed.  After that budget only measured options are chosen,
-/// and the request retires, stickily, to head-free AR as soon as no measured
-/// option costs strictly less per emitted token than AR (a tie retires).  An
-/// invalid AR measurement retires at the budget too: without a price, a win
-/// cannot be asserted.
+/// have been observed.  After that budget the AR verdict reads only measured
+/// options: the request retires, stickily, to head-free AR as soon as no
+/// measured option costs strictly less per emitted token than AR (a tie
+/// retires).  An invalid AR measurement retires at the budget too: without
+/// a price, a win cannot be asserted.
+///
+/// Depth choice (once a measured option beats AR): the candidates are the
+/// measured options plus every unmeasured depth next to a measured one,
+/// priced by the request's own window-cost fit ([`Self::modeled_us`]: a
+/// decayed least-squares line of wall time on drafted depth, whose slope
+/// is the measured cost of one more verify row on this GPU).  The cheapest
+/// per expected token runs, so a request whose drafts keep being accepted
+/// climbs one depth at a time (up to `MTP_WINDOW_COST.len() - 1`) and stops
+/// where the next row's measured price exceeds its predicted yield; without
+/// the neighbours, the depths the three probe windows happened to draft
+/// (early rejections and the margin prune push them to 2-3) were the only
+/// ones a request ever ran.
 ///
 /// External (n-gram) windows are tracked separately and never feed the
 /// native agreement; they count toward the shared probe budget.  A request
@@ -1024,6 +1077,10 @@ pub(crate) struct MtpFloor {
     retired: bool,
     /// Per actually drafted depth: decayed (wall us, windows).
     batched: [(f32, f32); MTP_WINDOW_COST.len()],
+    /// Decayed least-squares sums `[w, Σd, Σus, Σd², Σd·us]` of every priced
+    /// batched window's wall `us` on its drafted depth `d`, the data of
+    /// [`Self::modeled_us`] (f64: the cross terms of ~1e5 us cancel).
+    fit: [f64; 5],
     /// Decayed (wall us, emitted tokens).
     interleaved: (f32, f32),
     /// Decayed (wall us, emitted tokens) of external windows.
@@ -1065,6 +1122,7 @@ impl MtpFloor {
             retire_after: retire_after.max(MTP_FLOOR_PROBE_WINDOWS),
             retired: false,
             batched: [(0.0, 0.0); MTP_WINDOW_COST.len()],
+            fit: [0.0; 5],
             interleaved: (0.0, 0.0),
             external: (0.0, 0.0),
             external_blocked: false,
@@ -1098,13 +1156,95 @@ impl MtpFloor {
         self.retired
     }
 
-    /// Measured native window cost in AR-step units, once probing finishes.
+    /// Native window cost at `depth` drafts in AR-step units, once probing
+    /// finishes: the measured mean, else the request's cost fit.
     fn batched_cost(&self, depth: usize) -> Option<f32> {
         if self.probing() || !valid_us(self.ar_us) {
             return None;
         }
         let &(sum, windows) = self.batched.get(depth)?;
-        (windows > 0.0 && valid_us(sum)).then(|| sum / windows / self.ar_us)
+        if windows > 0.0 {
+            return valid_us(sum).then(|| sum / windows / self.ar_us);
+        }
+        self.modeled_us(depth).map(|us| us / self.ar_us)
+    }
+
+    /// This request's window-cost line `(mean depth, mean us, us per
+    /// drafted row)`: the decayed least-squares line of every priced batched
+    /// window's wall time on its drafted depth, its slope (one more verify
+    /// row and draft step on this GPU) ridge-pulled toward
+    /// [`MTP_ROW_COST_PRIOR`] AR steps with weight
+    /// [`MTP_ROW_COST_PRIOR_WEIGHT`] and never negative.  With windows at one
+    /// depth only the slope is the prior; it becomes the request's own as
+    /// soon as two depths are priced.  `None` before any batched window was
+    /// priced or without a valid AR price.
+    fn fit_line(&self) -> Option<(f64, f64, f64)> {
+        let [w, sd, sus, sdd, sdus] = self.fit;
+        if w <= 0.0 || !valid_us(self.ar_us) {
+            return None;
+        }
+        let (mean_d, mean_us) = (sd / w, sus / w);
+        let spread = (sdd - w * mean_d * mean_d).max(0.0);
+        let covariance = sdus - w * mean_d * mean_us;
+        let prior = MTP_ROW_COST_PRIOR * f64::from(self.ar_us);
+        let slope = ((covariance + MTP_ROW_COST_PRIOR_WEIGHT * prior)
+            / (spread + MTP_ROW_COST_PRIOR_WEIGHT))
+            .max(0.0);
+        Some((mean_d, mean_us, slope))
+    }
+
+    /// [`Self::fit_line`]'s wall time (us) of a batched window drafting
+    /// `depth` tokens, when positive.
+    fn modeled_us(&self, depth: usize) -> Option<f32> {
+        let (mean_d, mean_us, slope) = self.fit_line()?;
+        let us = (mean_us + slope * (depth as f64 - mean_d)) as f32;
+        valid_us(us).then_some(us)
+    }
+
+    /// Window cost (us) the chooser may route `depth` at: its decayed
+    /// measured mean; else, when a neighbouring depth is measured, the
+    /// request's fit (a one-depth exploration); else `None`.
+    fn candidate_us(&self, depth: usize) -> Option<f32> {
+        let &(sum, windows) = self.batched.get(depth)?;
+        if windows > 0.0 {
+            return Some(sum / windows);
+        }
+        let measured = |d: usize| self.batched.get(d).is_some_and(|&(_, w)| w > 0.0);
+        if depth == 0 || !(measured(depth - 1) || measured(depth + 1)) {
+            return None;
+        }
+        self.modeled_us(depth)
+    }
+
+    /// Cheapest candidate within `max_depth` drafts, `(route, us per
+    /// expected emitted token)`: the measured options of
+    /// [`Self::best_native`] plus the fitted unmeasured neighbours of
+    /// [`Self::candidate_us`].  Ties keep the earlier (shallower) option.
+    fn best_candidate(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
+        let mut best = (self.interleaved.1 > 0.0)
+            .then(|| (FloorRoute::Interleaved, self.interleaved.0 / self.interleaved.1));
+        for depth in 1..self.batched.len().min(max_depth.saturating_add(1)) {
+            let Some(us) = self.candidate_us(depth) else {
+                continue;
+            };
+            let cost = us / expected_emitted(agreement, depth);
+            if best.map_or(true, |(_, cheapest)| cost < cheapest) {
+                best = Some((FloorRoute::Batched(depth), cost));
+            }
+        }
+        best
+    }
+
+    /// Expected emitted tokens per AR step of window cost of the cheapest
+    /// candidate within `max_depth` (at least 1, the interleaved route's
+    /// rate), once probing finishes with a valid AR price: the native rate
+    /// an n-gram takeover must match.
+    fn candidate_rate(&self, agreement: &Agreement, max_depth: usize) -> Option<f32> {
+        if self.probing() || !valid_us(self.ar_us) {
+            return None;
+        }
+        let (_, cost) = self.best_candidate(agreement, max_depth)?;
+        Some((self.ar_us / cost).max(1.0))
     }
 
     fn probing(&self) -> bool {
@@ -1184,12 +1324,13 @@ impl MtpFloor {
                     decay_add(&mut self.interleaved, us, emitted, decay);
                 }
                 NativeWindow::Batched => {
-                    if let Some(entry) = self
-                        .batched
-                        .get_mut(window.drafts_generated)
-                        .filter(|_| window.drafts_generated >= 1)
-                    {
+                    let depth = window.drafts_generated;
+                    if let Some(entry) = self.batched.get_mut(depth).filter(|_| depth >= 1) {
                         decay_add(entry, us, 1.0, decay);
+                        let (d, us, decay) = (depth as f64, f64::from(us), f64::from(decay));
+                        for (sum, x) in self.fit.iter_mut().zip([1.0, d, us, d * d, d * us]) {
+                            *sum = *sum * decay + x;
+                        }
                     }
                 }
             }
@@ -1320,18 +1461,21 @@ impl MtpFloor {
 
     /// Route for the next native window with `k` drafts of budget.
     /// `provisional` is the unchanged Halo-table `batched_depth(k)`, used
-    /// only while the probe budget lasts.  Afterwards only a measured option
-    /// within `k` that costs strictly less per emitted token than AR may run;
-    /// when there is none (an external-only budget, `k` below every winning
-    /// measured depth, a losing measured option, no valid AR price) the
-    /// request retires, stickily, and runs AR: no unmeasured or losing route
-    /// is ever run after the budget.  Exceptions: inside the retirement grace
-    /// (`retire_after` observed windows) a request with a valid AR price keeps
-    /// drafting on its cheapest measured option within `k`, else the
-    /// provisional depth; and a floor with retire evidence
-    /// ([`Self::with_retire_evidence`]) first runs [`FloorRoute::ArSample`]
-    /// probe tokens, then keeps drafting while the slow-memory realized cost
-    /// beats the probed AR price.
+    /// only while the probe budget lasts.  Afterwards a window may draft
+    /// only while a measured option within `k` costs strictly less per
+    /// emitted token than AR; it then runs the cheapest candidate within `k`
+    /// ([`Self::best_candidate`]: a measured option, or an unmeasured depth
+    /// next to a measured one priced by the request's cost fit).  When no
+    /// measured option wins (an external-only budget, `k` below every
+    /// winning measured depth, a losing measured option, no valid AR price)
+    /// the request retires, stickily, and runs AR: no losing route, and no
+    /// unmeasured route without a measured winner, is ever run after the
+    /// budget.  Exceptions: inside the retirement grace (`retire_after`
+    /// observed windows) a request with a valid AR price keeps drafting on
+    /// its cheapest measured option within `k`, else the provisional depth;
+    /// and a floor with retire evidence ([`Self::with_retire_evidence`])
+    /// first runs [`FloorRoute::ArSample`] probe tokens, then keeps drafting
+    /// while the slow-memory realized cost beats the probed AR price.
     pub(crate) fn route(
         &mut self,
         agreement: &Agreement,
@@ -1353,7 +1497,11 @@ impl MtpFloor {
         let best = self.best_native(agreement, k);
         if let Some((route, cost)) = best {
             if cost < self.ar_us {
-                return route;
+                // The candidates include every measured option, so the
+                // cheapest one costs no more than `cost`.
+                return self
+                    .best_candidate(agreement, k)
+                    .map_or(route, |(candidate, _)| candidate);
             }
         }
         if (self.external_alive() && self.combined_wins()) || self.slow_wins() {
@@ -1375,8 +1523,9 @@ impl MtpFloor {
     }
 
     /// One `QWEN4_FLOOR_TRACE` JSON line (`HIPFIRE_MTP_FLOOR_TRACE=1`): the
-    /// floor's state after `event`, with every priced option in
-    /// microseconds per emitted token next to `ar_us`.
+    /// floor's state after `event`, with every candidate option in
+    /// microseconds per emitted token next to `ar_us` (`modeled`: priced by
+    /// the request's cost fit, not yet measured).
     pub(crate) fn trace_line(
         &self,
         agreement: &Agreement,
@@ -1393,20 +1542,21 @@ impl MtpFloor {
             ));
         }
         for depth in 1..self.batched.len() {
-            let (sum, windows) = self.batched[depth];
-            if windows <= 0.0 {
+            let Some(win_us) = self.candidate_us(depth) else {
                 continue;
-            }
+            };
             if !options.is_empty() {
                 options.push(',');
             }
             options.push_str(&format!(
-                "{{\"route\":\"batched{depth}\",\"win_us\":{:.1},\"pred_emit\":{:.3},\"us_per_tok\":{:.1}}}",
-                sum / windows,
+                "{{\"route\":\"batched{depth}\",\"modeled\":{},\"win_us\":{:.1},\"pred_emit\":{:.3},\"us_per_tok\":{:.1}}}",
+                self.batched[depth].1 <= 0.0,
+                win_us,
                 expected_emitted(agreement, depth),
-                sum / windows / expected_emitted(agreement, depth)
+                win_us / expected_emitted(agreement, depth)
             ));
         }
+        let row_us = self.fit_line().map_or(0.0, |(_, _, slope)| slope);
         let combined = if self.combined.1 > 0.0 {
             self.combined.0 / self.combined.1
         } else {
@@ -1418,7 +1568,7 @@ impl MtpFloor {
             0.0
         };
         format!(
-            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"options\":[{options}]}}",
+            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"row_us\":{row_us:.1},\"options\":[{options}]}}",
             self.ar_us, self.observed, self.probes, self.retire_after, self.retired, self.probe_left
         )
     }
@@ -2752,6 +2902,11 @@ pub struct Qwen4MtpDrafter {
     /// repairable ([`RetainedWindow`]). Dropped by the next window, forced
     /// advance, prefill, reset or request configuration.
     retained: Option<RetainedWindow>,
+    /// Bit `d`: this drafter already ran a batched window drafting `d`
+    /// tokens, so that row count's one-time verify work is done (see
+    /// [`Self::floor_observe_native`]). Lives as long as the drafter, across
+    /// requests.
+    warm_depths: u16,
 }
 
 impl Qwen4MtpDrafter {
@@ -2786,6 +2941,7 @@ impl Qwen4MtpDrafter {
             follower: false,
             replay: Vec::new(),
             retained: None,
+            warm_depths: 0,
         }
     }
 
@@ -3184,13 +3340,22 @@ impl Qwen4MtpDrafter {
     }
 
     /// Best expected emitted tokens per unit of window cost the native route
-    /// offers at the current agreement (`batched_depth`'s objective; the
-    /// interleaved route is 1.0).
+    /// offers at the current agreement (the interleaved route is 1.0): on a
+    /// priced arch with a measured floor, the floor's cheapest candidate
+    /// within `k` (the depth the chooser would run,
+    /// [`MtpFloor::candidate_rate`]); before that, `batched_depth`'s
+    /// objective over [`Self::ngram_window_cost`].
     fn native_rate(&self, k: usize) -> f32 {
+        let depths = k.min(MTP_WINDOW_COST.len() - 1);
+        if self.floor_enabled && self.ngram_row_cost.is_some() {
+            if let Some(rate) = self.floor.candidate_rate(&self.agreement, depths) {
+                return rate;
+            }
+        }
         let mut best = 1.0f32;
         let mut prefix = 1.0f32;
         let mut expected = 1.0f32;
-        let depths = self.agreement.iter().take(k.min(MTP_WINDOW_COST.len() - 1));
+        let depths = self.agreement.iter().take(depths);
         for (i, &(accepted, total)) in depths.enumerate() {
             let cost = self.ngram_window_cost(i + 1);
             prefix *= accepted / total.max(f32::MIN_POSITIVE);
@@ -3620,7 +3785,12 @@ impl Qwen4MtpDrafter {
 
     /// Count one finished native window; observe it for the floor unless
     /// `bypass` (a developer-forced route, `HIPFIRE_MTP_INCREMENTAL=0|1`, or
-    /// `HIPFIRE_MTP_AR_FLOOR=0`) skips the floor.
+    /// `HIPFIRE_MTP_AR_FLOOR=0`) skips the floor.  The first batched window
+    /// this drafter runs at a drafted depth is observed unpriced (an unusable
+    /// timing: it spends the probe, records no cost): its verify is the
+    /// process's first at that row count and carries one-time kernel work
+    /// (gfx1151 Flash-Next: +8 ms at 5 rows, +15 ms at 6 and 8 rows), which
+    /// would otherwise price that depth out for the whole request.
     fn floor_observe_native(
         &mut self,
         bypass: bool,
@@ -3630,12 +3800,20 @@ impl Qwen4MtpDrafter {
         k: usize,
     ) {
         self.stats.mtp_windows += 1;
+        let first_use = route == NativeWindow::Batched && {
+            let bit = 1u16 << window.drafts_generated.min(MTP_MAX_DEPTH);
+            let first = self.warm_depths & bit == 0;
+            self.warm_depths |= bit;
+            first
+        };
         if !bypass && !self.follower {
+            let priced_us = if first_use { f32::NAN } else { us };
             self.floor
-                .observe_native(route, window, us, k, &self.agreement);
+                .observe_native(route, window, priced_us, k, &self.agreement);
             if floor_trace_enabled() {
                 let event = match route {
                     NativeWindow::Interleaved => "native_interleaved",
+                    NativeWindow::Batched if first_use => "native_batched_first_use",
                     NativeWindow::Batched => "native_batched",
                 };
                 eprintln!(
@@ -6969,8 +7147,13 @@ mod tests {
         let mut floor = calibrated(33.0, &good);
         batched_windows(&mut floor, &good, 3, 75.0, MTP_FLOOR_PROBE_WINDOWS);
         assert!(!floor.retired);
-        // The provisional (Halo-table) depth is ignored once measured.
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        // The provisional (Halo-table) depth is ignored once measured. The
+        // cost fit prices the unmeasured neighbour 4 at 75 + 0.27 x 33 us
+        // (83.9 us for 4.10 predicted tokens, 20.5 us per token) against
+        // depth 3's measured 21.8: the chooser explores one depth up, never
+        // to the table's 5 or past the budget.
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(4));
+        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
         // `k` below the measured winning depth: no eligible measured option,
         // so the request retires to AR rather than run an unmeasured route.
         assert_eq!(floor.route(&good, 2, 5), FloorRoute::Ar);
@@ -7138,7 +7321,7 @@ mod tests {
             }
         }
         assert!(stopped && !floor.retired);
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
     }
 
     #[test]
@@ -7263,7 +7446,7 @@ mod tests {
         batched_windows(&mut floor, &good, 3, 75.0, 2);
         assert!(floor.observe_external(1, 90.0, 2, &good));
         assert!(!floor.retired);
-        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        assert_eq!(floor.route(&good, 3, 5), FloorRoute::Batched(3));
     }
 
     #[test]
@@ -7310,7 +7493,278 @@ mod tests {
         assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
         assert_eq!(floor.batched.len(), MTP_WINDOW_COST.len());
         assert!(!floor.retired);
-        assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top));
+        // Nothing past the table is ever a candidate: within k = 10 the
+        // choice is the measured top (100 us for 5.70 predicted tokens) or
+        // its fitted neighbour below (100 - 0.27 x 100 = 73 us for 5.22),
+        // the cheaper per token.
+        assert_eq!(floor.route(&good, 10, 5), FloorRoute::Batched(top - 1));
+    }
+
+    #[test]
+    fn floor_cost_fit_takes_the_requests_own_row_price() {
+        let good = agreement(1.6, 2.0);
+        let mut floor =
+            calibrated(28_600.0, &good).with_decay(MTP_AGREEMENT_DECAY_GFX1151);
+        // One depth priced: the row costs the prior, 0.27 AR steps, and only
+        // the measured depth's neighbours are candidates.
+        batched_windows(&mut floor, &good, 3, 73_500.0, MTP_FLOOR_PROBE_WINDOWS);
+        let prior_row = 0.27 * 28_600.0;
+        let fitted = floor.modeled_us(4).expect("fit");
+        assert!((fitted - (73_500.0 + prior_row)).abs() < 1.0, "{fitted}");
+        assert!(floor.candidate_us(2).is_some() && floor.candidate_us(4).is_some());
+        assert_eq!(floor.candidate_us(5), None);
+        assert_eq!(floor.candidate_us(1), None);
+        // Depths 2 and 3 priced at the R9700's 12.4 ms row: the slope is the
+        // request's own within a few percent, and at 0.8 agreement the
+        // unmeasured depth 4 (~85.9 ms for 3.36 tokens) loses to depth 3
+        // (73.5 ms for 2.95 tokens).
+        for _ in 0..20 {
+            batched_windows(&mut floor, &good, 2, 61_100.0, 1);
+            batched_windows(&mut floor, &good, 3, 73_500.0, 1);
+        }
+        let row = floor.modeled_us(4).expect("fit") - floor.modeled_us(3).expect("fit");
+        assert!((row - 12_400.0).abs() < 0.03 * 12_400.0, "row {row}");
+        assert_eq!(floor.route(&good, 7, 5), FloorRoute::Batched(3));
+        assert!(floor.trace_line(&good, "t", 1.0, 1, 3).contains("\"modeled\":true"));
+    }
+
+    #[test]
+    fn uncompared_depths_relax_toward_the_shallower_agreement() {
+        let ratio = |(accepted, total): (f32, f32)| accepted / total;
+        // Windows that accept both of two drafts never compare depth 5; it
+        // drifts to the request's own acceptance, not to the 0.8 prior.
+        let mut agreement = [(1.9, 2.0); MTP_MAX_DEPTH];
+        for _ in 0..100 {
+            observe_agreement(&mut agreement, &window(2, 2), MTP_AGREEMENT_DECAY);
+        }
+        assert!(ratio(agreement[5]) > 0.95, "{:?}", agreement[5]);
+        // Rejections at depth 0 pull every deeper depth toward depth 0's rate
+        // (each depth lags the one above it by the relaxation's ~20 windows).
+        let mut agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+        for _ in 0..300 {
+            observe_agreement(&mut agreement, &window(0, 3), MTP_AGREEMENT_DECAY);
+        }
+        assert!(ratio(agreement[0]) < 0.01);
+        assert!(ratio(agreement[4]) < 0.2, "{:?}", agreement[4]);
+        // Depth 0 itself, when no draft was compared, relaxes to the prior.
+        let mut agreement = [(0.0, 2.0); MTP_MAX_DEPTH];
+        for _ in 0..200 {
+            observe_agreement(&mut agreement, &window(0, 0), MTP_AGREEMENT_DECAY);
+        }
+        let prior = ratio(MTP_AGREEMENT_PRIOR);
+        assert!((ratio(agreement[0]) - prior).abs() < 1e-3);
+        assert!((ratio(agreement[MTP_MAX_DEPTH - 1]) - prior).abs() < 0.05);
+    }
+
+    /// Deterministic draws in `[0, 1)` (xorshift32).
+    struct Draws(u32);
+
+    impl Draws {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            (self.0 >> 8) as f32 / (1u32 << 24) as f32
+        }
+    }
+
+    /// The depth of each of `windows` native windows of a singleton request
+    /// (0: interleaved, 8: a retired request's AR token), driven the way the
+    /// drafter drives the floor: calibrated at `ar_us`, the table depth during
+    /// the probes (`forced`: every window at that depth, floor bypassed), AR
+    /// probe tokens priced at `ar_us`, and every batched window drafting its
+    /// routed depth up to the margin prune's cut, accepting drafts while a
+    /// draw stays below the acceptance and costing `window_us[drafted]`;
+    /// `stream(window)` is `(acceptance, drafts the prune keeps)`.
+    fn chooser_run(
+        window_us: [f32; 8],
+        ar_us: f32,
+        decay: f32,
+        k: usize,
+        windows: usize,
+        forced: Option<usize>,
+        seed: u32,
+        stream: impl Fn(usize) -> (f32, usize),
+    ) -> ChooserRun {
+        let mut agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+            .with_decay(decay)
+            .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
+        let mut draws = Draws(seed.max(1));
+        let mut run = ChooserRun { depths: Vec::with_capacity(windows), tokens: 0.0, us: 0.0 };
+        while run.depths.len() < windows {
+            if forced.is_none() && floor.needs_ar_sample() {
+                floor.observe_calibration(ar_us, &agreement);
+                run.tokens += 1.0;
+                run.us += ar_us;
+                continue;
+            }
+            let (p, kept) = stream(run.depths.len());
+            let route = match forced {
+                Some(depth) => FloorRoute::Batched(depth),
+                None => floor.route(&agreement, k, batched_depth(&agreement, k)),
+            };
+            let (depth, accepted, us, route) = match route {
+                FloorRoute::Ar => {
+                    run.depths.push(8);
+                    run.tokens += 1.0;
+                    run.us += ar_us;
+                    continue;
+                }
+                FloorRoute::ArSample => continue,
+                FloorRoute::Interleaved => {
+                    let accepted = (0..k).take_while(|_| draws.next() < p).count();
+                    let us = ar_us * (accepted + 1) as f32;
+                    (0, accepted, us, NativeWindow::Interleaved)
+                }
+                FloorRoute::Batched(depth) => {
+                    let drafted = depth.min(kept.max(1));
+                    let accepted = (0..drafted).take_while(|_| draws.next() < p).count();
+                    (drafted, accepted, window_us[drafted], NativeWindow::Batched)
+                }
+            };
+            let drafts = if depth == 0 { (accepted + 1).min(k) } else { depth };
+            let finished = window(accepted, drafts);
+            observe_agreement(&mut agreement, &finished, decay);
+            floor.observe_native(route, &finished, us, k, &agreement);
+            run.depths.push(depth);
+            run.tokens += (accepted + 1) as f32;
+            run.us += us;
+        }
+        run
+    }
+
+    /// One [`chooser_run`]: the depth of every native window (0:
+    /// interleaved, 8: a retired request's AR token) and the emitted tokens
+    /// and wall time of the whole request, AR tokens included.
+    struct ChooserRun {
+        depths: Vec<usize>,
+        tokens: f32,
+        us: f32,
+    }
+
+    impl ChooserRun {
+        fn tokens_per_ms(&self) -> f32 {
+            self.tokens / self.us * 1000.0
+        }
+    }
+
+    /// Halo gfx1151 Flash-Next mq4-xts window medians by drafted depth
+    /// (fnrw-halo forced K=5/7 and adaptive traces) and its AR step.
+    const HALO_WINDOW_US: [f32; 8] =
+        [0.0, 38_500.0, 44_500.0, 51_700.0, 59_800.0, 67_000.0, 85_000.0, 92_600.0];
+    const HALO_AR_US: f32 = 28_450.0;
+    /// R9700 gfx1201: 48.7 ms at one draft plus 12.4 ms per extra row
+    /// (fnrw-r9700 `DEPTH-RECORDS.md`), and its AR step.
+    const R9700_WINDOW_US: [f32; 8] =
+        [0.0, 48_700.0, 61_100.0, 73_500.0, 85_900.0, 98_300.0, 110_700.0, 123_100.0];
+    const R9700_AR_US: f32 = 28_600.0;
+
+    /// Sixteen seeded 60-window requests of one stream through
+    /// [`chooser_run`] with a budget of 7.
+    #[derive(Debug)]
+    struct ChooserScenario {
+        /// The chooser's mean tokens per ms.
+        rate: f32,
+        /// Mean tokens per ms of every fixed depth 1..=7 (index 0 unused).
+        forced: [f32; 8],
+        /// The chooser's windows from the 20th on, by depth (8: retired).
+        late: [usize; 9],
+    }
+
+    impl ChooserScenario {
+        fn best_depth(&self) -> usize {
+            (1..8).max_by(|&a, &b| self.forced[a].total_cmp(&self.forced[b])).expect("depths")
+        }
+
+        /// Share of the late native windows (retired AR tokens excluded)
+        /// whose depth `keep` admits.
+        fn late_share(&self, keep: impl Fn(usize) -> bool) -> f32 {
+            let kept: usize = (0..8).filter(|&d| keep(d)).map(|d| self.late[d]).sum();
+            kept as f32 / self.late[..8].iter().sum::<usize>().max(1) as f32
+        }
+    }
+
+    fn chooser_scenario(
+        window_us: [f32; 8],
+        ar_us: f32,
+        decay: f32,
+        stream: impl Fn(usize) -> (f32, usize) + Copy,
+    ) -> ChooserScenario {
+        let seeds = 1..=16u32;
+        let mean = |forced: Option<usize>| {
+            seeds
+                .clone()
+                .map(|seed| {
+                    chooser_run(window_us, ar_us, decay, 7, 60, forced, seed * 7919, stream)
+                        .tokens_per_ms()
+                })
+                .sum::<f32>()
+                / seeds.clone().count() as f32
+        };
+        let mut scenario = ChooserScenario { rate: mean(None), forced: [0.0; 8], late: [0; 9] };
+        for depth in 1..8 {
+            scenario.forced[depth] = mean(Some(depth));
+        }
+        for seed in seeds {
+            let run = chooser_run(window_us, ar_us, decay, 7, 60, None, seed * 7919, stream);
+            for &depth in &run.depths[20..] {
+                scenario.late[depth] += 1;
+            }
+        }
+        scenario
+    }
+
+    /// The lock-in the chooser exists to escape: a code request whose first
+    /// windows reject and are pruned to two drafts (the measured-only
+    /// chooser then ran depth 2 for the whole request, as humaneval_0, lru
+    /// and records_parser did on Halo) climbs to the measured optimum, 5,
+    /// and never settles on the dearer 6 or 7.
+    #[test]
+    fn chooser_climbs_out_of_a_pruned_slow_start() {
+        let code = |w: usize| if w < 4 { (0.3, 2) } else { (0.93, 7) };
+        let s = chooser_scenario(HALO_WINDOW_US, HALO_AR_US, MTP_AGREEMENT_DECAY_GFX1151, code);
+        assert_eq!(s.best_depth(), 5, "{s:?}");
+        assert!(s.late_share(|d| d == 5) >= 0.7, "{s:?}");
+        assert!(s.late_share(|d| d >= 6) <= 0.05, "{s:?}");
+        assert!(s.rate >= 0.95 * s.forced[5], "{s:?}");
+        assert!(s.rate >= 1.1 * s.forced[2], "{s:?}");
+    }
+
+    /// Where deeper rows lose a budget of 7 stays shallow.  R9700 row prices
+    /// at its forced-K measured acceptance (0.8: fixed depth 5 -8%, 7 -18%
+    /// against 3, as measured there) run 4 or deeper only on near-ties and
+    /// stay within a few percent of the best fixed depth; at prose
+    /// acceptance (0.72) on either card the chooser stays at 2-3.
+    #[test]
+    fn chooser_stays_shallow_where_deeper_rows_lose() {
+        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.8, 7));
+        assert!(matches!(r9700.best_depth(), 2 | 3), "{r9700:?}");
+        assert!(r9700.forced[5] < 0.94 * r9700.forced[3], "{r9700:?}");
+        assert!(r9700.late_share(|d| (5..8).contains(&d)) <= 0.1, "{r9700:?}");
+        // The calibration token and three table-depth probe windows are in
+        // the chooser's rate, not in the fixed depths'.
+        assert!(r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()], "{r9700:?}");
+        let prose = |w: usize| if w < 4 { (0.3, 2) } else { (0.72, 7) };
+        for s in [
+            chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.72, 7)),
+            chooser_scenario(HALO_WINDOW_US, HALO_AR_US, MTP_AGREEMENT_DECAY_GFX1151, prose),
+        ] {
+            assert!(matches!(s.best_depth(), 2 | 3), "{s:?}");
+            assert!(s.late_share(|d| (1..=3).contains(&d)) >= 0.85, "{s:?}");
+            assert!(s.late_share(|d| (5..8).contains(&d)) <= 0.03, "{s:?}");
+            assert!(s.rate >= 0.93 * s.forced[s.best_depth()], "{s:?}");
+        }
+    }
+
+    /// The same rule finds depth where a dearer row still pays: R9700 row
+    /// prices at code acceptance.
+    #[test]
+    fn chooser_goes_deep_on_r9700_costs_when_acceptance_pays() {
+        let s = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.93, 7));
+        assert!(s.best_depth() >= 4, "{s:?}");
+        assert!(s.late_share(|d| d >= 4 && d < 8) >= 0.6, "{s:?}");
+        assert!(s.rate >= 0.95 * s.forced[s.best_depth()], "{s:?}");
     }
 
     /// A window of `emitted` committed tokens that drafted `drafts`.
@@ -7603,6 +8057,34 @@ mod tests {
         assert!(!stats.mtp_retired);
         assert_eq!(stats.ar_windows, 0);
         assert_eq!(drafter.floor.probes, 0);
+    }
+
+    /// The first batched window a drafter runs at a drafted depth (the
+    /// process's first verify at that row count, one-time kernel work
+    /// included) spends a probe but is not priced; later windows at that
+    /// depth are, in this request and every later one.  Interleaved windows
+    /// are always priced.
+    #[test]
+    fn floor_prices_no_first_window_at_a_drafted_depth() {
+        let good = agreement(1.8, 2.0);
+        let mut drafter = floor_drafter(true);
+        drafter.floor.observe_calibration(30_000.0, &good);
+        drafter.floor_observe_native(false, NativeWindow::Batched, &window(3, 3), 90_000.0, 7);
+        assert_eq!(drafter.floor.batched[3], (0.0, 0.0));
+        assert_eq!(drafter.floor.fit, [0.0; 5]);
+        assert_eq!(drafter.floor.probes, 1);
+        drafter.floor_observe_native(false, NativeWindow::Batched, &window(3, 3), 75_000.0, 7);
+        assert_eq!(drafter.floor.batched[3], (75_000.0, 1.0));
+        drafter.floor_observe_native(false, NativeWindow::Interleaved, &window(1, 2), 40_000.0, 7);
+        assert_eq!(drafter.floor.interleaved, (40_000.0, 2.0));
+        // A forced route (bypass) still runs the depth's first window.
+        drafter.floor_observe_native(true, NativeWindow::Batched, &window(5, 5), 1.0e9, 7);
+        MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+        drafter.floor.observe_calibration(30_000.0, &good);
+        for depth in [3, 5] {
+            drafter.floor_observe_native(false, NativeWindow::Batched, &window(depth, depth), 75_000.0, 7);
+            assert_eq!(drafter.floor.batched[depth], (75_000.0, 1.0), "depth {depth}");
+        }
     }
 
     #[test]

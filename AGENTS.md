@@ -768,16 +768,31 @@ Caveats that are part of the fixture, not trivia:
   Sampled MTP output matches AR in distribution, not byte for byte; requests
   with non-neutral penalties still run AR.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
-  draft depth `K` that maximizes expected emitted tokens per window cost
+  draft depth `K` (up to the `mtp_k` cap; `auto` = 7 for native Qwen4 MTP on
+  gfx1151, else 3) that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
   A same-request AR floor guards the default route: the request's first
   window is one ordinary target-only token, timed (a sampled draw included)
   as the AR price and followed by one head append; up to three speculative
-  probe windows then run under the table-ordered route, and from then on only
-  options measured on this request are chosen (batched depth by its decayed
-  window time over the agreement-predicted tokens, interleaved by its time per
-  emitted token). When none costs strictly less per emitted token than AR (a
+  probe windows then run under the table-ordered route. The AR verdict (retire
+  or keep drafting) then reads only options measured on this request (batched
+  depth by its decayed window time over the agreement-predicted tokens,
+  interleaved by its time per emitted token); once a measured option beats AR
+  the window runs the cheapest candidate: every measured option plus every
+  unmeasured batched depth next to a measured one (d±1), priced by the
+  request's own window-cost fit (a decayed least-squares line of each priced
+  batched window's wall time on its drafted depth; its slope is the measured
+  cost of one more verify row + draft step, ridge-pulled toward
+  `MTP_ROW_COST_PRIOR`, 0.27 AR steps per row, until windows at two depths are
+  priced). A request climbs one depth at a time, up to 7 (the 8-row verify),
+  while the next row's measured price stays below its predicted yield, and
+  stays shallow where it does not. On the singleton drafter the first batched
+  window at each drafted depth (across requests) is observed unpriced and
+  spends a probe: the process's first verify at a row count carries one-time
+  kernel work. Chooser candidates and the fitted per-row cost appear in
+  `HIPFIRE_MTP_FLOOR_TRACE` lines (`modeled`, `row_us`). When none costs
+  strictly less per emitted token than AR (a
   tie, or an invalid AR timing, counts as no win) the request retires to
   head-free AR for good, unless n-gram windows keep it alive: a request stays
   alive on a losing native route only while external (n-gram) windows are
@@ -831,8 +846,10 @@ Caveats that are part of the fixture, not trivia:
   reseeded from the full prompt every request, so earlier requests never
   influence candidates) takes the window only when the head's own first draft
   (row-0 argmax, before any sampled draw) equals the first candidate and the
-  takeover's decayed emitted tokens per window over its verify cost
-  (`MTP_WINDOW_COST`) is at least the native chooser's best expected rate;
+  takeover's decayed emitted tokens per window over its verify cost (the
+  measured mean, else the request's window-cost fit, not the static per-arch
+  row table) is at least the native chooser's expected rate (the
+  floor's cheapest candidate once the floor is measured);
   otherwise the window is native (the batched route reuses that row-0 step).
   A takeover verifies `[seed, candidates..]` on the same batched verify
   executor as native MTP windows (interleaved one-row route under
@@ -842,9 +859,13 @@ Caveats that are part of the fixture, not trivia:
   sampled takeovers verify each candidate with the point-mass draft
   distribution δ(candidate) through the shared rejection verify, so output
   matches MTP-only in distribution, not byte for byte. The native chooser's
-  per-depth agreement relaxes toward its 0.8 prior for depths a window did not
-  compare (`MTP_AGREEMENT_RELAX`), so a depth rejected once is re-explored
-  instead of staying frozen below its threshold. Triple
+  per-depth agreement relaxes, for depths a window did not compare, toward the
+  next-shallower depth's agreement (depth 0 toward the 0.8 prior): at
+  `MTP_AGREEMENT_RELAX_UP` (0.8) per window while that agreement is above the
+  depth's own, `MTP_AGREEMENT_RELAX` (0.95) when below, so a depth rejected
+  once is re-explored instead of staying frozen below its threshold, and an
+  unreached depth is priced at the request's own deepest observed acceptance
+  (conditional acceptance is flat in depth past the first draft). Triple
   `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
   targets and 24/48/64 elsewhere (per-component overrides; Qwen4 `n_max`
   capped at 63, the 64-row verify). The load log prints `qwen4 native MTP

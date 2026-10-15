@@ -4628,12 +4628,18 @@ fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
 /// except [`mtp_k_default_for_arch`]'s admitted one.
 pub const MTP_K_DEFAULT: usize = 3;
 /// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next) on
-/// gfx1151 drafts 4; every other model/GPU keeps [`MTP_K_DEFAULT`]. An explicit
-/// `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load param (including `3`)
-/// overrides this; callers apply it only when no explicit value is present.
+/// gfx1151 drafts up to 7 (8 verify rows, the lane route's row limit): the
+/// adaptive depth chooser picks each window's depth from this request's
+/// measured window costs and agreement, and a 6.4 ms verify row there pays
+/// at code-class acceptance (forced K=5 +11% on code). Every other
+/// model/GPU keeps [`MTP_K_DEFAULT`] (gfx1201: a row costs ~0.5 AR steps,
+/// deeper forced K lost 10-16%, and its committed route plan was walked at
+/// K=3). An explicit `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load
+/// param (including `3`) overrides this; callers apply it only when no
+/// explicit value is present.
 pub fn mtp_k_default_for_arch(model_arch: u32, gpu_arch: &str) -> usize {
     if model_arch == 16 && gpu_arch == "gfx1151" {
-        4
+        7
     } else {
         MTP_K_DEFAULT
     }
@@ -6319,7 +6325,7 @@ mod tests {
 
     #[test]
     fn mtp_k_default_per_arch_and_auto_rule() {
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 4);
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 7);
         assert_eq!(mtp_k_default_for_arch(16, "gfx1201"), MTP_K_DEFAULT);
         assert_eq!(mtp_k_default_for_arch(16, "gfx1100"), MTP_K_DEFAULT);
         assert_eq!(mtp_k_default_for_arch(5, "gfx1151"), MTP_K_DEFAULT);

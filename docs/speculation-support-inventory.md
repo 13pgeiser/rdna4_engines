@@ -59,7 +59,7 @@ All values are from [`CONFIG.md`](CONFIG.md) / `crates/hipfire-config/src/lib.rs
 | `speculation` selector | `auto` | `off` / `auto` / `ngram` / `dflash` / `mtp` / `dspark`; forced names bypass heuristics, missing prerequisites fall back to AR with a warning |
 | `speculation.dflash` | `off` | One registry-scoped exception: Qwen3.8-27B tiers whose registry entry declares a paired `dflash` draft resolve `auto` (kill switch `dflash_mode off`). Daemon: `dflash_mode == "off"` skips draft load even if a draft path is supplied. |
 | `speculation.mtp` | `auto` | Uses a present head; `on` fails the load without one |
-| `speculation.mtp_k` | `auto` | 4 for native Qwen4 MTP on gfx1151, else 3 (`MTP_K_DEFAULT`); explicit 1–10 overrides |
+| `speculation.mtp_k` | `auto` | 7 for native Qwen4 MTP on gfx1151, else 3 (`MTP_K_DEFAULT`); explicit 1–10 overrides (`4` restores the previous gfx1151 cap) |
 | `speculation.mtp_sampled` | `true` | Documented for native Qwen4 MTP sampled serving |
 | `speculation.mtp_ngram` | `auto` | On for native Qwen4 MTP on gfx1151 / gfx1201; other producers off unless `on` |
 | `speculation.ngram` | `off` | Opt-in; `ngram_k` 12, `ngram_min_count` 2 |
@@ -154,7 +154,7 @@ through MTP. Penalties are applied to every verify row.
   (`hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator`) when
   `qwen4_native_mtp` admits it (default on; off for retained-Redline `.mq4r`; `--spec mtp`
   forced on is refused on `.mq4r` and on a profile with no MTP head). K via `mtp_k`
-  (`auto` = 4 on gfx1151). Sampled requests use speculative rejection sampling when
+  (`auto` = 7 on gfx1151). Sampled requests use speculative rejection sampling when
   `speculation.mtp_sampled` is on. MTP+ngram-mod takeover windows are a separate switch
   (`speculation.mtp_ngram`).
 - **deepseek4:** `Deepseek4MtpDrafter` reports `requires_greedy() == true`.
