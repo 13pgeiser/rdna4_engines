@@ -24,6 +24,11 @@
 #   --skip-build        reuse existing binaries (cargo target dir: $CARGO_TARGET_DIR or ./target)
 #   --skip-speed        exactness only (no `hipfire bench` cells)
 #   --skip-model-sha    do not hash the model file (the receipt then has no model sha256)
+#   --ref-ranks R       reference arm EP degree, 1 <= R < N (default 1 = one card). Use it when one card
+#                       would need more pinned host RAM than you have (a 24 GB card pins ~50 GiB of
+#                       experts; EP4 on 24 GB cards keeps every expert layer in VRAM). The reference then
+#                       runs EP-R on the first R cards (HIPFIRE_DEVICES = first R entries of the card
+#                       list) as arm `ref-epR`, and the EP-N arm is compared against it byte for byte.
 #   --no-isolate        keep your own HOME / HIPFIRE_HOME (default: a private one per arm under OUT_DIR
 #                       holding only `topology.ep`, so your config cannot change the arms)
 #   --target-dir DIR    cargo target dir
@@ -37,8 +42,10 @@
 # (hipfire-loader, feature `lab`), hipfire, daemon; (c) arms `single` (HIPFIRE_DEVICES = first card,
 # HIPFIRE_TOPOLOGY_EP=1) and `epN` (first N cards, HIPFIRE_TOPOLOGY_EP=N) through fn_ep_oracle with
 # the two prompts in scripts/fn-ep-gate-prompts (~500 and ~4,400 tokens), 128 greedy tokens, state
-# digests at steps 1,64,128; (d) scripts/fn_ep_compare.py (tokens, rank-0 logits sha, every peer
-# logits mirror sha, every rank's state digests: all must equal the single card byte for byte);
+# digests at steps 1,64,128 (with --ref-ranks R > 1 the first arm is `ref-epR`: the first R cards,
+# HIPFIRE_TOPOLOGY_EP=R, and every `single` below reads `ref-epR`); (d) scripts/fn_ep_compare.py
+# (tokens, rank-0 logits sha, every peer logits mirror sha, every rank's state digests: all must
+# equal the single card byte for byte; an EP-R reference is also checked against itself);
 # (e) speed cells, `hipfire bench --spec off` decode (500-token prompt, 128 tokens) and prefill
 # (4,400-token prompt, 1 token), REPS fresh processes per arm, A/B interleaved, raw JSON kept;
 # (f) OUT_DIR/receipt.json and OUT_DIR/summary.txt.
@@ -58,6 +65,7 @@ LONG_PROMPT=$PROMPT_DIR/long-4400.txt
 LONG_PROMPT_TOKENS=4400
 
 MODEL="" N="" OUT="" ARCH=""
+REF_RANKS=1
 TOKENS=128 MAX_SEQ=8192 STATE_STEPS="1,64,128" REPS=3
 SKIP_BUILD=0 SKIP_SPEED=0 SKIP_SHA=0 NO_ISOLATE=0
 ARM_TIMEOUT=${FN_EP_GATE_ARM_TIMEOUT:-7200}
@@ -85,6 +93,7 @@ while (($#)); do
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-speed) SKIP_SPEED=1; shift ;;
     --skip-model-sha) SKIP_SHA=1; shift ;;
+    --ref-ranks) [[ $# -ge 2 ]] || die "$1 needs a value"; REF_RANKS=$2; shift 2 ;;
     --no-isolate) NO_ISOLATE=1; shift ;;
     --) shift; POS+=("$@"); break ;;
     -*) die "unknown option $1 (try --help)" ;;
@@ -106,6 +115,9 @@ elif [[ -n $DEVLIST ]]; then
   DEVS_SOURCE=flag
 fi
 [[ $TOKENS =~ ^[0-9]+$ && $MAX_SEQ =~ ^[0-9]+$ && $REPS =~ ^[0-9]+$ ]] || die "--tokens/--max-seq/--reps must be integers"
+[[ $REF_RANKS =~ ^[0-9]+$ ]] || die "--ref-ranks must be an integer"
+[[ $REF_RANKS =~ ^0*([1-7])$ ]] || die "--ref-ranks must be in 1..7 and less than N"
+REF_RANKS=${BASH_REMATCH[1]}
 ((REPS >= 1)) || die "--reps must be >= 1"
 [[ -f $SHORT_PROMPT && -f $LONG_PROMPT && -f $COMPARE ]] || die "scripts/fn-ep-gate-prompts or fn_ep_compare.py missing next to this script"
 command -v python3 >/dev/null || die "python3 is required"
@@ -124,6 +136,7 @@ HIPFIRE=$TARGET_DIR/release/hipfire
 DAEMON=$TARGET_DIR/release/daemon
 
 DEVS="" BDFS=() SINGLE_DEVS="" CARD_IDX=""
+REF_ARM=single REF_DEVS=""
 SAMPLER=""
 VERDICT="" REASON=""
 BUILD_RC="" ORACLE_RC_SINGLE="" ORACLE_RC_EP="" COMPARE_STATE="not run"
@@ -139,13 +152,15 @@ write_receipt() {
     GATE_REASON=$REASON GATE_STARTED=$STARTED GATE_REPS=$REPS GATE_TOKENS=$TOKENS GATE_MAX_SEQ=$MAX_SEQ \
     GATE_STATE_STEPS=$STATE_STEPS GATE_BUILD_RC=$BUILD_RC GATE_COMPARE_STATE=$COMPARE_STATE \
     GATE_SKIP_SPEED=$SKIP_SPEED GATE_NO_ISOLATE=$NO_ISOLATE GATE_EXTRA_ENV=$EXTRA_ENV \
-    GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS
+    GATE_LONG_TOKENS=$LONG_PROMPT_TOKENS GATE_REF_RANKS=$REF_RANKS GATE_REF_ARM=$REF_ARM
   python3 - <<'PY' || echo "fn-ep-gate: WARNING: receipt writer failed" >&2
 import json, os, re, statistics, datetime
 
 E = os.environ
 out = E["GATE_OUT"]
 n = int(E["GATE_N"]) if E.get("GATE_N", "").isdigit() else None
+ref_ranks = int(E["GATE_REF_RANKS"]) if E.get("GATE_REF_RANKS", "").isdigit() else 1
+ref_arm = E.get("GATE_REF_ARM") or "single"
 
 
 def rd(path):
@@ -276,7 +291,7 @@ if chosen:
     ]
 
 arms = {}
-for arm in ("single", "ep%d" % n if n else "ep"):
+for arm in (ref_arm, "ep%d" % n if n else "ep"):
     rec = "%s/oracle/%s-receipt" % (out, arm)
     if not os.path.isdir(rec):
         continue
@@ -339,14 +354,14 @@ receipt = {
     "verdict": E.get("GATE_VERDICT") or "ERROR",
     "reason": E.get("GATE_REASON") or None,
     "config": {
-        "n": n, "arch": E.get("GATE_ARCH"), "hipfire_devices_ep": E.get("GATE_DEVS"),
+        "n": n, "ref_ranks": ref_ranks, "ref_arm": ref_arm, "arch": E.get("GATE_ARCH"), "hipfire_devices_ep": E.get("GATE_DEVS"),
         "devices_source": E.get("GATE_DEVS_SOURCE"),
         "model": E.get("GATE_MODEL"), "tokens": int(E.get("GATE_TOKENS", "0") or 0),
         "max_seq": int(E.get("GATE_MAX_SEQ", "0") or 0), "state_steps": E.get("GATE_STATE_STEPS"),
         "speed_reps": int(E.get("GATE_REPS", "0") or 0), "isolated_home": E.get("GATE_NO_ISOLATE") != "1",
         "extra_env": E.get("GATE_EXTRA_ENV") or None,
         "long_prompt_truncated_to": int(E.get("GATE_LONG_TOKENS", "0") or 0),
-        "oracle_arms_env": "HIPFIRE_GRAPH=0 (EP is eager; single pinned to the same schedule)",
+        "oracle_arms_env": "HIPFIRE_GRAPH=0 (EP is eager; %s pinned to the same schedule)" % ("single" if ref_ranks == 1 else "the reference"),
         "speed_arms_env": "default graph setting; EP arms run eager",
     },
     "env": env,
@@ -364,11 +379,17 @@ with open(out + "/receipt.json", "w", encoding="utf-8") as handle:
 # ------------------------------------------------------------- summary.txt
 lines = []
 lines.append("fn-ep-gate: %s%s" % (receipt["verdict"], " (%s)" % receipt["reason"] if receipt["reason"] else ""))
-lines.append("arch=%s  N=%s  hipfire devices (single=first, EP=all): %s" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+if ref_ranks == 1:
+    lines.append("arch=%s  N=%s  hipfire devices (single=first, EP=all): %s" % (E.get("GATE_ARCH"), n, E.get("GATE_DEVS")))
+else:
+    lines.append("arch=%s  N=%s  hipfire devices (reference=first %d, EP=all): %s" % (E.get("GATE_ARCH"), n, ref_ranks, E.get("GATE_DEVS")))
+    lines.append("reference: EP%d on the first %d cards (one card = --ref-ranks 1)" % (ref_ranks, ref_ranks))
+lines.append("ref_ranks=%d" % ref_ranks)
+lines.append("Note: EP-N ≡ one card is established separately by our gates.")
 lines.append("model: %s" % E.get("GATE_MODEL"))
 git = (env["git"] or "").strip().splitlines()
 lines.append("build: %s" % (git[0] if git else "unknown"))
-_prompts = (arms.get("single") or {}).get("prompts") or []
+_prompts = (arms.get(ref_arm) or {}).get("prompts") or []
 if _prompts:
     lines.append("prompts (tokens used / full): " + ", ".join(
         "%s/%s" % (p.get("token_count"), p.get("full_token_count")) for p in _prompts))
@@ -391,8 +412,8 @@ if compare.get("first_mismatch"):
 lines.append("")
 if speed:
     lines.append("speed (median of fresh processes, tok/s)       decode   prefill(4,400-token prompt)")
-    base_d = (speed.get("single", {}).get("decode") or {}).get("median")
-    base_p = (speed.get("single", {}).get("prefill") or {}).get("median")
+    base_d = (speed.get(ref_arm, {}).get("decode") or {}).get("median")
+    base_p = (speed.get(ref_arm, {}).get("prefill") or {}).get("median")
     for arm, cells in speed.items():
         d = (cells.get("decode") or {}).get("median")
         p = (cells.get("prefill") or {}).get("median")
@@ -400,7 +421,7 @@ if speed:
         rel = lambda v, b: "" if v is None or not b else " (%.2fx)" % (v / b)
         lines.append("  %-7s n_ok=%s/%s  %s%s   %s%s%s" % (
             arm, (cells.get("decode") or {}).get("n_ok"), (cells.get("prefill") or {}).get("n_ok"),
-            fmt(d), rel(d, base_d) if arm != "single" else "", fmt(p), rel(p, base_p) if arm != "single" else "",
+            fmt(d), rel(d, base_d) if arm != ref_arm else "", fmt(p), rel(p, base_p) if arm != ref_arm else "",
             "   [%s]" % cells["skipped"] if cells.get("skipped") else ""))
 lines.append("")
 lines.append("Send back: receipt.json, summary.txt, compare.txt, gate.log (and the oracle/*-receipt dirs on a failure).")
@@ -664,6 +685,19 @@ PY
   [[ -n $DEVLIST ]] && DEVS=$DEVLIST || DEVS=$CARD_IDX
   SINGLE_DEVS=${DEVS%%,*}
   log "arch=$ARCH N=$N devices(HIPFIRE_DEVICES)=$DEVS (source: $DEVS_SOURCE) single=$SINGLE_DEVS cards(PCI-order index)=$CARD_IDX bdfs=$bdfs"
+  if ((REF_RANKS < 1 || REF_RANKS >= N)); then
+    REASON="--ref-ranks $REF_RANKS is outside 1..$((N - 1)) for N=$N"; VERDICT=ERROR; FINAL_RC=2
+    die "$REASON"
+  fi
+  if ((REF_RANKS == 1)); then
+    REF_ARM=single REF_DEVS=$SINGLE_DEVS
+  else
+    local _devs
+    IFS=, read -r -a _devs <<<"$DEVS"
+    REF_ARM=ref-ep$REF_RANKS
+    REF_DEVS=$(IFS=,; echo "${_devs[*]:0:REF_RANKS}")
+    log "reference arm $REF_ARM: ep=$REF_RANKS devices=$REF_DEVS"
+  fi
 }
 
 hash_model() {
@@ -803,25 +837,26 @@ hash_model
 build_all
 
 EPARM=ep$N
-run_oracle_arm single 1 "$SINGLE_DEVS" 1
+run_oracle_arm "$REF_ARM" "$REF_RANKS" "$REF_DEVS" "$REF_RANKS"
 run_oracle_arm "$EPARM" "$N" "$DEVS" "$N"
 
 # (d) compare
-if oracle_arm_ok single && oracle_arm_ok "$EPARM"; then
+if oracle_arm_ok "$REF_ARM" && oracle_arm_ok "$EPARM"; then
   crc=0
-  python3 "$COMPARE" "$OUT/oracle/single" "$OUT/oracle/$EPARM" --expect-ranks "$N" --json "$OUT/compare.json" \
-    > "$OUT/compare.txt" 2>&1 || crc=$?
+  python3 "$COMPARE" "$OUT/oracle/$REF_ARM" "$OUT/oracle/$EPARM" --expect-ranks "$N" --ref-ranks "$REF_RANKS" \
+    --json "$OUT/compare.json" > "$OUT/compare.txt" 2>&1 || crc=$?
   sed 's/^/    /' "$OUT/compare.txt"
   if ((crc == 0)); then
     VERDICT=PASS; COMPARE_STATE="PASS"
   elif ((crc == 1)); then
-    VERDICT=FAIL; COMPARE_STATE="FAIL"; REASON="EP$N output differs from the single card"
+    VERDICT=FAIL; COMPARE_STATE="FAIL"
+    if ((REF_RANKS == 1)); then REASON="EP$N output differs from the single card"; else REASON="EP$N output differs from the EP$REF_RANKS reference"; fi
   else
     VERDICT=ERROR; COMPARE_STATE="comparator error rc=$crc"; REASON="fn_ep_compare.py failed to run"
   fi
 else
   VERDICT=ERROR
-  oracle_arm_ok single || COMPARE_STATE="single arm failed"
+  oracle_arm_ok "$REF_ARM" || COMPARE_STATE="$REF_ARM arm failed"
   oracle_arm_ok "$EPARM" || COMPARE_STATE="$EPARM arm failed (see oracle/$EPARM-receipt/stderr.txt)"
   REASON="$COMPARE_STATE; no comparison"
 fi
@@ -837,9 +872,9 @@ else
     echo "skipped: the $EPARM oracle arm failed to load/run" > "$OUT/speed/$EPARM/SKIPPED.txt"
   fi
   for ((rep = 1; rep <= REPS; rep++)); do
-    run_bench_cell single 1 "$SINGLE_DEVS" decode "$rep" "$SHORT_PROMPT" 128
+    run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" decode "$rep" "$SHORT_PROMPT" 128
     ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" decode "$rep" "$SHORT_PROMPT" 128
-    run_bench_cell single 1 "$SINGLE_DEVS" prefill "$rep" "$LONG_PROMPT" 1
+    run_bench_cell "$REF_ARM" "$REF_RANKS" "$REF_DEVS" prefill "$rep" "$LONG_PROMPT" 1
     ((EP_SPEED == 0)) || run_bench_cell "$EPARM" "$N" "$DEVS" prefill "$rep" "$LONG_PROMPT" 1
   done
 fi

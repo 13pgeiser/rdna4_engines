@@ -2,25 +2,31 @@
 """Flash-Next expert-parallel exactness comparator (stdlib only).
 
 Compares two `fn_ep_oracle` output directories (crates/hipfire-loader/examples/
-fn_ep_oracle.rs): the REFERENCE arm (one card, topology.ep = 1) and an EP arm
+fn_ep_oracle.rs): the REFERENCE arm (one card, topology.ep = 1, or EP-R with
+--ref-ranks R) and an EP arm
 (topology.ep = N). Each directory holds meta.json, logits.jsonl, state.jsonl
 (and optionally raw logits-p<prompt>-s<step>.f32 dumps).
 
-    fn_ep_compare.py REF_DIR EP_DIR [--expect-ranks N] [--json OUT.json] [--max-report K]
+    fn_ep_compare.py REF_DIR EP_DIR [--expect-ranks N] [--ref-ranks R] [--json OUT.json] [--max-report K]
     fn_ep_compare.py --self-test
 
 The EP arm must equal the reference byte for byte (hashes of bytes):
 
   * identity: both runs completed; same max_seq / tokens / vocab / model
     sha256 (when both recorded it) / prompt files, token counts, token-id md5;
-    the reference has 1 rank and the EP arm has --expect-ranks (default: the
-    EP arm's own meta.json `ranks`, which must be >= 2);
+    the reference has --ref-ranks ranks (default 1) and the EP arm has --expect-ranks
+    (default: the EP arm's own meta.json `ranks`, which must be >= 2 and, when
+    --ref-ranks > 1, greater than --ref-ranks);
   * logits: for every (prompt, step) the same record set, the same greedy
     token and the same rank-0 logits sha256;
   * mirrors: for every EP record every peer rank's logits mirror sha256 equals
     rank 0's (one entry per rank);
   * state: for every (prompt, step) the EP arm has a digest for EVERY rank and
-    every digest row (names and values) equals the reference rank 0's.
+    every digest row (names and values) equals the reference rank 0's;
+  * with --ref-ranks R > 1 the reference (itself EP, R ranks) is also checked
+    against itself (families mirrors / state_ranks / state, messages prefixed
+    "reference"): R mirror hashes equal to its own logits sha, and state
+    digests for ranks 0..R-1 all equal to its rank 0.
 
 Prints one line per failing check family (first mismatch in detail) and a
 final one-line summary beginning `PASS` or `FAIL`; `--json` writes the full
@@ -128,7 +134,7 @@ class Verdict:
 
 
 # --------------------------------------------------------------- identity
-def check_identity(v, ref_meta, ep_meta, expect_ranks):
+def check_identity(v, ref_meta, ep_meta, expect_ranks, ref_ranks=1):
     for label, meta in (("reference", ref_meta), ("EP", ep_meta)):
         v.checked("identity")
         if meta is None:
@@ -154,12 +160,14 @@ def check_identity(v, ref_meta, ep_meta, expect_ranks):
         v.fail("identity", "prompt identity (token_count, file_md5, ids_md5) differs: %r vs %r"
                % (prompts(ref_meta), prompts(ep_meta)))
     v.checked("identity")
-    if ref_meta.get("ranks") != 1:
-        v.fail("identity", "reference arm ran %r ranks, expected 1" % (ref_meta.get("ranks"),))
+    if ref_meta.get("ranks") != ref_ranks:
+        v.fail("identity", "reference arm ran %r ranks, expected %d" % (ref_meta.get("ranks"), ref_ranks))
     ranks = ep_meta.get("ranks")
     v.checked("identity")
     if not isinstance(ranks, int) or ranks < 2:
         v.fail("identity", "EP arm ran %r ranks, expected >= 2" % (ranks,))
+    elif ref_ranks > 1 and ranks <= ref_ranks:
+        v.fail("identity", "EP arm ran %d ranks, expected more than the %d-rank reference" % (ranks, ref_ranks))
     elif expect_ranks is not None and ranks != expect_ranks:
         v.fail("identity", "EP arm ran %d ranks, expected %d" % (ranks, expect_ranks))
 
@@ -251,15 +259,48 @@ def check_state(v, ref, ep, ranks):
                        prompt=prompt, step=step, rank=rank)
 
 
+def check_reference(v, ref_logits, ref_state, ref_ranks):
+    """An EP-R reference must itself be internally exact: R mirrors and R state digests equal to rank 0."""
+    for (prompt, step), rec in sorted(ref_logits.items()):
+        v.checked("mirrors")
+        mirrors = rec.get("rank_logits_sha256")
+        if not mirrors or len(mirrors) != ref_ranks:
+            v.fail("mirrors", "reference prompt=%d step=%d: record has %s logits mirror hashes, expected %d"
+                   % (prompt, step, len(mirrors) if mirrors else 0, ref_ranks), prompt=prompt, step=step)
+        else:
+            bad = [r for r, sha in enumerate(mirrors) if sha != rec["logits_sha256"]]
+            if bad:
+                v.fail("mirrors", "reference prompt=%d step=%d: rank(s) %s logits mirror != rank 0" % (prompt, step, bad),
+                       prompt=prompt, step=step, ranks=bad)
+    for prompt, step in sorted(set((p, s) for (p, s, _) in ref_state)):
+        have = sorted(r for (p, s, r) in ref_state if p == prompt and s == step)
+        v.checked("state_ranks")
+        if have != list(range(ref_ranks)):
+            v.fail("state_ranks", "reference prompt=%d step=%d: state records for ranks %s, expected 0..%d"
+                   % (prompt, step, have, ref_ranks - 1), prompt=prompt, step=step)
+        if 0 not in have:
+            continue
+        base = ref_state[(prompt, step, 0)]
+        for rank in have:
+            if rank == 0:
+                continue
+            v.checked("state")
+            notes = diff_digest(base, ref_state[(prompt, step, rank)])
+            if notes:
+                v.fail("state", "reference prompt=%d step=%d rank %d: %d digest row(s) differ from reference rank 0: %s"
+                       % (prompt, step, rank, len(notes), "; ".join(notes[:4])),
+                       prompt=prompt, step=step, rank=rank)
+
+
 # ------------------------------------------------------------------- main
-def compare(ref_dir, ep_dir, expect_ranks, max_report):
+def compare(ref_dir, ep_dir, expect_ranks, max_report, ref_ranks=1):
     v = Verdict(max_report)
     try:
         ref_meta, ep_meta = read_meta(ref_dir), read_meta(ep_dir)
     except ValueError as error:
         v.fail("identity", "meta.json unreadable: %s" % error)
         return v, {}
-    check_identity(v, ref_meta, ep_meta, expect_ranks)
+    check_identity(v, ref_meta, ep_meta, expect_ranks, ref_ranks)
     ranks = expect_ranks or (ep_meta or {}).get("ranks")
     try:
         ref_logits, ep_logits = load_logits(ref_dir), load_logits(ep_dir)
@@ -269,10 +310,13 @@ def compare(ref_dir, ep_dir, expect_ranks, max_report):
         return v, {}
     check_logits(v, ref_dir, ep_dir, ref_logits, ep_logits, ranks if isinstance(ranks, int) else None)
     check_state(v, ref_state, ep_state, ranks if isinstance(ranks, int) else None)
+    if ref_ranks > 1:
+        check_reference(v, ref_logits, ref_state, ref_ranks)
     prompts = sorted(set(p for (p, _) in ref_logits))
     steps = sorted(set(s for (_, s) in ref_logits))
     shape = {
         "ranks": ranks,
+        "ref_ranks": ref_ranks,
         "prompts": len(prompts),
         "logits_records": len(ref_logits),
         "max_step": steps[-1] if steps else None,
@@ -284,9 +328,11 @@ def compare(ref_dir, ep_dir, expect_ranks, max_report):
 def summary_line(v, shape, ref_dir, ep_dir):
     counts = {k: v.families[k]["checked"] for k in v.families}
     if v.ok:
-        return ("PASS fn_ep_compare: EP%s == single, %s prompt(s) x steps 0..%s (%s logits records token+sha, "
+        ref_ranks = shape.get("ref_ranks") or 1
+        ref_name = "single" if ref_ranks == 1 else "EP%d reference" % ref_ranks
+        return ("PASS fn_ep_compare: EP%s == %s, %s prompt(s) x steps 0..%s (%s logits records token+sha, "
                 "%s mirror hashes, %s state digests) byte-identical"
-                % (shape.get("ranks"), shape.get("prompts"), shape.get("max_step"), counts.get("logits", 0),
+                % (shape.get("ranks"), ref_name, shape.get("prompts"), shape.get("max_step"), counts.get("logits", 0),
                    counts.get("mirrors", 0), counts.get("state", 0)))
     failed = ", ".join("%s=%d" % (k, f["failed"]) for k, f in sorted(v.families.items()) if f["failed"])
     return "FAIL fn_ep_compare: %d failing check(s) [%s]; first: %s" % (
@@ -295,17 +341,21 @@ def summary_line(v, shape, ref_dir, ep_dir):
 
 def run(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], add_help=True)
-    parser.add_argument("ref_dir", help="reference arm directory (single card, ep = 1)")
+    parser.add_argument("ref_dir", help="reference arm directory (single card, ep = 1; or ep = --ref-ranks)")
     parser.add_argument("ep_dir", help="EP arm directory (ep = N)")
     parser.add_argument("--expect-ranks", type=int, default=None, help="required EP rank count")
+    parser.add_argument("--ref-ranks", type=int, default=1, help="reference arm rank count (1 = single card)")
     parser.add_argument("--json", default=None, help="write the verdict JSON here")
     parser.add_argument("--max-report", type=int, default=50, help="mismatches kept in the JSON")
     args = parser.parse_args(argv)
+    if args.ref_ranks < 1:
+        print("--ref-ranks must be >= 1", file=sys.stderr)
+        return 2
     for d in (args.ref_dir, args.ep_dir):
         if not os.path.isdir(d):
             print("not a directory: %s" % d, file=sys.stderr)
             return 2
-    v, shape = compare(args.ref_dir, args.ep_dir, args.expect_ranks, args.max_report)
+    v, shape = compare(args.ref_dir, args.ep_dir, args.expect_ranks, args.max_report, args.ref_ranks)
     for name, fam in sorted(v.families.items()):
         print("%s %-10s checked=%d failed=%d" % ("PASS" if not fam["failed"] else "FAIL", name, fam["checked"], fam["failed"]))
     if v.first is not None:
@@ -414,6 +464,31 @@ def self_test():
         empty = os.path.join(tmp, "empty")
         os.makedirs(empty)
         expect("empty arm", _quiet(single, empty)[0], 1)
+
+        # EP-R reference (--ref-ranks R > 1)
+        ref2 = _arm(tmp, "ref_ep2", good, [7, 8], ranks=2)
+        ep4 = _arm(tmp, "ep4", good, [7, 8], ranks=4)
+        code, out = _quiet(ref2, ep4, "--ref-ranks", "2", "--expect-ranks", "4")
+        expect("ref-ranks 2 vs EP4", code, 0)
+        if "EP4 == EP2 reference" not in out.strip().splitlines()[-1]:
+            failures.append("EP-R summary wording wrong: %s" % out)
+        expect("ref-ranks default vs EP-R reference", _quiet(ref2, ep4)[0], 1)
+        code, out = _quiet(ref2, ep4, "--ref-ranks", "3")
+        expect("reference rank-count mismatch", code, 1)
+        if "reference arm ran 2 ranks, expected 3" not in out:
+            failures.append("reference rank-count mismatch not reported: %s" % out)
+        code, out = _quiet(ref2, _arm(tmp, "ep2", good, [7, 8], ranks=2), "--ref-ranks", "2")
+        expect("EP not larger than reference", code, 1)
+        if "more than the 2-rank reference" not in out:
+            failures.append("EP-not-larger not reported: %s" % out)
+        code, out = _quiet(_arm(tmp, "ref_mirror", good, [7, 8], ranks=2, mirrors=["a", "Y", "c"]), ep4, "--ref-ranks", "2")
+        expect("reference mirror differs", code, 1)
+        if "reference prompt=0 step=1" not in out or "mirrors" not in out:
+            failures.append("reference mirror disagreement not reported: %s" % out)
+        code, out = _quiet(_arm(tmp, "ref_state", good, [7, 8], ranks=2, flip_state_rank=1), ep4, "--ref-ranks", "2")
+        expect("reference rank-1 state differs", code, 1)
+        if "reference prompt=0 step=1 rank 1" not in out or "gdn[0].recurrent" not in out:
+            failures.append("reference rank-1 state diff not reported: %s" % out)
 
     for line in failures:
         print("SELF-TEST FAIL:", line)

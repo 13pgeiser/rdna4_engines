@@ -566,6 +566,20 @@ every rank's state digests must equal the single card's. It then times
 default, arms interleaved). Each arm runs in a private HOME holding only
 `topology.ep` unless `--no-isolate` is given.
 
+`--ref-ranks R` (an integer, `1 <= R < N`, default 1) makes the reference arm
+EP too. It is for hosts with less RAM than the one-card reference needs: a
+single 24 GB card pins about 50 GiB of host RAM for the experts it cannot hold,
+while EP4 on four 24 GB cards keeps all 49 expert layers in VRAM and needs
+almost no host RAM. With `--ref-ranks R` the reference arm (`ref-epR`) runs
+`topology.ep = R` on the first R entries of the card list, and the EP-N arm is
+compared against it byte for byte exactly as above (rank-0 logits and token,
+every peer mirror, every rank's state digests against reference rank 0);
+`fn_ep_compare.py` also requires the reference to be internally exact (its R
+logits mirrors and R state digests all equal its own rank 0) and N to be larger
+than R. EP-R equal to one card was itself proven byte-exact for R up to 4 on
+gfx1201, so an EP-R reference chains back to the single card. The receipt
+config records `ref_ranks` and `ref_arm`. With R = 1 nothing else changes.
+
 The receipt (`OUT_DIR/receipt.json`, schema `fn-ep-gate-receipt-v1`, with a
 readable `summary.txt`, `compare.txt` and `gate.log`) holds the verdict and
 reason, the configuration, the environment (git/build hash, ROCm, `rocm-smi`
