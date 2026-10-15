@@ -651,15 +651,10 @@ pub struct FeatureFlags {
     /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
     pub fn_lane_pm_rows: bool,
     /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): parsed
-    /// on only for the exact value `1`, default off on every arch. KLD-gated,
-    /// not bit-exact against the per-head kernel.
+    /// on unless the value is exactly `0` (kill switch). KLD-gated, not
+    /// bit-exact against the per-head kernel; acted on only for exact gfx1151
+    /// (see `qwen4_qsa_decode_splitk_enabled`).
     pub qwen4_qsa_decode_splitk: bool,
-}
-
-/// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`: on only for the exact string `1`; unset,
-/// `0`, `true`, ` 1` and every other value are off.
-fn qsa_decode_splitk_env_on(raw: Option<&str>) -> bool {
-    raw == Some("1")
 }
 
 impl FeatureFlags {
@@ -1124,9 +1119,7 @@ impl FeatureFlags {
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
-            qwen4_qsa_decode_splitk: qsa_decode_splitk_env_on(
-                value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref(),
-            ),
+            qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref() != Some("0"),
         }
     }
 
@@ -1196,8 +1189,8 @@ impl FeatureFlags {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
     }
 
-    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1`, default
-    /// off). Exact gfx1151 only; the runtime additionally requires F32 K/V,
+    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
+    /// on; `=0` is the kill switch). Exact gfx1151 only; the runtime additionally requires F32 K/V,
     /// head_dim 256, 1..8 route rows and an eager (unrecorded, uncaptured) launch.
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
@@ -1653,20 +1646,10 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
     }
 
-    /// Pure parser: only the exact string `1` enables the QSA split-K knob.
+    /// The QSA split-K decode knob is default on and only the exact value `0`
+    /// turns it off; the arch gate admits gfx1151 alone.
     #[test]
-    fn qsa_decode_splitk_env_on_matches_only_exact_one() {
-        assert!(qsa_decode_splitk_env_on(Some("1")));
-        assert!(!qsa_decode_splitk_env_on(None));
-        for raw in ["0", "", "true", "TRUE", "on", "ON", "yes", "2", "11", " 1", "1 ", "01"] {
-            assert!(!qsa_decode_splitk_env_on(Some(raw)), "{raw:?}");
-        }
-    }
-
-    /// The QSA split-K decode knob is default off everywhere and parses on only
-    /// for the exact value `1`; the arch gate admits gfx1151 alone.
-    #[test]
-    fn qwen4_qsa_decode_splitk_parses_on_only_for_exactly_one() {
+    fn qwen4_qsa_decode_splitk_defaults_on_and_zero_opts_out() {
         for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
             let flags = |raw: Option<&str>| {
                 FeatureFlags::from_lookup(arch, |name| match raw {
@@ -1674,18 +1657,21 @@ mod tests {
                     _ => Err(()),
                 })
             };
-            assert!(!flags(None).qwen4_qsa_decode_splitk, "{arch}: unset");
-            for raw in ["0", "", "true", "TRUE", "on", "ON", "yes", "2", " 1", "1 "] {
-                assert!(!flags(Some(raw)).qwen4_qsa_decode_splitk, "{arch}: {raw:?}");
-                assert!(!flags(Some(raw)).qwen4_qsa_decode_splitk_enabled(), "{arch}: {raw:?}");
+            let gfx1151 = arch == "gfx1151";
+            assert!(flags(None).qwen4_qsa_decode_splitk, "{arch}: unset");
+            assert_eq!(flags(None).qwen4_qsa_decode_splitk_enabled(), gfx1151, "{arch}: unset enabled");
+            assert!(!flags(Some("0")).qwen4_qsa_decode_splitk, "{arch}: 0");
+            assert!(!flags(Some("0")).qwen4_qsa_decode_splitk_enabled(), "{arch}: 0 enabled");
+            for raw in ["1", "", "true", "TRUE", "on", "yes", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).qwen4_qsa_decode_splitk, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_decode_splitk_enabled(),
+                    gfx1151,
+                    "{arch}: {raw:?} enabled"
+                );
             }
-            assert!(flags(Some("1")).qwen4_qsa_decode_splitk, "{arch}: 1");
-            assert_eq!(
-                flags(Some("1")).qwen4_qsa_decode_splitk_enabled(),
-                arch == "gfx1151",
-                "{arch}: 1 enabled"
-            );
         }
+        // for_test zeroes every default-on flag (dn_snapshot_flip, fn_gdn_dense_scan, ...).
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
     }
 

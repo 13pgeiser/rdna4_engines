@@ -37,10 +37,13 @@
 //! `#[ignore]`d: needs a working HIP device. Run explicitly, one test thread
 //! (the tests share the one GPU):
 //!
-//!   cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk \
+//!   HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0 cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk \
 //!       -- --ignored --nocapture --test-threads=1
 //!
-//! No environment variable is set by this file.
+//! No environment variable is set by this file. `qsa_splitk_timing_table`
+//! requires `HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0` in the caller's environment
+//! (split-K is on by default on gfx1151), so its production-dispatch row is the
+//! per-head incumbent route.
 
 #![cfg(feature = "lab")]
 
@@ -723,9 +726,10 @@ fn time_us(gpu: &mut Gpu, mut call: impl FnMut(&mut Gpu)) -> f64 {
 #[test]
 #[ignore = "needs a HIP device"]
 fn qsa_splitk_timing_table() {
-    assert!(
-        std::env::var_os("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").is_none(),
-        "HIPFIRE_QWEN4_QSA_DECODE_SPLITK must be unset: the production-dispatch row is the incumbent route"
+    assert_eq!(
+        std::env::var("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").as_deref(),
+        Ok("0"),
+        "HIPFIRE_QWEN4_QSA_DECODE_SPLITK must be 0: split-K is the default on gfx1151, and the production-dispatch row is the incumbent route only with it off"
     );
     let mut gpu = Gpu::init().expect("gpu init");
     println!(

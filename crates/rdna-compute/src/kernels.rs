@@ -7034,9 +7034,9 @@ pub const QWEN4_DECODE_HEAD_FUSE_SRC: &str =
 /// `qsa_pooled_f32_low_nonzero_count`.
 pub const QSA_POOLED_BF16_MIRROR_SRC: &str =
     include_str!("../../../kernels/src/qsa_pooled_bf16_mirror.hip");
-/// Module `qsa_decode_splitk` (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1`, exact
-/// gfx1151, F32 K/V, head_dim 256, 1..8 rows, eager only): split-K QSA decode
-/// attention, `qsa_decode_splitk_partial_f32` plus
+/// Module `qsa_decode_splitk` (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`: default on
+/// (exact gfx1151; `=0` kill switch); F32 K/V, head_dim 256, 1..8 rows, eager
+/// only): split-K QSA decode attention, `qsa_decode_splitk_partial_f32` plus
 /// `qsa_decode_splitk_combine_f32`. KLD-gated, not bit-exact.
 pub const QSA_DECODE_SPLITK_SRC: &str =
     include_str!("../../../kernels/src/qsa_decode_splitk.hip");

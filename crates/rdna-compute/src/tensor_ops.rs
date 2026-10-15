@@ -5856,8 +5856,9 @@ fn indexed_attention_attention_batch_arena(
             ),
         ));
     }
-    // Opt-in split-K decode (HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1): eager
-    // gfx1151 F32 hd256 launches of 1..8 rows only; KLD-gated, not bit-exact.
+    // Split-K decode, default on (exact gfx1151; HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0
+    // kill switch): eager gfx1151 F32 hd256 launches of 1..8 rows only;
+    // KLD-gated, not bit-exact.
     if qsa_decode_splitk_applies(gpu, p, allow_fast, max_selected) {
         return qsa_decode_splitk_launch(
             gpu,
@@ -6006,7 +6007,7 @@ fn indexed_attention_attention_batch_arena(
 }
 
 /// Split count of the production QSA split-K decode route
-/// (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1`): 32. Chosen from an R9700 (gfx1201)
+/// (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default on): 32. Chosen from an R9700 (gfx1201)
 /// sweep as the lowest summed time over the 1131- and 8188-token cases (79.04 us),
 /// pending Strix Halo KLD and performance. A compromise: S16 is fastest at
 /// 1131 tokens (22.46 us vs 24.71 us at S32), S32 fastest at 8188 (54.33 us vs
