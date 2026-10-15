@@ -1505,16 +1505,18 @@ fn lower_prefill<'a>(
         ));
     }
     if params.ep_tile_exchange.is_some()
-        && (selection.route != Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+        && (!selection.route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
             || !selection.uses_grouped_rows()
             || params.routed_out.is_some()
             || params.ep_row_gather.is_some())
     {
-        // The exchange moves the BF16 grouped rows of the symmetric IU4 down for
-        // the canonical combine into the residual; every other prefill lowering
-        // has a different row layout, a different down kernel or EP contract.
+        // The exchange moves the BF16 grouped rows of the symmetric IU4 down or of the F16 WMMA
+        // grouped down (the gfx1100 route) for the canonical combine into the residual; the
+        // stages re-check the exact arm against the device (`qt44_qt53_prefill::tile_mask`).
+        // Every other prefill lowering has a different row layout, a different down kernel or
+        // EP contract.
         return Err(DispatchError::Hip(
-            "sealed moe: a prefill EP tile exchange requires the grouped symmetric IU4 route combining into the residual".into(),
+            "sealed moe: a prefill EP tile exchange requires the grouped QT44/QT53 route (symmetric IU4 or F16 WMMA) combining into the residual".into(),
         ));
     }
     if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {

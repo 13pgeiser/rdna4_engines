@@ -1469,8 +1469,9 @@ impl Qwen4Bundle {
             return Err(release_rank0(gpu, error));
         }
 
-        // 5b. Owner-routed chunk MoE (EP2/EP4): every rank's per-layer symmetric verdicts (taken
-        // on the full tables in `attach_ep`) must be identical and all-true on ALL ranks; only
+        // 5b. Owner-routed chunk MoE (EP2..EP8): every rank's per-layer verdicts (symmetric IU4
+        // headers on gfx1201, QT44/QT53 formats on gfx1100's F16 WMMA route; taken on the full
+        // tables in `attach_ep`) must be identical and all-true on ALL ranks; only
         // then does every rank propagate them to its compact layers and install the exchange.
         // Any mismatch refuses the lever for this load: never a per-rank route divergence.
         if let Some(tile) = tile.as_ref() {
@@ -1519,7 +1520,7 @@ impl Qwen4Bundle {
                     return Err(release_rank0(gpu, error));
                 }
                 eprintln!(
-                    "qwen4 EP: owner-routed prefill on ({} MoE layers symmetric on every rank, \
+                    "qwen4 EP: owner-routed prefill on ({} MoE layers admitted on every rank, \
                      owners e % {ranks})",
                     layer_count
                 );
@@ -1533,7 +1534,7 @@ impl Qwen4Bundle {
                     })
                     .collect();
                 eprintln!(
-                    "qwen4 EP: owner-routed prefill refused (per-rank symmetric layers {counts:?} \
+                    "qwen4 EP: owner-routed prefill refused (per-rank admitted layers {counts:?} \
                      are not identical and complete); chunks keep the full-table route"
                 );
             }

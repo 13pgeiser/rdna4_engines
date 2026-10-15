@@ -527,13 +527,13 @@ is tagged.
   logs one reason and runs GPU-only. Every other architecture resolves auto
   silently to off. `off` is the kill switch; timings are fixture-bound and live
   in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
-- **EP2 owner-routed prefill and expert staging (gfx1201, two cards).** With
-  `topology.ep = 2`, `HIPFIRE_EP_OWNER_ROUTED_PREFILL` and
-  `HIPFIRE_EP_EXPERT_STAGE` default on when every admission condition holds;
-  the exact value `0` disables each. EP4 owner-routed prefill is refused at
-  admission (`EP4 owner-routed prefill not yet gated`) and keeps the full-table
-  chunk route; single-card runs are unchanged. Setup and gates:
-  [multi-gpu.md](multi-gpu.md); variable semantics: [env-vars.md](env-vars.md).
+- **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
+  `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
+  holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16
+  WMMA grouped route); `HIPFIRE_EP_EXPERT_STAGE` defaults on only on gfx1201.
+  The exact value `0` disables each. Single-card runs are unchanged. Setup and
+  gates: [multi-gpu.md](multi-gpu.md); variable semantics:
+  [env-vars.md](env-vars.md).
 
 ## If something fails
 

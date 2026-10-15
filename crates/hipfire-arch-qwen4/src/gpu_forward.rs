@@ -1463,15 +1463,18 @@ pub(crate) fn qwen4_ep_balanced_owners_arch_admitted(arch: &str) -> bool {
     rdna_compute::moe::qwen4_ep_owner_assign_pm_arch(arch)
 }
 
-/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2; `=0` is the kill switch): owner-routed
-/// chunk MoE (rank-generic code; EP4 is still refused at admission). A prefill chunk of at least
-/// 512 rows whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the
+/// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP, N = 2..=8; `=0` is the kill switch):
+/// owner-routed chunk MoE. A prefill chunk of at least 512 rows runs the grouped GEMMs on the
 /// compact (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
 /// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`) instead
-/// of computing every expert on every rank. Every other chunk keeps the full-table route. Only
-/// the exact value `0` is off (unset or any other value is on, like `HIPFIRE_EP_BALANCED_OWNERS`);
-/// every other admission condition still applies, and off allocates nothing, lowers no stage and
-/// loads no kernel.
+/// of computing every expert on every rank. Two routes carry it, both over the stable grouping
+/// every rank shares: exact gfx1201 on the symmetric IU4 GEMMs (a chunk whose layers verified
+/// symmetric on every rank), and exact gfx1100 on the F16 WMMA grouped GEMMs (gate/up with the
+/// SwiGLU epilogue and the down, both BF16-out; no symmetric headers needed, the verdict is
+/// that every layer's experts are QT44/QT53). Every other chunk keeps the full-table route.
+/// Only the exact value `0` is off (unset or any other value is on, like
+/// `HIPFIRE_EP_BALANCED_OWNERS`); every other admission condition still applies, and off
+/// allocates nothing, lowers no stage and loads no kernel.
 pub const QWEN4_EP_OWNER_ROUTED_PREFILL_ENV: &str = "HIPFIRE_EP_OWNER_ROUTED_PREFILL";
 
 /// The shared EP lever rule: default on, exact `0` off.
@@ -1483,10 +1486,10 @@ fn qwen4_ep_owner_routed_prefill_enabled() -> bool {
     ep_lever_on(hipfire_config::developer_var(QWEN4_EP_OWNER_ROUTED_PREFILL_ENV).ok().as_deref())
 }
 
-/// Rank counts the owner-routed chunk MoE admits: EP2 and EP4, matching the mesh
-/// (`attach_ep_mesh`) and the four-source launcher ABI.
+/// Rank counts the owner-routed chunk MoE admits: EP2 through EP8, matching the mesh
+/// (`attach_ep_mesh`) and the eight-source pull launcher ABI.
 const fn tile_ranks_supported(ranks: usize) -> bool {
-    matches!(ranks, 2 | 4)
+    matches!(ranks, 2..=8)
 }
 
 /// The `experts` little-endian i32 owners (`expert % ranks`) the launcher reads.
@@ -1527,7 +1530,8 @@ fn redirect_owned_entries(
 
 /// One rank's owner-routed chunk MoE state. The buffers exist from forward construction
 /// (before the mesh enables peers, so a peer-mapped allocation never lags the mapping);
-/// the hook is installed once every rank agreed on the per-layer symmetric verdicts.
+/// the hook is installed once every rank agreed on the per-layer verdicts (symmetric IU4
+/// headers on gfx1201, QT44/QT53 formats for the F16 WMMA route on gfx1100).
 pub(crate) struct Qwen4TileRoute {
     /// Owner rank of every expert (`i32` per expert, `e % ranks`): the mask and the pull
     /// read it as an input.
@@ -1536,9 +1540,14 @@ pub(crate) struct Qwen4TileRoute {
     tile_ids_owned: GpuTensor,
     /// Padded tile capacity the exchange is registered for.
     max_tiles: usize,
-    /// Per layer: the compact layer's symmetric verdict, taken on the full tables in
-    /// `attach_ep`. Empty until then.
+    /// Per layer: the compact layer's verdict, taken on the full tables in `attach_ep`
+    /// (gfx1201: the symmetric IU4 header verdict; gfx1100: the expert formats the F16 WMMA
+    /// grouped GEMMs take). Empty until then.
     verdicts: Vec<bool>,
+    /// The route is the F16 WMMA grouped route (exact gfx1100) rather than the symmetric IU4
+    /// one (exact gfx1201): the compact layers keep their plain grouped declaration and the
+    /// chunk gate asks the WMMA predicate.
+    wmma: bool,
     /// The installed transport (`None` until the mesh agreed).
     hook: Option<Arc<dyn MoeTileExchange + Send + Sync>>,
 }
@@ -1563,20 +1572,28 @@ impl Qwen4TileRoute {
             Ok(None)
         };
         if !tile_ranks_supported(placement.ranks) {
-            return refuse("needs 2 or 4 ranks");
+            return refuse("needs 2..=8 ranks");
         }
-        if placement.ranks == 4 {
-            // The transport and the 4-source pull are rank-generic and CPU-tested, but the EP4
-            // exactness cells have not run on hardware: EP4 keeps the full-table route.
-            return refuse("EP4 owner-routed prefill not yet gated");
-        }
-        if gpu.arch != "gfx1201" {
-            return refuse("needs gfx1201");
+        if !rdna_compute::moe::ep_tile_pm_arch(&gpu.arch) {
+            return refuse("needs gfx1100 or gfx1201");
         }
         if !flash_next {
             return refuse("needs the Flash-Next profile");
         }
-        if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
+        // gfx1201 runs the symmetric IU4 route; gfx1100 the F16 WMMA grouped route (BF16-out
+        // gate/up with SwiGLU and BF16-out down), which needs no symmetric headers.
+        let wmma = gpu.arch == "gfx1100";
+        if wmma {
+            if !gpu.flags.moe_grouped_gemm
+                || !gpu.qwen4_moe_f16_wmma_grouped_applies(
+                    rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+                    config.moe_intermediate_size,
+                    config.hidden_size,
+                )
+            {
+                return refuse("the F16 WMMA grouped MoE route is not available");
+            }
+        } else if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
             return refuse("the symmetric IU4 route is not requested");
         }
         if mode != Qwen4ForwardScratchMode::Full {
@@ -1584,15 +1601,24 @@ impl Qwen4TileRoute {
             // would be reading.
             return refuse("the compact scratch plan aliases y_down_grouped");
         }
-        // Sym scratch before the mesh enables peers (the grouped-row buffer and the masked
-        // ids are allocated now; ROCm does not map later allocations).
-        gpu.reserve_qwen4_moe_sym(
-            max_chunk,
-            config.num_experts_per_tok,
-            config.num_experts,
-            config.hidden_size,
-            config.moe_intermediate_size,
-        )?;
+        // Grouping scratch (gfx1100) or the full sym scratch (gfx1201) before the mesh enables
+        // peers (the grouped-row buffer and the masked ids are allocated now; ROCm does not
+        // map later allocations).
+        if wmma {
+            gpu.reserve_qwen4_moe_group_scratch(
+                max_chunk,
+                config.num_experts_per_tok,
+                config.num_experts,
+            )?;
+        } else {
+            gpu.reserve_qwen4_moe_sym(
+                max_chunk,
+                config.num_experts_per_tok,
+                config.num_experts,
+                config.hidden_size,
+                config.moe_intermediate_size,
+            )?;
+        }
         let word = std::mem::size_of::<i32>();
         let tile_bytes = 16 * config.hidden_size * DType::BF16.size();
         let tile_capacity = scratch.moe_expert_tile_ids.buf.size() / word;
@@ -1615,6 +1641,7 @@ impl Qwen4TileRoute {
             tile_ids_owned,
             max_tiles,
             verdicts: Vec::new(),
+            wmma,
             hook: None,
         }))
     }
@@ -2682,9 +2709,7 @@ impl Qwen4MoeLayerRuntime {
             self.symmetric = false;
             return Ok(false);
         }
-        let formats = self.experts.iter().all(|expert| {
-            expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
-        });
+        let formats = self.qt44_qt53_formats();
         self.symmetric = formats
             && gpu.qwen4_moe_sym_check(
                 &self.expert_gate_up_ptrs,
@@ -2713,6 +2738,20 @@ impl Qwen4MoeLayerRuntime {
         Ok(self)
     }
 
+    /// Every routed expert is the QT44 gate/up + QT53 down pair (`MQ4G256V2`/`MQ4G128V2`) the
+    /// grouped GEMMs take.
+    fn qt44_qt53_formats(&self) -> bool {
+        self.experts.iter().all(|expert| {
+            expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
+        })
+    }
+
+    /// The layer may take the owner-routed F16 WMMA grouped route (exact gfx1100): QT44/QT53
+    /// experts, no stock-FP8 blocks. The WMMA arms read no symmetric header, so this replaces
+    /// [`Self::verify_symmetric`] as the per-layer verdict there.
+    fn f16_wmma_tile_eligible(&self) -> bool {
+        !self.fp8 && self.qt44_qt53_formats()
+    }
     /// Device bytes [`Self::from_moe`] allocates: the gate/up and down
     /// pointer tables, one device pointer per expert each.
     pub(crate) fn device_bytes(config: &Qwen4Config) -> Option<usize> {
@@ -2805,7 +2844,7 @@ mod slab_stage;
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
 
-    /// Per-forward admission: full EP (EP2/EP4) chunk tables read other ranks' donor VRAM
+    /// Per-forward admission: full EP (EP2..EP8) chunk tables read other ranks' donor VRAM
     /// and must never stage. S1 supplies true only when every trunk MoE layer
     /// binds the compact owner-routed route. Single-card admission is unchanged.
     ///
@@ -2834,6 +2873,15 @@ impl Qwen4ExpertStage {
         bundle: &Qwen4Bundle,
         moe: &[Qwen4MoeLayerRuntime],
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        if let Some(placement) = bundle.weights.ep_placement() {
+            if gpu.arch != "gfx1201" {
+                eprintln!(
+                    "qwen4 EP rank {}/{}: expert staging not admitted (needs gfx1201)",
+                    placement.rank, placement.ranks
+                );
+                return Ok(None);
+            }
+        }
         if !hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_ENV, gpu.arch == "gfx1201") {
             return Ok(None);
         }
@@ -5517,8 +5565,14 @@ impl Qwen4GpuForward {
         if let Some(route) = ep.tile.as_mut() {
             // The compact table carries no verdict of its own under EP (the verification
             // above ran on the full tables; same experts, same bytes): the mesh compares
-            // all ranks' vectors before anything is propagated to the compact layers.
-            route.verdicts = full.iter().map(|layer| layer.symmetric).collect();
+            // all ranks' vectors before anything is propagated to the compact layers. The
+            // F16 WMMA route (gfx1100) reads no symmetric header: its verdict is the
+            // layer's expert formats.
+            let wmma = route.wmma;
+            route.verdicts = full
+                .iter()
+                .map(|layer| if wmma { layer.f16_wmma_tile_eligible() } else { layer.symmetric })
+                .collect();
         }
         ep.moe_full = full;
         ep.balanced = balanced;
@@ -5552,10 +5606,12 @@ impl Qwen4GpuForward {
         })
     }
 
-    /// Install the agreed transport: every layer's compact runtime takes the symmetric
-    /// verdict (same experts, same bytes as the full tables it was taken on), so a chunk of
-    /// at least 512 rows binds the compact table with the tile exchange. Refused unless
-    /// every layer verified symmetric (the mesh checked every rank agrees).
+    /// Install the agreed transport. On gfx1201 every layer's compact runtime takes the
+    /// symmetric verdict (same experts, same bytes as the full tables it was taken on), so a
+    /// chunk of at least 512 rows binds the compact table with the tile exchange; on gfx1100
+    /// the compact layers keep their plain grouped declaration (the WMMA arms are chosen from
+    /// the device and the row count). Refused unless every layer's verdict is true (the mesh
+    /// checked every rank agrees).
     pub(crate) fn install_tile_exchange(
         &mut self,
         hook: Arc<dyn MoeTileExchange + Send + Sync>,
@@ -5564,14 +5620,18 @@ impl Qwen4GpuForward {
         let Some(route) = self.ep.as_mut().and_then(|ep| ep.tile.as_mut()) else {
             return Err(invalid("owner-routed prefill was not admitted on this rank"));
         };
-        if route.verdicts.len() != layers || !route.verdicts.iter().all(|&symmetric| symmetric) {
+        if route.verdicts.len() != layers || !route.verdicts.iter().all(|&admitted| admitted) {
             return Err(invalid(
-                "owner-routed prefill needs every layer verified symmetric on the full tables",
+                "owner-routed prefill needs every layer admitted on the full tables \
+                 (symmetric IU4 headers, or QT44/QT53 experts for the F16 WMMA route)",
             ));
         }
+        let wmma = route.wmma;
         route.hook = Some(hook);
-        for layer in &mut self.moe {
-            layer.symmetric = true;
+        if !wmma {
+            for layer in &mut self.moe {
+                layer.symmetric = true;
+            }
         }
         Ok(())
     }
@@ -6480,15 +6540,26 @@ impl Qwen4GpuForward {
                 })
             });
         // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, hook installed by
-        // the mesh): a chunk on the symmetric IU4 route (>= 512 routing rows that are the
-        // launch rows) binds each layer's compact table plus the tile exchange; every
-        // other chunk keeps the full-table route exactly as without the lever.
+        // the mesh): a chunk on the owner-routed route (symmetric IU4 on gfx1201, the F16
+        // WMMA grouped route on gfx1100; >= 512 routing rows that are the launch rows) binds
+        // each layer's compact table plus the tile exchange; every other chunk keeps the
+        // full-table route exactly as without the lever.
         let tile_route = ep
             .filter(|_| route_n > 1 && !ep_few_rows)
             .and_then(|ep| ep.tile.as_ref())
             .filter(|route| route.hook.is_some());
-        let tile_active =
-            tile_route.is_some() && route_n == n && gpu.qwen4_moe_sym_iu4_applies(route_n);
+        let tile_active = tile_route.is_some_and(|route| {
+            route_n == n
+                && if route.wmma {
+                    gpu.qwen4_moe_f16_wmma_grouped_applies(
+                        route_n,
+                        config.moe_intermediate_size,
+                        config.hidden_size,
+                    )
+                } else {
+                    gpu.qwen4_moe_sym_iu4_applies(route_n)
+                }
+        });
         if let Some(route) = tile_route.filter(|_| !tile_active) {
             // A full-table chunk also writes `y_down_grouped`: it may start only after the
             // peer finished pulling this rank's rows of the last exchange.
@@ -8901,12 +8972,18 @@ mod ep_rank_generic_tests {
     }
 
     #[test]
-    fn owner_routed_prefill_admits_exactly_ep2_and_ep4() {
-        for ranks in [2usize, 4] {
+    fn owner_routed_prefill_admits_exactly_ep2_through_ep8_on_gfx1100_and_gfx1201() {
+        for ranks in 2usize..=8 {
             assert!(tile_ranks_supported(ranks), "{ranks}");
         }
-        for ranks in [0usize, 1, 3, 5, 6, 8] {
+        for ranks in [0usize, 1, 9, 16] {
             assert!(!tile_ranks_supported(ranks), "{ranks}");
+        }
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(rdna_compute::moe::ep_tile_pm_arch(arch), "{arch}");
+        }
+        for arch in ["gfx1200", "gfx1151", "gfx1101", "gfx942", ""] {
+            assert!(!rdna_compute::moe::ep_tile_pm_arch(arch), "{arch:?}");
         }
     }
 

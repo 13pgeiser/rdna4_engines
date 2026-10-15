@@ -188,24 +188,24 @@ PFlash, an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
-Two EP levers are **default-on under EP2**, each with an exact-`0` kill switch
+Two EP levers are **default-on under EP**, each with an exact-`0` kill switch
 (`gpu_forward.rs`):
 
-- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE. A prefill chunk of
-  at least 512 rows whose MoE layers verified symmetric on every rank computes
-  only its owned expert tiles and pulls the other ranks' down rows over P2P,
-  instead of computing every expert on every rank. It also needs gfx1201, the
-  Flash-Next profile and the symmetric IU4 route requested.
+- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
+  A prefill chunk of at least 512 rows computes only its owned expert tiles and
+  pulls the other ranks' down rows over P2P, instead of computing every expert
+  on every rank. It needs the Flash-Next profile and one of two routes: exact
+  gfx1201 on the symmetric IU4 route (every MoE layer verified symmetric on
+  every rank), or exact gfx1100 on the F16 WMMA grouped route (BF16-out
+  gate/up with the SwiGLU epilogue, BF16-out down; the per-layer verdict is
+  the QT44/QT53 expert formats, and the grouping is the stable one so every
+  rank shares the grouped layout).
 - `HIPFIRE_EP_EXPERT_STAGE`: Flash-Next long-prefill expert staging. It exists
-  only when owner-routed prefill is admitted, so it is never created with
-  that lever off.
+  only when owner-routed prefill is admitted and only on gfx1201; a gfx1100
+  rank logs `expert staging not admitted (needs gfx1201)` and builds nothing.
 
-**EP4 is refused for both levers.** The transport is rank-generic and the mesh
-itself admits four ranks, but `Qwen4TileRoute::admit` refuses with
-`EP4 owner-routed prefill not yet gated`, so EP4 keeps the full-table chunk
-route (and never stages). Exact figures, memory arithmetic and the
-hardware-validation record live in [`multi-gpu.md`](multi-gpu.md) and
-[`env-vars.md`](env-vars.md), not here.
+Exact figures, memory arithmetic and the hardware-validation record live in
+[`multi-gpu.md`](multi-gpu.md) and [`env-vars.md`](env-vars.md), not here.
 
 ### Qwen4 long context, trunk overlay and PLE rows
 

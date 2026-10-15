@@ -2856,6 +2856,17 @@ impl Gpu {
             && *crate::gemm::QWEN4_F16_WMMA
     }
 
+    /// Whether a `rows`-row grouped Flash-Next MoE prefill takes the F16 WMMA arm end to
+    /// end with SwiGLU in the gate/up epilogue and BF16 grouped down rows (gfx11 BF16-out
+    /// entries): the gate/up and down predicates together, `mi % 128 == 0`. The EP
+    /// owner-routed prefill on gfx1100 runs exactly this route.
+    pub fn qwen4_moe_f16_wmma_grouped_applies(&self, rows: usize, mi: usize, hidden: usize) -> bool {
+        self.arch_caps.has_wmma_w32()
+            && mi % 128 == 0
+            && self.qwen4_moe_gateup_wmma_applies(2 * mi, hidden, rows)
+            && self.qwen4_moe_down_wmma_applies(hidden, mi, rows.saturating_mul(10))
+    }
+
     /// [`Gpu::gemm_mq4g128v2_moe_grouped_top10`] on the F16 WMMA route with X
     /// already rotated to F16 (`rotate_x_mq_128_v2_f16`): the route's bytes
     /// without its conversion pass; `bf16_out` stores Y as BF16 bits (RNE) for

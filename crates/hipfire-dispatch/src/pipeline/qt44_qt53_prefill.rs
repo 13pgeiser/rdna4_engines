@@ -1198,7 +1198,7 @@ pub(crate) fn scatter(
     }
     require_geometry(p)?;
     let total_slots = p.batch_size * p.k_top;
-    if sym_iu4(gpu, p, true) {
+    if sym_iu4(gpu, p, true) || (p.ep_tile_exchange.is_some() && wmma_tile_route(gpu, p, true)) {
         return hip(gpu.moe_scatter_stable_top10(
             p.topk_indices,
             p.expert_token_counts,
@@ -1251,6 +1251,23 @@ fn gemm_tile_ids<'p>(p: &'p MoePrefillParams<'_>) -> &'p GpuTensor {
         .map_or(p.expert_tile_ids, |tx| tx.tile_ids_owned)
 }
 
+/// Whether path 2 takes the F16 WMMA grouped route end to end with BF16 grouped rows: SwiGLU
+/// in the gate/up epilogue (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out` on gfx1100), the
+/// down's own unscatter + rotation, the grouped WMMA down with BF16 rows
+/// (`gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out`, 16-row tiles of `down_m * 2` bytes) and
+/// the BF16-input combine. Not the symmetric IU4 arm, which replaces all of it.
+fn wmma_tile_route(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    use_path2 && !sym_iu4(gpu, p, use_path2) && gateup_silu(gpu, p)
+}
+
+/// The routes that move peer-owned BF16 grouped down rows between ranks: the symmetric IU4
+/// arm or the F16 WMMA grouped route. Both write the BF16 grouped rows in the same
+/// `y_down_grouped` layout, from tile ids the masked copy replaces, over the stable grouping
+/// every rank shares.
+fn tile_exchange_route(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    sym_iu4(gpu, p, true) || wmma_tile_route(gpu, p, true)
+}
+
 fn tile_exchange_eager_only(gpu: &Gpu, what: &str) -> Result<(), DispatchError> {
     // The exchange waits on peer devices and a host barrier; neither can be
     // recorded into a graph or retained body. EP is eager-only.
@@ -1272,7 +1289,8 @@ fn grouped_tiles(grouped_rows: usize) -> usize {
 }
 
 /// Owner-routed EP chunk MoE, after the scatter: write the masked copy of the tile ids (the
-/// owner of every expert is the exchange's table input). Valid only on the symmetric IU4 arm.
+/// owner of every expert is the exchange's table input). Valid only on the symmetric IU4 arm
+/// or the F16 WMMA grouped route.
 pub(crate) fn tile_mask(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
@@ -1280,9 +1298,9 @@ pub(crate) fn tile_mask(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    if !sym_iu4(gpu, p, true) {
+    if !tile_exchange_route(gpu, p) {
         return Err(DispatchError::Hip(
-            "qt44 tile mask: the owner-routed chunk exchange needs the symmetric IU4 arm".into(),
+            "qt44 tile mask: the owner-routed chunk exchange needs the symmetric IU4 arm or the F16 WMMA grouped route".into(),
         ));
     }
     tile_exchange_eager_only(gpu, "mask")?;
@@ -1312,9 +1330,9 @@ pub(crate) fn tile_exchange(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
-    if !sym_iu4(gpu, p, true) {
+    if !tile_exchange_route(gpu, p) {
         return Err(DispatchError::Hip(
-            "qt44 tile exchange: the owner-routed chunk exchange needs the symmetric IU4 arm".into(),
+            "qt44 tile exchange: the owner-routed chunk exchange needs the symmetric IU4 arm or the F16 WMMA grouped route".into(),
         ));
     }
     tile_exchange_eager_only(gpu, "exchange")?;
@@ -1399,7 +1417,7 @@ pub(crate) fn gate_up(
         hip(gemm(
             gpu,
             gate_up_ptrs,
-            p.expert_tile_ids,
+            gemm_tile_ids(p),
             p.sorted_slot_index,
             x_f16.as_ref().unwrap_or(p.x_rot_batch),
             p.y_gate_up_grouped,
@@ -1676,6 +1694,9 @@ fn down_stage(
     if use_path2 && down_wmma(gpu, p) {
         // Rotation and GEMM in one stage: the rotated F16 rows live in the
         // shared FP16 scratch, which another stage's GEMM would overwrite.
+        // Under the owner-routed exchange the rotation also reads the stale rows of masked
+        // tiles: it writes them to their own flat slots (`sorted_slot_index` is unique per
+        // grouped row), which no owned tile's GEMM reads.
         let x_f16 = if gateup_silu(gpu, p) {
             hip(gpu.moe_unscatter_rotate128_f16(
                 p.y_gate_up_grouped,
@@ -1687,9 +1708,17 @@ fn down_stage(
         } else {
             hip(gpu.rotate_x_mq_128_v2_f16(p.rot_batch, p.mi, total_slots))?
         };
+        if let Some(tx) = p.ep_tile_exchange {
+            // The peer reads this rank's `y_down_grouped` between its producer and
+            // completion events of the previous layer's exchange: no write before its
+            // pull completed.
+            tx.exchange
+                .before_down(gpu)
+                .map_err(|error| DispatchError::Hip(format!("qt44 tile exchange: {error}")))?;
+        }
         hip(gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
             down_ptrs,
-            p.expert_tile_ids,
+            gemm_tile_ids(p),
             p.sorted_slot_index,
             &x_f16,
             p.y_down_grouped,

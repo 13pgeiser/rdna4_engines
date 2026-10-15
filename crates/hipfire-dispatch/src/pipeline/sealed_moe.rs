@@ -7841,18 +7841,43 @@ mod tests {
         assert_eq!(without, prefill_stages(None, symmetric, false).unwrap());
     }
 
+    /// The gfx1100 route: the layer declares the plain grouped QT44/QT53 route (its F16 WMMA
+    /// arms are chosen at stage time), and the exchange lowers the same two stages around the
+    /// same program as on the symmetric route.
     #[test]
-    fn prefill_lowering_refuses_a_tile_exchange_off_the_symmetric_route() {
-        for route in [None, Some(MoeRouteCapability::Qt44Qt53Grouped)] {
+    fn prefill_lowering_emits_tile_stages_exactly_when_installed_on_the_f16_wmma_route() {
+        let wmma = Some(MoeRouteCapability::Qt44Qt53Grouped);
+        let without = tile_prefill_stages(None, None, wmma, false).unwrap();
+        let with = tile_prefill_stages(Some(&NoopTileExchange), None, wmma, false).unwrap();
+        assert_tile_stages(&with, &without);
+        // The unmasked lowering is the historical one.
+        assert_eq!(without, prefill_stages(None, wmma, false).unwrap());
+        // Both declarations lower identically.
+        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
+        let with_symmetric =
+            tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, false).unwrap();
+        assert_eq!(with_symmetric, with);
+    }
+
+    #[test]
+    fn prefill_lowering_refuses_a_tile_exchange_off_the_grouped_qt44_qt53_route() {
+        for route in [None, Some(MoeRouteCapability::Fp8B128Grouped)] {
             let error = tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
             assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
         }
-        let symmetric = Some(MoeRouteCapability::Qt44Qt53GroupedSymmetric);
-        // A compact EP partial and the few-row row gather are other EP contracts.
-        let error = tile_prefill_stages(Some(&NoopTileExchange), None, symmetric, true).unwrap_err();
-        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
-        let error = tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), symmetric, false).unwrap_err();
-        assert!(format!("{error:?}").contains("tile exchange"), "{error:?}");
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+        ] {
+            // A compact EP partial and the few-row row gather are other EP contracts.
+            let error =
+                tile_prefill_stages(Some(&NoopTileExchange), None, Some(route), true).unwrap_err();
+            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+            let error =
+                tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), Some(route), false)
+                    .unwrap_err();
+            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+        }
     }
 }
 

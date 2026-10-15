@@ -47582,6 +47582,30 @@ impl Gpu {
         Ok(())
     }
 
+    /// Grow only the stable-grouping scratch ([`Gpu::moe_scatter_stable_top10`])
+    /// for prefills of up to `max_rows` tokens (`k_top` routed slots each) before
+    /// any graph capture. [`Gpu::reserve_qwen4_moe_sym`] covers the same scratch
+    /// on the symmetric-IU4 arches; this is the arch-neutral part, for the
+    /// owner-routed prefill on routes that take no symmetric sidecar.
+    pub fn reserve_qwen4_moe_group_scratch(
+        &mut self,
+        max_rows: usize,
+        k_top: usize,
+        experts: usize,
+    ) -> HipResult<()> {
+        let slots = max_rows.saturating_mul(k_top);
+        let group = crate::scratch::qwen4_moe_group_layout(slots, experts).bytes;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_group_scratch_bytes,
+            self.scratch.qwen4_moe_group_scratch.is_some(),
+            group,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.bind_thread()?;
+        self.scratch.reserve_qwen4_moe_group(&self.hip, slots, experts)
+    }
+
     /// Stable `(expert, flat_slot)` pad16 grouping: the six outputs of
     /// [`Gpu::moe_scatter_fused_top10`] (padded counts, offsets `[E+1]`,
     /// sorted slots with -1 padding and tail, tile ids with -1 tail,
@@ -47600,10 +47624,12 @@ impl Gpu {
         experts: usize,
         grouped_rows: usize,
     ) -> HipResult<()> {
-        // gfx942 reaches the stable scatter from the sealed FP8 grouped route
-        // (not the symmetric IU4 route), so only the other arches take the
-        // symmetric-IU4 arch refusal.
-        if self.arch != "gfx942" {
+        // gfx942 reaches the stable scatter from the sealed FP8 grouped route and
+        // the EP tile-exchange arches (gfx1100 F16 WMMA route, which needs the
+        // deterministic row order every rank's grouping must share) from the
+        // owner-routed prefill; only the other arches take the symmetric-IU4
+        // arch refusal.
+        if self.arch != "gfx942" && !crate::moe::ep_tile_pm_arch(&self.arch) {
             self.qwen4_moe_sym_arch("moe_scatter_stable_top10")?;
         }
         if total_slots == 0

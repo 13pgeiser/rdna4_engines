@@ -277,8 +277,8 @@ capture).
 |---|---|---|
 | Load / decode / verify / native MTP (`--spec mtp`) | Supported (opt-in, experimental) | Supported (opt-in, experimental) |
 | Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0` | On by default under EP (same switch); the decode numbers on this page are EP2 |
-| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` | **Refused at admission** with `EP4 owner-routed prefill not yet gated` until its hardware cells have run; EP4 keeps the full-table chunk route (replicated prefill, peer experts read over P2P) |
-| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (needs S1) |
+| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds (EP2..EP8, gfx1201 symmetric IU4 route or gfx1100 F16 WMMA grouped route); kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` | Same rule; the owner-routed route needs its arch's hardware cells to have run before it is a validated default |
+| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted on gfx1201; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`); never on gfx1100 (`expert staging not admitted (needs gfx1201)`) | Created only when S1 is admitted on gfx1201 and the load has host-mapped layers |
 | Routed layers resident per rank at 32K context | 30 of 49 (19 host-mapped), +0.34 GiB headroom | 49 of 49, +3.77 GiB headroom |
 
 For the three levers, exactly `0` is off and unset or any other value is on
@@ -335,7 +335,7 @@ MoE layers` at attach when it is on.
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2 on gfx1201; `=0` is the kill switch, any other value or unset is on; single card unchanged; EP4 is refused at admission with `EP4 owner-routed prefill not yet gated` until its hardware cells have run, the code is rank-generic)
+`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2..EP8 on gfx1201 (symmetric IU4 route) and gfx1100 (F16 WMMA grouped route); `=0` is the kill switch, any other value or unset is on; single card unchanged)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
 identical everywhere). Each rank runs the grouped symmetric IU4 gate/up and
