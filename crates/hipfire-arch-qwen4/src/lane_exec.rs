@@ -634,6 +634,56 @@ impl Qwen4LaneExecutor<'_> {
         Ok(())
     }
 
+    /// Per-request decode map-ahead for a Decoding lane, once, before its
+    /// first draft/decode step: map the lane's QSA arenas (an MTP lane's head
+    /// arenas too, unless retired) through `min(position +
+    /// remaining_new_tokens + k, admitted context)`, so `provision_step`
+    /// never remaps on the steady path. Best effort: a failure (or an
+    /// expert-parallel bundle, an unknown / non-Decoding lane, a zero budget)
+    /// is logged / skipped and `provision_step` grows on demand as before.
+    pub fn map_ahead_decode(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, remaining_new_tokens: usize) {
+        if refuse_expert_parallel(self.bundle).is_err() {
+            return;
+        }
+        let Some(store) = self.bundle.lanes.as_mut() else {
+            return;
+        };
+        let draft_rows = store.spec().map_or(0, |spec| spec.k);
+        let Some(lane) = store
+            .lane_mut(epoch)
+            .filter(|lane| lane.host.status == LaneStatus::Decoding)
+        else {
+            return;
+        };
+        let Some(target) = crate::state::decode_map_ahead_tokens(
+            lane.state.position,
+            Some(remaining_new_tokens),
+            draft_rows,
+            lane.state.max_seq_len,
+        ) else {
+            return;
+        };
+        let mapped = lane
+            .state
+            .ensure_mapped_capacity(gpu, target)
+            .map_err(|error| error.to_string())
+            .and_then(|()| match lane.spec.as_mut().filter(|spec| !spec.stats.retired) {
+                Some(spec) => spec
+                    .head
+                    .ensure_mapped_capacity(gpu, target.min(spec.head.context_capacity()))
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            });
+        match mapped {
+            Ok(()) => eprintln!(
+                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
+            ),
+            Err(error) => eprintln!(
+                "  qwen4 QSA map-ahead through {target} tokens failed ({error}); growing on demand"
+            ),
+        }
+    }
+
     /// The step's trunk forward(s) and one pick per decode / prompt-completing
     /// row. Decode rows (AR and Verify) of all lanes run as one exact trunk
     /// step, every Verify window and `ArSynced` head append finishes, then

@@ -4341,6 +4341,11 @@ pub fn generate_spec(
         return None;
     }
 
+    // Once per request, after prefill and before the first decode window
+    // (and any decode capture/record): map the target's context for the
+    // whole `max_tokens` budget plus the speculator's draft rows. Best
+    // effort; the target logs and swallows a failure (on-demand growth).
+    slot.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, spec.block_size());
     let t_prefill = Instant::now();
 
     // Per-token emission (EosFilter byte stream + grammar + think force-close +

@@ -346,6 +346,21 @@ pub trait SpecTarget {
     /// The target's usable context capacity (decode-loop overflow guard).
     fn ctx_capacity(&self) -> usize;
 
+    /// Once per request, after the speculator's prefill and before the first
+    /// decode window: map the target's context-growing state ahead for a
+    /// decode from `position` that may emit `remaining_new_tokens` more
+    /// tokens, with windows writing up to `max_draft_rows` rows past the
+    /// seed. Best effort (implementations log and swallow failure); default
+    /// no-op, as [`crate::arch_model::ArchModel::map_ahead_for_decode`].
+    fn map_ahead_for_decode(
+        &mut self,
+        _gpu: &mut Gpu,
+        _position: usize,
+        _remaining_new_tokens: usize,
+        _max_draft_rows: usize,
+    ) {
+    }
+
     /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
     /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
     /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation

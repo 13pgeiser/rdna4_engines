@@ -80,6 +80,9 @@ struct LaneCtl {
     /// A promoted lane's pending seed was already streamed by the singleton:
     /// its first decode advance does not emit the plan seed again.
     skip_first_forward: bool,
+    /// The lane's decode map-ahead ran (once per request, at its first
+    /// planned decode step).
+    mapped_ahead: bool,
 }
 
 fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
@@ -159,7 +162,7 @@ fn adopt_promoted(
     controls[ticket.lane] = Some(LaneCtl {
         epoch, slot, semantic: Some(producer), bytes, budget: ThinkBudget::new(max_think_tokens),
         forced: VecDeque::new(), started_in_think, max_tokens, start, decode_start: Some(decode_start),
-        prefill_ms, cache: None, skip_first_forward: seed_emitted,
+        prefill_ms, cache: None, skip_first_forward: seed_emitted, mapped_ahead: false,
     });
 }
 
@@ -315,6 +318,17 @@ fn plan_step(
     for c in controls.iter_mut().flatten().filter(|c| chosen.contains(&c.slot)) {
         if let Some(token) = c.forced.pop_front() {
             bundle.force_lane_seed(&c.epoch, token).map_err(|e| e.to_string())?;
+        }
+    }
+    // Once per request, before its first draft/decode step (and so before
+    // any provision): map the lane's context for the rest of its token
+    // budget (best effort, `provision_step` grows on demand otherwise).
+    if !chosen.is_empty() {
+        let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+        for (idx, c) in controls.iter_mut().enumerate() {
+            let Some(c) = c.as_mut().filter(|c| !c.mapped_ahead && chosen.contains(&c.slot)) else { continue; };
+            c.mapped_ahead = true;
+            executor.map_ahead_decode(gpu, &c.epoch, c.max_tokens.saturating_sub(streamed[idx]));
         }
     }
     let mut drafts: Vec<LaneDraft> = Vec::new();
@@ -639,7 +653,7 @@ pub fn drive_qwen4_lane_batch(
                     epoch, slot, semantic: Some(QwenArSemanticProducer::new_with_tool_protocol(&key.id, started, tools).with_stop(&stop)),
                     bytes: Vec::new(), budget: ThinkBudget::new(req.max_think_tokens), forced: VecDeque::new(),
                     started_in_think: started, max_tokens, start: Instant::now(), decode_start: None, prefill_ms: 0.0, cache: None,
-                    skip_first_forward: false,
+                    skip_first_forward: false, mapped_ahead: false,
                 });
                 let BatchLane::Running(lane) = &mut sched.lanes[ticket.lane] else { return Err("assigned lane is not running".into()); };
                 lane.prompt_len = prompt.len();

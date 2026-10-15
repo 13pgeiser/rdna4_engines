@@ -111,6 +111,23 @@ pub trait ArchModel: Send + std::any::Any {
         self.session_commit()
     }
 
+    /// Once per request, after prefill and before the first decode forward
+    /// (and so before any decode capture/record): map the model's
+    /// context-growing state ahead for a decode that starts at `position`,
+    /// may emit `remaining_new_tokens` more tokens and, when speculating,
+    /// writes up to `max_draft_rows` rows past a window's seed (0 for AR).
+    /// Best effort: an implementation logs and swallows failure, leaving
+    /// on-demand growth. Default is a no-op for models whose state does not
+    /// grow with context.
+    fn map_ahead_for_decode(
+        &mut self,
+        _gpu: &mut Gpu,
+        _position: usize,
+        _remaining_new_tokens: usize,
+        _max_draft_rows: usize,
+    ) {
+    }
+
     /// Downcast hatch for the architecture composition root.
     ///
     /// `hipfire-generate` legitimately needs the concrete bundle to call a

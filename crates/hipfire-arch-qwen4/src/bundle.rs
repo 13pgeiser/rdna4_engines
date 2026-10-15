@@ -21,6 +21,7 @@ use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
+use crate::state::decode_map_ahead_tokens;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, Qwen4Weights,
@@ -2466,6 +2467,55 @@ impl Qwen4Bundle {
         }
     }
 
+    /// Per-request decode map-ahead: map the target QSA context (and the
+    /// attached MTP head's, when the request drafts) through
+    /// `min(position + remaining_new_tokens + max_draft_rows, admitted
+    /// capacity)` once, after prefill and before the first decode, so
+    /// per-token growth checks never remap and no growth reaches a decode
+    /// capture or record. Uses the forward's own growth path, with session
+    /// snapshots yielding first. `max_draft_rows == 0` (AR) leaves the MTP
+    /// head unmapped. A failure is logged and swallowed: growth then happens
+    /// on demand as before. Expert-parallel bundles and a zero
+    /// `remaining_new_tokens` map nothing.
+    pub fn map_ahead_for_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        if self.ep.is_some() {
+            return;
+        }
+        let Some(target) = decode_map_ahead_tokens(
+            position,
+            Some(remaining_new_tokens),
+            max_draft_rows,
+            self.state.max_seq_len,
+        ) else {
+            return;
+        };
+        self.release_session_for_growth(gpu, target);
+        let mapped = self
+            .state
+            .ensure_mapped_capacity(gpu, target)
+            .map_err(|error| error.to_string())
+            .and_then(|()| match self.mtp.as_mut() {
+                Some(mtp) if max_draft_rows != 0 => mtp
+                    .ensure_mapped_capacity(gpu, target.min(mtp.context_capacity()))
+                    .map_err(|error| error.to_string()),
+                _ => Ok(()),
+            });
+        match mapped {
+            Ok(()) => eprintln!(
+                "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
+            ),
+            Err(error) => eprintln!(
+                "  qwen4 QSA map-ahead through {target} tokens failed ({error}); growing on demand"
+            ),
+        }
+    }
+
     /// Attach the PLE hot-row store and its worker thread: the row store reads
     /// the rows its pack holds from the pack.  A geometry mismatch is logged
     /// and the store is dropped (stopped and joined).  The hot store, the
@@ -3421,6 +3471,16 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
             session.commit_live(self, consumed);
             self.session = Some(session);
         }
+    }
+
+    fn map_ahead_for_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        Qwen4Bundle::map_ahead_for_decode(self, gpu, position, remaining_new_tokens, max_draft_rows);
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {

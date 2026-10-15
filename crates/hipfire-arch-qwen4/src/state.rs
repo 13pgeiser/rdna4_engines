@@ -584,6 +584,25 @@ pub(crate) fn context_arena_bytes_through(
     (tensor.byte_size() / capacity) as u64 * rows.min(capacity) as u64
 }
 
+/// Tokens a decode request maps ahead of its position so per-token growth
+/// checks never remap: the remaining new-token budget plus `max_draft_rows`
+/// speculative rows, clamped to `capacity`. A missing or zero budget
+/// (unbounded or finished request) maps nothing ahead.
+pub(crate) fn decode_map_ahead_tokens(
+    position: usize,
+    remaining_new_tokens: Option<usize>,
+    max_draft_rows: usize,
+    capacity: usize,
+) -> Option<usize> {
+    let budget = remaining_new_tokens.filter(|&tokens| tokens != 0)?;
+    Some(
+        position
+            .saturating_add(budget)
+            .saturating_add(max_draft_rows)
+            .min(capacity),
+    )
+}
+
 /// All of `tensor` as a fixed session-snapshot part.
 pub(crate) fn whole_part(tensor: &GpuTensor) -> StatePart<'_> {
     StatePart {
@@ -3336,6 +3355,31 @@ mod tests {
     }
 
     #[test]
+    fn decode_map_ahead_is_budget_plus_draft_clamped_to_capacity() {
+        // Budget plus draft rows past the position.
+        assert_eq!(decode_map_ahead_tokens(100, Some(64), 0, 4096), Some(164));
+        assert_eq!(decode_map_ahead_tokens(100, Some(64), 3, 4096), Some(167));
+        // Clamped to the admitted capacity, at and past it.
+        assert_eq!(decode_map_ahead_tokens(100, Some(64), 3, 167), Some(167));
+        assert_eq!(decode_map_ahead_tokens(100, Some(64), 3, 150), Some(150));
+        assert_eq!(decode_map_ahead_tokens(5000, Some(1), 0, 4096), Some(4096));
+        // No budget (unbounded or finished) maps nothing ahead, draft or not.
+        assert_eq!(decode_map_ahead_tokens(100, None, 3, 4096), None);
+        assert_eq!(decode_map_ahead_tokens(100, Some(0), 3, 4096), None);
+        assert_eq!(decode_map_ahead_tokens(100, Some(0), 0, 0), None);
+        // Saturating sums never overflow; the capacity still bounds them.
+        assert_eq!(
+            decode_map_ahead_tokens(usize::MAX, Some(usize::MAX), usize::MAX, 4096),
+            Some(4096)
+        );
+        assert_eq!(
+            decode_map_ahead_tokens(1, Some(usize::MAX), 2, usize::MAX),
+            Some(usize::MAX)
+        );
+        assert_eq!(decode_map_ahead_tokens(10, Some(1), 0, 0), Some(0));
+    }
+
+    #[test]
     fn legacy_context_ensure_is_a_bounds_check_over_full_allocations() {
         let Some(mut gpu) = try_gpu() else {
             return;
@@ -3468,6 +3512,65 @@ mod tests {
         state.reset(&mut gpu).expect("reset mapped prefix");
         assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
         assert_eq!(state.position, 0);
+        state.free_gpu(&mut gpu).expect("free state");
+        assert_eq!(gpu.vmm_allocation_count(), owners);
+    }
+
+    /// After mapping the decode map-ahead target once, per-token ensure calls
+    /// for the budgeted decode steps plus the draft rows never grow the
+    /// mapping and never move the position.
+    #[test]
+    fn vmm_map_ahead_target_makes_decode_and_draft_ensures_no_ops() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        if gpu.vmm_recommended_granularity().is_err() {
+            eprintln!("skip: HIP VMM unavailable");
+            return;
+        }
+        let owners = gpu.vmm_allocation_count();
+        let config = crate::config::compact_test_config();
+        let s = 16_384;
+        let mut state = Qwen4State::new_with_backend(
+            &mut gpu,
+            &config,
+            s,
+            Qwen4StateFormat::F32,
+            Qwen4KvBackend::Vmm,
+        )
+        .expect("VMM state");
+        let (position, budget, draft) = (100usize, 64usize, 3usize);
+        state.position = position;
+        let target = decode_map_ahead_tokens(position, Some(budget), draft, s)
+            .expect("budgeted request maps ahead");
+        assert_eq!(target, position + budget + draft);
+        assert!(decode_map_ahead_tokens(position, Some(0), draft, s).is_none());
+        assert!(decode_map_ahead_tokens(position, None, draft, s).is_none());
+
+        state
+            .ensure_mapped_capacity(&mut gpu, target)
+            .expect("map ahead");
+        let bytes = state.mapped_context_bytes(&gpu).unwrap();
+        let tokens = state.mapped_context_tokens();
+        assert!(bytes > 0);
+        assert!(tokens >= target && tokens < s);
+
+        // Each decode step needs its row plus the draft rows beyond it.
+        for step in 1..=budget {
+            state
+                .ensure_mapped_capacity(&mut gpu, position + step + draft)
+                .expect("budgeted decode + draft rows are already mapped");
+            assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
+            assert_eq!(state.mapped_context_tokens(), tokens);
+            assert_eq!(state.position, position);
+        }
+        state
+            .ensure_mapped_capacity(&mut gpu, target)
+            .expect("target stays mapped");
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), bytes);
+        assert_eq!(state.mapped_context_tokens(), tokens);
+        assert_eq!(state.position, position);
+
         state.free_gpu(&mut gpu).expect("free state");
         assert_eq!(gpu.vmm_allocation_count(), owners);
     }

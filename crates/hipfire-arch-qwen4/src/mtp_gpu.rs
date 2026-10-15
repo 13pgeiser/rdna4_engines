@@ -1371,6 +1371,12 @@ impl MtpGpuState {
         Ok(())
     }
 
+    /// Admitted token capacity of the context arenas (the bound
+    /// [`Self::ensure_mapped_capacity`] refuses above).
+    pub(crate) fn context_capacity(&self) -> usize {
+        self.full_capacity
+    }
+
     /// Tokens every context arena's mapped prefix covers.
     fn mapped_token_coverage(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
         let rows = |tensor: &GpuTensor, capacity: usize| -> Result<usize, MtpGpuError> {
@@ -2214,6 +2220,11 @@ impl Qwen4MtpGpu {
         required_tokens: usize,
     ) -> Result<(), MtpGpuError> {
         self.state.ensure_mapped_capacity(gpu, required_tokens)
+    }
+
+    /// Admitted token capacity of the head's context arenas.
+    pub(crate) fn context_capacity(&self) -> usize {
+        self.state.context_capacity()
     }
 
     /// See [`MtpGpuState::mapped_context_bytes`].

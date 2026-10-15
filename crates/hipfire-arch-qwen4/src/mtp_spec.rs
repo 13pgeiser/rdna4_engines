@@ -677,6 +677,16 @@ impl SpecTarget for Qwen4Bundle {
     fn ctx_capacity(&self) -> usize {
         self.state.max_seq_len
     }
+
+    fn map_ahead_for_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        position: usize,
+        remaining_new_tokens: usize,
+        max_draft_rows: usize,
+    ) {
+        Qwen4Bundle::map_ahead_for_decode(self, gpu, position, remaining_new_tokens, max_draft_rows);
+    }
 }
 
 /// Draft-step hidden conditioning mode; see [`draft_pairing`].

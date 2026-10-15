@@ -2026,6 +2026,13 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     m.seq_pos = prompt_tokens.len();
     m.conversation_tokens.extend_from_slice(prompt_tokens);
     let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // Once per request, after prefill and before the first decode forward
+    // (and any decode capture/record): map context ahead for the whole
+    // `max_tokens` budget (AR: no draft rows). Best effort; the model logs
+    // and swallows a failure, leaving on-demand growth.
+    if let Some(state) = m.state.as_deref_mut() {
+        state.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, 0);
+    }
     let sampler_config = SamplerConfig {
         temperature: temp,
         top_p,
