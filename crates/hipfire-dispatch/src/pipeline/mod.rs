@@ -32,6 +32,11 @@ pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadReque
 pub(crate) mod layer_ops;
 pub mod sandwich;
 pub(crate) mod steps;
+pub mod step_graph;
+pub use step_graph::{
+    op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
+    StateClass, StepGraph, StepGraphError,
+};
 pub use layer_ops::{
     execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
     execute_final_hyper, execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm,
