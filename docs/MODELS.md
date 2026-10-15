@@ -113,6 +113,7 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 |---|---|---:|---:|---|
 | `qwen3.8:flash-next-mq4-xts` | `qwen3.8-flash-next.mq4-xts` | 125.3 | 128 | MQ4 XTS; canonical pinned arch 16 fixture |
 | `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4`, `qwen3.8:flash-next-gptq3` | `qwen3.8-flash-next-gptq3.mq4` | 125.3 | 128 | Compatibility names for the same MQ4 XTS bytes |
+| `qwen3.8:flash-next-mq3-xts` | `qwen3.8-flash-next-base.mq3-xts` | 59.3 | 64 | MQ3 XTS split base: W3 GPTQ on 16,839 of 24,576 routed experts, PLE rows from the shared sidecar (below) |
 
 The short user-facing name is `qwen3.8:flash`, an alias for `qwen3.8:flash-next`.
 For example: `hipfire pull qwen3.8:flash` and
@@ -144,21 +145,24 @@ Other Flash-Next registry entries, retained for provenance and not the default:
 | `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | Previous canonical rung (RTN-asymmetric experts), superseded by MQ4 XTS |
 | `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | Earlier canonical rung, superseded |
 
-**MQ3 XTS tier (split base).** The planned `qwen3.8:flash-next-mq3-xts` tier
-is a split base (`qwen3.8-flash-next-base.mq3-xts`) with no PLE rows of its
-own. Sidecars use the existing `hipfire pull <tag> --ple q4|q8|auto` pick: a
-plain pull follows `memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere),
-`--ple q4` pulls the q4 rows explicitly, and `--ple q8` opts in to the exact
-Q8 rows, which `memory.ple_format = q8` then requires. The MQ4 XTS tags above
-are unchanged. Split bases share one published pair of row files in
-`hipfire-models/qwen3.8-flash-next`, `qwen3.8-flash-next.ple-q4` (28.8 GB) and
-`qwen3.8-flash-next.ple-q8` (54.4 GB), bound by the base marker's row geometry
-and the q8 source-rows SHA-256 (split bases only; the monolithic MQ4 XTS file
-and its binding are unchanged). The MQ3 XTS base file is not published yet,
-pending its release gates; once it is, the download is about 88.05 GB with the
-q4 rows and about 113.65 GB with the q8 rows. The q4 rows save about 25.6 GB
-of disk and download, not VRAM (the PLE rows are external). No GPU gate result
-is claimed.
+**MQ3 XTS tier (split base).** `qwen3.8:flash-next-mq3-xts` is a split base
+(`qwen3.8-flash-next-base.mq3-xts`, 59.3 GB) with no PLE rows of its own:
+16,839 of the 24,576 trunk routed experts are 3-bit GPTQ (W3), and the other
+7,737 experts and every other tensor are the MQ4 XTS bytes. Sidecars use the
+existing `hipfire pull <tag> --ple q4|q8|auto` pick: a plain pull follows
+`memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere), `--ple q4` pulls
+the q4 rows explicitly, and `--ple q8` opts in to the exact Q8 rows, which
+`memory.ple_format = q8` then requires. The MQ4 XTS tags above are unchanged.
+Split bases share one published pair of row files in
+`hipfire-models/qwen3.8-flash-next`, `qwen3.8-flash-next.ple-q4` (29.12 GB,
+rank-ordered rows) and `qwen3.8-flash-next.ple-q8` (54.4 GB), bound by the
+base marker's row geometry and the q8 source-rows SHA-256 (split bases only;
+the monolithic MQ4 XTS file and its binding are unchanged). The download is
+about 88.37 GB with the q4 rows and about 113.65 GB with the q8 rows; the q4
+rows save about 25.28 GB of disk and download, not VRAM (the PLE rows are
+external). Loader gates on hipfire a6f241ce2's split-base loader: greedy AR
+token ids equal the `qwen4_kld` reference on 8 prompts, MTP output equals AR,
+and the q4 and q8 sidecars both load.
 Row-table semantics: [`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables).
 
 ### DFlash draft artifacts (registry)
