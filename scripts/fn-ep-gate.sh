@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fn-ep-gate.sh: Flash-Next (Qwen4, mq4-xts) expert-parallel gate for a host with N homogeneous
 # gfx1100 (7900 XTX) or gfx1201 (R9700) cards. Run it from a hipfire checkout; it builds the
-# binaries, runs ONE card (topology.ep = 1) and N cards (topology.ep = N) over the same prompts,
+# binaries, runs a reference (one card by default) and N cards (topology.ep = N) over the same prompts,
 # compares them byte for byte, times decode/prefill, and writes a receipt you can send back.
 #
 #   scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]
@@ -9,6 +9,9 @@
 #   MODEL.mq4    Flash-Next mq4-xts model file (REQUIRED)
 #   N            EP degree, 2..=8 (default: length of --devices, else every visible card of the chosen arch, at most 8)
 #   OUT_DIR      output directory (default: ./fn-ep-gate-<UTC timestamp>)
+#
+# Run the arms inside whole-card fabric holds: automatic expert placement can fill each card.
+# On 32 GB R9700s the EP2 reference / EP4 target measured 31.17 / 30.68 GiB per-card peaks.
 #
 # Options (also accepted as --n N / --out DIR before or after the positionals):
 #   --arch ARCH         card arch to use (default: gfx1100 or gfx1201, whichever has more cards)
