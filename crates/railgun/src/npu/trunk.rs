@@ -1020,7 +1020,7 @@ mod tests {
             validate_panels(&range, count).unwrap();
         }
         assert!(validate_panels(&(3..3), 13).unwrap_err().contains("empty"));
-        assert!(validate_panels(&(5..4), 13).unwrap_err().contains("empty"));
+        assert!(validate_panels(&std::ops::Range { start: 5, end: 4 }, 13).unwrap_err().contains("empty"));
         assert!(validate_panels(&(0..0), 0).unwrap_err().contains("empty"));
         assert!(validate_panels(&(0..14), 13).unwrap_err().contains("exceeds"));
         assert!(validate_panels(&(12..14), 13).unwrap_err().contains("exceeds"));
