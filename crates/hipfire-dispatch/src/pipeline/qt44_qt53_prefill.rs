@@ -1630,7 +1630,8 @@ fn down_stage(
         .map_or(p.expert_down_ptrs, |stage| stage.down);
     let total_slots = p.batch_size * p.k_top;
     if is_slab(p) {
-        return slab_down(gpu, p, grouped_rows);
+        slab_down(gpu, p, grouped_rows)?;
+        return release_stage(gpu, p);
     }
     if sym_iu4(gpu, p, use_path2) {
         // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
@@ -1873,10 +1874,13 @@ fn slab_gate_up(
     }
     let xq = hip(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
     let host_mapped = experts_host_mapped(p);
+    let gate_up_ptrs = p
+        .expert_stage_ptrs
+        .map_or(p.expert_gate_up_ptrs, |stage| stage.gate_up);
     let (m, k) = (2 * p.mi, p.gate_up_k);
     match buckets {
         SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -1888,7 +1892,7 @@ fn slab_gate_up(
             p.batch_size,
         )),
         SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-            p.expert_gate_up_ptrs,
+            gate_up_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -1908,7 +1912,7 @@ fn slab_gate_up(
                 grouped_tiles(grouped_rows),
             ))?;
             hip(gpu.gemm_qwen4_moe_w3_gate_up_silu_iu4_sym(
-                p.expert_gate_up_ptrs,
+                gate_up_ptrs,
                 &w3,
                 p.sorted_slot_index,
                 &xq,
@@ -1920,7 +1924,7 @@ fn slab_gate_up(
                 p.batch_size,
             ))?;
             hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                p.expert_gate_up_ptrs,
+                gate_up_ptrs,
                 &mq4,
                 p.sorted_slot_index,
                 &xq,
@@ -1979,10 +1983,15 @@ fn slab_down(
         grouped_rows,
         total_slots,
     ))?;
+    // A staged long prefill reads this layer's arena copy in VRAM (stage tables
+    // rebased onto the parity stage buffer) and so takes the resident NT variant.
+    let down_ptrs = p
+        .expert_stage_ptrs
+        .map_or(p.expert_down_ptrs, |stage| stage.down);
     let host_mapped = experts_host_mapped(p);
     match buckets {
         SlabBuckets::Uniform(0) => hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
-            p.expert_down_ptrs,
+            down_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -1994,7 +2003,7 @@ fn slab_down(
             total_slots,
         )),
         SlabBuckets::Uniform(_) => hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-            p.expert_down_ptrs,
+            down_ptrs,
             p.expert_tile_ids,
             p.sorted_slot_index,
             &xq,
@@ -2014,7 +2023,7 @@ fn slab_down(
                 grouped_tiles(grouped_rows),
             ))?;
             hip(gpu.gemm_qwen4_moe_w3_down_iu4_sym(
-                p.expert_down_ptrs,
+                down_ptrs,
                 &w3,
                 p.sorted_slot_index,
                 &xq,
@@ -2026,7 +2035,7 @@ fn slab_down(
                 total_slots,
             ))?;
             hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-                p.expert_down_ptrs,
+                down_ptrs,
                 &mq4,
                 p.sorted_slot_index,
                 &xq,

@@ -2602,7 +2602,13 @@ pub(crate) struct Qwen4ExpertStage {
     /// Sticky until the donors are back: a failed forward leaves it set,
     /// and every later forward restores first ([`Self::restore_blocking`]).
     state: std::cell::Cell<[DonorState; 2]>,
+    /// `Some` for a slab-arena stage: dedicated VRAM stage buffers (in
+    /// `mirrors`) instead of donor layers, per-layer rebased tables (in
+    /// `tables`), and the host sources ([`slab_stage`]).
+    slab: Option<slab_stage::SlabStageMeta>,
 }
+
+mod slab_stage;
 
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
@@ -2642,10 +2648,11 @@ impl Qwen4ExpertStage {
         let Some(first_host) = moe.iter().position(RoutedExpertWeights::host_mapped) else {
             return Ok(None);
         };
-        // The donor mirrors are the legacy aggregate expert tensors; a slab
-        // layer's host-mapped arena is read in place.
+        // A slab layer's host-mapped arena stages through dedicated VRAM
+        // buffers (`slab_stage`); the donor mirrors below are the legacy
+        // aggregate expert tensors.
         if moe.iter().any(|layer| layer.slab.is_some()) {
-            return Ok(None);
+            return Self::new_slab(gpu, bundle, moe, first_host);
         }
         let config = &bundle.config;
         // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
@@ -2755,6 +2762,7 @@ impl Qwen4ExpertStage {
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
             state: std::cell::Cell::new([DonorState::Resident; 2]),
+            slab: None,
         };
         let result = (|| {
             for _ in 0..2 {
@@ -2820,6 +2828,14 @@ impl Qwen4ExpertStage {
 
     /// The stage tables a host `layer` reads from on a staged forward.
     fn tables(&self, layer: usize) -> MoeStageTables<'_> {
+        if self.slab.is_some() {
+            let index = layer - self.first_host;
+            return MoeStageTables {
+                gate_up: &self.tables[2 * index],
+                down: &self.tables[2 * index + 1],
+                free: &self.free[layer % 2],
+            };
+        }
         let parity = layer % 2;
         if self.placement.is_some() && self.compact_bound[layer].get() {
             return self.tables_compact(layer);
@@ -2971,6 +2987,9 @@ impl Qwen4ExpertStage {
         moe: &[Qwen4MoeLayerRuntime],
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
+        if self.slab.is_some() {
+            return self.slab_after_moe(gpu, moe, layer);
+        }
         let parity = layer % 2;
         let donor = self.donors[parity] == layer;
         if !donor && !moe[layer].host_mapped() {
@@ -2999,6 +3018,9 @@ impl Qwen4ExpertStage {
     /// End of a staged forward: the compute stream waits on every restore,
     /// charging what the trunk did not hide to this forward.
     fn join(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if self.slab.is_some() {
+            return Ok(());
+        }
         for parity in 0..2 {
             if self.state.get()[parity] == DonorState::Overwritten {
                 self.enqueue_restore(gpu, parity)?;
@@ -3020,6 +3042,10 @@ impl Qwen4ExpertStage {
     /// The state stays set on failure, so the next forward retries before
     /// anything reads the donors.
     fn restore_blocking(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        if self.slab.is_some() {
+            // Dedicated stage buffers: no donor was overwritten, nothing to restore.
+            return Ok(());
+        }
         if self.state.get() == [DonorState::Resident; 2] {
             return Ok(());
         }
@@ -6315,6 +6341,11 @@ impl Qwen4GpuForward {
             }
             _ => None,
         };
+        if let Some(stage) = expert_stage {
+            // Slab stage: the first two host layers copy while the resident
+            // layers compute (the legacy donors refill from their own MoE).
+            stage.slab_prime(gpu, self.moe.len())?;
+        }
         let ctx = DispatchCtx::new(gpu);
         let mut steps: SmallVec<[Step<'_>; QWEN4_STEP_INLINE_CAPACITY]> = SmallVec::new();
         let mut gdn_slot = 0usize;

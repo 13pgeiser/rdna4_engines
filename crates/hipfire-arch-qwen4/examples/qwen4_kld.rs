@@ -967,6 +967,8 @@ fn score_s11ref(
         if kls.iter().any(|v| !v.is_finite()) {
             return Err("non-finite KL rows".into());
         }
+        // The prefix rows are kept (never a receipt) so two smoke runs compare byte for byte.
+        write_kl_npy(output, &kls)?;
         eprintln!("qwen4_kld s11ref SMOKE (first {} sequences, not a gate, no receipt): mean KLD = {:.12}  ({} rows)",
             smoke_seqs.unwrap_or(0), kls.iter().sum::<f64>() / kls.len().max(1) as f64, kls.len());
         return Ok(());
@@ -1035,6 +1037,13 @@ fn speed(
         if first.iter().any(|v| !v.is_finite()) {
             return Err("non-finite prefill logits".into());
         }
+        let logits_sha = {
+            let mut digest = Sha256::new();
+            for v in &first {
+                digest.update(v.to_bits().to_le_bytes());
+            }
+            format!("{:x}", digest.finalize())
+        };
         let mut ids = Vec::with_capacity(warmup + decode_tokens);
         let mut t1 = Instant::now();
         for i in 0..warmup + decode_tokens {
@@ -1054,6 +1063,7 @@ fn speed(
         rep_rows.push(serde_json::json!({
             "rep": rep, "ttft_ms": ttft * 1e3, "decode_tok_s": tps,
             "decode_s": decode_s, "first_ids": ids.iter().take(16).collect::<Vec<_>>(),
+            "prefill_logits_sha256": logits_sha,
         }));
     }
     let binary = std::env::current_exe().map_err(|e| e.to_string())?;
