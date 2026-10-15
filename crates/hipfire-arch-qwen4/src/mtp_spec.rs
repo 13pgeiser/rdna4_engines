@@ -574,9 +574,7 @@ impl SpecTarget for Qwen4Bundle {
             }
             self.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
             let planned=self.npu_trunk_planned();
-            let rows=if planned {
-                self.prefill_schedule_rows(start_pos+offset,end_pos,max_chunk)
-            } else {(tokens.len()-offset).min(max_chunk)};
+            let rows = self.prefill_schedule_rows(start_pos + offset, end_pos, max_chunk);
             let end=offset+rows;
             // A planned pair group (rows above one chunk) runs through the pair
             // executor inside the forward, in every NPU mode.
@@ -589,8 +587,8 @@ impl SpecTarget for Qwen4Bundle {
                 last_argmax=Some(self.spec_prefill_rows(gpu,&tokens[offset..end],false)
                     .map_err(|error|error.to_string())?);
             }
-            if planned && start_pos==0 && self.session_next_boundary()==Some(end) {
-                self.spec_advance_session_boundary(gpu,&tokens[..end]).map_err(|e|e.to_string())?;
+            if self.session_next_boundary() == Some(start_pos + end) {
+                self.spec_advance_session_boundary(gpu, start_pos + end).map_err(|e|e.to_string())?;
             }
             offset = end;
         }

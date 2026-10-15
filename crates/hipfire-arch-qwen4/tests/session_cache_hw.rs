@@ -562,6 +562,108 @@ fn resident_restore_matches_cold_on_flash_next() {
     bundle.free_gpu(&mut gpu).expect("free bundle");
 }
 
+/// Lever 1: the tail snapshot. A cold prompt A ends with a user message, its
+/// final `<|im_end|>` and an assistant header; with the turn end token set
+/// (message-end snapshots off) its cold prefill also splits and snapshots at
+/// the index BEFORE that final `<|im_end|>`, at least the default 256 rows
+/// past the previous chunk boundary. Prompt B extends A's last user message
+/// (A up to that index, 200 new content tokens, then A's template suffix from
+/// the `<|im_end|>` on, so B's last `<|im_end|>` is at `tail + 200`) and must
+/// plan exactly A's index. B's own tail split is skipped: 200 rows past the
+/// restored tail is under the default 256 minimum gap. The tail schedule is
+/// session-exact, not cold-exact, so the restored B is compared with a cold B
+/// split manually at the same index (chunk boundary, then the index, then the
+/// rest as a live continuation), never with the unsplit cold schedule. A
+/// restore after the tail adds nothing to the pool. Runs with the tail
+/// snapshot at its default (`HIPFIRE_QWEN4_TAIL_SNAPSHOT` and `..._MIN_GAP`
+/// unset).
+#[test]
+#[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
+fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
+    let Loaded {
+        mut bundle,
+        mut gpu,
+        tokenizer,
+        vocab,
+        ..
+    } = load(false, u64::MAX >> 1, None);
+    let im_end = tokenizer
+        .special_token_id("<|im_end|>")
+        .expect("tokenizer has <|im_end|>");
+    bundle.set_turn_end_token(Some(im_end));
+    assert!(
+        !bundle.turn_snapshots_active(),
+        "message-end snapshots must stay off: only the tail splits"
+    );
+    let chunk = bundle.spec_chunk_rows().expect("chunk rows");
+    assert!(chunk >= 1024, "test needs B to end before the second chunk");
+    let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
+
+    // The tail index sits 300 rows past the chunk boundary (default minimum
+    // gap 256) and A ends in the same chunk. Neither prompt has an earlier
+    // `<|im_end|>`.
+    let tail = chunk + 300;
+    let mut a = prompt(0xa7, tail);
+    a.push(im_end);
+    a.extend(prompt(0xa8, 40));
+    assert_eq!(a.iter().rposition(|&t| t == im_end), Some(tail));
+    assert_eq!(a.iter().filter(|&&t| t == im_end).count(), 1);
+    // B continues A's last user message with new content and keeps A's
+    // template suffix, so its last `<|im_end|>` is 200 rows past the tail; it
+    // stays below the second chunk boundary.
+    let mut b = a[..tail].to_vec();
+    b.extend(prompt(0xb7, 200));
+    b.extend_from_slice(&a[tail..]);
+    assert_eq!(b.iter().rposition(|&t| t == im_end), Some(tail + 200));
+    assert_eq!(b.iter().filter(|&&t| t == im_end).count(), 1);
+    assert!(b.len() < 2 * chunk);
+    // The gap from the restored tail (200) is under the default minimum
+    // (256): B's own tail split is skipped, so B has no boundary after the
+    // restore.
+    assert_eq!(SessionState::lineage_boundary(&bundle, &b, tail, b.len()), None);
+
+    assert_eq!(bundle.session_plan(&a, SessionRoute::Ar), 0);
+    run(&mut bundle, &mut gpu, &logits, &a, 0);
+    let stored = stored_bytes(&bundle);
+    assert!(stored > 0, "cold A published no snapshot");
+
+    // B plans exactly A's tail index, past A's chunk snapshot.
+    let reused = bundle.session_plan(&b, SessionRoute::Ar);
+    assert_eq!(reused, tail, "plan must offer A's tail snapshot");
+    let warm = run(&mut bundle, &mut gpu, &logits, &b, reused);
+    assert_eq!(
+        stored_bytes(&bundle),
+        stored,
+        "a restore after the tail must not publish to the pool"
+    );
+
+    // Cold B split manually at A's tail index: the cold prefix up to it, kept
+    // live, then the rest continuing in place (no capture, no tail).
+    bundle
+        .prefill_final(&mut gpu, &b[..tail], 0, &logits)
+        .expect("split prefix prefill");
+    bundle.session_commit_live(&b[..tail]);
+    assert_eq!(
+        bundle.session_plan(&b, SessionRoute::Ar),
+        tail,
+        "the split reference continues the live prefix"
+    );
+    let cold = run(&mut bundle, &mut gpu, &logits, &b, tail);
+    println!(
+        "AR tail split-cold ids {:?}\nAR tail warm ids {:?}",
+        cold.2, warm.2
+    );
+    assert_same_state("AR tail", &cold.0, &warm.0);
+    assert!(
+        warm.1 == cold.1,
+        "tail-restored final logits differ from the same-split cold prefill"
+    );
+    assert_eq!(warm.2, cold.2, "AR tail ids");
+
+    gpu.free_tensor(logits).expect("free logits");
+    bundle.free_gpu(&mut gpu).expect("free bundle");
+}
+
 const DISK_WRITE_PHASE: &str = "HIPFIRE_SESSION_CACHE_DISK_WRITE_PHASE";
 
 fn snap_files(dir: &Path) -> usize {

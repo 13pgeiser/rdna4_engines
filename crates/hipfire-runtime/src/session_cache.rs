@@ -32,12 +32,12 @@
 //! never depend on what the live state held before; a snapshot that still
 //! has children is pinned, so eviction only ever removes leaves.
 //!
-//! Besides the pool, the cache keeps one *resident* snapshot: the fixed parts
-//! at the deepest boundary of the last committed prefill, whose rows the live
-//! row streams themselves still hold. It serves that lineage at any depth
-//! without copying a row, also past the budget, and is dropped as soon as
-//! anything else restores or resets the live state (an owner that resets
-//! outside the cache reports it through [`SessionCache::live_state_reset`]).
+//! Besides the pool, the cache keeps fixed-only *resident* snapshots backed by
+//! the live row streams: the deepest regular boundary and an optional lineage
+//! split before the prompt's final message end. A tail restore preserves the
+//! earlier resident's rows, but its descendants never enter the cold-exact
+//! pool. Other restores or resets invalidate residents whose rows are rewritten
+//! (external owners report resets through [`SessionCache::live_state_reset`]).
 //!
 //! An optional disk tier ([`SessionCache::with_disk`]) keeps snapshots the
 //! device tier evicts (and every published snapshot at [`SessionCache::clear`])
@@ -116,6 +116,11 @@ pub trait SessionState {
     /// prompt materializes state: chunk multiples, and whatever token-
     /// dependent split points (message ends) the architecture adds.
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize>;
+    /// One additional split before `up_to`, reusable only by this live row
+    /// lineage, never by the shared snapshot pool.
+    fn lineage_boundary(&self, _prompt: &[u32], _after: usize, _up_to: usize) -> Option<usize> {
+        None
+    }
     /// Layout + host metadata of the live state, which must be exactly at
     /// `position`.
     fn snapshot_parts(
@@ -213,6 +218,11 @@ struct Turn {
     domain: CacheDomain,
     route: SessionRoute,
     boundaries: VecDeque<usize>,
+    /// Extra split captured only in the tail resident.
+    lineage: Option<usize>,
+    /// False after any lineage split or restore: the pool stays cold-exact.
+    pool_capture: bool,
+    start: usize,
     /// Length of the prompt in flight.
     end: usize,
 }
@@ -225,6 +235,7 @@ struct Resident {
     fixed_bytes: Vec<usize>,
     rows: Vec<usize>,
     meta: Vec<u8>,
+    cold_exact: bool,
 }
 
 pub struct SessionCache {
@@ -243,6 +254,11 @@ pub struct SessionCache {
     resident: Option<Resident>,
     /// This turn's deepest boundary, published as `resident` by `commit`.
     resident_pending: Option<Resident>,
+    /// Fixed state before the prompt's last message-end token.
+    tail: Option<Resident>,
+    tail_pending: Option<Resident>,
+    /// Track split lineage even when the memory guard skips its resident.
+    live_cold_exact: bool,
     /// Displaced resident buffers; freed at the next `begin`/`clear`.
     release_bufs: Vec<DeviceBuffer>,
     disk: Option<disk::DiskTier>,
@@ -328,6 +344,9 @@ impl SessionCache {
             turn: None,
             resident: None,
             resident_pending: None,
+            tail: None,
+            tail_pending: None,
+            live_cold_exact: true,
             release_bufs: Vec::new(),
             disk: None,
         }
@@ -385,23 +404,36 @@ impl SessionCache {
             return 0;
         }
         let domain = self.domain.scoped(&scope);
-        let resident = self
-            .resident
-            .as_ref()
+        let resident = [self.resident.as_ref(), self.tail.as_ref()]
+            .into_iter()
+            .flatten()
             .map(|resident| &resident.key)
             .filter(|(d, p, fp)| {
                 let p = *p as usize;
                 *d == domain && p < prompt.len() && *fp == prefix_fingerprint(&prompt[..p])
             })
-            .map_or(0, |key| key.1 as usize);
+            .map(|key| key.1 as usize)
+            .max()
+            .unwrap_or(0);
         // Only a strictly deeper pool snapshot beats the resident one (no row
         // copy, see `begin`); each probe hashes its whole prefix.
-        state
+        let planned = state
             .snapshot_boundaries(prompt, resident, prompt.len() - 1)
             .into_iter()
             .rev()
             .find(|&p| self.present(&domain, p as u64, prefix_fingerprint(&prompt[..p])))
-            .unwrap_or(resident)
+            .unwrap_or(resident);
+        if planned > 0
+            && hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
+            && self.tail.as_ref().is_some_and(|tail| {
+                tail.key.0 == domain
+                    && tail.key.1 as usize == planned
+                    && tail.key.2 == prefix_fingerprint(&prompt[..planned])
+            })
+        {
+            eprintln!("  session cache: using tail resident at {planned}");
+        }
+        planned
     }
 
     /// A published or pending snapshot.
@@ -499,14 +531,23 @@ impl SessionCache {
         if let Some(resident) = self.resident.take() {
             free_device(gpu, resident.buf);
         }
+        if let Some(tail) = self.tail.take() {
+            free_device(gpu, tail.buf);
+        }
     }
 
     /// The live state was reset outside the cache: its rows no longer back
     /// the resident snapshot.
     pub fn live_state_reset(&mut self) {
-        for resident in [self.resident.take(), self.resident_pending.take()]
-            .into_iter()
-            .flatten()
+        self.live_cold_exact = true;
+        for resident in [
+            self.resident.take(),
+            self.resident_pending.take(),
+            self.tail.take(),
+            self.tail_pending.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             self.release_bufs.push(resident.buf);
         }
@@ -526,6 +567,9 @@ impl SessionCache {
         }
         if let Some(resident) = self.resident_pending.take() {
             free_device(gpu, resident.buf);
+        }
+        if let Some(tail) = self.tail_pending.take() {
+            free_device(gpu, tail.buf);
         }
         self.turn = None;
     }
@@ -557,26 +601,41 @@ impl SessionCache {
             reused as u64,
             prefix_fingerprint(&prompt[..reused]),
         );
-        // Anything but the resident snapshot itself rewrites the live rows.
-        if reused == 0 || self.resident.as_ref().is_none_or(|r| r.key != key) {
-            self.drop_resident(gpu);
-        }
-        let restored = if reused == 0 {
-            state.reset(gpu)
-        } else if let Some(resident) = &self.resident {
+        let mut pool_capture = true;
+        let restored = if reused > 0 && self.tail.as_ref().is_some_and(|r| r.key == key) {
+            pool_capture = false;
+            // Message-end snapshots may sit above the tail when enabled.
+            if self.resident.as_ref().is_some_and(|r| r.key.1 > reused as u64) {
+                free_device(gpu, self.resident.take().unwrap().buf);
+            }
+            restore_resident(gpu, state, route, self.tail.as_ref().unwrap())
+        } else if reused > 0 && self.resident.as_ref().is_some_and(|r| r.key == key) {
+            if let Some(tail) = self.tail.take() {
+                free_device(gpu, tail.buf);
+            }
+            let resident = self.resident.as_ref().unwrap();
+            pool_capture = resident.cold_exact;
             restore_resident(gpu, state, route, resident)
         } else {
-            self.restore(gpu, state, route, &domain, &prompt[..reused], prompt.len())
+            self.drop_resident(gpu);
+            if reused == 0 {
+                state.reset(gpu)
+            } else {
+                self.restore(gpu, state, route, &domain, &prompt[..reused], prompt.len())
+            }
         };
         if let Err(error) = restored {
             let _ = state.reset(gpu);
             self.drop_resident(gpu);
             return Err(error);
         }
+        self.live_cold_exact = pool_capture;
+        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused);
         self.turn = Some(Turn {
-            boundaries: state
-                .snapshot_boundaries(prompt, reused, prompt.len())
-                .into(),
+            boundaries,
+            lineage,
+            pool_capture,
+            start: reused,
             domain,
             route,
             end: prompt.len(),
@@ -611,20 +670,42 @@ impl SessionCache {
         capture: bool,
     ) {
         self.start_turn(gpu);
+        if self.tail.as_ref().is_some_and(|tail| reused < tail.key.1 as usize) {
+            free_device(gpu, self.tail.take().unwrap().buf);
+        }
         if !capture {
             return;
         }
         let Some(scope) = state.snapshot_scope(route) else {
             return;
         };
+        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused);
         self.turn = Some(Turn {
-            boundaries: state
-                .snapshot_boundaries(prompt, reused, prompt.len())
-                .into(),
+            boundaries,
+            lineage,
+            pool_capture: self.live_cold_exact,
+            start: reused,
             domain: self.domain.scoped(&scope),
             route,
             end: prompt.len(),
         });
+    }
+
+    fn turn_boundaries(
+        state: &dyn SessionState,
+        prompt: &[u32],
+        reused: usize,
+    ) -> (VecDeque<usize>, Option<usize>) {
+        let mut boundaries = state.snapshot_boundaries(prompt, reused, prompt.len());
+        let lineage = state
+            .lineage_boundary(prompt, reused, prompt.len())
+            .filter(|&p| reused < p && p < prompt.len());
+        if let Some(p) = lineage {
+            boundaries.push(p);
+            boundaries.sort_unstable();
+            boundaries.dedup();
+        }
+        (boundaries.into(), lineage)
     }
 
     /// Copy the snapshot of `prefix` and its ancestors into the live state,
@@ -933,9 +1014,15 @@ impl SessionCache {
             ));
         }
         turn.boundaries.pop_front();
+        let lineage = turn.lineage == Some(prefix.len());
+        if lineage {
+            turn.pool_capture = false;
+            self.live_cold_exact = false;
+        }
+        let pool_capture = turn.pool_capture;
         let (domain, route, p, end) = (turn.domain.clone(), turn.route, prefix.len(), turn.end);
         let fp = prefix_fingerprint(prefix);
-        let in_pool = self.present(&domain, p as u64, fp);
+        let in_pool = !pool_capture || self.present(&domain, p as u64, fp);
         let growth = state.growth_reserve_bytes(gpu, end);
         let ancestors: Vec<Key> = if in_pool {
             Vec::new()
@@ -948,7 +1035,20 @@ impl SessionCache {
                 .collect()
         };
         let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
-        self.capture_resident(gpu, (domain.clone(), p as u64, fp), &meta, &live, growth)?;
+        let pending = if lineage {
+            &mut self.tail_pending
+        } else {
+            &mut self.resident_pending
+        };
+        Self::capture_resident(
+            pending, gpu, (domain.clone(), p as u64, fp), &meta, &live, growth, pool_capture,
+        )?;
+        if lineage
+            && self.tail_pending.as_ref().is_some_and(|tail| tail.key.1 == p as u64)
+            && hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
+        {
+            eprintln!("  session cache: tail resident at {p}");
+        }
         if in_pool {
             return Ok(());
         }
@@ -1049,16 +1149,17 @@ impl SessionCache {
     /// resident snapshot, reusing its buffer. A capture the memory guard
     /// refuses is skipped and leaves the previous boundary's.
     fn capture_resident(
-        &mut self,
+        pending: &mut Option<Resident>,
         gpu: &mut Gpu,
         key: Key,
         meta: &[u8],
         live: &StateLayout<'_>,
         growth: u64,
+        cold_exact: bool,
     ) -> Result<(), String> {
         let fixed_bytes: Vec<usize> = live.fixed.iter().map(|part| part.bytes).collect();
         let (offsets, total) = layout(fixed_bytes.iter().copied());
-        let buf = match self.resident_pending.take() {
+        let buf = match pending.take() {
             Some(resident) if resident.buf.size() == total => resident.buf,
             previous => {
                 if memory_fits(gpu, total as u64 + growth) != Some(true) {
@@ -1066,7 +1167,7 @@ impl SessionCache {
                         "  session cache: skipped {}-token resident snapshot (memory guard)",
                         key.1
                     );
-                    self.resident_pending = previous;
+                    *pending = previous;
                     return Ok(());
                 }
                 if let Some(resident) = previous {
@@ -1095,12 +1196,13 @@ impl SessionCache {
                 "session cache: resident snapshot copy failed: {error}"
             ));
         }
-        self.resident_pending = Some(Resident {
+        *pending = Some(Resident {
             key,
             buf,
             fixed_bytes,
             rows: live.rows.iter().map(|stream| stream.rows).collect(),
             meta: meta.to_vec(),
+            cold_exact,
         });
         Ok(())
     }
@@ -1138,6 +1240,15 @@ impl SessionCache {
                 self.release_bufs.push(displaced.buf);
             }
         }
+        if let Some(tail) = self.tail_pending.take() {
+            if let Some(displaced) = self.tail.replace(tail) {
+                self.release_bufs.push(displaced.buf);
+            }
+        } else if self.tail.as_ref().is_some_and(|tail| {
+            self.turn.as_ref().is_some_and(|turn| turn.start < tail.key.1 as usize)
+        }) {
+            self.release_bufs.push(self.tail.take().unwrap().buf);
+        }
         self.turn = None;
     }
 
@@ -1172,9 +1283,14 @@ impl SessionCache {
         {
             free_buffer(gpu, snapshot);
         }
-        for resident in [self.resident.take(), self.resident_pending.take()]
-            .into_iter()
-            .flatten()
+        for resident in [
+            self.resident.take(),
+            self.resident_pending.take(),
+            self.tail.take(),
+            self.tail_pending.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             free_device(gpu, resident.buf);
         }
@@ -1503,6 +1619,9 @@ mod tests {
             route: SessionRoute::Mtp,
             boundaries: VecDeque::from([8192, 10000, 16384]),
             end: 16384,
+            lineage: None,
+            pool_capture: true,
+            start: 0,
         });
         assert_eq!(cache.next_boundary(), Some(8192));
         assert_eq!(cache.next_boundary_after(8192), Some(10000));
@@ -1521,6 +1640,9 @@ mod tests {
             route: SessionRoute::Mtp,
             boundaries: VecDeque::from([8192, 10000, 16384]),
             end: 16384,
+            lineage: None,
+            pool_capture: true,
+            start: 0,
         });
         for (position, expected) in [
             (0, Some(8192)),
@@ -1578,6 +1700,7 @@ mod tests {
         fixed: GpuTensor,
         rows: GpuTensor,
         position: usize,
+        tail_snapshot: bool,
     }
 
     impl Toy {
@@ -1627,14 +1750,23 @@ mod tests {
             let mut boundaries: Vec<usize> = (after / STRIDE + 1..=up_to / STRIDE)
                 .map(|k| k * STRIDE)
                 .collect();
-            boundaries.extend(
-                (after..up_to)
-                    .filter(|&i| prompt[i] == MARKER)
-                    .map(|i| i + 1),
-            );
+            if !self.tail_snapshot {
+                boundaries.extend(
+                    (after..up_to)
+                        .filter(|&i| prompt[i] == MARKER)
+                        .map(|i| i + 1),
+                );
+            }
             boundaries.sort_unstable();
             boundaries.dedup();
             boundaries
+        }
+        fn lineage_boundary(&self, prompt: &[u32], after: usize, up_to: usize) -> Option<usize> {
+            if !self.tail_snapshot {
+                return None;
+            }
+            let p = prompt[..up_to].iter().rposition(|&id| id == MARKER)?;
+            (p > after && p % STRIDE != 0 && p / STRIDE == up_to / STRIDE).then_some(p)
         }
         fn snapshot_parts(
             &mut self,
@@ -1780,6 +1912,111 @@ mod tests {
     }
 
     #[test]
+    fn tail_reuses_lcp_preserves_chunk_and_never_publishes_lineage_to_pool() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: 0,
+            tail_snapshot: true,
+        };
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        let tail = STRIDE + 30;
+        let mut a = prompt(1, tail + 6);
+        a[tail] = MARKER;
+        assert_eq!(turn(&mut cache, gpu, &mut toy, &a, true), 0);
+        assert_eq!(cache.resident.as_ref().unwrap().key.1, STRIDE as u64);
+        assert!(cache.resident.as_ref().unwrap().cold_exact);
+        assert_eq!(cache.tail.as_ref().unwrap().key.1, tail as u64);
+        assert!(!cache.tail.as_ref().unwrap().cold_exact);
+        let scope = cache.domain.scoped("toy");
+        assert!(!cache.present(&scope, tail as u64, prefix_fingerprint(&a[..tail])));
+        let pool_bytes = cache.stored_bytes();
+        let chunk_key = cache.resident.as_ref().unwrap().key.clone();
+
+        // Extending the final message changes the very token the tail precedes.
+        let mut b = a[..tail].to_vec();
+        b.extend(prompt(2, 2 * STRIDE));
+        b.push(MARKER);
+        b.extend([7, 8, 9]);
+        assert_eq!(a.iter().zip(&b).take_while(|(a, b)| a == b).count(), tail);
+        assert_eq!(cache.plan(&toy, &b, SessionRoute::Ar), tail);
+        cache.begin(gpu, &mut toy, &b, SessionRoute::Ar, tail).unwrap();
+        assert_eq!(cache.resident.as_ref().unwrap().key, chunk_key);
+        assert_eq!(cache.tail.as_ref().unwrap().key.1, tail as u64);
+        assert!(!cache.turn.as_ref().unwrap().pool_capture);
+        while let Some(p) = cache.next_boundary() {
+            toy.advance(gpu, &b[..p]);
+            cache.at_boundary(gpu, &mut toy, &b[..p]).unwrap();
+            assert!(cache.pending.is_empty());
+        }
+        toy.advance(gpu, &b);
+        cache.commit();
+        assert_eq!(cache.stored_bytes(), pool_bytes);
+        assert!(!cache.resident.as_ref().unwrap().cold_exact);
+        assert_eq!(cache.tail.as_ref().unwrap().key.1, (tail + 2 * STRIDE) as u64);
+
+        // A lineage-derived chunk restore also cannot publish to the pool.
+        let reused = cache.resident.as_ref().unwrap().key.1 as usize;
+        cache.begin(gpu, &mut toy, &b, SessionRoute::Ar, reused).unwrap();
+        assert!(cache.tail.is_none());
+        assert!(!cache.turn.as_ref().unwrap().pool_capture);
+        while let Some(p) = cache.next_boundary() {
+            toy.advance(gpu, &b[..p]);
+            cache.at_boundary(gpu, &mut toy, &b[..p]).unwrap();
+        }
+        cache.commit();
+        assert_eq!(cache.stored_bytes(), pool_bytes);
+        assert!(cache.resident.is_some());
+        assert!(cache.tail.is_some());
+        cache.live_state_reset();
+        assert!(cache.resident.is_none());
+        assert!(cache.resident_pending.is_none());
+        assert!(cache.tail.is_none());
+        assert!(cache.tail_pending.is_none());
+        assert_eq!(cache.release_bufs.len(), 2);
+        cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
+    fn live_without_capture_arms_no_lineage_boundary() {
+        let Ok(mut gpu) = Gpu::init() else {
+            eprintln!("skip: session cache tests require a GPU");
+            return;
+        };
+        let gpu = &mut gpu;
+        let mut toy = Toy {
+            fixed: gpu.alloc_tensor(&[FIXED_BYTES], DType::Raw).unwrap(),
+            rows: gpu
+                .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
+                .unwrap(),
+            position: STRIDE,
+            tail_snapshot: true,
+        };
+        let mut a = prompt(1, STRIDE + 40);
+        a[STRIDE + 30] = MARKER;
+        assert_eq!(toy.lineage_boundary(&a, STRIDE, a.len()), Some(STRIDE + 30));
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        cache.begin_live(gpu, &mut toy, &a, SessionRoute::Ar, STRIDE, false);
+        assert!(cache.turn.is_none());
+        assert_eq!(cache.next_boundary(), None);
+        assert!(cache.tail_pending.is_none());
+        cache.commit();
+        assert!(cache.tail.is_none());
+        cache.clear(gpu);
+        gpu.free_tensor(toy.fixed).unwrap();
+        gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    #[test]
     fn delta_snapshots_restore_exactly_share_prefixes_and_evict_leaves() {
         let Ok(mut gpu) = Gpu::init() else {
             eprintln!("skip: session cache tests require a GPU");
@@ -1794,6 +2031,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         // Every snapshot below holds the fixed part plus one stride of rows.
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
@@ -1853,6 +2091,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         // No pool snapshot fits the budget; only the resident one serves.
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
@@ -1901,6 +2140,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
         let mut cache = SessionCache::new(domain(), 4 * one);
@@ -1942,6 +2182,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
         let mut cache = SessionCache::new(domain(), 64 * one);
@@ -2026,6 +2267,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         let dir = tempfile::tempdir().unwrap();
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
@@ -2178,6 +2420,7 @@ mod tests {
             fixed,
             rows,
             position: 0,
+            tail_snapshot: false,
         };
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
         let mut driver = SessionDriver::new(SessionCache::new(domain(), 8 * one));
@@ -2279,6 +2522,7 @@ mod tests {
                 .alloc_tensor(&[ROW_CAPACITY * ROW_BYTES], DType::Raw)
                 .unwrap(),
             position: 0,
+            tail_snapshot: false,
         };
         let one = layout([FIXED_BYTES, STRIDE * ROW_BYTES]).1 as u64;
         let mut driver = SessionDriver::new(SessionCache::new(domain(), one - 1));

@@ -1921,6 +1921,8 @@ pub(crate) struct ReplicaFingerprint {
     pub(crate) state_format: crate::state::Qwen4StateFormat,
     pub(crate) turn_end_token: Option<u32>,
     pub(crate) turn_snapshots: bool,
+    pub(crate) tail_snapshot: bool,
+    pub(crate) tail_snapshot_min_gap: usize,
     pub(crate) has_mtp: bool,
     pub(crate) has_lanes: bool,
 }

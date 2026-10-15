@@ -113,6 +113,9 @@ fn live_position(
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
 /// when the bundle is assembled. Off by default.
 const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
+/// Lineage-only split before the final message end, read once at assembly.
+const TAIL_SNAPSHOT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT";
+const TAIL_SNAPSHOT_MIN_GAP_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP";
 
 /// The PLE rows owner of a bundle: present exactly when the profile declares
 /// PLE (`config.ple`), so a profile without it holds no row store, hash
@@ -173,6 +176,8 @@ pub struct Qwen4Bundle {
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
+    tail_snapshot: bool,
+    tail_snapshot_min_gap: usize,
     /// The tokenizer's `<|im_end|>` id (`set_turn_end_token`).
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
@@ -291,6 +296,23 @@ impl SessionState for Qwen4Bundle {
             return Vec::new();
         };
         stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
+    }
+
+    fn lineage_boundary(&self, prompt: &[u32], after: usize, up_to: usize) -> Option<usize> {
+        if !self.tail_snapshot {
+            return None;
+        }
+        let chunk = self.spec_chunk_rows()?;
+        let token = self.turn_end_token?;
+        let p = prompt[..up_to].iter().rposition(|&id| id == token)?;
+        if p <= after
+            || p - after.max((p / chunk) * chunk) < self.tail_snapshot_min_gap
+            || up_to / chunk > p / chunk
+            || p % chunk == 0 || self.turn_end_token_active() == Some(prompt[p - 1])
+        {
+            return None;
+        }
+        Some(p)
     }
 
     fn snapshot_parts(
@@ -594,6 +616,11 @@ impl Qwen4Bundle {
             session: None,
             pair_session_stage: None,
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
+            tail_snapshot: hipfire_config::developer_bool(TAIL_SNAPSHOT_ENV, true),
+            tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
             turn_end_token: None,
             state_format,
             lanes: None,
@@ -2645,6 +2672,8 @@ impl Qwen4Bundle {
             state_format: self.state_format,
             turn_end_token: self.turn_end_token,
             turn_snapshots: self.turn_snapshots,
+            tail_snapshot: self.tail_snapshot,
+            tail_snapshot_min_gap: self.tail_snapshot_min_gap,
             has_mtp: self.mtp.is_some(),
             has_lanes: self.lanes.is_some(),
         }
@@ -2697,10 +2726,10 @@ impl Qwen4Bundle {
     pub(crate) fn spec_advance_session_boundary(
         &mut self,
         gpu: &mut Gpu,
-        prefix: &[u32],
+        position: usize,
     ) -> Result<(), BundleError> {
         if self.session.as_ref().and_then(SessionDriver::turn_route) == Some(SessionRoute::Ar) {
-            self.session_at_boundary(gpu, prefix)?;
+            self.publish_pair_session_boundary(gpu, position)?;
         }
         Ok(())
     }
