@@ -8771,6 +8771,88 @@ mod tests {
         assert_eq!(gpu.vmm_allocation_count(), 0);
     }
 
+    /// Nonzero, step-dependent byte pattern for the VMM growth tests.
+    fn vmm_grow_pattern(step: usize, index: usize) -> u8 {
+        ((index * 131 + step * 17 + 7) % 251) as u8 + 1
+    }
+
+    /// Several growth steps (whole-segment `grow_vmm_tensor` and granule
+    /// `grow_vmm_tensor_granules`) over one arena: every step maps exactly the
+    /// requested bytes, the fresh range reads zero after the owner's zeroing
+    /// memset (the `grow_context_arena` contract), and every earlier step's
+    /// bytes survive each later growth.
+    #[test]
+    fn vmm_grow_steps_preserve_prior_bytes_and_zero_fresh() {
+        use hip_bridge::DeviceBuffer;
+        let Some((mut gpu, _guard)) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        for granules in [false, true] {
+            let Ok(granularity) = gpu.vmm_recommended_granularity() else {
+                eprintln!("skip: VMM unavailable");
+                return;
+            };
+            let unit = (2usize << 20).next_multiple_of(granularity);
+            let steps = [1usize, 2, 1, 3, 1, 2];
+            let total: usize = steps.iter().sum::<usize>() * unit;
+            let mut tensor = match unsafe { gpu.alloc_vmm_tensor(&[total], DType::Raw, 0, &access) }
+            {
+                Ok(tensor) => tensor,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+            let view = |t: &super::GpuTensor, bytes: usize| unsafe {
+                DeviceBuffer::from_raw(t.buf.as_ptr(), bytes)
+            };
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut mapped = 0usize;
+            for (step, units) in steps.iter().enumerate() {
+                let bytes = units * unit;
+                let grown = if granules {
+                    gpu.grow_vmm_tensor_granules(&mut tensor, bytes, &access)
+                } else {
+                    gpu.grow_vmm_tensor(&mut tensor, bytes, &access)
+                }
+                .expect("grow step");
+                assert_eq!(grown, mapped + bytes, "step {step} mapped bytes");
+                assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(grown));
+
+                // The grower's zeroing contract: memset exactly the fresh range.
+                let fresh = view(&tensor, grown).byte_view(mapped, bytes);
+                gpu.hip.memset(&fresh, 0, bytes).expect("zero fresh range");
+                let mut read = vec![0xA5u8; bytes];
+                gpu.hip.memcpy_dtoh(&mut read, &fresh).expect("read fresh");
+                assert!(
+                    read.iter().all(|b| *b == 0),
+                    "granules={granules} step {step}: fresh range is not zero"
+                );
+                let pattern: Vec<u8> = (0..bytes).map(|i| vmm_grow_pattern(step, i)).collect();
+                gpu.hip.memcpy_htod(&fresh, &pattern).expect("fill fresh");
+                ranges.push((mapped, bytes));
+                mapped = grown;
+
+                for (prior, &(offset, len)) in ranges.iter().enumerate() {
+                    let mut got = vec![0u8; len];
+                    gpu.hip
+                        .memcpy_dtoh(&mut got, &view(&tensor, mapped).byte_view(offset, len))
+                        .expect("read prior range");
+                    assert!(
+                        got.iter()
+                            .enumerate()
+                            .all(|(i, b)| *b == vmm_grow_pattern(prior, i)),
+                        "granules={granules}: step {prior} bytes changed by growth step {step}"
+                    );
+                }
+            }
+            gpu.free_tensor(tensor).expect("free tensor");
+        }
+    }
+
     /// Alloc→init failure must return the owner to the pool. Baseline is taken
     /// after a successful public warm so first-touch `total_new` sits outside the
     /// measured window; a leaked owner still forces a fresh malloc on retry.

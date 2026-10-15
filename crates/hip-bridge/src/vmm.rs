@@ -872,20 +872,30 @@ impl VmmArena {
         // 4 KiB offsets (for example base+16 KiB). Reapplying access from the
         // reservation base over the contiguous mapped prefix is accepted and
         // also ensures newly-added peer devices gain access to older segments.
+        // With >= 2 MiB granularity and no new peer device only the new range
+        // is set (`access_start`).
+        let access_start = self.access_start(&next_access_devices, self.mapped_bytes);
         if let Err(err) = take_fault(VmmFaultKind::AccessReset).map_or_else(
-            // SAFETY: `self.base..+next_mapped` is the contiguous mapped prefix
-            // (just extended by mem_map); `access` lists only owner/peer devices
-            // already validated for peer access.
-            || unsafe { hip.mem_set_access(self.base, next_mapped, &access) },
+            // SAFETY: `access_start..next_mapped` is mapped (just extended by
+            // mem_map; `access_start <= mapped_bytes`); `access` lists only
+            // owner/peer devices already validated for peer access.
+            || unsafe {
+                hip.mem_set_access(
+                    offset_ptr(self.base, access_start),
+                    next_mapped - access_start,
+                    &access,
+                )
+            },
             Err,
         ) {
             let err = HipError {
                 code: err.code,
                 message: format!(
-                    "{}; VMM access prefix base=0x{:x} size={} (new segment address=0x{:x} offset={} size={}) granularity={}",
+                    "{}; VMM access range base=0x{:x} offset={} size={} (new segment address=0x{:x} offset={} size={}) granularity={}",
                     err.message,
                     self.base as usize,
-                    next_mapped,
+                    access_start,
+                    next_mapped - access_start,
                     address as usize,
                     self.mapped_bytes,
                     size,
@@ -1117,7 +1127,14 @@ impl VmmArena {
             }
             offset += size;
         }
-        if let Err(err) = self.apply_access(hip, next_mapped, &access, self.mapped_bytes, bytes) {
+        if let Err(err) = self.apply_access(
+            hip,
+            next_mapped,
+            &access,
+            &next_access_devices,
+            self.mapped_bytes,
+            bytes,
+        ) {
             return Err(self.abort_granule_map(hip, staged, err));
         }
 
@@ -1204,7 +1221,14 @@ impl VmmArena {
             }
             offset += size;
         }
-        if let Err(err) = self.apply_access(hip, prefix_bytes, &access, 0, prefix_bytes) {
+        if let Err(err) = self.apply_access(
+            hip,
+            prefix_bytes,
+            &access,
+            &next_access_devices,
+            0,
+            prefix_bytes,
+        ) {
             return Err(self.abort_granule_map(hip, staged, err));
         }
 
@@ -1275,30 +1299,65 @@ impl VmmArena {
         Ok((next_access_devices, access))
     }
 
-    /// One `hipMemSetAccess` from the reservation base over the mapped prefix
-    /// `[0, next_mapped)` (see `map_next` for why it always starts at the base).
+    /// Offset the post-map `hipMemSetAccess` starts at. `new_offset` (just the
+    /// new range) only when the earlier mapped prefix already carries exactly
+    /// the requested access: no device was added, so its permissions are
+    /// unchanged, and the device allocation granularity is at least 2 MiB.
+    /// The gfx1100 ROCm 7.2 failure at 4 KiB subranges (see `map_next`) is
+    /// documented only for smaller granularities, so those, and any growth
+    /// that adds a peer device, keep the whole-prefix call from the base.
+    /// Whole-prefix `hipMemSetAccess` cost grows with the number of mapped
+    /// segments (measured on gfx1201: 0.03 ms with 1 segment mapped, 0.9 ms
+    /// with 512 one-granule segments), so small repeated growth would
+    /// otherwise be quadratic. HIP only requires the range to start at a
+    /// mapped sub-buffer and end on a sub-buffer boundary
+    /// (`ValidateSubBufferCoverage` in `hip_vm.cpp`); a new range starting at
+    /// the previous segment's end satisfies that.
+    fn access_start(&self, next_access_devices: &[i32], new_offset: usize) -> usize {
+        if self.granularity >= GRANULE_MIN_BYTES
+            && next_access_devices.len() == self.access_devices.len()
+        {
+            new_offset
+        } else {
+            0
+        }
+    }
+
+    /// One `hipMemSetAccess` over `[access_start, next_mapped)`: the whole
+    /// mapped prefix from the base by default (see `map_next` for why), only
+    /// the new range when [`Self::access_start`] allows it.
     fn apply_access(
         &self,
         hip: &HipRuntime,
         next_mapped: usize,
         access: &[HipMemAccessDesc],
+        next_access_devices: &[i32],
         new_offset: usize,
         new_size: usize,
     ) -> HipResult<()> {
+        let start = self.access_start(next_access_devices, new_offset);
         take_fault(VmmFaultKind::AccessReset)
             .map_or_else(
-                // SAFETY: `self.base..+next_mapped` is the contiguous mapped
-                // prefix (the caller just mapped `[new_offset, +new_size)` at its
-                // end); `access` lists only owner/peer devices already validated
-                // for peer access.
-                || unsafe { hip.mem_set_access(self.base, next_mapped, access) },
+                // SAFETY: `start..next_mapped` is mapped (the caller just mapped
+                // `[new_offset, +new_size)` at the prefix end and `start <=
+                // new_offset`); `access` lists only owner/peer devices already
+                // validated for peer access.
+                || unsafe {
+                    hip.mem_set_access(offset_ptr(self.base, start), next_mapped - start, access)
+                },
                 Err,
             )
             .map_err(|err| HipError {
                 code: err.code,
                 message: format!(
-                    "{}; VMM access prefix base=0x{:x} size={} (new granules offset={} size={}) granularity={}",
-                    err.message, self.base as usize, next_mapped, new_offset, new_size, self.granularity,
+                    "{}; VMM access range base=0x{:x} offset={} size={} (new granules offset={} size={}) granularity={}",
+                    err.message,
+                    self.base as usize,
+                    start,
+                    next_mapped - start,
+                    new_offset,
+                    new_size,
+                    self.granularity,
                 ),
                 context: err.context,
             })
@@ -1655,6 +1714,31 @@ mod tests {
 
     fn forget_global(id: VmmPhysicalId) {
         granule_table().drop_lease(id, &mut |_| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn access_start_is_the_new_range_only_for_unchanged_devices_at_2mib() {
+        const MIB: usize = 1 << 20;
+        let mut arena = host_arena(Vec::new());
+        arena.access_devices = vec![0];
+        arena.granularity = 2 * MIB;
+        // Default (>= 2 MiB, no added peer): only the new range.
+        assert_eq!(arena.access_start(&[0], 6 * MIB), 6 * MIB);
+        arena.granularity = 4 * MIB;
+        assert_eq!(arena.access_start(&[0], 8 * MIB), 8 * MIB);
+        // Small-page granularity keeps the whole-prefix call from the base.
+        arena.granularity = 4096;
+        assert_eq!(arena.access_start(&[0], 6 * MIB), 0);
+        arena.granularity = 2 * MIB - 4096;
+        assert_eq!(arena.access_start(&[0], 6 * MIB), 0);
+        // An added peer device must reach the older segments: whole prefix.
+        arena.granularity = 2 * MIB;
+        assert_eq!(arena.access_start(&[0, 1], 6 * MIB), 0);
+        // A never-mapped arena (first map, or a shared-prefix map at offset 0).
+        arena.access_devices = Vec::new();
+        assert_eq!(arena.access_start(&[0], 0), 0);
+        arena.access_devices = vec![0];
+        assert_eq!(arena.access_start(&[0], 0), 0);
     }
 
     #[test]
