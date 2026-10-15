@@ -196,9 +196,10 @@ Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
 (`gpu_forward.rs`):
 
 - `HIPFIRE_EP_BALANCED_OWNERS`: balanced per-call expert ownership on the
-  host-mapped trunk MoE layers. It ships for exact gfx1201 only; a gfx1100 rank
-  logs `balanced ownership not admitted (needs gfx1201); static split` and runs
-  the exact static split.
+  host-mapped trunk MoE layers. It ships for exact gfx1201 at 2..=4 ranks only;
+  a gfx1100 rank logs `balanced ownership not admitted (needs gfx1201); static
+  split`, a gfx1201 rank at 5..=8 ranks `... (needs at most 4 ranks); static
+  split`, and both run the exact static split.
 - `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
   A prefill chunk of at least 512 rows computes only its owned expert tiles and
   pulls the other ranks' down rows over P2P, instead of computing every expert

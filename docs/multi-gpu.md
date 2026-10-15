@@ -316,7 +316,7 @@ capture).
 | | exact gfx1201 (R9700), N = 2..=8 | exact gfx1100 (7900 XTX), N = 2..=8 |
 |---|---|---|
 | Load / decode / verify / native MTP (`--spec mtp`) | Admitted (opt-in, experimental) | Admitted (opt-in, experimental) |
-| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
+| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP at N = 2..=4; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0`. At N = 5..=8 **not admitted** (the certified owner-assign kernel covers 2..=4 ranks): each rank logs `balanced ownership not admitted (needs at most 4 ranks); static split` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
 | Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0`. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same default and kill switch. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
 | Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (`expert staging not admitted (needs gfx1201)`) |
 
@@ -421,7 +421,7 @@ slowest link. There is no host-staged fallback: if any directed card pair is
 not peer-accessible, the load refuses. The community gate below records each
 card's PCIe link speed and width and the P2P topology in its receipt.
 
-### Flash-Next EP: balanced expert ownership (default on under EP on gfx1201; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
+### Flash-Next EP: balanced expert ownership (default on under EP on gfx1201 at 2..=4 ranks; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
 
 Under Flash-Next (Qwen4) expert parallelism rank `r` owns routed expert `e`
 when `e % ranks == r`. On the trunk layers whose experts live in pinned host
@@ -449,10 +449,12 @@ forwards (more than 8 rows) and the MTP head keep the static split. With
 added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
-Balanced ownership is admitted on exact gfx1201 only (the per-call owner-assign
-kernel ships for that arch). On gfx1100 each rank logs `qwen4 EP rank r/n:
-balanced ownership not admitted (needs gfx1201); static split`, builds nothing,
-and runs the static `e % ranks` split, which is exact.
+Balanced ownership is admitted on exact gfx1201 at 2..=4 ranks only (the
+per-call owner-assign kernel ships for that arch and its certified contract
+covers 2..=4 ranks). On gfx1100 each rank logs `qwen4 EP rank r/n: balanced
+ownership not admitted (needs gfx1201); static split`, and on gfx1201 at 5..=8
+ranks `... (needs at most 4 ranks); static split`; either way the rank builds
+nothing and runs the static `e % ranks` split, which is exact.
 
 ### Flash-Next EP: owner-routed prefill chunks (default on under EP; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
 
@@ -597,7 +599,7 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1..=8`); **not** `--tp` |
 | `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
 | `HIPFIRE_EMULATE_GPUS` | Developer-only logical rank aliasing (integer `>=2`); also maps Flash-Next EP rank `r` to physical device `r % count` (see [emulation](#flash-next-qwen4-ep-under-emulation)) |
-| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 only; other arches keep the exact static split); on under EP, exact `0` disables |
+| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 at 2..=4 ranks only; other arches and larger N keep the exact static split); on under EP, exact `0` disables |
 | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP (N = 2..=8): owner-routed prefill chunks on gfx1201 and gfx1100; on under EP, exact `0` disables |
 | `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP: long-prefill expert staging (gfx1201 only); on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |

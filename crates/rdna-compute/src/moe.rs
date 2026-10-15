@@ -3126,8 +3126,10 @@ impl Gpu {
                 self.arch
             ));
         }
-        if !(2..=4).contains(&ranks) || self_rank >= ranks {
-            return refuse("ranks must be 2..=4 and self_rank < ranks");
+        if !(2..=QWEN4_EP_OWNER_ASSIGN_MAX_RANKS).contains(&ranks) || self_rank >= ranks {
+            return refuse(&format!(
+                "ranks must be 2..={QWEN4_EP_OWNER_ASSIGN_MAX_RANKS} and self_rank < ranks"
+            ));
         }
         if slots == 0 || slots > QWEN4_EP_OWNER_EXPERTS {
             return refuse("slots must be 1..=512");
@@ -3214,6 +3216,10 @@ pub const QWEN4_EP_OWNER_ASSIGN_PM_SYMBOL: &str = "qwen4_ep_owner_assign_pm_gfx1
 pub fn qwen4_ep_owner_assign_pm_arch(arch: &str) -> bool {
     arch == "gfx1201"
 }
+
+/// Largest rank count the certified balanced-ownership kernel covers (its
+/// contract is `2..=4` ranks); larger EP degrees run the exact static split.
+pub const QWEN4_EP_OWNER_ASSIGN_MAX_RANKS: usize = 4;
 
 /// Module key (and device symbol: the builder names both alike) of the embedded certified
 /// builder (PeaceMaker) image of [`Gpu::ep_tile_mask`] (`peacemaker-isa emit --kernel

@@ -1449,8 +1449,9 @@ impl Qwen4Bundle {
                 .map_err(|error| format!("attach EP tables: {error}"))
                 .and_then(|()| match forward.balanced_plan() {
                     // Default on (`HIPFIRE_EP_BALANCED_OWNERS=0` disables) with a
-                    // host-mapped layer on gfx1201; other arches run the exact
-                    // static split (`attach_ep` builds no balanced layers).
+                    // host-mapped layer on gfx1201 at 2..=4 ranks; other arches and
+                    // more ranks run the exact static split (`attach_ep` builds no
+                    // balanced layers).
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
                 });

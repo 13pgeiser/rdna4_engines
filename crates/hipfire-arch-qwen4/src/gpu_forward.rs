@@ -1456,11 +1456,20 @@ fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
-/// The per-call owner assignment (`qwen4_ep_owner_assign_pm`) ships for exact
-/// gfx1201 only. Elsewhere (gfx1100) balanced ownership is not admitted: the
-/// static `e % N` split is exact, so the rank simply runs without it.
-pub(crate) fn qwen4_ep_balanced_owners_arch_admitted(arch: &str) -> bool {
-    rdna_compute::moe::qwen4_ep_owner_assign_pm_arch(arch)
+/// Why an EP rank does not run balanced ownership, or `None` when it does. The
+/// per-call owner assignment (`qwen4_ep_owner_assign_pm`) ships for exact
+/// gfx1201 and at most [`rdna_compute::moe::QWEN4_EP_OWNER_ASSIGN_MAX_RANKS`]
+/// ranks only. Elsewhere (gfx1100, or more ranks) balanced ownership is not
+/// admitted: the static `e % N` split is exact, so the rank simply runs without it.
+pub(crate) fn qwen4_ep_balanced_owners_refusal(arch: &str, ranks: usize) -> Option<String> {
+    let max_ranks = rdna_compute::moe::QWEN4_EP_OWNER_ASSIGN_MAX_RANKS;
+    if !rdna_compute::moe::qwen4_ep_owner_assign_pm_arch(arch) {
+        Some("needs gfx1201".to_string())
+    } else if ranks > max_ranks {
+        Some(format!("needs at most {max_ranks} ranks"))
+    } else {
+        None
+    }
 }
 
 /// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP, N = 2..=8; `=0` is the kill switch):
@@ -5413,13 +5422,15 @@ impl Qwen4GpuForward {
         }
         let config = &bundle.config;
         let mut balanced_on = qwen4_ep_balanced_owners_enabled();
-        if balanced_on && !qwen4_ep_balanced_owners_arch_admitted(&gpu.arch) {
-            // Nothing is built, allocated or loaded: the static split is exact.
-            eprintln!(
-                "qwen4 EP rank {}/{}: balanced ownership not admitted (needs gfx1201); static split",
-                placement.rank, placement.ranks
-            );
-            balanced_on = false;
+        if balanced_on {
+            if let Some(reason) = qwen4_ep_balanced_owners_refusal(&gpu.arch, placement.ranks) {
+                // Nothing is built, allocated or loaded: the static split is exact.
+                eprintln!(
+                    "qwen4 EP rank {}/{}: balanced ownership not admitted ({reason}); static split",
+                    placement.rank, placement.ranks
+                );
+                balanced_on = false;
+            }
         }
         let dummy = ep.dummy.source();
         let layer_peers_of = |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
@@ -8274,10 +8285,24 @@ mod tests {
     }
 
     #[test]
-    fn balanced_owners_are_admitted_on_gfx1201_only() {
-        assert!(super::qwen4_ep_balanced_owners_arch_admitted("gfx1201"));
+    fn balanced_owners_are_admitted_on_gfx1201_up_to_four_ranks() {
+        for ranks in 2..=4 {
+            assert_eq!(super::qwen4_ep_balanced_owners_refusal("gfx1201", ranks), None);
+        }
+        for ranks in 5..=8 {
+            assert_eq!(
+                super::qwen4_ep_balanced_owners_refusal("gfx1201", ranks).as_deref(),
+                Some("needs at most 4 ranks")
+            );
+        }
         for arch in ["gfx1100", "gfx1151", "gfx1030", "gfx942", ""] {
-            assert!(!super::qwen4_ep_balanced_owners_arch_admitted(arch), "{arch:?}");
+            for ranks in [2, 6] {
+                assert_eq!(
+                    super::qwen4_ep_balanced_owners_refusal(arch, ranks).as_deref(),
+                    Some("needs gfx1201"),
+                    "{arch:?}"
+                );
+            }
         }
     }
 
