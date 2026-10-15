@@ -190,6 +190,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
         add!("qsa_filter_select", kernels::QSA_FILTER_SELECT_SRC,
             ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"]);
+        add!("qsa_bf16_scores", kernels::QSA_BF16_SCORES_SRC,
+            ["indexed_attention_select_scores_rows8_bf16", "indexed_attention_select_scores_rows16_bf16"]);
     }
 
     // Common Qwen3.5 kernels (historical whole-model precompile set).
@@ -1882,10 +1884,11 @@ mod tests {
         // the O4×R8 pipe gate/up twin `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe`
         // (gfx1151-routed, likewise packaged) and the Gemma 4 decode twins
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
-        // and the exact sampled-filter QSA module `qsa_filter_select`
+        // and the exact sampled-filter QSA module `qsa_filter_select`, plus the
+        // portable BF16 rows8/rows16 QSA score module `qsa_bf16_scores`
         // and the Flash-Next expert-slab K1 lane-union planner `qwen4_slab_union_plan`
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 153, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 154, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(
