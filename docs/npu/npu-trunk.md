@@ -721,7 +721,10 @@ stay the bit-exact comparable pair.
 * **Per-request families.** All four families (qkv, zab, q, kvidx) are packed at
   load under `auto`. At request start the planner picks the fastest family subset
   for the request's rows from the snapshot (`choose_families`), then plans the
-  pairs with it. A subset runs a contiguous panel range of the packed chains
+  pairs with it. Both use `plan_executable`: the planner without its single-chunk split
+  and re-banked options, which the executor cannot run (under learned scales the
+  re-banked plan can win the model by a fraction of a percent and would otherwise
+  be projected to GPU chunks). A subset runs a contiguous panel range of the packed chains
   (`ColumnMap::panel_range`), so no repacking happens per request; the rest of the
   fused projection runs on the GPU. Developer variable
   `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` (comma list of `qkv,zab,q,kvidx`, or `all`)

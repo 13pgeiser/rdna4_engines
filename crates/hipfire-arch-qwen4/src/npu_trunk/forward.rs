@@ -1320,7 +1320,7 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
 /// The request's executable plan. `auto` arms it from the crossover `n_star`; the forced modes (`on`, `emulate`)
 /// take the planner's pairs from the first row.
 fn request_plan(cal: &trunk::Calibration, mode: NpuTrunkMode, families: FamilyMask, n_star: Option<usize>, rows: usize) -> trunk::Plan {
-    let planned = trunk::plan(cal, families, rows);
+    let planned = trunk::plan_executable(cal, families, rows);
     let armed = if families.is_empty() { None } else { armed_from(mode, n_star) };
     trunk::executable_plan_for(cal, families, &planned, rows, armed)
 }

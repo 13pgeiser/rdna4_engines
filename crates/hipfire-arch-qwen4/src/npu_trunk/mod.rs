@@ -23,7 +23,7 @@ pub use calibration::{
 };
 pub use plan::{
     bank_segments, bank_segments_moved, contention_extra, crossover, gpu_chunk, load_log_line, npu_ms,
-    pair_time, pair_time_moved, plan, plan_moved,
+    pair_time, pair_time_moved, plan, plan_executable, plan_moved,
     request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, Moved, PairTime, Plan,
     SelectionReport, SelectionRow, Step, CHUNK, SELECTION_ROWS,
     auto_admission, executable_plan, executable_plan_for, planned_pair, planned_pair_rows,

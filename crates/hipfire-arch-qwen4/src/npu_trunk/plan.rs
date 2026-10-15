@@ -178,6 +178,15 @@ pub fn plan(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
     plan_moved(cal, Moved::from(families), rows)
 }
 pub fn plan_moved(cal: &Calibration, moved: Moved, rows: usize) -> Plan {
+    plan_with(cal, moved, rows, false)
+}
+/// `plan` restricted to what the executor runs: natural 8192 + B pairs and the rebalanced last pair. The single-chunk
+/// split and the re-banked plan are skipped, so a request never gets a plan whose pairs `executable_plan` would
+/// project back to GPU chunks (with live rate scales the re-banked plan can win the model by a fraction of a percent).
+pub fn plan_executable(cal: &Calibration, families: FamilyMask, rows: usize) -> Plan {
+    plan_with(cal, Moved::from(families), rows, true)
+}
+fn plan_with(cal: &Calibration, moved: Moved, rows: usize, executable_only: bool) -> Plan {
     let len = rows.div_ceil(CHUNK);
     let g: Vec<_> = (0..len).map(|i| gpu_chunk(cal, (rows - i * CHUNK).min(CHUNK), i * CHUNK).total).collect();
     let t_gpu_ms = g.iter().sum();
@@ -209,7 +218,7 @@ pub fn plan_moved(cal: &Calibration, moved: Moved, rows: usize) -> Plan {
             choice[len] = Choice { consumed: 2, split: Some(h1) };
         }
     }
-    if len == 1 && rows >= 2 * cal.gpu.min_bank_rows {
+    if !executable_only && len == 1 && rows >= 2 * cal.gpu.min_bank_rows {
         let h1 = half(rows);
         let t = pair_time_moved(cal, moved, h1, 0, rows - h1, h1).t + cal.gpu.boundary_tax_ms;
         if beats(cal, t, g[0]) && t < best[1] {
@@ -218,7 +227,7 @@ pub fn plan_moved(cal: &Calibration, moved: Moved, rows: usize) -> Plan {
         }
     }
     let nb = 2 * rows.div_ceil(2 * CHUNK);
-    if len >= 2 && nb > 0 && rows / nb >= cal.gpu.min_bank_rows {
+    if !executable_only && len >= 2 && nb > 0 && rows / nb >= cal.gpu.min_bank_rows {
         let size = (rows / nb).div_ceil(64) * 64;
         let last = rows as isize - (size * (nb - 1)) as isize;
         // Python can construct a nonpositive final bank for very small banks;

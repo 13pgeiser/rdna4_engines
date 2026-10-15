@@ -3,7 +3,7 @@
 //! learn a GPU-window scale and an NPU-chain scale that multiply the prior's terms (`scaled_calibration`).
 //! Forced modes (`on`, `emulate`) never use the estimator: they plan from the static calibration only.
 use super::calibration::FAMILY_NAMES;
-use super::plan::{bank_segments_moved, contention_extra, gpu_chunk, plan, subset_mask};
+use super::plan::{bank_segments_moved, contention_extra, gpu_chunk, plan_executable, subset_mask};
 use super::{Calibration, FamilyMask, Moved};
 
 /// Weight of a new sample in the scale EWMAs.
@@ -175,7 +175,7 @@ pub fn scaled_calibration(prior: &Calibration, gpu_scale: f64, npu_scale: f64) -
     cal
 }
 
-/// Fastest group subset of `allowed` for a `rows`-row request: the minimum `plan(cal, subset, rows).t_pipe_ms` over
+/// Fastest group subset of `allowed` for a `rows`-row request: the minimum `plan_executable(cal, subset, rows).t_pipe_ms` over
 /// the 15 `select_families` subsets that lie within `allowed` and whose families are `selectable`. Ties go to fewer
 /// families, then `select_families`' name order. `FamilyMask::NONE` when no subset's `t_pipe_ms` is below its `t_gpu_ms`.
 pub fn choose_families(cal: &Calibration, allowed: FamilyMask, rows: usize) -> FamilyMask {
@@ -188,7 +188,7 @@ pub fn choose_families(cal: &Calibration, allowed: FamilyMask, rows: usize) -> F
         let subset = subset_mask(bits);
         if subset.bits() & !allowed.bits() != 0 { continue; }
         if !FAMILY_NAMES.iter().enumerate().all(|(i, name)| bits & (1 << i) == 0 || cal.families[*name].selectable) { continue; }
-        let p = plan(cal, subset, rows);
+        let p = plan_executable(cal, subset, rows);
         if p.t_pipe_ms >= p.t_gpu_ms { continue; }
         let key = (p.t_pipe_ms, bits.count_ones() as usize, names(bits));
         let better = best.as_ref().is_none_or(|(t, count, order, _)| {
@@ -203,6 +203,7 @@ pub fn choose_families(cal: &Calibration, allowed: FamilyMask, rows: usize) -> F
 mod tests {
     use super::*;
     use super::super::Family;
+    use super::super::plan::{executable_plan_for, plan, Step};
 
     const ROUTE: &str = "overlay:gfx1151-zab-v1";
     fn builtin() -> Calibration {
@@ -390,5 +391,24 @@ mod tests {
         let qsa_only = choose_families(&prior, FamilyMask::QSA, 16384);
         assert_eq!(qsa_only.bits() & !FamilyMask::QSA.bits(), 0);
         assert_eq!(choose_families(&prior, FamilyMask::NONE, 16384), FamilyMask::NONE);
+    }
+
+    #[test]
+    fn scaled_requests_plan_executable_pairs_where_the_rebanked_model_wins() {
+        // Halo gate, cand-auto r1: after one 16K pair the scales were gpu x0.981 / npu x0.892, and the full model
+        // preferred the re-banked plan for 57,552 rows, which the executor projects to GPU chunks: the request ran
+        // GPU-only. Request planning uses `plan_executable`, which keeps the natural and rebalanced pairs.
+        let cal = scaled_calibration(&builtin(), 0.981, 0.892);
+        let rows = 57_552;
+        let pipes = |p: &super::super::Plan| p.steps.iter().filter(|s| matches!(s, Step::Pipe { .. })).count();
+        let full = executable_plan_for(&cal, FamilyMask::ALL, &plan(&cal, FamilyMask::ALL, rows), rows, Some(0));
+        assert_eq!(pipes(&full), 0, "the re-banked model plan has no executable pair");
+        let natural = plan_executable(&cal, FamilyMask::ALL, rows);
+        let executable = executable_plan_for(&cal, FamilyMask::ALL, &natural, rows, Some(0));
+        assert_eq!(pipes(&executable), 4);
+        assert!(executable.t_pipe_ms < executable.t_gpu_ms);
+        // The unscaled prior plans the same pairs either way.
+        let prior = builtin();
+        assert_eq!(plan(&prior, FamilyMask::ALL, rows), plan_executable(&prior, FamilyMask::ALL, rows));
     }
 }
