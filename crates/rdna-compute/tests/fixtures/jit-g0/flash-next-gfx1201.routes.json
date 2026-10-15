@@ -2042,7 +2042,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "366af7dbc662ce1f3ad7985589a3d4275f9d11ddcfbcabae9bf9feafe4ec76bd",
+      "sha256": "d36c19d027c49dd1a1a95053628f4ca11e25944f07cce0518f7505eb976f9758",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",
@@ -4329,7 +4329,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "366af7dbc662ce1f3ad7985589a3d4275f9d11ddcfbcabae9bf9feafe4ec76bd",
+          "sha256": "d36c19d027c49dd1a1a95053628f4ca11e25944f07cce0518f7505eb976f9758",
           "symbols": [
             "qwen4_moe_group_prefix",
             "qwen4_moe_group_ranks",
