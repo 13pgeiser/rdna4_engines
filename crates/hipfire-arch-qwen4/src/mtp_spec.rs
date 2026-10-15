@@ -560,9 +560,10 @@ impl SpecTarget for Qwen4Bundle {
             .max_chunk;
         self.begin_npu_trunk_request(gpu)
             .map_err(|error| error.to_string())?;
+        let plan_end = self.session_lineage_after(start_pos).map_or(end_pos, |p| p.min(end_pos));
         if let Some(forward) = &mut self.execution {
             forward
-                .plan_npu_trunk_request(gpu, tokens.len(), start_pos)
+                .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
                 .map_err(|error| error.to_string())?;
         }
         let mut offset = 0usize;

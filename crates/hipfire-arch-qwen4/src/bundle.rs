@@ -1112,6 +1112,17 @@ impl Qwen4Bundle {
         self.session.as_ref()?.next_boundary_after(position)
     }
 
+    /// The turn's armed lineage split row strictly after `position`. A prefill
+    /// pair group ends there and the NPU request is planned through it: the
+    /// pair executor carries one interior snapshot row, so a split inside a
+    /// group that already holds one would drop the whole group to GPU tiles.
+    pub(crate) fn session_lineage_after(&self, position: usize) -> Option<usize> {
+        self.session
+            .as_ref()?
+            .turn_lineage()
+            .filter(|&p| p > position)
+    }
+
     /// Banks and snapshot cut of the planned pair starting at `position`, the
     /// geometry both the pair executor and the MTP head appends follow.
     pub(crate) fn npu_trunk_pair_shape(
@@ -1132,6 +1143,9 @@ impl Qwen4Bundle {
     }
 
     pub(crate) fn prefill_schedule_rows(&self, position: usize, end: usize, chunk: usize) -> usize {
+        let end = self
+            .session_lineage_after(position)
+            .map_or(end, |p| p.min(end));
         let next = self.session_next_boundary();
         let boundaries = crate::gpu_forward::SessionBoundaries {
             next,
@@ -2740,9 +2754,12 @@ impl Qwen4Bundle {
             ))),
         };
         if result.is_ok() {
+            let end = self
+                .session_lineage_after(reused)
+                .map_or(prompt.len(), |p| p.min(prompt.len()));
             if let Some(forward) = &mut self.execution {
                 forward
-                    .plan_npu_trunk_request(gpu, prompt.len() - reused, reused)
+                    .plan_npu_trunk_request(gpu, end - reused, reused)
                     .map_err(|error| BundleError::Forward(error.to_string()))?;
             }
         }

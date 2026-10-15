@@ -1599,6 +1599,20 @@ mod tests {
             }
         }
     }
+    /// A lineage split p inside a pair group that already holds a snapshot row
+    /// (32K prime: 24576 and p = 32001 in 16384..32010) is a second interior row,
+    /// which drops the group to GPU tiles. The bundle plans and schedules through
+    /// p instead, so the group ends at p, keeps its one cut, and only the template
+    /// tail past p runs as a tile.
+    #[test] fn lineage_split_ends_the_pair_group() {
+        let (p, end) = (32001, 32010);
+        let boundaries = SessionBoundaries { next: Some(24576), after: Some(p) };
+        assert_eq!(qwen4_prefill_segment_rows(16384, end, 8192, boundaries, true), 8192);
+        assert_eq!(qwen4_prefill_segment_rows(16384, p, 8192, boundaries, true), p - 16384);
+        let shape = PairShape::new([7872, p - 16384 - 7872], 16384, Some(24576));
+        assert_eq!(shape.site(), CutSite::Bank { bank: 1, row: 24576 - 16384 - 7872 });
+        assert_eq!(qwen4_prefill_segment_rows(p, end, 8192, SessionBoundaries::default(), false), end - p);
+    }
     #[test] fn pair_shape_splits_banks_and_cut_sites() {
         // 9,319 rows rebalanced; the default cache's snapshot at 8192 falls in bank B.
         let shape = PairShape::new([4672, 4647], 0, Some(8192));

@@ -998,6 +998,13 @@ impl SessionCache {
             .find(|&p| p > position)
     }
 
+    /// The turn's lineage split row (the tail resident's boundary), if armed.
+    /// A pipelined architecture ends a pair group there instead of carrying it
+    /// as a second interior row.
+    pub fn turn_lineage(&self) -> Option<usize> {
+        self.turn.as_ref()?.lineage
+    }
+
     /// The live state reached `prefix.len()`, the boundary
     /// [`Self::next_boundary`] returned; capture it (pending until commit) as
     /// a delta over the deepest snapshot of a shorter prefix still present,
@@ -1541,6 +1548,11 @@ impl SessionDriver {
     /// The first still-pending boundary strictly after `position`.
     pub fn next_boundary_after(&self, position: usize) -> Option<usize> {
         self.cache.next_boundary_after(position)
+    }
+
+    /// The lineage split row of the request in flight, if armed.
+    pub fn turn_lineage(&self) -> Option<usize> {
+        self.cache.turn_lineage()
     }
 
     /// The route of the request in flight.
