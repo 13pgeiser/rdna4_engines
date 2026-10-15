@@ -47,7 +47,7 @@ kept for provenance and are not current recommendations.
   `emulate`) plan from the static calibration only, so `on` == `emulate` stays
   comparable. A guard sends the rest of a request GPU-only when, after a pair, the
   measured pair time exceeds the predicted GPU-only time for its rows by more than
-  2% (one `npu-trunk: guard: ...` line per load). Output numerics differ only
+  2% (one `npu-trunk: guard: ...` line per request). Output numerics differ only
   between the NPU and GPU projection routes, both within the accepted KLD cap.
   Details: Live rate scales (auto), below. Developer variable
   `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` forces the per-request subset.
@@ -669,16 +669,17 @@ Quality accepted: S11 j103 BF16-direct family B, ΔKLD WT2 −0.0005 / code24
 | Mode | Calibration unavailable/invalid/key mismatch | Match: all selected | Match: subset/none |
 | --- | --- | --- | --- |
 | `off` | No I/O | GPU-only | GPU-only |
-| `auto` | Route off, one reason line | Admit stored plan | Admit subset plan; none stays native |
+| `auto` | Route off, one reason line | Pack ALL; each request picks its subset from the live scales | Same (the static selection is only the admission check); none stays native |
 | `on` | `calibration=none (forced)`, ALL, natural 8192+B pairs | Use selected families; planned pairs from the first row (no crossover arming) | Use subset; none stays native |
 | `emulate` | Same as `on`, GPU twin | Same as `on`, GPU twin | Same as `on`, GPU twin |
 
 An auto key mismatch (any field for a file; a hard field for the built-in) logs exactly
 `npu-trunk: off (calibration key mismatch: <field>)`.
 Matching records log `load_log_line` with selection, key/hash, crossover and
-predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
-planning all use that same selected mask. Without a match, forced modes use ALL.
-Auto derives n* once at load from the matched calibration. Each request's uncached prompt segment runs
+predicted 16K/64K times. Forced modes pack, build programs and C arenas for that selected mask and plan
+every request with it (or with `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES`); `auto` packs ALL (the static selection
+must be nonempty to admit) and picks a subset per request. Without a match, forced modes use ALL.
+Auto derives n* from the request's family subset and the estimator snapshot (cached until either changes). Each request's uncached prompt segment runs
 `plan(cal, families, rows)` (auto: the request's family subset planned from the estimator snapshot, see
 Live rate scales below; forced modes: the static calibration) and logs `request_log_line` once. Natural planned
 8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, and the planner's
@@ -700,7 +701,9 @@ stay the bit-exact comparable pair.
 
 * **Samples.** After each executed pair the executor compares the measured NPU
   chain time (relay `Completion` statistics) and the GPU window hiding those
-  chains against `pair_model` for the same pair. The ratio measured/model of each
+  chains (pack end to wait begin of each chain, minus the NPU wait of the bank visit
+  inside it, so a slow NPU never reads as a slow GPU) against `pair_model` for the
+  same pair. The ratio measured/model of each
   is clamped to 0.5-2.0 and folded into an EWMA (alpha 0.25; the first valid
   sample initializes it). Samples whose modelled time is under 50 ms or whose
   numbers are not finite and positive are ignored.
