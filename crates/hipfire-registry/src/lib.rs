@@ -10,7 +10,6 @@
 //! wholesale; model code never consumes a partially validated catalog.
 
 use hipfire_config::{ConfigLayer, ConfigValue};
-use hipfire_config::memory::PleFormat;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -332,17 +331,6 @@ pub struct ModelEntry {
     /// Same placement rules as `ple_q8`.
     #[serde(default)]
     pub ple_q4: Option<Sidecar>,
-    /// Row format a plain `hipfire pull` (`--ple auto` with `memory.ple_format`
-    /// left at `auto`) fetches for this entry, `q4` or `q8`, instead of the
-    /// per-arch pick. Strict: anything else fails the parse, and the entry must
-    /// publish the slot it names. Absent keeps the per-arch behaviour. An
-    /// explicit `--ple` or a non-`auto` `memory.ple_format` always wins.
-    #[serde(
-        default,
-        with = "ple_format_name",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub ple_default: Option<PleFormat>,
     /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
     ///
     /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
@@ -600,18 +588,6 @@ impl RegistryV1 {
                     )));
                 }
             }
-            if let Some(default) = entry.ple_default {
-                let published = match default {
-                    PleFormat::Q4 => entry.ple_q4.is_some(),
-                    PleFormat::Q8 => entry.ple_q8.is_some(),
-                };
-                if !published {
-                    return Err(fail(format!(
-                        "model '{tag}' ple_default '{}' names a ple slot the entry does not publish",
-                        default.name()
-                    )));
-                }
-            }
             if let Some(format) = entry.default_tool_format.as_deref() {
                 if !matches!(format, "hermes" | "qwen_xml") {
                     return Err(fail(format!(
@@ -717,34 +693,6 @@ impl RegistryV1 {
                 other.repo == entry.repo && other.file == file && !other.has_ple_sidecars()
             })
             .map(|(tag, other)| (tag.as_str(), other))
-    }
-}
-
-/// `ple_default` wire form: the `q4` | `q8` spelling of [`PleFormat`].
-mod ple_format_name {
-    use hipfire_config::memory::PleFormat;
-    use serde::{de::Error, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        value: &Option<PleFormat>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(format) => serializer.serialize_str(format.name()),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<PleFormat>, D::Error> {
-        Option::<String>::deserialize(deserializer)?
-            .map(|name| {
-                PleFormat::from_name(&name).ok_or_else(|| {
-                    D::Error::custom(format!("ple_default '{name}' must be 'q4' or 'q8'"))
-                })
-            })
-            .transpose()
     }
 }
 
@@ -1533,86 +1481,6 @@ mod tests {
                 keep.is_some()
             );
         }
-    }
-
-    #[test]
-    fn ple_default_parses_roundtrips_and_is_absent_by_default() {
-        let registry = parse_split(&split_registry_json()).unwrap();
-        assert!(registry
-            .models
-            .values()
-            .all(|entry| entry.ple_default.is_none()));
-        let serialized = serde_json::to_string(&registry).unwrap();
-        assert!(
-            !serialized.contains("ple_default"),
-            "an absent default must not appear on the wire (older clients deny unknown fields)"
-        );
-        for (name, format) in [("q4", PleFormat::Q4), ("q8", PleFormat::Q8)] {
-            let mut value = split_registry_json();
-            value["models"]["qwen3.8:flash-next"]["ple_default"] = name.into();
-            let registry = parse_split(&value).unwrap();
-            assert_eq!(
-                registry.models["qwen3.8:flash-next"].ple_default,
-                Some(format)
-            );
-            assert!(registry.models["qwen3.8:flash-next-mq4"]
-                .ple_default
-                .is_none());
-            let reparsed = parse_split(&serde_json::to_value(&registry).unwrap()).unwrap();
-            assert_eq!(registry, reparsed);
-        }
-    }
-
-    #[test]
-    fn ple_default_on_an_mq3_split_base_names_a_published_slot() {
-        const MQ3_BASE: &str = "qwen3.8-flash-next-base.mq3-xts";
-        let mut value = split_registry_json();
-        let entry = &mut value["models"]["qwen3.8:flash-next"];
-        entry["file"] = MQ3_BASE.into();
-        entry["quant"] = "mq3".into();
-        entry["ple_q8"]["file"] = format!("{MQ3_BASE}.ple-q8").into();
-        entry["ple_q4"]["file"] = format!("{MQ3_BASE}.ple-q4").into();
-        entry["ple_default"] = "q4".into();
-        let registry = parse_split(&value).unwrap();
-        let entry = &registry.models["qwen3.8:flash-next"];
-        assert_eq!(entry.ple_default, Some(PleFormat::Q4));
-        assert!(entry.has_ple_sidecars());
-    }
-
-    #[test]
-    fn ple_default_rejects_unknown_spellings_and_unpublished_slots() {
-        for bad in [
-            serde_json::json!("q5"),
-            serde_json::json!("Q4"),
-            serde_json::json!("auto"),
-            serde_json::json!("all"),
-            serde_json::json!(""),
-            serde_json::json!(4),
-            serde_json::json!(true),
-        ] {
-            let mut value = split_registry_json();
-            value["models"]["qwen3.8:flash-next"]["ple_default"] = bad.clone();
-            assert!(
-                matches!(parse_split(&value), Err(RegistryError::Parse { .. })),
-                "ple_default {bad} must be rejected"
-            );
-        }
-        for (default, removed) in [("q4", "ple_q4"), ("q8", "ple_q8")] {
-            let mut value = split_registry_json();
-            let entry = &mut value["models"]["qwen3.8:flash-next"];
-            entry["ple_default"] = default.into();
-            entry.as_object_mut().unwrap().remove(removed);
-            let message = parse_split(&value).unwrap_err().to_string();
-            assert!(
-                message.contains("ple_default") && message.contains("does not publish"),
-                "{message}"
-            );
-        }
-        // A default on an entry with no PLE slots at all is the same error.
-        let mut value = split_registry_json();
-        value["models"]["qwen3.8:flash-next-mq4-xts"]["ple_default"] = "q4".into();
-        let message = parse_split(&value).unwrap_err().to_string();
-        assert!(message.contains("does not publish"), "{message}");
     }
 
     #[test]
