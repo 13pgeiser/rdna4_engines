@@ -1417,7 +1417,8 @@ impl Qwen4Manifest {
     /// of `ranks` holds experts `e % ranks == r` compactly in ascending `e`
     /// (local index `e / ranks`). The entries keep their logical shape
     /// (`[n_experts, ..]`, which the manifest validator requires); the
-    /// fulfilled tensor is `[n_experts / ranks, ..]`. Everything else is
+    /// fulfilled tensor is `[ep.local_count(n_experts), ..]` (uneven splits
+    /// give the low ranks one more expert). Everything else is
     /// unchanged, and a manifest that is never passed through here (ep = 1)
     /// stays byte-identical to the single-device declaration.
     pub fn with_expert_parallel(mut self, ep: Qwen4EpPlacement) -> Result<Self, WeightError> {
@@ -1442,9 +1443,9 @@ impl Qwen4Manifest {
             .filter(|entry| is_routed_expert_tensor(&entry.name))
         {
             let experts = entry.logical_shape.first().copied().unwrap_or(0);
-            if experts == 0 || experts % ep.ranks != 0 {
+            if experts < ep.ranks {
                 return Err(WeightError::EpPlacement(format!(
-                    "{}: {experts} routed experts do not divide across {} ranks",
+                    "{}: {experts} routed experts cannot cover {} ranks",
                     entry.name, ep.ranks
                 )));
             }
@@ -2211,6 +2212,19 @@ impl Qwen4EpPlacement {
     pub fn local_index(self, expert: usize) -> usize {
         expert / self.ranks
     }
+
+    /// Number of routed experts this rank owns out of `experts`
+    /// (`e % ranks == rank`): the low ranks hold one more when the split is
+    /// uneven (512 over 6 ranks = 86/86/85/85/85/85).
+    pub fn local_count(self, experts: usize) -> usize {
+        (experts + self.ranks - 1 - self.rank) / self.ranks
+    }
+
+    /// The largest per-rank expert count (rank 0's): the count a layer must
+    /// budget on every rank so it is resident on all ranks or none.
+    pub fn max_local_count(self, experts: usize) -> usize {
+        experts.div_ceil(self.ranks)
+    }
 }
 
 /// Device view of one resident stacked qt=55 `FP8E4M3B128` routed-expert
@@ -2343,7 +2357,7 @@ pub struct Qwen4Weights {
     /// `Some` iff `config.mtp` is declared.
     pub mtp: Option<Qwen4MtpWeights>,
     /// `Some` iff the routed experts were uploaded expert-sharded for one
-    /// rank of an expert-parallel mesh (compact tensors of `512 / ranks`
+    /// rank of an expert-parallel mesh (compact tensors of `local_count(512)`
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
     pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
@@ -3952,7 +3966,7 @@ mod tests {
             .iter()
             .filter(|entry| is_routed_expert_tensor(&entry.name))
             .all(|entry| entry.policy == ShardPolicy::Replicate));
-        for ranks in [2usize, 4] {
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
             let rank = ranks - 1;
             let ep = base
                 .clone()
@@ -3996,9 +4010,42 @@ mod tests {
     }
 
     #[test]
+    fn ep_placement_splits_experts_unevenly_and_densely() {
+        for experts in [512usize, 8] {
+            for ranks in [2usize, 3, 4, 5, 6, 8] {
+                let mut total = 0;
+                let mut owner_of = vec![usize::MAX; experts];
+                for rank in 0..ranks {
+                    let placement = Qwen4EpPlacement { rank, ranks };
+                    let count = placement.local_count(experts);
+                    assert!(count <= placement.max_local_count(experts));
+                    assert_eq!(count, (0..experts).filter(|&e| placement.owns(e)).count());
+                    // Owned experts fill slots 0..count densely, ascending.
+                    let slots: Vec<usize> = (0..experts)
+                        .filter(|&e| placement.owns(e))
+                        .map(|e| placement.local_index(e))
+                        .collect();
+                    assert_eq!(slots, (0..count).collect::<Vec<_>>());
+                    for e in (0..experts).filter(|&e| placement.owns(e)) {
+                        assert_eq!(owner_of[e], usize::MAX, "expert {e} owned twice");
+                        owner_of[e] = rank;
+                    }
+                    total += count;
+                }
+                assert_eq!(total, experts, "experts={experts} ranks={ranks}");
+                assert!(owner_of.iter().all(|&o| o != usize::MAX));
+            }
+        }
+        let six = |rank| Qwen4EpPlacement { rank, ranks: 6 };
+        let counts: Vec<usize> = (0..6).map(|r| six(r).local_count(512)).collect();
+        assert_eq!(counts, [86, 86, 85, 85, 85, 85]);
+        assert_eq!(six(3).max_local_count(512), 86);
+    }
+
+    #[test]
     fn expert_parallel_manifest_refuses_bad_placements() {
         let base = Qwen4Manifest::build(&pinned_config()).unwrap();
-        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 3), (1, 5)] {
+        for (rank, ranks) in [(0, 1), (0, 0), (2, 2), (4, 4), (0, 513), (1, 600)] {
             assert!(
                 matches!(
                     base.clone().with_expert_parallel(Qwen4EpPlacement { rank, ranks }),

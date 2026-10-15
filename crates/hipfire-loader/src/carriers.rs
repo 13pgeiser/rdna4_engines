@@ -1335,10 +1335,10 @@ struct RankCtx<'a> {
 /// the forward program and the native MTP head.
 ///
 /// `ep == None` is the single-device load, byte for byte what the carrier did
-/// inline before. With `ep == Some(rank, ranks)` (`ranks` in 2, 4) this is one
+/// inline before. With `ep == Some(rank, ranks)` (`ranks` in 2..=8) this is one
 /// rank of an expert-parallel load: routed experts (trunk and MTP head) are
 /// declared `ExpertSharded { 512, Stride }` and uploaded compactly (this
-/// rank's experts `e % ranks == rank` ascending, `512 / ranks` per stack, in
+/// rank's experts `e % ranks == rank` ascending, `local_count(512)` per stack, in
 /// VRAM or pinned host RAM per the residency policy); everything else is
 /// replicated; the rank attaches its own native MTP head when it is on; the
 /// rank prints its fit line and an `qwen4 EP rank r/N` load line. `session` is
@@ -1963,13 +1963,17 @@ pub fn load_qwen4_rank(
         };
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
         applied_layers = vram_layers.min(config.num_hidden_layers);
-        // One rank's pinned bytes; the host check covers every rank that
-        // has not pinned yet (this one and the later ranks).
-        let (host_bytes, _) =
+        // This rank's pinned bytes; the host check covers every rank that
+        // has not pinned yet (this one and the later ranks), each at its own
+        // share (an uneven split gives the low ranks one more expert).
+        let rank_host_bytes =
             residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
                 .map_err(|error| format!("qwen4: {error}"))?;
-        let pending_ranks = ep.map_or(1, |placement| placement.ranks - placement.rank) as u64;
-        let host_check_bytes = host_bytes.saturating_mul(pending_ranks);
+        let own_rank = ep.map_or(0, |placement| placement.rank);
+        let host_bytes = rank_host_bytes[own_rank];
+        let host_check_bytes = rank_host_bytes[own_rank..]
+            .iter()
+            .fold(0u64, |total, bytes| total.saturating_add(*bytes));
         let mem_available = rdna_compute::kv_slots::mem_available_bytes();
         let ttm_pool = residency::ttm_pool_estimate();
         residency::check_host_ram(host_check_bytes, mem_available, ttm_pool)
@@ -2088,10 +2092,11 @@ pub fn load_qwen4_rank(
                 .sum()
         } else {
             residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
-                .map(|(per_rank, _)| {
-                    per_rank + hotset_plan.as_ref().map_or(0, |(plan, _)| {
-                        plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
-                    })
+                .map(|per_rank| {
+                    per_rank[ep.map_or(0, |placement| placement.rank)]
+                        + hotset_plan.as_ref().map_or(0, |(plan, _)| {
+                            plan.owner_bytes(hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped)
+                        })
                 })
                 .unwrap_or(0)
         };
@@ -2482,11 +2487,12 @@ pub fn load_qwen4_rank(
         }
     if let Some(placement) = ep {
         eprintln!(
-            "qwen4 EP rank {}/{}: loaded on device {} ({} routed experts of 512 per stack, native MTP {}, max_seq {max_seq})",
+            "qwen4 EP rank {}/{}: loaded on device {} ({} routed experts of {} per stack, native MTP {}, max_seq {max_seq})",
             placement.rank,
             placement.ranks,
             ctx.gpu.device_id,
-            512 / placement.ranks,
+            placement.local_count(bundle.config.num_experts),
+            bundle.config.num_experts,
             if native_mtp { "on" } else { "off" },
         );
     }

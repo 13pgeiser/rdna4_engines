@@ -1025,7 +1025,8 @@ pub(crate) fn qwen4_ep_buffer_index(layer_idx: usize, trunk_layers: usize) -> us
 }
 
 /// Device pointers and byte lengths of one rank's compact routed-expert
-/// tensors of one MoE layer (`512 / ranks` experts, local index `e / ranks`).
+/// tensors of one MoE layer (`local_count(512)` experts of the owning rank, local
+/// index `e / ranks`).
 /// The same shape describes the per-rank zero dummy expert (one expert).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen4PeerExpertSource {
@@ -1088,9 +1089,9 @@ fn validate_ep_placement(
             placement.rank, placement.ranks
         )));
     }
-    if num_experts % placement.ranks != 0 {
+    if num_experts < placement.ranks {
         return Err(invalid(format!(
-            "{num_experts} experts do not shard evenly over {} EP ranks",
+            "{num_experts} experts cannot cover {} EP ranks",
             placement.ranks
         )));
     }
@@ -1104,7 +1105,7 @@ impl Qwen4ExpertTableLayout<'_> {
             Self::Single | Self::Tier { .. } => Ok(num_experts),
             Self::Ep { placement, .. } | Self::Full { placement, .. } => {
                 validate_ep_placement(*placement, num_experts)?;
-                Ok(num_experts / placement.ranks)
+                Ok(placement.local_count(num_experts))
             }
         }
     }
@@ -1165,8 +1166,8 @@ fn tier_expert_extent(
 
 /// Pure arithmetic behind every expert pointer table: the host entry of each
 /// global expert under `layout`. `local` names this rank's own resident
-/// tensors (all experts under `Single`, the compact `num_experts / ranks`
-/// under EP). Nothing here touches a device.
+/// tensors (all experts under `Single`, the compact
+/// `placement.local_count(num_experts)` under EP). Nothing here touches a device.
 pub(crate) fn qwen4_expert_table_entries(
     layout: &Qwen4ExpertTableLayout<'_>,
     local: Qwen4PeerExpertSource,
@@ -1278,6 +1279,13 @@ pub(crate) fn qwen4_expert_table_entries(
                     "EP peer source of rank {} does not name this rank's own expert tensors",
                     placement.rank
                 )));
+            }
+            // Each peer's compact tensors hold exactly that rank's own count
+            // (uneven splits: the low ranks hold one more).
+            for (peer_rank, peer) in peers.iter().enumerate() {
+                let peer_count = Qwen4EpPlacement { rank: peer_rank, ranks: placement.ranks }
+                    .local_count(num_experts);
+                check_exact_compact(*peer, peer_count, gate_up_expert_bytes, down_expert_bytes)?;
             }
             for expert in 0..num_experts {
                 let owner = expert % placement.ranks;
@@ -1481,10 +1489,11 @@ fn tile_owner_table_bytes(experts: usize, ranks: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Per-rank donor mirror bytes of one G2 stage layer (`[gate/up, down]`): a rank hosts
-/// `experts / ranks` experts of each kind.
-fn stage_donor_bytes(experts: usize, ranks: usize) -> [usize; 2] {
-    let local_experts = experts / ranks;
+/// Per-rank donor mirror bytes of one G2 stage layer (`[gate/up, down]`): rank `rank` of
+/// `ranks` hosts `Qwen4EpPlacement::local_count(experts)` experts of each kind, which covers
+/// slot `e / ranks` of every expert it owns.
+fn stage_donor_bytes(experts: usize, rank: usize, ranks: usize) -> [usize; 2] {
+    let local_experts = Qwen4EpPlacement { rank, ranks }.local_count(experts);
     [
         local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
         local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
@@ -1905,7 +1914,7 @@ impl Qwen4MoeLayerRuntime {
     }
 
     /// EP decode runtime: the resident expert tensors are this rank's compact
-    /// `num_experts / ranks` experts; owned experts name them, every other
+    /// `placement.local_count(num_experts)` experts; owned experts name them, every other
     /// expert names `dummy`.
     pub(crate) fn from_moe_ep(
         gpu: &mut Gpu,
@@ -2857,8 +2866,14 @@ impl Qwen4ExpertStage {
         donors.sort_by_key(|layer| layer % 2);
         let placement = bundle.weights.ep_placement();
         let ranks = placement.map_or(1, |placement| placement.ranks);
-        let bytes = stage_donor_bytes(config.num_experts, ranks);
-        let layer_bytes = bytes.iter().sum::<usize>();
+        let bytes = stage_donor_bytes(
+            config.num_experts,
+            placement.map_or(0, |placement| placement.rank),
+            ranks,
+        );
+        // The mirrors of all ranks share one host RAM/GTT budget: charge every rank at the
+        // largest (rank 0) share so an uneven split is never under-counted.
+        let layer_bytes = stage_donor_bytes(config.num_experts, 0, ranks).iter().sum::<usize>();
         let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, ranks)
             .map_err(invalid)?;
         let admitted = crate::expert_residency::check_host_ram(
@@ -7919,6 +7934,14 @@ mod ep_table_tests {
         assert!(text.contains("down expert slot 511") && text.contains("exceeds"), "{text}");
     }
 
+    /// Every `(ranks, rank)` of the supported EP rank counts.
+    fn ep_rank_cases() -> Vec<(usize, usize)> {
+        [2usize, 3, 4, 5, 6, 8]
+            .into_iter()
+            .flat_map(|ranks| (0..ranks).map(move |rank| (ranks, rank)))
+            .collect()
+    }
+
     #[test]
     fn tier_table_preserves_arbitrary_owner_addresses_and_local_ids() {
         let local = compact(0, 0, 0); // No aggregate allocation on a tier load.
@@ -7966,9 +7989,9 @@ mod ep_table_tests {
 
     #[test]
     fn ep_table_maps_owned_to_compact_local_and_the_rest_to_the_dummy() {
-        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 0), (4, 3)] {
+        for (ranks, rank) in ep_rank_cases() {
             let placement = Qwen4EpPlacement { rank, ranks };
-            let local = compact(0, 0x1000_0000, EXPERTS / ranks);
+            let local = compact(0, 0x1000_0000, placement.local_count(EXPERTS));
             let layout = Qwen4ExpertTableLayout::Ep {
                 placement,
                 dummy: dummy(),
@@ -7991,7 +8014,7 @@ mod ep_table_tests {
                     assert_eq!(entry.down_ptr, dummy().down_base);
                 }
             }
-            assert_eq!(owned, EXPERTS / ranks);
+            assert_eq!(owned, placement.local_count(EXPERTS));
         }
     }
 
@@ -8019,12 +8042,12 @@ mod ep_table_tests {
     }
 
     #[test]
-    fn ep_placement_must_shard_evenly() {
+    fn ep_placement_accepts_uneven_splits_and_refuses_out_of_range() {
         let local = compact(0, 0x1000_0000, EXPERTS / 4);
         for placement in [
             Qwen4EpPlacement { rank: 4, ranks: 4 },
             Qwen4EpPlacement { rank: 0, ranks: 0 },
-            Qwen4EpPlacement { rank: 0, ranks: 3 },
+            Qwen4EpPlacement { rank: 0, ranks: EXPERTS + 1 },
         ] {
             let layout = Qwen4ExpertTableLayout::Ep {
                 placement,
@@ -8032,12 +8055,25 @@ mod ep_table_tests {
             };
             assert!(entries(&layout, local).is_err(), "{placement:?}");
         }
+        // 512 over 3 ranks = 171/171/170: each rank's exact count is accepted.
+        for (rank, count) in [(0usize, 171usize), (1, 171), (2, 170)] {
+            let placement = Qwen4EpPlacement { rank, ranks: 3 };
+            let layout = Qwen4ExpertTableLayout::Ep {
+                placement,
+                dummy: dummy(),
+            };
+            assert_eq!(layout.local_experts(EXPERTS).unwrap(), count);
+            assert_eq!(entries(&layout, compact(0, 0x1000_0000, count)).unwrap().len(), EXPERTS);
+            // The even-split count is no longer the exact count.
+            assert!(entries(&layout, compact(0, 0x1000_0000, EXPERTS / 4)).is_err());
+        }
     }
 
     fn peers(ranks: usize) -> Vec<Qwen4PeerExpertSource> {
         (0..ranks)
             .map(|rank| {
-                let mut source = compact(0, 0x1000_0000 + rank * 0x1_0000_0000, EXPERTS / ranks);
+                let count = Qwen4EpPlacement { rank, ranks }.local_count(EXPERTS);
+                let mut source = compact(0, 0x1000_0000 + rank * 0x1_0000_0000, count);
                 source.down_base += rank * 0x1_0000_0000;
                 source
             })
@@ -8046,7 +8082,7 @@ mod ep_table_tests {
 
     #[test]
     fn full_table_maps_owned_local_and_non_owned_into_the_owner_peer() {
-        for (ranks, rank) in [(2usize, 0usize), (2, 1), (4, 2)] {
+        for (ranks, rank) in ep_rank_cases() {
             let placement = Qwen4EpPlacement { rank, ranks };
             let peers = peers(ranks);
             let layout = Qwen4ExpertTableLayout::Full {
@@ -8105,7 +8141,25 @@ mod ep_table_tests {
             peers: &short,
         };
         let text = message(entries(&layout_short, short[0]));
-        assert!(text.contains("peer gate/up expert slot 255") && text.contains("exceeds"), "{text}");
+        assert!(text.contains("exactly 256 experts"), "{text}");
+        // Uneven peers: rank 1 of 3 holds 171 experts; one short (and one over) is refused.
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 3 };
+        let uneven = peers(3);
+        let layout_uneven = Qwen4ExpertTableLayout::Full {
+            placement,
+            peers: &uneven,
+        };
+        assert_eq!(entries(&layout_uneven, uneven[0]).unwrap().len(), EXPERTS);
+        for delta in [-1isize, 1] {
+            let mut skewed = uneven.clone();
+            skewed[2].gate_up_bytes = (skewed[2].gate_up_bytes as isize + delta * GATE_UP as isize) as usize;
+            let layout_skewed = Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: &skewed,
+            };
+            let text = message(entries(&layout_skewed, skewed[0]));
+            assert!(text.contains("exactly 170 experts"), "{text}");
+        }
         // A null peer base is refused rather than mapped.
         let mut null = good.clone();
         null[1].down_base = 0;
@@ -8835,12 +8889,15 @@ mod ep_rank_generic_tests {
 
     #[test]
     fn owner_table_is_expert_modulo_ranks_and_balanced() {
-        for ranks in [2usize, 4] {
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
             let table = owners(&tile_owner_table_bytes(512, ranks));
             assert_eq!(table.len(), 512);
             assert!(table.iter().enumerate().all(|(e, &o)| o == (e % ranks) as i32));
             for rank in 0..ranks {
-                assert_eq!(table.iter().filter(|&&o| o == rank as i32).count(), 512 / ranks);
+                assert_eq!(
+                    table.iter().filter(|&&o| o == rank as i32).count(),
+                    Qwen4EpPlacement { rank, ranks }.local_count(512)
+                );
             }
         }
     }
@@ -8848,17 +8905,27 @@ mod ep_rank_generic_tests {
     #[test]
     fn stage_donor_bytes_split_by_every_rank_and_total_the_full_layer() {
         let full = 512 * (QWEN4_EXPERT_STAGE_GATE_UP_BYTES + QWEN4_EXPERT_STAGE_DOWN_BYTES);
-        for ranks in [1usize, 2, 4] {
-            let [gate_up, down] = stage_donor_bytes(512, ranks);
-            assert_eq!(gate_up, 512 / ranks * QWEN4_EXPERT_STAGE_GATE_UP_BYTES);
-            assert_eq!(down, 512 / ranks * QWEN4_EXPERT_STAGE_DOWN_BYTES);
-            assert_eq!((gate_up + down) * ranks, full);
+        for ranks in [1usize, 2, 3, 4, 5, 6, 8] {
+            let mut total = 0;
+            for rank in 0..ranks {
+                let count = Qwen4EpPlacement { rank, ranks }.local_count(512);
+                let [gate_up, down] = stage_donor_bytes(512, rank, ranks);
+                assert_eq!(gate_up, count * QWEN4_EXPERT_STAGE_GATE_UP_BYTES);
+                assert_eq!(down, count * QWEN4_EXPERT_STAGE_DOWN_BYTES);
+                total += gate_up + down;
+            }
+            assert_eq!(total, full, "ranks={ranks}");
         }
     }
 
     #[test]
-    fn ep4_donor_redirect_covers_each_expert_once_and_keeps_peer_pointers() {
-        let ranks = 4usize;
+    fn donor_redirect_covers_each_expert_once_and_keeps_peer_pointers() {
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
+            donor_redirect_case(ranks);
+        }
+    }
+
+    fn donor_redirect_case(ranks: usize) {
         let stride = QWEN4_EXPERT_STAGE_GATE_UP_BYTES;
         let base = 0x10_0000usize;
         let entries: Vec<usize> = (0..512).map(|e| 0x9000_0000 + e).collect();
@@ -8869,7 +8936,10 @@ mod ep_rank_generic_tests {
             for (expert, word) in bytes.chunks_exact(std::mem::size_of::<usize>()).enumerate() {
                 let pointer = usize::from_ne_bytes(word.try_into().unwrap());
                 if expert % ranks == rank {
-                    assert_eq!(pointer, base + (expert / ranks) * stride, "rank {rank} expert {expert}");
+                    let slot = expert / ranks;
+                    // The donor holds `local_count` slots; the owned slot is inside it.
+                    assert!(slot < placement.local_count(512), "rank {rank} expert {expert}");
+                    assert_eq!(pointer, base + slot * stride, "rank {rank} expert {expert}");
                     claimed[expert] += 1;
                 } else {
                     assert_eq!(pointer, entries[expert], "rank {rank} expert {expert}");

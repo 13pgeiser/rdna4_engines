@@ -13,6 +13,7 @@
 //! token reads only its routed experts' bytes from host RAM.
 
 use crate::gpu_forward::Qwen4ForwardScratchMode;
+use crate::weights::Qwen4EpPlacement;
 use crate::Qwen4Config;
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::uma_memory::{
@@ -142,8 +143,10 @@ pub fn routed_expert_bytes(
     routed_expert_bytes_ranks(weights, bytes_of, 1)
 }
 
-/// [`routed_expert_bytes`] for one rank of a `ranks`-way expert-parallel load
-/// (`1/ranks` of every routed expert stack).
+/// [`routed_expert_bytes`] for one rank of a `ranks`-way expert-parallel load:
+/// the largest rank's share (`max_local_count` experts of every routed expert
+/// stack), which is what every rank budgets so a layer is resident on all
+/// ranks or none.
 pub fn routed_expert_bytes_ranks(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
@@ -159,7 +162,7 @@ pub fn routed_expert_bytes_ranks(
         .try_fold(0u64, |total, entry| {
             let bytes =
                 bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
-            Ok(total + rank_share(entry, bytes, ranks)?)
+            Ok(total + rank_share(entry, bytes, 0, ranks)?)
         })
 }
 
@@ -192,7 +195,8 @@ pub fn resident_split(
 
 /// [`resident_split`] for one rank of a `ranks`-way expert-parallel load: the
 /// non-expert bytes are replicated on every rank, the layer-0 routed-expert
-/// bytes are `1/ranks` of the single-device figure.
+/// bytes are the per-expert bytes times `max_local_count` (the largest rank's
+/// share; an uneven split gives the low ranks one more expert).
 pub fn resident_split_ranks(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
@@ -213,7 +217,7 @@ pub fn resident_split_ranks(
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
             layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
-            layer_experts += rank_share(entry, bytes, ranks)?;
+            layer_experts += rank_share(entry, bytes, 0, ranks)?;
         }
     }
     Ok((non_expert, layer_experts + layer_arena_max))
@@ -468,26 +472,33 @@ pub fn hotset_host_mapped_bytes(
     Ok(total)
 }
 
-/// Pinned host bytes one rank of a `ranks`-way expert-parallel load takes for
-/// its [`WeightResidency::HostMapped`] entries (`bytes_of` is the full source
-/// payload; a routed expert stack is `1/ranks` of it per rank), and the total
-/// across all ranks: every rank pins its own copy in the same host RAM, so
-/// [`check_host_ram`] and [`check_gtt_cap`] take the total. `ranks == 1` is
+/// Pinned host bytes every rank of a `ranks`-way expert-parallel load takes for
+/// its [`WeightResidency::HostMapped`] entries, indexed by rank (`bytes_of` is
+/// the full source payload; a routed expert stack's share on rank `r` is its
+/// per-expert bytes times that rank's `local_count`, so an uneven split gives
+/// the low ranks more). Every rank pins its own copy in the same host RAM, so
+/// [`check_host_ram`] and [`check_gtt_cap`] take the sum of the ranks that
+/// have not pinned yet. `ranks == 1` is a single entry equal to
 /// [`host_mapped_bytes`].
 pub fn host_mapped_bytes_ranks(
     weights: &[WeightEntry],
     bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
     ranks: usize,
-) -> Result<(u64, u64), String> {
-    let mut per_rank = 0u64;
+) -> Result<Vec<u64>, String> {
+    if ranks == 0 {
+        return Err("expert-parallel rank count must be at least 1".to_string());
+    }
+    let mut per_rank = vec![0u64; ranks];
     for entry in weights {
         if entry.residency == WeightResidency::HostMapped {
             let bytes =
                 bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
-            per_rank += rank_share(entry, bytes, ranks)? + HOST_MAPPED_PAD_BYTES;
+            for (rank, charge) in per_rank.iter_mut().enumerate() {
+                *charge += rank_share(entry, bytes, rank, ranks)? + HOST_MAPPED_PAD_BYTES;
+            }
         }
     }
-    Ok((per_rank, per_rank.saturating_mul(ranks as u64)))
+    Ok(per_rank)
 }
 
 /// Two donor mirrors per rank share one host RAM/GTT budget. Each donor has
@@ -501,23 +512,34 @@ pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Res
         .ok_or_else(|| "expert stage mirror host charge overflow or zero ranks".to_string())
 }
 
-/// One rank's share of an entry's payload: routed expert stacks split evenly
-/// across `ranks`, everything else is replicated.
-fn rank_share(entry: &WeightEntry, bytes: u64, ranks: usize) -> Result<u64, String> {
+/// Rank `rank`'s share of an entry's payload: a routed expert stack (logical
+/// shape `[n_experts, ..]`) holds its per-expert bytes times the rank's
+/// `local_count` (experts `e % ranks == rank`), everything else is replicated.
+fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Result<u64, String> {
     if ranks == 0 {
         return Err("expert-parallel rank count must be at least 1".to_string());
     }
     if ranks == 1 || !is_routed_expert(&entry.name) {
         return Ok(bytes);
     }
-    let ranks = ranks as u64;
-    if bytes % ranks != 0 {
+    if rank >= ranks {
+        return Err(format!("expert-parallel rank {rank} is outside {ranks} ranks"));
+    }
+    let experts = entry.logical_shape.first().copied().unwrap_or(0);
+    if experts < ranks {
         return Err(format!(
-            "'{}' has {bytes} bytes, which do not split across {ranks} ranks",
+            "'{}' has {experts} routed experts, which cannot cover {ranks} ranks",
             entry.name
         ));
     }
-    Ok(bytes / ranks)
+    if bytes % experts as u64 != 0 {
+        return Err(format!(
+            "'{}' has {bytes} bytes, which are not a multiple of its {experts} experts",
+            entry.name
+        ));
+    }
+    let local = Qwen4EpPlacement { rank, ranks }.local_count(experts) as u64;
+    Ok(bytes / experts as u64 * local)
 }
 
 /// MoE layers of the model: the trunk's plus the MTP head's.
@@ -530,7 +552,8 @@ pub fn moe_layer_count(config: &Qwen4Config) -> usize {
 /// layer's experts and the reserve fit, otherwise the trunk layers `auto`
 /// fits (the MTP layer is then always host-mapped, as in
 /// [`place_routed_experts`]). `layer_expert_bytes_per_rank` is one MoE
-/// layer's routed experts on one rank.
+/// layer's routed experts on the largest rank (`max_local_count` experts), so
+/// a layer counted resident fits every rank of an uneven split.
 pub fn ep_rank_layers(
     config: &Qwen4Config,
     free_vram: u64,
@@ -585,7 +608,8 @@ pub fn ep_vram_layers(
 /// `layer_expert_bytes_per_rank` each), the split applied (`applied_layers`
 /// of the MoE layers resident, the rest pinned host RAM; the MTP layer is the
 /// last), what this rank alone could keep, the reserve and the predicted
-/// headroom.
+/// headroom. `layer_expert_bytes_per_rank` is the largest rank's layer bytes
+/// (`max_local_count` experts), as every rank budgets it.
 pub fn ep_fit_rank_line(
     config: &Qwen4Config,
     rank: usize,
@@ -630,7 +654,7 @@ pub fn ep_fit_rank_line(
 /// sized for and the split every rank applies ([`ep_vram_layers`], the minimum
 /// over ranks), then one [`ep_fit_rank_line`] per rank at that split.
 /// `non_expert_bytes` is the replicated trunk, `layer_expert_bytes_per_rank`
-/// one MoE layer's routed experts on one rank (`resident_split_ranks`),
+/// one MoE layer's routed experts on the largest rank (`resident_split_ranks`),
 /// `reserve_bytes` ([`auto_vram_reserve`]) what `auto` keeps free.
 pub fn ep_fit_report(
     config: &Qwen4Config,
@@ -1577,21 +1601,24 @@ mod tests {
             routed_expert_bytes_ranks(&manifest.weights, element_bytes, 1),
             Ok(experts)
         );
-        for ranks in [2u64, 4] {
-            let r = ranks as usize;
-            // The trunk is replicated; experts are 1/ranks per rank.
+        for r in [2usize, 3, 4, 5, 6, 8] {
+            // The trunk is replicated; every rank budgets the largest share:
+            // the per-expert bytes times `max_local_count` experts.
+            let max = Qwen4EpPlacement { rank: 0, ranks: r }.max_local_count(512) as u64;
             assert_eq!(
                 resident_split_ranks(&manifest.weights, element_bytes, r),
-                Ok((non_expert, layer_experts / ranks))
+                Ok((non_expert, layer_experts / 512 * max)),
+                "ranks={r}"
             );
             assert_eq!(
                 routed_expert_bytes_ranks(&manifest.weights, element_bytes, r),
-                Ok(experts / ranks)
+                Ok(experts / 512 * max),
+                "ranks={r}"
             );
-            assert_eq!(layer_experts % ranks, 0);
         }
-        // Every rank host-maps its own 1/N share: the total across ranks is
-        // N x the per-rank bytes, and ranks == 1 equals host_mapped_bytes.
+        // Every rank host-maps its own share; the ranks' charges sum to the
+        // exact payload (plus one pad per tensor per rank), and ranks == 1
+        // equals host_mapped_bytes.
         let routed = manifest
             .weights
             .iter()
@@ -1601,19 +1628,48 @@ mod tests {
         let single = host_mapped_bytes(&manifest.weights, element_bytes).unwrap();
         assert_eq!(
             host_mapped_bytes_ranks(&manifest.weights, element_bytes, 1),
-            Ok((single, single))
+            Ok(vec![single])
         );
-        for ranks in [2usize, 4] {
-            let (per_rank, total) =
+        let pad = routed as u64 * HOST_MAPPED_PAD_BYTES;
+        for ranks in [2usize, 3, 4, 5, 6, 8] {
+            let charges =
                 host_mapped_bytes_ranks(&manifest.weights, element_bytes, ranks).unwrap();
-            // Payload bytes shrink by N; each tensor keeps its pad.
-            let pad = routed as u64 * HOST_MAPPED_PAD_BYTES;
-            assert_eq!(per_rank, (single - pad) / ranks as u64 + pad);
-            assert_eq!(total, per_rank * ranks as u64);
+            assert_eq!(charges.len(), ranks);
+            for (rank, &charge) in charges.iter().enumerate() {
+                let local = Qwen4EpPlacement { rank, ranks }.local_count(512) as u64;
+                assert_eq!(charge, (single - pad) / 512 * local + pad, "ranks={ranks} rank={rank}");
+            }
+            // The host charge equals the full payload: nothing lost or doubled.
+            assert_eq!(
+                charges.iter().sum::<u64>(),
+                (single - pad) + pad * ranks as u64,
+                "ranks={ranks}"
+            );
         }
-        // An indivisible stack and a zero rank count are refused.
-        assert!(resident_split_ranks(&manifest.weights, element_bytes, 3).is_err());
+        // More ranks than experts, and a zero rank count, are refused.
+        assert!(resident_split_ranks(&manifest.weights, element_bytes, 513).is_err());
+        assert!(host_mapped_bytes_ranks(&manifest.weights, element_bytes, 513).is_err());
+        assert!(host_mapped_bytes_ranks(&manifest.weights, element_bytes, 0).is_err());
         assert!(routed_expert_bytes_ranks(&manifest.weights, element_bytes, 0).is_err());
+        // A stack whose bytes are not a multiple of its expert count is refused.
+        assert!(resident_split_ranks(&manifest.weights, |_| Some(1), 3).is_err());
+    }
+
+    #[test]
+    fn uneven_ep_split_uses_the_largest_rank_share() {
+        let config = crate::config::compact_test_config();
+        assert_eq!(moe_layer_count(&config), 49);
+        let (free, non_expert, reserve) = (24_520u64 << 20, 5_115u64 << 20, 6_656u64 << 20);
+        let per_expert = 1_336_934_400u64 / 512;
+        let split = |ranks: usize| {
+            let max = Qwen4EpPlacement { rank: 0, ranks }.max_local_count(512) as u64;
+            ep_vram_layers(&config, &[free; 8][..ranks], non_expert, per_expert * max, reserve)
+        };
+        assert_eq!(split(2), 19);
+        assert_eq!(split(4), 39);
+        assert_eq!(split(6), 49);
+        // N = 3 keeps 29 layers: an uneven 171/171/170 split budgets 171 experts.
+        assert_eq!(split(3), 29);
     }
 
     #[test]

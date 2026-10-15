@@ -1433,12 +1433,19 @@ fn validate_external_range(
 /// [`ShardPolicy::ExpertSharded`] with `Stride` assignment are uploaded
 /// compactly: rank `r` of `ranks` keeps experts `e % ranks == r` in ascending
 /// `e` (local index `e / ranks`), so the uploaded tensor is
-/// `[n_experts / ranks, ..]` and byte-identical per expert to the source.
+/// `[ep_local_expert_count(n_experts, rank, ranks), ..]` (an uneven split gives
+/// the low ranks one more expert) and byte-identical per expert to the source.
 /// Every other entry is fulfilled exactly as on a single device.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EpFulfill {
     pub rank: usize,
     pub ranks: usize,
+}
+
+/// Experts rank `rank` of `ranks` owns under `Stride` assignment
+/// (`e % ranks == rank`): `(n_experts + ranks - 1 - rank) / ranks`.
+pub fn ep_local_expert_count(n_experts: usize, rank: usize, ranks: usize) -> usize {
+    (n_experts + ranks - 1 - rank) / ranks
 }
 
 /// The owned experts' bytes of a stacked expert tensor under `Stride`
@@ -1457,8 +1464,8 @@ pub fn compact_owned_experts(
     if ranks == 0 || rank >= ranks {
         return Err(format!("expert rank {rank} is outside {ranks} ranks"));
     }
-    if n_experts == 0 || n_experts % ranks != 0 {
-        return Err(format!("{n_experts} experts do not divide across {ranks} ranks"));
+    if n_experts < ranks {
+        return Err(format!("{n_experts} experts cannot cover {ranks} ranks"));
     }
     if bytes.is_empty() || bytes.len() % n_experts != 0 {
         return Err(format!(
@@ -1467,7 +1474,8 @@ pub fn compact_owned_experts(
         ));
     }
     let per_expert = bytes.len() / n_experts;
-    let mut compact = Vec::with_capacity(bytes.len() / ranks);
+    let mut compact =
+        Vec::with_capacity(per_expert * ep_local_expert_count(n_experts, rank, ranks));
     for expert in (rank..n_experts).step_by(ranks) {
         compact.extend_from_slice(&bytes[expert * per_expert..(expert + 1) * per_expert]);
     }
@@ -1476,7 +1484,8 @@ pub fn compact_owned_experts(
 
 /// Validate one expert-stack payload against its manifest entry and upload
 /// the rank's owned experts compactly (device-pooled or pinned host-mapped per
-/// the entry's residency). Returns the tensor, shaped `[n_experts / ranks, ..]`,
+/// the entry's residency). Returns the tensor, shaped
+/// `[ep_local_expert_count(n_experts, rank, ranks), ..]`,
 /// and the source dtype.
 fn upload_expert_compact(
     gpu: &mut Gpu,
@@ -1507,7 +1516,7 @@ fn upload_expert_compact(
     validate_payload_extent(&info.shape, dtype, bytes.len())?;
     let compact = compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign)?;
     let mut shape = entry.logical_shape.clone();
-    shape[0] = n_experts / ep.ranks;
+    shape[0] = ep_local_expert_count(n_experts, ep.rank, ep.ranks);
     let mut tensor = upload_resident_bytes(gpu, entry.residency, &compact, &shape)
         .map_err(|error| format!("pooled upload failed: {error}"))?;
     tensor.dtype = dtype;
@@ -2034,7 +2043,7 @@ mod tests {
     fn compact_owned_experts_concatenates_owned_extents_ascending() {
         let (n, b) = (16, 5);
         let stack = expert_stack(n, b);
-        for ranks in [2usize, 4] {
+        for ranks in [2usize, 3, 4, 5, 6] {
             let mut owned_total = 0;
             for rank in 0..ranks {
                 let compact =
@@ -2044,7 +2053,7 @@ mod tests {
                     .flat_map(|e| stack[e * b..(e + 1) * b].iter().copied())
                     .collect();
                 assert_eq!(compact, expected, "ranks={ranks} rank={rank}");
-                assert_eq!(compact.len(), n / ranks * b);
+                assert_eq!(compact.len(), ep_local_expert_count(n, rank, ranks) * b);
                 // Local index e / ranks holds expert e.
                 for e in (rank..n).step_by(ranks) {
                     let local = e / ranks;
@@ -2061,7 +2070,8 @@ mod tests {
         let stack = expert_stack(8, 4);
         let stride = ExpertAssign::Stride;
         assert!(compact_owned_experts(&stack, 8, 2, 2, stride).is_err());
-        assert!(compact_owned_experts(&stack, 8, 0, 3, stride).is_err());
+        assert!(compact_owned_experts(&stack, 8, 0, 3, stride).is_ok());
+        assert!(compact_owned_experts(&stack, 8, 0, 9, stride).is_err());
         assert!(compact_owned_experts(&stack, 8, 0, 0, stride).is_err());
         assert!(compact_owned_experts(&stack[..31], 8, 0, 2, stride).is_err());
         assert!(compact_owned_experts(&[], 8, 0, 2, stride).is_err());
