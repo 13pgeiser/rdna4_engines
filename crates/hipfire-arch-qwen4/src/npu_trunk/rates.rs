@@ -326,6 +326,25 @@ mod tests {
     }
 
     #[test]
+    fn npu_thirty_percent_slower_than_the_prior_converges_and_drops_zab() {
+        // A stock-kernel host whose NPU leg runs x1.3 the built-in model at depth (fivetide's 57K), after short
+        // requests that matched the prior: from fresh, and from a snapshot already frozen at the prior.
+        let zab = |m: FamilyMask| m.contains(Family::GdnZ);
+        for frozen_first in [false, true] {
+            let mut e = RateEstimator::new(builtin());
+            for _ in 0..if frozen_first { FREEZE_AFTER } else { 2 } { e.observe(&sample(1.0, 1.0)); }
+            assert_eq!(e.snapshot().frozen, frozen_first);
+            for _ in 0..20 { e.observe(&sample(1.0, 1.3)); }
+            let s = e.snapshot();
+            assert!((s.npu_scale / 1.3 - 1.0).abs() < 0.02 && (s.gpu_scale - 1.0).abs() < 0.01, "{s:?}");
+            let chosen = choose_families(&s.calibration, FamilyMask::ALL, 57_552);
+            assert!(!zab(chosen) && chosen.contains(Family::GdnQkv) && chosen.contains(Family::QsaQ), "{chosen:?}");
+            let p = plan_executable(&s.calibration, chosen, 57_552);
+            assert!(p.t_pipe_ms < p.t_gpu_ms);
+        }
+    }
+
+    #[test]
     fn unit_ratios_freeze_without_changing_the_snapshot() {
         let mut e = RateEstimator::new(builtin());
         for i in 1..=FREEZE_AFTER {
