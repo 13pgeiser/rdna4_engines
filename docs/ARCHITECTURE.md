@@ -168,15 +168,19 @@ count. `Gpu::qwen4_append_f16_moe_scope` keeps that tile's MoE on the F16 WMMA
 grouped arm, because the IU4 arm below 512 rows exceeds the KLD cap.
 `HIPFIRE_QWEN4_APPEND_WMMA=0` restores the F32 SIMT routes.
 
-### Qwen4 expert-parallel mesh (Flash-Next, EP2/EP4)
+### Qwen4 expert-parallel mesh (Flash-Next, EP2 through EP8)
 
-`topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes `1`, `2` or `4`; `HIPFIRE_QWEN4_EP=0`
-forces `1`. Qwen4 admits expert parallelism only with `pp = 1`, `tp = 1`, on
-exact gfx1201 on every rank, with the peers directly accessible from each
+`topology.ep` (`HIPFIRE_TOPOLOGY_EP`) takes an integer `1..=8`;
+`HIPFIRE_QWEN4_EP=0` forces `1`. Qwen4 admits expert parallelism only with
+`pp = 1`, `tp = 1`, on `ep` ranks of one exact arch, gfx1100 or gfx1201 (a
+mixed set is refused), with the peers directly accessible from each
 other (`qwen4_ep_geometry_refusal`, `qwen4_ep_preflight` in
 `crates/hipfire-loader/src/admission.rs`; checked before rank 0 allocates).
-Routed experts shard by id; every rank runs the unchanged single-device
-program.
+Routed experts shard by id (`e % N`; an N that does not divide 512 gives
+uneven per-rank counts, `Qwen4EpPlacement::local_count`); every rank runs the
+unchanged single-device program. Under the developer-only
+`HIPFIRE_EMULATE_GPUS` the ranks alias physical devices (rank `r` on device
+`r % count`, `qwen4_ep_rank_devices`).
 
 The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 `crates/hipfire-arch-qwen4/src/ep.rs`): peers are bundles on persistent worker
@@ -188,9 +192,13 @@ PFlash, an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
-Two EP levers are **default-on under EP**, each with an exact-`0` kill switch
+Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
 (`gpu_forward.rs`):
 
+- `HIPFIRE_EP_BALANCED_OWNERS`: balanced per-call expert ownership on the
+  host-mapped trunk MoE layers. It ships for exact gfx1201 only; a gfx1100 rank
+  logs `balanced ownership not admitted (needs gfx1201); static split` and runs
+  the exact static split.
 - `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
   A prefill chunk of at least 512 rows computes only its owned expert tiles and
   pulls the other ranks' down rows over P2P, instead of computing every expert
@@ -282,7 +290,7 @@ hipfire-loader
   ModelSource::from_path  →  HfqFile  |  SafetensorsSource dir
   Carrier registry probe on arch_id (+ is_dir namespace)
   carrier.load → LoadedModel { arch_id, state: Option<Box<dyn ArchModel>>, tokenizer, … }
-  optional: draft/speculator, VL weights, EP/PP scaffolding (Qwen4 EP2/EP4 mesh rides rank 0's bundle)
+  optional: draft/speculator, VL weights, EP/PP scaffolding (Qwen4 EP mesh rides rank 0's bundle)
   Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
         │
         ▼
@@ -380,7 +388,7 @@ Qwen4's EP mesh lives inside rank 0's `Qwen4Bundle`.
 
 | API | Scope |
 |---|---|
-| `load_model` | Single GPU (Qwen3.5 PP when `pp > 1` inside the carrier; the Qwen4 carrier also attaches its EP2/EP4 mesh here, `attach_qwen4_ep_peers`) |
+| `load_model` | Single GPU (Qwen3.5 PP when `pp > 1` inside the carrier; the Qwen4 carrier also attaches its EP mesh here, `attach_qwen4_ep_peers`) |
 | `load_model_ep` | Expert-parallel: arch_id 9 and 10 only; staging reclaims completed/pushed ranks on failure (constructor-mid-failure can still leak that rank’s partial allocs) |
 
 ## Architecture crates
@@ -398,7 +406,7 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-qwen2` | Standalone Qwen2 text |
 | `hipfire-arch-qwen35` | Hybrid DeltaNet + full attention; dense (5) and MoE/A3B (6); DFlash/MTP hooks |
 | `hipfire-arch-qwen35-vl` | Vision tower attached to Qwen3.5 ids 5/6 |
-| `hipfire-arch-qwen4` | Qwen3.8-Flash-Next / Qwen4 (16): hybrid GatedDeltaNet + QSA sparse attention, PLE, 512-expert MoE, native MTP, EP2/EP4, NPU trunk |
+| `hipfire-arch-qwen4` | Qwen3.8-Flash-Next / Qwen4 (16): hybrid GatedDeltaNet + QSA sparse attention, PLE, 512-expert MoE, native MTP, EP (2..=8 ranks), NPU trunk |
 | `hipfire-arch-dots-ocr` | dots.ocr / Qwen2-VL-class OCR |
 | `hipfire-arch-deepseek4` | DeepSeek V4 Flash (HC, compressed-KV indexer, optional MTP/DSpark) |
 | `hipfire-arch-minimax` | MiniMax-M2 MoE |

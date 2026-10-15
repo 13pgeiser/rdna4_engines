@@ -27,7 +27,7 @@ cannot be combined with either (`pp` or `tp` ≠ 1 is refused when `ep > 1`).
 |---|---|---|---|
 | **Pipeline parallel (PP)** | daemon load `params.pp` (`N`, default `1`) | Contiguous **layer bands** across `N` devices; residual stream crosses bands via `boundary_copy` | Qwen3.5 / 3.6 **HFQ** only (`arch_id` 5 dense, 6 MoE/A3B) via `load_qwen35_pp` |
 | **Expert parallel (EP / `tp`)** | `params.tp`, or CLI `hipfire serve --tp N` → `HIPFIRE_TP` | Within-layer expert sharding + all-reduce; every rank runs every layer (`Gpus::init_tp`) | MiniMax-M2 (`arch_id` 10) and DeepSeek V4 Flash (`arch_id` 9) via `load_model_ep` |
-| **Flash-Next expert parallel (EP2 / EP4)** | config `topology.ep` (`hipfire config set topology.ep N`; env `HIPFIRE_TOPOLOGY_EP`; default `1`, allowed `1`/`2`/`4`; `HIPFIRE_QWEN4_EP=0` forces `1`). **Not `--tp`.** | Routed experts shard by id (`e % N`); every rank holds the whole trunk and runs the unchanged single-device program on its own worker thread; a copy-only owner exchange feeds the unchanged slot-order combine. **Opt-in, experimental.** | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on exact **gfx1201** only, 2 or 4 ranks, every directed card pair peer-accessible (Qwen4 carrier, `load_qwen4_rank`; admission in `crates/hipfire-loader/src/admission.rs`) |
+| **Flash-Next expert parallel (EP, N = 2..=8)** | config `topology.ep` (`hipfire config set topology.ep N`; env `HIPFIRE_TOPOLOGY_EP`; default `1`, allowed `1..=8`; `HIPFIRE_QWEN4_EP=0` forces `1`). **Not `--tp`.** | Routed experts shard by id (`e % N`; an N that does not divide 512 gives uneven per-rank counts); every rank holds the whole trunk and runs the unchanged single-device program on its own worker thread; a copy-only owner exchange feeds the unchanged slot-order combine. **Opt-in, experimental.** | Qwen3.8 Flash-Next (Qwen4, `arch_id` 16) on N = 2..=8 homogeneous cards of one exact arch, **gfx1100** (7900 XTX) or **gfx1201** (R9700), every directed card pair peer-accessible (Qwen4 carrier, `load_qwen4_rank`; admission in `crates/hipfire-loader/src/admission.rs`) |
 
 `pp = 1`, `tp = 1` and `ep = 1` are single-GPU. Behavior matches the pre-multi-GPU paths.
 
@@ -37,7 +37,9 @@ Source-wired means the load path exists in runtime at the audited ref — not th
 it is promoted. Flash-Next EP is opt-in (`topology.ep` defaults to `1`) and
 carries the `experimental` lifecycle status in [`CONFIG.md`](CONFIG.md); the
 defaults listed in [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status)
-apply only once `topology.ep` is set to `2` or `4`.
+apply only once `topology.ep` is set to a value in `2..=8`. The measured and
+exactness evidence on this page was taken on exact gfx1201 R9700s at EP2 and
+EP4; it is not evidence for gfx1100 or for other rank counts.
 
 **PP is not tensor-parallel serving.** It does not give multi-user throughput.
 It is a **capacity** tool: fit larger context / larger HFQ weights by splitting
@@ -49,7 +51,7 @@ sequential PP=2 (see [Appendix A](#appendix-a-historical-pp-evidence-immutable))
 
 | Model / situation | Cards | Use | Why |
 |---|---|---|---|
-| Qwen3.8 Flash-Next (Qwen4) | 2 or 4 gfx1201 | **EP** (`topology.ep` = 2 or 4) | Experts are what does not fit one card: EP2 keeps 30 of 49 routed layers in VRAM per rank (19 host-mapped), EP4 keeps all 49, and EP2 prefill is measured faster than one card ([Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)). EP4 prefill has no owner-routed path yet (see status). |
+| Qwen3.8 Flash-Next (Qwen4) | 2..=8 cards of one exact arch, gfx1100 or gfx1201 | **EP** (`topology.ep` = N) | Experts are what does not fit one card. On 32 GB gfx1201 at 32K context EP2 keeps 30 of 49 routed layers in VRAM per rank (19 host-mapped) and EP4 keeps all 49, and EP2 prefill is measured faster than one card ([Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)). For 24 GB gfx1100 cards see the [per-rank fit arithmetic](#flash-next-ep-per-rank-expert-fit); gfx1100 and N > 4 have no measurement on this page. |
 | MiniMax-M2, DeepSeek V4 Flash | 2+ | **EP via `--tp N`** | The `load_model_ep` route above; no admission, no measured numbers on this page. |
 | Dense Qwen 27B-class that fits one card (registry weights: 11.78 GB for `qwen3.8:27b-mq3-xt`, [`MODELS.md`](MODELS.md); the historical probe in Appendix A shows about 15.5 GB for the mq4 27B proxy) | 2+ | **One model per card** (one daemon per card, each pinned by `hardware.devices`; the per-card lock makes two daemons asking for `gfx1201` get different cards) or **batched serving** on one card ([`SERVE.md`](SERVE.md) continuous batching) rather than splitting | Splitting a model that already fits adds cross-card traffic and, under PP, a sequential decode penalty; it does not buy multi-user throughput. |
 | Qwen3.5 / 3.6 HFQ that does not fit one card at the wanted context | 2+ | **PP** (`params.pp`) | PP is a **capacity** tool, not a speedup: historical PP=2 decode measured about two thirds of single-card decode on short prompts (Appendix A). |
@@ -176,7 +178,10 @@ physical-device count:
 
 The switch is only an enable switch; it does not choose the logical EP width.
 `Gpus::init_ep(2, ...)` owns the two-rank layout and `Gpus::init_ep(4, ...)`
-owns the four-rank layout. Duplicate physical IDs remain refused in ordinary
+owns the four-rank layout; Flash-Next (Qwen4) EP takes its width from
+`topology.ep` (see
+[Flash-Next EP under emulation](#flash-next-qwen4-ep-under-emulation)).
+Duplicate physical IDs remain refused in ordinary
 mode; the snapshotted emulation state is the explicit diagnostic exception for
 sealed ownership, load, and batch policy.
 
@@ -203,6 +208,32 @@ ownership. Same-device peer setup is fail-soft: when two logical ranks resolve
 to the same physical device, peer capability/enable calls are skipped for that
 pair and the route continues with peer access disabled rather than aborting.
 
+### Flash-Next (Qwen4) EP under emulation
+
+Flash-Next EP honors the same switch. With `HIPFIRE_EMULATE_GPUS >= 2` and
+`topology.ep = N` (2..=8), the load maps rank `r` to physical device
+`r % count` (`qwen4_ep_rank_devices`, the same alias rule as above), so one
+visible device is enough for any N. Each rank keeps its own worker thread,
+stream, buffers, expert shard and exchange state. What differs from physical
+mode:
+
+- **Device count:** at least one visible device, not N.
+- **Arch:** unchanged. The aliased devices are still checked: exact gfx1100 or
+  exact gfx1201, one arch for every rank.
+- **Peer checks:** ranks that resolve to the same physical device are never
+  probed and no peer mapping is enabled between them (the row gather and the
+  tile exchange accept ranks that share a device); each pair of distinct
+  physical devices is probed once.
+- **Free VRAM:** each rank's free VRAM is its physical device's free VRAM
+  divided by the number of ranks aliased onto that device
+  (`qwen4_ep_alias_free`), so the residency split is budgeted per alias and
+  ranks sharing a card do not each claim all of it.
+- **Log:** the plan prints `qwen4 EP logical emulation (HIPFIRE_EMULATE_GPUS):
+  rank -> physical device 0->0, 1->1, 2->0, …`.
+
+This is developer-only and not an admission. Under a `HIPFIRE_EMU` capacity
+profile logical emulation is refused ([`EMU.md`](EMU.md)).
+
 ### Evidence boundary
 
 The logical EP route-oracle suite is designed as byte-exact checks on one
@@ -213,8 +244,11 @@ lifecycle pass.
 
 A passing logical-rank oracle does **not** prove RCCL, PCIe/xGMI or other
 interconnect behavior, physical-device synchronization, throughput, product
-gfx1201 admission, or G5 acceptance. Do not describe this evidence as physical
-EP2/EP4, interconnect, or performance validation.
+gfx1201 admission, or G5 acceptance. The same boundary holds for Flash-Next
+EP under emulation: same-device ranks skip peer setup and share one card's
+compute and memory bandwidth, and the per-alias free-VRAM division is not a
+real per-card fit. Do not describe this evidence as physical EP, interconnect,
+or performance validation.
 
 ## Launch and config
 
@@ -256,40 +290,52 @@ Flash-Next (Qwen3.8 Flash-Next, Qwen4, registry tag `qwen3.8:flash-next`) uses
 `topology.ep`, not `--tp`:
 
 ```sh
-# two (or four) distinct gfx1201 cards, in logical order
-hipfire config set hardware.devices gfx1201,gfx1201     # or HIPFIRE_DEVICES=…
-hipfire config set topology.ep 2                         # or HIPFIRE_TOPOLOGY_EP=2; 4 for EP4
+# N distinct cards of ONE arch (all gfx1100 or all gfx1201), in logical order; N = 4 shown
+hipfire config set hardware.devices gfx1100,gfx1100,gfx1100,gfx1100   # or HIPFIRE_DEVICES=…
+hipfire config set topology.ep 4                         # or HIPFIRE_TOPOLOGY_EP=4; any N in 2..=8
 hipfire serve qwen3.8:flash-next
 # optional: native MTP under EP is opt-in, `auto` stays AR
 hipfire serve qwen3.8:flash-next --spec mtp
 ```
 
-`HIPFIRE_QWEN4_EP=0` forces `topology.ep = 1` whatever the config says. The
-first `ep` visible gfx1201 cards become the ranks. The load is refused (naming
-`topology.ep`) when `pp` or `tp` is not `1`, when device 0 is not gfx1201, when
-fewer than `ep` devices are visible, or when a directed card pair is not
-peer-accessible; EP also refuses DFlash, DSpark, n-gram drafting, DDTree,
-adaptive KV, drafters, CASK, PFlash, lane batching and the retained Redline
-default, and `HIPFIRE_MTP_SAMPLED_MODE=naive`. EP decode is eager (no graph
+`topology.ep` is an integer in `1..=8` (anything else is rejected by config
+validation naming that range). `HIPFIRE_QWEN4_EP=0` forces `topology.ep = 1`
+whatever the config says. The first `ep` visible cards become the ranks. The
+load is refused (naming `topology.ep` or the missing requirement) when `pp` or
+`tp` is not `1`, when `ep` is above 8, when device 0 is not gfx1100 or gfx1201,
+when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
+`requires the same architecture on every rank`), when fewer than `ep` devices
+are visible, or when a directed card pair is not peer-accessible. There is no
+host-staged fallback for a missing peer pair; the load refuses. EP also refuses
+DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK, PFlash,
+lane batching and the retained Redline default, and
+`HIPFIRE_MTP_SAMPLED_MODE=naive`. Flash-Next EP stays **opt-in and
+experimental** (`topology.ep` defaults to `1`). EP decode is eager (no graph
 capture).
 
-| | EP2 | EP4 |
+| | exact gfx1201 (R9700), N = 2..=8 | exact gfx1100 (7900 XTX), N = 2..=8 |
 |---|---|---|
-| Load / decode / verify / native MTP (`--spec mtp`) | Supported (opt-in, experimental) | Supported (opt-in, experimental) |
-| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0` | On by default under EP (same switch); the decode numbers on this page are EP2 |
-| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds (EP2..EP8, gfx1201 symmetric IU4 route or gfx1100 F16 WMMA grouped route); kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` | Same rule; the owner-routed route needs its arch's hardware cells to have run before it is a validated default |
-| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted on gfx1201; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`); never on gfx1100 (`expert staging not admitted (needs gfx1201)`) | Created only when S1 is admitted on gfx1201 and the load has host-mapped layers |
-| Routed layers resident per rank at 32K context | 30 of 49 (19 host-mapped), +0.34 GiB headroom | 49 of 49, +3.77 GiB headroom |
+| Load / decode / verify / native MTP (`--spec mtp`) | Admitted (opt-in, experimental) | Admitted (opt-in, experimental) |
+| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
+| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0`. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same default and kill switch. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
+| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (`expert staging not admitted (needs gfx1201)`) |
 
 For the three levers, exactly `0` is off and unset or any other value is on
 (they follow one rule, `ep_lever_on`). Single-card (`ep = 1`) behavior is
 unchanged by all of them. The per-rank load log states what ran (`qwen4 EP
 rank r/n: balanced ownership on N host-mapped MoE layers`; `owner-routed
-prefill on …` or `owner-routed prefill not admitted (reason)`).
+prefill on …` or `owner-routed prefill not admitted (reason)`). How many routed
+layers stay in VRAM depends on the card and N: see
+[per-rank expert fit](#flash-next-ep-per-rank-expert-fit). On the 32 GB R9700
+fixture at 32K context the changelog-reported figures are EP2: 30 of 49 routed
+layers resident per rank (19 host-mapped), +0.34 GiB headroom; EP4: 49 of 49,
++3.77 GiB headroom.
 
-**Exactness.** Under EP the output is bit-identical to the same build on one
-card, not merely close. Evidence (`fn_ep_oracle` and the serve harnesses, 2×/4×
-R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`; fixture-bound):
+**Exactness.** On the evidence below, EP output on exact gfx1201 is
+bit-identical to the same build on one card, not merely close. The evidence
+(`fn_ep_oracle` and the serve harnesses, 2×/4× R9700, pinned Flash-Next XTS
+sha256 prefix `8b15b6fe`; fixture-bound) covers **exact gfx1201 at EP2 and EP4
+only**; it is not evidence for gfx1100 or for other rank counts:
 
 - EP2 and EP4 AR decode: logits and per-request state match one card at every
   step over 256 greedy tokens (ctx 512, 8192, 32768).
@@ -297,13 +343,85 @@ R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`; fixture-bound):
   match one card on EP2 (34/34 compared) and EP4 (52/52); greedy MTP equals AR.
 - Sampled MTP (T 0.6, top-p 0.95, top-k 20, seed 7, two fresh processes) on
   EP2 with the defaults above: tokens, windows and state identical to one card,
-  and per-seed stable. **No sampled-MTP oracle was run on EP4**, and no EP4
-  hardware cell exists for S1/S2 (it is refused).
+  and per-seed stable. **No sampled-MTP oracle was run on EP4**, and the EP4
+  cells above were taken when S1 was still refused at EP4, so no EP4 hardware
+  cell for S1/S2 is recorded on this page.
 - S1 + S2 on EP2: 25 of 25 compares against one card pass (greedy AR and MTP at
   p8k and p16k, a 4,396-token prompt whose last chunk is 300 rows, bitwise chunk
   digests at layers 0/2/3/31/47); flag-off EP2 equals the previous EP2.
 
-### Flash-Next EP: balanced expert ownership (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
+### Flash-Next EP: expert ownership and uneven splits
+
+Routed expert `e` is owned by rank `e % N` and stored at local slot `e / N` of
+that rank's compact expert tensors (ascending expert id). N does not have to
+divide the 512 experts: rank `r` holds `(512 + N - 1 - r) / N` experts, so the
+low ranks hold one more. Per-rank counts (`Qwen4EpPlacement::local_count`):
+
+| N | experts per rank |
+|---|---|
+| 2 | 256 / 256 |
+| 3 | 171 / 171 / 170 |
+| 4 | 128 each |
+| 5 | 103 / 103 / 102 / 102 / 102 |
+| 6 | 86 / 86 / 85 / 85 / 85 / 85 |
+| 7 | 74 / 73 / 73 / 73 / 73 / 73 / 73 |
+| 8 | 64 each |
+
+Residency is decided per layer for all ranks together: every rank budgets the
+**largest** share (`max_local_count = ceil(512 / N)` experts of each routed
+stack) when it sizes how many MoE layers stay in VRAM, and the split every rank
+applies is the minimum over the ranks' own free VRAM (`ep_vram_layers`). A
+layer is therefore resident on every rank or on none; the full-table prefill
+route relies on equal residency per layer across ranks. Pinned host bytes are
+charged per rank at that rank's own share (an uneven split charges the low
+ranks more), and the host RAM and GTT checks cover every rank that has not
+pinned yet. Each rank prints its own fit line and `qwen4 EP rank r/n: loaded on
+device d (K routed experts of 512 per stack, …)`.
+
+### Flash-Next EP: per-rank expert fit
+
+How many of the 49 MoE layers (48 trunk layers plus the MTP head's) stay
+resident per rank is `floor((free − non-expert weights − reserve) / per-layer
+routed bytes)` when they do not all fit, and all 49 when
+`49 × per-layer bytes + non-expert weights + reserve` fits in free VRAM
+(`ep_rank_layers`, `fits_fully_resident`). The table below is **arithmetic from
+the single-card figures pinned in the unit test
+`uneven_ep_split_uses_the_largest_rank_share`, not a measurement of an EP
+load**: 24,520 MiB free per 24 GB gfx1100 card, 5,115 MiB of replicated
+non-expert weights, a 6,656 MiB reserve (`AUTO_VRAM_RESERVE_BYTES`, the 32,768
+token baseline), and 1,336,934,400 bytes of routed experts per MoE layer for
+all 512 experts (2,611,200 bytes per expert). The real load computes the reserve
+with `auto_vram_reserve`, which also depends on the prefill chunk, the KV
+backend and native MTP, so the per-rank fit line a load prints is the figure
+that applies.
+
+| N | largest rank share (experts) | routed bytes per layer on that rank | MoE layers resident per rank (of 49) |
+|---|---|---|---|
+| 2 | 256 | 637.5 MiB | 19 |
+| 3 | 171 | 425.8 MiB | 29 |
+| 4 | 128 | 318.75 MiB | 39 |
+| 5 | 103 | 256.5 MiB | 49 |
+| 6 | 86 | 214.2 MiB | 49 |
+| 7 | 74 | 184.3 MiB | 49 |
+| 8 | 64 | 159.4 MiB | 49 |
+
+N = 2 and N = 4 sit within 1 MiB of the next layer (the quotient is 19.998 and
+39.997), so a slightly different free-VRAM or reserve figure moves them by one
+layer. At N = 2, 3 and 4 the layers that do not fit are host-mapped (the MTP
+layer always is when not every layer is resident).
+
+### Flash-Next EP: card topology
+
+All EP exchange traffic (the row gather on decode and few-row forwards, the
+tile pull in owner-routed prefill) is peer-to-peer copies between the cards, so
+exchange bandwidth is whatever the card-to-card links give. Consumer boards
+commonly hang cards off chipset lanes or PCIe switches and run some slots at
+x4 or x8; that lowers the exchange bandwidth, and every rank waits for the
+slowest link. There is no host-staged fallback: if any directed card pair is
+not peer-accessible, the load refuses. The community gate below records each
+card's PCIe link speed and width and the P2P topology in its receipt.
+
+### Flash-Next EP: balanced expert ownership (default on under EP on gfx1201; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
 
 Under Flash-Next (Qwen4) expert parallelism rank `r` owns routed expert `e`
 when `e % ranks == r`. On the trunk layers whose experts live in pinned host
@@ -331,36 +449,51 @@ forwards (more than 8 rows) and the MTP head keep the static split. With
 added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
-### Flash-Next EP2/EP4: owner-routed prefill chunks (default on under EP2; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
+Balanced ownership is admitted on exact gfx1201 only (the per-call owner-assign
+kernel ships for that arch). On gfx1100 each rank logs `qwen4 EP rank r/n:
+balanced ownership not admitted (needs gfx1201); static split`, builds nothing,
+and runs the static `e % ranks` split, which is exact.
+
+### Flash-Next EP: owner-routed prefill chunks (default on under EP; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2..EP8 on gfx1201 (symmetric IU4 route) and gfx1100 (F16 WMMA grouped route); `=0` is the kill switch, any other value or unset is on; single card unchanged)
+`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2..EP8 on exact gfx1201 (symmetric IU4 route) and exact gfx1100 (F16 WMMA grouped route); `=0` is the kill switch, any other value or unset is on; single card unchanged)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
-identical everywhere). Each rank runs the grouped symmetric IU4 gate/up and
-down on its own experts' tiles only (`e % ranks`):
-a PeaceMaker kernel (`ep_tile_mask_pm_gfx1201`) writes
+identical everywhere). Each rank runs the grouped gate/up and down on its own
+experts' tiles only (`e % ranks`): the symmetric IU4 GEMMs on gfx1201, the F16
+WMMA grouped GEMMs on gfx1100 (BF16-out gate/up with the SwiGLU epilogue and
+BF16-out down). The stable grouping is used whenever the exchange is installed
+(on gfx1100 the fused scatter's row order is not reproducible across ranks).
+A PeaceMaker kernel (`ep_tile_mask_pm_gfx1201` or `ep_tile_mask_pm_gfx1100`) writes
 a copy of the tile ids with every tile of a peer expert set to the `-1`
-sentinel the symmetric kernels already return on before any load, and the
+sentinel the grouped kernels already return on before any load, and the
 kernels read the copy (the scatter's ids are never modified). The rank then
 pulls every peer-owned tile's sixteen BF16 grouped rows of `y_down_grouped`
-(the PeaceMaker tile pull: predicated 16-byte copies, approximately 105 MB per
+(the PeaceMaker tile pull: predicated 16-byte copies, two-source kernel on EP2
+and eight-source kernel on EP3..EP8, approximately 105 MB per
 layer/rank on EP2 or 157 MB on EP4 before grouping padding), and the unchanged
 BF16-row combine reads exactly the bytes a single card stores. Per layer:
 record ready after down, cross a host barrier, wait every peer's ready, pull,
 record done and cross a second host barrier. Right before the next routed
 down, wait every peer's previous done (one layer of trunk work later). Two
-alternating event pairs make buffer reuse safe for either rank count.
+alternating event pairs make buffer reuse safe for every rank count.
 Without an installed launch stream the waits are host
 `hipEventSynchronize` calls, as in the decode row gather.
 
-Scope: chunks of at least 512 rows when every MoE layer verified symmetric on
-every rank. A tail chunk of 9 to 511 rows, few-row forwards (2 to 8 rows),
-decode and the MTP head keep today's route. Per rank one `qwen4 EP rank r/n:
-owner-routed prefill not admitted (reason)` line explains a refusal (ranks
-other than 2 or 4, not gfx1201, the sym-IU4 route not requested, the compact
-scratch plan, mismatching per-layer verdicts). The rotation of the grouped
+Scope: chunks of at least 512 rows, with a per-layer verdict that holds on every
+rank and agrees across ranks: gfx1201 needs every MoE layer verified symmetric,
+gfx1100 needs the QT44/QT53 expert formats on every layer (it reads no
+symmetric headers). A tail chunk of 9 to 511 rows, few-row forwards (2 to 8
+rows), decode and the MTP head keep today's route. Per rank one `qwen4 EP
+rank r/n: owner-routed prefill not admitted (reason)` line explains a refusal
+(ranks outside 2..=8, an arch other than gfx1100 or gfx1201, no Flash-Next
+profile, the sym-IU4 route not requested (gfx1201) or the F16 WMMA grouped MoE
+route not available (gfx1100), the compact scratch plan); per-rank verdicts
+that disagree log `qwen4 EP: owner-routed prefill refused (per-rank admitted
+layers … are not identical and complete)` and chunks keep the full-table
+route. The rotation of the grouped
 activations still runs over every slot (it has no tile input);
 non-owned tiles' activation rows are never consumed. Diagnostics:
 `fn_ep_oracle --chunk-dump` (`HIPFIRE_CHUNK_DUMP_DIR`) digests `y_down_grouped`
@@ -369,12 +502,15 @@ bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
 ### Flash-Next EP: long-prefill expert staging
 
-`HIPFIRE_EP_EXPERT_STAGE` (default ON under EP2 when the owner-routed prefill is admitted; `=0` is the kill switch, any other value or unset is on) admits the existing
-`HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. Each rank
+`HIPFIRE_EP_EXPERT_STAGE` (default ON under EP when the owner-routed prefill is admitted on gfx1201; `=0` is the kill switch, any other value or unset is on) admits the existing
+`HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. It is gfx1201
+only: on gfx1100 a rank logs `qwen4 EP rank r/n: expert staging not admitted
+(needs gfx1201)` and builds nothing. Each rank
 borrows its last two resident compact expert layers as alternating DMA stages,
 then restores their original bytes before the forward returns. Residency is
-unchanged; each host layer copies 637.5 MiB/rank on EP2 or 318.75 MiB/rank
-on EP4. Two donor mirrors/rank are charged for all ranks against one host's
+unchanged; each host layer copies the rank's owned compact experts (637.5
+MiB/rank on EP2 and 318.75 MiB/rank on EP4). Two donor mirrors/rank, each
+charged at the largest rank's share, are charged for all ranks against one host's
 RAM/GTT budgets; an all-resident load needs no host-layer stage.
 Decode and verify continue to use mapped experts and host-wait row exchange,
 independent of the staging launch stream. Staging stays outside capture/tapes.
@@ -396,9 +532,10 @@ prepared runtime kind. Single-card tables retain their original parity layout.
 ### Rehostable owner-routed tile exchange
 
 The PeaceMaker tile mask and pull kernels and runtime `EpTileExchange` are
-model-independent building blocks for two or four ranks on gfx1201. The mask
+model-independent building blocks for two to eight ranks on gfx1100 and
+gfx1201 (`ep_tile_pm_arch`). The mask
 reads `owner_table[expert]`; the pull uses the peer source on EP2 or selects
-one of four registered bases by that logical owner on EP4. Every rank waits all peers' ready
+one of eight registered bases by that logical owner on EP3..EP8. Every rank waits all peers' ready
 events before pulling, and all peers' done events before overwriting its
 grouped-row buffer. Two alternating event pairs and two host barriers per
 exchange preserve the buffer lifetime without another row bank.
@@ -409,7 +546,38 @@ logical ranks rather than physical device IDs. This transport does not change
 the generic EP schedule's numerical combine contract or attach itself to a
 model. Flash-Next binds these pieces through its rank-generic S1/S2 adapter
 for 0.4.2; moving that adapter onto the generic engine is separate work.
-The EP2 pull retains its 48-byte kernarg specialization behind the same API.
+The EP2 pull retains its 48-byte kernarg specialization behind the same API;
+EP3..EP8 take the eight-source launch.
+
+### Flash-Next EP: community gate
+
+`scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]` is a one-command
+gate for a host with N homogeneous gfx1100 or gfx1201 cards (N in 2..=8;
+default: every visible card of the chosen arch, at most 8). From a hipfire
+checkout it builds the binaries, runs one card (`topology.ep = 1`) and N cards
+(`topology.ep = N`) through `fn_ep_oracle` over two committed prompts (about
+500 and about 4,400 tokens, 128 greedy tokens, state digests at steps 1, 64 and
+128), and `scripts/fn_ep_compare.py` compares the arms byte for byte: the
+tokens, the rank-0 logits sha256, every peer rank's logits mirror sha256 and
+every rank's state digests must equal the single card's. It then times
+`hipfire bench --spec off` decode and prefill (3 fresh processes per arm by
+default, arms interleaved). Each arm runs in a private HOME holding only
+`topology.ep` unless `--no-isolate` is given.
+
+The receipt (`OUT_DIR/receipt.json`, schema `fn-ep-gate-receipt-v1`, with a
+readable `summary.txt`, `compare.txt` and `gate.log`) holds the verdict and
+reason, the configuration, the environment (git/build hash, ROCm, `rocm-smi`
+topology and P2P access, host RAM), a per-rank table of arch, VRAM and PCIe
+link speed and width, each arm's status, duration and peak VRAM per card (an EP
+load that fails, for example on a missing peer pair or out of VRAM, is recorded
+with its stderr tail instead of aborting the run), the compare verdict with the
+first mismatch, and every speed run with its raw JSON. Exit status: 0 for a
+byte-exact PASS, 1 for a mismatch or a failed arm, 2 for an environment or
+usage problem. It is supporting manual evidence, not a
+[`VALIDATION.md`](VALIDATION.md) selector route.
+`crates/hipfire-runtime/examples/ep_transport_oracle.rs` (feature `lab`) is a
+separate no-model, one-device synthetic oracle for the row-gather and tile
+launchers at N = 2..=8.
 
 
 ### Environment (operator-facing)
@@ -426,11 +594,12 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_ALLOW_MIXED_ARCH` | Opt into mixed-arch device sets |
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
 | `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
-| `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1`/`2`/`4`); **not** `--tp` |
+| `HIPFIRE_TOPOLOGY_EP` | Flash-Next EP degree (`topology.ep`, default `1`, allowed `1..=8`); **not** `--tp` |
 | `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
-| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers; on under EP, exact `0` disables |
-| `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP2: owner-routed prefill chunks; on under EP2, exact `0` disables; EP4 refused at admission |
-| `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP2: long-prefill expert staging; on when owner-routed prefill is admitted, exact `0` disables |
+| `HIPFIRE_EMULATE_GPUS` | Developer-only logical rank aliasing (integer `>=2`); also maps Flash-Next EP rank `r` to physical device `r % count` (see [emulation](#flash-next-qwen4-ep-under-emulation)) |
+| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 only; other arches keep the exact static split); on under EP, exact `0` disables |
+| `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP (N = 2..=8): owner-routed prefill chunks on gfx1201 and gfx1100; on under EP, exact `0` disables |
+| `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP: long-prefill expert staging (gfx1201 only); on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
 | `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
@@ -459,9 +628,10 @@ string or a blanket “always refuse at load.”
 | `bench_prefill` / multi-GPU EP | Daemon refuses bench_prefill when `pp>1` or EP is active |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
-Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, non-gfx1201, too few
-devices, missing peer access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
-`HIPFIRE_MTP_SAMPLED_MODE=naive`; EP4 owner-routed prefill): see
+Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
+arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
+access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
+`HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
 Dense Qwen3.5/3.6 at `tp>1` can speculate with MTP, **opt-in**: only an explicit
@@ -602,7 +772,7 @@ Every EP2 run was above the single-card median at both lengths. A
 default-flags re-run at p8k (no `HIPFIRE_EP_*` set, three fresh processes per
 arm, interleaved) gave single 3039.8 / 3037.4 / 3035.2 (median 3037.4) and EP2
 3948.1 / 3941.6 / 3936.7 (median 3941.6), ratio 1.298. **EP4 prefill was not
-measured** (S1 is refused on EP4); the changelog's earlier EP4 run measured a
+measured** (S1 was refused on EP4 in the measured build); the changelog's earlier EP4 run measured a
 42-token prompt at 408 ms to first token against 286 ms on one card.
 
 ### Decode: no trade for the prefill levers (EP2)

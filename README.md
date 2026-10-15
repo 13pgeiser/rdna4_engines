@@ -119,10 +119,11 @@ gives different token streams across fresh processes on three of the eight
 prompts (a known issue in the wall-time route chooser). Greedy AR and greedy
 MTP are bit-identical across processes.
 
-- **Qwen3.8-Flash EP2.** Owner-routed prefill and long-prefill expert staging
-  are on by default when two R9700s (gfx1201) admit EP2. Balanced per-call
-  expert ownership and native MTP also run under EP. EP4 owner-routed
-  prefill is still refused at admission.
+- **Qwen3.8-Flash expert parallelism (EP2 through EP8).** Owner-routed prefill
+  is on by default when `topology.ep` ranks of one exact arch, gfx1201 or
+  gfx1100, admit it; long-prefill expert staging and balanced per-call expert
+  ownership are gfx1201-only. Native MTP also runs under EP. EP is opt-in and
+  experimental.
   *Measured on 2x R9700 (gfx1201), pinned Qwen3.8-Flash XTS, committed prompts,
   2026-10-13: prefill went from 3,033 to 3,943 tok/s at 8K (1.30x) and from
   3,754 to 4,308 tok/s at 16K (1.15x), one card vs EP2.* See
