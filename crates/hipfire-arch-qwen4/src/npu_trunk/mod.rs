@@ -10,6 +10,7 @@ mod gpu;
 mod packing;
 mod plan;
 mod programs;
+mod rates;
 mod shapes;
 
 pub(crate) use packing::pack_matrix_direct;
@@ -25,7 +26,12 @@ pub use plan::{
     pair_time, pair_time_moved, plan, plan_moved,
     request_log_line, select_families, BankSegments, GpuChunk, LoadLogKey, Moved, PairTime, Plan,
     SelectionReport, SelectionRow, Step, CHUNK, SELECTION_ROWS,
-    auto_admission, executable_plan, planned_pair, planned_pair_rows,
+    auto_admission, executable_plan, executable_plan_for, planned_pair, planned_pair_rows,
+};
+pub use rates::{
+    choose_families, pair_model, scaled_calibration, LayerKind, PairModel, RateEstimator, RateSample, RateSnapshot,
+    APPLY_EPS, EWMA_ALPHA, FREEZE_AFTER, FREEZE_EPS, FREEZE_WINDOW, MIN_MODEL_MS, REOPEN_CONFIRM, REOPEN_EPS,
+    SCALE_MAX, SCALE_MIN,
 };
 pub use config::{NpuTrunkMode, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV};
 pub use packing::{

@@ -291,7 +291,7 @@ impl SelectionRow {
         FAMILY_NAMES.into_iter().zip(selected(self.families)).filter_map(|(name, yes)| yes.then_some(name))
     }
 }
-fn subset_mask(bits: u8) -> FamilyMask {
+pub(crate) fn subset_mask(bits: u8) -> FamilyMask {
     let groups = [FamilyMask::from(Family::GdnQkv), FamilyMask::from_bits(0x0e),
                   FamilyMask::from(Family::QsaQ), FamilyMask::from_bits(0xe0)];
     groups.into_iter().enumerate().fold(FamilyMask::NONE, |mask, (i, group)| {
@@ -360,6 +360,10 @@ fn executable_pair(a: &Range<usize>, b: &Range<usize>, rows: usize, minimum: usi
 /// and the rebalanced last pair (`pipe-rebalanced`). Split/rebanked steps stay
 /// GPU-only; never substitute force-pairs.
 pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: Option<usize>) -> Plan {
+    executable_plan_for(cal, FamilyMask::ALL, planned, rows, n_star)
+}
+/// `executable_plan` whose predicted `t_pipe_ms` prices each pair with `families` (the set `planned` was made for).
+pub fn executable_plan_for(cal: &Calibration, families: FamilyMask, planned: &Plan, rows: usize, n_star: Option<usize>) -> Plan {
     let minimum = 512.max(cal.gpu.min_bank_rows);
     let armed = n_star.is_some_and(|n| rows >= n);
     let mut steps = Vec::with_capacity(rows.div_ceil(CHUNK));
@@ -371,7 +375,7 @@ pub fn executable_plan(cal: &Calibration, planned: &Plan, rows: usize, n_star: O
             _ => None,
         })).flatten();
         if let Some((a, b)) = pair {
-            t_pipe_ms += pair_time(cal, FamilyMask::ALL, a.len(), a.start, b.len(), b.start).t;
+            t_pipe_ms += pair_time(cal, families, a.len(), a.start, b.len(), b.start).t;
             at = b.end;
             steps.push(Step::Pipe { a, b });
         } else {

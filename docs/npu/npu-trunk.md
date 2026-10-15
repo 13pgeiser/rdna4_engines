@@ -27,14 +27,30 @@ kept for provenance and are not current recommendations.
   only, with an open NPU and a matching keyed calibration; every other arch is
   effectively `off` with no NPU I/O or allocation. Any auto load refusal logs one
   reason and runs GPU-only. `off` is the kill switch.
-* **Calibration.** `fusions.npu_trunk_calibration` /
-  `HIPFIRE_QWEN4_NPU_TRUNK_CAL` defaults to `<hipfire home>/npu-trunk/calibration.json`.
-  A file there wins; only an absent file falls back to the compiled-in measured
-  Halo records. Those apply on any Halo kernel/firmware with a 5% safety margin
-  (see below); first-load self-calibration is planned. The
-  schema is **4**, BF16-direct only: there is no int32 contract
+* **Calibration.** The compiled-in measured Halo records are the normal path: they
+  bind on arch, build, model index, epilogue and trunk route only, and apply on any
+  Halo kernel, NPU firmware or GPU PCI address at margin 0.0 (see below).
+  `fusions.npu_trunk_calibration` / `HIPFIRE_QWEN4_NPU_TRUNK_CAL` (default
+  `<hipfire home>/npu-trunk/calibration.json`) is an optional strict override: a
+  file there wins, must match every key field, and is produced by
+  `hipfire calibrate-npu-trunk`. No file is required. The schema is **4**,
+  BF16-direct only: there is no int32 contract
   (`glue.fold_ms_per_col_8192` is gone and `epilogue` must be `bf16`), and a
   schema-3 record is rejected.
+* **Auto planning (0.4.3).** Under `auto` each request picks its NPU family
+  subset and pair plan at request start from rate scales learned live in this
+  process: a GPU-window scale and an NPU-chain scale, EWMA 0.25 against the
+  built-in model, clamped 0.5-2.0, frozen once settled, reopened after 3
+  consistent deviations over 5%. The first long request of a process runs the
+  built-in prior. All four families are packed at load under `auto`; per-request
+  subsets run contiguous panel ranges of the packed chains. Forced modes (`on`,
+  `emulate`) plan from the static calibration only, so `on` == `emulate` stays
+  comparable. A guard sends the rest of a request GPU-only when, after a pair, the
+  measured pair time exceeds the predicted GPU-only time for its rows by more than
+  2% (one `npu-trunk: guard: ...` line per load). Output numerics differ only
+  between the NPU and GPU projection routes, both within the accepted KLD cap.
+  Details: Live rate scales (auto), below. Developer variable
+  `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` forces the per-request subset.
 * **Trace.** `HIPFIRE_QWEN4_NPU_TRUNK_TRACE` is unset by default; set it to a
   path to append per-(layer, bank) JSONL.
 * **Pairs and chains.** Natural 8192+B pairs, the planner's rebalanced last pair
@@ -413,8 +429,9 @@ Measured fields are mandatory; only an omitted `key.build` defaults to the
 release contract. Unknown fields/versions and invalid costs are errors.
 Runtime `CalKey` derives:
 
-* `device.arch`: the selected GPU's architecture; `device.pci_bdf`: HIP's PCI
-  bus ID, lowercase; `device.npu_fw_version`: trimmed
+* `device.arch`: the selected GPU's architecture; `device.pci_bdf`: the selected
+  GPU's PCI address (HIP's PCI bus ID, lowercase; not an NPU slot);
+  `device.npu_fw_version`: trimmed
   `/sys/class/accel/accel0/device/fw_version` (the amdxdna device railgun opens).
 * `build`: `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`, shared by serving and
   `calibrate-npu-trunk`; no git SHA and no binary hashing.
@@ -600,23 +617,23 @@ packing, NPU allocations, trace opens or new logging. Explicit on/emulate
 refuse non-gfx1151. `off` / `fusions.npu_trunk = off` is the kill switch.
 
 `fusions.npu_trunk_calibration` (alias `npu_trunk_calibration`, env
-`HIPFIRE_QWEN4_NPU_TRUNK_CAL`) defaults, when empty, to
+`HIPFIRE_QWEN4_NPU_TRUNK_CAL`) is an optional strict override; when empty it names
 `<hipfire home>/npu-trunk/calibration.json`. A file at that path takes precedence.
-Only an absent file falls back to compiled-in measured Halo schema-4 records:
-`halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
+Only an absent file falls back to the compiled-in measured Halo schema-4 records,
+the normal path: `halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
 `halo-xdna2-stock-v2.json` (`stock`). The stock lab record is schema-compatible,
 keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
 Invalid/unreadable files never fall back. Successful arming logs
-`cal_source=file|builtin`. A file must match every key field. For the built-in
-record, `device.pci_bdf`, `device.npu_fw_version` and `kernel.uname_release` are
-advisory: when any differs, the record is used with `margin` raised to at least
-`ADVISORY_MARGIN` = 0.05 (the pipe must be predicted at least 5% faster than
-GPU-only, since the timings were measured on a different kernel/firmware), and
-the load logs one line
-`npu-trunk: built-in calibration measured on <kernel>/<fw>, this host <kernel>/<fw>; using it with margin 0.05`.
-So the built-in calibration applies on any Halo kernel/firmware; first-load
-self-calibration is planned. The reference key is
-gfx1151, the reference unit's PCI bus ID (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
+`cal_source=file|builtin`. A file must match every key field. The built-in
+record binds on the hard fields only (`device.arch`, `build`, `model_index_sha256`,
+`epilogue`, `trunk_route`; `Calibration::bind_builtin`): it takes this host's
+`device.pci_bdf` (the GPU's PCI address, not an NPU slot), `device.npu_fw_version`
+and `kernel.uname_release`, keeps `margin` 0.0, and when any of them differed the
+load logs one line
+`npu-trunk: built-in Halo calibration (measured on kernel <k>, NPU firmware <fw>, GPU <bdf>) applies by arch/model/route; this host kernel <k>, NPU firmware <fw>, GPU <bdf>`.
+The speed it predicts for another kernel/firmware is corrected by the live rate
+scales below, not by a margin. The reference key is
+gfx1151, the reference unit's GPU PCI address (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
 model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
 BF16 and the matching stock/overlay route; the builtin does not admit another
 arch, build, model, epilogue or route.
@@ -661,8 +678,9 @@ An auto key mismatch (any field for a file; a hard field for the built-in) logs 
 Matching records log `load_log_line` with selection, key/hash, crossover and
 predicted 16K/64K times. Packing, twin, row-major programs, C arenas and request
 planning all use that same selected mask. Without a match, forced modes use ALL.
-Auto derives n* once at load. Each request's uncached prompt segment runs
-`plan(cal, selected, rows)` and logs `request_log_line` once. Natural planned
+Auto derives n* once at load from the matched calibration. Each request's uncached prompt segment runs
+`plan(cal, families, rows)` (auto: the request's family subset planned from the estimator snapshot, see
+Live rate scales below; forced modes: the static calibration) and logs `request_log_line` once. Natural planned
 8192+B pairs, with B >= `max(512, cal.gpu.min_bank_rows)`, and the planner's
 `pipe-rebalanced` last pair (two banks <= 8192 rows, 64-aligned split, each >=
 `max(512, min_bank_rows)`, ending the request) execute above n*. Split and
@@ -671,6 +689,46 @@ logged executable projection reflects those restrictions; a second snapshot row
 inside a pair may additionally shorten a candidate group. Rebalanced pairs and
 in-bank snapshot cuts run in the default profile too: partial Core windows route as
 their bank (`with_bank_routing`), and banks need at least 512 rows.
+
+### Live rate scales (auto)
+
+Under `auto` the matched calibration (built-in unless a file overrides it) is the
+*prior*; one estimator per process learns two rate scales against it and the
+request planner reads its snapshot. Forced modes (`on`, `emulate`) never use the
+estimator: they plan from the static calibration only, so `on` and `emulate`
+stay the bit-exact comparable pair.
+
+* **Samples.** After each executed pair the executor compares the measured NPU
+  chain time (relay `Completion` statistics) and the GPU window hiding those
+  chains against `pair_model` for the same pair. The ratio measured/model of each
+  is clamped to 0.5-2.0 and folded into an EWMA (alpha 0.25; the first valid
+  sample initializes it). Samples whose modelled time is under 50 ms or whose
+  numbers are not finite and positive are ignored.
+* **Scales.** The GPU-window scale multiplies the prior's `gpu.*` ms terms, glue
+  pack/visit/consume terms and out-family GPU times; the NPU-chain scale divides
+  `npu.tops_corun`/`tops_alone` and multiplies `glue.sync_ms`
+  (`scaled_calibration`). Nothing else changes; scales 1.0/1.0 are the prior.
+* **Settle then freeze.** The snapshot takes the EWMA values when either differs
+  from it by more than 1%. After 6 valid samples with the last 4 each moving both
+  EWMAs by less than 1%, the snapshot freezes (the EWMAs keep updating). A frozen
+  snapshot reopens, taking the EWMA values, after 3 consecutive samples whose raw
+  ratio deviates from the frozen scale by more than 5% in the same direction.
+* **First request.** The first long request of a process runs the built-in prior
+  (scales 1.0/1.0); later requests use what was learned.
+* **Per-request families.** All four families (qkv, zab, q, kvidx) are packed at
+  load under `auto`. At request start the planner picks the fastest family subset
+  for the request's rows from the snapshot (`choose_families`), then plans the
+  pairs with it. A subset runs a contiguous panel range of the packed chains
+  (`ColumnMap::panel_range`), so no repacking happens per request; the rest of the
+  fused projection runs on the GPU. Developer variable
+  `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` (comma list of `qkv,zab,q,kvidx`, or `all`)
+  forces the per-request subset in every mode.
+* **Guard.** After each pair, if the measured pair time exceeds the predicted
+  GPU-only time for its rows by more than 2%, the rest of that request runs
+  GPU-only and the load logs one `npu-trunk: guard: ...` line.
+* **Numerics.** Output differs only between the NPU and GPU projection routes
+  (BF16-direct W8 rows on the NPU), both within the accepted KLD cap; `on` equals
+  `emulate` bit-exactly.
 
 For the historical stock-v2/overlay-v2 planner records, executable pair starts/lengths are:
 8000: none; 9000: `(0,9000)` (4544+4456); 9319: `(0,9319)` (4672+4647);
@@ -720,8 +778,8 @@ shared over dma-buf) are planned for 0.4.3.
 ### Installing and testing auto on a Strix Halo host (maintainer hardware gate)
 
 After CPU acceptance, install the **same** release CLI/daemon on the Halo host.
-The built-in calibration covers the reference model on any Halo kernel/firmware
-(with the 5% advisory margin off the reference key), so no calibration file is
+The built-in calibration covers the reference model on any Halo kernel/firmware/GPU
+address (it is keyed by arch, build, model, epilogue and route), so no calibration file is
 needed there. A file at `<hipfire home>/npu-trunk/calibration.json` is needed
 only to override it, and must be a schema-4 BF16-direct record whose key matches
 this device exactly (schema-3 and I32 records are refused). These commands are
@@ -735,11 +793,12 @@ scp target/release/hipfire target/release/hipfire-daemon <halo-host>:$GATE/bin/
 # scp <schema-4 calibration.json> <halo-host>:<hipfire home>/npu-trunk/calibration.json
 ```
 
-On the Halo host, verify `uname -r` is `7.3.0-rc7-perfopt+`, the GPU PCI bus ID
-equals the record's `device.pci_bdf`, and
-`cat /sys/class/accel/accel0/device/fw_version` matches the record (for the
-built-in reference key, the values in the built-in record). Do not rewrite a
-measured device/kernel key to hide a mismatch. The default route uses the
+On the Halo host, `uname -r`, the GPU PCI address and
+`cat /sys/class/accel/accel0/device/fw_version` may differ from the built-in
+reference unit's (the load logs one `npu-trunk: built-in Halo calibration ...`
+line saying so). An override file must match all three exactly (the reference
+values are in the built-in record). Do not rewrite a measured device/kernel key
+to hide a mismatch. The default route uses the
 verified overlay-bound model; for the stock route instead set
 `HIPFIRE_QWEN4_TRUNK_OVERLAY=0` (the built-in stock record then applies). Do
 **not** inherit the CPU gate's visibility masks (`-1`); use the Halo device

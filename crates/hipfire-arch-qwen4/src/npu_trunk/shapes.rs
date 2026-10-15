@@ -207,6 +207,22 @@ impl ColumnMap {
             (fused_col >= col0 && fused_col < col0 + cols).then(|| (family, fused_col - col0))
         })
     }
+
+    /// Panels `floor(first selected col0 / PANEL_COLS)..ceil(last selected end / PANEL_COLS)` covering the parts
+    /// whose family is in `families`. `None` when none of this map's parts is selected, or when the selected parts are
+    /// not adjacent in the map's fused order (a skipped retained family sits between them).
+    pub fn panel_range(&self, families: FamilyMask) -> Option<std::ops::Range<usize>> {
+        let mut selected = self.parts.iter().enumerate().filter(|(_, &(family, _, _))| families.contains(family));
+        let (first, &(_, col0, cols)) = selected.next()?;
+        let (mut last, mut end) = (first, (col0 + cols) as usize);
+        for (i, &(_, c, n)) in selected {
+            if i != last + 1 {
+                return None;
+            }
+            (last, end) = (i, (c + n) as usize);
+        }
+        Some(col0 as usize / PANEL_COLS..end.div_ceil(PANEL_COLS))
+    }
 }
 
 /// A fused trunk shape: the two input shapes (`GdnIn`, `QsaIn`; K = 2560, 1280-column panels) and the two out-projection
@@ -315,6 +331,26 @@ impl fmt::Display for Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_range_selects_contiguous_groups_only() {
+        let gdn = Shape::GdnIn.column_map(FamilyMask::ALL);
+        let qsa = Shape::QsaIn.column_map(FamilyMask::ALL);
+        let qkv = FamilyMask::from(Family::GdnQkv);
+        assert_eq!(gdn.panel_range(qkv), Some(0..8));
+        assert_eq!(gdn.panel_range(FamilyMask::from_bits(0x0e)), Some(8..13));
+        assert_eq!(gdn.panel_range(FamilyMask::from_bits(0x0f)), Some(0..13));
+        let q = FamilyMask::from(Family::QsaQ);
+        assert_eq!(qsa.panel_range(q), Some(0..10));
+        assert_eq!(qsa.panel_range(FamilyMask::from_bits(0xe0)), Some(9..11));
+        assert_eq!(qsa.panel_range(FamilyMask::from_bits(0xf0)), Some(0..11));
+        // A skipped retained family between two selected ones, and nothing selected.
+        assert_eq!(gdn.panel_range(qkv | Family::GdnA), None);
+        assert_eq!(gdn.panel_range(FamilyMask::from(Family::GdnZ) | Family::GdnB), None);
+        assert_eq!(qsa.panel_range(q | Family::QsaIdx), None);
+        assert_eq!(gdn.panel_range(FamilyMask::NONE), None);
+        assert_eq!(gdn.panel_range(FamilyMask::QSA), None);
+    }
 
     #[test]
     fn family_table_and_order() {

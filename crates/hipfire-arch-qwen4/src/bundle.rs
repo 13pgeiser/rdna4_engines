@@ -1048,10 +1048,24 @@ impl Qwen4Bundle {
             .is_some_and(|f| f.npu_trunk_planned())
     }
 
-    pub(crate) fn begin_npu_trunk_request(&mut self) {
+    pub(crate) fn begin_npu_trunk_request(&mut self, gpu: &Gpu) -> Result<(), BundleError> {
         if let Some(forward) = &mut self.execution {
-            forward.begin_npu_trunk_request();
+            forward
+                .begin_npu_trunk_request(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Advance the NPU trunk executor before a driver asks for the next pair
+    /// (`prefill_schedule_rows`, `npu_trunk_pair_shape`).
+    pub(crate) fn poll_npu_trunk(&mut self, gpu: &Gpu) -> Result<(), BundleError> {
+        if let Some(forward) = &mut self.execution {
+            forward
+                .poll_npu_trunk(gpu)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// The first still-pending snapshot boundary strictly after `position`.
@@ -2384,7 +2398,7 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
-        self.begin_npu_trunk_request();
+        self.begin_npu_trunk_request(gpu)?;
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
         }
@@ -2648,7 +2662,7 @@ impl Qwen4Bundle {
         route: SessionRoute,
     ) -> Result<(), BundleError> {
         self.ep_refuse("session_begin outside a replicated call")?;
-        self.begin_npu_trunk_request();
+        self.begin_npu_trunk_request(gpu)?;
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
         let capture = self.turn_snapshots_active();
@@ -2667,7 +2681,9 @@ impl Qwen4Bundle {
         };
         if result.is_ok() {
             if let Some(forward) = &mut self.execution {
-                forward.plan_npu_trunk_request(prompt.len() - reused, reused);
+                forward
+                    .plan_npu_trunk_request(gpu, prompt.len() - reused, reused)
+                    .map_err(|error| BundleError::Forward(error.to_string()))?;
             }
         }
         result
@@ -2719,6 +2735,7 @@ impl Qwen4Bundle {
         self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
         let mut pos = reused;
         while pos < prompt.len() {
+            self.poll_npu_trunk(gpu)?;
             let end = if self.npu_trunk_planned() {
                 pos + self.prefill_schedule_rows(
                     pos,

@@ -16,6 +16,12 @@ use std::{ffi::c_void, io::Write};
 pub(super) struct NpuForward {
     mode: NpuTrunkMode,
     families: FamilyMask,
+    request_families: FamilyMask,
+    family_override: Option<FamilyMask>,
+    rates: Option<trunk::RateEstimator>,
+    sampling: Option<PairSampling>,
+    request_epoch: u64,
+    guard_tripped: bool,
     layers: Vec<NpuLayer>,
     emulation: Option<EmulationScratch>,
     // The pack producer writes compact activation sidecars in both modes.
@@ -28,7 +34,7 @@ pub(super) struct NpuForward {
     host_ple: Vec<u8>,
     pair_logged: bool,
     calibration: Option<trunk::Calibration>,
-    n_star: Option<usize>,
+    n_star_cache: Option<(u64, FamilyMask, Option<usize>)>,
     request_plan: Option<trunk::Plan>,
     request_origin: usize,
     /// Wave-padded bank rows below 8192 whose row-adaptive NPU programs this load admitted ([`admitted_plan`]).
@@ -56,6 +62,32 @@ fn family_view<'a>(map: &trunk::ColumnMap, tensor: &'a GpuTensor, family: Family
 fn transport_shape(shape: Shape) -> railgun::npu::trunk::Shape {
     use railgun::npu::trunk::Shape as T;
     match shape { Shape::GdnIn => T::GdnIn, Shape::QsaIn => T::QsaIn, Shape::GdnOut => T::GdnOut, Shape::QsaO => T::QsaO }
+}
+
+fn parse_family_override(value: &str) -> Result<FamilyMask, String> {
+    let mut mask = FamilyMask::NONE;
+    for name in value.split(',').map(str::trim) {
+        mask = mask | match name {
+            "all" => FamilyMask::ALL,
+            "qkv" => FamilyMask::from_bits(0x01),
+            "zab" => FamilyMask::from_bits(0x0e),
+            "q" => FamilyMask::from_bits(0x10),
+            "kvidx" => FamilyMask::from_bits(0xe0),
+            _ => return Err(format!("invalid HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES group {name:?}; expected qkv,zab,q,kvidx or all")),
+        };
+    }
+    Ok(mask)
+}
+
+fn intersect_families(a: FamilyMask, b: FamilyMask) -> FamilyMask {
+    FamilyMask::from_bits(a.bits() & b.bits())
+}
+
+fn family_names(mask: FamilyMask) -> String {
+    if mask.is_empty() { return "none".to_owned(); }
+    [("qkv", 0x01), ("zab", 0x0e), ("q", 0x10), ("kvidx", 0xe0)]
+        .into_iter().filter_map(|(name, bits)| (mask.bits() & bits != 0).then_some(name))
+        .collect::<Vec<_>>().join(",")
 }
 
 fn registered_c_view(rt: &NpuTrunkRuntime, bank: usize, shape: Shape, families: FamilyMask) -> Result<Option<GpuTensor>, Qwen4GpuForwardError> {
@@ -157,12 +189,15 @@ fn match_calibration(gpu: &Gpu, bundle: &Qwen4Bundle, route: &str, mode: NpuTrun
         Some(firmware) => trunk::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?,
         None => trunk::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
     };
-    // A user calibration file stays fully strict; the built-in one treats PCI slot, NPU firmware
-    // and kernel as advisory under a raised margin.
-    let host = format!("{}/{}", key.kernel.uname_release, key.device.npu_fw_version);
-    if !cal.adopt_advisory(source, &mut key).is_empty() {
-        eprintln!("npu-trunk: built-in calibration measured on {}/{}, this host {host}; using it with margin {}",
-            cal.key.kernel.uname_release, cal.key.device.npu_fw_version, cal.margin);
+    // A user calibration file stays fully strict; the built-in one binds on the hard key fields
+    // (arch, build, model, epilogue, route) and takes this host's GPU PCI address, NPU firmware and
+    // kernel release.
+    if source == "builtin" {
+        let (kernel, firmware, bdf) = (cal.key.kernel.uname_release.clone(), cal.key.device.npu_fw_version.clone(), cal.key.device.pci_bdf.clone());
+        if !cal.bind_builtin(&key)?.is_empty() {
+            eprintln!("npu-trunk: built-in Halo calibration (measured on kernel {kernel}, NPU firmware {firmware}, GPU {bdf}) applies by arch/model/route; this host kernel {}, NPU firmware {}, GPU {}",
+                key.kernel.uname_release, key.device.npu_fw_version, key.device.pci_bdf);
+        }
     }
     let families = if mode == NpuTrunkMode::Auto { trunk::auto_admission(&cal, &key)? } else {
         cal.key_matches(&key)?;
@@ -240,8 +275,8 @@ impl NpuForward {
                 let route = bundle.trunk_overlay.as_ref().map(|overlay| overlay.default).or(bundle.config.trunk_iu4_default);
                 if mode != NpuTrunkMode::Auto { return Ok((None, FamilyMask::ALL, route)); }
                 let trunk_route = route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
-                let (cal, key, source, families) = match_calibration(gpu, bundle, &trunk_route, mode, firmware.as_deref()).map_err(fail)?;
-                Ok((Some((cal, key, source)), families, route))
+                let (cal, key, source, _) = match_calibration(gpu, bundle, &trunk_route, mode, firmware.as_deref()).map_err(fail)?;
+                Ok((Some((cal, key, source)), FamilyMask::ALL, route))
             },
             |(matched, families, overlay_route)| {
                 let started = Instant::now();
@@ -290,6 +325,14 @@ impl NpuForward {
             None => Self::prepare_stock(gpu, bundle, false, rows, scratch_mode)?,
         }) else { return Ok(None); };
         let PreparedTrunk { mode, layers, download_ms, mut pack_ms, pre_overlay, overlay_route, matched, mut families } = prepared;
+        let family_override = hipfire_config::developer_var("HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES")
+            .ok().filter(|value| !value.trim().is_empty()).map(|value| parse_family_override(&value))
+            .transpose().or_else(|reason| {
+                if mode == NpuTrunkMode::Auto {
+                    eprintln!("npu-trunk: {reason}; ignoring override");
+                    Ok(None)
+                } else { Err(fail(reason)) }
+            })?;
         let trunk_route = overlay_route.map_or_else(|| "stock".to_owned(), |default| format!("overlay:{}", default.marker()));
         let matched = if mode == NpuTrunkMode::Auto { matched } else {
             match match_calibration(gpu, bundle, &trunk_route, mode, None) {
@@ -397,8 +440,13 @@ impl NpuForward {
                 }, n_star, &trunk::plan(cal, families, 16384), &trunk::plan(cal, families, 65536)));
             }
             eprintln!("npu-trunk: mode={mode} families={:#x} contract=bf16_direct trunk_route={trunk_route} zab_source={zab_source} pack_ms={pack_ms:.3} download_ms={download_ms:.3} resident_bytes={resident_bytes} npu_panels_bytes={npu_panels_bytes} gpu_twin_bytes={gpu_twin_bytes} bank_b_bytes={bank_b_bytes} runtime={} raw=DtoH(no-retained-host-copy)", families.bits(), if runtime.is_some() { "open" } else { "not-opened" });
-            Ok(Some(Self { mode, families, layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
-                calibration, n_star, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
+            let rates = (mode == NpuTrunkMode::Auto && runtime.is_some())
+                .then(|| trunk::RateEstimator::new(calibration.as_ref().expect("auto calibration").clone()));
+            let sampling = if rates.is_some() { Some(PairSampling::new(gpu, layers.len())?) } else { None };
+            let request_families = intersect_families(family_override.unwrap_or(families), families);
+            Ok(Some(Self { mode, families, request_families, family_override, rates, sampling, request_epoch: 0, guard_tripped: false,
+                layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
+                calibration, n_star_cache: None, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
         })();
         if result.is_err() { for tensor in allocations { let _ = gpu.free_tensor(tensor); } }
         result
@@ -406,18 +454,53 @@ impl NpuForward {
     /// Pairs run layer-major through the pair executor: `on`/`auto` on the NPU,
     /// `emulate` with the GPU twin projection in its place.
     pub(super) fn pipelined(&self) -> bool { self.bank_b.is_some() }
-    pub(super) fn begin_request(&mut self) { self.pair_logged=false; self.request_plan=None; }
+    pub(super) fn begin_request(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        self.poll(gpu)?;
+        self.request_epoch = self.request_epoch.wrapping_add(1);
+        self.guard_tripped = false;
+        self.pair_logged = false;
+        self.request_plan = None;
+        Ok(())
+    }
     /// With a matched calibration every mode (`auto`, `on`, `emulate`) executes the planner's pairs, including the
     /// rebalanced last pair; `auto` logs the plan. Without one the forced modes keep the natural 8192 + B pairing.
-    pub(super) fn plan_request(&mut self, rows: usize, position: usize) {
-        let Some(cal) = self.calibration.as_ref() else { return };
-        if self.request_plan.is_some() { return; }
-        let executable = admitted_plan(request_plan(cal, self.mode, self.families, self.n_star, rows), &mut self.adaptive, |planned| {
-            trunk::executable_plan(cal, planned, rows, armed_from(self.mode, self.n_star))
+    pub(super) fn plan_request(&mut self, gpu: &Gpu, rows: usize, position: usize) -> Result<(), Qwen4GpuForwardError> {
+        self.poll(gpu)?;
+        if self.request_plan.is_some() { return Ok(()); }
+        let snapshot = self.rates.as_ref().map(|rates| rates.snapshot());
+        let cal = snapshot.map(|snapshot| &snapshot.calibration).or(self.calibration.as_ref());
+        let selected = self.family_override.unwrap_or_else(|| match cal {
+            Some(cal) if self.mode == NpuTrunkMode::Auto => trunk::choose_families(cal, self.families, rows),
+            Some(cal) => trunk::select_families(cal).0,
+            None => self.families,
         });
-        if self.mode == NpuTrunkMode::Auto { eprintln!("{}", trunk::request_log_line(rows, &executable)); }
+        self.request_families = intersect_families(selected, self.families);
+        let Some(cal) = cal else { return Ok(()); };
+        let families = self.request_families;
+        let generation = snapshot.map_or(0, |snapshot| snapshot.generation);
+        let n_star = if self.mode == NpuTrunkMode::Auto {
+            match self.n_star_cache {
+                Some((g, mask, star)) if g == generation && mask == families => star,
+                _ => {
+                    let star = trunk::crossover(cal, families);
+                    self.n_star_cache = Some((generation, families, star));
+                    star
+                }
+            }
+        } else { Some(0) };
+        let executable = admitted_plan(request_plan(cal, self.mode, families, n_star, rows), &mut self.adaptive, |planned| {
+            trunk::executable_plan_for(cal, families, planned, rows, armed_from(self.mode, n_star))
+        });
+        if self.mode == NpuTrunkMode::Auto {
+            let line = trunk::request_log_line(rows, &executable);
+            let rest = line.strip_prefix(&format!("npu-trunk: rows={rows}")).unwrap_or(&line);
+            let (gpu_scale, npu_scale, frozen) = snapshot.map_or((1.0, 1.0, false), |s| (s.gpu_scale, s.npu_scale, s.frozen));
+            eprintln!("npu-trunk: rows={rows} families={}{} rates=gen{generation} gpu_x{gpu_scale:.3} npu_x{npu_scale:.3}{}",
+                family_names(families), rest, if frozen { " frozen" } else { "" });
+        }
         self.request_origin = position;
         self.request_plan = Some(executable);
+        Ok(())
     }
     /// Rows of banks A and B of the pair starting at `position`: the plan's
     /// split, or (forced modes without a matched calibration) the natural
@@ -425,6 +508,7 @@ impl NpuForward {
     /// hold one runs every chunk native).
     pub(super) fn selected_pair(&self, position: usize, remaining: usize, chunk: usize) -> Option<[usize; 2]> {
         self.bank_b.as_ref()?;
+        if self.guard_tripped || self.request_families.is_empty() { return None; }
         if self.calibration.is_none() { return pair_rows(remaining, chunk).map(|rows| [chunk, rows - chunk]); }
         planned_banks(self.request_plan.as_ref()?, self.request_origin, position, remaining, chunk)
     }
@@ -437,6 +521,11 @@ impl NpuForward {
     pub(super) fn free(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
         let mut first = None;
         if let Some(rt) = self.runtime { if let Err(e) = rt.close() { first = Some(hip_bridge::HipError::new(1, &e)); } }
+        if let Some(sampling) = self.sampling {
+            for set in sampling.sets {
+                for event in set.events { if let Err(e) = gpu.hip.event_destroy(event) { first.get_or_insert(e); } }
+            }
+        }
         if let Some(b) = self.bank_b { if let Some(e) = b.free_gpu(gpu) { first.get_or_insert(e); } }
         let twins = self.layers.into_iter().filter_map(|layer| layer.twin).flat_map(|twin| [twin.w, twin.scales]);
         let emulation = self.emulation.into_iter().flat_map(|scratch| [scratch.a, scratch.sums]);
@@ -467,7 +556,7 @@ impl NpuForward {
             _ => return Err(fail("expected mixer")),
         };
         let map = self.shape_map(shape);
-        targets.into_iter().filter(|(f,_)| self.families.contains(*f)).map(|(f,t)| map.gpu_output(f,t).map_err(Into::into)).collect()
+        targets.into_iter().filter(|(f,_)| self.request_families.contains(*f)).map(|(f,t)| map.gpu_output(f,t).map_err(Into::into)).collect()
     }
     fn pack(&self, gpu: &mut Gpu, step: &Step<'_>, bank: usize, pipe: bool, prep_end: Option<&hip_bridge::Event>) -> Result<u64, Qwen4GpuForwardError> {
         let (input, rows, shape) = match step { Step::GatedDeltaNet(op) => (op.input,op.rows,Shape::GdnIn), Step::IndexedAttention(op) => (op.input,op.rows,Shape::QsaIn), _ => return Err(fail("pack expected mixer")) };
@@ -496,7 +585,7 @@ impl NpuForward {
         Ok(())
     }
     fn uncovered(&self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), Qwen4GpuForwardError> {
-        let covered = |families: [Family; 4]| families.map(|f| self.families.contains(f));
+        let covered = |families: [Family; 4]| families.map(|f| self.request_families.contains(f));
         match step {
             Step::GatedDeltaNet(op) => execute_gated_delta_net_uncovered(gpu, op,
                 covered([Family::GdnQkv, Family::GdnA, Family::GdnB, Family::GdnZ])).map_err(fail),
@@ -631,6 +720,104 @@ fn core_windows(rows: usize, cut: Option<usize>) -> SmallVec<[CoreWindow; 2]> {
     }
 }
 
+/// Two reusable timing sets. Events are explicitly destroyed by `free`; Event has no Drop.
+struct PairSampling {
+    sets: [SampleEvents; 2],
+    next: usize,
+    active: Option<usize>,
+}
+struct SampleEvents {
+    // Three events per (layer, bank), followed by pair_start and pair_end.
+    events: Vec<hip_bridge::Event>,
+    pending: Option<PendingSample>,
+}
+struct PendingSample {
+    rows: [usize; 2],
+    prefixes: [usize; 2],
+    mask: FamilyMask,
+    covered: SmallVec<[bool; 128]>,
+    kinds: SmallVec<[trunk::LayerKind; 64]>,
+    epoch: u64,
+    position: usize,
+    npu_busy_ms: f64,
+}
+impl PairSampling {
+    fn new(gpu: &Gpu, layers: usize) -> Result<Self, Qwen4GpuForwardError> {
+        let count = 2 * (6 * layers + 2);
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            match gpu.hip.event_create() {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    for event in events { let _ = gpu.hip.event_destroy(event); }
+                    return Err(error.into());
+                }
+            }
+        }
+        let second = events.split_off(6 * layers + 2);
+        Ok(Self { sets: [SampleEvents { events, pending: None }, SampleEvents { events: second, pending: None }],
+            next: 0, active: None })
+    }
+}
+impl SampleEvents {
+    fn pair_start(&self) -> &hip_bridge::Event { &self.events[self.events.len() - 2] }
+    fn pair_end(&self) -> &hip_bridge::Event { &self.events[self.events.len() - 1] }
+}
+
+impl NpuForward {
+    fn record_sample_event(&self, gpu: &Gpu, layer: usize, bank: usize, phase: usize) -> Result<(), Qwen4GpuForwardError> {
+        if let Some(sampling) = &self.sampling {
+            if let Some(active) = sampling.active {
+                gpu.hip.event_record(&sampling.sets[active].events[(layer * 2 + bank) * 3 + phase], gpu.active_stream.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Query completed sets only: no synchronization, and no elapsed-time read until pair_end is complete.
+    pub(super) fn poll(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        let (Some(sampling), Some(rates)) = (&mut self.sampling, &mut self.rates) else { return Ok(()); };
+        for set in &mut sampling.sets {
+            if set.pending.is_none() || !gpu.hip.event_query(set.pair_end())? { continue; }
+            let pending = set.pending.as_ref().expect("queried pending sample");
+            // Chain index = layer * 2 + bank is also the run_bank visit order. The window of chain c (its pack_end ->
+            // its wait_begin) contains run_bank(c - 1), whose own NPU wait (stall) is not GPU work: subtract it, so a slow
+            // NPU never reads as a slow GPU.
+            let mut windows_ms = 0.0;
+            let mut stalls_ms = 0.0;
+            let mut previous_stall = 0.0;
+            for (chain, &covered) in pending.covered.iter().enumerate() {
+                if !covered { previous_stall = 0.0; continue; }
+                let events = &set.events[chain * 3..chain * 3 + 3];
+                if chain != 0 { windows_ms += gpu.hip.event_elapsed_ms(&events[0], &events[1])? as f64 - previous_stall; }
+                let stall = gpu.hip.event_elapsed_ms(&events[1], &events[2])? as f64;
+                stalls_ms += stall;
+                previous_stall = stall;
+            }
+            let span_ms = gpu.hip.event_elapsed_ms(set.pair_start(), set.pair_end())? as f64;
+            let pending = set.pending.take().expect("completed sample");
+            let model = trunk::pair_model(rates.prior(), trunk::Moved::from(pending.mask), pending.rows, pending.prefixes, &pending.kinds);
+            rates.observe(&trunk::RateSample {
+                npu_measured_ms: pending.npu_busy_ms, npu_model_ms: model.npu_ms,
+                window_measured_ms: windows_ms, window_model_ms: model.window_ms,
+            });
+            let snapshot = rates.snapshot();
+            let predicted = trunk::pair_model(&snapshot.calibration, trunk::Moved::from(pending.mask),
+                pending.rows, pending.prefixes, &pending.kinds).gpu_only_ms;
+            if self.trace.is_some() {
+                eprintln!("npu-trunk: sample: row={} npu_busy={:.3} ms windows={windows_ms:.3} ms stalls={stalls_ms:.3} ms span={span_ms:.3} ms",
+                    pending.position, pending.npu_busy_ms);
+            }
+            if pending.epoch == self.request_epoch && !self.guard_tripped && span_ms > 1.02 * predicted {
+                self.guard_tripped = true;
+                eprintln!("npu-trunk: guard: pair at row {} took {span_ms:.0} ms, GPU-only predicted {predicted:.0} ms (gpu_x{:.3} npu_x{:.3}); the rest of this request runs GPU-only",
+                    pending.position, snapshot.gpu_scale, snapshot.npu_scale);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl NpuForward {
     /// One Core launch over `window` of the bank's mixer; arenas only when the
     /// layer's projections came from the NPU.
@@ -640,7 +827,7 @@ impl NpuForward {
         let arenas = covered && self.arenas.is_some();
         let tensor = arenas.then(|| self.arenas.as_ref().expect("on arena views")[bank][shape.index()].as_ref().expect("selected shape arena"));
         let map = &self.layers[layer].map;
-        let family = |family| tensor.and_then(|tensor| family_view(map, tensor, family));
+        let family = |family| tensor.filter(|_| self.request_families.contains(family)).and_then(|tensor| family_view(map, tensor, family));
         match step {
             Step::GatedDeltaNet(op) => execute_gated_delta_net_core_rows(gpu, op, arenas.then(|| GdnTrunkArenas {
                 qkv: family(Family::GdnQkv), z: family(Family::GdnZ),
@@ -656,7 +843,7 @@ impl NpuForward {
     fn prepare(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, records: &mut [TraceRow], snapshot: Option<Snapshot<'_>>) -> Result<Option<Seq>,Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
-        let covered = self.layers[layer].map.panel_count() != 0;
+        let covered = !self.guard_tripped && self.layers[layer].map.parts.iter().any(|&(family, _, _)| self.request_families.contains(family));
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.prep_begin, gpu.active_stream.as_ref())?;
         }
@@ -723,8 +910,10 @@ impl NpuForward {
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.pack_end, gpu.active_stream.as_ref())?;
         }
+        self.record_sample_event(gpu, layer, bank, 0)?;
         let kick_ns=if records.is_empty(){0}else{monotonic_ns()};
-        let seq=unsafe { rt.kick(layer,transport_shape(self.layers[layer].shape),bank,program.rows,stream(gpu)).map_err(fail)? };
+        let panels = self.layers[layer].map.panel_range(self.request_families).expect("selected family groups are contiguous within a shape");
+        let seq=unsafe { rt.kick_panels(layer,transport_shape(self.layers[layer].shape),bank,program.rows,panels,stream(gpu)).map_err(fail)? };
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
             r.pack_issue_ns=pack_issue_ns; r.kick_ns=kick_ns; r.seq=seq.value;
@@ -734,11 +923,13 @@ impl NpuForward {
     fn run_bank(&self, gpu: &mut Gpu, ctx: &DispatchCtx, program: &mut layers::BankProgram<'_>, hc: &mut HcFusionCursor, layer: usize, bank: usize, seq: Option<Seq>, cut: Option<CoreCut<'_>>, records: &mut [TraceRow]) -> Result<(),Qwen4GpuForwardError> {
         let index=mixer_index(program,layer);
         let rt=self.runtime.as_ref();
-        let covered = self.layers[layer].map.panel_count() != 0;
+        let covered = !self.guard_tripped && self.layers[layer].map.parts.iter().any(|&(family, _, _)| self.request_families.contains(family));
         if let Some(r) = records.get(layer*2+bank) {
             gpu.hip.event_record(&r.wait_begin, gpu.active_stream.as_ref())?;
         }
+        if covered { self.record_sample_event(gpu, layer, bank, 1)?; }
         if let (Some(rt),Some(seq)) = (rt,seq) { unsafe { rt.wait_gpu(seq,stream(gpu)).map_err(fail)?; } }
+        if covered { self.record_sample_event(gpu, layer, bank, 2)?; }
         let wait_enqueue_ns=monotonic_ns();
         if !records.is_empty() {
             let r=&mut records[layer*2+bank];
@@ -819,6 +1010,19 @@ impl NpuForward {
         result.and(restored)
     }
     fn pair_scoped(&mut self, owner: &mut Qwen4GpuForward, bundle: &mut Qwen4Bundle, gpu: &mut Gpu, tokens: &[u32], rows: [usize; 2], logits: Option<&GpuTensor>, top1: Option<&GpuTensor>, capture: Option<&GpuTensor>, output: Qwen4OutputPolicy) -> Result<(),Qwen4GpuForwardError> {
+        self.poll(gpu)?;
+        // A sample may complete between the driver's decision and this poll.
+        // Such an already-admitted pair uses native projections throughout.
+        if let Some(sampling) = &mut self.sampling {
+            sampling.active = None;
+            if !self.guard_tripped {
+                let active = sampling.next;
+                sampling.next = (active + 1) % sampling.sets.len();
+                // poll just queried this set. Drop an unready sample rather than wait for reuse.
+                sampling.sets[active].pending = None;
+                sampling.active = Some(active);
+            }
+        }
         owner.restore_expert_stage(gpu)?;
         let position=bundle.state.position;
         let end=position.checked_add(tokens.len()).ok_or_else(||fail("position overflow"))?;
@@ -866,6 +1070,11 @@ impl NpuForward {
         let mut history=bundle.state.ple_history;
         // Bank A only: bank B initializes after kick(0, A) (L1 fill reorder),
         // so NPU(0, A) does not wait behind bank B's embedding/PLE staging.
+        if let Some(sampling) = &self.sampling {
+            if let Some(active) = sampling.active {
+                gpu.hip.event_record(sampling.sets[active].pair_start(), gpu.active_stream.as_ref())?;
+            }
+        }
         let mut ple_next=initialize(gpu,bundle,&owner.scratch,&tokens[..rows[0]],&history,programs[0].ple_rows_f16,&mut self.host_tokens,&mut self.host_ple,ple_ahead,Some(&tokens[rows[0]..]))?;
         for &token in &tokens[..rows[0]] { history.push(token); }
         if let (Some(stage), Some(cut)) = (&mut stage, shape.cut) {
@@ -962,8 +1171,38 @@ impl NpuForward {
             // Both trunks finish before prompt-end head/capture work.
             finish_bank(gpu,bundle,&owner.scratch,logits,top1,capture,0,0,rows[0],output)?;
             finish_bank(gpu,bundle,b,logits,top1,capture,1,rows[0],rows[1],output)?;
+            if let Some(sampling) = &self.sampling {
+                if let Some(active) = sampling.active {
+                    gpu.hip.event_record(sampling.sets[active].pair_end(), gpu.active_stream.as_ref())?;
+                }
+            }
             Ok(())
         })();
+        if let (Some(sampling), Some(rt)) = (&mut self.sampling, &self.runtime) {
+            let stats = rt.take_chain_stats();
+            if let Some(active) = sampling.active.take() {
+                if attempt.is_ok() {
+                    use railgun::npu::trunk::Shape as T;
+                    let npu_busy_ms = (stats.shape(T::GdnIn).npu_busy_ns as f64
+                        + stats.shape(T::QsaIn).npu_busy_ns as f64) / 1e6;
+                    let kinds = (0..bundle.config.num_hidden_layers).map(|layer| {
+                        match &programs[0].steps[mixer_index(&programs[0], layer)] {
+                            Step::GatedDeltaNet(_) => trunk::LayerKind::Gdn,
+                            Step::IndexedAttention(_) => trunk::LayerKind::Qsa,
+                            _ => unreachable!("typed layer mixer"),
+                        }
+                    }).collect();
+                    let covered = self.layers.iter().flat_map(|layer| {
+                        let covered = layer.map.parts.iter().any(|&(family, _, _)| self.request_families.contains(family));
+                        [covered; 2]
+                    }).collect();
+                    sampling.sets[active].pending = Some(PendingSample {
+                        rows, prefixes: [position, position + rows[0]], mask: self.request_families,
+                        covered, kinds, epoch: self.request_epoch, position, npu_busy_ms,
+                    });
+                }
+            }
+        }
         self.host_tokens=host_tokens;
         self.host_ple=host_ple;
         drop(programs);
@@ -1082,7 +1321,8 @@ fn finish_bank(gpu: &mut Gpu, bundle: &Qwen4Bundle, scratch: &Qwen4GpuForwardScr
 /// take the planner's pairs from the first row.
 fn request_plan(cal: &trunk::Calibration, mode: NpuTrunkMode, families: FamilyMask, n_star: Option<usize>, rows: usize) -> trunk::Plan {
     let planned = trunk::plan(cal, families, rows);
-    trunk::executable_plan(cal, &planned, rows, armed_from(mode, n_star))
+    let armed = if families.is_empty() { None } else { armed_from(mode, n_star) };
+    trunk::executable_plan_for(cal, families, &planned, rows, armed)
 }
 /// The row the executable plan arms pairs from: the crossover `n_star` in `auto`, the first row in the forced modes.
 fn armed_from(mode: NpuTrunkMode, n_star: Option<usize>) -> Option<usize> {
@@ -1125,6 +1365,19 @@ pub(super) fn pair_rows(remaining: usize, chunk: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::npu_trunk::Calibration;
+    #[test] fn family_override_parser_selects_groups_and_rejects_unknowns() {
+        assert_eq!(parse_family_override("all").unwrap(), FamilyMask::ALL);
+        for (name, bits) in [("qkv", 0x01), ("zab", 0x0e), ("q", 0x10), ("kvidx", 0xe0)] {
+            assert_eq!(parse_family_override(name).unwrap(), FamilyMask::from_bits(bits));
+        }
+        assert_eq!(parse_family_override(" qkv, zab,q,kvidx ").unwrap(), FamilyMask::ALL);
+        assert_eq!(parse_family_override("qkv,q").unwrap().bits(), 0x11);
+        assert_eq!(parse_family_override("q,q").unwrap().bits(), 0x10);
+        for bad in ["", "z", "qsa_q", "qkv,", "ALL", "qkv,nope"] {
+            assert!(parse_family_override(bad).is_err(), "{bad}");
+        }
+        assert_eq!(intersect_families(parse_family_override("all").unwrap(), FamilyMask::QSA), FamilyMask::QSA);
+    }
     #[test] fn trace_jsonl_preserves_schema_and_adds_fine_timestamps() {
         let record = TraceRecord { layer:3, bank:"B", rows:512, seq:7, prep_begin_ns:11,
             prep_end_ns:12, pack_end_ns:13, wait_begin_ns:14, wait_end_ns:17,
@@ -1408,6 +1661,20 @@ mod tests {
         // The forced modes pair from the first row, auto only from the crossover.
         assert!(pairs(NpuTrunkMode::Auto, 4096).is_empty());
         assert_eq!(planned_banks(&request_plan(&cal, NpuTrunkMode::On, families, star, 9319), 0, 0, 9319, 4096), None);
+    }
+    #[test] fn forced_request_subsets_use_only_the_static_prior() {
+        let (cal, _) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", "overlay:gfx1151-zab-v1").unwrap();
+        for names in ["qkv", "zab", "q", "kvidx", "qkv,q", "all"] {
+            let mask = parse_family_override(names).unwrap();
+            let on = request_plan(&cal, NpuTrunkMode::On, mask, None, 16384);
+            let emulate = request_plan(&cal, NpuTrunkMode::Emulate, mask, Some(usize::MAX), 16384);
+            assert_eq!(on, emulate, "{names}");
+            assert_eq!(on, trunk::executable_plan_for(&cal, mask, &trunk::plan(&cal, mask, 16384), 16384, Some(0)), "{names}");
+        }
+        for mode in [NpuTrunkMode::Auto, NpuTrunkMode::On, NpuTrunkMode::Emulate] {
+            let plan = request_plan(&cal, mode, FamilyMask::NONE, Some(0), 16384);
+            assert!(plan.steps.iter().all(|step| matches!(step, trunk::Step::Gpu { .. })));
+        }
     }
     #[test] fn row_adaptive_budget_demotes_pairs_beyond_it_to_gpu_chunks() {
         // A long-lived load meets many bank sizes: the first MAX_ADAPTIVE_CONTEXTS wave counts are admitted and keep their

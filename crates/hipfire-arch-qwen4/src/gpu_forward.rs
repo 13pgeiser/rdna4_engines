@@ -5249,16 +5249,30 @@ impl Qwen4GpuForward {
         { false }
     }
 
-    pub(crate) fn begin_npu_trunk_request(&mut self) {
+    pub(crate) fn begin_npu_trunk_request(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
         #[cfg(target_os = "linux")]
-        if let Some(npu)=&mut self.npu_trunk { npu.begin_request(); }
+        if let Some(npu)=&mut self.npu_trunk { npu.begin_request(gpu)?; }
+        #[cfg(not(target_os = "linux"))]
+        let _ = gpu;
+        Ok(())
     }
 
-    pub(crate) fn plan_npu_trunk_request(&mut self, rows: usize, position: usize) {
+    pub(crate) fn plan_npu_trunk_request(&mut self, gpu: &Gpu, rows: usize, position: usize) -> Result<(), Qwen4GpuForwardError> {
         #[cfg(target_os = "linux")]
-        if let Some(npu) = &mut self.npu_trunk { npu.plan_request(rows, position); }
+        if let Some(npu) = &mut self.npu_trunk { npu.plan_request(gpu, rows, position)?; }
         #[cfg(not(target_os = "linux"))]
-        let _ = (rows, position);
+        let _ = (gpu, rows, position);
+        Ok(())
+    }
+
+    /// Advance the executor's pending completions; must precede every
+    /// [`Self::npu_trunk_pair`] decision on a mutable path.
+    pub(crate) fn poll_npu_trunk(&mut self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = &mut self.npu_trunk { npu.poll(gpu)?; }
+        #[cfg(not(target_os = "linux"))]
+        let _ = gpu;
+        Ok(())
     }
 
     /// Rows of banks A and B of the pair the plan starts at `position`.
@@ -5980,7 +5994,7 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_rows,
         )?;
-        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
+        self.plan_npu_trunk_request(gpu, tokens.len(), bundle.state.position)?;
         // Start the first tile's PLE rows now, ahead of the output-resource
         // preflight.
         self.prefetch_first_tile_ple(bundle, tokens);
@@ -6004,6 +6018,7 @@ impl Qwen4GpuForward {
         while offset < tokens.len() {
             // A planned pair (`on`, `auto` and `emulate` alike) runs layer-major
             // through the pair executor; everything else is an ordinary tile.
+            self.poll_npu_trunk(gpu)?;
             #[cfg(target_os = "linux")]
             if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
             {
@@ -6097,7 +6112,7 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         let mut caller_lookahead = Some(std::mem::take(&mut self.ple_lookahead));
         self.validate_tokens(bundle, tokens)?;
-        self.plan_npu_trunk_request(tokens.len(), bundle.state.position);
+        self.plan_npu_trunk_request(gpu, tokens.len(), bundle.state.position)?;
         let capture_width = wide_hidden_capture.map(|_| program_dims(&bundle.config).wide());
         if let Some((capture, wide)) = wide_hidden_capture.zip(capture_width) {
             let expected = tokens
@@ -6114,6 +6129,7 @@ impl Qwen4GpuForward {
         let max_chunk = self.scratch.max_chunk;
         let mut offset = 0usize;
         while offset < tokens.len() {
+            self.poll_npu_trunk(gpu)?;
             #[cfg(target_os = "linux")]
             if let Some(banks)=self.npu_trunk_pair(bundle.state.position,tokens.len()-offset,max_chunk)
             {

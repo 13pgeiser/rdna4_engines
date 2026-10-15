@@ -4,10 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 pub const CALIBRATION_SCHEMA_VERSION: u32 = 4;
-/// Margin a built-in calibration runs under when it was measured on a different NPU PCI slot,
-/// NPU firmware or kernel than this host: the pipe must be predicted at least 5% faster than
-/// GPU-only, since those timings were measured on a different kernel/firmware.
-pub const ADVISORY_MARGIN: f64 = 0.05;
 /// Identity of the NPU serving numerics/transport the stored calibrations were measured against.
 /// Deliberately not the crate version: a release bump does not change the NPU route, and tying the
 /// two would orphan every shipped calibration on each bump. Change this when serving
@@ -22,6 +18,7 @@ pub(crate) const OUT_FAMILY_NAMES: [&str; 2] = ["gdn.out", "qsa.o"];
 #[serde(deny_unknown_fields)]
 pub struct DeviceKey {
     pub arch: String,
+    /// PCI address of the selected GPU (HIP's PCI bus ID), not an NPU slot.
     pub pci_bdf: String,
     pub npu_fw_version: String,
 }
@@ -171,23 +168,34 @@ impl Calibration {
         check!(model_index_sha256); check!(epilogue); check!(trunk_route);
         Ok(())
     }
-    /// For the built-in calibration (`source == "builtin"`) the NPU PCI slot, NPU firmware and
-    /// kernel release are advisory: copies this calibration's values for any of them that differ
-    /// into `key` (so `key_matches` passes on them) and raises `margin` to at least
-    /// `ADVISORY_MARGIN`. Returns the differing fields. A user calibration file stays fully strict
-    /// (nothing adopted); the hard fields (arch, build, model, epilogue, trunk route) always do.
-    pub fn adopt_advisory(&mut self, source: &str, key: &mut CalKey) -> Vec<&'static str> {
+    /// Binds the built-in calibration (the only record that may be bound) to this host. Checks the hard
+    /// fields only, in order `device.arch`, `build`, `model_index_sha256`, `epilogue`, `trunk_route`
+    /// (same `calibration key mismatch: <field>` errors as `key_matches`), then copies the host's
+    /// `device.pci_bdf` (the GPU's PCI address), `device.npu_fw_version` and `kernel.uname_release` from
+    /// `key` into this record's key and returns the names of those that differed. `margin` is unchanged
+    /// (built-ins carry 0.0). A record is untouched on error. A user calibration file never goes through
+    /// this and keeps the fully strict `key_matches`.
+    pub fn bind_builtin(&mut self, key: &CalKey) -> Result<Vec<&'static str>, String> {
+        macro_rules! check { ($($field:ident).+) => {
+            if self.key.$($field).+ != key.$($field).+ {
+                return Err(format!("calibration key mismatch: {}", stringify!($($field).+)));
+            }
+        }; }
+        check!(device.arch); check!(build); check!(model_index_sha256); check!(epilogue); check!(trunk_route);
         let mut differ = Vec::new();
-        if source != "builtin" { return differ; }
-        for (name, ours, theirs) in [
-            ("device.pci_bdf", &self.key.device.pci_bdf, &mut key.device.pci_bdf),
-            ("device.npu_fw_version", &self.key.device.npu_fw_version, &mut key.device.npu_fw_version),
-            ("kernel.uname_release", &self.key.kernel.uname_release, &mut key.kernel.uname_release),
-        ] {
-            if ours != theirs { theirs.clone_from(ours); differ.push(name); }
+        if self.key.device.pci_bdf != key.device.pci_bdf {
+            self.key.device.pci_bdf.clone_from(&key.device.pci_bdf);
+            differ.push("device.pci_bdf");
         }
-        if !differ.is_empty() { self.margin = self.margin.max(ADVISORY_MARGIN); }
-        differ
+        if self.key.device.npu_fw_version != key.device.npu_fw_version {
+            self.key.device.npu_fw_version.clone_from(&key.device.npu_fw_version);
+            differ.push("device.npu_fw_version");
+        }
+        if self.key.kernel.uname_release != key.kernel.uname_release {
+            self.key.kernel.uname_release.clone_from(&key.kernel.uname_release);
+            differ.push("kernel.uname_release");
+        }
+        Ok(differ)
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != CALIBRATION_SCHEMA_VERSION { return Err("unsupported calibration schema_version".into()); }
@@ -354,57 +362,65 @@ mod builtin_tests {
         }
     }
 
-    fn builtin_with_host(route: &str, uname: &str, fw: &str, bdf: &str) -> (Calibration, CalKey, Vec<&'static str>) {
+    fn builtin_with_host(route: &str, uname: &str, fw: &str, bdf: &str) -> (Calibration, CalKey, Result<Vec<&'static str>, String>) {
         let (mut cal, source) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route).unwrap();
         assert_eq!(source, "builtin");
-        let mut key = calibration_key("gfx1151", bdf, fw, uname,
+        let key = calibration_key("gfx1151", bdf, fw, uname,
             "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013", route);
-        let differ = cal.adopt_advisory(source, &mut key);
+        let differ = cal.bind_builtin(&key);
         (cal, key, differ)
     }
 
     #[test]
-    fn builtin_admits_other_kernel_firmware_slot_under_advisory_margin() {
+    fn builtin_binds_any_kernel_firmware_gpu_address_at_margin_zero() {
         use super::super::{auto_admission, plan, Step};
         for route in ["overlay:gfx1151-zab-v1", "stock"] {
             let (cal, key, differ) = builtin_with_host(route, "7.3.0-rc7-perfopt+", "1.1.2.65", "0000:c0:00.0");
-            assert!(differ.is_empty());
+            assert!(differ.unwrap().is_empty());
             assert_eq!(cal.margin, 0.0);
             let (cal, key2, differ) = builtin_with_host(route, "6.17.0-stock", "1.1.9.9", "0000:c1:00.0");
-            assert_eq!(differ, ["device.pci_bdf", "device.npu_fw_version", "kernel.uname_release"]);
-            assert_eq!(cal.margin, ADVISORY_MARGIN);
-            assert_eq!(key2, key);
+            assert_eq!(differ.unwrap(), ["device.pci_bdf", "device.npu_fw_version", "kernel.uname_release"]);
+            assert_eq!(cal.margin, 0.0);
+            assert_eq!(cal.key, key2);
+            assert_ne!(key2, key);
+            cal.key_matches(&key2).unwrap();
             let families = auto_admission(&cal, &key2).unwrap();
             assert!(!families.is_empty());
-            // The 16K prompt still plans a pipe under the advisory margin.
             let p = plan(&cal, families, 16384);
             assert!(p.steps.iter().any(|s| matches!(s, Step::Pipe { .. })), "{route}: {p:?}");
-            let (_, _, differ) = builtin_with_host(route, "6.17.0-stock", "1.1.2.65", "0000:c0:00.0");
-            assert_eq!(differ, ["kernel.uname_release"]);
+            let (cal, _, differ) = builtin_with_host(route, "6.17.0-stock", "1.1.2.65", "0000:c0:00.0");
+            assert_eq!(differ.unwrap(), ["kernel.uname_release"]);
+            assert_eq!(cal.margin, 0.0);
         }
     }
 
     #[test]
     fn builtin_hard_fields_and_file_calibrations_stay_strict() {
         let route = "stock";
-        let (mut cal, source) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route).unwrap();
+        let (cal, _) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route).unwrap();
         let base = calibration_key("gfx1151", "0000:c0:00.0", "1.1.2.65", "6.17.0-stock",
             "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013", route);
         let mut arch = base.clone();
         arch.device.arch = "gfx1150".into();
-        assert_eq!(cal.clone().adopt_advisory(source, &mut arch), ["kernel.uname_release"]);
-        assert_eq!(super::super::auto_admission(&cal, &arch), Err("calibration key mismatch: device.arch".into()));
+        assert_eq!(cal.clone().bind_builtin(&arch), Err("calibration key mismatch: device.arch".into()));
+        let mut build = base.clone();
+        build.build.push('x');
+        assert_eq!(cal.clone().bind_builtin(&build), Err("calibration key mismatch: build".into()));
         let mut model = base.clone();
         model.model_index_sha256 = "0".repeat(64);
-        cal.adopt_advisory(source, &mut model);
-        assert_eq!(super::super::auto_admission(&cal, &model), Err("calibration key mismatch: model_index_sha256".into()));
-        // The same calibration from a user file: nothing is adopted, the uname mismatch refuses it.
-        let (mut file, _) = Calibration::load_with_builtin("/nonexistent/npu-trunk-calibration.json", route).unwrap();
-        let mut key = base;
-        assert!(file.adopt_advisory("file", &mut key).is_empty());
-        assert_eq!(file.margin, 0.0);
-        assert_eq!(key.kernel.uname_release, "6.17.0-stock");
-        assert_eq!(super::super::auto_admission(&file, &key), Err("calibration key mismatch: kernel.uname_release".into()));
+        assert_eq!(cal.clone().bind_builtin(&model), Err("calibration key mismatch: model_index_sha256".into()));
+        let mut epilogue = base.clone();
+        epilogue.epilogue = "f32".into();
+        assert_eq!(cal.clone().bind_builtin(&epilogue), Err("calibration key mismatch: epilogue".into()));
+        let mut other_route = base.clone();
+        other_route.trunk_route = "overlay:gfx1151-zab-v1".into();
+        assert_eq!(cal.clone().bind_builtin(&other_route), Err("calibration key mismatch: trunk_route".into()));
+        // A refused bind leaves the record untouched.
+        let mut refused = cal.clone();
+        assert!(refused.bind_builtin(&model).is_err());
+        assert_eq!(refused.key, cal.key);
+        // A calibration file is never bound: the host's kernel differs from the record's, so the strict key refuses it.
+        assert_eq!(super::super::auto_admission(&cal, &base), Err("calibration key mismatch: kernel.uname_release".into()));
     }
 
     #[test]

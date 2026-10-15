@@ -813,6 +813,7 @@ pub(crate) fn prefill_tile(
     // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+        b.poll_npu_trunk(gpu)?;
         mtp_prefill_chunk(
             b,
             gpu,

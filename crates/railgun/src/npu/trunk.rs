@@ -102,8 +102,31 @@ pub struct Completion {
     pub done_ns: u64,
     /// CLOCK_MONOTONIC immediately after publishing/flushing the terminal word.
     pub signal_write_ns: u64,
-    /// Host time the relay spent building the row-adaptive program of this chain (zero when it was cached or full-row).
+    /// Host time the relay spent resolving this chain's program/commands/chain on this kick: building a row-adaptive
+    /// program, its panel commands, or a panel-range sub-chain, or looking one up in the cache (zero for the full-row
+    /// full-range chain).
     pub chain_build: Duration,
+}
+/// Relay statistics of the chains of one shape completed since the previous [`NpuTrunkRuntime::take_chain_stats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShapeChainStats { pub chains: u64, pub npu_busy_ns: u64, pub kick_to_done_ns: u64 }
+/// Per-shape relay chain statistics, indexed in [`Shape::ALL`] order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChainStats { pub shapes: [ShapeChainStats; 4] }
+impl ChainStats {
+    pub fn shape(&self, shape: Shape) -> ShapeChainStats { self.shapes[shape.index()] }
+    fn record(&mut self, shape: Shape, completion: &Completion) {
+        let s = &mut self.shapes[shape.index()];
+        s.chains += 1;
+        s.npu_busy_ns = s.npu_busy_ns.saturating_add(completion.npu_busy.as_nanos() as u64);
+        s.kick_to_done_ns = s.kick_to_done_ns.saturating_add(completion.kick_to_done.as_nanos() as u64);
+    }
+}
+/// A kick's panel range is non-empty and within the layer's `count` resident panels.
+fn validate_panels(range: &std::ops::Range<usize>, count: usize) -> Result<(), String> {
+    if range.start >= range.end { return Err(format!("empty panel range {}..{}", range.start, range.end)); }
+    if range.end > count { return Err(format!("panel range {}..{} exceeds the layer's {count} resident panels", range.start, range.end)); }
+    Ok(())
 }
 
 /// Linux CLOCK_MONOTONIC timestamp shared by relay and forward trace.
@@ -160,11 +183,13 @@ struct Binding { handle: u32, addr: u64 }
 type BankBindings = [Binding; 6];
 #[derive(Clone, Copy)]
 struct BankPages { a: [usize; 2], a_len: [usize; 2], c: [usize; 4], c_len: [usize; 4] }
-struct Job { seq: Seq, layer: usize, shape: Shape, rows: usize, event: usize, start: Instant }
+struct Job { seq: Seq, layer: usize, shape: Shape, rows: usize, panels: std::ops::Range<usize>, event: usize, start: Instant }
 struct Pending { value: u32, result: Option<Result<Completion, String>> }
 struct Status { pending: Vec<Pending>, failure: Option<String>, stopping: bool }
-struct Shared { status: Mutex<Status>, changed: Condvar, signals: Vec<usize> }
+struct Shared { status: Mutex<Status>, changed: Condvar, signals: Vec<usize>, stats: Mutex<ChainStats> }
 impl Shared {
+    fn record_chain(&self, shape: Shape, completion: &Completion) { self.stats.lock().record(shape, completion); }
+    fn take_chain_stats(&self) -> ChainStats { std::mem::take(&mut *self.stats.lock()) }
     fn validate(&self, seq: Seq) -> Result<(), String> {
         let status = self.status.lock();
         let p = status.pending.get(seq.bank).ok_or("invalid sequence bank")?;
@@ -258,6 +283,8 @@ pub struct NpuTrunkRuntime {
     layout: ArenaLayout,
     rows_max: usize,
     layers: Vec<(usize, Shape)>,
+    /// Resident panel count of each `layers` entry, same order.
+    panel_counts: Vec<usize>,
     state: RefCell<Vec<BankState>>,
     builder: bool,
     variants: RefCell<Vec<(bool, usize)>>,
@@ -306,6 +333,7 @@ impl NpuTrunkRuntime {
             keys.push((l.layer, l.shape));
         }
         if keys.is_empty() { return Err("no resident B panels".into()); }
+        let panel_counts: Vec<usize> = layers.iter().map(|l| l.panels.len()).collect();
         // Arena bytes of one bank, `[a_in, a_out, c GdnIn, c QsaIn, c GdnOut, c QsaO]`. An absent shape (or A class)
         // keeps only one registration page for the fixed binding table, never a full arena.
         let (has_in, has_out) = (shapes.iter().any(|s| !s.is_out()), shapes.iter().any(|s| s.is_out()));
@@ -330,7 +358,7 @@ impl NpuTrunkRuntime {
             c_len: [b.c[0].pages.len, b.c[1].pages.len, b.c[2].pages.len, b.c[3].pages.len] }).collect();
         let shared = Arc::new(Shared {
             status: Mutex::new(Status { pending: (0..banks).map(|_| Pending { value: 0, result: None }).collect(), failure: None, stopping: false }),
-            changed: Condvar::new(), signals: storage.iter().map(|b| b.control.pages.ptr as usize).collect(),
+            changed: Condvar::new(), signals: storage.iter().map(|b| b.control.pages.ptr as usize).collect(), stats: Mutex::new(ChainStats::default()),
         });
         let (tx, rx) = mpsc::sync_channel(banks);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
@@ -341,7 +369,7 @@ impl NpuTrunkRuntime {
         }).map_err(|e| format!("spawn trunk relay: {e}"))?;
         // Construct the teardown guard before receiving: all early returns join
         // the relay (contexts/BOs) before unregistering/unmapping caller pages.
-        let mut rt = Self { hip, api, banks: storage, bindings: Vec::new(), layout, rows_max, layers: keys,
+        let mut rt = Self { hip, api, banks: storage, bindings: Vec::new(), layout, rows_max, layers: keys, panel_counts,
             state: RefCell::new((0..banks).map(|_| BankState { generation: 0, kicked: false, retired: false, prepared: false }).collect()),
             builder: has_builder, variants: RefCell::new(Vec::new()), shared, tx: Some(tx), relay: Some(relay) };
         rt.bindings = init_rx.recv().map_err(|_| "trunk relay exited during open")??;
@@ -403,10 +431,27 @@ impl NpuTrunkRuntime {
     /// Records a system-release event after GPU A writes on stream, then queues
     /// relay work. Caller must not touch A/C until completion/consumer retirement.
     /// `stream` must be live and on the selected GPU; null selects its default stream.
+    /// Runs the layer's whole chain (every resident panel); see [`Self::kick_panels`].
     pub unsafe fn kick(&self, layer: usize, shape: Shape, bank: usize, rows: usize, stream: *mut c_void) -> Result<Seq, String> {
+        let panels = self.layer_panels(layer, shape).ok_or("unknown layer/shape")?;
+        unsafe { self.kick_panels(layer, shape, bank, rows, 0..panels, stream) }
+    }
+    /// Resident panel count of (`layer`, `shape`); `None` if the pair is unknown.
+    pub fn layer_panels(&self, layer: usize, shape: Shape) -> Option<usize> {
+        self.layers.iter().position(|&k| k == (layer, shape)).map(|i| self.panel_counts[i])
+    }
+    /// Relay statistics of the chains completed since the previous call, then reset. Takes one short lock; no device sync.
+    pub fn take_chain_stats(&self) -> ChainStats { self.shared.take_chain_stats() }
+    /// [`Self::kick`] running only the resident panels `panels` (non-empty, `end` <= the layer's panel count) of the
+    /// layer's chain, in panel order. Only the C columns of those panels are written; the C arena columns of the other
+    /// panels keep their previous bytes. The full range runs the layer's full chain; any other range runs a chain over
+    /// the same panel commands (same TXN, B BO and C offsets), built on first use and cached. `Err` before any bank state
+    /// changes when the range is invalid. Same safety contract as [`Self::kick`].
+    pub unsafe fn kick_panels(&self, layer: usize, shape: Shape, bank: usize, rows: usize, panels: std::ops::Range<usize>, stream: *mut c_void) -> Result<Seq, String> {
         self.check_error()?;
         if rows == 0 || rows > self.rows_max { return Err("rows outside admitted extent".into()); }
-        if !self.layers.contains(&(layer, shape)) { return Err("unknown layer/shape".into()); }
+        let count = self.layer_panels(layer, shape).ok_or("unknown layer/shape")?;
+        validate_panels(&panels, count)?;
         let b = self.banks.get(bank).ok_or("invalid trunk bank")?;
         let mut states = self.state.borrow_mut();
         let state = &mut states[bank];
@@ -432,7 +477,7 @@ impl NpuTrunkRuntime {
         state.prepared = false;
         let enqueue = (|| {
             unsafe { self.hip.record_raw(&b.ready, stream)?; }
-            self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, rows: self.chain_rows(shape, rows), event: b.ready.raw(), start })
+            self.tx.as_ref().ok_or("runtime closed")?.try_send(Job { seq, layer, shape, rows: self.chain_rows(shape, rows), panels, event: b.ready.raw(), start })
                 .map_err(|e| format!("trunk relay queue: {e}"))
         })();
         if let Err(e) = enqueue {
@@ -539,58 +584,86 @@ fn prepared_panel(dev: &Device, insts: &Bo, a: &Bo, b: &Bo, c: &Bo, c_offset: us
     super::write_words(&command.cmd, &words);
     Ok(command)
 }
-/// Row-adaptive state of the relay: which (class, padded rows) contexts, (shape, padded rows) TXN BOs and
-/// (layer, bank, padded rows) chains exist, as indices into the `extra_*` vectors of [`Resources`].
+/// Row-adaptive state of the relay: which (class, padded rows) contexts, (shape, padded rows) TXN BOs,
+/// (layer, bank, padded rows) panel-command sets and (layer, bank, padded rows, first, end panel) chains exist, as indices
+/// into the `extra_*` vectors of [`Resources`]. `chains` also holds the sub-range chains of the full-row program
+/// (`padded` = the full program rows, which never collides with an adaptive row count).
 #[derive(Default)]
 struct Adaptive {
     ctx: std::collections::HashMap<(bool, usize), usize>,
     pdi: std::collections::HashMap<(bool, usize), Vec<u8>>,
     insts: std::collections::HashMap<(usize, usize), usize>,
-    chains: std::collections::HashMap<(usize, usize, usize), usize>,
+    /// (layer, bank, padded) -> index of the first of the layer's panel commands in `extra_commands`.
+    commands: std::collections::HashMap<(usize, usize, usize), usize>,
+    chains: std::collections::HashMap<(usize, usize, usize, usize, usize), usize>,
 }
-/// The chain and hardware context of (`layer`, `bank`) for a bank of `padded` rows (a whole number of the shape's waves,
-/// smaller than the full program), built and cached on first use: the PDI/TXN of that row count from `build`, one hardware
-/// context per distinct (class, rows) PDI (the 32 cores' loop count is part of the PDI), the layer's panel commands
-/// against the bank's own A/B/C arenas. The host admits at most [`MAX_ADAPTIVE_CONTEXTS`] variants
-/// ([`NpuTrunkRuntime::chain_rows`]), so a larger set is an error.
+/// The chain over `panels` and hardware context of (`layer`, `bank`) for a bank of `padded` rows (a whole number of the
+/// shape's waves, smaller than the full program), built and cached on first use: the PDI/TXN of that row count from
+/// `build`, one hardware context per distinct (class, rows) PDI (the 32 cores' loop count is part of the PDI), the layer's
+/// panel commands against the bank's own A/B/C arenas (built once per (layer, bank, rows), whatever the range). The host
+/// admits at most [`MAX_ADAPTIVE_CONTEXTS`] variants ([`NpuTrunkRuntime::chain_rows`]), so a larger set is an error.
 #[allow(clippy::too_many_arguments)]
 fn adaptive_chain<'d>(dev: &'d Device, build: &TxnBuilder, layout: ArenaLayout, layers: &[LayerPanels], b_starts: &[usize],
-    layer: usize, bank: usize, shape: Shape, padded: usize, r: &mut Resources<HwCtx<'d>>, ad: &mut Adaptive) -> Result<Option<(usize, usize)>, String> {
+    layer: usize, bank: usize, shape: Shape, padded: usize, panels: std::ops::Range<usize>, r: &mut Resources<HwCtx<'d>>, ad: &mut Adaptive) -> Result<(usize, usize), String> {
     let class = (shape.is_out(), padded);
-    if let Some(&chain) = ad.chains.get(&(layer, bank, padded)) { return Ok(Some((chain, ad.ctx[&class]))); }
+    let key = (layer, bank, padded, panels.start, panels.end);
+    if let Some(&chain) = ad.chains.get(&key) { return Ok((chain, ad.ctx[&class])); }
     if !ad.ctx.contains_key(&class) && ad.ctx.len() >= MAX_ADAPTIVE_CONTEXTS { return Err(format!("row-adaptive context budget {MAX_ADAPTIVE_CONTEXTS} exceeded at {padded} rows")); }
-    let insts_key = (shape.index(), padded);
-    if !ad.insts.contains_key(&insts_key) {
-        let PanelBuild { pdi, txn } = build(shape, padded)?;
-        if txn.is_empty() || pdi.is_empty() { return Err(format!("empty row-adaptive program for {shape:?} at {padded} rows")); }
-        match ad.pdi.get(&class) {
-            Some(have) if *have != pdi => return Err(format!("{shape:?} and its class built different PDIs at {padded} rows")),
-            Some(_) => {}
-            None => {
-                let bo = dev.dev_bo(&pdi)?;
-                let ctx = HwCtx::create(dev, 32, 1)?;
-                ctx.config_cu(&bo)?;
-                r.extra_pdis.push(bo); r.extra_ctxs.push(ctx);
-                ad.ctx.insert(class, r.extra_ctxs.len() - 1);
-                ad.pdi.insert(class, pdi);
+    let command_key = (layer, bank, padded);
+    let start = match ad.commands.get(&command_key) {
+        Some(&start) => start,
+        None => {
+            let insts_key = (shape.index(), padded);
+            if !ad.insts.contains_key(&insts_key) {
+                let PanelBuild { pdi, txn } = build(shape, padded)?;
+                if txn.is_empty() || pdi.is_empty() { return Err(format!("empty row-adaptive program for {shape:?} at {padded} rows")); }
+                match ad.pdi.get(&class) {
+                    Some(have) if *have != pdi => return Err(format!("{shape:?} and its class built different PDIs at {padded} rows")),
+                    Some(_) => {}
+                    None => {
+                        let bo = dev.dev_bo(&pdi)?;
+                        let ctx = HwCtx::create(dev, 32, 1)?;
+                        ctx.config_cu(&bo)?;
+                        r.extra_pdis.push(bo); r.extra_ctxs.push(ctx);
+                        ad.ctx.insert(class, r.extra_ctxs.len() - 1);
+                        ad.pdi.insert(class, pdi);
+                    }
+                }
+                r.extra_insts.push(dev.dev_bo(&txn)?);
+                ad.insts.insert(insts_key, r.extra_insts.len() - 1);
             }
+            let (insts, l) = (ad.insts[&insts_key], &layers[layer]);
+            let start = r.extra_commands.len();
+            let a = if shape.is_out() { &r.a_out[bank] } else { &r.a[bank] };
+            for panel in 0..l.panels.len() {
+                let command = prepared_panel(dev, &r.extra_insts[insts], a, &r.b[b_starts[layer] + panel],
+                    &r.c[bank * 4 + shape.index()], layout.c_offset(shape, panel)?, layout.c_span(shape))?;
+                r.extra_commands.push(command);
+            }
+            ad.commands.insert(command_key, start);
+            start
         }
-        r.extra_insts.push(dev.dev_bo(&txn)?);
-        ad.insts.insert(insts_key, r.extra_insts.len() - 1);
-    }
-    let (insts, l) = (ad.insts[&insts_key], &layers[layer]);
-    let start = r.extra_commands.len();
-    let a = if shape.is_out() { &r.a_out[bank] } else { &r.a[bank] };
-    for panel in 0..l.panels.len() {
-        let command = prepared_panel(dev, &r.extra_insts[insts], a, &r.b[b_starts[layer] + panel],
-            &r.c[bank * 4 + shape.index()], layout.c_offset(shape, panel)?, layout.c_span(shape))?;
-        r.extra_commands.push(command);
-    }
-    let refs: Vec<_> = r.extra_commands[start..].iter().collect();
+    };
+    let refs: Vec<_> = r.extra_commands[start + panels.start..start + panels.end].iter().collect();
     r.extra_chains.push(Chain::new(dev, &refs)?);
     let chain = r.extra_chains.len() - 1;
-    ad.chains.insert((layer, bank, padded), chain);
-    Ok(Some((chain, ad.ctx[&class])))
+    ad.chains.insert(key, chain);
+    Ok((chain, ad.ctx[&class]))
+}
+/// The chain over the sub-range `panels` (not the whole layer) of the full-row program's panel commands of (`layer`,
+/// `bank`), built on first use from commands `relay_main` already prepared (`cmd_starts[layer * banks + bank]`); no new
+/// command, TXN or context. Index into `extra_chains`; runs on the full-row program's context.
+#[allow(clippy::too_many_arguments)]
+fn range_chain<'d>(dev: &'d Device, cmd_starts: &[usize], banks: usize, layer: usize, bank: usize, padded: usize,
+    panels: std::ops::Range<usize>, r: &mut Resources<HwCtx<'d>>, ad: &mut Adaptive) -> Result<usize, String> {
+    let key = (layer, bank, padded, panels.start, panels.end);
+    if let Some(&chain) = ad.chains.get(&key) { return Ok(chain); }
+    let start = cmd_starts[layer * banks + bank];
+    let refs: Vec<_> = r.commands[start + panels.start..start + panels.end].iter().collect();
+    r.extra_chains.push(Chain::new(dev, &refs)?);
+    let chain = r.extra_chains.len() - 1;
+    ad.chains.insert(key, chain);
+    Ok(chain)
 }
 fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<BankPages>, api: RelayApi, layout: ArenaLayout,
     build: Option<TxnBuilder>,
@@ -628,6 +701,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             r.a.push(a); r.a_out.push(a_out);
         }
         let mut b_starts = Vec::with_capacity(layers.len());
+        let mut cmd_starts = Vec::with_capacity(layers.len() * pages.len());
         for l in &layers {
             let b_start = r.b.len();
             b_starts.push(b_start);
@@ -638,6 +712,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             }
             for bank in 0..pages.len() {
                 let start = r.commands.len();
+                cmd_starts.push(start);
                 let a = if l.shape.is_out() { &r.a_out[bank] } else { &r.a[bank] };
                 for panel in 0..l.panels.len() {
                     r.commands.push(prepared_panel(&dev, &r.insts[program], a, &r.b[b_start + panel],
@@ -651,9 +726,9 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
         // Evict any initialization lines once, before handing arenas to devices.
         // Production CPU code never accesses A/C again.
         for arena in r.a.iter().chain(&r.a_out).chain(&r.c) { arena.flush(); }
-        Ok::<_, String>((r, bindings, b_starts))
+        Ok::<_, String>((r, bindings, b_starts, cmd_starts))
     })();
-    let (mut resources, bindings, b_starts) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
+    let (mut resources, bindings, b_starts, cmd_starts) = match setup { Ok(r) => r, Err(e) => { let _ = init.send(Err(e)); return; } };
     let mut ad = Adaptive::default();
     if init.send(Ok(bindings)).is_err() { return; }
     // Declared after resources, so unwinding releases waits before context/BO
@@ -686,17 +761,26 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             // built on first use. `job.rows` is the padded row count the host chose ([`NpuTrunkRuntime::chain_rows`]); the
             // full-row count (or a runtime without a builder) runs the full-row chain, exactly as before.
             let padded = job.rows;
+            let count = layers[layer].panels.len();
+            let (lo, hi) = (job.panels.start, job.panels.end);
+            if lo >= hi || hi > count { return Err(format!("invalid panel range {lo}..{hi} of {count} panels")); }
             let build_started = Instant::now();
             let adaptive = match &build {
                 Some(build) if padded != programs[program].padded_rows => {
-                    adaptive_chain(&dev, build, layout, &layers, &b_starts, layer, job.seq.bank, job.shape, padded, &mut resources, &mut ad)?
+                    Some(adaptive_chain(&dev, build, layout, &layers, &b_starts, layer, job.seq.bank, job.shape, padded, lo..hi, &mut resources, &mut ad)?)
                 }
                 _ => None,
             };
-            let chain_build = if adaptive.is_some() { build_started.elapsed() } else { Duration::ZERO };
-            let (chain, ctx) = match adaptive {
-                Some((chain, ctx)) => (&resources.extra_chains[chain], &resources.extra_ctxs[ctx]),
-                None => (&resources.chains[layer * pages.len() + job.seq.bank], &resources.ctxs[pdi_of_program[program]]),
+            // Full-row program on a partial panel range: a chain over that sub-slice of the (layer, bank)'s own commands.
+            let sub = match adaptive {
+                None if lo != 0 || hi != count => Some(range_chain(&dev, &cmd_starts, pages.len(), layer, job.seq.bank, programs[program].padded_rows, lo..hi, &mut resources, &mut ad)?),
+                _ => None,
+            };
+            let chain_build = if adaptive.is_some() || sub.is_some() { build_started.elapsed() } else { Duration::ZERO };
+            let (chain, ctx) = match (adaptive, sub) {
+                (Some((chain, ctx)), _) => (&resources.extra_chains[chain], &resources.extra_ctxs[ctx]),
+                (None, Some(chain)) => (&resources.extra_chains[chain], &resources.ctxs[pdi_of_program[program]]),
+                (None, None) => (&resources.chains[layer * pages.len() + job.seq.bank], &resources.ctxs[pdi_of_program[program]]),
             };
             let start = Instant::now();
             let watchdog = options.watchdog;
@@ -717,6 +801,7 @@ fn relay_main(programs: Vec<PanelProgram>, layers: Vec<LayerPanels>, pages: Vec<
             Ok(Completion { kick_to_done: job.start.elapsed(), npu_busy, submit_ns, done_ns, signal_write_ns: 0, chain_build })
         })();
         if let Err(e) = &result { fatal = Some(e.clone()); }
+        if let Ok(completion) = &result { shared.record_chain(job.shape, completion); }
         shared.finish(job.seq, result);
     }
     drop(resources); // destroys context before any operand BO, even on timeout
@@ -837,7 +922,7 @@ mod tests {
         Shared { status: Mutex::new(Status {
             pending: signals.iter().map(|_| Pending { value, result: None }).collect(),
             failure: None, stopping: false,
-        }), changed: Condvar::new(), signals: signals.iter().map(|s| &s.0 as *const AtomicU32 as usize).collect() }
+        }), changed: Condvar::new(), signals: signals.iter().map(|s| &s.0 as *const AtomicU32 as usize).collect(), stats: Mutex::new(ChainStats::default()) }
     }
     fn completion() -> Completion {
         Completion { kick_to_done: Duration::ZERO, npu_busy: Duration::ZERO, submit_ns: 1, done_ns: 2, signal_write_ns: 0, chain_build: Duration::ZERO }
@@ -928,6 +1013,44 @@ mod tests {
             assert_eq!(u64::from(words[11]) | (u64::from(words[12]) << 32), c);
             assert_eq!(words[7], 0x2000);
             assert_eq!(words[6], 4096);
+        }
+    }
+    #[test] fn panel_ranges_are_validated_against_the_resident_count() {
+        for (range, count) in [(0..13, 13), (8..13, 13), (0..8, 13), (4..5, 5), (0..1, 1)] {
+            validate_panels(&range, count).unwrap();
+        }
+        assert!(validate_panels(&(3..3), 13).unwrap_err().contains("empty"));
+        assert!(validate_panels(&(5..4), 13).unwrap_err().contains("empty"));
+        assert!(validate_panels(&(0..0), 0).unwrap_err().contains("empty"));
+        assert!(validate_panels(&(0..14), 13).unwrap_err().contains("exceeds"));
+        assert!(validate_panels(&(12..14), 13).unwrap_err().contains("exceeds"));
+        assert!(validate_panels(&(0..1), 0).is_err());
+    }
+    fn timed(busy_us: u64, kick_to_done_us: u64) -> Completion {
+        Completion { kick_to_done: Duration::from_micros(kick_to_done_us), npu_busy: Duration::from_micros(busy_us), ..completion() }
+    }
+    #[test] fn chain_stats_accumulate_per_shape_then_reset_on_take() {
+        let signals = [Signal(AtomicU32::new(0))];
+        let s = shared(&signals, 1);
+        assert_eq!(s.take_chain_stats(), ChainStats::default());
+        s.record_chain(Shape::GdnIn, &timed(10, 12));
+        s.record_chain(Shape::QsaO, &timed(7, 9));
+        s.record_chain(Shape::GdnIn, &timed(20, 25));
+        let taken = s.take_chain_stats();
+        assert_eq!(taken.shape(Shape::GdnIn), ShapeChainStats { chains: 2, npu_busy_ns: 30_000, kick_to_done_ns: 37_000 });
+        assert_eq!(taken.shape(Shape::QsaO), ShapeChainStats { chains: 1, npu_busy_ns: 7_000, kick_to_done_ns: 9_000 });
+        assert_eq!(taken.shape(Shape::QsaIn), ShapeChainStats::default());
+        assert_eq!(taken.shape(Shape::GdnOut), ShapeChainStats::default());
+        assert_eq!(s.take_chain_stats(), ChainStats::default());
+        s.record_chain(Shape::GdnOut, &timed(3, 4));
+        assert_eq!(s.take_chain_stats().shape(Shape::GdnOut).chains, 1);
+    }
+    #[test] fn chain_stats_index_in_shape_all_order() {
+        let mut stats = ChainStats::default();
+        for (i, shape) in Shape::ALL.into_iter().enumerate() { stats.record(shape, &timed(i as u64 + 1, 0)); }
+        for (i, shape) in Shape::ALL.into_iter().enumerate() {
+            assert_eq!(stats.shapes[i], stats.shape(shape));
+            assert_eq!(stats.shape(shape).npu_busy_ns, (i as u64 + 1) * 1000);
         }
     }
 }

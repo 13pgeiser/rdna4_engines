@@ -558,9 +558,12 @@ impl SpecTarget for Qwen4Bundle {
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?
             .scratch
             .max_chunk;
-        self.begin_npu_trunk_request();
+        self.begin_npu_trunk_request(gpu)
+            .map_err(|error| error.to_string())?;
         if let Some(forward) = &mut self.execution {
-            forward.plan_npu_trunk_request(tokens.len(), start_pos);
+            forward
+                .plan_npu_trunk_request(gpu, tokens.len(), start_pos)
+                .map_err(|error| error.to_string())?;
         }
         let mut offset = 0usize;
         let mut last_argmax = None;
@@ -569,6 +572,7 @@ impl SpecTarget for Qwen4Bundle {
                 self.reset_recurrent(gpu)?;
                 return Ok(SpecAdvance::Aborted);
             }
+            self.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
             let planned=self.npu_trunk_planned();
             let rows=if planned {
                 self.prefill_schedule_rows(start_pos+offset,end_pos,max_chunk)
@@ -5446,6 +5450,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
             }
             // A chunk ends at the session cache's next snapshot boundary when
             // one lies inside the natural chunk, else at the natural chunk end.
+            Self::bundle(target)?.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
             let rows=Self::bundle(target)?.prefill_schedule_rows(pos,prompt_tokens.len(),chunk_rows);
             let natural=pos.checked_add(rows)
                 .ok_or_else(||"Qwen4 native MTP prefill position overflow".to_string())?;
