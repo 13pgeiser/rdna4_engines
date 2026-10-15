@@ -346,8 +346,11 @@ impl EpRowGatherBuilder {
                 "ep_row_gather: ranks registered different buffer counts".into(),
             ));
         }
+        // Logical emulation (`HIPFIRE_EMULATE_GPUS`) deliberately maps several
+        // ranks onto one physical device; physical mode needs distinct devices.
+        let emulated = crate::config::get().emulate_gpus.is_some();
         for (i, a) in ranks.iter().enumerate() {
-            if ranks[..i].iter().any(|b| b.device_id == a.device_id) {
+            if !emulated && ranks[..i].iter().any(|b| b.device_id == a.device_id) {
                 return Err(err(format!(
                     "ep_row_gather: two ranks share device {}",
                     a.device_id
@@ -448,7 +451,8 @@ impl EpRowGather {
         self.check(gpu, rank, 0)?;
         gpu.bind_thread()?;
         for (peer, state) in self.ranks.iter().enumerate() {
-            if peer == rank {
+            // Same physical device (logical emulation): no peer mapping needed.
+            if peer == rank || state.device_id == gpu.device_id {
                 continue;
             }
             if !gpu.hip.can_access_peer(gpu.device_id, state.device_id)? {
