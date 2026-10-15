@@ -7,11 +7,16 @@
 #   scripts/fn-ep-gate.sh [options] MODEL.mq4 [N] [OUT_DIR]
 #
 #   MODEL.mq4    Flash-Next mq4-xts model file (REQUIRED)
-#   N            EP degree, 2..=8 (default: every visible card of the chosen arch, at most 8)
+#   N            EP degree, 2..=8 (default: length of --devices, else every visible card of the chosen arch, at most 8)
 #   OUT_DIR      output directory (default: ./fn-ep-gate-<UTC timestamp>)
 #
 # Options (also accepted as --n N / --out DIR before or after the positionals):
 #   --arch ARCH         card arch to use (default: gfx1100 or gfx1201, whichever has more cards)
+#   --devices LIST      comma list of cards in any hardware.devices form (PCI-order index, GPU-<uuid>, PCI
+#                       address, gfxNNNN). HIPFIRE_DEVICES for the EP arm is LIST verbatim, the single arm
+#                       uses its first entry, N defaults to its length. Default: an inherited HIPFIRE_DEVICES
+#                       (e.g. a scheduler's held cards) when set, else the first N cards of --arch from KFD.
+#                       ROCR_VISIBLE_DEVICES is cleared in the arms only for the KFD-selected default.
 #   --tokens T          greedy tokens per prompt (default 128)
 #   --max-seq S         KV context (default 8192)
 #   --state-steps L     state digest steps (default 1,64,128)
@@ -58,6 +63,7 @@ SKIP_BUILD=0 SKIP_SPEED=0 SKIP_SHA=0 NO_ISOLATE=0
 ARM_TIMEOUT=${FN_EP_GATE_ARM_TIMEOUT:-7200}
 BENCH_TIMEOUT=${FN_EP_GATE_BENCH_TIMEOUT:-3600}
 EXTRA_ENV=${EXTRA_ENV:-}
+DEVLIST="" DEVS_SOURCE=kfd
 
 usage() { sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 die() { echo "fn-ep-gate: $*" >&2; exit 2; }
@@ -70,6 +76,7 @@ while (($#)); do
     --n|-n) [[ $# -ge 2 ]] || die "$1 needs a value"; N=$2; shift 2 ;;
     --out) [[ $# -ge 2 ]] || die "$1 needs a value"; OUT=$2; shift 2 ;;
     --arch) [[ $# -ge 2 ]] || die "$1 needs a value"; ARCH=$2; shift 2 ;;
+    --devices) [[ $# -ge 2 ]] || die "$1 needs a value"; DEVLIST=${2// /}; shift 2 ;;
     --tokens) [[ $# -ge 2 ]] || die "$1 needs a value"; TOKENS=$2; shift 2 ;;
     --max-seq) [[ $# -ge 2 ]] || die "$1 needs a value"; MAX_SEQ=$2; shift 2 ;;
     --state-steps) [[ $# -ge 2 ]] || die "$1 needs a value"; STATE_STEPS=$2; shift 2 ;;
@@ -91,6 +98,13 @@ done
 [[ -n $MODEL ]] || { usage >&2; die "MODEL.mq4 is required"; }
 [[ -f $MODEL && -r $MODEL ]] || die "model file not readable: $MODEL"
 [[ -z $N || $N =~ ^[0-9]+$ ]] || die "N must be an integer"
+if [[ -z $DEVLIST && -n ${HIPFIRE_DEVICES:-} ]]; then
+  DEVLIST=${HIPFIRE_DEVICES// /}
+  DEVS_SOURCE=inherited
+  echo "fn-ep-gate: using inherited HIPFIRE_DEVICES=$DEVLIST as the card list (ROCR_VISIBLE_DEVICES left as inherited)"
+elif [[ -n $DEVLIST ]]; then
+  DEVS_SOURCE=flag
+fi
 [[ $TOKENS =~ ^[0-9]+$ && $MAX_SEQ =~ ^[0-9]+$ && $REPS =~ ^[0-9]+$ ]] || die "--tokens/--max-seq/--reps must be integers"
 ((REPS >= 1)) || die "--reps must be >= 1"
 [[ -f $SHORT_PROMPT && -f $LONG_PROMPT && -f $COMPARE ]] || die "scripts/fn-ep-gate-prompts or fn_ep_compare.py missing next to this script"
@@ -109,7 +123,7 @@ ORACLE=$TARGET_DIR/release/examples/fn_ep_oracle
 HIPFIRE=$TARGET_DIR/release/hipfire
 DAEMON=$TARGET_DIR/release/daemon
 
-DEVS="" BDFS=() SINGLE_DEVS=""
+DEVS="" BDFS=() SINGLE_DEVS="" CARD_IDX=""
 SAMPLER=""
 VERDICT="" REASON=""
 BUILD_RC="" ORACLE_RC_SINGLE="" ORACLE_RC_EP="" COMPARE_STATE="not run"
@@ -121,7 +135,7 @@ RECEIPT_DONE=0
 write_receipt() {
   ((RECEIPT_DONE == 0)) || return 0
   RECEIPT_DONE=1
-  export GATE_OUT=$OUT GATE_N=$N GATE_ARCH=$ARCH GATE_DEVS=$DEVS GATE_MODEL=$MODEL GATE_VERDICT=$VERDICT \
+  export GATE_OUT=$OUT GATE_N=$N GATE_ARCH=$ARCH GATE_DEVS=$DEVS GATE_CARD_IDX=$CARD_IDX GATE_DEVS_SOURCE=$DEVS_SOURCE GATE_MODEL=$MODEL GATE_VERDICT=$VERDICT \
     GATE_REASON=$REASON GATE_STARTED=$STARTED GATE_REPS=$REPS GATE_TOKENS=$TOKENS GATE_MAX_SEQ=$MAX_SEQ \
     GATE_STATE_STEPS=$STATE_STEPS GATE_BUILD_RC=$BUILD_RC GATE_COMPARE_STATE=$COMPARE_STATE \
     GATE_SKIP_SPEED=$SKIP_SPEED GATE_NO_ISOLATE=$NO_ISOLATE GATE_EXTRA_ENV=$EXTRA_ENV \
@@ -217,8 +231,9 @@ def peaks(path, bdf_count):
 
 
 cards = (rdj(out + "/env/cards.json") or {}).get("cards", [])
-devs = [int(x) for x in E.get("GATE_DEVS", "").split(",") if x.strip().isdigit()]
-chosen = [c for c in cards if c["index"] in devs]
+devs = [int(x) for x in E.get("GATE_CARD_IDX", "").split(",") if x.strip().isdigit()]
+by_index = {c["index"]: c for c in cards}
+chosen = [by_index[i] for i in devs if i in by_index]
 
 env = {
     "host": rd(out + "/env/host.txt"),
@@ -325,6 +340,7 @@ receipt = {
     "reason": E.get("GATE_REASON") or None,
     "config": {
         "n": n, "arch": E.get("GATE_ARCH"), "hipfire_devices_ep": E.get("GATE_DEVS"),
+        "devices_source": E.get("GATE_DEVS_SOURCE"),
         "model": E.get("GATE_MODEL"), "tokens": int(E.get("GATE_TOKENS", "0") or 0),
         "max_seq": int(E.get("GATE_MAX_SEQ", "0") or 0), "state_steps": E.get("GATE_STATE_STEPS"),
         "speed_reps": int(E.get("GATE_REPS", "0") or 0), "isolated_home": E.get("GATE_NO_ISOLATE") != "1",
@@ -528,11 +544,11 @@ PY
 
 select_cards() {
   local sel
-  sel=$(python3 - "$OUT/env/cards.json" "$ARCH" "$N" <<'PY'
+  sel=$(python3 - "$OUT/env/cards.json" "$ARCH" "$N" "$DEVLIST" <<'PY'
 import collections, json, sys
 
 doc = json.load(open(sys.argv[1]))
-cards, want, n = doc["cards"], sys.argv[2], sys.argv[3]
+cards, want, n, devlist = doc["cards"], sys.argv[2], sys.argv[3], sys.argv[4]
 SUPPORTED = ("gfx1100", "gfx1201")
 
 
@@ -541,36 +557,113 @@ def fail(message):
     sys.exit(2)
 
 
+def table():
+    return "visible cards: " + "; ".join("%d:%s@%s uuid=%s" % (c["index"], c["arch"], c["bdf"],
+        ("GPU-%016x" % int(c["unique_id"])) if str(c.get("unique_id") or "0").isdigit() and int(c.get("unique_id") or 0) else "none")
+        for c in cards)
+
+
+def parse_bdf(text):
+    # DDDD:BB:DD.F or BB:DD.F, hex; returns (domain or None, bus, dev, fn)
+    try:
+        head, fn = text.rsplit(".", 1)
+        parts = head.split(":")
+        if len(parts) == 3:
+            return (int(parts[0], 16), int(parts[1], 16), int(parts[2], 16), int(fn, 16))
+        if len(parts) == 2:
+            return (None, int(parts[0], 16), int(parts[1], 16), int(fn, 16))
+    except ValueError:
+        pass
+    return None
+
+
+def card_bdf(c):
+    d, b, rest = c["bdf"].split(":")
+    dev, fn = rest.split(".")
+    return (int(d, 16), int(b, 16), int(dev, 16), int(fn, 16))
+
+
 if not doc["kfd_present"] or not cards:
     fail("no GPU found in the KFD topology (/sys/class/kfd/kfd/topology/nodes)")
-if want:
-    arch = want
+
+if devlist:
+    # Resolve every entry of a hardware.devices-style list to a KFD card, keeping list order.
+    entries = [e.strip() for e in devlist.split(",")]
+    chosen, deferred = [None] * len(entries), []
+    for slot, entry in enumerate(entries):
+        low = entry.lower()
+        if not entry:
+            fail("empty entry in --devices %r" % devlist)
+        if entry.isdigit():
+            hits = [c for c in cards if c["index"] == int(entry)]
+        elif low.startswith("gpu-"):
+            try:
+                uid = int(low[4:], 16)
+            except ValueError:
+                fail("%r is not a GPU-<hex> uuid" % entry)
+            hits = [c for c in cards if str(c.get("unique_id") or "0").isdigit() and int(c.get("unique_id") or 0) == uid and uid]
+        elif low.startswith("gfx"):
+            deferred.append(slot)
+            continue
+        elif ":" in entry:
+            bdf = parse_bdf(entry)
+            if bdf is None:
+                fail("%r is not a DDDD:BB:DD.F or BB:DD.F PCI address" % entry)
+            hits = [c for c in cards if card_bdf(c)[1:] == bdf[1:] and (bdf[0] is None or card_bdf(c)[0] == bdf[0])]
+        else:
+            fail("unknown device selector %r (index, GPU-uuid, PCI address or gfxNNNN); %s" % (entry, table()))
+        if len(hits) != 1:
+            fail("--devices entry %r matches %d card(s); %s" % (entry, len(hits), table()))
+        chosen[slot] = hits[0]
+    for slot in deferred:
+        taken = {c["index"] for c in chosen if c}
+        hits = [c for c in cards if c["arch"] == entries[slot].lower() and c["index"] not in taken]
+        if not hits:
+            fail("--devices entry %r: no unused %s card; %s" % (entries[slot], entries[slot], table()))
+        chosen[slot] = hits[0]
+    if len({c["index"] for c in chosen}) != len(chosen):
+        fail("--devices names the same card more than once; %s" % table())
+    count = len(chosen)
+    if n and int(n) != count:
+        fail("N=%s but --devices lists %d card(s)" % (n, count))
+    archs = sorted({c["arch"] for c in chosen})
+    if len(archs) != 1:
+        print("fn-ep-gate: WARNING: --devices mixes archs %s (EP needs a homogeneous set)" % archs, file=sys.stderr)
+    arch = chosen[0]["arch"]
+    if want and any(c["arch"] != want for c in chosen):
+        fail("--arch %s but --devices selects %s" % (want, archs))
+    if not 2 <= count <= 8:
+        fail("N=%d is outside 2..=8" % count)
 else:
-    counts = collections.Counter(c["arch"] for c in cards)
-    supported = [a for a in counts if a in SUPPORTED]
-    if supported:
-        arch = max(supported, key=lambda a: (counts[a], -min(c["index"] for c in cards if c["arch"] == a)))
+    if want:
+        arch = want
     else:
-        arch = cards[0]["arch"]
-        print("fn-ep-gate: WARNING: no gfx1100/gfx1201 card; trying %s (EP admission will likely refuse it)" % arch,
-              file=sys.stderr)
-same = [c for c in cards if c["arch"] == arch]
-if not same:
-    fail("no %s card found (have: %s)" % (arch, sorted(set(c["arch"] for c in cards))))
-count = int(n) if n else min(len(same), 8)
-if not 2 <= count <= 8:
-    fail("N=%d is outside 2..=8 (%d %s card(s) visible)" % (count, len(same), arch))
-if count > len(same):
-    fail("N=%d but only %d %s card(s) are visible" % (count, len(same), arch))
-chosen = same[:count]
-print(arch, count, ",".join(str(c["index"]) for c in chosen), ",".join(c["bdf"] for c in chosen))
+        counts = collections.Counter(c["arch"] for c in cards)
+        supported = [a for a in counts if a in SUPPORTED]
+        if supported:
+            arch = max(supported, key=lambda a: (counts[a], -min(c["index"] for c in cards if c["arch"] == a)))
+        else:
+            arch = cards[0]["arch"]
+            print("fn-ep-gate: WARNING: no gfx1100/gfx1201 card; trying %s (EP admission will likely refuse it)" % arch,
+                  file=sys.stderr)
+    same = [c for c in cards if c["arch"] == arch]
+    if not same:
+        fail("no %s card found (have: %s)" % (arch, sorted(set(c["arch"] for c in cards))))
+    count = int(n) if n else min(len(same), 8)
+    if not 2 <= count <= 8:
+        fail("N=%d is outside 2..=8 (%d %s card(s) visible)" % (count, len(same), arch))
+    if count > len(same):
+        fail("N=%d but only %d %s card(s) are visible" % (count, len(same), arch))
+    chosen = same[:count]
+print(arch, count, ",".join(c["bdf"] for c in chosen), ",".join(str(c["index"]) for c in chosen))
 PY
 ) || { REASON="card selection failed (see gate.log)"; VERDICT=ERROR; FINAL_RC=2; exit 2; }
   local bdfs
-  read -r ARCH N DEVS bdfs <<<"$sel"
+  read -r ARCH N bdfs CARD_IDX <<<"$sel"
   IFS=, read -r -a BDFS <<<"$bdfs"
+  [[ -n $DEVLIST ]] && DEVS=$DEVLIST || DEVS=$CARD_IDX
   SINGLE_DEVS=${DEVS%%,*}
-  log "arch=$ARCH N=$N devices(HIPFIRE_DEVICES)=$DEVS single=$SINGLE_DEVS"
+  log "arch=$ARCH N=$N devices(HIPFIRE_DEVICES)=$DEVS (source: $DEVS_SOURCE) single=$SINGLE_DEVS cards(PCI-order index)=$CARD_IDX bdfs=$bdfs"
 }
 
 hash_model() {
@@ -615,7 +708,11 @@ build_all() {
 ARM_ENV=()
 arm_env() {
   local arm=$1 ep=$2 devs=$3
-  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u ROCR_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP
+  # ROCR_VISIBLE_DEVICES: dropped only when the card list came from our own KFD selection; a list the
+  # caller supplied (--devices) or inherited (a scheduler's HIPFIRE_DEVICES) leaves ROCR_VISIBLE_DEVICES alone.
+  local unset_rocr=()
+  [[ $DEVS_SOURCE != kfd ]] || unset_rocr=(-u ROCR_VISIBLE_DEVICES)
+  ARM_ENV=(env -u HIP_VISIBLE_DEVICES -u HIPFIRE_QWEN4_EP ${unset_rocr[@]+"${unset_rocr[@]}"}
     "HIPFIRE_DEVICES=$devs" "HIPFIRE_TOPOLOGY_EP=$ep" HIPFIRE_NO_REGISTRY_FETCH=1 "HIPFIRE_DAEMON_BIN=$DAEMON")
   if ((NO_ISOLATE == 0)); then
     local home=$OUT/home-$arm
