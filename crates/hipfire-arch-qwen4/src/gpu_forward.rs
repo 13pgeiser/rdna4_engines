@@ -1456,6 +1456,13 @@ fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
 }
 
+/// The per-call owner assignment (`qwen4_ep_owner_assign_pm`) ships for exact
+/// gfx1201 only. Elsewhere (gfx1100) balanced ownership is not admitted: the
+/// static `e % N` split is exact, so the rank simply runs without it.
+pub(crate) fn qwen4_ep_balanced_owners_arch_admitted(arch: &str) -> bool {
+    rdna_compute::moe::qwen4_ep_owner_assign_pm_arch(arch)
+}
+
 /// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2; `=0` is the kill switch): owner-routed
 /// chunk MoE (rank-generic code; EP4 is still refused at admission). A prefill chunk of at least
 /// 512 rows whose layer verified symmetric on every rank runs the symmetric IU4 GEMMs on the
@@ -5357,7 +5364,15 @@ impl Qwen4GpuForward {
             }
         }
         let config = &bundle.config;
-        let balanced_on = qwen4_ep_balanced_owners_enabled();
+        let mut balanced_on = qwen4_ep_balanced_owners_enabled();
+        if balanced_on && !qwen4_ep_balanced_owners_arch_admitted(&gpu.arch) {
+            // Nothing is built, allocated or loaded: the static split is exact.
+            eprintln!(
+                "qwen4 EP rank {}/{}: balanced ownership not admitted (needs gfx1201); static split",
+                placement.rank, placement.ranks
+            );
+            balanced_on = false;
+        }
         let dummy = ep.dummy.source();
         let layer_peers_of = |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
             peers
@@ -8185,6 +8200,14 @@ mod tests {
         assert_eq!(super::qwen4_prefill_chunk_default("gfx942"), 1536);
         assert_eq!(super::qwen4_prefill_chunk_default("gfx1151"), 8192);
         assert_eq!(super::qwen4_prefill_chunk_default("gfx1201"), 4096);
+    }
+
+    #[test]
+    fn balanced_owners_are_admitted_on_gfx1201_only() {
+        assert!(super::qwen4_ep_balanced_owners_arch_admitted("gfx1201"));
+        for arch in ["gfx1100", "gfx1151", "gfx1030", "gfx942", ""] {
+            assert!(!super::qwen4_ep_balanced_owners_arch_admitted(arch), "{arch:?}");
+        }
     }
 
     use super::{

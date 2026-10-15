@@ -2235,11 +2235,11 @@ pub static FIELDS: &[ConfigField] = &[
         Hardware,
         ModelLoad,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 4 },
+        ValueRule::Integer { min: 1, max: 8 },
         false,
         true,
         Some("HIPFIRE_TOPOLOGY_EP"),
-        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1201: 1 (default, single device), 2 or 4. Experts shard e % N across N visible gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
+        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1100 or gfx1201: 1 (default, single device) or 2..=8. Experts shard e % N across N visible homogeneous gfx1100 or gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -7547,19 +7547,20 @@ pub mod topology {
     pub const QWEN4_EP_KILL_SWITCH_ENV: &str = "HIPFIRE_QWEN4_EP";
     /// Compatibility spelling of `topology.ep`.
     pub const EP_ENV: &str = "HIPFIRE_TOPOLOGY_EP";
-    /// Expert-parallel degrees the schema admits (512 experts divide evenly).
-    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+    /// Largest expert-parallel degree the schema admits. Experts shard
+    /// `e % N`, so uneven splits (e.g. 512 over 6 ranks) are admitted.
+    pub const EP_MAX_DEGREE: usize = 8;
 
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
-    /// integer outside [`EP_DEGREES`] is a refusal naming the allowed set.
+    /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
     pub fn parse_ep(raw: Option<&str>) -> Result<usize, String> {
         let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(1);
         };
         match raw.parse::<usize>() {
-            Ok(n) if EP_DEGREES.contains(&n) => Ok(n),
+            Ok(n) if (1..=EP_MAX_DEGREE).contains(&n) => Ok(n),
             _ => Err(format!(
-                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: 1, 2, 4)"
+                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: integers 1..=8)"
             )),
         }
     }
@@ -7605,11 +7606,13 @@ pub mod topology {
             assert_eq!(parse_ep(Some("")), Ok(1));
             assert_eq!(parse_ep(Some("1")), Ok(1));
             assert_eq!(parse_ep(Some(" 2 ")), Ok(2));
-            assert_eq!(parse_ep(Some("4")), Ok(4));
-            for bad in ["0", "3", "5", "8", "-1", "two", "2.0"] {
+            for n in 1..=8usize {
+                assert_eq!(parse_ep(Some(&n.to_string())), Ok(n));
+            }
+            for bad in ["0", "9", "16", "-1", "two", "2.0"] {
                 let err = parse_ep(Some(bad)).unwrap_err();
                 assert!(
-                    err.contains("topology.ep") && err.contains("1, 2, 4"),
+                    err.contains("topology.ep") && err.contains("1..=8"),
                     "{bad}: {err}"
                 );
             }
@@ -7620,13 +7623,14 @@ pub mod topology {
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
             assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
             // Even an invalid configured value is moot under the kill switch.
-            assert_eq!(resolve_qwen4_ep(Some("3"), Some("0")), Ok(1));
+            assert_eq!(resolve_qwen4_ep(Some("9"), Some("0")), Ok(1));
             // Any other kill-switch spelling leaves the config in charge.
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
             assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
             assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
             assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
-            assert!(resolve_qwen4_ep(Some("3"), None).is_err());
+            assert_eq!(resolve_qwen4_ep(Some("6"), None), Ok(6));
+            assert!(resolve_qwen4_ep(Some("9"), None).is_err());
         }
 
         #[test]
@@ -7637,9 +7641,11 @@ pub mod topology {
                 .expect("topology.ep is in the schema");
             assert_eq!(field.env_compat, Some(EP_ENV));
             assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
-            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_ok());
+            for n in 1..=8 {
+                assert!(field.validate(&crate::ConfigValue::Integer(n)).is_ok());
+            }
             assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
-            assert!(field.validate(&crate::ConfigValue::Integer(5)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(9)).is_err());
             assert!(matches!(
                 field.parse_cli("2"),
                 Ok(crate::ConfigValue::Integer(2))

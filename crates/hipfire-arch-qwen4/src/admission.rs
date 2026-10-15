@@ -136,14 +136,15 @@ impl EffectiveMesh {
         self.pp == 1 && self.tp == 1 && self.ep == 1
     }
 
-    /// Expert-parallel degrees Qwen4 admits: 512 experts divide evenly and the
-    /// replicated program runs on 1, 2 or 4 cards.
-    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+    /// Largest expert-parallel degree Qwen4 admits. Experts shard `e % N`
+    /// across `N` ranks and the replicated program runs on each card, so
+    /// uneven splits (512 over 6 ranks = 86/86/85/85/85/85) are admitted.
+    pub const EP_MAX_DEGREE: usize = 8;
 
     /// The meshes Qwen4 admits: no pipeline or tensor parallelism, expert
-    /// parallelism of 1, 2 or 4 ranks.
+    /// parallelism of 1..=8 ranks.
     pub const fn is_qwen4_admitted(self) -> bool {
-        self.pp == 1 && self.tp == 1 && (self.ep == 1 || self.ep == 2 || self.ep == 4)
+        self.pp == 1 && self.tp == 1 && self.ep >= 1 && self.ep <= Self::EP_MAX_DEGREE
     }
 }
 
@@ -589,7 +590,7 @@ impl fmt::Display for AdmissionError {
             }
             Self::NonSingleMesh(mesh) => write!(
                 f,
-                "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
+                "qwen4 admission: only pp=1, tp=1 with expert-parallel ep in 1..=8 is admitted (pp={}, tp={}, ep={})",
                 mesh.pp, mesh.tp, mesh.ep
             ),
             Self::UnsupportedFormat(format) => {
@@ -952,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn ep_mesh_matrix_admits_one_two_four_only() {
+    fn ep_mesh_matrix_admits_one_through_eight() {
         let admit = |mesh: EffectiveMesh, mtp: bool| {
             let artifact = Qwen4Artifact::manifest_hfqm();
             let request = if mtp {
@@ -962,22 +963,22 @@ mod tests {
             };
             Qwen4Admission::admit(&config(), &request)
         };
-        for ep in [1, 2, 4] {
+        for ep in 1..=8 {
             let mesh = EffectiveMesh::new(1, 1, ep);
             assert!(mesh.is_qwen4_admitted());
             assert_eq!(admit(mesh, false).expect("ep AR admitted").effective_mesh.ep, ep);
         }
         assert!(EffectiveMesh::single().is_single());
         assert!(!EffectiveMesh::new(1, 1, 2).is_single());
-        // 3 is not a divisor-of-512 rank count the program shards to; 0 is malformed.
-        for ep in [0, 3, 5, 8] {
+        // 0 is malformed; above the 8-rank maximum is refused.
+        for ep in [0, 9, 16] {
             assert!(matches!(
                 admit(EffectiveMesh::new(1, 1, ep), false),
                 Err(AdmissionError::NonSingleMesh(_))
             ));
         }
         // pp / tp stay refused at every ep.
-        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4), (4, 1, 4)] {
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4), (4, 1, 4), (1, 2, 6)] {
             assert!(matches!(
                 admit(EffectiveMesh::new(pp, tp, ep), false),
                 Err(AdmissionError::NonSingleMesh(_))
@@ -986,7 +987,7 @@ mod tests {
         // Native MTP is admitted on every admitted mesh: under EP the drafter
         // is replicated on every rank.
         assert!(admit(EffectiveMesh::single(), true).is_ok());
-        for ep in [2, 4] {
+        for ep in [2, 3, 4, 6, 8] {
             let admitted = admit(EffectiveMesh::new(1, 1, ep), true).expect("EP native MTP");
             assert!(admitted.native_mtp);
             assert_eq!(admitted.effective_mesh.ep, ep);

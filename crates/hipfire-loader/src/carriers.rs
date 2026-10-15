@@ -1031,6 +1031,17 @@ impl Qwen4EpPlan {
     }
 }
 
+/// `rank->device` list for the plan-time emulation log line, e.g.
+/// `0->0, 1->1, 2->0`.
+fn qwen4_ep_emulation_map(devices: &[i32]) -> String {
+    devices
+        .iter()
+        .enumerate()
+        .map(|(rank, device)| format!("{rank}->{device}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolve the expert-parallel plan for `ep`: `None` for `ep <= 1`; otherwise
 /// the geometry and (with real devices) architecture and peer-access checks of
 /// [`crate::admission::qwen4_ep_preflight`], before rank 0 allocates anything.
@@ -1043,7 +1054,10 @@ fn plan_qwen4_ep(
     if ep <= 1 {
         return Ok(None);
     }
-    if let Some(refusal) = crate::admission::qwen4_ep_geometry_refusal(ep, pp, 1, &gpu.arch, None) {
+    let emulated = hipfire_runtime::config::get().emulate_gpus.is_some();
+    if let Some(refusal) =
+        crate::admission::qwen4_ep_geometry_refusal(ep, pp, 1, &gpu.arch, None, emulated)
+    {
         return Err(refusal);
     }
     if gpu.device_id != 0 {
@@ -1054,6 +1068,12 @@ fn plan_qwen4_ep(
         ));
     }
     let devices = crate::admission::qwen4_ep_preflight(&gpu.hip, ep)?;
+    if emulated {
+        eprintln!(
+            "qwen4 EP logical emulation (HIPFIRE_EMULATE_GPUS): rank -> physical device {}",
+            qwen4_ep_emulation_map(&devices)
+        );
+    }
     Ok(Some(Qwen4EpPlan {
         ranks: ep,
         devices,
@@ -1226,6 +1246,11 @@ fn qwen4_placement_inputs(
 /// that: its per-thread cache still names `gpu`'s device, so it would skip the
 /// call and leave every later rank-0 allocation on the last queried device).
 ///
+/// Under `HIPFIRE_EMULATE_GPUS` several ranks alias one physical device
+/// (`devices` repeats an id): that device's free VRAM is divided evenly among
+/// the ranks on it ([`qwen4_ep_alias_free`]). Physical mode lists each device
+/// once, so the division is by 1.
+///
 /// Under a `HIPFIRE_EMU` profile expert parallelism is refused (single-device
 /// capacity budget); a one-device list is the budget owner's capped query.
 pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Vec<u64>, String> {
@@ -1240,7 +1265,21 @@ pub fn qwen4_ep_free_vram(gpu: &rdna_compute::Gpu, devices: &[i32]) -> Result<Ve
             .map_err(|error| format!("qwen4: device {device} memory query: {error}"))?;
         free.push(bytes as u64);
     }
-    Ok(free)
+    Ok(qwen4_ep_alias_free(devices, &free))
+}
+
+/// Per-rank free VRAM from each rank's physical device free: divided by the
+/// number of ranks aliased onto that device (`devices[r]`), so ranks sharing
+/// a card split it instead of each claiming all of it.
+pub fn qwen4_ep_alias_free(devices: &[i32], free: &[u64]) -> Vec<u64> {
+    devices
+        .iter()
+        .zip(free)
+        .map(|(device, &bytes)| {
+            let aliased = devices.iter().filter(|other| *other == device).count().max(1);
+            bytes / aliased as u64
+        })
+        .collect()
 }
 
 /// The expert VRAM split every rank of an expert-parallel load applies, in
@@ -5656,7 +5695,7 @@ mod qwen4_admission_tests {
                 },
             ),
         ];
-        for ep in [2usize, 4] {
+        for ep in [2usize, 3, 4, 6, 8] {
             assert!(
                 qwen4_ep_option_refusal(ep, None, &defaults).is_ok(),
                 "ep {ep} plain AR"
@@ -5679,6 +5718,32 @@ mod qwen4_admission_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn emulated_ranks_split_their_physical_device_free_vram() {
+        use super::{qwen4_ep_alias_free, qwen4_ep_emulation_map};
+        use crate::admission::qwen4_ep_rank_devices;
+        let gib = 1u64 << 30;
+        // Physical mode: every device listed once, free untouched.
+        assert_eq!(
+            qwen4_ep_alias_free(&[0, 1, 2], &[24 * gib, 20 * gib, 16 * gib]),
+            vec![24 * gib, 20 * gib, 16 * gib]
+        );
+        // One physical device under 3 and 6 ranks.
+        assert_eq!(qwen4_ep_alias_free(&[0, 0, 0], &[24 * gib; 3]), vec![8 * gib; 3]);
+        assert_eq!(qwen4_ep_alias_free(&[0; 6], &[24 * gib; 6]), vec![4 * gib; 6]);
+        // Four physical devices under 6 ranks: devices 0 and 1 carry two ranks.
+        let devices = qwen4_ep_rank_devices(6, 4, true).unwrap();
+        let free = [24 * gib, 20 * gib, 16 * gib, 12 * gib, 24 * gib, 20 * gib];
+        assert_eq!(
+            qwen4_ep_alias_free(&devices, &free),
+            vec![12 * gib, 10 * gib, 16 * gib, 12 * gib, 12 * gib, 10 * gib]
+        );
+        // Four physical devices under 8 ranks: every device carries two.
+        let devices = qwen4_ep_rank_devices(8, 4, true).unwrap();
+        assert_eq!(qwen4_ep_alias_free(&devices, &[24 * gib; 8]), vec![12 * gib; 8]);
+        assert_eq!(qwen4_ep_emulation_map(&[0, 1, 0]), "0->0, 1->1, 2->0");
     }
 }
 

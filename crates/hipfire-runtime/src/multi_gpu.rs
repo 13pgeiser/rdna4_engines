@@ -3490,7 +3490,10 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
         .collect()
 }
 
-fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
+/// Logical -> physical device aliasing for `HIPFIRE_EMULATE_GPUS`: every id
+/// wraps modulo the physical device count (`id.rem_euclid(real_count)`);
+/// a non-positive count leaves the ids untouched.
+pub fn alias_ids(ids: &[i32], real_count: i32) -> Vec<i32> {
     if real_count > 0 {
         ids.iter().map(|&id| id.rem_euclid(real_count)).collect()
     } else {

@@ -15,7 +15,7 @@
 //! state so it is testable without a device. [`Qwen4EpMesh`] is the Qwen4
 //! instantiation: peers are [`Qwen4EpPeer`] and a failure on any rank aborts
 //! the row-gather barrier so no rank is left waiting on a dead peer. The mesh is
-//! rank-generic over EP2 and EP4 (`attach_ep_mesh` admits `1 + peers` of 2 or 4).
+//! rank-generic over EP2..=EP8 (`attach_ep_mesh` admits `1 + peers` of 2..=8).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::gpu_forward::{
@@ -1171,8 +1171,8 @@ impl Qwen4Bundle {
     /// 5. every rank builds its full (P2P) tables from all sources and installs
     ///    the row-gather hook (`Qwen4GpuForward::attach_ep`);
     /// 5b. with `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, every rank's tile-exchange
-    ///    registration and symmetric verdicts are collected (`run_all`, every rank, EP2
-    ///    and EP4); the exchange is installed only if all ranks admitted and agree;
+    ///    registration and symmetric verdicts are collected (`run_all`, every rank, any
+    ///    admitted rank count); the exchange is installed only if all ranks admitted and agree;
     /// 6. per-rank memory is recorded and the mesh is stored in `self`.
     ///
     /// On `Err` the bundle must be freed, not served (rank 0's forward may
@@ -1187,12 +1187,15 @@ impl Qwen4Bundle {
             return Err(ep_err("the mesh is already attached"));
         }
         let ranks = 1 + peer_device_ids.len();
-        if !matches!(ranks, 2 | 4) {
-            return Err(ep_err(format!("{ranks} ranks requested; supported: 2 or 4")));
+        if !(2..=8).contains(&ranks) {
+            return Err(ep_err(format!("{ranks} ranks requested; supported: 2..=8")));
         }
+        // Developer-only logical emulation (`HIPFIRE_EMULATE_GPUS`) runs several
+        // ranks on one physical device; physical mode keeps one rank per device.
+        let emulated = hipfire_runtime::config::get().emulate_gpus.is_some();
         let mut device_ids = vec![gpu.device_id];
         for &id in peer_device_ids {
-            if device_ids.contains(&id) {
+            if !emulated && device_ids.contains(&id) {
                 return Err(ep_err(format!("device {id} is used by more than one rank")));
             }
             device_ids.push(id);
@@ -1446,7 +1449,8 @@ impl Qwen4Bundle {
                 .map_err(|error| format!("attach EP tables: {error}"))
                 .and_then(|()| match forward.balanced_plan() {
                     // Default on (`HIPFIRE_EP_BALANCED_OWNERS=0` disables) with a
-                    // host-mapped layer.
+                    // host-mapped layer on gfx1201; other arches run the exact
+                    // static split (`attach_ep` builds no balanced layers).
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
                 });
