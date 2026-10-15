@@ -198,13 +198,14 @@ pub(crate) fn attention_steps<'a>(
     let pack = attention_input_pack_op(cfg, weights, state, gpu, layer_idx)?;
     let packed = pack.is_some();
     if let Some(pack) = pack {
-        program.push(Stage::Other, Step::PackedProjections(pack));
+        program.push(
+            Stage::Other,
+            Step::PackedProjections(pack),
+        );
     }
     program.push(
         Stage::QueryProject,
-        Step::QLoraProject(q_lora_project_op(
-            cfg, weights, state, gpu, layer_idx, packed,
-        )?),
+        Step::QLoraProject(q_lora_project_op(cfg, weights, state, gpu, layer_idx, packed)?),
     );
     program.push(
         Stage::Other,
@@ -226,7 +227,10 @@ pub(crate) fn attention_steps<'a>(
             };
             let indexer_packed = indexer_pack.is_some();
             if let Some(pack) = indexer_pack {
-                program.push(Stage::Other, Step::PackedProjections(pack));
+                program.push(
+                    Stage::Other,
+                    Step::PackedProjections(pack),
+                );
             }
             push_compressor(
                 program,
@@ -300,6 +304,7 @@ fn push_compressor<'a>(
     let op = compressor_op(
         cfg, weights, state, gpu, layer_idx, position, is_indexer, None,
         /*state_buffer_driven=*/ true,
+        None,
     )?
     .ok_or_else(missing)?;
     program.push(Stage::Other, Step::KvCompress(op));

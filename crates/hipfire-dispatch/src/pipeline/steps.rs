@@ -159,13 +159,14 @@ pub enum Step<'a> {
     KvJoint(crate::pipeline::mla::query_kv::KvJointOp<'a>),
     /// Tail-only YaRN RoPE of Q and the latent KV.
     ApplyTailRope(crate::pipeline::mla::query_kv::ApplyTailRopeOp<'a>),
-    /// Shared-plus-routed expert FFN of one decode row.
+    /// Shared-plus-routed expert FFN of one row or rows window.
     ExpertFfn(crate::pipeline::mla::expert_ffn::ExpertFfnOp<'a>),
     /// Ratio-4 sparse indexer: query, head weights, scores, top-k.
     SparseIndex(crate::pipeline::mla::attention::SparseIndexOp<'a>),
-    /// Strided KV compressor (main or indexer flavor) of one row.
+    /// Strided KV compressor (main or indexer flavor): one decode row or a rows window.
     KvCompress(crate::pipeline::mla::compressor::KvCompressOp<'a>),
-    /// One-row projection of an architecture-prepared (plain + rotated) input.
+    /// Projection of architecture-prepared (plain + rotated) input: one row, or a
+    /// `rows`-row window.
     PreparedProjection(crate::pipeline::mla::project::PreparedProjectionOp<'a>),
     /// Write the step's KV rows into the SWA rings.
     SwaRingWrite(crate::pipeline::mla::attention::SwaRingWriteOp<'a>),
@@ -179,6 +180,16 @@ pub enum Step<'a> {
     OLora(crate::pipeline::mla::attention::OLoraOp<'a>),
     /// Compressor `wkv` / `wgate` projections of the prepared input.
     CompressorProject(crate::pipeline::mla::compressor::CompressorProjectOp<'a>),
+    /// Row-batched Q8 embedding lookup and HC stream broadcast (prefill / verify).
+    EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp<'a>),
+    /// Row-batched DSpark capture: HC stream mean of each row into a capture slot.
+    StreamMeanCapture(crate::pipeline::mla::rows::StreamMeanCaptureOp<'a>),
+    /// Row-batched latent KV of the context rows, written into the SWA rings.
+    RingKv(crate::pipeline::mla::rows::RingKvOp<'a>),
+    /// Row-batched bidirectional block staging over the ring's committed window.
+    BlockStage(crate::pipeline::mla::rows::BlockStageOp<'a>),
+    /// Row-batched sliding-window KV staging of each row's visible window.
+    SwaStage(crate::pipeline::mla::rows::SwaStageOp<'a>),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -231,6 +242,11 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::SwaAttention(_)
         | Step::SparseAttention(_)
         | Step::OLora(_)
+        | Step::EmbedStreams(_)
+        | Step::StreamMeanCapture(_)
+        | Step::RingKv(_)
+        | Step::BlockStage(_)
+        | Step::SwaStage(_)
         | Step::CompressorProject(_) => None,
     }
 }
@@ -887,6 +903,18 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::SparseAttention(op) => op.validate_for_gpu(gpu)?,
             Step::OLora(op) => op.validate_for_gpu(gpu)?,
             Step::CompressorProject(op) => op.validate_for_gpu(gpu)?,
+            // Rows-only DS4 operations have one route; a window holds rows.
+            Step::EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp { rows: 0, .. })
+            | Step::SwaStage(crate::pipeline::mla::rows::SwaStageOp { rows: 0, .. })
+            | Step::StreamMeanCapture(crate::pipeline::mla::rows::StreamMeanCaptureOp {
+                rows: 0, ..
+            })
+            | Step::BlockStage(crate::pipeline::mla::rows::BlockStageOp { block: 0, .. }) => {
+                return Err(DispatchError::Hip("DS4 rows step with no rows".into()));
+            }
+            Step::RingKv(op) if op.positions.is_empty() => {
+                return Err(DispatchError::Hip("DS4 ring KV step with no rows".into()));
+            }
             _ => {}
         }
     }
@@ -1830,7 +1858,9 @@ pub(crate) fn launch_op_rows(
         }
         Step::QLoraProject(op) => crate::pipeline::mla::query_kv::execute_q_lora_project(gpu, op),
         Step::KvJoint(op) => crate::pipeline::mla::query_kv::execute_kv_joint(gpu, op),
-        Step::ApplyTailRope(op) => crate::pipeline::mla::query_kv::execute_apply_tail_rope(gpu, op),
+        Step::ApplyTailRope(op) => {
+            crate::pipeline::mla::query_kv::execute_apply_tail_rope(gpu, op)
+        }
         Step::ExpertFfn(op) => crate::pipeline::mla::expert_ffn::execute_expert_ffn(gpu, op),
         Step::SparseIndex(op) => crate::pipeline::mla::attention::execute_sparse_index(gpu, op),
         Step::KvCompress(op) => crate::pipeline::mla::compressor::execute_kv_compress(gpu, op),
@@ -1849,6 +1879,13 @@ pub(crate) fn launch_op_rows(
         Step::CompressorProject(op) => {
             crate::pipeline::mla::compressor::execute_compressor_project(gpu, op)
         }
+        Step::EmbedStreams(op) => crate::pipeline::mla::rows::execute_embed_streams(gpu, op),
+        Step::StreamMeanCapture(op) => {
+            crate::pipeline::mla::rows::execute_stream_mean_capture(gpu, op)
+        }
+        Step::RingKv(op) => crate::pipeline::mla::rows::execute_ring_kv(gpu, op),
+        Step::BlockStage(op) => crate::pipeline::mla::rows::execute_block_stage(gpu, op),
+        Step::SwaStage(op) => crate::pipeline::mla::rows::execute_swa_stage(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {
