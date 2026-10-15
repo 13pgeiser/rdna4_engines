@@ -1678,6 +1678,15 @@ pub trait SpecEmit {
     fn take_forced(&mut self) -> Vec<u32> {
         Vec::new()
     }
+
+    /// The most tokens the next speculative window may commit so that no
+    /// emitter intervention (think-budget force-close or think-cap stop) lands
+    /// strictly inside it: any intervention may only fall on the window's last
+    /// token, so the loop never has to repair already-committed state.
+    /// `None` = no limit (the default).
+    fn window_cap(&self) -> Option<usize> {
+        None
+    }
 }
 
 // ─── Model-free drafting sources (arch-agnostic, pure CPU) ──────────────────
