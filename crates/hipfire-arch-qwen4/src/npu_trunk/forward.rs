@@ -802,15 +802,17 @@ impl NpuForward {
                 window_measured_ms: windows_ms, window_model_ms: model.window_ms,
             });
             let snapshot = rates.snapshot();
-            let predicted = trunk::pair_model(&snapshot.calibration, trunk::Moved::from(pending.mask),
-                pending.rows, pending.prefixes, &pending.kinds).gpu_only_ms;
+            // The pair loses to GPU-only once the GPU's measured waits on the NPU exceed what pairing saves it. Both
+            // sides avoid the model's prefix-dependent terms, so the model's error at depth cannot trip the guard.
+            let savings = trunk::pair_model(&snapshot.calibration, trunk::Moved::from(pending.mask),
+                pending.rows, pending.prefixes, &pending.kinds).savings_ms;
             if self.trace.is_some() {
-                eprintln!("npu-trunk: sample: row={} npu_busy={:.3} ms windows={windows_ms:.3} ms stalls={stalls_ms:.3} ms span={span_ms:.3} ms",
+                eprintln!("npu-trunk: sample: row={} npu_busy={:.3} ms windows={windows_ms:.3} ms stalls={stalls_ms:.3} ms span={span_ms:.3} ms savings={savings:.3} ms",
                     pending.position, pending.npu_busy_ms);
             }
-            if pending.epoch == self.request_epoch && !self.guard_tripped && span_ms > 1.02 * predicted {
+            if pending.epoch == self.request_epoch && !self.guard_tripped && stalls_ms > savings {
                 self.guard_tripped = true;
-                eprintln!("npu-trunk: guard: pair at row {} took {span_ms:.0} ms, GPU-only predicted {predicted:.0} ms (gpu_x{:.3} npu_x{:.3}); the rest of this request runs GPU-only",
+                eprintln!("npu-trunk: guard: pair at row {}: the GPU waited {stalls_ms:.0} ms on the NPU, more than the {savings:.0} ms pairing saves it (pair {span_ms:.0} ms; gpu_x{:.3} npu_x{:.3}); the rest of this request runs GPU-only",
                     pending.position, snapshot.gpu_scale, snapshot.npu_scale);
             }
         }

@@ -46,8 +46,8 @@ kept for provenance and are not current recommendations.
   subsets run contiguous panel ranges of the packed chains. Forced modes (`on`,
   `emulate`) plan from the static calibration only, so `on` == `emulate` stays
   comparable. A guard sends the rest of a request GPU-only when, after a pair, the
-  measured pair time exceeds the predicted GPU-only time for its rows by more than
-  2% (one `npu-trunk: guard: ...` line per request). Output numerics differ only
+  GPU's measured waits on the NPU exceed what pairing saves it (one `npu-trunk: guard: ...`
+  line per request). Output numerics differ only
   between the NPU and GPU projection routes, both within the accepted KLD cap.
   Details: Live rate scales (auto), below. Developer variable
   `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` forces the per-request subset.
@@ -729,9 +729,14 @@ stay the bit-exact comparable pair.
   fused projection runs on the GPU. Developer variable
   `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` (comma list of `qkv,zab,q,kvidx`, or `all`)
   forces the per-request subset in every mode.
-* **Guard.** After each pair, if the measured pair time exceeds the predicted
-  GPU-only time for its rows by more than 2%, the rest of that request runs
-  GPU-only and the load logs one `npu-trunk: guard: ...` line.
+* **Guard.** After each pair, if the GPU's measured waits on the NPU (summed
+  `wait_gpu` time over the pair's chains) exceed what pairing saves it (`pair_model`
+  `savings_ms` under the current scales: the moved families' GPU projection time minus
+  the pair's GPU glue and DRAM contention), the pair lost to GPU-only and the rest of
+  that request runs GPU-only; one `npu-trunk: guard: ...` line per request. The rule
+  compares a measurement with a prefix-independent model term, so the model's error
+  at depth (its QSA growth term) cannot trip it; the planner's identity
+  `t_pipe = gpu_only - savings + stall + fill` ties it to the plan.
 * **Numerics.** Output differs only between the NPU and GPU projection routes
   (BF16-direct W8 rows on the NPU), both within the accepted KLD cap; `on` equals
   `emulate` bit-exactly.

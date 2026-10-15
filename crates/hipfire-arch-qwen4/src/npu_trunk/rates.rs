@@ -3,7 +3,7 @@
 //! learn a GPU-window scale and an NPU-chain scale that multiply the prior's terms (`scaled_calibration`).
 //! Forced modes (`on`, `emulate`) never use the estimator: they plan from the static calibration only.
 use super::calibration::FAMILY_NAMES;
-use super::plan::{bank_segments_moved, contention_extra, gpu_chunk, plan_executable, subset_mask};
+use super::plan::{bank_segments_moved, contention_extra, gpu_chunk, pair_time_moved, plan_executable, subset_mask};
 use super::{Calibration, FamilyMask, Moved};
 
 /// Weight of a new sample in the scale EWMAs.
@@ -33,14 +33,17 @@ impl LayerKind {
 
 /// Modelled times of one executed pair, comparable with the measured NPU chain and GPU window sums.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PairModel { pub npu_ms: f64, pub window_ms: f64, pub gpu_only_ms: f64 }
+pub struct PairModel { pub npu_ms: f64, pub window_ms: f64, pub gpu_only_ms: f64, pub savings_ms: f64 }
 
 /// Model of one executed pair. `kinds[l]` is the kind of layer `l`; `rows`/`prefix` describe banks A, B.
 /// `npu_ms`: the sum of the in-proj NPU chain (`npu[k]` of `bank_segments_moved`) over every (layer, bank) whose
 /// kind has a nonzero chain under `moved`. `window_ms`: the sum over the same chains except (0, A) (its window is
 /// bank-B initialization) of the GPU window hiding the chain, plus its contention: chain (l, A), l >= 1, is hidden
 /// by bank B's segment of layer l-1; chain (l, B) by bank A's segment of layer l.
-/// `gpu_only_ms`: both banks run GPU-only.
+/// `gpu_only_ms`: both banks run GPU-only. `savings_ms`: what pairing saves the GPU before any NPU wait: the moved
+/// families' GPU projection time minus the pair's GPU glue (pack, consume, visit) and its DRAM contention. The pair
+/// loses to GPU-only once the GPU's measured NPU waits exceed it; unlike `gpu_only_ms` it carries no prefix-dependent
+/// term, so the model's error at depth does not move it.
 pub fn pair_model(cal: &Calibration, moved: Moved, rows: [usize; 2], prefix: [usize; 2], kinds: &[LayerKind]) -> PairModel {
     let a = bank_segments_moved(cal, moved, rows[0], prefix[0]);
     let b = bank_segments_moved(cal, moved, rows[1], prefix[1]);
@@ -60,7 +63,16 @@ pub fn pair_model(cal: &Calibration, moved: Moved, rows: [usize; 2], prefix: [us
             window_ms += window + contention_extra(cal, window, b.npu[k], b.bytes[k]);
         }
     }
-    PairModel { npu_ms, window_ms, gpu_only_ms: gpu_chunk(cal, rows[0], prefix[0]).total + gpu_chunk(cal, rows[1], prefix[1]).total }
+    let mut savings_ms = -pair_time_moved(cal, moved, rows[0], prefix[0], rows[1], prefix[1]).extra;
+    for (s, (r, p)) in [&a, &b].into_iter().zip([(rows[0], prefix[0]), (rows[1], prefix[1])]) {
+        let chunk = gpu_chunk(cal, r, p);
+        let moved_trunk: f64 = (0..4).filter(|&i| moved.inproj[i]).map(|i| chunk.trunk[i]).sum();
+        let segments: f64 = kinds.iter().map(|kind| s.gpu[kind.index()]).sum();
+        let glue = segments - (chunk.total - cal.gpu.fixed_per_chunk_ms - moved_trunk);
+        savings_ms += moved_trunk - glue;
+    }
+    PairModel { npu_ms, window_ms, savings_ms,
+        gpu_only_ms: gpu_chunk(cal, rows[0], prefix[0]).total + gpu_chunk(cal, rows[1], prefix[1]).total }
 }
 
 /// One measured pair against its model: summed NPU chain time and summed GPU window time.
@@ -283,6 +295,12 @@ mod tests {
         let none = pair_model(&cal, Moved::from(FamilyMask::NONE), [8192, 8192], [0, 8192], &kinds);
         assert_eq!((none.npu_ms, none.window_ms), (0.0, 0.0));
         assert!((none.gpu_only_ms - p.t_gpu_ms).abs() < 1e-6);
+        assert!(none.savings_ms.abs() < 1e-9);
+        // savings is exactly what the planner's pair time credits the pipe: t = gpu_only - savings + stall + fill.
+        let pr = pair_time_moved(&cal, Moved::from(FamilyMask::ALL), 8192, 0, 8192, 8192);
+        assert!((pr.t - (model.gpu_only_ms - model.savings_ms + pr.stall + pr.fill)).abs() < 1e-6, "{pr:?} {model:?}");
+        // At the built-in rates the modelled NPU waits (stall + fill) stay far below the saving: no guard trip.
+        assert!(pr.stall + pr.fill < 0.5 * model.savings_ms, "{pr:?} {model:?}");
         // Only GDN in-proj moved: QSA layers contribute no chain.
         let qkv = pair_model(&cal, Moved::from(FamilyMask::from(Family::GdnQkv)), [8192, 8192], [0, 8192], &kinds);
         let qa = bank_segments_moved(&cal, Moved::from(FamilyMask::from(Family::GdnQkv)), 8192, 0);
