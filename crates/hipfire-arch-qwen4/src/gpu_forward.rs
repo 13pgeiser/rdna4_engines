@@ -8160,11 +8160,11 @@ mod ep_table_tests {
             let text = message(entries(&layout_skewed, skewed[0]));
             assert!(text.contains("exactly 170 experts"), "{text}");
         }
-        // A null peer base is refused rather than mapped.
+        // A null peer base is refused rather than mapped (the two-rank layout).
         let mut null = good.clone();
         null[1].down_base = 0;
         let layout_null = Qwen4ExpertTableLayout::Full {
-            placement,
+            placement: Qwen4EpPlacement { rank: 0, ranks: 2 },
             peers: &null,
         };
         let text = message(entries(&layout_null, null[0]));
