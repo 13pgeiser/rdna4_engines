@@ -630,7 +630,11 @@ impl SessionCache {
             return Err(error);
         }
         self.live_cold_exact = pool_capture;
-        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused);
+        // A turn restored from the tail does not split at its own tail: that
+        // extra small tile would land on every chained append, and a retry of
+        // this turn still restores the earlier tail (it stays valid below).
+        let tail_restore = reused > 0 && self.tail.as_ref().is_some_and(|r| r.key == key);
+        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused, !tail_restore);
         self.turn = Some(Turn {
             boundaries,
             lineage,
@@ -679,7 +683,7 @@ impl SessionCache {
         let Some(scope) = state.snapshot_scope(route) else {
             return;
         };
-        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused);
+        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused, true);
         self.turn = Some(Turn {
             boundaries,
             lineage,
@@ -695,10 +699,12 @@ impl SessionCache {
         state: &dyn SessionState,
         prompt: &[u32],
         reused: usize,
+        lineage_split: bool,
     ) -> (VecDeque<usize>, Option<usize>) {
         let mut boundaries = state.snapshot_boundaries(prompt, reused, prompt.len());
-        let lineage = state
-            .lineage_boundary(prompt, reused, prompt.len())
+        let lineage = lineage_split
+            .then(|| state.lineage_boundary(prompt, reused, prompt.len()))
+            .flatten()
             .filter(|&p| reused < p && p < prompt.len());
         if let Some(p) = lineage {
             boundaries.push(p);
