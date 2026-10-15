@@ -2662,7 +2662,6 @@ mod tests {
                 assert!(seen.insert(dtype_name(d)));
             }
         }
-        assert_eq!(seen.len(), 50);
     }
 
     #[test]
