@@ -18970,9 +18970,8 @@ mod tests {
         pull_command(
             paths,
             PullArgs {
-                model: model.into(),
-                force: false,
-                ple: selection,
+                ple: Some(selection),
+                ..PullArgs::defaults(model)
             },
         )
     }
