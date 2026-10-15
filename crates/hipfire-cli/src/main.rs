@@ -2112,7 +2112,7 @@ fn pull_with_overlay_pins(
                 entry,
                 *format,
                 sidecar,
-                &paths.models.join(&sidecar.file),
+                &paths.models,
                 args.force,
             )?;
         }
@@ -2564,6 +2564,50 @@ fn rm_with_overlay_pins(
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
+    // A family-shared PLE file (`qwen3.8-flash-next.ple-q4`) is the link target
+    // of every Flash-Next split base's `<base>.ple-qN`: it goes with the last
+    // base that still links it, like the other shared sidecars.
+    let mut kept_ple: Vec<(String, String)> = Vec::new();
+    if let Some((tag, entry)) = resolved.filter(|(_, entry)| {
+        path.file_name()
+            .is_some_and(|name| name == std::ffi::OsStr::new(&entry.file))
+    }) {
+        for format in [
+            hipfire_config::memory::PleFormat::Q4,
+            hipfire_config::memory::PleFormat::Q8,
+        ] {
+            let Some(sidecar) = ple::ple_slot(entry, format)
+                .filter(|sidecar| ple::is_shared_slot(entry, format, sidecar))
+            else {
+                continue;
+            };
+            let shared = paths.models.join(&sidecar.file);
+            if !shared.is_file() {
+                continue;
+            }
+            let keepers: Vec<&str> = registry
+                .models
+                .iter()
+                .filter(|(other_tag, other)| {
+                    other_tag.as_str() != tag
+                        && other.file != entry.file
+                        && ple::ple_slot(other, format)
+                            .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                        && hipfire_config::memory::ple_sidecar_path(
+                            &paths.models.join(&other.file),
+                            format,
+                        )
+                        .is_file()
+                })
+                .map(|(other_tag, _)| other_tag.as_str())
+                .collect();
+            if keepers.is_empty() {
+                targets.insert(shared);
+            } else {
+                kept_ple.push((sidecar.file.clone(), keepers.join(", ")));
+            }
+        }
+    }
     // A trunk overlay rides with its base: the pinned overlay file (also
     // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
     let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
@@ -2604,6 +2648,9 @@ fn rm_with_overlay_pins(
     }
     if let Some((file, keepers)) = kept_xdna {
         eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
+    }
+    for (file, keepers) in kept_ple {
+        eprintln!("keeping shared PLE sidecar {file}: still linked by {keepers}");
     }
     Ok(())
 }
@@ -18864,6 +18911,338 @@ mod tests {
         assert_eq!(fs::read(&q4).unwrap(), PLE_Q4);
         assert!(!q8.exists());
         DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ---- Shared Flash-Next PLE pair: one family file, per-base link aliases ---
+
+    const SHARED_BASE_A: &[u8] = b"shared-base-a-mq4";
+    const SHARED_BASE_B: &[u8] = b"shared-base-b-mq3";
+    const SHARED_FILE_A: &str = "qwen3.8-flash-next-base.mq4-xts";
+    const SHARED_FILE_B: &str = "qwen3.8-flash-next-base.mq3-xts";
+    const SHARED_Q8_FILE: &str = "qwen3.8-flash-next.ple-q8";
+    const SHARED_Q4_FILE: &str = "qwen3.8-flash-next.ple-q4";
+
+    /// Two Flash-Next split bases (`flash-a`, `flash-b`) naming ONE shared pair.
+    fn shared_registry_raw() -> String {
+        let slots = format!(
+            r#""ple_q8":{{"file":"{SHARED_Q8_FILE}","sha256":"{}","size_bytes":{}}},
+               "ple_q4":{{"file":"{SHARED_Q4_FILE}","sha256":"{}","size_bytes":{}}}"#,
+            ple_sha(PLE_Q8),
+            PLE_Q8.len(),
+            ple_sha(PLE_Q4),
+            PLE_Q4.len(),
+        );
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "flash-a":{{
+                    "repo":"test/repo","file":"{SHARED_FILE_A}","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},{slots}
+                }},
+                "flash-b":{{
+                    "repo":"test/repo","file":"{SHARED_FILE_B}","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},{slots}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(SHARED_BASE_A),
+            SHARED_BASE_A.len(),
+            ple_sha(SHARED_BASE_B),
+            SHARED_BASE_B.len(),
+        )
+    }
+
+    fn same_inode(a: &Path, b: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let (a, b) = (fs::metadata(a).unwrap(), fs::metadata(b).unwrap());
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+
+    fn loader_path(paths: &Paths, base: &str, format: hipfire_config::memory::PleFormat) -> PathBuf {
+        hipfire_config::memory::ple_sidecar_path(&paths.models.join(base), format)
+    }
+
+    fn pull_shared(paths: &Paths, model: &str, selection: ple::PleSelection) -> Result<()> {
+        pull_command(
+            paths,
+            PullArgs {
+                model: model.into(),
+                force: false,
+                ple: selection,
+            },
+        )
+    }
+
+    fn serve_files(entries: &[(&str, &[u8])]) -> (String, std::thread::JoinHandle<()>) {
+        exact_http_server(
+            entries
+                .iter()
+                .map(|(name, data)| ((*name).to_owned(), data.to_vec()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn pull_downloads_the_shared_pair_once_and_links_each_base_alias() {
+        use hipfire_config::memory::PleFormat;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-shared-pull");
+        write_test_registry_cache(&paths, &shared_registry_raw());
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        let canonical_q8 = paths.models.join(SHARED_Q8_FILE);
+        let canonical_q4 = paths.models.join(SHARED_Q4_FILE);
+
+        // flash-a --ple q8: base + the shared q8; the loader's name is a link.
+        let (base, handle) = serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
+        handle.join().unwrap();
+        let a_q8 = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
+        assert_eq!(fs::read(&canonical_q8).unwrap(), PLE_Q8);
+        assert_eq!(fs::read(&a_q8).unwrap(), PLE_Q8);
+        assert!(same_inode(&a_q8, &canonical_q8), "alias is a hard link, not a copy");
+        assert!(!canonical_q4.exists(), "--ple q8 leaves q4 alone");
+        assert!(!loader_path(&paths, SHARED_FILE_A, PleFormat::Q4).exists());
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // flash-b --ple all: its base and the shared q4 download; the q8 is reused.
+        let (base, handle) = serve_files(&[(SHARED_FILE_B, SHARED_BASE_B), (SHARED_Q4_FILE, PLE_Q4)]);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_shared(&paths, "flash-b", ple::PleSelection::All).unwrap();
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 4));
+        let b_q8 = loader_path(&paths, SHARED_FILE_B, PleFormat::Q8);
+        let b_q4 = loader_path(&paths, SHARED_FILE_B, PleFormat::Q4);
+        assert_eq!(fs::read(&b_q8).unwrap(), PLE_Q8);
+        assert_eq!(fs::read(&b_q4).unwrap(), PLE_Q4);
+        assert!(same_inode(&b_q8, &canonical_q8));
+        assert!(same_inode(&b_q4, &canonical_q4));
+        assert!(same_inode(&a_q8, &b_q8), "both bases serve the same bytes");
+
+        // flash-a --ple all afterwards downloads nothing (no server is running).
+        let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+        pull_shared(&paths, "flash-a", ple::PleSelection::All).unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 4));
+        let a_q4 = loader_path(&paths, SHARED_FILE_A, PleFormat::Q4);
+        assert_eq!(fs::read(&a_q4).unwrap(), PLE_Q4);
+        assert!(same_inode(&a_q4, &canonical_q4));
+        // `--ple none` touches no PLE file.
+        pull_shared(&paths, "flash-a", ple::PleSelection::Skip).unwrap();
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_refreshes_a_stale_alias_after_a_corrupt_canonical_is_redownloaded() {
+        use hipfire_config::memory::PleFormat;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-shared-stale");
+        write_test_registry_cache(&paths, &shared_registry_raw());
+        let canonical = paths.models.join(SHARED_Q8_FILE);
+        let alias = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
+        let (base, handle) = serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
+        handle.join().unwrap();
+
+        // The canonical file is replaced by a corrupt one (new inode): the alias
+        // still names the old, good inode.
+        fs::remove_file(&canonical).unwrap();
+        fs::write(&canonical, b"corrupt-rows").unwrap();
+        assert!(!same_inode(&alias, &canonical));
+        let (base, handle) = serve_files(&[(SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&canonical).unwrap(), PLE_Q8);
+        assert_eq!(fs::read(&alias).unwrap(), PLE_Q8);
+        assert!(
+            same_inode(&alias, &canonical),
+            "the alias follows the refreshed canonical file"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_never_overwrites_an_unverified_alias_and_rejects_a_tampered_download() {
+        use hipfire_config::memory::PleFormat;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-shared-unverified");
+        write_test_registry_cache(&paths, &shared_registry_raw());
+        let canonical = paths.models.join(SHARED_Q8_FILE);
+        let alias = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
+
+        // A tampered shared download fails verification and installs nothing.
+        let (base, handle) = serve_files(&[
+            (SHARED_FILE_A, SHARED_BASE_A),
+            (SHARED_Q8_FILE, &b"tampered-rows"[..]),
+        ]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        let error = pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+        assert!(!canonical.exists() && !alias.exists());
+
+        // A private, unverified file under the loader's name is left untouched
+        // (e.g. an old `hipfire ple split` output).
+        fs::write(&alias, b"private-rows").unwrap();
+        let (base, handle) = serve_files(&[(SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        let error = pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap_err();
+        handle.join().unwrap();
+        assert!(
+            format!("{error:#}").contains("not the verified shared"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&alias).unwrap(), b"private-rows");
+        assert_eq!(fs::read(&canonical).unwrap(), PLE_Q8);
+        let leftovers: Vec<_> = fs::read_dir(&paths.models)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".link."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A dangling symlink under that name is replaced.
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(paths.models.join("gone"), &alias).unwrap();
+        pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
+        assert!(same_inode(&alias, &canonical));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn on_demand_links_the_shared_file_for_a_second_base_without_downloading() {
+        use hipfire_config::memory::{PleFormat, PleFormatRequest};
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("ple-shared-on-demand");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&shared_registry_raw(), "ple shared").unwrap();
+        let (tag_a, entry_a) = registry.model("flash-a").unwrap();
+        let (tag_b, entry_b) = registry.model("flash-b").unwrap();
+        let model_a = paths.models.join(SHARED_FILE_A);
+        let model_b = paths.models.join(SHARED_FILE_B);
+        fs::write(&model_a, SHARED_BASE_A).unwrap();
+        fs::write(&model_b, SHARED_BASE_B).unwrap();
+        let canonical = paths.models.join(SHARED_Q8_FILE);
+
+        let (base, handle) = serve_files(&[(SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry_a),
+            Some(tag_a),
+            &model_a,
+            PleFormatRequest::Q8,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(fs::read(&canonical).unwrap(), PLE_Q8);
+        let alias_a = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
+        assert!(same_inode(&alias_a, &canonical));
+
+        // The second base only links: no server, downloads off.
+        let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry_b),
+            Some(tag_b),
+            &model_b,
+            PleFormatRequest::Q8,
+            false,
+        )
+        .unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        let alias_b = loader_path(&paths, SHARED_FILE_B, PleFormat::Q8);
+        assert_eq!(fs::read(&alias_b).unwrap(), PLE_Q8);
+        assert!(same_inode(&alias_b, &canonical));
+
+        // Present aliases are a no-op for every request, q4 included.
+        for request in [PleFormatRequest::Q8, PleFormatRequest::Q4, PleFormatRequest::Auto] {
+            ple::ensure_ple_sidecar(&registry, Some(entry_b), Some(tag_b), &model_b, request, false)
+                .unwrap();
+        }
+
+        // A corrupt canonical never gets linked: downloads off -> refuse.
+        fs::remove_file(&alias_b).unwrap();
+        fs::remove_file(&canonical).unwrap();
+        fs::write(&canonical, b"corrupt-rows").unwrap();
+        let error = ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry_b),
+            Some(tag_b),
+            &model_b,
+            PleFormatRequest::Q8,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("fails verification"), "{error:#}");
+        assert!(!alias_b.exists());
+        // Downloads on: the stale canonical is refreshed and linked.
+        let (base, handle) = serve_files(&[(SHARED_Q8_FILE, PLE_Q8)]);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry_b),
+            Some(tag_b),
+            &model_b,
+            PleFormatRequest::Q8,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&canonical).unwrap(), PLE_Q8);
+        assert!(same_inode(&alias_b, &canonical));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_the_shared_pair_until_the_last_base_alias_goes() {
+        use hipfire_config::memory::PleFormat;
+        let paths = test_paths("ple-shared-rm");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&shared_registry_raw(), "ple shared rm").unwrap();
+        let canonical = paths.models.join(SHARED_Q8_FILE);
+        fs::write(&canonical, PLE_Q8).unwrap();
+        for base in [SHARED_FILE_A, SHARED_FILE_B] {
+            fs::write(paths.models.join(base), base.as_bytes()).unwrap();
+            fs::hard_link(&canonical, loader_path(&paths, base, PleFormat::Q8)).unwrap();
+        }
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "flash-a".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join(SHARED_FILE_A).exists());
+        assert!(!loader_path(&paths, SHARED_FILE_A, PleFormat::Q8).exists());
+        assert!(canonical.is_file(), "flash-b still links the shared file");
+        assert_eq!(
+            fs::read(loader_path(&paths, SHARED_FILE_B, PleFormat::Q8)).unwrap(),
+            PLE_Q8
+        );
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "flash-b".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!canonical.exists(), "the last base takes the shared file along");
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

@@ -40,6 +40,8 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
 
+Optional split-base PLE fields (`ple_q4`, `ple_q8`, each `{file, sha256, size_bytes}`) name the PLE row sidecars of a split entry; `registry_gen.py` pins them from the live Hugging Face tree. A slot's `file` is either the per-base `<file>.ple-q4` / `<file>.ple-q8` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-q4` / `.ple-q8`. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-q4` / `.ple-q8` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without PLE fields are unchanged.
+
 ### Qwen 3.5 dense / hybrid
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
@@ -141,6 +143,23 @@ Other Flash-Next registry entries, retained for provenance and not the default:
 | `qwen3.8:flash-next-mq4-xts-zab` | `qwen3.8-flash-next.mq4-xts-zab` | 125.1 | 128 | **Local-only** (empty `repo`): not uploaded, not pullable |
 | `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | Previous canonical rung (RTN-asymmetric experts), superseded by MQ4 XTS |
 | `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | Earlier canonical rung, superseded |
+
+**MQ3 XTS tier (split base).** The planned `qwen3.8:flash-next-mq3-xts` tier
+is a split base (`qwen3.8-flash-next-base.mq3-xts`) with no PLE rows of its
+own. Sidecars use the existing `hipfire pull <tag> --ple q4|q8|auto` pick: a
+plain pull follows `memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere),
+`--ple q4` pulls the q4 rows explicitly, and `--ple q8` opts in to the exact
+Q8 rows, which `memory.ple_format = q8` then requires. The MQ4 XTS tags above
+are unchanged. Split bases share one published pair of row files in
+`hipfire-models/qwen3.8-flash-next`, `qwen3.8-flash-next.ple-q4` (28.8 GB) and
+`qwen3.8-flash-next.ple-q8` (54.4 GB), bound by the base marker's row geometry
+and the q8 source-rows SHA-256 (split bases only; the monolithic MQ4 XTS file
+and its binding are unchanged). The MQ3 XTS base file is not published yet,
+pending its release gates; once it is, the download is about 88.05 GB with the
+q4 rows and about 113.65 GB with the q8 rows. The q4 rows save about 25.6 GB
+of disk and download, not VRAM (the PLE rows are external). No GPU gate result
+is claimed.
+Row-table semantics: [`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables).
 
 ### DFlash draft artifacts (registry)
 

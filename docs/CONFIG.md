@@ -983,6 +983,46 @@ to (delete it and re-derive, or re-pull). A `.ple-q4` derived from a base
 is bound to that base the same way. A split base cannot load without the
 sidecar for the selected format.
 
+**MQ3 XTS split tier (`qwen3.8:flash-next-mq3-xts`).** This tier is a split
+base (`qwen3.8-flash-next-base.mq3-xts`) that carries no PLE rows. Its row
+tables come from sidecars chosen by the same `--ple q4|q8|auto` pick as every
+split entry, with no tier-specific default. A plain `hipfire pull` (`--ple
+auto`) follows `memory.ple_format`, whose own `auto` is q4 on gfx1151 and q8
+elsewhere, so on other architectures a plain pull selects q8. To get the q4
+rows on any architecture, pull them explicitly:
+`hipfire pull qwen3.8:flash-next-mq3-xts --ple q4`. The exact Q8 rows are an
+explicit opt-in the same way: `--ple q8` fetches `.ple-q8` and nothing else.
+
+At load, `memory.ple_format = q8` (or `HIPFIRE_PLE_FORMAT=q8`) requires the
+`.ple-q8` sidecar and refuses to load without it; it is never substituted
+with q4. `auto` takes the architecture's preferred format if that file is
+present and the other one if it is absent (it never downloads), so after a
+q8-only pull `auto` loads the q8 rows.
+
+To go back to q4 once a `.ple-q8` file is on disk, set
+`memory.ple_format = q4` or `HIPFIRE_PLE_FORMAT=q4`, with the `.ple-q4`
+sidecar present. Pulling with `--ple q4` does not remove the q8 sidecar and
+does not change which format a later load selects, so with both files present
+`auto` still follows the architecture's preference (q8 off gfx1151), not the
+pull. Shared row files: the split bases of the Flash-Next family share one
+published pair of row files in `hipfire-models/qwen3.8-flash-next`,
+`qwen3.8-flash-next.ple-q4` (28,800,142,336 B) and
+`qwen3.8-flash-next.ple-q8` (54,400,269,312 B). A split entry may name these
+shared file names. The CLI then downloads each shared file once and gives
+every base a hardlink alias at that base's `<base>.ple-q4` / `<base>.ple-q8`
+path, which is what the loader reads. A split base binds a sidecar by the base
+marker's row geometry and the SHA-256 of the q8 source rows, not by the base's
+file size and header/index hash, so a base with the same marker geometry and
+q8 source rows can use the same shared file; a mismatch is refused. This
+applies to split bases only: a monolithic model (the MQ4 XTS tags included)
+keeps the file-size plus header/index binding described above, gets no
+shared-file slot, and is unchanged. The MQ3 XTS base file itself is not
+published yet, pending its release gates. With the q4 rows the MQ3 XTS download
+is about 88.05 GB (base plus `.ple-q4`), with the q8 rows about 113.65 GB; the
+q4 rows are about 25.6 GB smaller on disk and in the download. The PLE rows are
+read from the external file, not held in VRAM, so this is not a VRAM reduction.
+No GPU gate result is claimed here.
+
 `memory.ple_hot_store_bytes` (above) also applies to the sidecars: the
 hot-row pack is cut from, and verified against, the rows file in use.
 With the q4 sidecar and no hot-row pack attached, the sidecar's data is

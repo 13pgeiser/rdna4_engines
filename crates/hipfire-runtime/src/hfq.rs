@@ -828,14 +828,17 @@ impl HfqFile {
             .cloned()
     }
 
-    /// Bind a PLE row sidecar to this base. The sidecar must have been built
-    /// for exactly this file: same length and same sha256 over
-    /// `[0, data_offset)`. A split base (marker, no shard tensors) must also
-    /// agree on the rows' source digest (`q8_rows_sha256 ==
-    /// source_rows_sha256`) and geometry; a monolithic base's embedded shard
-    /// tensors must match the sidecar's geometry (Q8_0 `[rows_per_shard,
-    /// row_width]`). One attach only. The sidecar takes no part in the
-    /// effective source identity, overlays or [`Self::tensor_range`].
+    /// Bind a PLE row sidecar to this base. A monolithic base (embedded shard
+    /// tensors, no marker) is bound to exactly one file: the sidecar must
+    /// carry this file's length and sha256 over `[0, data_offset)`, and the
+    /// embedded shards must match the sidecar's geometry (Q8_0
+    /// `[rows_per_shard, row_width]`). A split base (marker, no shard
+    /// tensors) is bound by row identity instead: the marker's geometry and
+    /// `q8_rows_sha256` must equal the sidecar's geometry and
+    /// `source_rows_sha256`; its own file length and index hash are free, so
+    /// one sidecar serves every split base marked for the same rows. One
+    /// attach only. The sidecar takes no part in the effective source
+    /// identity, overlays or [`Self::tensor_range`].
     pub fn attach_ple_rows(&mut self, rows: PleRowsFile) -> Result<(), String> {
         use crate::ple_sidecar::{
             embedded_shard_count, ple_shard_name, short_hex, PLE_BASE_MARKER_KEY, Q8_QUANT_TYPE,
@@ -849,7 +852,7 @@ impl HfqFile {
             crate::external_rows::RowEncoding::Q4Lm => {
                 "delete it and run `hipfire ple derive --format q4 <model>` to rebuild it for this base, or re-pull the matching files with `hipfire pull <model tag> --ple q4`"
             }
-            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar is bound to exactly one base file)",
+            _ => "re-pull the matching base and sidecar files with `hipfire pull <model tag> --ple q8` (a q8 sidecar must match its base: the same file for a monolithic base, the same source rows for a split base)",
         };
         if let Some(existing) = &self.ple_rows {
             return Err(format!(
@@ -857,16 +860,16 @@ impl HfqFile {
                 existing.path().display()
             ));
         }
-        if self.file_len() != table.base_file_bytes {
-            return Err(format!(
-                "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
-                table.base_file_bytes,
-                self.file_len()
-            ));
-        }
         let embedded = embedded_shard_count(&self.tensors).map_err(|e| format!("{base}: {e}"))?;
         let marker = self.ple_rows_marker();
         if embedded > 0 {
+            if self.file_len() != table.base_file_bytes {
+                return Err(format!(
+                    "PLE sidecar {sidecar} was built for a base file of {} bytes, but {base} is {} bytes ({remedy})",
+                    table.base_file_bytes,
+                    self.file_len()
+                ));
+            }
             if marker.is_some() {
                 return Err(format!(
                     "{base} carries `{PLE_BASE_MARKER_KEY}` (rows in a sidecar) but its index also holds {embedded} embedded PLE shard tensors; PLE sidecar {sidecar} cannot bind to it"
@@ -890,6 +893,18 @@ impl HfqFile {
                         rows_per_shard, row_width, info.quant_type, info.shape
                     ));
                 }
+            }
+            let actual = crate::ple_sidecar::hex_lower(
+                &self
+                    .index_sha256()
+                    .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
+            );
+            if actual != table.base_index_sha256 {
+                return Err(format!(
+                    "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
+                    short_hex(&table.base_index_sha256),
+                    short_hex(&actual)
+                ));
             }
         } else {
             let marker = marker.ok_or_else(|| {
@@ -917,18 +932,6 @@ impl HfqFile {
                     short_hex(&table.source_rows_sha256)
                 ));
             }
-        }
-        let actual = crate::ple_sidecar::hex_lower(
-            &self
-                .index_sha256()
-                .map_err(|e| format!("{base}: hashing the container index: {e}"))?,
-        );
-        if actual != table.base_index_sha256 {
-            return Err(format!(
-                "PLE sidecar {sidecar} is bound to base index sha256 {} but {base} has {} ({remedy})",
-                short_hex(&table.base_index_sha256),
-                short_hex(&actual)
-            ));
         }
         self.ple_rows = Some(rows);
         Ok(())
