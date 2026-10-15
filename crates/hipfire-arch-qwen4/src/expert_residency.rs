@@ -1565,6 +1565,79 @@ mod tests {
         assert!(reserve.describe().contains("QSA context"));
     }
 
+    /// The shipped Strix Halo (gfx1151, unified memory) admission: VMM QSA
+    /// F32 K/V, Q8 GDN, BF16 pooled mirror on, F16 arena off, no MTP,
+    /// 8192-row chunk, `max_seq` 16384, free 118,441 MiB (XTS) / 118,415 MiB
+    /// (mq3), routed 62,475 / 51,375 MiB, non-expert 5,115 MiB, logged
+    /// reserve 12,150 MiB. Unified memory fits fully resident when
+    /// `non_expert + routed + reserve <= free`; the reserve there is
+    /// `AutoReserve::bytes()`, so this pins both formulas and the decision.
+    #[test]
+    fn halo_unified_memory_admission_reserve_and_census_decision() {
+        let config = crate::config::compact_test_config();
+        let format = crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::F32,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let (max_seq, chunk, granularity) = (16384usize, 8192usize, 2usize << 20);
+        // Unified memory: the historical formula charges the first chunk's
+        // pages (`for_expert_reserve(use_ranges = true)`), the census the
+        // whole admitted context.
+        let first = crate::Qwen4ContextCommit::for_expert_reserve(
+            crate::Qwen4KvBackend::Vmm, true, max_seq, chunk, granularity,
+        );
+        let full =
+            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        assert!(full.committed_layer_bytes(&config, format.layout())
+            > first.committed_layer_bytes(&config, format.layout()));
+        let gather = |tokens: usize| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(config.num_key_value_heads, tokens)
+                .unwrap() as u64
+        };
+        let historical = auto_vram_reserve(
+            &config, &first, chunk, Full, format.layout(), None, Some(gather(first.tokens)),
+        )
+        .unwrap();
+        // The logged reserve of the shipped runs.
+        assert_eq!(historical >> 20, 12150);
+        // Census: gfx1151 has no dense GDN scan, F16 shadow or split selector.
+        let state = state_census(&config, format, &full, chunk, Full).unwrap();
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            dense_gdn: false,
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        let census = ReserveCensus {
+            qsa_context: state.qsa_context,
+            state: state.state,
+            forward: state.forward,
+            f16_shadows: 0,
+            workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
+            qsa_selector: 0,
+            mtp: 0,
+            gather: gather(full.tokens),
+        };
+        let reserve = AutoReserve::new(historical, census).unwrap();
+        // Both Halo artifacts fit fully resident under whichever formula wins
+        // (exact non-expert bytes 5,364,055,296 = 5,115.6 MiB).
+        assert_eq!(reserve.census_total >> 20, 9854, "{}", reserve.describe());
+        for (free, routed) in [(118_441u64 << 20, 62_475u64 << 20), (118_415 << 20, 51_375 << 20)] {
+            assert!(fits_fully_resident(free, 5_364_055_296, routed, reserve.bytes()), "{}", reserve.describe());
+        }
+        // The census decision: the historical floor wins on this admission
+        // (no flip), so unified-memory behaviour is unchanged. A failure here
+        // is the flip: unified memory must then admit on `historical`.
+        assert_eq!(reserve.winner(), "historical floor", "{}", reserve.describe());
+    }
+
     #[test]
     fn the_census_winner_sets_the_reserve_and_every_term_is_itemised() {
         let (free, non_expert, layer, historical) = EVIDENCE;
