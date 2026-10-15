@@ -63,8 +63,8 @@ use std::time::{Duration, Instant};
 /// Default host-barrier timeout.
 pub const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Largest supported rank count (the kernel takes four source pointers).
-pub const MAX_RANKS: usize = 4;
+/// Largest supported rank count (the kernel takes eight source pointers).
+pub const MAX_RANKS: usize = 8;
 
 /// Supported buffers per rank: `MIN_BUFFERS..=MAX_BUFFERS`.
 pub const MIN_BUFFERS: usize = 2;
@@ -632,7 +632,11 @@ mod tests {
         assert!(spec(4, 1, 16).validate().is_ok());
         assert!(spec(1, 10, 10240).validate().is_err());
         assert!(spec(0, 10, 10240).validate().is_err());
-        assert!(spec(5, 10, 10240).validate().is_err());
+        assert!(spec(5, 10, 10240).validate().is_ok());
+        assert!(spec(6, 10, 10240).validate().is_ok());
+        assert!(spec(8, 10, 10240).validate().is_ok());
+        assert!(spec(9, 10, 10240).validate().is_err());
+        assert!(spec(usize::MAX, 10, 10240).validate().is_err());
         assert!(spec(4, 0, 10240).validate().is_err());
         assert!(spec(4, 10, 0).validate().is_err());
         assert!(spec(4, 10, 10248).validate().is_err());

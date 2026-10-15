@@ -7171,7 +7171,7 @@ impl Gpu {
     pub fn ep_gather_rows_by_owner(
         &mut self,
         slot_experts: &GpuTensor,
-        src: [usize; 4],
+        src: [usize; 8],
         dst: usize,
         n_slots: usize,
         n_ranks: usize,
@@ -7179,10 +7179,10 @@ impl Gpu {
         n16: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+        if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks {
             return Err(HipError::new(
                 0,
-                "ep_gather_rows_by_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+                "ep_gather_rows_by_owner: n_ranks must be 2..=8 and self_rank < n_ranks",
             ));
         }
         if n_slots == 0 || n16 == 0 {
@@ -7216,13 +7216,21 @@ impl Gpu {
         let s1 = src[1] as *mut c_void;
         let s2 = src[2] as *mut c_void;
         let s3 = src[3] as *mut c_void;
+        let s4 = src[4] as *mut c_void;
+        let s5 = src[5] as *mut c_void;
+        let s6 = src[6] as *mut c_void;
+        let s7 = src[7] as *mut c_void;
         let d = dst as *mut c_void;
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 14] = [
             &ids as *const _ as *mut c_void,
             &s0 as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &s3 as *const _ as *mut c_void,
+            &s4 as *const _ as *mut c_void,
+            &s5 as *const _ as *mut c_void,
+            &s6 as *const _ as *mut c_void,
+            &s7 as *const _ as *mut c_void,
             &d as *const _ as *mut c_void,
             &mut slots_i32 as *mut _ as *mut c_void,
             &mut ranks_i32 as *mut _ as *mut c_void,
@@ -7236,6 +7244,10 @@ impl Gpu {
             blob.push_ptr(s1);
             blob.push_ptr(s2);
             blob.push_ptr(s3);
+            blob.push_ptr(s4);
+            blob.push_ptr(s5);
+            blob.push_ptr(s6);
+            blob.push_ptr(s7);
             blob.push_ptr(d);
             blob.push_i32(slots_i32);
             blob.push_i32(ranks_i32);
@@ -7266,7 +7278,7 @@ impl Gpu {
     pub fn ep_gather_rows_by_slot_owner(
         &mut self,
         slot_owner: &GpuTensor,
-        src: [usize; 4],
+        src: [usize; 8],
         dst: usize,
         n_slots: usize,
         n_ranks: usize,
@@ -7274,10 +7286,10 @@ impl Gpu {
         n16: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !(2..=4).contains(&n_ranks) || self_rank >= n_ranks {
+        if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks {
             return Err(HipError::new(
                 0,
-                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=4 and self_rank < n_ranks",
+                "ep_gather_rows_by_slot_owner: n_ranks must be 2..=8 and self_rank < n_ranks",
             ));
         }
         if n_slots == 0 || n16 == 0 {
@@ -7311,13 +7323,21 @@ impl Gpu {
         let s1 = src[1] as *mut c_void;
         let s2 = src[2] as *mut c_void;
         let s3 = src[3] as *mut c_void;
+        let s4 = src[4] as *mut c_void;
+        let s5 = src[5] as *mut c_void;
+        let s6 = src[6] as *mut c_void;
+        let s7 = src[7] as *mut c_void;
         let d = dst as *mut c_void;
-        let mut params: [*mut c_void; 10] = [
+        let mut params: [*mut c_void; 14] = [
             &owners as *const _ as *mut c_void,
             &s0 as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
             &s2 as *const _ as *mut c_void,
             &s3 as *const _ as *mut c_void,
+            &s4 as *const _ as *mut c_void,
+            &s5 as *const _ as *mut c_void,
+            &s6 as *const _ as *mut c_void,
+            &s7 as *const _ as *mut c_void,
             &d as *const _ as *mut c_void,
             &mut slots_i32 as *mut _ as *mut c_void,
             &mut ranks_i32 as *mut _ as *mut c_void,
@@ -7331,6 +7351,10 @@ impl Gpu {
             blob.push_ptr(s1);
             blob.push_ptr(s2);
             blob.push_ptr(s3);
+            blob.push_ptr(s4);
+            blob.push_ptr(s5);
+            blob.push_ptr(s6);
+            blob.push_ptr(s7);
             blob.push_ptr(d);
             blob.push_i32(slots_i32);
             blob.push_i32(ranks_i32);

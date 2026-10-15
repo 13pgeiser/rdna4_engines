@@ -17,7 +17,7 @@ fn peer_probe(after:bool)->Result<()> {
     for (r,g) in gs.iter_mut().enumerate(){transport.enable_peers(r,g)?;}
     // The after arm deliberately grows a new allocation after enable_peers.
     let mut late=Vec::new();if after{for g in &mut gs{late.push(g.alloc_tensor(&[bytes/4],DType::F32)?);}}
-    let mut bases=[0;4];let mut expected=Vec::new();
+    let mut bases=[0;8];let mut expected=Vec::new();
     for (r,g) in gs.iter_mut().enumerate(){g.bind_thread()?;let src=if after{&late[r]}else{&bufs[r][0]};g.hip.memset(&src.buf,0x31+r as i32,bytes)?;g.hip.device_synchronize()?;expected.push(download(g,src,1<<20)?);bases[r]=src.buf.as_ptr() as usize;}
     for (r,g) in gs.iter_mut().enumerate(){g.bind_thread()?;let ids=g.upload_raw(&(0..65536).flat_map(|_|((1-r) as i32).to_le_bytes()).collect::<Vec<_>>(),&[65536])?;
         g.ep_gather_rows_by_owner(&ids,bases,bufs[r][1].buf.as_ptr() as usize,65536,2,r,1)?;g.hip.device_synchronize()?;
