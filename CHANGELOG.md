@@ -66,23 +66,29 @@
 - **Sub-4-bit G2 run carrier: `scripts/subq4_g2_carrier.py` (lab tooling, no engine change).** One scheduler submission (class correct, card C, 30 GB device, 44 GB pinned host, hostmem lock, P1, 7200 s) through `/home/kaden/qcal/locks/fabric/fabric-run.sh` runs `fn_lane_oracle` (AR and native-MTP lanes with controls, ks 1,2,4,8), `qwen4_parity --mode state` and `qwen4_g2_replay_gate` serially on the ctl3-hot artifact and writes `g2.json` with per-check rc, command, hashes, card identity, mismatch counts and the first mismatch's repro. `--expert-vram-layers N` (integer, default 16; 15 only if 16 still runs out of device memory) sets `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` for the lane and parity checks and the replay gate's CLI flag, is required in the replay report's params, and is recorded in `g2.json`. The scheduler is mandatory: `fabric.py` silently falls back to in-process admission when fabricd is down, so the carrier refuses unless a live fabricd answers `--status --json`, refuses when `FABRIC_NO_DAEMON`/`FABRIC_SANDBOX` is set, and inside the job requires fabricd to list the wrapper as a running `jN` job with the declared card, memory, lock, priority and owner, before any GPU child starts. It also refuses to start without an explicit real-artifact PASS smoke receipt, a `--code-sha` that matches the G2 worktree's HEAD, and a card whose UUID/BDF match the known map, the KFD topology and the scheduler. An MTP run that never drafts, accepts and rejects a window is a FAIL.
 - **Real-model expert-slab retained-replay gate: `qwen4_g2_replay_gate` (lab example, no engine change).** On a ctl3-hot slab artifact it captures the decode body through the production lifecycle, checks that the production route, the prepared plan and the recorded-HIP oracle reproduce ordinary HIP byte for byte (logits, GDN, QSA, PLE state, lengths, position) at consecutive positions while proving each arm actually replayed, then frees and rebuilds the bundle between capture and replay and requires all three executors to refuse the changed binding with the route-identity error before any retained submit. Output is JSON with an exact mismatch count and error per check; the exit status is non-zero on any failed or unevaluable check.
 - **Flash-Next on one R9700: per-expert VRAM hot set (default when a bound sidecar is present, exact).** On gfx1201, an aggregate-MQ4 artifact with a bound decode-routing sidecar now replaces whole-layer expert placement by default. `HIPFIRE_QWEN4_EXPERT_HOTSET=0` is the kill switch and restores whole-layer placement; an absolute path in the variable selects a sidecar explicitly. An absent or unusable sidecar, or an artifact the hot set cannot back, falls back to the unchanged whole-layer placement instead of refusing the load. The VRAM budget is the same as `auto` (free − non-expert − reserve − tier tables − long-prefill stage buffers) minus a 512 MiB safety margin. It is filled with the experts ranked highest by a decode-routing sidecar, in one device owner plus one host-mapped owner, and reached through the existing per-layer absolute expert pointer tables. Kernels, slot order and combine order are unchanged. Long-prefill staging copies only a layer's host-tier experts into two VRAM stage buffers. EP, stock FP8, slab arenas, unified memory and an explicit `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` are not eligible and keep whole-layer placement.
-  - Measured on R9700 card B: mq4-xts, PLE q4, max_seq 16384. The sidecar `hotset-decode-v1` was ranked on 25 prompts disjoint from the bench set. Both arms use the same binary. MTP is the median of 3 interleaved fresh processes per arm; AR is 1 process per arm. Greedy ids are identical on all 11 prompts, AR and MTP. These are the pre-margin numbers; the 512 MiB margin re-check will replace them.
+  - Measured on R9700 card B with the 512 MiB safety margin in force (default-on hot set vs `HIPFIRE_QWEN4_EXPERT_HOTSET=0`): mq4-xts, PLE q4, max_seq 16384, 11 committed prompts. The sidecar `hotset-decode-v1` (sha256 `7f6760e1…`) was ranked on 25 prompts disjoint from the bench set and is the same one that ships. Both arms use the same binary. MTP is the median of 3 interleaved fresh processes per arm and AR is 1 process per arm. Greedy ids are identical on all 11 prompts, AR and MTP. It is not a blanket gain on every prompt: `records_parser_1k` regressed (43.1 → 39.4 tok/s, −8.6%) and `code_edit` is flat (47.7 → 47.6). Receipts: `/home/kaden/qcal/release-0.4.3/lever1-r9700/runs/{dec,cmd}-l2-*` (scheduler job j723).
 
     | decode tok/s | whole-layer | hot set |
     |---|---:|---:|
-    | MTP glimmer_coding | 45.6 | 65.8 |
-    | MTP lru_cache | 47.5 | 64.7 |
-    | MTP humaneval_0 | 43.4 | 49.5 |
-    | MTP code_edit | 47.8 | 47.6 |
-    | MTP fiction | 34.0 | 40.6 |
-    | MTP agentic | 36.9 | 45.1 |
-    | MTP records_parser_1k | 42.2 | 51.4 |
-    | MTP records_parser_4k | 41.2 | 50.7 |
-    | **MTP aggregate** | **41.1** | **49.7** |
-    | **AR aggregate** | **34.6** | **42.3** |
-    | p16k prefill | 3,786 | 4,585 |
-    | VRAM experts (MTP / AR) | 7,168 / 7,680 | 6,690 / 7,065 |
-    | peak VRAM MiB | 31,845 | 32,209 |
+    | MTP warmup | 37.7 | 46.0 |
+    | MTP glimmer_coding | 45.7 | 64.8 |
+    | MTP fiction | 33.9 | 40.2 |
+    | MTP bare_factual | 36.4 | 38.0 |
+    | MTP humaneval_0 | 43.7 | 49.1 |
+    | MTP lru_cache | 48.2 | 64.9 |
+    | MTP code_edit | 47.7 | 47.6 |
+    | MTP agentic | 36.7 | 43.2 |
+    | MTP glimmer_prefill_1024 | 42.6 | 56.9 |
+    | MTP records_parser_1k | 43.1 | 39.4 |
+    | MTP records_parser_4k | 41.3 | 50.4 |
+    | **MTP aggregate** | **41.41** | **47.44** |
+    | **AR aggregate** | **34.95** | **42.23** |
+    | p16k prefill | 3,787.0 | 3,786.3 |
+    | VRAM experts (MTP / AR) | 7,168 / 7,680 | 6,479 / 6,850 |
+    | peak VRAM MiB, decode runs (max of 4 per arm) | 31,662 | 31,517 |
+    | peak VRAM MiB, p16k prefill run | 31,841 | 31,841 |
+
+    The MTP aggregate rises +14.6% and the AR aggregate +20.8%, but per prompt the change ranges from −8.6% (`records_parser_1k`) to +41.8% (`glimmer_coding`). p16k prefill is flat. With the margin the hot set holds 6,479 experts under MTP and 6,850 under AR (daemon log); the whole-layer arm holds 14 (MTP) and 15 (AR) layers of 512 experts, 7,168 and 7,680. Peak VRAM is the maximum `peak_vram_mib` in each run's `vram-peak.txt`: the decode row is the max over the 4 decode runs per arm (3 MTP and 1 AR; the whole-layer maximum is the AR run at 31,662, the hot-set maximum the AR run at 31,517), the prefill row the single p16k run per arm. These are VRAM-poller samples, not an allocator high-water mark, and decode and prefill are separate measurements. In decode the hot set peaks 145 MiB lower than whole-layer placement; at p16k prefill both arms peak at the same 31,841 MiB.
 - **Flash-Next expert-slab artifacts load on gfx1201.** A version-1 expert-slab artifact (MQ3-I4 experts plus an MQ4 hot set) loads as one slab arena per trunk layer, resident or host-mapped through the existing expert-VRAM placement, with a zeroed tail pad and a per-expert codec table. Decode (up to 8 rows) runs the K1 lane-union GEMV over codec buckets, planned on the device with no readback; longer prefill runs the grouped IU4 kernels of both codecs over the same buffers on codec-masked tiles. Other architectures keep refusing slab artifacts.
 - **gfx1201 pointer-addressed slab MoE decode added, without production-route changes.** `mq_i4_moe_gemv` specializes MQ3-I4 R256 gate/up and R128 down plus symmetric MQ4, using the frozen 88-byte F4 ABI. Codec/profile buckets keep ascending expert IDs and original output slots; C1–C8 share each expert's weight reads across its selected lanes. Down outputs remain unweighted. The loader-independent `slab_moe_decode` launch module and lab byte-oracle runner are provided for sealed-route integration; legacy MQ4 kernels and existing bundles are unchanged.
 - **MQ-I4 CPU reference twins added (no default-path changes).** Rotated dequantization, signed A4/IU4 folding, grouped BF16 epilogues, a frozen F4 decode reduction tree and original-slot routing provide byte/arithmetic oracles for PeaceMaker kernels; qt131–134 remain refused by production GPU dispatch.

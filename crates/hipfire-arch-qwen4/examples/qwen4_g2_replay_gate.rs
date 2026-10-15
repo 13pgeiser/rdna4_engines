@@ -329,6 +329,7 @@ fn load_bundle(
         receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .map_err(|e| format!("qwen4 bundle assembly: {e}"))?;
     bundle.attach_npu_trunk_identity(npu_identity);
