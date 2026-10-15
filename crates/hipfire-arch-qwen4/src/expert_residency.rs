@@ -215,7 +215,7 @@ pub fn resident_split_ranks(
         if !is_routed_expert(&entry.name) {
             non_expert += bytes;
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
-            layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, ranks)?);
+            layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, 0, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
             layer_experts += rank_share(entry, bytes, 0, ranks)?;
         }
@@ -515,12 +515,25 @@ pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Res
 /// Rank `rank`'s share of an entry's payload: a routed expert stack (logical
 /// shape `[n_experts, ..]`) holds its per-expert bytes times the rank's
 /// `local_count` (experts `e % ranks == rank`), everything else is replicated.
+/// An expert-slab arena (logical shape `[bytes]`, no expert axis) keeps its
+/// even byte split; EP refuses slab manifests today
+/// (`Qwen4Manifest::with_expert_parallel`).
 fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Result<u64, String> {
     if ranks == 0 {
         return Err("expert-parallel rank count must be at least 1".to_string());
     }
     if ranks == 1 || !is_routed_expert(&entry.name) {
         return Ok(bytes);
+    }
+    if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
+        let ranks = ranks as u64;
+        if bytes % ranks != 0 {
+            return Err(format!(
+                "'{}' has {bytes} bytes, which do not split across {ranks} ranks",
+                entry.name
+            ));
+        }
+        return Ok(bytes / ranks);
     }
     if rank >= ranks {
         return Err(format!("expert-parallel rank {rank} is outside {ranks} ranks"));
