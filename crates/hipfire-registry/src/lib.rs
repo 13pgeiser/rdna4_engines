@@ -70,6 +70,26 @@ pub fn monolithic_file_for_split_base(file: &str) -> Option<String> {
     )
 }
 
+/// Stem (before `-base`) of the one split-base family that shares its PLE row
+/// files between bases (`qwen3.8-flash-next-base.<ext>`). Every other file
+/// keeps strictly per-base sidecar names.
+const SHARED_PLE_FAMILY: &str = "qwen3.8-flash-next";
+
+/// The family-wide PLE row file a split base may name instead of its own
+/// `<file><suffix>` (`qwen3.8-flash-next-base.mq3-xts` + `.ple-q4` ->
+/// `qwen3.8-flash-next.ple-q4`). `None` unless `base_file` is a Flash-Next
+/// split base; `suffix` is [`PLE_Q4_SIDECAR_SUFFIX`] or [`PLE_Q8_SIDECAR_SUFFIX`].
+///
+/// The rows are bound to the base by the row table, not by the file name, so
+/// one shared pair serves every split base of the family; consumers install
+/// `<base file><suffix>` as a link to it for the runtime loader.
+pub fn shared_ple_file(base_file: &str, suffix: &str) -> Option<String> {
+    monolithic_file_for_split_base(base_file)?;
+    let stem = Path::new(base_file).file_stem()?.to_str()?;
+    (stem.strip_suffix(SPLIT_BASE_STEM_SUFFIX)? == SHARED_PLE_FAMILY)
+        .then(|| format!("{SHARED_PLE_FAMILY}{suffix}"))
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("failed to read {path}: {source}")]
@@ -531,6 +551,7 @@ impl RegistryV1 {
         if self.models.is_empty() {
             return Err(fail("model catalog is empty".into()));
         }
+        let mut shared_pins: BTreeMap<String, (Option<&str>, Option<u64>)> = BTreeMap::new();
         for (tag, entry) in &self.models {
             if tag.trim().is_empty() || entry.file.trim().is_empty() {
                 return Err(fail(format!("model '{tag}' has an empty tag or file")));
@@ -580,12 +601,32 @@ impl RegistryV1 {
                         entry.file
                     )));
                 }
-                let expected = format!("{}{suffix}", entry.file);
-                if sidecar.file != expected {
+                let own = format!("{}{suffix}", entry.file);
+                if sidecar.file == own {
+                    continue;
+                }
+                let Some(shared) =
+                    shared_ple_file(&entry.file, suffix).filter(|shared| *shared == sidecar.file)
+                else {
                     return Err(fail(format!(
-                        "model '{tag}' {slot} file '{}' must be '{expected}'",
+                        "model '{tag}' {slot} file '{}' must be '{own}'",
                         sidecar.file
                     )));
+                };
+                // Every split base of the family shares one file, so each one
+                // must pin the same bytes.
+                let pin = (sidecar.sha256.as_deref(), sidecar.size_bytes);
+                match shared_pins.get(&shared) {
+                    Some(first) if *first != pin => {
+                        return Err(fail(format!(
+                            "model '{tag}' {slot} shared file '{shared}' is pinned differently \
+                             by another model"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        shared_pins.insert(shared, pin);
+                    }
                 }
             }
             if let Some(format) = entry.default_tool_format.as_deref() {
@@ -1550,6 +1591,126 @@ mod tests {
             parse_split(&value).is_err(),
             "sidecar slots stay deny_unknown_fields"
         );
+    }
+
+    const SHARED_Q4: &str = "qwen3.8-flash-next.ple-q4";
+    const SHARED_Q8: &str = "qwen3.8-flash-next.ple-q8";
+
+    /// The split registry with the shared Flash-Next pair on the MQ4 split base
+    /// and on a second (MQ3) split base of the same family.
+    fn shared_pair_registry_json() -> serde_json::Value {
+        let mut value = split_registry_json();
+        let models = value["models"].as_object_mut().unwrap();
+        let mut mq3 = models["qwen3.8:flash-next"].clone();
+        mq3["file"] = "qwen3.8-flash-next-base.mq3-xts".into();
+        models.insert("qwen3.8:flash-next-mq3".into(), mq3);
+        for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
+            models[tag]["ple_q4"]["file"] = SHARED_Q4.into();
+            models[tag]["ple_q8"]["file"] = SHARED_Q8.into();
+        }
+        value
+    }
+
+    #[test]
+    fn flash_next_split_bases_may_share_one_ple_pair() {
+        let registry = parse_split(&shared_pair_registry_json()).unwrap();
+        for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
+            let entry = &registry.models[tag];
+            assert_eq!(entry.ple_q4.as_ref().unwrap().file, SHARED_Q4, "{tag}");
+            assert_eq!(entry.ple_q8.as_ref().unwrap().file, SHARED_Q8, "{tag}");
+        }
+        // Own per-base names stay valid next to the shared ones (mixed slots).
+        let mut mixed = shared_pair_registry_json();
+        mixed["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+            "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
+        parse_split(&mixed).unwrap();
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq3-xts", PLE_Q4_SIDECAR_SUFFIX).as_deref(),
+            Some(SHARED_Q4)
+        );
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", PLE_Q8_SIDECAR_SUFFIX).as_deref(),
+            Some(SHARED_Q8)
+        );
+        for (file, why) in [
+            ("qwen3.8-flash-next.mq4-xts", "monolithic"),
+            ("model-base.mq4", "other family"),
+            ("Qwen3.8-Flash-Next-base.mq4-xts", "case"),
+            ("dir/qwen3.8-flash-next-base.mq4-xts", "path"),
+        ] {
+            assert_eq!(
+                shared_ple_file(file, PLE_Q4_SIDECAR_SUFFIX),
+                None,
+                "{file}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_ple_names_are_refused_outside_the_flash_next_split_family() {
+        let cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>, &str); 6] = [
+            (
+                "shared file on the monolithic mq4 entry",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "qwen3.8-flash-next.mq4-xts".into();
+                }),
+                "not a split base",
+            ),
+            (
+                "another family cannot borrow the Flash-Next pair",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "other-model-base.mq4".into();
+                }),
+                "must be 'other-model-base.mq4.ple-q",
+            ),
+            (
+                "q4 slot names the shared q8",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = SHARED_Q8.into();
+                }),
+                "must be",
+            ),
+            (
+                "arbitrary family file",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = "qwen3.8-flash-next.other-q4".into();
+                }),
+                "must be",
+            ),
+            (
+                "shared name in a subdirectory",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["file"] = format!("sub/{SHARED_Q8}").into();
+                }),
+                "must be",
+            ),
+            (
+                "different case",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["file"] = "Qwen3.8-Flash-Next.ple-q8".into();
+                }),
+                "must be",
+            ),
+        ];
+        for (name, mutate, needle) in cases {
+            let mut value = shared_pair_registry_json();
+            mutate(&mut value["models"]["qwen3.8:flash-next"]);
+            let error = parse_split(&value).expect_err(name).to_string();
+            assert!(error.contains(needle), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn bases_naming_the_same_shared_file_must_pin_the_same_bytes() {
+        for (field, value) in [
+            ("sha256", serde_json::Value::from(digest('d'))),
+            ("size_bytes", serde_json::Value::from(1_u64)),
+        ] {
+            let mut value_json = shared_pair_registry_json();
+            value_json["models"]["qwen3.8:flash-next-mq3"]["ple_q4"][field] = value;
+            let error = parse_split(&value_json).unwrap_err().to_string();
+            assert!(error.contains("pinned differently"), "{field}: {error}");
+        }
     }
 
     #[test]
