@@ -373,10 +373,14 @@ pub fn rebind_q4(
     {
         return Err("ple rebind: PLE metadata changed".into());
     }
-    let old_shards: Vec<_> = old.tensor_infos().iter()
+    let old_shards: Vec<_> = old
+        .tensor_infos()
+        .iter()
         .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
         .collect();
-    let new_shards: Vec<_> = new.tensor_infos().iter()
+    let new_shards: Vec<_> = new
+        .tensor_infos()
+        .iter()
         .filter(|t| t.name.starts_with(PLE_SHARD_PREFIX) && t.name.ends_with(PLE_SHARD_SUFFIX))
         .collect();
     if old_shards.is_empty() || old_shards.len() != new_shards.len() {
@@ -387,17 +391,22 @@ pub fn rebind_q4(
     let mut left = vec![0u8; DEFAULT_CHUNK_BYTES];
     let mut right = vec![0u8; DEFAULT_CHUNK_BYTES];
     for (a, b) in old_shards.iter().zip(&new_shards) {
-        if a.name != b.name || a.shape != b.shape || a.quant_type != b.quant_type
-            || a.group_size != b.group_size || a.data_size != b.data_size
+        if a.name != b.name
+            || a.shape != b.shape
+            || a.quant_type != b.quant_type
+            || a.group_size != b.group_size
+            || a.data_size != b.data_size
         {
             return Err("ple rebind: PLE descriptor changed".into());
         }
         let mut offset = 0;
         while offset < a.data_size {
             let n = left.len().min(a.data_size - offset);
-            old_file.read_exact_at(&mut left[..n], (a.data_offset + offset) as u64)
+            old_file
+                .read_exact_at(&mut left[..n], (a.data_offset + offset) as u64)
                 .map_err(|e| e.to_string())?;
-            new_file.read_exact_at(&mut right[..n], (b.data_offset + offset) as u64)
+            new_file
+                .read_exact_at(&mut right[..n], (b.data_offset + offset) as u64)
                 .map_err(|e| e.to_string())?;
             if left[..n] != right[..n] {
                 return Err(format!("ple rebind: source rows changed in {}", a.name));
@@ -406,12 +415,30 @@ pub fn rebind_q4(
         }
     }
     let input = File::open(source).map_err(|e| e.to_string())?;
-    let tuning = Tuning { threads: 1, segment_bytes: header.table.as_ref()
-        .ok_or("ple rebind: missing table")?.segment_bytes, ..Tuning::default() };
-    let segments = segment_digests(&input, source, header.data_offset,
-        header.data_bytes, &tuning, progress)?;
+    let tuning = Tuning {
+        threads: 1,
+        segment_bytes: header
+            .table
+            .as_ref()
+            .ok_or("ple rebind: missing table")?
+            .segment_bytes,
+        ..Tuning::default()
+    };
+    let segments = segment_digests(
+        &input,
+        source,
+        header.data_offset,
+        header.data_bytes,
+        &tuning,
+        progress,
+    )?;
     if segments.iter().map(|s| hex(s)).collect::<Vec<_>>()
-        != header.table.as_ref().ok_or("ple rebind: missing table")?.segment_sha256 {
+        != header
+            .table
+            .as_ref()
+            .ok_or("ple rebind: missing table")?
+            .segment_sha256
+    {
         return Err("ple rebind: source payload digest mismatch".into());
     }
     let original = header.clone();
@@ -436,9 +463,15 @@ pub fn rebind_q4(
     let mut offset = 0;
     while offset < size {
         let n = left.len().min((size - offset) as usize);
-        input.read_exact_at(&mut left[..n], offset).map_err(|e| e.to_string())?;
-        output.write_all_at(&left[..n], offset).map_err(|e| e.to_string())?;
-        output.read_exact_at(&mut right[..n], offset).map_err(|e| e.to_string())?;
+        input
+            .read_exact_at(&mut left[..n], offset)
+            .map_err(|e| e.to_string())?;
+        output
+            .write_all_at(&left[..n], offset)
+            .map_err(|e| e.to_string())?;
+        output
+            .read_exact_at(&mut right[..n], offset)
+            .map_err(|e| e.to_string())?;
         if left[..n] != right[..n] {
             return Err("ple rebind: copied bytes differ".into());
         }
@@ -2003,7 +2036,7 @@ fn open_locked_tmp(path: &Path, ctx: &str) -> Result<File, String> {
 
 /// Free bytes available to unprivileged writers on the filesystem of `dir`.
 #[cfg(unix)]
-fn available_bytes(dir: &Path) -> Result<u64, String> {
+pub fn available_bytes(dir: &Path) -> Result<u64, String> {
     use std::os::unix::ffi::OsStrExt;
     let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|_| format!("path {} contains a NUL byte", dir.display()))?;
@@ -2349,14 +2382,24 @@ mod tests {
         let out = q4_path(&base);
         fs::hard_link(&source, &out).unwrap();
         rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap();
-        assert_ne!(fs::metadata(&source).unwrap().ino(), fs::metadata(&out).unwrap().ino());
+        assert_ne!(
+            fs::metadata(&source).unwrap().ino(),
+            fs::metadata(&out).unwrap().ino()
+        );
         assert_eq!(read_all(&source), stock);
         let a = read_ple_hot_pack_header(&source).unwrap();
         let mut b = read_ple_hot_pack_header(&out).unwrap();
-        assert_eq!(&stock[a.data_offset as usize..], &read_all(&out)[b.data_offset as usize..]);
-        assert_eq!(b.table.as_ref().unwrap().base_file_bytes, fs::metadata(&base).unwrap().len());
+        assert_eq!(
+            &stock[a.data_offset as usize..],
+            &read_all(&out)[b.data_offset as usize..]
+        );
+        assert_eq!(
+            b.table.as_ref().unwrap().base_file_bytes,
+            fs::metadata(&base).unwrap().len()
+        );
         b.table.as_mut().unwrap().base_file_bytes = a.table.as_ref().unwrap().base_file_bytes;
-        b.table.as_mut().unwrap().base_index_sha256 = a.table.as_ref().unwrap().base_index_sha256.clone();
+        b.table.as_mut().unwrap().base_index_sha256 =
+            a.table.as_ref().unwrap().base_index_sha256.clone();
         assert_eq!(a, b);
     }
 
@@ -2369,16 +2412,26 @@ mod tests {
         let base = fx.dir.path().join("changed.mq4");
         fs::copy(&fx.model, &base).unwrap();
         let hfq = HfqFile::open(&base).unwrap();
-        let shard = hfq.tensor_infos().iter().find(|t| t.name == ple_shard_name(0)).unwrap();
+        let shard = hfq
+            .tensor_infos()
+            .iter()
+            .find(|t| t.name == ple_shard_name(0))
+            .unwrap();
         let file = OpenOptions::new().write(true).open(&base).unwrap();
         file.write_all_at(&[255], shard.data_offset as u64).unwrap();
-        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress())
+            .unwrap_err()
             .contains("source rows changed"));
         fs::copy(&fx.model, &base).unwrap();
         let header = read_ple_hot_pack_header(&source).unwrap();
-        OpenOptions::new().write(true).open(&source).unwrap()
-            .write_all_at(&[255], header.data_offset).unwrap();
-        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress()).unwrap_err()
+        OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .write_all_at(&[255], header.data_offset)
+            .unwrap();
+        assert!(rebind_q4(&fx.model, &base, &source, &mut no_progress())
+            .unwrap_err()
             .contains("payload digest mismatch"));
         assert!(!q4_path(&base).exists());
     }

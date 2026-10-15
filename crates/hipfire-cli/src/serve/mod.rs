@@ -8,6 +8,9 @@
 //! and the `serve` subcommand entrypoints. Centralises all state that must be
 //! shared across HTTP workers so transport changes stay isolated.
 
+use crate::process_identity::{
+    pid_alive, pid_owns_listen_port, process_start_time, serve_process_matches,
+};
 use crate::{
     apply_kv_axis_overrides, apply_speculation_selector, config_bool, config_f64, config_i64,
     config_string, config_u64, find_daemon, find_model_path, http_get_json, list_local_models,
@@ -15,13 +18,10 @@ use crate::{
     resolve_dflash_sidecar, resolve_mtp_sidecar, resolved_for_model, resolved_global, ListArgs,
     Paths, PullArgs, ServeArgs, ServiceEndpoint, StopArgs,
 };
-use crate::process_identity::{
-    pid_alive, pid_owns_listen_port, process_start_time, serve_process_matches,
-};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
-use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
 use hipfire_config::secret::BearerToken;
+use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
 use hipfire_registry::{load as load_registry, RegistryV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1367,12 +1367,7 @@ pub(crate) fn parse_bind(
 
 /// Builds the detached child's argv. `--open` stays a parent-only action; the
 /// child receives `--ui`, and `--detach` is replaced by `--foreground-child`.
-fn detached_serve_command(
-    executable: &Path,
-    args: &ServeArgs,
-    host: &str,
-    port: u16,
-) -> Command {
+fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port: u16) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("serve")
@@ -1503,9 +1498,10 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
         }
         // Only this child counts as ready: another responder on the port
         // must not turn a failed spawn into a reported success.
-        let ours = http_get_json(&endpoint, "/health", Duration::from_secs(1)).is_ok_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
-        });
+        let ours =
+            http_get_json(&endpoint, "/health", Duration::from_secs(1)).is_ok_and(|health| {
+                health.get("pid").and_then(serde_json::Value::as_u64) == Some(child_pid)
+            });
         if ours {
             println!(
                 "hipfire serve running at http://{}:{} (PID {}, log {})",
@@ -2151,14 +2147,7 @@ impl ServeRuntime {
                 ))
                 .into());
             }
-            pull_command(
-                &self.paths,
-                PullArgs {
-                    model: model.to_owned(),
-                    force: false,
-                    ple: crate::ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(&self.paths, PullArgs::defaults(model))?;
             // pull has already verified the installed payload; avoid a second hash.
             path = find_model_path(&self.paths, &self.registry, model);
         }
@@ -2782,9 +2771,9 @@ fn wait_for_serve_exit(record: &ServePidRecord, timeout: Duration, poll: Duratio
     let deadline = Instant::now() + timeout;
     loop {
         let gone = !pid_alive(record.pid)
-            || record
-                .start_time
-                .is_some_and(|expected| process_start_time(record.pid).is_some_and(|actual| actual != expected));
+            || record.start_time.is_some_and(|expected| {
+                process_start_time(record.pid).is_some_and(|actual| actual != expected)
+            });
         if gone {
             return Ok(());
         }
@@ -2982,7 +2971,10 @@ mod tests {
         assert!(legacy.manage_port.is_none());
         assert!(legacy.manage_token.is_none());
         let record = parse_pid_record(r#"{"pid":43,"start_time":7,"port":8080,"token":"instance","manage_port":8081,"manage_token":"secret"}"#).unwrap();
-        assert_eq!(parse_pid_record(&serde_json::to_string(&record).unwrap()), Some(record.clone()));
+        assert_eq!(
+            parse_pid_record(&serde_json::to_string(&record).unwrap()),
+            Some(record.clone())
+        );
         let public = record.to_public_json();
         assert_eq!(public["manage_token_present"], true);
         assert!(public.get("manage_token").is_none());
@@ -4487,10 +4479,8 @@ mod capabilities_tests {
     #[cfg(unix)]
     fn test_bearer(label: &str) -> BearerToken {
         use std::os::unix::fs::OpenOptionsExt;
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-bind-key-{label}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-bind-key-{label}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.key");
         let mut file = fs::OpenOptions::new()

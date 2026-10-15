@@ -10,8 +10,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    complete_openai_chat, http_get_json, probe_host, service_ready, service_url, stream_openai_chat,
-    Engine, OpenAiSseEvent, ServiceEndpoint,
+    complete_openai_chat, http_get_json, probe_host, service_ready, service_url,
+    stream_openai_chat, Engine, OpenAiSseEvent, ServiceEndpoint,
 };
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
@@ -38,7 +38,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{Read, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
@@ -55,6 +55,7 @@ mod kernel_pack;
 mod npu_trunk;
 mod ple;
 mod process_identity;
+mod pull_select;
 mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
@@ -412,9 +413,46 @@ pub(crate) struct PullArgs {
     force: bool,
     /// Which PLE row sidecar a split model pulls next to its base: `auto`
     /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
-    /// `all`, or `none` (fetched on first load).
-    #[arg(long, value_enum, default_value_t = ple::PleSelection::Auto)]
-    ple: ple::PleSelection,
+    /// `all`, or `none` (fetched on first load). Omitted: asked on a terminal,
+    /// else `auto`.
+    #[arg(long, value_enum)]
+    ple: Option<ple::PleSelection>,
+    /// Fetch the registry's draft/MTP sidecars without asking (the default).
+    #[arg(long, overrides_with = "no_draft")]
+    draft: bool,
+    /// Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash).
+    #[arg(long, overrides_with = "draft")]
+    no_draft: bool,
+    /// Take the registry defaults without asking. A pull whose stdin is not a
+    /// terminal never asks either.
+    #[arg(short, long)]
+    yes: bool,
+}
+
+impl PullArgs {
+    /// A pull another command starts for a missing model: the requested tag
+    /// with the registry defaults, never a prompt.
+    pub(crate) fn defaults(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            force: false,
+            ple: None,
+            draft: false,
+            no_draft: false,
+            yes: true,
+        }
+    }
+
+    /// `--draft` / `--no-draft`; `None` when neither is given.
+    pub(crate) fn draft_flag(&self) -> Option<bool> {
+        if self.no_draft {
+            Some(false)
+        } else if self.draft {
+            Some(true)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -1980,6 +2018,34 @@ fn pull_with_overlay_pins(
     }
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
+    let flags = pull_select::PullFlags {
+        ple: args.ple,
+        draft: args.draft_flag(),
+        force: args.force,
+    };
+    let choice = if pull_select::is_interactive(io::stdin().is_terminal(), args.yes) {
+        let host = pull_select::HostFacts::detect(paths);
+        let present = |file: &str, size: Option<u64>| {
+            pull_select::file_present(&paths.models.join(file), size)
+        };
+        let context = pull_select::PullContext {
+            registry: &loaded.registry,
+            host: &host,
+            overlay_pins,
+            present: &present,
+        };
+        let mut prompt = pull_select::LinePrompt::new(io::stdin().lock(), io::stderr());
+        match pull_select::select_pull(&context, tag, entry, &flags, &mut prompt)? {
+            Some(choice) => choice,
+            None => {
+                eprintln!("Pull cancelled.");
+                return Ok(());
+            }
+        }
+    } else {
+        pull_select::PullChoice::defaults(tag, entry, &flags)
+    };
+    let (tag, entry) = (choice.tag, choice.entry);
     let destination = paths.models.join(&entry.file);
     let migrated = if args.force {
         None
@@ -2004,7 +2070,7 @@ fn pull_with_overlay_pins(
     };
     let ple_plan = entry
         .has_ple_sidecars()
-        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, args.ple, !needs_base));
+        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, choice.ple, !needs_base));
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -2042,21 +2108,21 @@ fn pull_with_overlay_pins(
             )?;
         }
     }
-    for (label, sidecar) in [
-        ("TriAttention", entry.triattn.as_ref()),
-        ("MTP", entry.mtp.as_ref()),
-        ("DSpark", entry.dspark.as_ref()),
-        ("DFlash", entry.dflash.as_ref()),
-        ("XDNA", entry.xdna.as_ref()),
-        ("Vision", entry.vision.as_ref()),
-        ("T5", entry.t5.as_ref()),
-        ("CLIP", entry.clip.as_ref()),
-        ("Qwen3", entry.qwen3.as_ref()),
-        ("VAE", entry.vae.as_ref()),
-    ] {
-        if let Some(sidecar) = sidecar {
-            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
+    for declared in pull_select::declared_sidecars(entry) {
+        if declared.spec && !choice.draft {
+            eprintln!(
+                "  Skipping {} sidecar (draft/MTP not selected): {}",
+                declared.label, declared.sidecar.file
+            );
+            continue;
         }
+        fetch_registry_sidecar(
+            declared.label,
+            &entry.repo,
+            declared.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     // The trunk overlay is not a registry field: the client carries its pin,
     // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
@@ -2124,7 +2190,12 @@ fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
+    format!(
+        "{}/{}/resolve/main/{}",
+        base.trim_end_matches('/'),
+        repo,
+        file
+    )
 }
 
 #[cfg(test)]
@@ -2541,14 +2612,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
             );
-            pull_command(
-                paths,
-                PullArgs {
-                    model: args.model.clone(),
-                    force: false,
-                    ple: ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(paths, PullArgs::defaults(args.model.clone()))?;
             // pull already verified either the downloaded canonical or legacy fallback.
             model_path = find_model_path(paths, registry, &args.model);
         }
@@ -2912,8 +2976,7 @@ fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
 /// last.
 fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
     let largest = reports.iter().map(|r| r.bytes).max()?;
-    let biggest: Vec<&CalibrationReport> =
-        reports.iter().filter(|r| r.bytes == largest).collect();
+    let biggest: Vec<&CalibrationReport> = reports.iter().filter(|r| r.bytes == largest).collect();
     let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
     shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let label = if biggest.len() == 1 {
@@ -3117,14 +3180,7 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
             );
-            pull_command(
-                paths,
-                PullArgs {
-                    model: args.model.clone(),
-                    force: false,
-                    ple: ple::PleSelection::Auto,
-                },
-            )?;
+            pull_command(paths, PullArgs::defaults(args.model.clone()))?;
             model_path = Some(paths.models.join(&entry.file));
         }
     }
@@ -5644,7 +5700,9 @@ pub(crate) fn local_service_endpoint(
     let bearer = if key_path.is_empty() {
         None
     } else {
-        Some(hipfire_config::secret::BearerToken::load(Path::new(&key_path))?)
+        Some(hipfire_config::secret::BearerToken::load(Path::new(
+            &key_path,
+        ))?)
     };
     Ok(ServiceEndpoint::local(host, port, bearer)?)
 }
@@ -6454,14 +6512,7 @@ fn open_bench_engine(
         .unwrap_or((None, None));
     let mut path = resolve_model_path(paths, &registry, &args.model)?;
     if path.is_none() && entry.is_some() {
-        pull_command(
-            paths,
-            PullArgs {
-                model: args.model.clone(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )?;
+        pull_command(paths, PullArgs::defaults(args.model.clone()))?;
         // Do not hash a payload twice after a verified pull.
         path = find_model_path(paths, &registry, &args.model);
     }
@@ -6568,7 +6619,15 @@ fn open_bench_engine(
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
-    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation))
+    Ok((
+        engine,
+        loaded,
+        pre_diag,
+        post_diag,
+        devices_spec,
+        max_seq,
+        load_speculation,
+    ))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -8332,8 +8391,8 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     // One DXGI query serves both the JSON and the text report. Failures stay
     // as text so the report names them instead of showing an empty adapter list.
     #[cfg(windows)]
-    let gpu_budget_query = hipfire_config::host_memory::dxgi_adapter_budgets()
-        .map_err(|error| error.to_string());
+    let gpu_budget_query =
+        hipfire_config::host_memory::dxgi_adapter_budgets().map_err(|error| error.to_string());
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut report = serde_json::json!({
         "registry": registry_source(loaded_registry.source),
@@ -8358,7 +8417,10 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     {
         report["gpu_memory_budget"] = gpu_memory_budget_json(
             std::process::id(),
-            gpu_budget_query.as_ref().map(Vec::as_slice).map_err(String::as_str),
+            gpu_budget_query
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(String::as_str),
         );
     }
     if output.json {
@@ -8460,7 +8522,10 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         #[cfg(windows)]
         for line in gpu_memory_budget_text(
             std::process::id(),
-            gpu_budget_query.as_ref().map(Vec::as_slice).map_err(String::as_str),
+            gpu_budget_query
+                .as_ref()
+                .map(Vec::as_slice)
+                .map_err(String::as_str),
         ) {
             println!("{line}");
         }
@@ -8556,9 +8621,8 @@ fn gpu_memory_budget_text(
     ];
     match result {
         Err(error) => lines.push(format!("  error: {error}")),
-        Ok([]) => lines.push(
-            "  no hardware adapters reported (software adapters are skipped)".to_string(),
-        ),
+        Ok([]) => lines
+            .push("  no hardware adapters reported (software adapters are skipped)".to_string()),
         Ok(adapters) => {
             for (index, adapter) in adapters.iter().enumerate() {
                 let label = if dxgi_adapter_is_amd(adapter) {
@@ -8581,8 +8645,10 @@ fn gpu_memory_budget_text(
                     dxgi_mib_text(adapter.dedicated_video_memory_bytes),
                     dxgi_mib_text(adapter.shared_system_memory_bytes),
                 ));
-                for (name, segment) in [("local:", &adapter.local), ("non-local:", &adapter.non_local)]
-                {
+                for (name, segment) in [
+                    ("local:", &adapter.local),
+                    ("non-local:", &adapter.non_local),
+                ] {
                     lines.push(format!(
                         "    {name:<10} budget {}  usage {}  available-for-reservation {}  reservation {}",
                         dxgi_mib_text(segment.budget_bytes),
@@ -8841,7 +8907,10 @@ pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !targets.iter().all(|&pid| process_identity::process_gone(pid))
+    while Instant::now() < deadline
+        && !targets
+            .iter()
+            .all(|&pid| process_identity::process_gone(pid))
     {
         thread::sleep(Duration::from_millis(100));
     }
@@ -9397,7 +9466,10 @@ mod tests {
         assert_eq!(listed[0]["vendor_label"], "AMD");
         assert_eq!(listed[0]["description"], "AMD Radeon");
         assert_eq!(listed[0]["luid_hex"], "0100000000000000");
-        assert_eq!(listed[0]["local"]["budget_bytes"], 7u64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            listed[0]["local"]["budget_bytes"],
+            7u64 * 1024 * 1024 * 1024
+        );
         assert_eq!(
             listed[0]["non_local"]["current_reservation_bytes"],
             256u64 * 1024 * 1024
@@ -9656,13 +9728,24 @@ mod tests {
         let paths = test_paths("offload-bench-pids");
         std::fs::create_dir_all(&paths.root).unwrap();
         // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
-        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
-        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
-            .unwrap();
+        std::fs::write(
+            paths.root.join("daemon.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"),
+            "999999999\n",
+        )
+        .unwrap();
         // Not pid files, and not a pid: ignored, never an error.
         std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
         std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
-        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(
+            paths.root.join("serve.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
 
         assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
 
@@ -9724,7 +9807,10 @@ mod tests {
 
         // One pinned format: itself, named.
         let one = vec![report("mq4g256", 201_328_960, 0.375)];
-        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+        assert_eq!(
+            recommended_share(&one),
+            Some(("mq4g256".to_string(), 0.375))
+        );
 
         // A tie on size takes the median share of the tied set, and says so.
         let tied = vec![
@@ -9740,10 +9826,7 @@ mod tests {
 
         // A strictly larger entry wins outright, wherever it sits in the matrix.
         let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
-        assert_eq!(
-            recommended_share(&mixed),
-            Some(("big".to_string(), 0.30))
-        );
+        assert_eq!(recommended_share(&mixed), Some(("big".to_string(), 0.30)));
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery
@@ -12733,7 +12816,8 @@ mod tests {
                 &paths.models,
                 &model_path,
                 Some("qwen3.6:35b-a3b-mq4p"),
-            ).expect_err("DFlash on requires a DFlash draft, not an MTP head");
+            )
+            .expect_err("DFlash on requires a DFlash draft, not an MTP head");
             assert!(error.to_string().contains("--model-draft"), "{error:#}");
             assert_eq!(params["mtp_mode"], mtp_mode);
             assert!(params.get("draft").is_none());
@@ -14400,9 +14484,14 @@ mod tests {
             .http_status_as_error(false)
             .build()
             .into();
-        let response = agent.post(&format!("http://127.0.0.1:{}/api/v1/shutdown", harness.port()))
+        let response = agent
+            .post(&format!(
+                "http://127.0.0.1:{}/api/v1/shutdown",
+                harness.port()
+            ))
             .header("Authorization", "Bearer unrelated-management-token")
-            .send_empty().unwrap();
+            .send_empty()
+            .unwrap();
         assert_eq!(response.status().as_u16(), 404);
         assert!(!harness.shutdown.is_cancelled());
         assert_eq!(serve_health(harness.port()).0, 200);
@@ -14551,7 +14640,12 @@ mod tests {
         ];
         for (method, path) in routes {
             let mut bodies = Vec::new();
-            for credential in [None, Some(wrong.as_str()), Some(basic.as_str()), Some("Bearer")] {
+            for credential in [
+                None,
+                Some(wrong.as_str()),
+                Some(basic.as_str()),
+                Some("Bearer"),
+            ] {
                 let (status, challenge, text) = auth_call(port, method, path, credential, &chat);
                 assert_eq!(status, 401, "{method} {path} {credential:?}: {text}");
                 assert_eq!(challenge.as_deref(), Some("Bearer"), "{method} {path}");
@@ -14566,13 +14660,16 @@ mod tests {
         }
         // Reject before waiting for the advertised body or applying its limit.
         let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         write!(
             socket,
             "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999999\r\n\r\n"
         ).unwrap();
         let mut status_line = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(socket), &mut status_line).unwrap();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(socket), &mut status_line)
+            .unwrap();
         assert!(status_line.starts_with("HTTP/1.1 401"), "{status_line}");
         let log = h.read_requests_log();
         assert!(Task11HttpHarness::ops_of_type(&log, "generate").is_empty());
@@ -14586,8 +14683,7 @@ mod tests {
                 assert_eq!(challenge, None);
             }
         }
-        let (status, _, text) =
-            auth_call(port, "POST", "/v1/chat/completions", Some(&good), &chat);
+        let (status, _, text) = auth_call(port, "POST", "/v1/chat/completions", Some(&good), &chat);
         assert_eq!(status, 200, "{text}");
         assert!(!text.contains(&token), "{text}");
 
@@ -14678,11 +14774,7 @@ mod tests {
         let log = h.read_requests_log();
         let loads = Task11HttpHarness::ops_of_type(&log, "load");
         assert_eq!(loads.len(), 2);
-        assert!(
-            loads
-                .iter()
-                .all(|load| load["params"]["max_seq"] == 65_536)
-        );
+        assert!(loads.iter().all(|load| load["params"]["max_seq"] == 65_536));
     }
 
     /// A request may not load a file outside the installed models, nor start
@@ -17825,15 +17917,7 @@ mod tests {
         let (base, handle) = tiny_http_server(files);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         // Pull should download base + both heads
-        pull_command(
-            &paths,
-            PullArgs {
-                model: "test-model".into(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )
-        .unwrap();
+        pull_command(&paths, PullArgs::defaults("test-model")).unwrap();
         assert_eq!(
             fs::read(paths.models.join("test-model.mq4")).unwrap(),
             base_content
@@ -17897,15 +17981,7 @@ mod tests {
         let (base, handle) = tiny_http_server(files);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         // Without --force, stale should still be detected and refreshed
-        pull_command(
-            &paths,
-            PullArgs {
-                model: "test-model".into(),
-                force: false,
-                ple: ple::PleSelection::Auto,
-            },
-        )
-        .unwrap();
+        pull_command(&paths, PullArgs::defaults("test-model")).unwrap();
         assert_eq!(
             fs::read(paths.models.join("test-model.mq4")).unwrap(),
             fresh
@@ -18599,9 +18675,8 @@ mod tests {
             pull_command(
                 &paths,
                 PullArgs {
-                    model: "split-model".into(),
-                    force: false,
-                    ple: selection,
+                    ple: Some(selection),
+                    ..PullArgs::defaults("split-model")
                 },
             )
             .unwrap();
@@ -18642,9 +18717,8 @@ mod tests {
         let error = pull_command(
             &paths,
             PullArgs {
-                model: "split-model".into(),
-                force: false,
-                ple: ple::PleSelection::Q8,
+                ple: Some(ple::PleSelection::Q8),
+                ..PullArgs::defaults("split-model")
             },
         )
         .unwrap_err();
@@ -18655,6 +18729,53 @@ mod tests {
             "a failed verification must not leave the sidecar installed"
         );
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_fetches_draft_sidecars_by_default_and_skips_them_with_no_draft() {
+        const BASE: &[u8] = b"draft-base";
+        const MTP: &[u8] = b"mtp-head";
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let raw = format!(
+            r#"{{"schema_version":1,"generated_at":"2099-01-01T00:00:00Z","models":{{
+                "draft-model":{{"repo":"test/repo","file":"draft-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "mtp":{{"file":"draft-model.mtp","sha256":"{}","size_bytes":{}}}}}
+            }},"aliases":{{}}}}"#,
+            ple_sha(BASE),
+            BASE.len(),
+            ple_sha(MTP),
+            MTP.len()
+        );
+        for (index, no_draft) in [false, true].into_iter().enumerate() {
+            let paths = test_paths(&format!("draft-pull-{index}"));
+            write_test_registry_cache(&paths, &raw);
+            let mut files = std::collections::HashMap::new();
+            files.insert("draft-model.mq4".to_owned(), BASE.to_vec());
+            if !no_draft {
+                files.insert("draft-model.mtp".to_owned(), MTP.to_vec());
+            }
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            pull_command(
+                &paths,
+                PullArgs {
+                    no_draft,
+                    ..PullArgs::defaults("draft-model")
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS
+                .with(|count| assert_eq!(count.get(), if no_draft { 1 } else { 2 }));
+            assert_eq!(
+                fs::read(paths.models.join("draft-model.mtp")).ok(),
+                (!no_draft).then(|| MTP.to_vec())
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
     }
 
     #[test]
@@ -18962,9 +19083,8 @@ mod tests {
         pull_with_overlay_pins(
             paths,
             PullArgs {
-                model: "overlay-model".into(),
                 force,
-                ple: ple::PleSelection::Auto,
+                ..PullArgs::defaults("overlay-model")
             },
             &overlay_pins(),
         )
@@ -19041,7 +19161,10 @@ mod tests {
         handle.join().unwrap();
         assert!(paths.models.join("overlay-model.mq4").is_file());
         assert!(
-            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            !paths
+                .models
+                .join("overlay-model.mq4.trunk-overlay")
+                .exists(),
             "a failed verification must not leave the overlay installed"
         );
         fs::remove_dir_all(&paths.root).unwrap();
@@ -19052,7 +19175,11 @@ mod tests {
         let paths = test_paths("overlay-rm");
         let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
         fs::create_dir_all(&paths.models).unwrap();
-        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+        for file in [
+            "overlay-model.mq4",
+            "overlay-model.mq4.trunk-overlay",
+            "untouched.mq4",
+        ] {
             fs::write(paths.models.join(file), b"x").unwrap();
         }
         rm_with_overlay_pins(
@@ -19066,7 +19193,10 @@ mod tests {
         )
         .unwrap();
         assert!(!paths.models.join("overlay-model.mq4").exists());
-        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(!paths
+            .models
+            .join("overlay-model.mq4.trunk-overlay")
+            .exists());
         assert!(paths.models.join("untouched.mq4").exists());
 
         // An unregistered base takes its `<file>.trunk-overlay` with it too.
