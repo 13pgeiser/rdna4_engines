@@ -240,7 +240,12 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, `mtp_bytes` when a native MTP
 /// speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
 /// `gather_bytes` for the gathered QSA prefill attention's workspace
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). Only
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`), and
+/// [`QWEN4_FORWARD_HEADROOM_BYTES`](crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES)
+/// for the kernels' lazily sized `GpuPool` workspaces (333-347 MiB at pp8192
+/// on gfx1201), which nothing allocated at load covers and the first long
+/// prefill grows (the chunk rung selection at bundle build keeps the same
+/// amount free). Only
 /// committed bytes are charged: VMM context arenas commit the first chunk's
 /// pages (inside the measured layout), their virtual extent nothing, so the
 /// admitted context does not size a VMM reserve; legacy arenas commit all
@@ -311,7 +316,19 @@ pub fn auto_vram_reserve(
         .and_then(|bytes| bytes.checked_sub(measured))
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
+        .and_then(|bytes| bytes.checked_add(lazy_workspace_reserve_bytes()))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
+}
+
+/// VRAM `auto` keeps free for the kernels' lazily sized `GpuPool`
+/// workspaces, which grow at the first long prefill beyond everything the
+/// load allocates. The engine's own fixed bound
+/// ([`QWEN4_FORWARD_HEADROOM_BYTES`](crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES),
+/// the headroom the prefill chunk rung selection keeps); the single place
+/// [`auto_vram_reserve`] reads it, so an exact max-chunk pool query replaces
+/// it here alone.
+pub fn lazy_workspace_reserve_bytes() -> u64 {
+    crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES
 }
 
 /// The largest trunk-layer count whose routed experts fit in `free_vram`
@@ -330,6 +347,34 @@ pub fn auto_vram_layers(
         Some(layers) => (layers as usize).min(num_layers),
         None => num_layers,
     }
+}
+
+/// The trunk-layer count a whole-layer `auto` placement keeps resident:
+/// [`auto_vram_layers`] against `base_reserve` ([`auto_vram_reserve`]) plus
+/// every [`PlacementCharges`] term. Refuses, before anything is allocated,
+/// when even zero resident layers cannot hold the non-expert weights and the
+/// charged reserve (the load would fail at its first long request instead).
+pub fn auto_placement_layers(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    layer_expert_bytes: u64,
+    num_layers: usize,
+    base_reserve: u64,
+    charges: &PlacementCharges,
+) -> Result<usize, String> {
+    const MIB: u64 = 1 << 20;
+    let reserve = charges.reserve(base_reserve)?;
+    if non_expert_bytes.checked_add(reserve).is_none_or(|need| free_vram < need) {
+        return Err(format!(
+            "{} MiB of free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve ({} MiB base + {}) even with every routed expert in host RAM; free VRAM on this GPU",
+            free_vram / MIB,
+            non_expert_bytes / MIB,
+            reserve / MIB,
+            base_reserve / MIB,
+            charges.describe()
+        ));
+    }
+    Ok(auto_vram_layers(free_vram, non_expert_bytes, layer_expert_bytes, num_layers, reserve))
 }
 
 /// Device bytes an expert-tier lease's frozen tables take beyond the payload:
@@ -394,6 +439,70 @@ pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -
         largest[layer % 2] = largest[layer % 2].max(host);
     }
     largest.iter().map(|bytes| bytes + crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64).sum()
+}
+
+/// Whether a whole-layer (slab arena) load allocates the two dedicated
+/// long-prefill stage buffers at load: the stage switch is on
+/// ([`expert_stage_enabled`]), the artifact is a slab-arena recipe (the
+/// legacy aggregate layout borrows resident donor layers and allocates
+/// nothing; a tier lease charges its own stage in the hot set fixed point)
+/// and the load is not expert-parallel (`Qwen4ExpertStage::new_slab` has no
+/// EP route). Not conditioned on the prefill length: the buffers exist from
+/// load, even if every prompt stays under `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`.
+pub fn dedicated_slab_stage(stage_enabled: bool, slab_recipe: bool, expert_parallel: bool) -> bool {
+    stage_enabled && slab_recipe && !expert_parallel
+}
+
+/// What a whole-layer placement (`auto`, or the unset fallback that decides
+/// whether everything is resident) keeps free beyond [`auto_vram_reserve`]
+/// (which already holds the chunk-sized forward resources and the kernels'
+/// lazy workspace headroom), itemised for the placement log:
+///
+/// - `margin`: [`EXPERT_HOTSET_VRAM_MARGIN_BYTES`], the driver/allocator
+///   safety margin the hot set budget keeps.
+/// - `stage`: the two dedicated long-prefill stage buffers of a slab load,
+///   `2 * (largest layer payload + ARENA_TAIL_PAD_BYTES)`
+///   ([`dedicated_slab_stage`]); 0 when none are allocated.
+///
+/// The hot set path does not use this: it subtracts its own margin and
+/// tier-plan stage ([`expert_hotset_budget`], [`expert_tier_stage_bytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementCharges {
+    pub margin: u64,
+    pub stage: u64,
+}
+
+impl PlacementCharges {
+    /// `layer_expert_bytes` is the largest layer payload (`resident_split`);
+    /// `dedicated_stage` is [`dedicated_slab_stage`].
+    pub fn new(layer_expert_bytes: u64, dedicated_stage: bool) -> Result<Self, String> {
+        let stage = if dedicated_stage {
+            layer_expert_bytes
+                .checked_add(crate::expert_arena::ARENA_TAIL_PAD_BYTES as u64)
+                .and_then(|buffer| buffer.checked_mul(2))
+                .ok_or("long-prefill stage buffer bytes overflow")?
+        } else {
+            0
+        };
+        Ok(Self { margin: EXPERT_HOTSET_VRAM_MARGIN_BYTES, stage })
+    }
+
+    /// `base` ([`auto_vram_reserve`]) plus both charges.
+    pub fn reserve(&self, base: u64) -> Result<u64, String> {
+        base.checked_add(self.margin)
+            .and_then(|bytes| bytes.checked_add(self.stage))
+            .ok_or_else(|| "auto expert VRAM reserve with placement charges overflows".to_string())
+    }
+
+    /// The charges for the placement log, in MiB.
+    pub fn describe(&self) -> String {
+        const MIB: u64 = 1 << 20;
+        format!(
+            "{} MiB safety margin + {} MiB long-prefill stage buffers",
+            self.margin / MIB,
+            self.stage / MIB
+        )
+    }
 }
 
 /// Mark the routed-expert entries of trunk layers `>= vram_layers`, and of
@@ -1032,8 +1141,14 @@ mod tests {
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        let reserve =
-            |chunk| auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
+        // The layer counts below were measured before the reserve charged the
+        // lazy workspace headroom; keep that layout so they stay the
+        // measured-card record (the headroom is asserted in
+        // `reserve_charges_the_lazy_workspace_headroom`).
+        let reserve = |chunk| {
+            auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap()
+                - lazy_workspace_reserve_bytes()
+        };
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
@@ -1059,6 +1174,127 @@ mod tests {
             auto_vram_layers(8 << 30, 5_364_000_000, 1_336_900_000, 48, reserve),
             0
         );
+    }
+
+    #[test]
+    fn reserve_charges_the_lazy_workspace_headroom() {
+        // At the measured context and chunk the QSA term cancels, but the
+        // current forward's speculative logits cover fewer rows than the
+        // historical all-row measured layout, so the reserve is the measured
+        // constant, plus the current forward, minus the historical measured
+        // forward (Full scratch and all-row speculative logits), plus the
+        // engine's headroom for the kernels' lazily sized workspaces, which
+        // no load-time allocation covers.
+        let config = crate::config::compact_test_config();
+        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
+        let reserve = auto_vram_reserve(
+            &config, &measured, AUTO_VRAM_RESERVE_CHUNK, Full, F32, None, None,
+        )
+        .unwrap();
+        let forward =
+            crate::gpu_forward::qwen4_forward_device_bytes(&config, AUTO_VRAM_RESERVE_CHUNK, Full)
+                .unwrap();
+        let historical = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+            &config, AUTO_VRAM_RESERVE_CHUNK, Full,
+        )
+        .unwrap()
+            + (AUTO_VRAM_RESERVE_CHUNK * (config.vocab_size * 4 + 4)) as u64;
+        assert_eq!(
+            reserve,
+            AUTO_VRAM_RESERVE_BYTES + forward - historical + lazy_workspace_reserve_bytes()
+        );
+    }
+
+    /// The card-E record (daemon p6, 763 tokens): 32550 MiB free, 5115 MiB
+    /// non-expert, 1060 MiB per slab layer, 7927 MiB reserve before the
+    /// headroom, stage and margin were charged.
+    const EVIDENCE: (u64, u64, u64, u64) = (32550 << 20, 5115 << 20, 1060 << 20, 7927 << 20);
+
+    #[test]
+    fn evidence_placement_keeps_fewer_layers_once_scratch_stage_and_margin_are_charged() {
+        let (free, non_expert, layer, unfixed) = EVIDENCE;
+        let layers = |reserve| auto_vram_layers(free, non_expert, layer, 49, reserve);
+        // Unfixed: (32550 - 5115 - 7927) / 1060 = 18.40 -> 18 resident
+        // layers, leaving 428 MiB for 2 x 1060 MiB of stage buffers.
+        assert_eq!(layers(unfixed), 18);
+        // The headroom `auto_vram_reserve` now charges moves 18 to 17.
+        let base = unfixed + lazy_workspace_reserve_bytes();
+        assert_eq!(layers(base), 17);
+        // Slab stage on: scratch 1024 + margin 512 + stage 2 x (1060 MiB +
+        // 4096 B) = 2120 MiB + 8192 B on top of the 7927 MiB.
+        let charges = PlacementCharges::new(layer, true).unwrap();
+        assert_eq!(charges.margin, 512 << 20);
+        assert_eq!(charges.stage, 2 * ((1060 << 20) + 4096));
+        let reserve = charges.reserve(base).unwrap();
+        assert_eq!(reserve, (7927 + 1024 + 512 + 2120) * (1 << 20) + 8192);
+        let placed = auto_placement_layers(free, non_expert, layer, 49, base, &charges).unwrap();
+        assert_eq!(placed, 14);
+        assert!(placed < 18);
+        // The staged forward fits: the chosen layers leave the whole reserve
+        // (scratch, margin and both stage buffers), one more would not.
+        assert!(free - non_expert - placed as u64 * layer >= reserve);
+        assert!(free - non_expert - (placed as u64 + 1) * layer < reserve);
+        assert!(charges.describe().contains("512 MiB safety margin"));
+        assert!(charges.describe().contains("2120 MiB long-prefill stage buffers"));
+    }
+
+    #[test]
+    fn stage_charge_only_where_the_slab_stage_allocates() {
+        // Needs the switch, a slab recipe and no expert parallelism.
+        assert!(dedicated_slab_stage(true, true, false));
+        assert!(!dedicated_slab_stage(false, true, false));
+        assert!(!dedicated_slab_stage(true, false, false));
+        assert!(!dedicated_slab_stage(true, true, true));
+        let (free, non_expert, layer, unfixed) = EVIDENCE;
+        let base = unfixed + lazy_workspace_reserve_bytes();
+        let off = PlacementCharges::new(layer, false).unwrap();
+        assert_eq!(off, PlacementCharges { margin: 512 << 20, stage: 0 });
+        assert_eq!(off.reserve(base).unwrap(), base + (512 << 20));
+        // No stage: only the margin and headroom cost layers
+        // ((32550 - 5115 - 7927 - 1024 - 512) / 1060 = 16.95).
+        let unstaged = auto_placement_layers(free, non_expert, layer, 49, base, &off).unwrap();
+        assert_eq!(unstaged, 16);
+        let staged = PlacementCharges::new(layer, true).unwrap();
+        let staged = auto_placement_layers(free, non_expert, layer, 49, base, &staged).unwrap();
+        assert!(staged < unstaged);
+        // Fully resident: the unset fallback charges the same reserve and
+        // margin (never a stage), so a card that only just holds everything
+        // without the margin falls to `auto` instead of loading.
+        let experts = 20 * layer;
+        let need = non_expert + experts + base;
+        assert!(fits_fully_resident(need, non_expert, experts, base));
+        assert!(!fits_fully_resident(need, non_expert, experts, off.reserve(base).unwrap()));
+    }
+
+    #[test]
+    fn charged_placement_refuses_clearly_when_zero_layers_do_not_fit() {
+        let (_, non_expert, layer, unfixed) = EVIDENCE;
+        let base = unfixed + lazy_workspace_reserve_bytes();
+        let charges = PlacementCharges::new(layer, true).unwrap();
+        let need = non_expert + charges.reserve(base).unwrap();
+        // Exactly the weights and the charged reserve: zero resident layers.
+        assert_eq!(auto_placement_layers(need, non_expert, layer, 49, base, &charges), Ok(0));
+        let error =
+            auto_placement_layers(need - 1, non_expert, layer, 49, base, &charges).unwrap_err();
+        assert!(error.contains("cannot hold") && error.contains("every routed expert in host RAM"), "{error}");
+        assert!(error.contains("512 MiB safety margin"), "{error}");
+        assert!(error.contains("2120 MiB long-prefill stage buffers"), "{error}");
+        // Without the stage the same card still loads: the 2120 MiB + 8191 B
+        // the stage took now holds two whole layers.
+        let off = PlacementCharges::new(layer, false).unwrap();
+        assert_eq!(auto_placement_layers(need - 1, non_expert, layer, 49, base, &off), Ok(2));
+    }
+
+    #[test]
+    fn placement_charges_refuse_overflow() {
+        assert!(PlacementCharges::new(u64::MAX, true).is_err());
+        assert!(PlacementCharges::new(u64::MAX / 2, true).is_err());
+        assert!(PlacementCharges::new(u64::MAX, false).is_ok());
+        let charges = PlacementCharges::new(1 << 20, true).unwrap();
+        assert!(charges.reserve(u64::MAX).is_err());
+        assert!(auto_placement_layers(u64::MAX, 0, 1 << 20, 49, u64::MAX, &charges).is_err());
+        // A non-expert size that overflows the sum is a refusal, not a wrap.
+        assert!(auto_placement_layers(u64::MAX, u64::MAX, 1 << 20, 49, 1, &charges).is_err());
     }
 
     #[test]
@@ -1192,10 +1428,14 @@ mod tests {
             .unwrap();
             assert_eq!(batched, resident + scratch.max(request + fill));
         }
-        // On the measured R9700 the MTP bytes fit beside the chosen layers,
-        // and one layer more would not have left them.
-        let free = 32548u64 << 20;
+        // On a card whose free VRAM sits exactly on a layer boundary of the
+        // base reserve (non-expert weights + base + 16 layers; not a
+        // measured card), any positive MTP charge must cost a layer; the
+        // MTP bytes then fit beside the chosen layers, and one layer more
+        // would not have left them.
         let (weights, layer) = (5_364_000_000u64, 1_336_900_000u64);
+        let free = weights + base + 16 * layer;
+        assert_eq!(auto_vram_layers(free, weights, layer, 48, base), 16);
         let with = auto_vram_layers(free, weights, layer, 48, with_mtp) as u64;
         assert!(with < auto_vram_layers(free, weights, layer, 48, base) as u64);
         assert!(free - weights - with * layer >= with_mtp);

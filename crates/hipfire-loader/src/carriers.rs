@@ -1348,6 +1348,12 @@ pub fn qwen4_ep_vram_layers(
         scratch_mode,
         ranks,
     )?;
+    // Same charges as each rank's load applies to an expert-parallel split
+    // (no slab stage: `new_slab` has no EP route), so the agreed split never
+    // exceeds what a rank's own check keeps.
+    let reserve = hipfire_arch_qwen4::expert_residency::PlacementCharges::new(layer_experts, false)
+        .and_then(|charges| charges.reserve(reserve))
+        .map_err(|error| format!("qwen4: {error}"))?;
     Ok(hipfire_arch_qwen4::expert_residency::ep_vram_layers(
         &config,
         free_per_rank,
@@ -1705,6 +1711,22 @@ pub fn load_qwen4_rank(
             gather_bytes,
         ))
     };
+    // What a whole-layer placement keeps free beyond the reserve: the safety
+    // margin and, on a slab load that allocates them (`staged`), the two
+    // dedicated long-prefill stage buffers sized from the largest layer.
+    // The hot set path charges its own margin and tier-plan stage.
+    let slab_stage = residency::dedicated_slab_stage(
+        residency::expert_stage_enabled(&ctx.gpu.arch),
+        matches!(
+            manifest.identity.recipe,
+            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+        ),
+        ep.is_some(),
+    );
+    let placement_charges = |layer_experts: u64, staged: bool| {
+        residency::PlacementCharges::new(layer_experts, staged && slab_stage)
+            .map_err(|error| format!("qwen4: {error}"))
+    };
     let explicit =
         residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
     use hipfire_arch_qwen4::expert_hotset as hotsets;
@@ -1877,13 +1899,19 @@ pub fn load_qwen4_rank(
             let experts =
                 residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
                     .map_err(|error| format!("qwen4: {error}"))?;
-            let (free, non_expert, _, reserve, ..) = inputs;
+            let (free, non_expert, layer_experts, base_reserve, ..) = inputs;
+            // Fully resident has no host layer, so no stage buffers; the
+            // safety margin is charged exactly as `auto` charges it.
+            let charges = placement_charges(layer_experts, false)?;
+            let reserve = charges.reserve(base_reserve).map_err(|error| format!("qwen4: {error}"))?;
             let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
             unset_note = format!(
-                    " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve {} {} MiB free VRAM)",
+                    " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve ({} MiB base + {}) {} {} MiB free VRAM)",
                     experts / MIB,
                     non_expert / MIB,
                     reserve / MIB,
+                    base_reserve / MIB,
+                    charges.describe(),
                     if fits { "fit in" } else { "exceed" },
                     free / MIB
                 );
@@ -1902,6 +1930,11 @@ pub fn load_qwen4_rank(
     // The agreed split must fit this rank: refuse before allocating.
     if let Some(layers) = expert_vram_layers {
         let (free, non_expert, layer_experts, reserve, ..) = auto_inputs()?;
+        // Expert-parallel loads have no slab stage; the scratch headroom is
+        // in the reserve and the safety margin is charged like `auto`'s.
+        let reserve = placement_charges(layer_experts, false)?
+            .reserve(reserve)
+            .map_err(|error| format!("qwen4: {error}"))?;
         let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
         if own < layers.min(moe_layers) {
             return Err(format!(
@@ -1950,8 +1983,17 @@ pub fn load_qwen4_rank(
                 residency::EXPERT_VRAM_LAYERS_ENV
             );
     }
-    // Measured before placement mutates the manifest (the fit line below).
-    let fit_inputs = ep.map(|_| auto_inputs()).transpose()?;
+    // Measured before placement mutates the manifest (the fit line below),
+    // with the same charged reserve the EP split check applied.
+    let fit_inputs = ep
+        .map(|_| -> Result<_, String> {
+            let (free, non_expert, layer_experts, reserve, mtp, gather) = auto_inputs()?;
+            let reserve = placement_charges(layer_experts, false)?
+                .reserve(reserve)
+                .map_err(|error| format!("qwen4: {error}"))?;
+            Ok((free, non_expert, layer_experts, reserve, mtp, gather))
+        })
+        .transpose()?;
     let mut applied_layers = moe_layers;
     if let Some(policy) = placement {
         if use_ranges {
@@ -1971,33 +2013,36 @@ pub fn load_qwen4_rank(
                 let gather_note = gather_bytes
                     .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                     .unwrap_or_default();
+                // The reserve holds the chunk-sized forward resources, the
+                // lazy workspace headroom, MTP and gather; the safety margin
+                // and (slab only) the dedicated long-prefill stage buffers
+                // are charged on top, itemised.
+                let charges = placement_charges(layer_experts, true)?;
+                let charged = charges.reserve(reserve).map_err(|error| format!("qwen4: {error}"))?;
                 eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB native MTP{gather_note}), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB base incl. {} MiB lazy workspace headroom, {} MiB native MTP{gather_note}; plus {}), {} MiB per expert layer",
                         free / MIB,
                         non_expert / MIB,
+                        charged / MIB,
                         reserve / MIB,
+                        hipfire_arch_qwen4::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES / MIB,
                         mtp_bytes.unwrap_or(0) / MIB,
+                        charges.describe(),
                         layer_experts / MIB
                     );
                 // With every routed expert in host RAM the load would
                 // still leave less than the reserve, and fail later at
                 // the first request (e.g. beside another process's
                 // model): refuse before allocating instead.
-                if free < non_expert.saturating_add(reserve) {
-                    return Err(format!(
-                            "qwen4: {} MiB of free VRAM cannot hold the {} MiB of non-expert weights plus the {} MiB reserve even with every routed expert in host RAM; free VRAM on this GPU",
-                            free / MIB,
-                            non_expert / MIB,
-                            reserve / MIB
-                        ));
-                }
-                residency::auto_vram_layers(
+                residency::auto_placement_layers(
                     free,
                     non_expert,
                     layer_experts,
                     config.num_hidden_layers,
                     reserve,
+                    &charges,
                 )
+                .map_err(|error| format!("qwen4: {error}"))?
             }
         };
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
