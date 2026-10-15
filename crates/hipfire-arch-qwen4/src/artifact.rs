@@ -1640,8 +1640,7 @@ pub fn routed_headers_symmetric(
 fn hotset_refusal(reason: impl fmt::Display) -> String {
     format!(
         "qwen4: {HOTSET_ENV} requires the packed Flash-Next aggregate MQ4-XTS routed experts \
-         (48 trunk layers x 512 experts, top-10, qt44 gate_up + qt53 down): {reason}; \
-         unset {HOTSET_ENV} to load this artifact"
+         (48 trunk layers x 512 experts, top-10, qt44 gate_up + qt53 down): {reason}"
     )
 }
 
@@ -1651,8 +1650,11 @@ fn hotset_refusal(reason: impl fmt::Display) -> String {
 /// artifact (qwen4.expert_slabs metadata, per-expert entry names, qt131..134
 /// planar I4 experts, i.e. the slab arena / K4 route), a stock-FP8 artifact
 /// (qt55 routed experts), any trunk routed tensor that is not qt44/qt53, and
-/// an overlaid source.  Run it before [`admit_hfqm_artifact_on`], whose
-/// generic refusals do not mention the hotset.
+/// an overlaid source.  This is an optional eligibility check, called from
+/// [`hotset_aggregate_slabs`] during hotset preparation after
+/// [`admit_hfqm_artifact_on`]'s generic admission has already succeeded; a
+/// failure here means the hotset is not eligible and the caller must fall
+/// back to the exact whole-layer placement, not refuse the load.
 pub fn hotset_source_preflight(hfq: &HfqFile) -> Result<(), String> {
     if hfq.arch_id != ARCH_ID {
         return Err(hotset_refusal(format!(

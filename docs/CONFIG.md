@@ -249,8 +249,7 @@ The EP2 owner-routed prefill and the expert-staging levers have no typed schema 
 | `developer.qwen4_expert_stage_min_rows` | `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` | `2048` | Forwards with at least this many rows stage (integer ≥ 2); smaller ones, decode and verify keep the mapped reads. |
 | `developer.qwen4_expert_stage_capture` | `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE` | on | `0` keeps the native-MTP prompt-fill tiles on the mapped reads. |
 | `developer.qwen4_expert_vram_layers` | `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` | unset (automatic placement) | `N` keeps the routed experts of trunk layers before `N` in VRAM and places layers at or past `N` in pinned host RAM. |
-| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset (off) | Absolute path of a Lever1 expert hotset sidecar (`kind` `hipfire.qwen4.expert_hotset`, version 1; see `docs/env-vars.md`). Only this key enables the hotset. A relative or empty path is refused, and so is setting it together with an explicit `developer.qwen4_expert_vram_layers`. |
-| `developer.qwen4_expert_hotcache` | `HIPFIRE_QWEN4_EXPERT_HOTCACHE` | on | Kill switch for the hotset: exactly `0` bypasses `developer.qwen4_expert_hotset` entirely and keeps today's per-layer placement; unset or `1` leaves it in charge. With `developer.qwen4_expert_hotset` unset the value is not examined; with it set, any other value is refused. |
+| `developer.qwen4_expert_hotset` | `HIPFIRE_QWEN4_EXPERT_HOTSET` | unset: `<model>.expert-hotset` is used when it exists (gfx1201) | Lever1 expert hotset, a decode-ranked per-expert VRAM placement (sidecar `kind` `hipfire.qwen4.expert_hotset`, version 1; format and binding in `docs/env-vars.md` and below). Unset applies the sidecar beside the model when one exists; `0` is the kill switch (whole-layer placement); an absolute path names the sidecar explicitly; a relative or empty value is a policy error. A sidecar that does not apply (missing, unreadable, bound to another base, wrong dimensions, another architecture, explicit `developer.qwen4_expert_vram_layers`) keeps whole-layer placement and never fails the load. The expert budget keeps a 512 MiB VRAM margin. |
 | `developer.ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | unset (canonical) | `1` selects the legacy unrooted peer all-reduce diagnostic, `0` selects RCCL. |
 
 ---
@@ -1068,6 +1067,30 @@ value fails the load. `HIPFIRE_QWEN4_TRUNK_IU4=0` keeps the overlay weights
 and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
 from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
 (repeatable), `--trunk-iu4-default`, `--output`).
+
+### Qwen4 expert hotset sidecar
+
+`<model>.expert-hotset` (JSON, `kind` `hipfire.qwen4.expert_hotset`, version
+1) is the decode-ranked per-expert VRAM placement of a Qwen4 aggregate-MQ4
+base. On an exact gfx1201 discrete card it replaces whole-layer expert
+placement by keeping the highest-ranked experts of every trunk layer in VRAM
+and the rest in pinned host RAM. It is bound to its base by two required
+fields, `base_size` (`u64`, the base file's length in bytes) and
+`base_index_sha256` (lowercase hex sha256 of the base's HFQ header and
+index); there is no whole-artifact hash. Like the trunk overlay it is looked
+up next to the model file `hipfire serve`/`run` resolve.
+
+Env `HIPFIRE_QWEN4_EXPERT_HOTSET` (`developer.qwen4_expert_hotset`) selects
+the policy: unset (default) applies `<model>.expert-hotset` when it exists,
+`0` never applies it (kill switch: whole-layer placement), an absolute path
+names the sidecar explicitly, and a relative or empty value is a policy error.
+A sidecar that does not apply (absent, unreadable or malformed, bound to a
+different base, dimensions that do not match the model, another architecture,
+unified memory, expert parallelism, or an explicit
+`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) keeps whole-layer placement and never
+fails the load. The expert byte budget is derived at load, never read from the
+file: free VRAM less the non-expert weights, the `auto` reserve, the frozen
+expert tables and a 512 MiB margin.
 
 ---
 

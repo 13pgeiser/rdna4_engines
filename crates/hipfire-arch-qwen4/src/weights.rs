@@ -1474,6 +1474,15 @@ impl Qwen4Manifest {
     /// layer) must be present.  The slab-arena and stock-FP8 recipes, a
     /// dense FFN, synthetic profiles and expert-parallel shards are refused.
     pub fn with_expert_tiers(mut self) -> Result<Self, WeightError> {
+        self.check_expert_tiers()?;
+        self.weights
+            .retain(|entry| !is_trunk_routed_expert_entry(entry));
+        Ok(self)
+    }
+
+    /// The validation half of [`Self::with_expert_tiers`], with no mutation:
+    /// `Ok(())` exactly when `with_expert_tiers` would accept this manifest.
+    pub fn check_expert_tiers(&self) -> Result<(), WeightError> {
         let refuse = |why: &str| {
             WeightError::Config(format!("HIPFIRE_QWEN4_EXPERT_HOTSET: {why}"))
         };
@@ -1536,9 +1545,7 @@ impl Qwen4Manifest {
                 }
             }
         }
-        self.weights
-            .retain(|entry| !is_trunk_routed_expert_entry(entry));
-        Ok(self)
+        Ok(())
     }
 }
 
@@ -5040,6 +5047,43 @@ mod tests {
                 error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn check_expert_tiers_accepts_base_and_refuses_without_mutation() {
+        let config = pinned_config();
+        let recipe = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let base = Qwen4Manifest::build_with_recipe(&config, recipe).expect("base manifest");
+        let base_keys = base.resident_keys().collect::<Vec<_>>();
+        let base_len = base.weights.len();
+        base.check_expert_tiers().expect("base manifest qualifies");
+        assert_eq!(base.weights.len(), base_len);
+        assert_eq!(base.resident_keys().collect::<Vec<_>>(), base_keys);
+
+        let tiered = base.clone().with_expert_tiers().expect("tier manifest");
+        let tiered_keys = tiered.resident_keys().collect::<Vec<_>>();
+        let tiered_len = tiered.weights.len();
+        let ep = base
+            .clone()
+            .with_expert_parallel(Qwen4EpPlacement { rank: 0, ranks: 2 })
+            .expect("ep manifest");
+        let ep_keys = ep.resident_keys().collect::<Vec<_>>();
+        let ep_len = ep.weights.len();
+        for (manifest, keys, len) in [
+            (&tiered, &tiered_keys, tiered_len),
+            (&ep, &ep_keys, ep_len),
+        ] {
+            let error = manifest.check_expert_tiers().expect_err("refusal");
+            assert!(
+                error.to_string().contains("HIPFIRE_QWEN4_EXPERT_HOTSET"),
+                "{error}"
+            );
+            assert_eq!(manifest.weights.len(), len);
+            assert_eq!(&manifest.resident_keys().collect::<Vec<_>>(), keys);
         }
     }
 
