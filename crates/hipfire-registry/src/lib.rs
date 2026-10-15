@@ -470,6 +470,27 @@ impl ModelEntry {
         self.ple_q4.is_some() || self.ple_q8.is_some()
     }
 
+    /// True when this split base is published split-only: there is no
+    /// monolithic artifact it is a view of, so it has no monolithic sibling.
+    /// Derived from the entry's shape, not a flag: every published PLE slot
+    /// names the Flash-Next family's shared rows-bound file
+    /// ([`shared_ple_file`]), and the name without `-base` is not the
+    /// published MQ4 XTS monolithic, whose split views must keep it
+    /// catalogued. A split base naming its own `<file>.ple-q*` rows is a view
+    /// of a monolithic.
+    pub fn is_split_only(&self) -> bool {
+        let slot_is_shared = |slot: Option<&Sidecar>, suffix: &str| {
+            slot.is_none_or(|sidecar| {
+                shared_ple_file(&self.file, suffix).as_deref() == Some(sidecar.file.as_str())
+            })
+        };
+        self.has_ple_sidecars()
+            && monolithic_file_for_split_base(&self.file)
+                .is_some_and(|monolithic| monolithic != FLASH_NEXT_XTS_CANONICAL_FILE)
+            && slot_is_shared(self.ple_q4.as_ref(), PLE_Q4_SIDECAR_SUFFIX)
+            && slot_is_shared(self.ple_q8.as_ref(), PLE_Q8_SIDECAR_SUFFIX)
+    }
+
     /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
     /// `general` falls back to `recommended_settings` (the default profile)
     /// when no explicit profile map is present. Unknown names return `None`.
@@ -1328,7 +1349,10 @@ mod tests {
         assert_eq!(settings.temperature, Some(1.0));
         assert_eq!(settings.top_p, Some(0.95));
         assert_eq!(settings.top_k, Some(20));
-        assert_eq!(serde_json::to_value(&wire.aliases).unwrap(), curated["aliases"]);
+        assert_eq!(
+            serde_json::to_value(&wire.aliases).unwrap(),
+            curated["aliases"]
+        );
         assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
         assert!(!wire.aliases.values().any(|target| target == tag));
         for stock in FLASH_NEXT_FIXTURE_TAGS {
@@ -1948,17 +1972,58 @@ mod tests {
             .is_none());
     }
 
+    /// Split tags that are views of a monolithic (not split-only) and whose
+    /// grandfathered monolithic is not catalogued.
+    fn missing_monolithic_siblings(registry: &RegistryV1) -> Vec<&str> {
+        registry
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.has_ple_sidecars() && !entry.is_split_only())
+            .filter(|(_, entry)| registry.monolithic_sibling(entry).is_none())
+            .map(|(tag, _)| tag.as_str())
+            .collect()
+    }
+
     #[test]
     fn bundled_split_entries_name_their_monolithic_sibling() {
         let registry = bundled().unwrap();
-        for (tag, entry) in &registry.models {
-            if entry.has_ple_sidecars() {
-                assert!(
-                    registry.monolithic_sibling(entry).is_some(),
-                    "{tag}: a split entry must keep its grandfathered monolithic catalogued"
-                );
-            }
+        assert_eq!(
+            missing_monolithic_siblings(&registry),
+            Vec::<&str>::new(),
+            "a split view of a monolithic must keep its grandfathered monolithic catalogued"
+        );
+    }
+
+    #[test]
+    fn only_a_shared_pair_split_base_without_a_published_monolithic_is_split_only() {
+        let mut value = shared_pair_registry_json();
+        for tag in ["qwen3.8:flash-next-mq4", "qwen3.8:flash-next-mq4-xts"] {
+            value["models"].as_object_mut().unwrap().remove(tag);
         }
+        let registry = parse_split(&value).unwrap();
+        // Both slots on the shared rows-bound pair and no published monolithic.
+        assert!(registry.models["qwen3.8:flash-next-mq3"].is_split_only());
+        // The MQ4 XTS split base is a view of the published monolithic even on
+        // the shared pair, so dropping that monolithic still fails.
+        assert!(!registry.models["qwen3.8:flash-next"].is_split_only());
+        assert_eq!(
+            missing_monolithic_siblings(&registry),
+            ["qwen3.8:flash-next"]
+        );
+
+        // Without the marker (one slot naming its own per-base rows) the MQ3
+        // split base is a view of an uncatalogued monolithic: it fails too.
+        value["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+            "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
+        let unmarked = parse_split(&value).unwrap();
+        assert!(!unmarked.models["qwen3.8:flash-next-mq3"].is_split_only());
+        assert_eq!(
+            missing_monolithic_siblings(&unmarked),
+            ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"]
+        );
+        // A monolithic entry is never split-only.
+        let split = parse_split(&split_registry_json()).unwrap();
+        assert!(!split.models["qwen3.8:flash-next-mq4-xts"].is_split_only());
     }
 
     #[test]
