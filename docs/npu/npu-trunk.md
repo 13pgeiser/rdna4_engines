@@ -737,6 +737,11 @@ stay the bit-exact comparable pair.
   compares a measurement with a prefix-independent model term, so the model's error
   at depth (its QSA growth term) cannot trip it; the planner's identity
   `t_pipe = gpu_only - savings + stall + fill` ties it to the plan.
+* **Counters.** `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG=1` (developer) prints one
+  `npu-trunk: pair-sample ...` line per executed pair: measured NPU chain time, GPU
+  window and GPU wait on the NPU, next to the model the request was planned with, the
+  prior and the scales after the sample. It reads the same always-on events and adds
+  no synchronization.
 * **Numerics.** Output differs only between the NPU and GPU projection routes
   (BF16-direct W8 rows on the NPU), both within the accepted KLD cap; `on` equals
   `emulate` bit-exactly.

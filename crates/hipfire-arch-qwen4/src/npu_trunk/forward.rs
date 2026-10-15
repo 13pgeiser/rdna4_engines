@@ -22,6 +22,10 @@ pub(super) struct NpuForward {
     sampling: Option<PairSampling>,
     request_epoch: u64,
     guard_tripped: bool,
+    /// `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG=1`: one `pair-sample` line per resolved pair (auto), no added sync.
+    sample_log: bool,
+    /// The calibration (and estimator generation) the current auto request was planned with, kept for the sample log.
+    request_cal: Option<(u64, trunk::Calibration)>,
     layers: Vec<NpuLayer>,
     emulation: Option<EmulationScratch>,
     // The pack producer writes compact activation sidecars in both modes.
@@ -325,6 +329,7 @@ impl NpuForward {
             None => Self::prepare_stock(gpu, bundle, false, rows, scratch_mode)?,
         }) else { return Ok(None); };
         let PreparedTrunk { mode, layers, download_ms, mut pack_ms, pre_overlay, overlay_route, matched, mut families } = prepared;
+        let sample_log = hipfire_config::developer_bool("HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG", false);
         let family_override = hipfire_config::developer_var("HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES")
             .ok().filter(|value| !value.trim().is_empty()).map(|value| parse_family_override(&value))
             .transpose().or_else(|reason| {
@@ -445,6 +450,7 @@ impl NpuForward {
             let sampling = if rates.is_some() { Some(PairSampling::new(gpu, layers.len())?) } else { None };
             let request_families = intersect_families(family_override.unwrap_or(families), families);
             Ok(Some(Self { mode, families, request_families, family_override, rates, sampling, request_epoch: 0, guard_tripped: false,
+                sample_log, request_cal: None,
                 layers, emulation, scales: [d0,d1], bank_b, runtime, arenas, trace,host_tokens,host_ple,pair_logged:false,
                 calibration, n_star_cache: None, request_plan: None, request_origin: 0, adaptive: Vec::new() }))
         })();
@@ -498,6 +504,7 @@ impl NpuForward {
             eprintln!("npu-trunk: rows={rows} families={}{} rates=gen{generation} gpu_x{gpu_scale:.3} npu_x{npu_scale:.3}{}",
                 family_names(families), rest, if frozen { " frozen" } else { "" });
         }
+        self.request_cal = (self.sample_log && self.mode == NpuTrunkMode::Auto).then(|| (generation, cal.clone()));
         self.request_origin = position;
         self.request_plan = Some(executable);
         Ok(())
@@ -740,6 +747,7 @@ struct PendingSample {
     epoch: u64,
     position: usize,
     npu_busy_ms: f64,
+    planned: Option<(u64, trunk::Calibration)>,
 }
 impl PairSampling {
     fn new(gpu: &Gpu, layers: usize) -> Result<Self, Qwen4GpuForwardError> {
@@ -806,9 +814,18 @@ impl NpuForward {
             // sides avoid the model's prefix-dependent terms, so the model's error at depth cannot trip the guard.
             let savings = trunk::pair_model(&snapshot.calibration, trunk::Moved::from(pending.mask),
                 pending.rows, pending.prefixes, &pending.kinds).savings_ms;
-            if self.trace.is_some() {
-                eprintln!("npu-trunk: sample: row={} npu_busy={:.3} ms windows={windows_ms:.3} ms stalls={stalls_ms:.3} ms span={span_ms:.3} ms savings={savings:.3} ms",
-                    pending.position, pending.npu_busy_ms);
+            if self.sample_log || self.trace.is_some() {
+                let moved = trunk::Moved::from(pending.mask);
+                let planned = pending.planned.as_ref().map_or_else(|| "planned=n/a".to_owned(), |(generation, cal)| {
+                    let m = trunk::pair_model(cal, moved, pending.rows, pending.prefixes, &pending.kinds);
+                    let t = trunk::pair_time_moved(cal, moved, pending.rows[0], pending.prefixes[0], pending.rows[1], pending.prefixes[1]);
+                    format!("planned(gen{generation}) npu={:.1} window={:.1} wait={:.1} pair={:.1} gpu_only={:.1} saving={:.1}",
+                        m.npu_ms, m.window_ms, t.stall + t.fill, t.t, m.gpu_only_ms, m.savings_ms)
+                });
+                eprintln!("npu-trunk: pair-sample row={} rows={}+{} families={} measured npu={:.1} window={windows_ms:.1} wait={stalls_ms:.1} pair={span_ms:.1} | {planned} | prior npu={:.1} window={:.1} | now gen{} gpu_x{:.3} npu_x{:.3}{}",
+                    pending.position, pending.rows[0], pending.rows[1], family_names(pending.mask), pending.npu_busy_ms,
+                    model.npu_ms, model.window_ms, snapshot.generation, snapshot.gpu_scale, snapshot.npu_scale,
+                    if snapshot.frozen { " frozen" } else { "" });
             }
             if pending.epoch == self.request_epoch && !self.guard_tripped && stalls_ms > savings {
                 self.guard_tripped = true;
@@ -1200,7 +1217,7 @@ impl NpuForward {
                     }).collect();
                     sampling.sets[active].pending = Some(PendingSample {
                         rows, prefixes: [position, position + rows[0]], mask: self.request_families,
-                        covered, kinds, epoch: self.request_epoch, position, npu_busy_ms,
+                        covered, kinds, epoch: self.request_epoch, position, npu_busy_ms, planned: self.request_cal.clone(),
                     });
                 }
             }
