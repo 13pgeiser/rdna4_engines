@@ -1013,7 +1013,22 @@ fn grow_scratch_buffer(
 /// lanes (`S = 10 * lanes` slots): two buckets of `S` expert ids, `S + 1`
 /// offsets and `S` slot ids.
 pub const fn qwen4_slab_union_words(lanes: usize) -> usize {
-    6 * (10 * lanes) + 2
+    match qwen4_slab_union_words_checked(lanes) {
+        Some(words) => words,
+        None => panic!("qwen4_slab_union_words: lane count overflows"),
+    }
+}
+
+/// [`qwen4_slab_union_words`] with checked arithmetic; `None` on overflow.
+pub const fn qwen4_slab_union_words_checked(lanes: usize) -> Option<usize> {
+    let slots = match lanes.checked_mul(10) {
+        Some(slots) => slots,
+        None => return None,
+    };
+    match slots.checked_mul(6) {
+        Some(words) => words.checked_add(2),
+        None => None,
+    }
 }
 
 pub(crate) fn grow_scratch_slot(
@@ -1134,6 +1149,33 @@ pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     blocks_k * n * 72
 }
 
+/// Checked byte size of the IU4 sidecar of a producer reservation `(k, rows)`:
+/// the extent `reserve_int4_mmq` / `reserve_int4_mmq_down` allocate (one 72 B
+/// `block_i4_128` per [K/128 block, row]). Applies the allocators' admission
+/// (`k % 256 == 0`, `k > 0`, `rows > 0`); `None` for a rejected shape or on
+/// overflow.
+pub fn int4_mmq_reservation_bytes(k: usize, rows: usize) -> Option<usize> {
+    if k == 0 || rows == 0 || k % 256 != 0 {
+        return None;
+    }
+    int4_mmq_blocks_bytes(k, rows)
+}
+
+/// [`int4_mmq_reservation_bytes`] for the Qwen4 symmetric MoE down sidecar,
+/// whose allocator (`reserve_qwen4_moe_down_i4`) admits `k % 128 == 0`.
+pub fn qwen4_moe_down_i4_bytes(k: usize, rows: usize) -> Option<usize> {
+    if k == 0 || rows == 0 || k % 128 != 0 {
+        return None;
+    }
+    int4_mmq_blocks_bytes(k, rows)
+}
+
+/// `k / 128 * rows * 72` with checked arithmetic (same value as
+/// [`int4_mmq_reserve_needed`] for admitted shapes).
+fn int4_mmq_blocks_bytes(k: usize, rows: usize) -> Option<usize> {
+    (k / 128).checked_mul(rows)?.checked_mul(72)
+}
+
 /// Byte offsets of the stable-grouping scratch for `slots` routed slots over
 /// `experts` experts: `[slots]` ranks, `[experts, chunks]` counts, then
 /// `[experts, chunks + 1]` chunk prefixes, `chunks = ceil(slots / 256)`.
@@ -1146,15 +1188,157 @@ pub struct Qwen4MoeGroupLayout {
 }
 
 pub fn qwen4_moe_group_layout(slots: usize, experts: usize) -> Qwen4MoeGroupLayout {
+    qwen4_moe_group_layout_checked(slots, experts)
+        .expect("qwen4_moe_group_layout: slot/expert counts overflow the layout")
+}
+
+/// [`qwen4_moe_group_layout`] with checked arithmetic; `None` on `usize` overflow.
+pub fn qwen4_moe_group_layout_checked(slots: usize, experts: usize) -> Option<Qwen4MoeGroupLayout> {
     let chunks = slots.div_ceil(256);
-    let partial_offset = slots * 4;
-    let prefix_offset = partial_offset + experts * chunks * 4;
-    Qwen4MoeGroupLayout {
-        chunks,
-        partial_offset,
-        prefix_offset,
-        bytes: prefix_offset + experts * (chunks + 1) * 4,
-    }
+    let partial_offset = slots.checked_mul(4)?;
+    let prefix_offset = partial_offset.checked_add(experts.checked_mul(chunks)?.checked_mul(4)?)?;
+    let bytes = prefix_offset.checked_add(experts.checked_mul(chunks.checked_add(1)?)?.checked_mul(4)?)?;
+    Some(Qwen4MoeGroupLayout { chunks, partial_offset, prefix_offset, bytes })
+}
+
+/// Upper bound on the grouped (per-expert 16-row padded) row count of `slots`
+/// routed slots over `experts` experts: every slot, plus at most 15 pad rows
+/// for each non-empty expert (`min(slots, experts)` of them), rounded up to a
+/// 16-row tile. `None` on overflow.
+pub fn qwen4_grouped_rows_bound(slots: usize, experts: usize) -> Option<usize> {
+    let padded = slots
+        .checked_add(slots.min(experts).checked_mul(15)?)?
+        .checked_add(15)?;
+    Some(padded / 16 * 16)
+}
+
+/// Bytes of the Qwen4 slab route's two codec-masked tile-id arrays for
+/// `tiles` grouped tiles (`2 * tiles` u32), the extent `reserve_qwen4_slab`
+/// allocates. `None` on overflow.
+pub fn qwen4_slab_tiles_bytes(tiles: usize) -> Option<usize> {
+    tiles.checked_mul(2)?.checked_mul(4)
+}
+
+/// Bytes of the slab lane-union descriptor for `lanes` decode lanes
+/// ([`qwen4_slab_union_words_checked`] words of u32). `None` on overflow.
+pub fn qwen4_slab_union_bytes(lanes: usize) -> Option<usize> {
+    qwen4_slab_union_words_checked(lanes)?.checked_mul(4)
+}
+
+/// Bytes of the FP16 X scratch for `n_elems` F16 elements; `None` on overflow.
+pub fn fp16_x_bytes(n_elems: usize) -> Option<usize> {
+    n_elems.checked_mul(2)
+}
+
+/// FWHT sign-table lengths (f32 elements each, two tables per group size).
+pub const MQ_FWHT_SIGNS_G256: usize = 256;
+pub const MQ_FWHT_SIGNS_G128: usize = 128;
+/// Shared F32 rotation scratch elements (covers K up to 32768).
+pub const MQ_X_ROT_ELEMS: usize = 32768;
+/// INT8 dp4a activation scratch bytes.
+pub const MQ_X_Q8_BYTES: usize = 32768;
+/// Per-group F32 activation scales (up to 128 groups).
+pub const MQ_X_SCALES_BYTES: usize = 128 * 4;
+/// The fixed MagnumQuant allocations once both `ensure_mq_signs` and
+/// `ensure_mq_signs_128` have run: two G256 and two G128 sign tables, the
+/// shared rotation scratch, the INT8 scratch and the scales.
+pub const MQ_FIXED_WORKSPACE_BYTES: usize = (2 * MQ_FWHT_SIGNS_G256
+    + 2 * MQ_FWHT_SIGNS_G128
+    + MQ_X_ROT_ELEMS)
+    * std::mem::size_of::<f32>()
+    + MQ_X_Q8_BYTES
+    + MQ_X_SCALES_BYTES;
+
+/// Model dimensions the Qwen4 prefill workspace census reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4PrefillWorkspaceDims {
+    pub hidden_size: usize,
+    pub moe_intermediate_size: usize,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub hc_count: usize,
+    pub hc_lowrank: usize,
+    /// The dense GDN scan's thread-local A / EF scratch is reachable (exact
+    /// gfx1201 route). Needs the `deltanet` feature: without it the scratch
+    /// cannot be sized and a `true` here yields `None`.
+    pub dense_gdn: bool,
+    /// Include the GDN head-pair counters the short-tail remainder steps
+    /// allocate.
+    pub include_short_tails: bool,
+    /// The routed-expert IU4 path exists (MoE profile whose `hidden_size` and
+    /// `moe_intermediate_size` the IU4 allocators admit). The `int4_xq`,
+    /// `moe_group`, `down_i4q`, `slab_tiles` and `slab_union` terms are also 0
+    /// whenever `num_experts == 0` or `top_k == 0` (no MoE owner reachable).
+    /// When they are 0 none of their dimension checks can make the query
+    /// return `None`.
+    pub routed_i4: bool,
+}
+
+/// Reusable prefill workspace terms for `rows` rows, in allocation-census
+/// order: `fp16_x`, `ksplit_det`, `int4_xq`, `moe_group`, `down_i4q`,
+/// `slab_tiles`, `slab_union`, `mq_fixed`, `gdn_dense_a`, `gdn_dense_ef`,
+/// `gdn_pair_counters`. Every term is the owning allocator's size query, not a
+/// copy of its formula. Excludes F16 weight shadows, `State::device_bytes`, the
+/// QSA selector / gather scratch and stage buffers. `None` on overflow, a
+/// dimension an owning allocator rejects, or `dense_gdn` without `deltanet`.
+pub fn qwen4_prefill_workspace_terms(
+    rows: usize,
+    dims: &Qwen4PrefillWorkspaceDims,
+) -> Option<[(&'static str, u64); 11]> {
+    let hc_wide = dims.hc_count.checked_mul(dims.hidden_size)?;
+    let fp16_x = fp16_x_bytes(rows.checked_mul(hc_wide.max(dims.hidden_size))?)?;
+    let ksplit_det = if hc_wide == 0 || dims.hc_lowrank == 0 {
+        0
+    } else {
+        crate::Gpu::qwen4_prefill_ksplit_bytes(rows, dims.hc_lowrank, hc_wide)?
+    };
+    let routed = dims.routed_i4 && dims.num_experts != 0 && dims.top_k != 0;
+    let (int4_xq, moe_group, down_i4q, slab_tiles) = if routed {
+        let slots = rows.checked_mul(dims.top_k)?;
+        (
+            int4_mmq_reservation_bytes(dims.hidden_size, rows)?,
+            qwen4_moe_group_layout_checked(slots, dims.num_experts)?.bytes,
+            qwen4_moe_down_i4_bytes(dims.moe_intermediate_size, slots)?,
+            qwen4_slab_tiles_bytes(qwen4_grouped_rows_bound(slots, dims.num_experts)?.div_ceil(16))?,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let slab_union = if routed {
+        qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES)?
+    } else {
+        0
+    };
+    #[cfg(feature = "deltanet")]
+    let (gdn_a, gdn_ef) = if dims.dense_gdn {
+        (
+            crate::fn_gdn_dense::workspace_a_bytes(rows)?,
+            crate::fn_gdn_dense::workspace_ef_bytes(rows),
+        )
+    } else {
+        (0, 0)
+    };
+    #[cfg(not(feature = "deltanet"))]
+    let (gdn_a, gdn_ef) = if dims.dense_gdn { return None } else { (0usize, 0usize) };
+    let pair_counters = if dims.include_short_tails {
+        crate::tensor_ops::GDN_PAIR_COUNTERS_BYTES
+    } else {
+        0
+    };
+    let term = |name: &'static str, bytes: usize| Some((name, u64::try_from(bytes).ok()?));
+    Some([
+        term("fp16_x", fp16_x)?,
+        term("ksplit_det", ksplit_det)?,
+        term("int4_xq", int4_xq)?,
+        term("moe_group", moe_group)?,
+        term("down_i4q", down_i4q)?,
+        term("slab_tiles", slab_tiles)?,
+        term("slab_union", slab_union)?,
+        term("mq_fixed", MQ_FIXED_WORKSPACE_BYTES)?,
+        term("gdn_dense_a", gdn_a)?,
+        term("gdn_dense_ef", gdn_ef)?,
+        term("gdn_pair_counters", pair_counters)?,
+    ])
 }
 
 #[inline]
@@ -1317,18 +1501,18 @@ impl ScratchState {
         if self.mq_signs1.is_some() {
             return Ok(());
         }
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
+        let s1 = gen_fwht_signs(42, MQ_FWHT_SIGNS_G256);
+        let s2 = gen_fwht_signs(1042, MQ_FWHT_SIGNS_G256);
         let s1b: Vec<u8> = s1.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1t = alloc_tensor_on(hip, pool, device_id, &[256], DType::F32)?;
-        let s2t = alloc_tensor_on(hip, pool, device_id, &[256], DType::F32)?;
+        let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
+        let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
         hip.memcpy_htod(&s1t.buf, &s1b)?;
         hip.memcpy_htod(&s2t.buf, &s2b)?;
         // Allocate scratch buffers — 32K elements covers K up to 32768
-        let x_rot = alloc_tensor_on(hip, pool, device_id, &[32768], DType::F32)?;
-        let x_q8 = hip.malloc(32768)?; // INT8 buffer for dp4a
-        let x_scales = hip.malloc(128 * 4)?; // up to 128 groups × f32
+        let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
+        let x_q8 = hip.malloc(MQ_X_Q8_BYTES)?; // INT8 buffer for dp4a
+        let x_scales = hip.malloc(MQ_X_SCALES_BYTES)?; // up to 128 groups × f32
         self.mq_signs1 = Some(s1t);
         self.mq_signs2 = Some(s2t);
         self.mq_x_rot = Some(x_rot);
@@ -1388,12 +1572,12 @@ impl ScratchState {
             return Ok(());
         }
         if self.mq_signs1_128.is_none() {
-            let signs1 = gen_fwht_signs(43, 128);
-            let signs2 = gen_fwht_signs(1043, 128);
+            let signs1 = gen_fwht_signs(43, MQ_FWHT_SIGNS_G128);
+            let signs2 = gen_fwht_signs(1043, MQ_FWHT_SIGNS_G128);
             let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let s1t = alloc_tensor_on(hip, pool, device_id, &[128], DType::F32)?;
-            let s2t = alloc_tensor_on(hip, pool, device_id, &[128], DType::F32)?;
+            let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
+            let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
             hip.memcpy_htod(&s1t.buf, &s1b)?;
             hip.memcpy_htod(&s2t.buf, &s2b)?;
             self.mq_signs1_128 = Some(s1t);
@@ -1401,7 +1585,7 @@ impl ScratchState {
         }
         // Allocate shared rotation scratch if ensure_mq_signs (G256 path) has not run yet.
         if self.mq_x_rot.is_none() {
-            let x_rot = alloc_tensor_on(hip, pool, device_id, &[32768], DType::F32)?;
+            let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
             self.mq_x_rot = Some(x_rot);
         }
         Ok(())
@@ -1520,7 +1704,8 @@ impl ScratchState {
         )?;
 
         let src_ptr = x.buf.as_ptr();
-        let needed = n_elems * 2;
+        let needed = fp16_x_bytes(n_elems)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "ensure_fp16_x: extent overflow"))?;
 
         // Grow scratch if needed (never shrinks), releasing the old buffer.
         if self.fp16_x_scratch_bytes < needed {
@@ -1588,7 +1773,9 @@ impl ScratchState {
         hip: &HipRuntime,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
-        let needed = n_elems * 2;
+        let needed = fp16_x_bytes(n_elems).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "fp16_x_scratch_writable: extent overflow")
+        })?;
         if self.fp16_x_scratch_bytes < needed {
             grow_scratch_buffer(
                 hip,
@@ -2425,18 +2612,24 @@ impl ScratchState {
         max_lanes: usize,
         tiles: usize,
     ) -> HipResult<()> {
+        let union_bytes = qwen4_slab_union_bytes(max_lanes).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_slab: union descriptor extent overflow")
+        })?;
         grow_scratch_buffer(
             hip,
             &mut self.qwen4_slab_union_scratch,
             &mut self.qwen4_slab_union_scratch_bytes,
-            qwen4_slab_union_words(max_lanes) * 4,
+            union_bytes,
         )?;
         if tiles != 0 {
+            let tile_bytes = qwen4_slab_tiles_bytes(tiles).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "reserve_qwen4_slab: tile mask extent overflow")
+            })?;
             grow_scratch_buffer(
                 hip,
                 &mut self.qwen4_slab_tiles_scratch,
                 &mut self.qwen4_slab_tiles_scratch_bytes,
-                2 * tiles * 4,
+                tile_bytes,
             )?;
         }
         Ok(())
@@ -2457,11 +2650,14 @@ impl ScratchState {
                 "reserve_qwen4_moe_down_i4: need k%128==0 and n>0",
             ));
         }
+        let needed = qwen4_moe_down_i4_bytes(k, n).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "reserve_qwen4_moe_down_i4: extent overflow")
+        })?;
         grow_scratch_buffer(
             hip,
             &mut self.qwen4_moe_down_i4_scratch,
             &mut self.qwen4_moe_down_i4_scratch_bytes,
-            k / 128 * n * 72,
+            needed,
         )?;
         self.qwen4_moe_down_i4_generation = self.qwen4_moe_down_i4_generation.wrapping_add(1);
         Ok(Int4MmqReservation {
@@ -3348,5 +3544,126 @@ mod scratch_growth_tests {
             fa2_fp8_q_needed(512, 8, true),
             (3_719_168, 512 * 24 * 256, 512 * 24 * 256 + 512 * 24 * 4)
         );
+    }
+}
+
+#[cfg(test)]
+mod prefill_workspace_tests {
+    use super::*;
+
+    fn flash_next(dense_gdn: bool, include_short_tails: bool) -> Qwen4PrefillWorkspaceDims {
+        Qwen4PrefillWorkspaceDims {
+            hidden_size: 2560,
+            moe_intermediate_size: 640,
+            num_experts: 512,
+            top_k: 10,
+            hc_count: 4,
+            hc_lowrank: 320,
+            dense_gdn,
+            include_short_tails,
+            routed_i4: true,
+        }
+    }
+
+    #[test]
+    fn size_queries_match_allocator_geometry() {
+        assert_eq!(int4_mmq_reservation_bytes(2560, 4096), Some(5_898_240));
+        assert_eq!(int4_mmq_reservation_bytes(2560, 4096), Some(int4_mmq_reserve_needed(2560, 4096)));
+        assert_eq!(int4_mmq_reservation_bytes(640, 4096), None); // k % 256 != 0
+        assert_eq!(int4_mmq_reservation_bytes(2560, 0), None);
+        assert_eq!(qwen4_moe_down_i4_bytes(640, 40960), Some(14_745_600));
+        assert_eq!(qwen4_moe_down_i4_bytes(641, 40960), None);
+        assert_eq!(qwen4_moe_group_layout_checked(40960, 512).map(|l| l.bytes), Some(821_248));
+        assert_eq!(qwen4_moe_group_layout_checked(40960, 512), Some(qwen4_moe_group_layout(40960, 512)));
+        assert_eq!(qwen4_moe_group_layout_checked(usize::MAX, 512), None);
+        assert_eq!(qwen4_grouped_rows_bound(40960, 512), Some(48_640));
+        assert_eq!(qwen4_slab_tiles_bytes(3040), Some(24_320));
+        assert_eq!(qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES), Some(1928));
+        assert_eq!(qwen4_slab_union_bytes(usize::MAX), None);
+        assert_eq!(fp16_x_bytes(4096 * 10240), Some(83_886_080));
+        assert_eq!(fp16_x_bytes(usize::MAX), None);
+        assert_eq!(MQ_FIXED_WORKSPACE_BYTES, 167_424);
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn flash_next_4096_workspace_terms() {
+        let sum = |terms: [(&str, u64); 11]| terms.iter().map(|t| t.1).sum::<u64>();
+        let terms = qwen4_prefill_workspace_terms(4096, &flash_next(true, true)).unwrap();
+        let names: Vec<&str> = terms.iter().map(|t| t.0).collect();
+        assert_eq!(
+            names,
+            [
+                "fp16_x", "ksplit_det", "int4_xq", "moe_group", "down_i4q", "slab_tiles",
+                "slab_union", "mq_fixed", "gdn_dense_a", "gdn_dense_ef", "gdn_pair_counters",
+            ]
+        );
+        let values: Vec<u64> = terms.iter().map(|t| t.1).collect();
+        assert_eq!(
+            values,
+            [
+                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 1_928, 167_424,
+                25_165_824, 1_572_864, 1_024,
+            ]
+        );
+        assert_eq!(sum(terms), 153_256_072);
+        let no_tails = qwen4_prefill_workspace_terms(4096, &flash_next(true, false)).unwrap();
+        assert_eq!(sum(no_tails), 153_255_048);
+        let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(false, false)).unwrap();
+        assert_eq!(sum(no_gdn), 153_255_048 - 25_165_824 - 1_572_864);
+    }
+
+    #[test]
+    fn workspace_terms_overflow_and_invalid_dims_are_none() {
+        assert!(qwen4_prefill_workspace_terms(usize::MAX, &flash_next(false, false)).is_none());
+        let mut dims = flash_next(false, false);
+        dims.hidden_size = 2561; // int4 sidecar needs k % 256 == 0
+        assert!(qwen4_prefill_workspace_terms(4096, &dims).is_none());
+    }
+
+    #[test]
+    fn dense_profile_without_routed_i4_charges_only_generic_terms() {
+        let mut dims = flash_next(false, false);
+        dims.num_experts = 0;
+        dims.top_k = 0;
+        dims.moe_intermediate_size = 0;
+        dims.routed_i4 = false;
+        let terms = qwen4_prefill_workspace_terms(4096, &dims).unwrap();
+        for (name, bytes) in terms {
+            if ["int4_xq", "moe_group", "down_i4q", "slab_tiles", "slab_union"].contains(&name) {
+                assert_eq!(bytes, 0, "{name}");
+            }
+        }
+        assert_eq!(terms[1], ("ksplit_det", 20_971_520));
+        assert_eq!(terms[0], ("fp16_x", 83_886_080));
+        assert_eq!(terms[7], ("mq_fixed", 167_424));
+        // Routed dims that the i4 allocators reject stay ignored when the gate is off.
+        dims.hidden_size = 2561;
+        dims.hc_count = 0;
+        dims.hc_lowrank = 0;
+        assert!(qwen4_prefill_workspace_terms(4096, &dims).is_some());
+    }
+
+    #[test]
+    fn dense_ffn_profile_is_not_none_even_with_routed_i4_set() {
+        // Dense FFN / synthetic: no experts, small non-256 hidden, routed_i4 left true.
+        let dims = Qwen4PrefillWorkspaceDims {
+            hidden_size: 64,
+            moe_intermediate_size: 0,
+            num_experts: 0,
+            top_k: 0,
+            hc_count: 4,
+            hc_lowrank: 32,
+            dense_gdn: false,
+            include_short_tails: true,
+            routed_i4: true,
+        };
+        let terms = qwen4_prefill_workspace_terms(4096, &dims).unwrap();
+        for index in [2, 3, 4, 5, 6] {
+            assert_eq!(terms[index].1, 0, "{}", terms[index].0);
+        }
+        assert_eq!(terms[0], ("fp16_x", 4096 * 256 * 2));
+        assert_eq!(terms[7], ("mq_fixed", 167_424));
+        assert_eq!(terms[10], ("gdn_pair_counters", 1024));
     }
 }

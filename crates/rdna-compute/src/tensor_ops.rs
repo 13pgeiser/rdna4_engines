@@ -298,6 +298,9 @@ pub struct GatedDeltaStep<'a> {
 /// Head-pair arrival counters of the fused GDN step's optional rotation.
 const GDN_PAIR_COUNTERS: usize = 256;
 
+/// Bytes of the head-pair arrival counters [`ensure_gdn_pair_counters`] allocates.
+pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
+
 /// Allocate and zero the fused GDN step's head-pair arrival counters if they
 /// do not exist yet. Each launch leaves them zero, so the zeroing memset runs
 /// once. A retained-body boundary calls this before opening its capture
@@ -305,8 +308,8 @@ const GDN_PAIR_COUNTERS: usize = 256;
 /// makes the capture effect-incomplete.
 pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
     if gpu.scratch.gdn_pair_counters.is_none() {
-        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
-        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
+        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS_BYTES)?;
+        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS_BYTES)?;
         gpu.scratch.gdn_pair_counters = Some(counters);
     }
     Ok(())
@@ -4313,20 +4316,57 @@ fn qsa_bf16_split_layout(
     Ok(QsaBf16SplitLayout { cand_off, ctl_off, total })
 }
 
+/// Constant upper-bound extent of the split route's score / filter scratch
+/// (`MAX_GROUP_ROWS` groups at the full score budget with the filter capacity).
+/// Shared by the reservation and [`qsa_bf16_split_scratch_bytes`].
+fn qsa_bf16_split_reserve_layout() -> HipResult<QsaBf16SplitLayout> {
+    qsa_bf16_split_layout(
+        QSA_SELECT_SCORE_SCRATCH_BYTES,
+        QSA_BF16_SPLIT_MAX_GROUP_ROWS,
+        QSA_FILTER_CAP,
+    )
+}
+
+/// Whether [`reserve_qsa_bf16_split_scratch`] reserves anything for `pooled`:
+/// switch on, exact gfx1201 parallel-QSA arch, BF16 pooled keys. Pure metadata
+/// (no allocation, no device call); the runtime block-count crossover is not
+/// part of the reservation.
+fn qsa_bf16_split_reserves(gpu: &Gpu, pooled: DType) -> bool {
+    *QWEN4_QSA_BF16_SPLIT && pooled == DType::BF16 && qsa_bf16_split_arch(gpu)
+}
+
+/// Bytes of the QSA split-route selector scratch that
+/// [`reserve_qsa_bf16_split_scratch`] allocates for `pooled` keys on `gpu`:
+/// the constant score + filter-candidate + control extent, or 0 when the route
+/// cannot run (same gates as the reservation). Selector only: the gather path
+/// is not included. Does not allocate or touch the device.
+pub fn qsa_bf16_split_scratch_bytes(gpu: &Gpu, pooled: DType) -> usize {
+    if !qsa_bf16_split_reserves(gpu, pooled) {
+        return 0;
+    }
+    qsa_bf16_split_capacity_bytes()
+}
+
+/// The constant extent [`reserve_qsa_bf16_split_scratch`] reserves when the
+/// split route can run (score + filter candidates + control rows). No `Gpu`,
+/// arch or env gate: those decide only whether it is reserved at all.
+pub fn qsa_bf16_split_capacity_bytes() -> usize {
+    // The layout inputs are compile-time constants; the unit test pins the result.
+    qsa_bf16_split_reserve_layout()
+        .expect("QSA BF16 split reserve layout overflows its compile-time constants")
+        .total
+}
+
 /// Reserves the split route's score / filter scratch at its constant upper
 /// bound before any capture or record, so [`Gpu::qsa_select_scores`] never
 /// grows (and the pointer never moves) under a recorder. A no-op, returning 0,
 /// unless the route can run: switch on, exact gfx1201, BF16 pooled keys.
 /// Returns the reserved bytes.
 pub fn reserve_qsa_bf16_split_scratch(gpu: &mut Gpu, pooled: DType) -> HipResult<usize> {
-    if !*QWEN4_QSA_BF16_SPLIT || pooled != DType::BF16 || !qsa_bf16_split_arch(gpu) {
+    if !qsa_bf16_split_reserves(gpu, pooled) {
         return Ok(0);
     }
-    let layout = qsa_bf16_split_layout(
-        QSA_SELECT_SCORE_SCRATCH_BYTES,
-        QSA_BF16_SPLIT_MAX_GROUP_ROWS,
-        QSA_FILTER_CAP,
-    )?;
+    let layout = qsa_bf16_split_reserve_layout()?;
     gpu.qsa_select_scores(layout.total)?;
     Ok(layout.total)
 }
@@ -7021,6 +7061,11 @@ mod tests {
                 assert!(valid.min(committed) - start < 4);
             }
         }
+    }
+
+    #[test]
+    fn qsa_bf16_split_reserve_layout_is_83894272() {
+        assert_eq!(qsa_bf16_split_reserve_layout().unwrap().total, 83_894_272);
     }
 
     #[test]

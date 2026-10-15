@@ -1142,8 +1142,10 @@ pub fn attach_qwen4_ep_peers(
 
 /// What the expert placement is sized from, for one rank of a `ranks`-way
 /// load: the replicated non-expert bytes, one MoE layer's routed-expert bytes
-/// on this rank, the `auto` reserve (with its native MTP and QSA gather
-/// parts, returned too). The one place this is computed, for the load and for
+/// on this rank, the `auto` reserve ([`residency::AutoReserve`]: the larger
+/// of the historical measured formula and a bottom-up census of the first
+/// full-context request, itemised) and its native MTP and QSA gather parts,
+/// returned too. The one place this is computed, for the load and for
 /// [`qwen4_ep_vram_layers`].
 #[allow(clippy::too_many_arguments)]
 fn qwen4_placement_inputs(
@@ -1162,7 +1164,10 @@ fn qwen4_placement_inputs(
     state_format: hipfire_arch_qwen4::Qwen4StateFormat,
     scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
     ranks: usize,
-) -> Result<(u64, u64, u64, Option<u64>, Option<u64>), String> {
+) -> Result<
+    (u64, u64, hipfire_arch_qwen4::expert_residency::AutoReserve, Option<u64>, Option<u64>),
+    String,
+> {
     use hipfire_arch_qwen4::expert_residency as residency;
     let qsa_format = state_format.qsa;
     let (non_expert, layer_experts) = residency::resident_split_ranks(weights, bytes_of, ranks)
@@ -1176,6 +1181,16 @@ fn qwen4_placement_inputs(
         chunk_rows,
         vmm_granularity,
     );
+    // The context the census charges: the ACTUAL backend with the whole
+    // admitted context mapped (a VMM arena maps ahead to `max_seq`, rounded
+    // to the driver granularity), not the legacy-forced layout the historical
+    // formula charges on a discrete card.
+    let census_context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+        backend,
+        max_seq,
+        max_seq,
+        vmm_granularity,
+    );
     // Every placement host-maps at least the MTP layer's routed experts, so
     // the head is still attached after it only where the host-mapped policy
     // keeps it (exact gfx1201, or an explicit `--spec mtp`); only then does
@@ -1186,15 +1201,18 @@ fn qwen4_placement_inputs(
             &gpu.arch,
             usize::from(routed_experts),
         );
-    let mtp_bytes = if mtp_kept {
+    let mtp_for = |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+        if !mtp_kept {
+            return Ok(None);
+        }
         let head = residency::language_head_dtype(weights)
             .ok_or("qwen4: manifest has no language head")?;
         let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(gpu, config)
             .then_some(state_format.gdn);
-        Some(
+        Ok(Some(
             hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                 config,
-                &context,
+                context,
                 chunk_rows,
                 max_k,
                 head,
@@ -1202,29 +1220,31 @@ fn qwen4_placement_inputs(
                 hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
             )
             .ok_or("qwen4: native MTP device bytes overflow")?,
-        )
-    } else {
-        None
+        ))
     };
     // The gathered QSA prefill attention's workspace, committed as the
     // context is (none when the route is off: the reserve is then unchanged).
     // Bytes already committed by an earlier load in this process are out of
     // `free` and only growth past them is charged.
-    let gather_bytes = rdna_compute::tensor_ops::qsa_gather_workspace_needed(
-        gpu,
-        qsa_format,
-        state_format.qsa_f16_arena,
-    )
-    .then(|| {
-        rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-            config.num_key_value_heads,
-            context.tokens,
+    let gather_for = |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+        rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            gpu,
+            qsa_format,
+            state_format.qsa_f16_arena,
         )
-        .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
-        .ok_or("qwen4: QSA gather scratch size overflows")
-    })
-    .transpose()?;
-    let reserve = residency::auto_vram_reserve(
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
+            .ok_or("qwen4: QSA gather scratch size overflows".to_string())
+        })
+        .transpose()
+    };
+    let mtp_bytes = mtp_for(&context)?;
+    let gather_bytes = gather_for(&context)?;
+    let historical = residency::auto_vram_reserve(
         config,
         &context,
         chunk_rows,
@@ -1234,6 +1254,80 @@ fn qwen4_placement_inputs(
         gather_bytes,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
+    // The bottom-up census at the full admitted context.
+    let state = residency::state_census(
+        config,
+        state_format,
+        &census_context,
+        chunk_rows,
+        scratch_mode,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
+    // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
+    // arms read (exact gfx1201): the cold bound from the manifest, not the
+    // warm cache.
+    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201() {
+        residency::f16_shadow_bytes(weights, config.num_hidden_layers)
+            .map_err(|error| format!("qwen4: {error}"))?
+    } else {
+        0
+    };
+    // The kernels' pool workspaces at the largest requested chunk, exactly
+    // (every short-tail remainder included). The dense GDN scan's scratch is
+    // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
+    // Q8 GDN state and the pinned 16-key/48-value-head, 128-dim, 10240-wide
+    // geometry (its opt-out flag only lowers the charge, so it is ignored).
+    let dense_gdn = gpu.arch == "gfx1201"
+        && state_format.gdn == hipfire_arch_qwen4::GdnStateFormat::Q8
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim
+            == 10240;
+    // The routed-expert I4 MoE terms exist only for a profile whose routed
+    // experts run the grouped I4 route; a dense or synthetic profile
+    // (no experts, or dimensions that route cannot take) charges none of
+    // them and is never refused for them.
+    let routed_i4 = routed_experts
+        && config.num_experts > 0
+        && config.num_experts_per_tok > 0
+        && config.moe_intermediate_size > 0
+        && config.hidden_size % 256 == 0
+        && config.moe_intermediate_size % 128 == 0;
+    let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+        hidden_size: config.hidden_size,
+        moe_intermediate_size: config.moe_intermediate_size,
+        num_experts: config.num_experts,
+        top_k: config.num_experts_per_tok,
+        hc_count: config.hc_count,
+        hc_lowrank: config.hc_lowrank,
+        dense_gdn,
+        routed_i4,
+        include_short_tails: true,
+    };
+    // Overflow (or a dimension an owning allocator rejects) refuses the load
+    // with a clear error; there is no historical-only fallback.
+    let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk_rows, &dims)
+        .ok_or("qwen4: prefill workspace bytes cannot be computed (arithmetic overflow, or a hidden/MoE dimension the kernel allocators reject)")?;
+    let census = residency::ReserveCensus {
+        qsa_context: state.qsa_context,
+        state: state.state,
+        forward: state.forward,
+        f16_shadows,
+        workspace,
+        // The split QSA selector's score/filter scratch (0 unless its route
+        // can run).
+        qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_scratch_bytes(
+            gpu,
+            state_format.layout().index_dtype(),
+        ) as u64,
+        mtp: mtp_for(&census_context)?.unwrap_or(0),
+        gather: gather_for(&census_context)?.unwrap_or(0),
+    };
+    let reserve = residency::AutoReserve::new(historical, census)
+        .map_err(|error| format!("qwen4: {error}"))?;
     Ok((non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
 }
 
@@ -1352,7 +1446,7 @@ pub fn qwen4_ep_vram_layers(
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
     // exceeds what a rank's own check keeps.
     let reserve = hipfire_arch_qwen4::expert_residency::PlacementCharges::new(layer_experts, false)
-        .and_then(|charges| charges.reserve(reserve))
+        .and_then(|charges| charges.reserve(reserve.bytes()))
         .map_err(|error| format!("qwen4: {error}"))?;
     Ok(hipfire_arch_qwen4::expert_residency::ep_vram_layers(
         &config,
@@ -1680,7 +1774,7 @@ pub fn load_qwen4_rank(
     // never their virtual extent; a discrete card charges legacy storage
     // of `max_seq` whatever the backend, so VMM growth stays inside the
     // reserve and placement matches legacy.
-    let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
+    let auto_inputs = || -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
         let (free, _) = ctx
             .gpu
             .device_mem_info()
@@ -1772,6 +1866,8 @@ pub fn load_qwen4_rank(
                 &hfq, &config, &manifest,
             )?;
             let (free, non_expert, _, reserve, mtp_bytes, gather_bytes) = auto_inputs()?;
+            let reserve_note = reserve.describe();
+            let reserve = reserve.bytes();
             let total = hotsets::require_budget(
                 residency::expert_hotset_budget(free, non_expert, reserve),
             ).map_err(|skip| skip.to_string())?;
@@ -1821,7 +1917,7 @@ pub fn load_qwen4_rank(
                 ));
             }
             eprintln!(
-                "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables - {} MiB safety margin - {} MiB long-prefill stage buffers = {} MiB",
+                "  qwen4 expert hot set budget: {} MiB free - {} MiB non-expert weights - {} MiB reserve ({reserve_note}; {} MiB native MTP, {} MiB QSA gather) - {} bytes tier tables - {} MiB safety margin - {} MiB long-prefill stage buffers = {} MiB",
                 free / MIB, non_expert / MIB, reserve / MIB,
                 mtp_bytes.unwrap_or(0) / MIB, gather_bytes.unwrap_or(0) / MIB,
                 residency::EXPERT_TIER_TABLE_BYTES,
@@ -1867,12 +1963,14 @@ pub fn load_qwen4_rank(
     } else if use_ranges {
         if explicit.is_none() {
             let (free, non_expert, _, reserve, ..) = auto_inputs()?;
+            let reserve_note = reserve.describe();
+            let reserve = reserve.bytes();
             let experts =
                 residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
                     .map_err(|error| format!("qwen4: {error}"))?;
             let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
             let detail = format!(
-                    "{} MiB routed experts + {} MiB non-expert weights + {} MiB reserve {} {} MiB free device memory",
+                    "{} MiB routed experts + {} MiB non-expert weights + {} MiB reserve ({reserve_note}) {} {} MiB free device memory",
                     experts / MIB,
                     non_expert / MIB,
                     reserve / MIB,
@@ -1899,18 +1997,19 @@ pub fn load_qwen4_rank(
             let experts =
                 residency::routed_expert_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
                     .map_err(|error| format!("qwen4: {error}"))?;
-            let (free, non_expert, layer_experts, base_reserve, ..) = inputs;
+            let (free, non_expert, layer_experts) = (inputs.0, inputs.1, inputs.2);
+            let base_reserve = inputs.3.bytes();
             // Fully resident has no host layer, so no stage buffers; the
             // safety margin is charged exactly as `auto` charges it.
             let charges = placement_charges(layer_experts, false)?;
             let reserve = charges.reserve(base_reserve).map_err(|error| format!("qwen4: {error}"))?;
             let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
             unset_note = format!(
-                    " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve ({} MiB base + {}) {} {} MiB free VRAM)",
+                    " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve (base {}; plus {}) {} {} MiB free VRAM)",
                     experts / MIB,
                     non_expert / MIB,
                     reserve / MIB,
-                    base_reserve / MIB,
+                    inputs.3.describe(),
                     charges.describe(),
                     if fits { "fit in" } else { "exceed" },
                     free / MIB
@@ -1930,10 +2029,10 @@ pub fn load_qwen4_rank(
     // The agreed split must fit this rank: refuse before allocating.
     if let Some(layers) = expert_vram_layers {
         let (free, non_expert, layer_experts, reserve, ..) = auto_inputs()?;
-        // Expert-parallel loads have no slab stage; the scratch headroom is
-        // in the reserve and the safety margin is charged like `auto`'s.
+        // Expert-parallel loads have no slab stage; the safety margin is
+        // charged like `auto`'s.
         let reserve = placement_charges(layer_experts, false)?
-            .reserve(reserve)
+            .reserve(reserve.bytes())
             .map_err(|error| format!("qwen4: {error}"))?;
         let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
         if own < layers.min(moe_layers) {
@@ -1989,7 +2088,7 @@ pub fn load_qwen4_rank(
         .map(|_| -> Result<_, String> {
             let (free, non_expert, layer_experts, reserve, mtp, gather) = auto_inputs()?;
             let reserve = placement_charges(layer_experts, false)?
-                .reserve(reserve)
+                .reserve(reserve.bytes())
                 .map_err(|error| format!("qwen4: {error}"))?;
             Ok((free, non_expert, layer_experts, reserve, mtp, gather))
         })
@@ -2005,7 +2104,7 @@ pub fn load_qwen4_rank(
         let vram_layers = match policy {
             residency::ExpertVramLayers::Layers(layers) => layers,
             residency::ExpertVramLayers::Auto => {
-                let (free, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes) =
+                let (free, non_expert, layer_experts, auto, mtp_bytes, gather_bytes) =
                     match measured.take() {
                         Some(inputs) => inputs,
                         None => auto_inputs()?,
@@ -2013,19 +2112,20 @@ pub fn load_qwen4_rank(
                 let gather_note = gather_bytes
                     .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                     .unwrap_or_default();
-                // The reserve holds the chunk-sized forward resources, the
-                // lazy workspace headroom, MTP and gather; the safety margin
-                // and (slab only) the dedicated long-prefill stage buffers
-                // are charged on top, itemised.
+                // The reserve is the larger of the historical formula and the
+                // census (every term itemised below); the safety margin and
+                // (slab only) the dedicated long-prefill stage buffers are
+                // charged on top.
                 let charges = placement_charges(layer_experts, true)?;
-                let charged = charges.reserve(reserve).map_err(|error| format!("qwen4: {error}"))?;
+                let charged = charges
+                    .reserve(auto.bytes())
+                    .map_err(|error| format!("qwen4: {error}"))?;
                 eprintln!(
-                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved ({} MiB base incl. {} MiB lazy workspace headroom, {} MiB native MTP{gather_note}; plus {}), {} MiB per expert layer",
+                        "  qwen4 auto expert placement: {} MiB free, {} MiB non-expert weights, {} MiB reserved (base {}; {} MiB native MTP{gather_note}; plus {}), {} MiB per expert layer",
                         free / MIB,
                         non_expert / MIB,
                         charged / MIB,
-                        reserve / MIB,
-                        hipfire_arch_qwen4::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES / MIB,
+                        auto.describe(),
                         mtp_bytes.unwrap_or(0) / MIB,
                         charges.describe(),
                         layer_experts / MIB
@@ -2039,7 +2139,7 @@ pub fn load_qwen4_rank(
                     non_expert,
                     layer_experts,
                     config.num_hidden_layers,
-                    reserve,
+                    auto.bytes(),
                     &charges,
                 )
                 .map_err(|error| format!("qwen4: {error}"))?

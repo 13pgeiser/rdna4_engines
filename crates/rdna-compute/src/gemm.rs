@@ -564,6 +564,15 @@ impl LdsTileSplitK {
     /// (`qcal/release-0.4.1/hc-down-g0`): 447 -> 384 us at B = 4096, 887 -> 714 us at 8192.
     pub const HC_DOWN_GFX1201: Self = Self::new(160, 80, 32, 80, true, 4).k_stage(32);
 
+    /// Bytes of the shared K-split partials scratch (`split * rows * m` F32)
+    /// this tile writes for `rows` token rows of `m` outputs, `None` on overflow.
+    pub fn partials_bytes(&self, rows: usize, m: usize) -> Option<usize> {
+        self.split
+            .checked_mul(rows)?
+            .checked_mul(m)?
+            .checked_mul(std::mem::size_of::<f32>())
+    }
+
     /// Kernel entry-point name, matching `SK_KERNEL` in the .hip.
     pub fn entry(&self) -> String {
         format!(
@@ -29287,7 +29296,10 @@ impl Gpu {
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = if tile.split > 1 {
-            self.ensure_ksplit_det_partials(tile.split * batch_size * m * 4)?
+            let partial_bytes = tile.partials_bytes(batch_size, m).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "gemm_f16_x_f16_wmma_lds_splitk: K-split partials extent overflow")
+            })?;
+            self.ensure_ksplit_det_partials(partial_bytes)?
         } else {
             y_f32.buf.as_ptr()
         };
@@ -29462,6 +29474,28 @@ impl Gpu {
             0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
             512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
             _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+        }
+    }
+
+    /// Bytes of the shared deterministic K-split partials scratch that
+    /// [`Self::gemm_f16_x_f16_wmma_lds_splitk`] sizes for the
+    /// [`Self::qwen4_lds_tile_gfx1201`] tile of a `[m x k]` GEMM over `rows`
+    /// token rows: `split * rows * m * 4`, or 0 when the GEMM is empty, the tile
+    /// does not split, or `k` is not a positive multiple of `ks * split` (the
+    /// launcher would reject it, so the split route is unreachable and uses its
+    /// fallback with no partials). `None` only on `usize` overflow.
+    pub fn qwen4_prefill_ksplit_bytes(rows: usize, m: usize, k: usize) -> Option<usize> {
+        if m == 0 || rows == 0 {
+            return Some(0);
+        }
+        let tile = Self::qwen4_lds_tile_gfx1201(m, k);
+        if k == 0 || k % (tile.ks * tile.split) != 0 {
+            return Some(0);
+        }
+        if tile.split > 1 {
+            tile.partials_bytes(rows, m)
+        } else {
+            Some(0)
         }
     }
 
@@ -48226,6 +48260,22 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen4_prefill_ksplit_bytes_known_and_checked() {
+        // Flash-Next R = 4096, hc_lowrank = 320, hidden = 2560: 4-way split.
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(4096, 320, 2560), Some(20_971_520));
+        // m >= 512 does not split; an empty GEMM allocates nothing.
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(4096, 2560, 2560), Some(0));
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(0, 320, 2560), Some(0));
+        // Unsplit k (k % 256 != 0) on a small m is the split = 1 tile.
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(4096, 320, 2560 + 64), Some(0));
+        // A K the launcher rejects (not a positive multiple of ks * split) never
+        // reaches the F16 split route: it needs no partials.
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(4096, 320, 0), Some(0));
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(4096, 32, 24), Some(0));
+        assert_eq!(Gpu::qwen4_prefill_ksplit_bytes(usize::MAX / 8, 320, 2560), None);
+    }
 
     #[test]
     fn splitk_ld_rejects_invalid_pitch_and_geometry() {

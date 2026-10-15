@@ -22,6 +22,32 @@ use crate::tensor_ops::{
 use crate::{DType, Gpu, GpuTensor};
 
 const EF_BYTES: usize = 48 * 128 * 128 * 2;
+/// Bytes of one A row of the KKT solve: 48 value heads x 64 BF16 columns.
+const A_ROW_BYTES: usize = 48 * 64 * 2;
+/// Admission floor of [`applies`]: below this row count the route never runs.
+const MIN_ROWS: usize = 64;
+
+/// Bytes of the thread-local A scratch for a `rows`-row step: `round64(rows)`
+/// rows of [`A_ROW_BYTES`] (KKT writes whole 64-row blocks). 0 below the
+/// [`applies`] row floor, where the route never allocates; `None` on overflow.
+pub fn workspace_a_bytes(rows: usize) -> Option<usize> {
+    if rows < MIN_ROWS {
+        return Some(0);
+    }
+    rows.div_ceil(64).checked_mul(64)?.checked_mul(A_ROW_BYTES)
+}
+
+/// Bytes of the thread-local zero-entry EF scratch (one per allocation, rows-independent);
+/// 0 below the [`applies`] row floor.
+pub fn workspace_ef_bytes(rows: usize) -> usize {
+    if rows < MIN_ROWS { 0 } else { EF_BYTES }
+}
+
+/// Total thread-local workspace (A + EF) of the dense scan for `rows` rows,
+/// `None` on overflow. Excludes the aliased Q/K/V/G/scan-output views.
+pub fn workspace_bytes(rows: usize) -> Option<usize> {
+    workspace_a_bytes(rows)?.checked_add(workspace_ef_bytes(rows))
+}
 
 struct Scratch {
     rows: usize,
@@ -57,7 +83,7 @@ pub fn applies(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
         && p.projection.dtype == DType::F32
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
-        && n >= 64
+        && n >= MIN_ROWS
         && (n % 512 == 0 || (64..512).contains(&(n % 512)))
 }
 
@@ -104,7 +130,12 @@ pub fn run(
         Some(s) => s,
         None => Scratch {
             rows: n64,
-            a: gpu.zeros(&[n64 * 48 * 64 * 2], DType::Raw)?,
+            a: gpu.zeros(
+                &[workspace_a_bytes(n).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "fn_gdn_dense: A scratch extent overflow")
+                })?],
+                DType::Raw,
+            )?,
             ef: gpu.zeros(&[EF_BYTES], DType::Raw)?,
         },
     };
@@ -166,5 +197,21 @@ pub fn gate(
         args.push_i32(p.value_heads as i32);
         args.push_i32(p.value_dim as i32);
         launch(gpu, "fn_gdn_dense_gate_bf16in", [(elements / 128) as u32, 1, 1], 32, &mut args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_bytes_match_flash_next_4096() {
+        assert_eq!(workspace_a_bytes(4096), Some(25_165_824));
+        assert_eq!(workspace_ef_bytes(4096), 1_572_864);
+        assert_eq!(workspace_bytes(4096), Some(26_738_688));
+        // A rounds up to whole 64-row blocks; the route needs n >= 64.
+        assert_eq!(workspace_a_bytes(65), workspace_a_bytes(128));
+        assert_eq!(workspace_bytes(63), Some(0));
+        assert_eq!(workspace_a_bytes(usize::MAX), None);
     }
 }

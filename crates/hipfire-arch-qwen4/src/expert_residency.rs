@@ -240,12 +240,9 @@ pub fn language_head_dtype(weights: &[WeightEntry]) -> Option<rdna_compute::DTyp
 /// measured [`AUTO_VRAM_RESERVE_CHUNK`] layout, `mtp_bytes` when a native MTP
 /// speculator attaches (`mtp_spec::native_mtp_device_bytes`), and
 /// `gather_bytes` for the gathered QSA prefill attention's workspace
-/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`), and
-/// [`QWEN4_FORWARD_HEADROOM_BYTES`](crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES)
-/// for the kernels' lazily sized `GpuPool` workspaces (333-347 MiB at pp8192
-/// on gfx1201), which nothing allocated at load covers and the first long
-/// prefill grows (the chunk rung selection at bundle build keeps the same
-/// amount free). Only
+/// (`rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes`). This is
+/// the historical measured formula: the floor of [`AutoReserve`], which
+/// takes the larger of it and the bottom-up [`ReserveCensus`]. Only
 /// committed bytes are charged: VMM context arenas commit the first chunk's
 /// pages (inside the measured layout), their virtual extent nothing, so the
 /// admitted context does not size a VMM reserve; legacy arenas commit all
@@ -316,19 +313,223 @@ pub fn auto_vram_reserve(
         .and_then(|bytes| bytes.checked_sub(measured))
         .and_then(|bytes| bytes.checked_add(mtp_bytes.unwrap_or(0)))
         .and_then(|bytes| bytes.checked_add(gather_bytes.unwrap_or(0)))
-        .and_then(|bytes| bytes.checked_add(lazy_workspace_reserve_bytes()))
         .ok_or_else(|| "auto expert VRAM reserve overflows".to_string())
 }
 
-/// VRAM `auto` keeps free for the kernels' lazily sized `GpuPool`
-/// workspaces, which grow at the first long prefill beyond everything the
-/// load allocates. The engine's own fixed bound
-/// ([`QWEN4_FORWARD_HEADROOM_BYTES`](crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES),
-/// the headroom the prefill chunk rung selection keeps); the single place
-/// [`auto_vram_reserve`] reads it, so an exact max-chunk pool query replaces
-/// it here alone.
-pub fn lazy_workspace_reserve_bytes() -> u64 {
-    crate::gpu_forward::QWEN4_FORWARD_HEADROOM_BYTES
+/// Number of itemised terms of the kernels' pool workspace
+/// (`rdna_compute::scratch::qwen4_prefill_workspace_terms`).
+pub const WORKSPACE_TERM_COUNT: usize = 11;
+
+/// A bottom-up census of what one load's first full-context request takes
+/// beyond the resident weights, term by term: the state's QSA context at the
+/// admitted `max_seq` as the actual backend maps it, the rest of the request
+/// state, the chunk-sized forward resources, the lazy F16 weight shadows, the
+/// kernels' pool workspace (itemised by the engine), the QSA split
+/// selector's scratch, native MTP and the QSA gather workspace. `auto`
+/// keeps the larger of this and the historical measured formula
+/// ([`auto_vram_reserve`]) free ([`AutoReserve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReserveCensus {
+    pub qsa_context: u64,
+    pub state: u64,
+    pub forward: u64,
+    pub f16_shadows: u64,
+    pub workspace: [(&'static str, u64); WORKSPACE_TERM_COUNT],
+    pub qsa_selector: u64,
+    pub mtp: u64,
+    pub gather: u64,
+}
+
+impl ReserveCensus {
+    /// Every term, named, in log order.
+    pub fn terms(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        [
+            ("QSA context", self.qsa_context),
+            ("state", self.state),
+            ("forward", self.forward),
+            ("F16 weight shadows", self.f16_shadows),
+            ("QSA selector", self.qsa_selector),
+            ("native MTP", self.mtp),
+            ("QSA gather", self.gather),
+        ]
+        .into_iter()
+        .chain(self.workspace.iter().copied())
+    }
+
+    /// Sum of every term, checked.
+    pub fn total(&self) -> Result<u64, String> {
+        self.terms().try_fold(0u64, |total, (name, bytes)| {
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| format!("reserve census overflows at '{name}'"))
+        })
+    }
+
+    /// `name MiB, ...` for the placement log, every term.
+    pub fn describe(&self) -> String {
+        let mut text = String::new();
+        for (name, bytes) in self.terms() {
+            if !text.is_empty() {
+                text.push_str(", ");
+            }
+            text.push_str(&format!("{name} {} MiB", bytes >> 20));
+        }
+        text
+    }
+}
+
+/// The state-derived census terms ([`ReserveCensus::qsa_context`],
+/// [`ReserveCensus::state`], [`ReserveCensus::forward`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateCensus {
+    pub qsa_context: u64,
+    pub state: u64,
+    pub forward: u64,
+}
+
+/// The census terms the state and forward determine, for a load whose
+/// context storage is `context`: pass the ACTUAL backend with the whole
+/// admitted context mapped (`Qwen4ContextCommit::new(backend, max_seq,
+/// max_seq, granularity)`), never the legacy-forced expert-reserve layout.
+///
+/// - `qsa_context`: the trunk QSA context arenas as `context` commits them
+///   (VMM: each arena's mapped pages rounded to the driver granularity).
+/// - `state`: the rest of `Qwen4State::device_bytes` (GDN recurrent and
+///   conv with the snapshot arena's mirror, the QSA fixed arenas, PLE conv,
+///   hyper feedback), the QSA context counted once in `qsa_context`.
+/// - `forward`: [`crate::gpu_forward::qwen4_forward_device_bytes`] at
+///   `chunk_rows` in `mode`.
+pub fn state_census(
+    config: &Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    context: &crate::Qwen4ContextCommit,
+    chunk_rows: usize,
+    mode: Qwen4ForwardScratchMode,
+) -> Result<StateCensus, String> {
+    let overflow = |what: &str| format!("reserve census {what} overflows");
+    let qsa_context = context
+        .committed_layer_bytes(config, format.layout())
+        .and_then(|bytes| bytes.checked_mul(config.n_full_layers()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("QSA context"))?;
+    let state = crate::state::Qwen4State::device_bytes(config, format, context)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| overflow("state"))?;
+    let state = state
+        .checked_sub(qsa_context)
+        .ok_or_else(|| overflow("state without its QSA context"))?;
+    let forward = crate::gpu_forward::qwen4_forward_device_bytes(config, chunk_rows, mode)
+        .ok_or_else(|| overflow("forward resources"))?;
+    Ok(StateCensus { qsa_context, state, forward })
+}
+
+/// Name suffixes, below a trunk layer's `model.language_model.layers.{i}.`
+/// prefix, of the BF16 matrices the long-prefill F16 WMMA routes read through
+/// a model-lifetime F16 shadow (`Gpu::ensure_bf16_f16_shadow`, keyed by the
+/// weight pointer): hyper-connection down mixes, the router, the shared
+/// expert's gate/up/down and the PLE key/value projections. The direct BF16
+/// readers (`input_mix_weight_up`, `shared_expert_gate`) and every other
+/// tensor are not shadowed.
+const F16_SHADOW_LAYER_SUFFIXES: [&str; 8] = [
+    "attn_hyper_connection.input_mix_weight_down.weight",
+    "mlp_hyper_connection.input_mix_weight_down.weight",
+    "mlp.gate.weight",
+    "mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_expert.up_proj.weight",
+    "mlp.shared_expert.down_proj.weight",
+    "ple.key_proj.weight",
+    "ple.value_proj.weight",
+];
+
+/// The final hyper-connection's down mix, shadowed like the per-layer ones.
+const F16_SHADOW_ROOT: &str = "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight";
+
+/// Device bytes of the lazy F16 weight shadows the long-prefill routes can
+/// create for the trunk: for every resident, non-tied BF16 rank-2 entry of
+/// [`F16_SHADOW_ROOT`] or a [`F16_SHADOW_LAYER_SUFFIXES`] tensor of a trunk
+/// layer `0..num_layers`, the whole F16 matrix (`2 * rows * cols`, the full
+/// payload). A conservative cold bound: the shadows exist only when the F16
+/// WMMA arms run (exact gfx1201, long prefill, K a multiple of 64), but they
+/// are charged whenever the manifest owns the weights, never from the
+/// current warm cache. Entries are the manifest's own, so a profile or dtype
+/// without them (an MQ-quantized trunk) charges nothing.
+pub fn f16_shadow_bytes(weights: &[WeightEntry], num_layers: usize) -> Result<u64, String> {
+    use rdna_compute::DType;
+    const LAYER_PREFIX: &str = "model.language_model.layers.";
+    let shadowed = |name: &str| {
+        if name == F16_SHADOW_ROOT {
+            return true;
+        }
+        name.strip_prefix(LAYER_PREFIX)
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(layer, suffix)| {
+                layer.parse::<usize>().is_ok_and(|layer| layer < num_layers)
+                    && F16_SHADOW_LAYER_SUFFIXES.contains(&suffix)
+            })
+    };
+    weights
+        .iter()
+        .filter(|entry| {
+            entry.dtype == DType::BF16
+                && entry.logical_shape.len() == 2
+                && !entry.residency.is_external()
+                && !matches!(entry.policy, ShardPolicy::Tied { .. })
+                && shadowed(&entry.name)
+        })
+        .try_fold(0u64, |total, entry| {
+            let bytes = entry.logical_shape[0]
+                .checked_mul(entry.logical_shape[1])
+                .and_then(|elements| elements.checked_mul(2))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| format!("F16 shadow bytes of '{}' overflow", entry.name))?;
+            Ok(bytes)
+        })
+}
+
+/// The reserve `auto` keeps free: the larger of the historical measured
+/// formula (`historical`, [`auto_vram_reserve`], the floor, no longer
+/// evidence of what a long context takes) and the bottom-up
+/// [`ReserveCensus`]. The whole-layer stage buffers and safety margin
+/// ([`PlacementCharges`]) are added on top of [`Self::bytes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoReserve {
+    pub historical: u64,
+    pub census: ReserveCensus,
+    pub census_total: u64,
+}
+
+impl AutoReserve {
+    pub fn new(historical: u64, census: ReserveCensus) -> Result<Self, String> {
+        let census_total = census.total()?;
+        Ok(Self { historical, census, census_total })
+    }
+
+    /// The bytes `auto` reserves: `max(historical, census)`.
+    pub fn bytes(&self) -> u64 {
+        self.historical.max(self.census_total)
+    }
+
+    /// Which formula set [`Self::bytes`].
+    pub fn winner(&self) -> &'static str {
+        if self.census_total > self.historical {
+            "census"
+        } else {
+            "historical floor"
+        }
+    }
+
+    /// The reserve and its parts for the placement log, every census term.
+    pub fn describe(&self) -> String {
+        format!(
+            "{} MiB = max({} MiB historical floor, {} MiB census [{}]): {} wins",
+            self.bytes() >> 20,
+            self.historical >> 20,
+            self.census_total >> 20,
+            self.census.describe(),
+            self.winner()
+        )
+    }
 }
 
 /// The largest trunk-layer count whose routed experts fit in `free_vram`
@@ -454,9 +655,10 @@ pub fn dedicated_slab_stage(stage_enabled: bool, slab_recipe: bool, expert_paral
 }
 
 /// What a whole-layer placement (`auto`, or the unset fallback that decides
-/// whether everything is resident) keeps free beyond [`auto_vram_reserve`]
-/// (which already holds the chunk-sized forward resources and the kernels'
-/// lazy workspace headroom), itemised for the placement log:
+/// whether everything is resident) keeps free beyond [`AutoReserve::bytes`]
+/// (the larger of the historical formula and the full-context census, which
+/// already hold the chunk-sized forward resources and the pool workspace),
+/// itemised for the placement log:
 ///
 /// - `margin`: [`EXPERT_HOTSET_VRAM_MARGIN_BYTES`], the driver/allocator
 ///   safety margin the hot set budget keeps.
@@ -1141,14 +1343,8 @@ mod tests {
         let free = 32548u64 << 20;
         let config = crate::config::compact_test_config();
         let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        // The layer counts below were measured before the reserve charged the
-        // lazy workspace headroom; keep that layout so they stay the
-        // measured-card record (the headroom is asserted in
-        // `reserve_charges_the_lazy_workspace_headroom`).
-        let reserve = |chunk| {
-            auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap()
-                - lazy_workspace_reserve_bytes()
-        };
+        let reserve =
+            |chunk| auto_vram_reserve(&config, &measured, chunk, Full, F32, None, None).unwrap();
         // Verify-sized spec logits free 1472 logit rows of the measured
         // 1536-row layout: one layer past the measured N = 16 fits.
         let measured_chunk = reserve(AUTO_VRAM_RESERVE_CHUNK);
@@ -1176,66 +1372,316 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reserve_charges_the_lazy_workspace_headroom() {
-        // At the measured context and chunk the QSA term cancels, but the
-        // current forward's speculative logits cover fewer rows than the
-        // historical all-row measured layout, so the reserve is the measured
-        // constant, plus the current forward, minus the historical measured
-        // forward (Full scratch and all-row speculative logits), plus the
-        // engine's headroom for the kernels' lazily sized workspaces, which
-        // no load-time allocation covers.
-        let config = crate::config::compact_test_config();
-        let measured = crate::Qwen4ContextCommit::legacy(AUTO_VRAM_RESERVE_MAX_SEQ);
-        let reserve = auto_vram_reserve(
-            &config, &measured, AUTO_VRAM_RESERVE_CHUNK, Full, F32, None, None,
-        )
-        .unwrap();
-        let forward =
-            crate::gpu_forward::qwen4_forward_device_bytes(&config, AUTO_VRAM_RESERVE_CHUNK, Full)
-                .unwrap();
-        let historical = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
-            &config, AUTO_VRAM_RESERVE_CHUNK, Full,
-        )
-        .unwrap()
-            + (AUTO_VRAM_RESERVE_CHUNK * (config.vocab_size * 4 + 4)) as u64;
-        assert_eq!(
-            reserve,
-            AUTO_VRAM_RESERVE_BYTES + forward - historical + lazy_workspace_reserve_bytes()
-        );
-    }
-
     /// The card-E record (daemon p6, 763 tokens): 32550 MiB free, 5115 MiB
-    /// non-expert, 1060 MiB per slab layer, 7927 MiB reserve before the
-    /// headroom, stage and margin were charged.
+    /// non-expert, 1060 MiB per slab layer, 7927 MiB historical reserve.
     const EVIDENCE: (u64, u64, u64, u64) = (32550 << 20, 5115 << 20, 1060 << 20, 7927 << 20);
 
-    #[test]
-    fn evidence_placement_keeps_fewer_layers_once_scratch_stage_and_margin_are_charged() {
-        let (free, non_expert, layer, unfixed) = EVIDENCE;
-        let layers = |reserve| auto_vram_layers(free, non_expert, layer, 49, reserve);
-        // Unfixed: (32550 - 5115 - 7927) / 1060 = 18.40 -> 18 resident
-        // layers, leaving 428 MiB for 2 x 1060 MiB of stage buffers.
-        assert_eq!(layers(unfixed), 18);
-        // The headroom `auto_vram_reserve` now charges moves 18 to 17.
-        let base = unfixed + lazy_workspace_reserve_bytes();
-        assert_eq!(layers(base), 17);
-        // Slab stage on: scratch 1024 + margin 512 + stage 2 x (1060 MiB +
-        // 4096 B) = 2120 MiB + 8192 B on top of the 7927 MiB.
+    /// A census of the five terms given, a workspace of 153,256,072 B (the
+    /// 4096-row target table, in its first term) and zero MTP and gather.
+    fn census_with(
+        qsa_context: u64,
+        state: u64,
+        forward: u64,
+        f16_shadows: u64,
+        qsa_selector: u64,
+    ) -> ReserveCensus {
+        let mut workspace = [("workspace", 0u64); WORKSPACE_TERM_COUNT];
+        workspace[0].1 = 153_256_072;
+        ReserveCensus {
+            qsa_context,
+            state,
+            forward,
+            f16_shadows,
+            workspace,
+            qsa_selector,
+            mtp: 0,
+            gather: 0,
+        }
+    }
+
+    /// The target profile's actual state formats: fp8 QSA K/V, Q8 GDN.
+    fn target_state_format() -> crate::Qwen4StateFormat {
+        crate::Qwen4StateFormat {
+            qsa: QsaKvFormat::Fp8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        }
+    }
+
+    /// The 48-layer target's F16-shadowed owners (BF16, rank 2): the final
+    /// and every layer's two hyper-connection down mixes (97), each router
+    /// and shared gate/up/down (48 + 144), and the PLE layer's key/value.
+    fn target_f16_manifest() -> Vec<WeightEntry> {
+        let layer = |i: usize, suffix: &str| format!("model.language_model.layers.{i}.{suffix}");
+        let mut weights = vec![bf16(
+            "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+            &[320, 10240],
+        )];
+        for i in 0..48 {
+            weights.push(bf16(&layer(i, "attn_hyper_connection.input_mix_weight_down.weight"), &[320, 10240]));
+            weights.push(bf16(&layer(i, "mlp_hyper_connection.input_mix_weight_down.weight"), &[320, 10240]));
+            weights.push(bf16(&layer(i, "mlp.gate.weight"), &[512, 2560]));
+            weights.push(bf16(&layer(i, "mlp.shared_expert.gate_proj.weight"), &[640, 2560]));
+            weights.push(bf16(&layer(i, "mlp.shared_expert.up_proj.weight"), &[640, 2560]));
+            weights.push(bf16(&layer(i, "mlp.shared_expert.down_proj.weight"), &[2560, 640]));
+        }
+        weights.push(bf16(&layer(2, "ple.key_proj.weight"), &[6400, 2560]));
+        weights.push(bf16(&layer(2, "ple.value_proj.weight"), &[6400, 2560]));
+        weights
+    }
+
+    /// The full-context census of the target profile on a VMM discrete card
+    /// at `max_seq` (native MTP off), every term from its owning query.
+    fn real_census(config: &Qwen4Config, max_seq: usize) -> ReserveCensus {
+        let format = target_state_format();
+        let chunk = crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201");
+        let context =
+            crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, max_seq, max_seq, 2 << 20);
+        let state = state_census(config, format, &context, chunk, Full).unwrap();
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            dense_gdn: true,
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        ReserveCensus {
+            qsa_context: state.qsa_context,
+            state: state.state,
+            forward: state.forward,
+            f16_shadows: f16_shadow_bytes(&target_f16_manifest(), config.num_hidden_layers).unwrap(),
+            workspace: rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap(),
+            qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64,
+            mtp: 0,
+            gather: rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                max_seq,
+            )
+            .unwrap() as u64,
+        }
+    }
+
+    /// Placement of the reproduction card with the real census: the layers
+    /// the unfixed planner kept (`historical` alone), what stage and margin
+    /// on the historical floor leave, and what the census-backed reserve
+    /// leaves.
+    fn replay(
+        free: u64,
+        non_expert: u64,
+        layer: u64,
+        historical: u64,
+        census: ReserveCensus,
+    ) -> (usize, usize, usize, AutoReserve, PlacementCharges) {
+        let reserve = AutoReserve::new(historical, census).unwrap();
         let charges = PlacementCharges::new(layer, true).unwrap();
+        let unfixed = auto_vram_layers(free, non_expert, layer, 49, historical);
+        let floor_charged = auto_vram_layers(
+            free,
+            non_expert,
+            layer,
+            49,
+            charges.reserve(historical).unwrap(),
+        );
+        let placed =
+            auto_placement_layers(free, non_expert, layer, 49, reserve.bytes(), &charges).unwrap();
+        (unfixed, floor_charged, placed, reserve, charges)
+    }
+
+    #[test]
+    fn real_census_terms_come_from_their_owning_queries() {
+        let config = crate::config::compact_test_config();
+        let census = real_census(&config, 16384);
+        // 97 + 144 + 48 + 2 shadowed BF16 owners.
+        assert_eq!(census.f16_shadows, 1_298_923_520);
+        // The 4096-row pool workspace with every short tail.
+        assert_eq!(census.workspace.iter().map(|term| term.1).sum::<u64>(), 153_256_072);
+        // The split selector's constant score + filter extent.
+        assert_eq!(census.qsa_selector, 83_894_272);
+        assert!(census.gather > 0 && census.forward > 0 && census.state > 0);
+        assert_eq!(census.mtp, 0);
+    }
+
+    #[test]
+    fn evidence_placement_charges_the_full_context_and_keeps_fewer_layers() {
+        let (free, non_expert, layer, historical) = EVIDENCE;
+        let config = crate::config::compact_test_config();
+        // The p6 run's 16384-token context, VMM fp8 state: 12 trunk QSA
+        // layers x 26 MiB, 312 MiB with the 2 MiB granularity.
+        let census = real_census(&config, 16384);
+        assert_eq!(census.qsa_context, 312 << 20);
+        let (unfixed, floor_charged, placed, reserve, charges) =
+            replay(free, non_expert, layer, historical, census);
+        // The beta that ran out of memory kept the historical reserve alone:
+        // (32550 - 5115 - 7927) / 1060 = 18.40 -> 18 resident layers.
+        assert_eq!(unfixed, 18);
+        // Stage + margin on the floor already cost layers; the census never
+        // raises the count.
+        assert!(floor_charged < 18);
+        assert!(placed <= floor_charged && placed < 18);
+        // The whole full-context reserve plus margin and both stage buffers
+        // is left free, and one more layer would not leave it.
         assert_eq!(charges.margin, 512 << 20);
         assert_eq!(charges.stage, 2 * ((1060 << 20) + 4096));
-        let reserve = charges.reserve(base).unwrap();
-        assert_eq!(reserve, (7927 + 1024 + 512 + 2120) * (1 << 20) + 8192);
-        let placed = auto_placement_layers(free, non_expert, layer, 49, base, &charges).unwrap();
-        assert_eq!(placed, 14);
-        assert!(placed < 18);
-        // The staged forward fits: the chosen layers leave the whole reserve
-        // (scratch, margin and both stage buffers), one more would not.
-        assert!(free - non_expert - placed as u64 * layer >= reserve);
-        assert!(free - non_expert - (placed as u64 + 1) * layer < reserve);
+        let charged = charges.reserve(reserve.bytes()).unwrap();
+        assert!(free - non_expert - placed as u64 * layer >= charged);
+        assert!(free - non_expert - (placed as u64 + 1) * layer < charged);
+        // Every census term is itemised in the log text.
+        let text = reserve.describe();
+        for name in ["QSA context", "state", "forward", "F16 weight shadows", "QSA selector", "native MTP", "QSA gather", "fp16_x", "ksplit_det", "gdn_pair_counters"] {
+            assert!(text.contains(name), "{name}: {text}");
+        }
         assert!(charges.describe().contains("512 MiB safety margin"));
         assert!(charges.describe().contains("2120 MiB long-prefill stage buffers"));
+    }
+
+    #[test]
+    fn mq2_16k_failure_card_charges_the_full_qsa_context_and_places_fewer_layers() {
+        // r9700.speed.json first_failure: free 32550 MiB, non-expert 5115,
+        // reserve 7929, 840 MiB per layer, max_seq 17408 on a VMM fp8 / Q8 GDN
+        // state: (32550 - 5115 - 7929) / 840 = 23.2 -> layers 0..23 resident,
+        // then the 16343-token prefill ran out of memory mapping the QSA
+        // context.
+        let (free, non_expert, layer, historical) =
+            (32550u64 << 20, 5115u64 << 20, 840u64 << 20, 7929u64 << 20);
+        let config = crate::config::compact_test_config();
+        let census = real_census(&config, 17_408);
+        // 12 trunk QSA layers x 28 MiB with the 2 MiB granularity.
+        assert_eq!(census.qsa_context, 336 << 20);
+        // The actual full map exceeds what the first prefill chunk maps: the
+        // growth the historical floor charges as zero.
+        let first = crate::Qwen4ContextCommit::new(crate::Qwen4KvBackend::Vmm, 17_408, 1536, 2 << 20);
+        let first = state_census(&config, target_state_format(), &first, 4096, Full).unwrap();
+        assert!(census.qsa_context > first.qsa_context);
+        let (unfixed, floor_charged, placed, reserve, _) =
+            replay(free, non_expert, layer, historical, census);
+        assert_eq!(unfixed, 23);
+        assert!(floor_charged < 23);
+        assert!(placed <= floor_charged && placed < 23);
+        assert!(reserve.describe().contains("QSA context"));
+    }
+
+    #[test]
+    fn the_census_winner_sets_the_reserve_and_every_term_is_itemised() {
+        let (free, non_expert, layer, historical) = EVIDENCE;
+        let census = census_with(
+            2000 << 20,
+            1000 << 20,
+            5000 << 20,
+            1_298_923_520,
+            83_894_272,
+        );
+        let total = (2000 + 1000 + 5000) * (1u64 << 20) + 1_298_923_520 + 153_256_072 + 83_894_272;
+        let reserve = AutoReserve::new(historical, census).unwrap();
+        assert_eq!(reserve.census_total, total);
+        assert!(total > historical);
+        assert_eq!(reserve.bytes(), total);
+        assert_eq!(reserve.winner(), "census");
+        let text = reserve.describe();
+        for name in ["QSA context", "state", "forward", "F16 weight shadows", "workspace", "QSA selector", "native MTP", "QSA gather"] {
+            assert!(text.contains(name), "{name}: {text}");
+        }
+        assert!(text.contains("census wins") && text.contains("7927 MiB historical floor"), "{text}");
+        // The census, not the floor, sizes the placement.
+        let by_floor = auto_vram_layers(free, non_expert, layer, 49, historical);
+        let by_census = auto_vram_layers(free, non_expert, layer, 49, reserve.bytes());
+        assert!(by_census < by_floor);
+        let overflowing = ReserveCensus {
+            gather: 1,
+            qsa_context: u64::MAX,
+            ..census_with(0, 0, 0, 0, 0)
+        };
+        assert!(AutoReserve::new(0, overflowing).is_err());
+    }
+
+    #[test]
+    fn state_census_charges_the_actual_backends_full_context_once() {
+        let config = crate::config::compact_test_config();
+        let max_seq = 17_408;
+        let granularity = 2 << 20;
+        // The reference F32 state and the target's actual fp8 K/V + Q8 GDN.
+        for format in [crate::Qwen4StateFormat::F32, target_state_format()] {
+            for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
+                // Whole admitted context mapped, as the actual backend maps it.
+                let full = crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, granularity);
+                let census = state_census(&config, format, &full, 4096, Full).unwrap();
+                let context = full.committed_layer_bytes(&config, format.layout()).unwrap()
+                    * config.n_full_layers();
+                assert_eq!(census.qsa_context, context as u64, "{backend:?} {format:?}");
+                // The rest of the state plus the context is exactly the state.
+                let state = crate::state::Qwen4State::device_bytes(&config, format, &full).unwrap();
+                assert_eq!(
+                    census.qsa_context + census.state,
+                    state as u64,
+                    "{backend:?} {format:?}"
+                );
+                assert_eq!(
+                    census.forward,
+                    crate::gpu_forward::qwen4_forward_device_bytes(&config, 4096, Full).unwrap()
+                );
+                // Not the first chunk's pages: growth past them is charged.
+                let first = crate::Qwen4ContextCommit::new(backend, max_seq, 1536, granularity);
+                let first = state_census(&config, format, &first, 4096, Full).unwrap();
+                if backend == crate::Qwen4KvBackend::Vmm {
+                    assert!(census.qsa_context > first.qsa_context, "{format:?}");
+                }
+            }
+        }
+    }
+
+    fn bf16(name: &str, shape: &[usize]) -> WeightEntry {
+        WeightEntry::model(name, shape.to_vec(), DType::BF16, ShardPolicy::Replicate)
+    }
+
+    #[test]
+    fn f16_shadow_bytes_query_the_manifest_for_the_shadowed_owners_only() {
+        let layer = |i: usize, suffix: &str| format!("model.language_model.layers.{i}.{suffix}");
+        let mut weights = vec![
+            // Shadowed: full F16 matrices, 2 bytes per element.
+            bf16("model.language_model.hyper_connection_mixer.input_mix_weight_down.weight", &[4, 8]),
+            bf16(&layer(0, "attn_hyper_connection.input_mix_weight_down.weight"), &[2, 2]),
+            bf16(&layer(1, "mlp_hyper_connection.input_mix_weight_down.weight"), &[2, 2]),
+            bf16(&layer(0, "mlp.gate.weight"), &[3, 5]),
+            bf16(&layer(0, "mlp.shared_expert.gate_proj.weight"), &[3, 5]),
+            bf16(&layer(0, "mlp.shared_expert.up_proj.weight"), &[3, 5]),
+            bf16(&layer(0, "mlp.shared_expert.down_proj.weight"), &[5, 3]),
+            bf16(&layer(0, "ple.key_proj.weight"), &[1, 7]),
+            bf16(&layer(0, "ple.value_proj.weight"), &[1, 7]),
+            // Direct BF16 readers and other tensors: no shadow.
+            bf16(&layer(0, "attn_hyper_connection.input_mix_weight_up.weight"), &[2, 2]),
+            bf16(&layer(0, "mlp.shared_expert_gate.weight"), &[1, 9]),
+            bf16(&layer(0, "input_layernorm.weight"), &[1, 9]),
+            // Past the trunk, wrong rank or wrong dtype: no shadow.
+            bf16(&layer(2, "mlp.gate.weight"), &[3, 5]),
+            bf16(&layer(0, "ple.key_proj.weight.extra"), &[1, 7]),
+            WeightEntry::model(
+                layer(1, "mlp.gate.weight"),
+                vec![3, 5],
+                DType::MQ4G256V2,
+                ShardPolicy::Replicate,
+            ),
+            bf16(&layer(1, "mlp.gate.weight"), &[15]),
+        ];
+        let expected = 2 * (4 * 8 + 2 * 2 + 2 * 2 + 3 * 5 + 3 * 5 + 3 * 5 + 5 * 3 + 7 + 7);
+        assert_eq!(f16_shadow_bytes(&weights, 2), Ok(expected as u64));
+        // An alias or external row store has no payload of its own.
+        weights.push(WeightEntry::model(
+            layer(1, "mlp.gate.weight"),
+            vec![3, 5],
+            DType::BF16,
+            ShardPolicy::Tied { source: "x".into() },
+        ));
+        assert_eq!(f16_shadow_bytes(&weights, 2), Ok(expected as u64));
+        // An MQ-quantized trunk (no BF16 owners) charges nothing.
+        assert_eq!(f16_shadow_bytes(&[], 48), Ok(0));
+        // The 48-layer total the target profile pins: 97 HC down, 144 shared,
+        // 48 routers, 2 PLE.
+        let target: u64 = 1_298_923_520;
+        assert_eq!(target, 1238 * (1 << 20) + (3 << 18));
     }
 
     #[test]
@@ -1245,15 +1691,14 @@ mod tests {
         assert!(!dedicated_slab_stage(false, true, false));
         assert!(!dedicated_slab_stage(true, false, false));
         assert!(!dedicated_slab_stage(true, true, true));
-        let (free, non_expert, layer, unfixed) = EVIDENCE;
-        let base = unfixed + lazy_workspace_reserve_bytes();
+        let (free, non_expert, layer, base) = EVIDENCE;
         let off = PlacementCharges::new(layer, false).unwrap();
         assert_eq!(off, PlacementCharges { margin: 512 << 20, stage: 0 });
         assert_eq!(off.reserve(base).unwrap(), base + (512 << 20));
-        // No stage: only the margin and headroom cost layers
-        // ((32550 - 5115 - 7927 - 1024 - 512) / 1060 = 16.95).
+        // No stage: only the margin costs layers
+        // ((32550 - 5115 - 7927 - 512) / 1060 = 17.9).
         let unstaged = auto_placement_layers(free, non_expert, layer, 49, base, &off).unwrap();
-        assert_eq!(unstaged, 16);
+        assert_eq!(unstaged, 17);
         let staged = PlacementCharges::new(layer, true).unwrap();
         let staged = auto_placement_layers(free, non_expert, layer, 49, base, &staged).unwrap();
         assert!(staged < unstaged);
@@ -1268,8 +1713,7 @@ mod tests {
 
     #[test]
     fn charged_placement_refuses_clearly_when_zero_layers_do_not_fit() {
-        let (_, non_expert, layer, unfixed) = EVIDENCE;
-        let base = unfixed + lazy_workspace_reserve_bytes();
+        let (_, non_expert, layer, base) = EVIDENCE;
         let charges = PlacementCharges::new(layer, true).unwrap();
         let need = non_expert + charges.reserve(base).unwrap();
         // Exactly the weights and the charged reserve: zero resident layers.
