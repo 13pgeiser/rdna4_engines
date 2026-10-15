@@ -491,7 +491,11 @@ pub struct HfqSourceIdentity {
 /// those sealed files.
 struct HfqRangeReader {
     identity: Arc<SourceIdentity>,
-    file: File,
+    /// The container's own open file, shared by every range of it: one
+    /// descriptor per HFQ file however many ranges are live (a Flash-Next EP
+    /// rank keeps ~130 ranges for its lifetime; a descriptor each ran a
+    /// many-rank load into `RLIMIT_NOFILE`). Reads are positional.
+    file: Arc<File>,
     file_identity: SourceFileIdentity,
     /// The file's `evict_page_cache` policy when the range was taken: the
     /// weight upload's bytes are dropped from the page cache after upload.
@@ -543,7 +547,9 @@ pub struct RecommendedSampling {
 }
 
 pub struct HfqFile {
-    _file: File,
+    /// Open container file, shared with every range reader handed out by
+    /// [`Self::tensor_range`] / [`Self::span_range`].
+    _file: Arc<File>,
     /// Path used to open the file. Exposed via [`Self::path`] so the
     /// weight pager can open its own file handle for paged reads without
     /// going through this struct (cleanly separates HfqFile's mmap-based
@@ -1299,7 +1305,7 @@ impl HfqFile {
             }
         }
         let me = Self {
-            _file: file,
+            _file: Arc::new(file),
             path: path.to_path_buf(),
             source_file_identity,
             mmap: Some(mmap),
@@ -2023,10 +2029,7 @@ impl HfqFile {
                 reason: format!("HFQ source file index {file_index} is not sealed"),
             })?
             .clone();
-        let file = target._file.try_clone().map_err(|source| SourceError::Io {
-            offset: info.data_offset as u64,
-            source,
-        })?;
+        let file = Arc::clone(&target._file);
         let reader = SourceReader::from_inner(HfqRangeReader {
             identity: source_identity.clone(),
             file,
@@ -2062,10 +2065,7 @@ impl HfqFile {
                 reason: "HFQ source file index 0 is not sealed".to_string(),
             })?
             .clone();
-        let file = self._file.try_clone().map_err(|source| SourceError::Io {
-            offset: offset as u64,
-            source,
-        })?;
+        let file = Arc::clone(&self._file);
         let reader = SourceReader::from_inner(HfqRangeReader {
             identity: source_identity.clone(),
             file,
@@ -4235,6 +4235,46 @@ mod range_upload_release_tests {
             range.read_exact(&mut bytes).unwrap();
             assert_eq!(bytes, data);
         }
+    }
+
+    /// Every range of one container reads through the container's own
+    /// descriptor: holding many ranges (as an EP rank does for its lifetime)
+    /// opens no further descriptors on the file, and the ranges stay readable
+    /// after the container is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ranges_share_the_container_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weights.hfq");
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let tensors = vec![HfqMemTensor {
+            name: "w".to_string(),
+            quant_type: 16,
+            shape: vec![32, 64],
+            group_size: 0,
+            data: data.clone(),
+        }];
+        write_hfqm_package_mem(&path, 16, "{}", &tensors).unwrap();
+        let target = std::fs::canonicalize(&path).unwrap();
+        let open_on_path = || {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                .filter(|link| *link == target)
+                .count()
+        };
+        let hfq = HfqFile::open(&path).unwrap();
+        let base = open_on_path();
+        let mut ranges = Vec::new();
+        for _ in 0..256 {
+            ranges.push(hfq.tensor_range("w").unwrap().unwrap());
+            ranges.push(hfq.span_range(0, 64, "u8", vec![64]).unwrap());
+        }
+        assert_eq!(open_on_path(), base);
+        drop(hfq);
+        let mut bytes = vec![0u8; data.len()];
+        ranges[0].read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, data);
     }
 }
 #[cfg(test)]
