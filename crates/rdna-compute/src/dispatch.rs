@@ -5312,10 +5312,10 @@ impl Gpu {
     /// init when a gfx1100 wavegrid route is requested, and the DS4
     /// `rsqrt_once` control-state setup.
     pub fn ensure_device_wait_block(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         if self.device_wait.is_some() {
             return Ok(());
         }
-        self.bind_thread()?;
         self.device_wait = Some(crate::device_wait::DeviceWaitMapping::alloc(
             &self.hip,
             self.device_id,
@@ -5369,6 +5369,7 @@ impl Gpu {
     /// after their copy. This is a single host-memory read, and a no-op on a
     /// GPU that never launched a bounded wait.
     pub fn take_device_wait_error(&self) -> HipResult<()> {
+        // bind_thread: skip — reads host memory only, touches no device state.
         match self.take_device_wait_timeout() {
             Some(timeout) => Err(timeout.to_hip_error()),
             None => Ok(()),
