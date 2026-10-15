@@ -1557,8 +1557,9 @@ fn run_profile_inner(
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
     let manifest_started = Instant::now();
     let source_progress = RefCell::new((0_u64, None::<Instant>, None::<Instant>));
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
@@ -1881,8 +1882,9 @@ pub fn run_state_parity(
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    let weights = oracle_expert_placement(&gpu, &manifest.weights)?;
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads(
-        &manifest.weights,
+        &weights,
         &mesh,
         config.num_hidden_layers,
         &mut gpu,
