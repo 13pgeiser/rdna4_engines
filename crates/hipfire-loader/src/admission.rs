@@ -801,34 +801,13 @@ fn qwen4_ple_rows_layout_present(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
             .any(|tensor| hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name))
 }
 
-/// Stderr progress of a PLE derive: one line per phase and per ~5% step, so a
-/// minutes-long derivation of the q4 rows is visible without flooding the log.
-pub fn ple_progress_printer() -> impl FnMut(&hipfire_runtime::ple_convert::PleProgress) + Send {
-    let mut last: Option<(&'static str, u64)> = None;
-    move |progress| {
-        let percent = match progress.total_bytes {
-            0 => 100,
-            total => progress.done_bytes.min(total).saturating_mul(100) / total,
-        };
-        let step = percent / 5 * 5;
-        if last == Some((progress.phase, step)) {
-            return;
-        }
-        last = Some((progress.phase, step));
-        eprintln!(
-            "  qwen4 ple {}: {percent}% ({:.1} of {:.1} GB)",
-            progress.phase,
-            progress.done_bytes as f64 / 1e9,
-            progress.total_bytes as f64 / 1e9
-        );
-    }
-}
-
 /// Resolve and attach the Qwen4 PLE rows source (`memory.ple_format`) on an
-/// opened HFQ source, deriving the q4 rows when they are missing and the
-/// request allows it.  Idempotent; a no-op for non-HFQ sources and for a
-/// source that is not a PLE-bearing Qwen4 base.  Returns the choice for the
-/// load log (`None` when nothing was resolved).
+/// opened HFQ source.  Sidecars are looked up beside `path` exactly as given,
+/// then beside its canonical target.  A missing sidecar is an error: the load
+/// path never derives (`hipfire ple derive` is the explicit step).  Idempotent;
+/// a no-op for non-HFQ sources and for a source that is not a PLE-bearing
+/// Qwen4 base.  Returns the choice for the load log (`None` when nothing was
+/// resolved).
 pub fn resolve_qwen4_ple_rows(
     source: &mut ModelSource,
     path: &str,
@@ -848,13 +827,26 @@ pub fn resolve_qwen4_ple_rows_hfq(
     path: &str,
     gpu_arch: &str,
 ) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
+    resolve_qwen4_ple_rows_requested(hfq, path, hipfire_config::memory::ple_format(), gpu_arch)
+}
+
+/// [`resolve_qwen4_ple_rows_hfq`] for an explicit `memory.ple_format`
+/// request.  The load path's resolve policy lives here: it never derives a
+/// missing q4 sidecar, whatever the request (a q4 request alone is not
+/// consent to write a ~29 GB file; `hipfire ple derive` is the explicit step).
+fn resolve_qwen4_ple_rows_requested(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    path: &str,
+    request: hipfire_config::memory::PleFormatRequest,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
     if !qwen4_ple_rows_layout_present(hfq) {
         return Ok(None);
     }
     if qwen4_ple_rows_fp8(hfq) {
         // Stock-FP8 PLE rows are the artifact's own qt=56 shards (their scale
         // is per shard): there is no q4/q8 sidecar to resolve or derive.
-        return match hipfire_config::memory::ple_format() {
+        return match request {
             hipfire_config::memory::PleFormatRequest::Auto => Ok(None),
             format => Err(format!(
                 "qwen4: memory.ple_format = {format:?} requests PLE sidecar rows, but this \
@@ -862,15 +854,14 @@ pub fn resolve_qwen4_ple_rows_hfq(
             )),
         };
     }
-    let mut progress = ple_progress_printer();
     hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
         hfq,
         std::path::Path::new(path),
-        hipfire_config::memory::ple_format(),
+        request,
         gpu_arch,
         hipfire_runtime::ple_sidecar::ResolvePolicy {
-            derive_missing_q4: true,
-            progress: Some(&mut progress),
+            derive_missing_q4: false,
+            progress: None,
         },
     )
     .map(Some)
@@ -1692,11 +1683,10 @@ pub fn admit_source_with_options(
         ) {
             return Err(refusal);
         }
-        // The PLE rows source is chosen (and a missing q4 derived from the
-        // q8 rows or the embedded shards) here, before the resident model is
-        // torn down: a refusal (missing sidecar, binding mismatch, no space)
-        // leaves the loaded model in place.  The attached sidecar travels
-        // with `source` to the carrier.
+        // The PLE rows source is chosen here, before the resident model is
+        // torn down: a refusal (missing sidecar, binding mismatch) leaves the
+        // loaded model in place; nothing is derived on this path.  The
+        // attached sidecar travels with `source` to the carrier.
         resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
         let admitted = admit_qwen4_source(
             &source,
@@ -2137,6 +2127,69 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load path never derives a missing q4 sidecar: a `q4` request with
+    /// the q4 rows absent from the selected path and its canonical target is
+    /// an error naming both locations and both remedies, and nothing is
+    /// written next to either.
+    #[cfg(unix)]
+    #[test]
+    fn qwen4_ple_load_path_refuses_instead_of_deriving_a_missing_q4() {
+        use hipfire_config::memory::PleFormatRequest;
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-loader-ple-no-derive-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let models = root.join("models");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let target = store.join("flash-next.mq4-xts");
+        let marker = format!(
+            "{{\"{}\":{{\"version\":1}}}}",
+            hipfire_runtime::ple_sidecar::PLE_BASE_MARKER_KEY
+        );
+        let tensor = HfqMemTensor {
+            name: "model.language_model.layers.1.ple.ple_embedding.layer_multipliers".into(),
+            quant_type: 54,
+            shape: vec![3],
+            group_size: 0,
+            data: (0u8..24).collect(),
+        };
+        write_hfqm_package_mem(&target, 16, &marker, &[tensor]).unwrap();
+        let link = models.join("flash-next.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut hfq = HfqFile::open(&link).unwrap();
+        let link_str = link.to_str().unwrap();
+        for request in [PleFormatRequest::Q4, PleFormatRequest::Q8] {
+            let error = resolve_qwen4_ple_rows_requested(&mut hfq, link_str, request, "gfx1151")
+                .unwrap_err();
+            let selected = format!("{}.ple-", link.display());
+            let canonical = format!("{}.ple-", std::fs::canonicalize(&link).unwrap().display());
+            assert!(
+                error.contains(&selected) && error.contains(&canonical),
+                "{error}"
+            );
+            assert!(error.contains("hipfire pull"), "{error}");
+        }
+        let error =
+            resolve_qwen4_ple_rows_requested(&mut hfq, link_str, PleFormatRequest::Q4, "gfx1151")
+                .unwrap_err();
+        assert!(error.contains("hipfire ple derive --format q4"), "{error}");
+        assert!(hfq.ple_rows().is_none());
+        for dir in [&store, &models] {
+            let written: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(written.len(), 1, "{dir:?}: {written:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {

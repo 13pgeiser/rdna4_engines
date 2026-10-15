@@ -1799,7 +1799,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Enum(&["auto", "q4", "q8"]),
         false,
         "HIPFIRE_PLE_FORMAT",
-        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, derived from the Q8 rows on first load when missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
+        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, created ahead of time with `hipfire ple derive --format q4 <model>` or `hipfire pull`; a load never derives it and refuses when it is missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
     ),
     process_field!(
         "memory.ple_prewarm_bytes",
@@ -7809,7 +7809,7 @@ pub mod memory {
         /// q4 on the unified-memory Strix Halo (`gfx1151`), q8 elsewhere; never
         /// derives or downloads a missing sidecar.
         Auto,
-        /// 4-bit rows; derived from the Q8 rows on first load when missing.
+        /// 4-bit rows; created ahead of time (`hipfire ple derive`), never derived by a load.
         Q4,
         /// Exact Q8 rows.
         Q8,

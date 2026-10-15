@@ -422,8 +422,10 @@ hipfire pull <tag> --ple auto|q4|q8|all|none              # which sidecar(s) to 
   `gfx1151`**, and to **q8 on every other architecture** (an unknown architecture
   resolves to q8). `auto` never derives and never downloads: if the preferred file
   is absent it uses the other format when present and prints a note.
-- `q4` always uses the 4-bit rows, deriving `<model>.ple-q4` from the local Q8 rows on
-  first load when it is missing (`hipfire ple derive` does it ahead of time).
+- `q4` always uses the 4-bit rows. A load never derives `<model>.ple-q4`: when it is
+  missing the load is refused with both searched locations and the remedies
+  `hipfire pull <tag> --ple q4` / `hipfire ple derive --format q4 <model>` (the
+  explicit step that derives it from the local Q8 rows).
 - `q8` always uses the exact rows. This is the opt-out from the q4 default on
   gfx1151: set `HIPFIRE_PLE_FORMAT=q8` or `memory.ple_format = "q8"`. A split base
   then needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`); a missing file is

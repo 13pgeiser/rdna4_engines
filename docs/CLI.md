@@ -47,7 +47,7 @@ A split registry entry (`file` = `<name>-base.<ext>`, e.g.
 `qwen3.8-flash-next-base.mq4-xts`) ships the model without its 128 PLE n-gram
 shards plus swappable row files next to it: `<base>.ple-q8` (exact Q8F16 rows,
 ~54.4 GB) and `<base>.ple-q4` (4-bit Lloyd-Max rows, ~28.8 GB, bit-identical in
-decode to the q4 the loader derives locally from the q8 rows).
+decode to the q4 `hipfire ple derive` makes locally from the q8 rows).
 
 - **Pull.** `hipfire pull <tag> [--ple auto|q4|q8|all|none]` downloads the base
   plus the chosen sidecar(s) after printing the plan (files, sizes). `auto`
@@ -60,7 +60,8 @@ decode to the q4 the loader derives locally from the q8 rows).
 - **On-demand.** `run`, `bench` and `serve` download a missing sidecar before
   loading (`ple: downloading <file> (<GB>) for memory.ple_format=<..>`): q8 when
   q8 is requested; q4 only when neither `<base>.ple-q4` nor `<base>.ple-q8` is on
-  disk (the loader derives q4 from q8 locally). `auto` uses whichever of the two
+  disk. With only the q8 rows present, a `q4` load is refused until you run
+  `hipfire ple derive --format q4 <base>`: a load never derives. `auto` uses whichever of the two
   is present and downloads the arch's preferred format only when neither is. A
   serve *request* naming such a model downloads only when
   `serve.allow_request_pull` is on; otherwise the load is refused with the pull

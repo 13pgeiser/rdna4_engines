@@ -404,7 +404,7 @@ pub struct ModelEntry {
     #[serde(default)]
     pub ple_q8: Option<Sidecar>,
     /// 4-bit Lloyd-Max PLE rows of a Flash-Next split base (`<file>.ple-q4`),
-    /// bit-identical in decode to the q4 derived locally from the q8 rows.
+    /// bit-identical in decode to the q4 `hipfire ple derive` makes locally from the q8 rows.
     /// Same placement rules as `ple_q8`.
     #[serde(default)]
     pub ple_q4: Option<Sidecar>,

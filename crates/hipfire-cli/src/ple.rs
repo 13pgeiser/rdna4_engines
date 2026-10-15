@@ -174,7 +174,7 @@ pub(crate) fn plan_pull<'a>(
                 match ple_slot(entry, other).filter(|_| fallback) {
                     Some(sidecar) => {
                         let derive = if other == PleFormat::Q8 {
-                            " (the loader derives q4 from it)"
+                            " (derive q4 from it with `hipfire ple derive --format q4`)"
                         } else {
                             ""
                         };
@@ -223,8 +223,9 @@ impl PlePresence {
 /// The sidecar a load must download first, if any.
 ///
 /// * `q8`: download ple-q8 when absent.
-/// * `q4`: nothing when ple-q4 *or* ple-q8 is present (the loader derives q4
-///   locally); otherwise download ple-q4, or ple-q8 when the registry
+/// * `q4`: nothing when ple-q4 *or* ple-q8 is present (with only q8 the load
+///   refuses until `hipfire ple derive --format q4` is run: a load never
+///   derives); otherwise download ple-q4, or ple-q8 when the registry
 ///   publishes no q4.
 /// * `auto`: the arch's preferred format when present; else the other one when
 ///   present (auto never downloads over an available file); with neither
@@ -780,9 +781,16 @@ pub(crate) fn ensure_ple_sidecar(
         }
         ModelLayout::Other => return Ok(()),
     }
+    // The same lookup order as the loader: the path as selected, then its
+    // canonical target (a symlinked base keeps the sidecars beside either).
+    let sidecar_present = |format: PleFormat| {
+        std::iter::once(model_path.to_path_buf())
+            .chain(std::fs::canonicalize(model_path).ok())
+            .any(|base| ple_sidecar_path(&base, format).is_file())
+    };
     let present = PlePresence {
-        q4: ple_sidecar_path(model_path, PleFormat::Q4).is_file(),
-        q8: ple_sidecar_path(model_path, PleFormat::Q8).is_file(),
+        q4: sidecar_present(PleFormat::Q4),
+        q8: sidecar_present(PleFormat::Q8),
     };
     let Some(format) = plan_on_demand(entry, request, &local_gpu_arch(), present) else {
         return Ok(());
@@ -1053,11 +1061,15 @@ mod tests {
     fn pull_selection_handles_unpublished_slots() {
         let q8_only = split_entry(false, true);
         let auto = PleFormatRequest::Auto;
-        // q4 falls back to q8 (the loader derives q4 from it), with a note.
+        // q4 falls back to q8 (`hipfire ple derive` makes q4 from it), with a note.
         for selection in [PleSelection::Q4, PleSelection::Auto] {
             let plan = plan_pull(&q8_only, selection, auto, "gfx1151");
             assert_eq!(formats(&plan), [PleFormat::Q8], "{selection:?}");
-            assert!(plan.notes[0].contains("derives q4"), "{:?}", plan.notes);
+            assert!(
+                plan.notes[0].contains("hipfire ple derive --format q4"),
+                "{:?}",
+                plan.notes
+            );
         }
         // `all` takes what exists and explains what does not.
         let plan = plan_pull(&q8_only, PleSelection::All, auto, "gfx1151");
@@ -1092,7 +1104,7 @@ mod tests {
             Some(PleFormat::Q8)
         );
         assert_eq!(go(PleFormatRequest::Q8, "gfx1151", Q4), Some(PleFormat::Q8));
-        // q4: ple-q4 or ple-q8 on disk is enough (the loader derives); else download q4.
+        // q4: ple-q4 or ple-q8 on disk is enough (a load never derives; `hipfire ple derive` does); else download q4.
         assert_eq!(go(PleFormatRequest::Q4, "gfx1100", Q4), None);
         assert_eq!(go(PleFormatRequest::Q4, "gfx1100", Q8), None);
         assert_eq!(
@@ -1287,6 +1299,41 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("--ple q8"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_sees_a_sidecar_beside_the_canonical_target_of_a_symlinked_base() {
+        let registry = registry_with_split();
+        let split = &registry.models["qwen3.8:flash-next"];
+        let root =
+            std::env::temp_dir().join(format!("hipfire-ple-ensure-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let models = root.join("models");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let target = store.join("qwen3.8-flash-next-base.mq4-xts");
+        std::fs::write(&target, b"base").unwrap();
+        let link = models.join("qwen3.8-flash-next-base.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let ensure = || {
+            ensure_ple_sidecar(
+                &registry,
+                Some(split),
+                Some("qwen3.8:flash-next"),
+                &link,
+                PleFormatRequest::Q8,
+                false,
+            )
+        };
+
+        // Nothing anywhere: a needed download is refused (downloads off).
+        assert!(ensure().is_err());
+        // The q8 rows beside the canonical target satisfy the symlinked base.
+        std::fs::write(ple_sidecar_path(&target, PleFormat::Q8), b"rows").unwrap();
+        ensure().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -667,7 +667,9 @@ pub struct PleRowsChoice {
 /// What resolution may do besides opening existing files.
 pub struct ResolvePolicy<'a> {
     /// Derive a missing `.ple-q4` (from the embedded rows or the q8 sidecar).
-    /// Never honoured for `auto`.
+    /// Never honoured for `auto`. Explicit API consumers only: the serve/load
+    /// path never sets it, because `memory.ple_format = "q4"` alone is not
+    /// consent to write a ~29 GB file.
     pub derive_missing_q4: bool,
     /// Progress sink for a derivation.
     pub progress: Option<&'a mut (dyn FnMut(&PleProgress) + Send)>,
@@ -795,6 +797,50 @@ fn derive_and_attach(
     open_and_attach(hfq, q4_path, PleFormat::Q4)
 }
 
+/// A sidecar found by [`locate_sidecar`]: the file and the base path whose
+/// `<base>.ple-*` name it carries.
+struct FoundSidecar {
+    sidecar: PathBuf,
+    base: PathBuf,
+}
+
+/// Base paths whose sidecars are looked up, in order: `model_path` exactly as
+/// given (a symlink keeps the sidecars published beside the link), then its
+/// canonical target when that differs.
+fn sidecar_bases(model_path: &Path) -> Vec<PathBuf> {
+    let mut bases = vec![model_path.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(model_path) {
+        if canonical != model_path {
+            bases.push(canonical);
+        }
+    }
+    bases
+}
+
+/// The first existing sidecar of `format` across `bases`. A sidecar that
+/// exists but cannot be stat'ed is a hard error ([`sidecar_present`]).
+fn locate_sidecar(bases: &[PathBuf], format: PleFormat) -> Result<Option<FoundSidecar>, String> {
+    for base in bases {
+        let sidecar = ple_sidecar_path(base, format);
+        if sidecar_present(&sidecar)? {
+            return Ok(Some(FoundSidecar {
+                sidecar,
+                base: base.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Every location [`locate_sidecar`] probes for `format`, for messages.
+fn searched(bases: &[PathBuf], format: PleFormat) -> String {
+    bases
+        .iter()
+        .map(|base| ple_sidecar_path(base, format).display().to_string())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Pick the PLE rows source for a Qwen4 model and bind it.
 ///
 /// Base kinds: **monolithic** (the shard tensors are in the index) and
@@ -807,6 +853,11 @@ fn derive_and_attach(
 /// | `q4` | `<model>.ple-q4`, else derive (if allowed), else refuse | `<base>.ple-q4`, else derive from `<base>.ple-q8` (if allowed), else refuse |
 /// | `auto` | preferred (q4 on gfx1151, else q8) if available, else the other with a `note`; **never derives, never downloads**; monolithic always has q8 | same; neither available → refuse |
 ///
+/// Every `<model>.ple-*` lookup probes `model_path` exactly as given first
+/// (so sidecars published beside a symlink are found), then the canonical
+/// target of `model_path` (`<target>.ple-*`). Derivation happens only when
+/// `policy.derive_missing_q4` is set by the caller; the load path leaves it
+/// off, so a missing q4 sidecar is an error naming both searched locations.
 /// A present sidecar that fails to open or bind is always a hard error. The
 /// call is idempotent: an already attached sidecar is reported, not reopened
 /// (an explicit request for the other format is an error).
@@ -839,12 +890,14 @@ pub fn resolve_and_attach_ple_rows(
     }
 
     let kind = classify_base(hfq)?;
-    let q4_path = ple_sidecar_path(model_path, PleFormat::Q4);
-    let q8_path = ple_sidecar_path(model_path, PleFormat::Q8);
-    let path_of = |format: PleFormat| match format {
-        PleFormat::Q4 => &q4_path,
-        PleFormat::Q8 => &q8_path,
+    let bases = sidecar_bases(model_path);
+    let q4_at = locate_sidecar(&bases, PleFormat::Q4)?;
+    let q8_at = locate_sidecar(&bases, PleFormat::Q8)?;
+    let at = |format: PleFormat| match format {
+        PleFormat::Q4 => &q4_at,
+        PleFormat::Q8 => &q8_at,
     };
+    let searched_for = |format: PleFormat| searched(&bases, format);
 
     match kind {
         BaseKind::Monolithic => {
@@ -857,46 +910,47 @@ pub fn resolve_and_attach_ple_rows(
             if wanted == PleFormat::Q8 {
                 return Ok(embedded(None));
             }
-            if sidecar_present(&q4_path)? {
-                open_and_attach(hfq, &q4_path, PleFormat::Q4)?;
-                return Ok(sidecar_choice(PleFormat::Q4, q4_path, false, None));
+            if let Some(found) = &q4_at {
+                open_and_attach(hfq, &found.sidecar, PleFormat::Q4)?;
+                return Ok(sidecar_choice(
+                    PleFormat::Q4,
+                    found.sidecar.clone(),
+                    false,
+                    None,
+                ));
             }
             if auto {
                 return Ok(embedded(Some(format!(
-                    "q4 PLE sidecar {} not found; using the embedded q8 rows. Create the q4 rows with {}",
-                    q4_path.display(),
+                    "q4 PLE sidecar not found (searched {}); using the embedded q8 rows. Create the q4 rows with {}",
+                    searched_for(PleFormat::Q4),
                     derive_hint(model_path)
                 ))));
             }
             if policy.derive_missing_q4 {
+                let q4_path = ple_sidecar_path(model_path, PleFormat::Q4);
                 derive_and_attach(hfq, model_path, &q4_path, policy.progress.take())?;
                 return Ok(sidecar_choice(PleFormat::Q4, q4_path, true, None));
             }
             Err(format!(
-                "PLE q4 sidecar {} is missing and derivation was not requested. Create it with {}, or set memory.ple_format = \"q8\" to load the embedded q8 rows",
-                q4_path.display(),
+                "PLE q4 sidecar is missing (searched {}) and derivation was not requested. Fetch it with {} or create it with {}, or set memory.ple_format = \"q8\" to load the embedded q8 rows",
+                searched_for(PleFormat::Q4),
+                pull_hint(model_path, PleFormat::Q4),
                 derive_hint(model_path)
             ))
         }
         BaseKind::Split => {
-            let q8_present = sidecar_present(&q8_path)?;
-            let q4_present = sidecar_present(&q4_path)?;
-            let present = |format: PleFormat| match format {
-                PleFormat::Q4 => q4_present,
-                PleFormat::Q8 => q8_present,
-            };
             if auto {
                 let (preferred, other) = match wanted {
                     PleFormat::Q4 => (PleFormat::Q4, PleFormat::Q8),
                     PleFormat::Q8 => (PleFormat::Q8, PleFormat::Q4),
                 };
-                if present(preferred) {
-                    let path = path_of(preferred).clone();
+                if let Some(found) = at(preferred) {
+                    let path = found.sidecar.clone();
                     open_and_attach(hfq, &path, preferred)?;
                     return Ok(sidecar_choice(preferred, path, false, None));
                 }
-                if present(other) {
-                    let path = path_of(other).clone();
+                if let Some(found) = at(other) {
+                    let path = found.sidecar.clone();
                     open_and_attach(hfq, &path, other)?;
                     let how = match preferred {
                         PleFormat::Q4 => format!(
@@ -907,32 +961,38 @@ pub fn resolve_and_attach_ple_rows(
                         PleFormat::Q8 => pull_hint(model_path, PleFormat::Q8),
                     };
                     let note = format!(
-                        "{} PLE sidecar {} not found; using the {} rows. Get the {} rows with {how}",
+                        "{} PLE sidecar not found (searched {}); using the {} rows. Get the {} rows with {how}",
                         preferred.name(),
-                        path_of(preferred).display(),
+                        searched_for(preferred),
                         other.name(),
                         preferred.name()
                     );
                     return Ok(sidecar_choice(other, path, false, Some(note)));
                 }
                 return Err(format!(
-                    "{} is a split base without embedded PLE rows, and neither {} nor {} exists. Fetch one with {} or {}",
+                    "{} is a split base without embedded PLE rows, and neither the q8 sidecar (searched {}) nor the q4 sidecar (searched {}) exists. Fetch one with {} or {} ({} derives q4 once the q8 file is present)",
                     model_path.display(),
-                    q8_path.display(),
-                    q4_path.display(),
+                    searched_for(PleFormat::Q8),
+                    searched_for(PleFormat::Q4),
                     pull_hint(model_path, PleFormat::Q4),
-                    pull_hint(model_path, PleFormat::Q8)
+                    pull_hint(model_path, PleFormat::Q8),
+                    derive_hint(model_path)
                 ));
             }
             match wanted {
                 PleFormat::Q8 => {
-                    if q8_present {
-                        open_and_attach(hfq, &q8_path, PleFormat::Q8)?;
-                        return Ok(sidecar_choice(PleFormat::Q8, q8_path, false, None));
+                    if let Some(found) = &q8_at {
+                        open_and_attach(hfq, &found.sidecar, PleFormat::Q8)?;
+                        return Ok(sidecar_choice(
+                            PleFormat::Q8,
+                            found.sidecar.clone(),
+                            false,
+                            None,
+                        ));
                     }
                     Err(format!(
-                        "PLE q8 sidecar {} is missing ({} is a split base without embedded PLE rows). Fetch it with {}, or set memory.ple_format = \"q4\" and use the q4 rows ({} or {} once the q8 file is present)",
-                        q8_path.display(),
+                        "PLE q8 sidecar is missing (searched {}; {} is a split base without embedded PLE rows). Fetch it with {}, or set memory.ple_format = \"q4\" and use the q4 rows ({} or {} once the q8 file is present)",
+                        searched_for(PleFormat::Q8),
                         model_path.display(),
                         pull_hint(model_path, PleFormat::Q8),
                         pull_hint(model_path, PleFormat::Q4),
@@ -940,30 +1000,37 @@ pub fn resolve_and_attach_ple_rows(
                     ))
                 }
                 PleFormat::Q4 => {
-                    if q4_present {
-                        open_and_attach(hfq, &q4_path, PleFormat::Q4)?;
-                        return Ok(sidecar_choice(PleFormat::Q4, q4_path, false, None));
+                    if let Some(found) = &q4_at {
+                        open_and_attach(hfq, &found.sidecar, PleFormat::Q4)?;
+                        return Ok(sidecar_choice(
+                            PleFormat::Q4,
+                            found.sidecar.clone(),
+                            false,
+                            None,
+                        ));
                     }
-                    if q8_present && policy.derive_missing_q4 {
-                        derive_and_attach(hfq, model_path, &q4_path, policy.progress.take())?;
+                    if let (Some(q8), true) = (&q8_at, policy.derive_missing_q4) {
+                        // Derive beside the base whose q8 rows were found.
+                        let q4_path = ple_sidecar_path(&q8.base, PleFormat::Q4);
+                        derive_and_attach(hfq, &q8.base, &q4_path, policy.progress.take())?;
                         return Ok(sidecar_choice(PleFormat::Q4, q4_path, true, None));
                     }
-                    if q8_present {
+                    if let Some(q8) = &q8_at {
                         return Err(format!(
-                            "PLE q4 sidecar {} is missing and derivation was not requested. Derive it from {} with {}, fetch it with {}, or set memory.ple_format = \"q8\"",
-                            q4_path.display(),
-                            q8_path.display(),
-                            derive_hint(model_path),
+                            "PLE q4 sidecar is missing (searched {}) and derivation was not requested. Derive it from {} with {}, fetch it with {}, or set memory.ple_format = \"q8\"",
+                            searched_for(PleFormat::Q4),
+                            q8.sidecar.display(),
+                            derive_hint(&q8.base),
                             pull_hint(model_path, PleFormat::Q4)
                         ));
                     }
                     Err(format!(
-                        "PLE q4 sidecar {} is missing ({} is a split base without embedded PLE rows). Fetch it with {} ({} to derive it needs the q8 file {} first), or set memory.ple_format = \"q8\" and fetch {}",
-                        q4_path.display(),
+                        "PLE q4 sidecar is missing (searched {}; {} is a split base without embedded PLE rows). Fetch it with {} ({} to derive it needs the q8 file, searched {}, first), or set memory.ple_format = \"q8\" and fetch {}",
+                        searched_for(PleFormat::Q4),
                         model_path.display(),
                         pull_hint(model_path, PleFormat::Q4),
                         derive_hint(model_path),
-                        q8_path.display(),
+                        searched_for(PleFormat::Q8),
                         pull_hint(model_path, PleFormat::Q8)
                     ))
                 }
@@ -2320,6 +2387,10 @@ mod tests {
                 err.contains("--ple q4") && err.contains("--ple q8"),
                 "{err}"
             );
+            assert!(
+                err.contains("hipfire ple derive --format q4") && err.contains("q8 file is present"),
+                "{err}"
+            );
         }
 
         // q8 present
@@ -2480,5 +2551,290 @@ mod tests {
         .unwrap();
         assert!(choice.derived);
         assert_eq!(hfq.ple_rows().unwrap().encoding(), RowEncoding::Q4Lm);
+    }
+
+    /// `<tmp>/models/<name>` is a symlink to `<tmp>/store/<name>`: the layout
+    /// of a models directory that points at an artifact kept elsewhere.
+    #[cfg(unix)]
+    struct Linked {
+        _dir: tempfile::TempDir,
+        /// The symlink, as a user selects it.
+        link: PathBuf,
+        /// Its canonical target.
+        real: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn linked_base(name: &str, write: impl FnOnce(&Path)) -> Linked {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        let target = store.join(name);
+        write(&target);
+        let link = models.join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let real = std::fs::canonicalize(&link).unwrap();
+        assert_ne!(real, link, "fixture must be a real symlink");
+        Linked {
+            _dir: dir,
+            link,
+            real,
+        }
+    }
+
+    #[cfg(unix)]
+    fn dir_entries(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    fn resolve_at(
+        base: &Path,
+        request: PleFormatRequest,
+        arch: &str,
+        derive: bool,
+    ) -> (HfqFile, Result<PleRowsChoice, String>) {
+        let mut hfq = HfqFile::open(base).unwrap();
+        let result = resolve_and_attach_ple_rows(&mut hfq, base, request, arch, policy(derive));
+        (hfq, result)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monolithic_symlink_prefers_the_sidecar_beside_the_link() {
+        let linked = linked_base("m.hfqm", |p| {
+            write_monolithic(p, &all_shards(RowEncoding::Q8F16, 4))
+        });
+        let link_q4 = sidecar_of(&linked.link, PleFormat::Q4);
+        let real_q4 = sidecar_of(&linked.real, PleFormat::Q4);
+        let sha = q8_rows_sha(4);
+        write_bound_sidecar(&link_q4, &linked.real, RowEncoding::Q4Lm, &sha, 4);
+        // The canonical target has its own, different, bound sidecar: the one
+        // beside the selected path must still win.
+        write_bound_sidecar(&real_q4, &linked.real, RowEncoding::Q4Lm, &sha, 9);
+        let real_before = std::fs::read(&real_q4).unwrap();
+
+        // Explicit API consumers may allow derivation; an existing sidecar
+        // must not be derived over or replaced regardless.
+        for derive in [false, true] {
+            let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", derive);
+            let choice = choice.unwrap();
+            assert_eq!(choice.origin, PleRowsOrigin::Sidecar(link_q4.clone()));
+            assert!(!choice.derived);
+            assert_eq!(hfq.ple_rows().unwrap().path(), link_q4);
+        }
+        let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Auto, "gfx1151", false);
+        assert_eq!(
+            choice.unwrap().origin,
+            PleRowsOrigin::Sidecar(link_q4.clone())
+        );
+        assert_eq!(hfq.ple_rows().unwrap().path(), link_q4);
+        assert_eq!(std::fs::read(&real_q4).unwrap(), real_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monolithic_symlink_falls_back_to_the_sidecar_beside_the_canonical_target() {
+        let linked = linked_base("m.hfqm", |p| {
+            write_monolithic(p, &all_shards(RowEncoding::Q8F16, 4))
+        });
+        let link_q4 = sidecar_of(&linked.link, PleFormat::Q4);
+        let real_q4 = sidecar_of(&linked.real, PleFormat::Q4);
+        write_bound_sidecar(&real_q4, &linked.real, RowEncoding::Q4Lm, &q8_rows_sha(4), 4);
+
+        let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        let choice = choice.unwrap();
+        assert_eq!(choice.origin, PleRowsOrigin::Sidecar(real_q4.clone()));
+        assert!(!choice.derived);
+        assert_eq!(hfq.ple_rows().unwrap().path(), real_q4);
+        assert!(!link_q4.exists(), "nothing may be created beside the link");
+
+        // A dangling sidecar link beside the selected path is "not found",
+        // not an error: the canonical lookup still runs.
+        std::os::unix::fs::symlink(linked.real.with_extension("nowhere"), &link_q4).unwrap();
+        let (_, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        assert_eq!(choice.unwrap().origin, PleRowsOrigin::Sidecar(real_q4));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_q4_is_refused_naming_both_locations_and_never_derived() {
+        let linked = linked_base("m.hfqm", |p| {
+            write_monolithic(p, &all_shards(RowEncoding::Q8F16, 4))
+        });
+        let link_q4 = sidecar_of(&linked.link, PleFormat::Q4);
+        let real_q4 = sidecar_of(&linked.real, PleFormat::Q4);
+        let link_dir = dir_entries(&linked.link);
+        let real_dir = dir_entries(&linked.real);
+
+        // The loader's policy (`derive_missing_q4: false`): a q4 request with
+        // no sidecar anywhere is an error, not a ~29 GB derivation.
+        let (hfq, err) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        let err = err.unwrap_err();
+        assert!(err.contains(link_q4.to_str().unwrap()), "{err}");
+        assert!(err.contains(real_q4.to_str().unwrap()), "{err}");
+        assert!(err.contains("hipfire pull"), "{err}");
+        assert!(err.contains("hipfire ple derive --format q4"), "{err}");
+        assert!(err.contains("derivation was not requested"), "{err}");
+        assert!(hfq.ple_rows().is_none());
+
+        // auto never derives either and says where it looked.
+        let (_, choice) = resolve_at(&linked.link, PleFormatRequest::Auto, "gfx1151", true);
+        let choice = choice.unwrap();
+        assert_eq!(choice.origin, PleRowsOrigin::Embedded);
+        let note = choice.note.unwrap();
+        assert!(
+            note.contains(link_q4.to_str().unwrap()) && note.contains(real_q4.to_str().unwrap()),
+            "{note}"
+        );
+        assert!(note.contains("hipfire ple derive"), "{note}");
+
+        assert_eq!(dir_entries(&linked.link), link_dir);
+        assert_eq!(dir_entries(&linked.real), real_dir);
+        assert!(!link_q4.exists() && !real_q4.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinked_missing_q4_names_the_single_location_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("m.hfqm");
+        write_monolithic(&base, &all_shards(RowEncoding::Q8F16, 4));
+        let q4 = sidecar_of(&base, PleFormat::Q4);
+        let (_, err) = resolve_at(&base, PleFormatRequest::Q4, "gfx1100", false);
+        let err = err.unwrap_err();
+        assert!(err.contains("searched "), "{err}");
+        // `searched` joins locations with " and ": a plain file has one.
+        assert!(
+            err.contains(&format!("searched {})", q4.display())),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_symlink_prefers_the_link_side_then_the_canonical_target() {
+        let sha = q8_rows_sha(2);
+        let linked = linked_base("flash-next-base.mq4-xts", |p| write_split(p, &sha));
+        let link_q8 = sidecar_of(&linked.link, PleFormat::Q8);
+        let real_q8 = sidecar_of(&linked.real, PleFormat::Q8);
+        let link_q4 = sidecar_of(&linked.link, PleFormat::Q4);
+        let real_q4 = sidecar_of(&linked.real, PleFormat::Q4);
+
+        // Canonical only: found there.
+        write_bound_sidecar(&real_q8, &linked.real, RowEncoding::Q8F16, &sha, 2);
+        let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Q8, "gfx1100", false);
+        assert_eq!(
+            choice.unwrap().origin,
+            PleRowsOrigin::Sidecar(real_q8.clone())
+        );
+        assert_eq!(hfq.ple_rows().unwrap().path(), real_q8);
+
+        // Both: the one beside the selected link wins.
+        write_bound_sidecar(&link_q8, &linked.real, RowEncoding::Q8F16, &sha, 2);
+        for request in [PleFormatRequest::Q8, PleFormatRequest::Auto] {
+            let (hfq, choice) = resolve_at(&linked.link, request, "gfx1100", false);
+            assert_eq!(
+                choice.unwrap().origin,
+                PleRowsOrigin::Sidecar(link_q8.clone())
+            );
+            assert_eq!(hfq.ple_rows().unwrap().path(), link_q8);
+        }
+
+        // q4 likewise: canonical only, then link-side preferred.
+        write_bound_sidecar(&real_q4, &linked.real, RowEncoding::Q4Lm, &sha, 2);
+        let (_, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        assert_eq!(
+            choice.unwrap().origin,
+            PleRowsOrigin::Sidecar(real_q4.clone())
+        );
+        write_bound_sidecar(&link_q4, &linked.real, RowEncoding::Q4Lm, &sha, 2);
+        let (_, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        assert_eq!(choice.unwrap().origin, PleRowsOrigin::Sidecar(link_q4));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_symlink_missing_sidecars_name_both_locations_and_derive_only_on_request() {
+        let sha = q8_rows_sha(2);
+        let linked = linked_base("flash-next-base.mq4-xts", |p| write_split(p, &sha));
+        let q8 = |base: &Path| sidecar_of(base, PleFormat::Q8).to_str().unwrap().to_owned();
+        let q4 = |base: &Path| sidecar_of(base, PleFormat::Q4).to_str().unwrap().to_owned();
+        let link_dir = dir_entries(&linked.link);
+        let real_dir = dir_entries(&linked.real);
+
+        // Nothing anywhere: every request names both locations of the file it
+        // needs plus the pull remedy, and `q4` also the derive command.
+        for (request, wanted) in [
+            (PleFormatRequest::Q8, q8 as fn(&Path) -> String),
+            (PleFormatRequest::Q4, q4 as fn(&Path) -> String),
+        ] {
+            let (_, err) = resolve_at(&linked.link, request, "gfx1100", false);
+            let err = err.unwrap_err();
+            assert!(err.contains(&wanted(&linked.link)), "{err}");
+            assert!(err.contains(&wanted(&linked.real)), "{err}");
+            assert!(err.contains("hipfire pull"), "{err}");
+            assert!(err.contains("hipfire ple derive --format q4"), "{err}");
+        }
+        let (_, err) = resolve_at(&linked.link, PleFormatRequest::Auto, "gfx1151", false);
+        let err = err.unwrap_err();
+        for base in [&linked.link, &linked.real] {
+            assert!(err.contains(&q8(base)) && err.contains(&q4(base)), "{err}");
+        }
+        assert!(err.contains("hipfire pull"), "{err}");
+        assert!(err.contains("hipfire ple derive --format q4"), "{err}");
+
+        // q8 only beside the canonical target: a q4 request is refused (no
+        // implicit derive), naming both q4 locations and the derive command.
+        write_bound_sidecar(
+            &sidecar_of(&linked.real, PleFormat::Q8),
+            &linked.real,
+            RowEncoding::Q8F16,
+            &sha,
+            2,
+        );
+        let real_entries = dir_entries(&linked.real);
+        let (hfq, err) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", false);
+        let err = err.unwrap_err();
+        assert!(err.contains("derivation was not requested"), "{err}");
+        assert!(err.contains(&q4(&linked.link)), "{err}");
+        assert!(err.contains(&q4(&linked.real)), "{err}");
+        assert!(err.contains("hipfire ple derive --format q4"), "{err}");
+        assert!(err.contains("hipfire pull"), "{err}");
+        assert!(hfq.ple_rows().is_none());
+        assert_eq!(dir_entries(&linked.link), link_dir);
+        assert_eq!(dir_entries(&linked.real), real_entries);
+        assert_ne!(real_entries, real_dir);
+
+        // auto with only q8 around (gfx1151 prefers q4) falls back silently
+        // of derivation, noting both searched q4 locations.
+        let (_, choice) = resolve_at(&linked.link, PleFormatRequest::Auto, "gfx1151", true);
+        let choice = choice.unwrap();
+        assert_eq!(choice.format, PleFormat::Q8);
+        let note = choice.note.unwrap();
+        assert!(
+            note.contains(&q4(&linked.link)) && note.contains(&q4(&linked.real)),
+            "{note}"
+        );
+        assert_eq!(dir_entries(&linked.real), real_entries);
+
+        // An explicit-API caller that does opt in derives beside the base
+        // whose q8 rows were found.
+        let (hfq, choice) = resolve_at(&linked.link, PleFormatRequest::Q4, "gfx1100", true);
+        let choice = choice.unwrap();
+        assert!(choice.derived);
+        assert_eq!(
+            choice.origin,
+            PleRowsOrigin::Sidecar(sidecar_of(&linked.real, PleFormat::Q4))
+        );
+        assert_eq!(hfq.ple_rows().unwrap().encoding(), RowEncoding::Q4Lm);
+        assert_eq!(dir_entries(&linked.link), link_dir);
     }
 }

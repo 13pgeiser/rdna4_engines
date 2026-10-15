@@ -2388,7 +2388,10 @@ fn rm_with_sidecar_pins(
     args: RmArgs,
 ) -> Result<()> {
     let resolved = registry_entry_for_path(paths, registry, &args.model);
+    // Removal acts on the artifact itself, so it resolves symlinks (the
+    // selected path `find_model_path` returns keeps them for sidecar lookup).
     let path = find_model_path(paths, registry, &args.model)
+        .map(|selected| fs::canonicalize(&selected).unwrap_or(selected))
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
         if let Some((tag, _)) = registry.model(&args.model) {
@@ -4131,6 +4134,29 @@ fn migrate_verified_artifact(
     Ok(Some(old.to_owned()))
 }
 
+/// `path` made absolute without resolving symlinks: the daemon may run from
+/// another cwd, but the spelling the user selected (a symlink beside which
+/// sidecars are published) must survive.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `model_path` as selected, then its canonical target when that differs: the
+/// locations a sidecar of a possibly symlinked trunk may sit beside.
+fn trunk_locations(model_path: &Path) -> Vec<PathBuf> {
+    let mut locations = vec![model_path.to_path_buf()];
+    if let Ok(canonical) = fs::canonicalize(model_path) {
+        if canonical != model_path {
+            locations.push(canonical);
+        }
+    }
+    locations
+}
+
+/// Resolve a model name or path to a local file. A path the user named (or a
+/// catalog path) is returned as selected, made absolute but with symlinks
+/// intact: the PLE sidecar lookup probes `<selected>.ple-*` first and the
+/// canonical target second, and a canonical path would lose the former.
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
@@ -4138,12 +4164,12 @@ pub(crate) fn find_model_path(
 ) -> Option<PathBuf> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
-        return fs::canonicalize(direct).ok();
+        return Some(lexical_absolute(&direct));
     }
     if let Ok(catalog) = load_catalog(&paths.config) {
         if let Some((_, record)) = catalog.catalog.model(model) {
             if let Some(path) = record.path.as_ref().filter(|path| path.is_file()) {
-                return fs::canonicalize(path).ok().or_else(|| Some(path.clone()));
+                return Some(lexical_absolute(path));
             }
         }
     }
@@ -4540,9 +4566,10 @@ pub(crate) fn load_params(
 /// that merely shares a basename with an entry file): `auto` wires no draft
 /// for a bare artifact, but `on` fails closed instead of silently running AR.
 /// The sidecar is looked up in `models_dir` first — `find_model_path`
-/// canonicalizes, so a symlinked target's parent is wherever the artifact
-/// really lives, not the models directory the draft was pulled into — then
-/// next to the target. An explicit draft always wins; a final `off` never
+/// keeps the selected (possibly symlinked) path, so the artifact's real
+/// directory is probed too, not only the models directory the draft was
+/// pulled into — then next to the selected path, then next to its canonical
+/// target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
 pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
@@ -4570,9 +4597,17 @@ pub(crate) fn resolve_dflash_sidecar(
         }
         return Ok(());
     };
-    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let candidate = [models_dir, beside_target]
-        .into_iter()
+    let beside_target: Vec<PathBuf> = trunk_locations(model_path)
+        .iter()
+        .map(|location| {
+            location
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+        .collect();
+    let candidate = std::iter::once(models_dir)
+        .chain(beside_target.iter().map(PathBuf::as_path))
         .map(|dir| dir.join(&sidecar.file))
         .find(|candidate| candidate.is_file());
     if let Some(candidate) = candidate {
@@ -4599,9 +4634,10 @@ pub(crate) fn resolve_dflash_sidecar(
 /// selector); `off` never carries a head. Otherwise the first existing file
 /// wins: the registry `entry.mtp` file in `models_dir`, then `<entry
 /// file>.mtp` in `models_dir`, then `.mtp` beside `requested` as typed (when
-/// it names a file), then `.mtp` beside the canonical `model_path`.
-/// `find_model_path` canonicalizes, so a head beside a symlinked trunk — the
-/// models-dir layout — is invisible from `model_path` alone. With no hit
+/// it names a file), then `.mtp` beside `model_path` as selected, then beside
+/// its canonical target. `find_model_path` keeps a symlinked trunk's own
+/// path, so a head beside the link or beside the target is found either way.
+/// With no hit
 /// `params["mtp"]` stays unset and the loader keeps its bundled-trailer and
 /// `<trunk>.mtp` lookup (and `on` fails there); a registry-declared head that
 /// is not pulled gets a one-line `hipfire pull` hint.
@@ -4633,7 +4669,11 @@ pub(crate) fn resolve_mtp_sidecar(
         let requested = std::path::absolute(requested).unwrap_or_else(|_| requested.to_path_buf());
         candidates.push(requested.with_extension("mtp"));
     }
-    candidates.push(model_path.with_extension("mtp"));
+    candidates.extend(
+        trunk_locations(model_path)
+            .iter()
+            .map(|location| location.with_extension("mtp")),
+    );
     if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
         params["mtp"] = serde_json::json!(hit.display().to_string());
         return;
@@ -4685,9 +4725,17 @@ fn resolve_xdna_sidecar(
         );
         return Ok(());
     };
-    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
-    let candidate = [models_dir, beside_target]
-        .into_iter()
+    let beside_target: Vec<PathBuf> = trunk_locations(model_path)
+        .iter()
+        .map(|location| {
+            location
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+        .collect();
+    let candidate = std::iter::once(models_dir)
+        .chain(beside_target.iter().map(PathBuf::as_path))
         .map(|dir| dir.join(&sidecar.file))
         .find(|candidate| candidate.is_file());
     let Some(candidate) = candidate else {
@@ -4723,9 +4771,10 @@ fn resolve_xdna_sidecar(
 /// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
 /// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
 /// `entry.vision`, looked up in `models_dir` first — `find_model_path`
-/// canonicalizes, so a symlinked target's parent is wherever the artifact
-/// really lives, not the models directory the sidecar was pulled into —
-/// then next to the target, then as the `<trunk-stem>-vision.hfq` sibling
+/// keeps the selected (possibly symlinked) path, so the artifact's real
+/// directory is probed too, not only the models directory the sidecar was
+/// pulled into — then next to the selected path and its canonical target,
+/// then as the `<trunk-stem>-vision.hfq` sibling
 /// convention beside any trunk.
 fn resolve_vision_sidecar(
     params: &mut serde_json::Value,
@@ -4760,18 +4809,33 @@ fn resolve_vision_sidecar(
         params["vision"] = serde_json::json!(env);
         return Ok(());
     }
-    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let locations = trunk_locations(model_path);
     let mut candidates = Vec::new();
     if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
         candidates.push(models_dir.join(&sidecar.file));
-        candidates.push(beside_target.join(&sidecar.file));
+        for location in &locations {
+            candidates.push(
+                location
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&sidecar.file),
+            );
+        }
     }
-    if let Some(stem) = model_path
-        .file_name()
-        .and_then(|file| file.to_str())
-        .map(|file| file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file))
-    {
-        candidates.push(beside_target.join(format!("{stem}-vision.hfq")));
+    for location in &locations {
+        let Some(stem) = location
+            .file_name()
+            .and_then(|file| file.to_str())
+            .map(|file| file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file))
+        else {
+            continue;
+        };
+        candidates.push(
+            location
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("{stem}-vision.hfq")),
+        );
     }
     if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
         params["vision"] = serde_json::json!(hit.display().to_string());
@@ -10190,6 +10254,56 @@ mod tests {
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn find_model_path_keeps_the_selected_symlink_for_sidecar_lookup() {
+        // The PLE loader probes `<given>.ple-*` first and the canonical target
+        // second; a canonicalized path would lose the sidecars published beside
+        // the link.
+        let paths = test_paths("find-model-symlink");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        let target = store.join("flash-next-base.mq4-xts");
+        fs::write(&target, b"fixture").unwrap();
+        let link = paths.models.join("flash-next-base.mq4-xts");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+
+        let found = find_model_path(&paths, &registry, link.to_str().unwrap()).unwrap();
+        assert_eq!(found, link);
+        assert_ne!(found, fs::canonicalize(&link).unwrap());
+        // A plain file is returned as given (already absolute and canonical).
+        let found = find_model_path(&paths, &registry, target.to_str().unwrap()).unwrap();
+        assert_eq!(found, target);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mtp_head_is_found_beside_the_selected_link_then_beside_its_canonical_target() {
+        let paths = test_paths("mtp-link-then-target");
+        let store = paths.root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        let target = store.join("trunk.mq4");
+        fs::write(&target, b"trunk").unwrap();
+        let link = paths.models.join("trunk.mq4");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let resolve = || {
+            let mut params = serde_json::json!({"mtp_mode": "auto"});
+            resolve_mtp_sidecar(&mut params, None, &paths.models, &link, "", None);
+            params["mtp"].as_str().map(PathBuf::from)
+        };
+
+        assert_eq!(resolve(), None);
+        fs::write(target.with_extension("mtp"), b"head").unwrap();
+        assert_eq!(resolve(), Some(target.with_extension("mtp")));
+        fs::write(link.with_extension("mtp"), b"head").unwrap();
+        assert_eq!(resolve(), Some(link.with_extension("mtp")));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     #[test]
     fn nested_model_discovery_matches_native_registry_layout() {
         let paths = test_paths("nested-models");
@@ -11318,9 +11432,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     pub(crate) fn load_params_finds_sidecar_in_models_dir_for_symlinked_target() {
-        // find_model_path canonicalizes, so a target symlinked out of the
-        // models dir has a parent with no draft in it. The sidecar must be
-        // looked up in the models dir, not beside the canonical file.
+        // A target symlinked out of the models dir has a parent with no draft
+        // in it. The sidecar must be looked up in the models dir, not only
+        // beside the target.
         // Measured 2026-09-03: serve --speculation dflash ran AR (tau=None)
         // on a symlinked qwen3.8-27b.mq5 while the tag form resolved.
         let paths = test_paths("dflash-sidecar-symlink");
@@ -12512,10 +12626,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mtp_sidecar_resolves_beside_a_symlinked_trunk() {
-        // B2: `find_model_path` canonicalizes, so the trunk path the daemon gets
-        // is the symlink TARGET. The head the user placed (or pulled) beside the
-        // symlink must still be found: via the models dir for a registry tag,
-        // via the path as typed for a bare path.
+        // B2: a daemon handed the symlink TARGET (a resolved or canonical trunk
+        // path) must still find the head the user placed (or pulled) beside the
+        // symlink: via the models dir for a registry tag, via the path as typed
+        // for a bare path.
         let paths = test_paths("mtp-symlinked-trunk");
         let store = paths.root.join("store");
         fs::create_dir_all(&paths.models).unwrap();
@@ -18918,7 +19032,7 @@ mod tests {
         DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
         assert!(
             !q4.exists(),
-            "q4 is derived locally from the q8 rows, never downloaded"
+            "q4 is derived locally from the q8 rows (`hipfire ple derive`), never downloaded"
         );
 
         // q4 requested with neither file present: the q4 sidecar is fetched.
