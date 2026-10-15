@@ -565,18 +565,19 @@ fn resident_restore_matches_cold_on_flash_next() {
 /// Lever 1: the tail snapshot. A cold prompt A ends with a user message, its
 /// final `<|im_end|>` and an assistant header; with the turn end token set
 /// (message-end snapshots off) its cold prefill also splits and snapshots at
-/// the index BEFORE that final `<|im_end|>`, at least the default 256 rows
+/// the index BEFORE that final `<|im_end|>`, at least the test's 256-row minimum gap
 /// past the previous chunk boundary. Prompt B extends A's last user message
 /// (A up to that index, 200 new content tokens, then A's template suffix from
 /// the `<|im_end|>` on, so B's last `<|im_end|>` is at `tail + 200`) and must
 /// plan exactly A's index. B's own tail split is skipped: 200 rows past the
-/// restored tail is under the default 256 minimum gap. The tail schedule is
+/// restored tail is under that 256-row gap (and a turn restored from a tail
+/// never splits again). The tail schedule is
 /// session-exact, not cold-exact, so the restored B is compared with a cold B
 /// split manually at the same index (chunk boundary, then the index, then the
 /// rest as a live continuation), never with the unsplit cold schedule. A
 /// restore after the tail adds nothing to the pool. Runs with the tail
-/// snapshot at its default (`HIPFIRE_QWEN4_TAIL_SNAPSHOT` and `..._MIN_GAP`
-/// unset).
+/// snapshot on (`HIPFIRE_QWEN4_TAIL_SNAPSHOT` unset) and the thresholds
+/// lowered to a 256-row gap and no minimum prompt (`set_tail_snapshot_limits`).
 #[test]
 #[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
 fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
@@ -591,6 +592,9 @@ fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
         .special_token_id("<|im_end|>")
         .expect("tokenizer has <|im_end|>");
     bundle.set_turn_end_token(Some(im_end));
+    // The production thresholds (1024-row gap, 16384-token prompt) would skip
+    // a split this short; keep the test prompts small.
+    bundle.set_tail_snapshot_limits(256, 0);
     assert!(
         !bundle.turn_snapshots_active(),
         "message-end snapshots must stay off: only the tail splits"
@@ -599,7 +603,7 @@ fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
     assert!(chunk >= 1024, "test needs B to end before the second chunk");
     let logits = gpu.zeros(&[vocab], DType::F32).expect("logits");
 
-    // The tail index sits 300 rows past the chunk boundary (default minimum
+    // The tail index sits 300 rows past the chunk boundary (test minimum
     // gap 256) and A ends in the same chunk. Neither prompt has an earlier
     // `<|im_end|>`.
     let tail = chunk + 300;
@@ -617,7 +621,7 @@ fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
     assert_eq!(b.iter().rposition(|&t| t == im_end), Some(tail + 200));
     assert_eq!(b.iter().filter(|&&t| t == im_end).count(), 1);
     assert!(b.len() < 2 * chunk);
-    // The gap from the restored tail (200) is under the default minimum
+    // The gap from the restored tail (200) is under the test minimum
     // (256): B's own tail split is skipped, so B has no boundary after the
     // restore.
     assert_eq!(SessionState::lineage_boundary(&bundle, &b, tail, b.len()), None);

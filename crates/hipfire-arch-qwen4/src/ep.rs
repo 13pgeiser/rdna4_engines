@@ -1923,6 +1923,7 @@ pub(crate) struct ReplicaFingerprint {
     pub(crate) turn_snapshots: bool,
     pub(crate) tail_snapshot: bool,
     pub(crate) tail_snapshot_min_gap: usize,
+    pub(crate) tail_snapshot_min_prompt: usize,
     pub(crate) has_mtp: bool,
     pub(crate) has_lanes: bool,
 }

@@ -116,6 +116,12 @@ const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
 /// Lineage-only split before the final message end, read once at assembly.
 const TAIL_SNAPSHOT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT";
 const TAIL_SNAPSHOT_MIN_GAP_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP";
+const TAIL_SNAPSHOT_MIN_PROMPT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_PROMPT";
+/// Below these the tail split's extra small tile costs more than the replay it
+/// can save: a gap under 1024 rows replays in well under a second, and on a
+/// short prompt the tile is a large share of the cold prefill.
+const TAIL_SNAPSHOT_MIN_GAP_DEFAULT: usize = 1024;
+const TAIL_SNAPSHOT_MIN_PROMPT_DEFAULT: usize = 16384;
 
 /// The PLE rows owner of a bundle: present exactly when the profile declares
 /// PLE (`config.ple`), so a profile without it holds no row store, hash
@@ -178,6 +184,7 @@ pub struct Qwen4Bundle {
     turn_snapshots: bool,
     tail_snapshot: bool,
     tail_snapshot_min_gap: usize,
+    tail_snapshot_min_prompt: usize,
     /// The tokenizer's `<|im_end|>` id (`set_turn_end_token`).
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
@@ -306,6 +313,7 @@ impl SessionState for Qwen4Bundle {
         let token = self.turn_end_token?;
         let p = prompt[..up_to].iter().rposition(|&id| id == token)?;
         if p <= after
+            || prompt.len() < self.tail_snapshot_min_prompt
             || p - after.max((p / chunk) * chunk) < self.tail_snapshot_min_gap
             || up_to / chunk > p / chunk
             || p % chunk == 0 || self.turn_end_token_active() == Some(prompt[p - 1])
@@ -620,7 +628,11 @@ impl Qwen4Bundle {
             tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(256),
+                .unwrap_or(TAIL_SNAPSHOT_MIN_GAP_DEFAULT),
+            tail_snapshot_min_prompt: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_PROMPT_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(TAIL_SNAPSHOT_MIN_PROMPT_DEFAULT),
             turn_end_token: None,
             state_format,
             lanes: None,
@@ -1182,6 +1194,24 @@ impl Qwen4Bundle {
             Ok(())
         }) {
             eprintln!("  qwen4 EP: set_turn_snapshots: {error}");
+        }
+    }
+
+    /// Override the tail-split thresholds read at assembly
+    /// (`HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP` / `_MIN_PROMPT`); hardware tests
+    /// use it to exercise the split on short prompts.
+    pub fn set_tail_snapshot_limits(&mut self, min_gap: usize, min_prompt: usize) {
+        let set = |bundle: &mut Self| {
+            bundle.tail_snapshot_min_gap = min_gap;
+            bundle.tail_snapshot_min_prompt = min_prompt;
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("set_tail_snapshot_limits", set, &|bundle, _, _| {
+            bundle.tail_snapshot_min_gap = min_gap;
+            bundle.tail_snapshot_min_prompt = min_prompt;
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: set_tail_snapshot_limits: {error}");
         }
     }
 
@@ -2674,6 +2704,7 @@ impl Qwen4Bundle {
             turn_snapshots: self.turn_snapshots,
             tail_snapshot: self.tail_snapshot,
             tail_snapshot_min_gap: self.tail_snapshot_min_gap,
+            tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
             has_mtp: self.mtp.is_some(),
             has_lanes: self.lanes.is_some(),
         }
