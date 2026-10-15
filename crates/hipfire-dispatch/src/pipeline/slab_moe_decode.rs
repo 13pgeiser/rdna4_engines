@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! K1 decode GEMV `mq_i4_moe_gemv` (gfx1201): mixed-codec F4 lane-union planner,
+//! K1 decode GEMV `mq_i4_moe_gemv` (gfx1201, gfx1151): mixed-codec F4 lane-union planner,
 //! frozen 88-byte kernarg ABI and the real per-bucket launch.
 //!
 //! The module is deliberately independent: it depends only on `std`,
@@ -300,7 +300,7 @@ pub enum SlabMoeError {
     Layout(&'static str),
     /// An operand is null, misaligned, too small or aliases another operand.
     Operand { name: &'static str, reason: &'static str },
-    /// Device is not exactly gfx1201.
+    /// Device is neither gfx1201 nor gfx1151.
     Arch(String),
     /// The launch cannot be issued in this execution mode.
     Unavailable(&'static str),
@@ -323,7 +323,7 @@ impl fmt::Display for SlabMoeError {
             Self::Geometry { what, got, want } => write!(f, "{what} {got} != frozen {want}"),
             Self::Layout(why) => write!(f, "union layout: {why}"),
             Self::Operand { name, reason } => write!(f, "operand {name}: {reason}"),
-            Self::Arch(got) => write!(f, "mq_i4_moe_gemv is exact gfx1201 only, device is {got:?}"),
+            Self::Arch(got) => write!(f, "mq_i4_moe_gemv is exact gfx1201/gfx1151 only, device is {got:?}"),
             Self::Unavailable(why) => write!(f, "{why}"),
         }
     }
@@ -876,7 +876,7 @@ pub fn plan_launches(req: &DecodeRequest<'_>) -> Result<LaunchPlan, SlabMoeError
 // Real launch through the HIP module API
 // ---------------------------------------------------------------------------
 
-/// The four K1 decode functions loaded from a gfx1201 code object, indexed by
+/// The four K1 decode functions loaded from a gfx1201 or gfx1151 code object, indexed by
 /// [`BucketKey::order_index`] (the order of [`SYMBOLS`]).
 ///
 /// The HIP module owns its functions: dropping this value may unload them.
@@ -887,8 +887,8 @@ pub struct SlabMoeDecodeModule {
     functions: [Function; 4],
 }
 
-fn require_gfx1201(gpu: &Gpu) -> Result<(), SlabMoeError> {
-    if gpu.arch_caps.is_gfx1201() {
+fn require_slab_arch(gpu: &Gpu) -> Result<(), SlabMoeError> {
+    if gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1151() {
         Ok(())
     } else {
         Err(SlabMoeError::Arch(gpu.arch.clone()))
@@ -896,11 +896,11 @@ fn require_gfx1201(gpu: &Gpu) -> Result<(), SlabMoeError> {
 }
 
 impl SlabMoeDecodeModule {
-    /// Loads `image` (the gfx1201 code object exporting every [`SYMBOLS`]
-    /// entry) on `gpu`. Refuses any device that is not exactly gfx1201 and
+    /// Loads `image` (the code object of this device's architecture exporting every
+    /// [`SYMBOLS`] entry) on `gpu`. Refuses any device that is not exactly gfx1201 or gfx1151 and
     /// fails closed if a symbol is missing.
     pub fn load(gpu: &mut Gpu, image: &[u8]) -> HipResult<Self> {
-        require_gfx1201(gpu).map_err(hip_err)?;
+        require_slab_arch(gpu).map_err(hip_err)?;
         gpu.bind_thread()?;
         gpu.ensure_route_modules_preloaded()?;
         let module = gpu.hip.module_load_data(image)?;
@@ -944,7 +944,7 @@ impl SlabMoeDecodeModule {
     ///   retain it until the stream has synchronized or the work has been
     ///   ordered before the drop.
     pub unsafe fn launch(&self, gpu: &mut Gpu, req: &DecodeRequest<'_>) -> HipResult<()> {
-        require_gfx1201(gpu).map_err(hip_err)?;
+        require_slab_arch(gpu).map_err(hip_err)?;
         if gpu.replay.is_recording() || gpu.graphs.capture_mode {
             return Err(hip_err(SlabMoeError::Unavailable(
                 "mq_i4_moe_gemv launch is not recordable or capturable yet",

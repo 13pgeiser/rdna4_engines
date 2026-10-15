@@ -24,8 +24,8 @@
 
 #include <hip/hip_runtime.h>
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
-#error "qwen4_slab_union_plan.gfx1201.hip is gfx1201-only"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__) && !defined(__gfx1151__)
+#error "qwen4_slab_union_plan.hip is gfx1201/gfx1151-only"
 #endif
 
 #define SLAB_PLAN_MAX_SLOTS 128

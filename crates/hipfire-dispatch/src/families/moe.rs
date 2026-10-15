@@ -304,7 +304,7 @@ pub enum MoeRouteCapability {
     /// FP8 stages; admitted by `pipeline::select_fp8_grouped_route` and
     /// never by generic resolution.
     Fp8B128Grouped,
-    /// gfx1201 sealed expert-slab route (ctl3-hot): the same fixed
+    /// gfx1201 / gfx1151 sealed expert-slab route (ctl3-hot): the same fixed
     /// 512/10/2560/640/640 geometry over experts whose codec is per expert
     /// (MQ4 symmetric QT44/QT53 or MQ3-I4 planar qt131/qt132), addressed
     /// through the layer's pointer tables. Decode rows (`route_rows <= 8`)
@@ -333,12 +333,12 @@ impl MoeRouteCapability {
     pub(crate) fn admitted_on_arch(self, arch: &rdna_compute::arch_caps::ArchCaps) -> bool {
         match self {
             Self::Qt44Qt53Grouped | Self::Qt44Qt53GroupedSymmetric => self.admitted_on(),
-            Self::SlabCodecGrouped => self.admitted_on() && arch.is_gfx1201(),
+            Self::SlabCodecGrouped => self.admitted_on() && (arch.is_gfx1201() || arch.is_gfx1151()),
             Self::Fp8B128Grouped => arch.is_gfx942(),
         }
     }
 
-    /// The gfx1201 sealed expert-slab declaration.
+    /// The gfx1201 / gfx1151 sealed expert-slab declaration.
     pub fn is_slab(self) -> bool {
         matches!(self, Self::SlabCodecGrouped)
     }

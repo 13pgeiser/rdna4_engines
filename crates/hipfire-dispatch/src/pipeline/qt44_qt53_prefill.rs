@@ -109,7 +109,7 @@ fn is_fp8(p: &MoePrefillParams<'_>) -> bool {
         .is_some_and(|policy| policy.capability.is_fp8_grouped())
 }
 
-/// The declared route is the gfx1201 sealed expert-slab route.
+/// The declared route is the sealed expert-slab route (gfx1201, gfx1151).
 #[inline]
 fn is_slab(p: &MoePrefillParams<'_>) -> bool {
     p.route_policy
@@ -121,7 +121,7 @@ fn is_slab(p: &MoePrefillParams<'_>) -> bool {
 /// other slab calls run the K1 lane-union GEMV in the path-1 stage shape.
 fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     is_slab(p)
-        && gpu.arch == "gfx1201"
+        && gpu.qwen4_slab_arch()
         && p.recipe.bf16_round_trip()
         && p.x_norm_batch.dtype == DType::F32
         && p.down_k == p.mi
@@ -1864,7 +1864,7 @@ fn combine_stage(
     Ok(())
 }
 
-// ───────────────────── sealed expert-slab (gfx1201) ─────────────────────
+// ──────────────── sealed expert-slab (gfx1201, gfx1151) ────────────────
 
 /// Slab gate/up. K2: rotate256 A4 once, then the W3 and MQ4 NT1 kernels over
 /// the same grouped Y rows, each on its own codec-masked tile ids (a uniform
@@ -1876,8 +1876,8 @@ fn slab_gate_up(
     grouped_rows: usize,
 ) -> Result<(), DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
-    if gpu.arch != "gfx1201" {
-        return Err(DispatchError::Hip("sealed expert-slab route is gfx1201-only".into()));
+    if !gpu.qwen4_slab_arch() {
+        return Err(DispatchError::Hip("sealed expert-slab route is gfx1151/gfx1201-only".into()));
     }
     let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
     if !slab_k2(gpu, p) {

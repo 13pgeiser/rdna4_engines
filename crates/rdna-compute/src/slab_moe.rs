@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Sealed expert-slab (ctl3-hot) GPU entries, gfx1201 only.
+//! Sealed expert-slab (ctl3-hot) GPU entries, gfx1201 and gfx1151.
 //!
 //! * K1 decode: [`Gpu::qwen4_slab_union_plan`] turns the routed ids into the
 //!   fixed-capacity per-codec-bucket lane-union descriptor the four
@@ -12,15 +12,18 @@
 //!   buckets. Both go through `launch_maybe_blob`, so they are recorded by the
 //!   replay recorder and captured by graphs like every other route launch.
 //! * K2 prefill: [`Gpu::qwen4_slab_tile_masks`] splits the grouped tile ids by
-//!   codec with the table-driven `ep_tile_mask_pm_gfx1201`.
+//!   codec with the table-driven mask: the builder `ep_tile_mask_pm_gfx1201`, or on
+//!   gfx1151 its hipcc twin `qwen4_slab_tile_mask` (same law, same ids out).
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 
-/// Module key of the embedded K1 certified builder image.
-pub const MQ_I4_MOE_GEMV_MODULE: &str = "mq_i4_moe_gemv_pm_gfx1201";
+/// Module keys of the embedded K1 certified builder images, `[gfx1151, gfx1201]`.
+const MQ_I4_MOE_GEMV_MODULES: [&str; 2] = ["mq_i4_moe_gemv_pm_gfx1151", "mq_i4_moe_gemv_pm_gfx1201"];
+/// The embedded K1 images, same order.
+const MQ_I4_MOE_GEMV_IMAGES: [&[u8]; 2] = [kernels::MQ_I4_MOE_GEMV_PM_GFX1151, kernels::MQ_I4_MOE_GEMV_PM_GFX1201];
 
 /// K1 symbols in bucket order: `[codec][kind]`, codec 0 = W3 (`MQ3I4`),
 /// 1 = MQ4 (`Mq4Sym`), kind 0 = gate/up (R256), 1 = down (R128).
@@ -31,6 +34,10 @@ pub const MQ_I4_MOE_GEMV_SYMBOLS: [[&str; 2]; 2] = [
 
 const PLAN_SYMBOL: &str = "qwen4_slab_union_plan";
 const PLAN_MODULE: &str = "qwen4_slab_union_plan";
+const MASK_SYMBOL: &str = "qwen4_slab_tile_mask";
+const MASK_MODULE: &str = "qwen4_slab_tile_mask";
+/// Threads (tiles) per workgroup of the gfx1151 mask kernel.
+const MASK_BLOCK: u32 = 256;
 
 /// Most decode lanes the lane-union admits (`C8`).
 pub const SLAB_MAX_LANES: usize = 8;
@@ -64,31 +71,48 @@ pub enum SlabBuckets<'a> {
 }
 
 impl Gpu {
-    /// Load the planner and the four K1 symbols (call before graph capture).
+    /// Index of this device in the slab route's per-arch tables (gfx1151,
+    /// gfx1201); `None` on every other architecture.
+    fn slab_arch_index(&self) -> Option<usize> {
+        match self.arch.as_str() {
+            "gfx1151" => Some(0),
+            "gfx1201" => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Whether the sealed expert-slab route's kernels exist for this device.
+    pub fn qwen4_slab_arch(&self) -> bool {
+        self.slab_arch_index().is_some()
+    }
+
+    /// Load the planner, the mask (gfx1151) and the four K1 symbols (call before graph capture).
     pub fn ensure_qwen4_slab_kernels(&mut self) -> HipResult<()> {
-        self.slab_require_gfx1201("ensure_qwen4_slab_kernels")?;
+        let arch = self.slab_require_arch("ensure_qwen4_slab_kernels")?;
         self.bind_thread()?;
-        self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_GFX1201_SRC, PLAN_SYMBOL)?;
+        self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_SRC, PLAN_SYMBOL)?;
+        if arch == 0 {
+            self.ensure_kernel(MASK_MODULE, kernels::QWEN4_SLAB_TILE_MASK_SRC, MASK_SYMBOL)?;
+        }
         for symbol in MQ_I4_MOE_GEMV_SYMBOLS.iter().flatten() {
-            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULE, kernels::MQ_I4_MOE_GEMV_PM_GFX1201, symbol)?;
+            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], symbol)?;
         }
         Ok(())
     }
 
-    fn slab_require_gfx1201(&self, what: &str) -> HipResult<()> {
-        if self.arch != "gfx1201" {
-            return Err(hip_bridge::HipError::new(
+    fn slab_require_arch(&self, what: &str) -> HipResult<usize> {
+        self.slab_arch_index().ok_or_else(|| {
+            hip_bridge::HipError::new(
                 0,
-                &format!("{what}: the sealed expert-slab route is gfx1201-only, got {}", self.arch),
-            ));
-        }
-        Ok(())
+                &format!("{what}: the sealed expert-slab route is gfx1151/gfx1201-only, got {}", self.arch),
+            )
+        })
     }
 
     /// Reserve the slab route's scratch (union descriptor for `SLAB_MAX_LANES`,
     /// and `tiles` masked tile ids per codec) before any capture.
     pub fn reserve_qwen4_slab(&mut self, tiles: usize) -> HipResult<()> {
-        self.slab_require_gfx1201("reserve_qwen4_slab")?;
+        self.slab_require_arch("reserve_qwen4_slab")?;
         self.bind_thread()?;
         if crate::scratch::scratch_will_grow(
             self.scratch.qwen4_slab_union_scratch_bytes,
@@ -123,7 +147,7 @@ impl Gpu {
         buckets: SlabBuckets<'_>,
         lanes: usize,
     ) -> HipResult<()> {
-        self.slab_require_gfx1201("qwen4_slab_union_plan")?;
+        self.slab_require_arch("qwen4_slab_union_plan")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
             return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: lanes must be 1..=8"));
         }
@@ -144,7 +168,7 @@ impl Gpu {
             }
         };
         self.bind_thread()?;
-        self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_GFX1201_SRC, PLAN_SYMBOL)?;
+        self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_SRC, PLAN_SYMBOL)?;
         if self.scratch.qwen4_slab_union_scratch.is_none() {
             self.reserve_qwen4_slab(0)?;
         }
@@ -188,7 +212,7 @@ impl Gpu {
         y1: Option<&GpuTensor>,
         lanes: usize,
     ) -> HipResult<()> {
-        self.slab_require_gfx1201("mq_i4_moe_gemv_slab")?;
+        let arch = self.slab_require_arch("mq_i4_moe_gemv_slab")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
             return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: lanes must be 1..=8"));
         }
@@ -230,7 +254,7 @@ impl Gpu {
                 continue;
             }
             let func = MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize];
-            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULE, kernels::MQ_I4_MOE_GEMV_PM_GFX1201, func)?;
+            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], func)?;
             let ids = (union + bucket * s * 4) as *mut c_void;
             let offs = (union + (2 * s + bucket * (s + 1)) * 4) as *mut c_void;
             let slot_ids = (union + (2 * s + 2 * (s + 1) + bucket * s) * 4) as *mut c_void;
@@ -282,7 +306,7 @@ impl Gpu {
         codec_i32: &GpuTensor,
         tiles: usize,
     ) -> HipResult<[GpuTensor; 2]> {
-        self.slab_require_gfx1201("qwen4_slab_tile_masks")?;
+        self.slab_require_arch("qwen4_slab_tile_masks")?;
         if tiles == 0 {
             return Err(hip_bridge::HipError::new(0, "qwen4_slab_tile_masks: no tiles"));
         }
@@ -298,8 +322,73 @@ impl Gpu {
             dtype: DType::Raw,
         });
         // codec 1 (W3) -> views[0], codec 0 (MQ4) -> views[1].
-        self.ep_tile_mask(tile_ids, &views[0], codec_i32, tiles, SLAB_EXPERTS, 1)?;
-        self.ep_tile_mask(tile_ids, &views[1], codec_i32, tiles, SLAB_EXPERTS, 0)?;
+        self.slab_tile_mask(tile_ids, &views[0], codec_i32, tiles, 1)?;
+        self.slab_tile_mask(tile_ids, &views[1], codec_i32, tiles, 0)?;
         Ok(views)
+    }
+
+    /// One codec mask: `owned[t] = tile_ids[t]` when `0 <= tile_ids[t] < 512` and
+    /// `codec_i32[tile_ids[t]] == codec`, else `-1`; `tile_ids` is never written.
+    /// gfx1201: the certified builder kernel behind [`Gpu::ep_tile_mask`]; gfx1151: the
+    /// hipcc twin `qwen4_slab_tile_mask` (one thread per tile, the same law and bytes).
+    fn slab_tile_mask(
+        &mut self,
+        tile_ids: &GpuTensor,
+        owned: &GpuTensor,
+        codec_i32: &GpuTensor,
+        tiles: usize,
+        codec: usize,
+    ) -> HipResult<()> {
+        if self.arch == "gfx1201" {
+            return self.ep_tile_mask(tile_ids, owned, codec_i32, tiles, SLAB_EXPERTS, codec);
+        }
+        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("qwen4_slab_tile_mask: {what}")));
+        let word = std::mem::size_of::<i32>();
+        if i32::try_from(tiles).is_err() {
+            return refuse("tiles exceed i32");
+        }
+        if tile_ids.buf.size() < tiles * word || owned.buf.size() < tiles * word {
+            return refuse("tile id buffers hold fewer than `tiles` words");
+        }
+        if codec_i32.buf.size() < SLAB_EXPERTS * word {
+            return refuse("codec table holds fewer than 512 words");
+        }
+        if tile_ids.buf.as_ptr() == owned.buf.as_ptr() {
+            return refuse("the masked copy must not alias the source tile ids");
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(MASK_MODULE, kernels::QWEN4_SLAB_TILE_MASK_SRC, MASK_SYMBOL)?;
+        let (ids, out, table) = (tile_ids.buf.as_ptr(), owned.buf.as_ptr(), codec_i32.buf.as_ptr());
+        let (tv, ev, cv) = (tiles as i32, SLAB_EXPERTS as i32, codec as i32);
+        let mut params = [
+            &ids as *const _ as *mut c_void,
+            &out as *const _ as *mut c_void,
+            &table as *const _ as *mut c_void,
+            &tv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", MASK_SYMBOL, tiles * word * 2);
+        let result = self.launch_maybe_blob(
+            MASK_SYMBOL,
+            [(tiles as u32).div_ceil(MASK_BLOCK), 1, 1],
+            [MASK_BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ids);
+                b.push_ptr(out);
+                b.push_ptr(table);
+                b.push_i32(tv);
+                b.push_i32(ev);
+                b.push_i32(cv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 }

@@ -2470,9 +2470,9 @@ impl Qwen4MoeLayerRuntime {
                 "layer {layer_label}: slab arenas are single-device only (no EP route)"
             )));
         }
-        if gpu.arch != "gfx1201" {
+        if !gpu.qwen4_slab_arch() {
             return Err(invalid(format!(
-                "layer {layer_label}: the expert-slab route is gfx1201-only, device is {}",
+                "layer {layer_label}: the expert-slab route is gfx1151/gfx1201-only, device is {}",
                 gpu.arch
             )));
         }

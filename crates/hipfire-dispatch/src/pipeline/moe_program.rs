@@ -2233,7 +2233,7 @@ pub(super) fn select_prefill(
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
                 variant: "slab-sealed-replicated-grouped-only",
-                arch: "gfx1201",
+                arch: "gfx1151/gfx1201",
                 quant: "MQ3-I4/MQ4 slab",
             });
         }

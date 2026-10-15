@@ -265,14 +265,33 @@ fn refuse_expert_slabs(
 /// `rcpt/`, both with 0 mismatches: K1 decode
 /// (`r5.k1.g1.L0-records.raw.json`, sha256 `2bb0cfa1…8239`) and K2 prefill
 /// (`g1.k2.real.json`, sha256 `bb1bde6b…c226`, with the A4 identity
-/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). gfx1201 only; every other
-/// architecture keeps refusing in [`slab_route_admitted`].
+/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). gfx1201 only; see
+/// [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151.
 pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
 
+/// gfx1151 twin of [`SLAB_ROUTE_RECEIPTS_LANDED`]. Set because the G1 receipts
+/// of the gfx1151 slab kernels are in `rcpt/` on the Halo card (exact gfx1151,
+/// BDF `0000:c0:00.0`), each passing with 0 mismatches against the CPU twin:
+/// K1 decode `mq_i4_moe_gemv_pm_gfx1151`, synthetic plus certified L0 records
+/// with the old-kernel parity (`r9.g1.k1.gfx1151.json`, sha256 `f5e4e524…b3c6`);
+/// K2 prefill, the W3 NT1 anchor and the NT4 entries with the down row repeats
+/// 1/2/4 (`qwen4_moe_iu4_sym_w3_pm_gfx1151`,
+/// `qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151`), synthetic
+/// (`r9.g1.k2.synthetic.gfx1151.json`, sha256 `eb5c643a…181c`) and real layers
+/// (`r9.g1.k2.real.gfx1151.json`, sha256 `ceabf444…0f73`). The A4 activations
+/// are deterministic synthetic rows through the real weights. gfx1151 only;
+/// every other architecture keeps the `ExpertSlabKernelsUnavailable` refusal.
+pub const SLAB_ROUTE_GFX1151_RECEIPTS_LANDED: bool = true;
+
 /// Whether the sealed expert-slab route may load on GPU architecture `arch`.
-/// gfx1201 only; every other architecture keeps refusing.
+/// gfx1201 and gfx1151, each only after its own G1 receipts landed; every
+/// other architecture keeps refusing.
 pub fn slab_route_admitted(arch: &str) -> bool {
-    arch == "gfx1201" && SLAB_ROUTE_RECEIPTS_LANDED
+    match arch {
+        "gfx1201" => SLAB_ROUTE_RECEIPTS_LANDED,
+        "gfx1151" => SLAB_ROUTE_GFX1151_RECEIPTS_LANDED,
+        _ => false,
+    }
 }
 
 /// The arena plan of a version-1 expert-slab artifact when the route is
@@ -2338,6 +2357,15 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("not available on any GPU"));
+    }
+
+    #[test]
+    fn slab_route_admission_follows_each_arch_receipts() {
+        assert_eq!(slab_route_admitted("gfx1201"), SLAB_ROUTE_RECEIPTS_LANDED);
+        assert_eq!(slab_route_admitted("gfx1151"), SLAB_ROUTE_GFX1151_RECEIPTS_LANDED);
+        for other in ["gfx1100", "gfx1200", "gfx942", ""] {
+            assert!(!slab_route_admitted(other), "{other:?}");
+        }
     }
 
     #[test]
