@@ -7207,6 +7207,13 @@ pub const QSA_POOLED_BF16_MIRROR_SRC: &str =
 /// only): split-K QSA decode attention, `qsa_decode_splitk_partial_f32` plus
 /// `qsa_decode_splitk_combine_f32`. KLD-gated, not bit-exact.
 pub const QSA_DECODE_SPLITK_SRC: &str = include_str!("../../../kernels/src/qsa_decode_splitk.hip");
+/// Module `qsa_decode_splitkv_q8` (same `HIPFIRE_QWEN4_QSA_DECODE_SPLITK` switch;
+/// q8 K/V, 24 query heads over 2 KV heads, head_dim 256, 1..=`few_row_limit`
+/// rows, eager only): split-KV QSA decode attention, `qsa_decode_splitkv_partial_q8` plus
+/// `qsa_decode_splitkv_merge_f32`; the q8 subset of f1771197a's
+/// `qsa_decode_splitkv.hip`. KLD-gated, not bit-exact.
+pub const QSA_DECODE_SPLITKV_Q8_SRC: &str =
+    include_str!("../../../kernels/src/qsa_decode_splitkv_q8.hip");
 /// The MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560`).
 pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
     "#define HIPFIRE_TOPK8_RESCORE 1\n",

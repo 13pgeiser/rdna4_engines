@@ -1963,6 +1963,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "qsa_decode_splitk_combine_f32"
             ]
         );
+        // Exact-gfx1151 Qwen4 QSA split-KV decode for q8 K/V (same HIPFIRE_QWEN4_QSA_DECODE_SPLITK switch; KLD-gated; tensor_ops.rs qsa_decode_splitkv_q8_launch).
+        add!(
+            "qsa_decode_splitkv_q8",
+            kernels::QSA_DECODE_SPLITKV_Q8_SRC,
+            ["qsa_decode_splitkv_partial_q8", "qsa_decode_splitkv_merge_f32"]
+        );
         add!(
             "repeat_interleave_qk_batched",
             kernels::REPEAT_INTERLEAVE_QK_BATCHED_SRC,

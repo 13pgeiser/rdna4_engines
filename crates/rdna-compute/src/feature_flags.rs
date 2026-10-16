@@ -650,10 +650,11 @@ pub struct FeatureFlags {
     /// incumbent while sharing activation loads across weight rows. Default on
     /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
     pub fn_lane_pm_rows: bool,
-    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): parsed
-    /// on unless the value is exactly `0` (kill switch). KLD-gated, not
-    /// bit-exact against the per-head kernel; acted on only for exact gfx1151
-    /// (see `qwen4_qsa_decode_splitk_enabled`).
+    /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
+    /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
+    /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
+    /// the per-head kernel; acted on only for exact gfx1151 (see
+    /// `qwen4_qsa_decode_splitk_enabled`).
     pub qwen4_qsa_decode_splitk: bool,
     /// Developer QSA mapped/allocation extent checks; exactly `1` or `2`.
     pub qwen4_qsa_extent_check: bool,
@@ -1200,9 +1201,11 @@ impl FeatureFlags {
         self.fn_lane_pm_rows && self.arch == "gfx1151"
     }
 
-    /// Split-K QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
-    /// on; `=0` is the kill switch). Exact gfx1151 only; the runtime additionally requires F32 K/V,
-    /// head_dim 256, 1..8 route rows and an eager (unrecorded, uncaptured) launch.
+    /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
+    /// on; `=0` is the kill switch for both the F32 split-K and the q8
+    /// split-KV routes). Exact gfx1151 only; the runtime additionally requires
+    /// F32 or q8 K/V, head_dim 256, an admitted decode call (1..=`few_row_limit`
+    /// rows) and an eager (unrecorded, uncaptured) launch.
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
     }

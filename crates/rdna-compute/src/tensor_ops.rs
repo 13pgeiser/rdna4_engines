@@ -7773,12 +7773,20 @@ fn indexed_attention_attention_batch_arena(
             ),
         ));
     }
-    // Split-K decode, default on (exact gfx1151; HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0
-    // kill switch): eager gfx1151 F32 hd256 admitted decode calls; KLD-gated,
-    // not bit-exact. The reference entry (`allow_fast = false`) stays per-head.
-    if let (true, Some(QsaDecodeAttentionPolicy::SplitK { splits, layout })) = (allow_fast, policy)
-    {
-        return qsa_decode_splitk_launch(gpu, p, max_selected, splits, layout);
+    // Split decode, default on (exact gfx1151; HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0
+    // kill switch): eager gfx1151 hd256 admitted decode calls, split-K for F32
+    // K/V and split-KV for q8 K/V; KLD-gated, not bit-exact. The reference
+    // entry (`allow_fast = false`) stays per-head.
+    if allow_fast {
+        match policy {
+            Some(QsaDecodeAttentionPolicy::SplitK { splits, layout }) => {
+                return qsa_decode_splitk_launch(gpu, p, max_selected, splits, layout);
+            }
+            Some(QsaDecodeAttentionPolicy::SplitKvQ8 { splits }) => {
+                return qsa_decode_splitkv_q8_launch(gpu, p, splits);
+            }
+            Some(QsaDecodeAttentionPolicy::PerHead) | None => {}
+        }
     }
     if allow_fast && !decode && qsa_gathered_wmma_applies(gpu, p) {
         return qsa_gathered_wmma(gpu, p, end_position, max_selected, arena);
@@ -8048,6 +8056,10 @@ pub enum QsaDecodeAttentionPolicy {
     /// `qsa_decode_splitk_{partial,combine}_f32`; every row partitions its own
     /// selected length `ell_r` into `splits` slices.
     SplitK { splits: usize, layout: usize },
+    /// `qsa_decode_splitkv_{partial_q8,merge_f32}`; every row splits its own
+    /// selected list into `splits` slices. q8 K/V, 24 query heads over 2 KV
+    /// heads, head_dim 256; the LDS is fixed, so no `max_selected` term.
+    SplitKvQ8 { splits: usize },
     /// The one-row per-head kernels (`indexed_attention_attention_*_batched`
     /// / `_serial`), grid z = rows. Never hg4, hg12 or WMMA.
     PerHead,
@@ -8055,9 +8067,10 @@ pub enum QsaDecodeAttentionPolicy {
 
 /// The policy proper. Inputs only: the architecture and flag (gfx1151 +
 /// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`), K/V format, head_dim, head grouping, the
-/// context-derived `max_selected` (LDS fit of the slice) and the launch mode
-/// (`eager`: no recorder or capture armed; split-K bakes its grid, LDS and
-/// position into the launch and is eager only). No row count.
+/// context-derived `max_selected` (LDS fit of the F32 slice; the q8 split-KV
+/// LDS is fixed) and the launch mode (`eager`: no recorder or capture armed;
+/// both split routes bake their grid, LDS and position into the launch and
+/// are eager only). No row count.
 fn qsa_decode_attention_policy_for(
     gpu: &Gpu,
     format: QsaKvFormat,
@@ -8067,9 +8080,33 @@ fn qsa_decode_attention_policy_for(
     max_selected: usize,
     eager: bool,
 ) -> QsaDecodeAttentionPolicy {
+    qsa_decode_attention_policy_with(
+        &gpu.flags,
+        &gpu.arch_caps,
+        format,
+        head_dim,
+        n_heads,
+        n_kv_heads,
+        max_selected,
+        eager,
+    )
+}
+
+/// [`qsa_decode_attention_policy_for`] over the flags and architecture alone
+/// (no device), so the policy is unit-testable without a GPU.
+fn qsa_decode_attention_policy_with(
+    flags: &crate::feature_flags::FeatureFlags,
+    arch_caps: &crate::arch_caps::ArchCaps,
+    format: QsaKvFormat,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_selected: usize,
+    eager: bool,
+) -> QsaDecodeAttentionPolicy {
     let split_k = eager
-        && gpu.flags.qwen4_qsa_decode_splitk_enabled()
-        && gpu.arch_caps.is_gfx1151()
+        && flags.qwen4_qsa_decode_splitk_enabled()
+        && arch_caps.is_gfx1151()
         && format == QsaKvFormat::F32
         && head_dim == 256
         && qsa_decode_splitk_layout_fits(
@@ -8085,10 +8122,17 @@ fn qsa_decode_attention_policy_for(
         )
         .is_some();
     if split_k {
-        QsaDecodeAttentionPolicy::SplitK {
+        return QsaDecodeAttentionPolicy::SplitK {
             splits: QSA_DECODE_SPLITK_SPLITS,
             layout: QSA_DECODE_SPLITK_SCORING_LAYOUT,
-        }
+        };
+    }
+    let split_kv_q8 = eager
+        && flags.qwen4_qsa_decode_splitk_enabled()
+        && arch_caps.is_gfx1151()
+        && qsa_decode_splitkv_q8_geometry_fits(format, head_dim, n_heads, n_kv_heads);
+    if split_kv_q8 {
+        QsaDecodeAttentionPolicy::SplitKvQ8 { splits: QSA_DECODE_SPLITK_SPLITS }
     } else {
         QsaDecodeAttentionPolicy::PerHead
     }
@@ -8483,6 +8527,290 @@ pub fn indexed_attention_attention_splitk_for_test(
 ) -> HipResult<()> {
     let max_selected = qsa_decode_splitk_validate(gpu, p, splits, scoring_layout)?;
     qsa_decode_splitk_launch(gpu, p, max_selected, splits, scoring_layout)
+}
+
+/// Splits, shape and geometry of the q8 split-KV decode route (the measured
+/// f1771197a kernels, `qsa_decode_splitkv_q8.hip`): the grid is one workgroup
+/// of 384 threads (one wave32 per query head of a KV group) per (KV head,
+/// split, row), so the kernels implement exactly 24 query heads over 2 KV
+/// heads at head_dim 256 and at most 32 splits. The route splits
+/// `QSA_DECODE_SPLITK_SPLITS` (32) ways.
+const QSA_DECODE_SPLITKV_Q8_MAX_SPLITS: usize = 32;
+const QSA_DECODE_SPLITKV_Q8_HEADS: usize = 24;
+const QSA_DECODE_SPLITKV_Q8_KV_HEADS: usize = 2;
+const QSA_DECODE_SPLITKV_Q8_HEAD_DIM: usize = 256;
+/// Partial kernel block: one wave32 per query head of a KV group (12 waves).
+const QSA_DECODE_SPLITKV_Q8_PARTIAL_THREADS: u32 = 384;
+/// Merge kernel block: eight wave32, one (row, head) record per wave.
+const QSA_DECODE_SPLITKV_Q8_MERGE_THREADS: u32 = 256;
+const QSA_DECODE_SPLITKV_Q8_MERGE_RECORDS_PER_BLOCK: usize = 8;
+/// Fixed dynamic LDS of the partial kernel (no static LDS): one 32 KiB F32
+/// K/V bank (64 keys x 128 channels), 12 heads x 64 key weights and 64 token
+/// ids = 32768 + 3072 + 256 = 36096 bytes.
+const QSA_DECODE_SPLITKV_Q8_LDS_BYTES: usize =
+    64 * 128 * 4 + QSA_ATTENTION_HG12_HEADS * 64 * 4 + 64 * 4;
+const _: () = assert!(
+    QSA_DECODE_SPLITKV_Q8_LDS_BYTES == 36096
+        && QSA_DECODE_SPLITKV_Q8_LDS_BYTES <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+);
+/// Workspace record: `rows * n_heads * splits` product-LSE records, an F32 LSE
+/// plane then `head_dim` normalized F32 O values per record (257 F32 per
+/// record). The kernel's record ABI differs from the F32 split-K scratch
+/// layout, so the q8 route never reads or writes that layout; both share the
+/// one QSA per-launch scratch allocation. The reservation bound is
+/// `QSA_DECODE_SPLITK_RESERVE_ROWS` rows x 24 heads x
+/// `QSA_DECODE_SPLITKV_Q8_MAX_SPLITS` splits.
+const QSA_DECODE_SPLITKV_Q8_RECORD_BYTES: usize =
+    (1 + QSA_DECODE_SPLITKV_Q8_HEAD_DIM) * std::mem::size_of::<f32>();
+const QSA_DECODE_SPLITKV_Q8_MODULE: &str = "qsa_decode_splitkv_q8";
+const QSA_DECODE_SPLITKV_Q8_PARTIAL: &str = "qsa_decode_splitkv_partial_q8";
+const QSA_DECODE_SPLITKV_Q8_MERGE: &str = "qsa_decode_splitkv_merge_f32";
+
+/// Whether a call of this format and geometry is one the q8 split-KV kernels
+/// implement: q8 K/V, head_dim 256, 24 query heads over exactly 2 KV heads.
+fn qsa_decode_splitkv_q8_geometry_fits(
+    format: QsaKvFormat,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+) -> bool {
+    format == QsaKvFormat::Q8
+        && head_dim == QSA_DECODE_SPLITKV_Q8_HEAD_DIM
+        && n_kv_heads == QSA_DECODE_SPLITKV_Q8_KV_HEADS
+        && n_heads == QSA_DECODE_SPLITKV_Q8_HEADS
+}
+
+/// [`qsa_decode_splitkv_q8_geometry_fits`] for `p`.
+fn qsa_decode_splitkv_q8_shape_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    qsa_decode_splitkv_q8_geometry_fits(p.format, p.head_dim, p.n_heads, p.n_kv_heads)
+}
+
+/// The q8 split-KV partial + merge launches. `p` is already shape-validated
+/// (the production arena checks or `qsa_decode_splitkv_q8_validate`). The F32
+/// product-LSE records (`records = rows * n_heads * splits`, record
+/// `(row * n_heads + head) * splits + split`; LSE plane, then normalized O)
+/// live in the QSA per-launch scratch ([`Gpu::qsa_gather_scratch`], not the
+/// F16 arena), reserved once at the fixed bound of
+/// `QSA_DECODE_SPLITK_RESERVE_ROWS` rows x 24 heads x
+/// `QSA_DECODE_SPLITKV_Q8_MAX_SPLITS` splits x 257 F32 and kept if a larger
+/// buffer is already held (the F32 split-K reservation shares the slot); only
+/// the launch's actual `rows x heads x splits` records are mapped. Every row
+/// splits its own selected list; both kernels run on the same stream back to
+/// back.
+fn qsa_decode_splitkv_q8_launch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    splits: usize,
+) -> HipResult<()> {
+    if splits == 0
+        || splits > QSA_DECODE_SPLITKV_Q8_MAX_SPLITS
+        || p.rows == 0
+        || p.rows > QSA_DECODE_SPLITK_RESERVE_ROWS
+        || !qsa_decode_splitkv_q8_shape_fits(p)
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    if !qsa_decode_splitk_eager(gpu) {
+        return Err(HipError::new(0, "QSA q8 split-KV decode is eager-only"));
+    }
+    // The kernels index with 32-bit ints: row * capacity (selected), and
+    // (row * heads) * splits (workspace record).
+    checked_product(p.rows, p.capacity, "QSA q8 split-KV selected rows")?;
+    checked_product3(p.rows, p.n_heads, splits, "QSA q8 split-KV workspace records")?;
+    let rows = checked_i32(p.rows, "QSA q8 split-KV rows")?;
+    let position_start = checked_i32(p.position_start, "QSA q8 split-KV position")?;
+    let n_heads = checked_i32(p.n_heads, "QSA q8 split-KV heads")?;
+    let n_kv_heads = checked_i32(p.n_kv_heads, "QSA q8 split-KV KV heads")?;
+    let head_dim = checked_i32(p.head_dim, "QSA q8 split-KV head width")?;
+    let budget_blocks = checked_i32(p.budget_blocks, "QSA q8 split-KV budget")?;
+    let compress = checked_i32(p.compress, "QSA q8 split-KV compress")?;
+    let capacity = checked_i32(p.capacity, "QSA q8 split-KV capacity")?;
+    let full_capacity = checked_i32(p.full_capacity, "QSA q8 split-KV cache capacity")?;
+    let splits_i = checked_i32(splits, "QSA q8 split-KV splits")?;
+    let kv_grid = checked_u32(p.n_kv_heads, "QSA q8 split-KV KV head grid")?;
+    let split_grid = checked_u32(splits, "QSA q8 split-KV split grid")?;
+    let row_grid = checked_u32(p.rows, "QSA q8 split-KV row grid")?;
+    let merge_grid = checked_u32(
+        (p.rows * p.n_heads).div_ceil(QSA_DECODE_SPLITKV_Q8_MERGE_RECORDS_PER_BLOCK),
+        "QSA q8 split-KV merge grid",
+    )?;
+    for kernel in [QSA_DECODE_SPLITKV_Q8_PARTIAL, QSA_DECODE_SPLITKV_Q8_MERGE] {
+        gpu.ensure_kernel_public(
+            QSA_DECODE_SPLITKV_Q8_MODULE,
+            crate::kernels::QSA_DECODE_SPLITKV_Q8_SRC,
+            kernel,
+        )?;
+    }
+    // Actual demand: rows x n_heads x splits records; the reservation is the
+    // fixed max-rows x max-splits bound, so one slot serves every admitted row
+    // count and a wider launch never moves it.
+    let record_bytes = |rows: usize, splits: usize| {
+        rows.checked_mul(p.n_heads)
+            .and_then(|value| value.checked_mul(splits))
+            .and_then(|value| value.checked_mul(QSA_DECODE_SPLITKV_Q8_RECORD_BYTES))
+            .ok_or_else(|| HipError::new(0, "QSA q8 split-KV workspace size overflows"))
+    };
+    let workspace_bytes = record_bytes(p.rows, splits)?;
+    let reserve_bytes = record_bytes(QSA_DECODE_SPLITK_RESERVE_ROWS, QSA_DECODE_SPLITKV_Q8_MAX_SPLITS)?;
+    let workspace = gpu.qsa_gather_scratch(workspace_bytes, reserve_bytes)?;
+    let mut partial = KernargBlob::new();
+    for ptr in [
+        p.q_with_gate.buf.as_ptr(),
+        p.full_keys.buf.as_ptr(),
+        p.full_values.buf.as_ptr(),
+        p.selected.buf.as_ptr(),
+        workspace,
+    ] {
+        partial.push_ptr(ptr);
+    }
+    for value in [
+        rows,
+        position_start,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        budget_blocks,
+        compress,
+        capacity,
+        full_capacity,
+        splits_i,
+    ] {
+        partial.push_i32(value);
+    }
+    partial.pad_to(16);
+    let mut merge = KernargBlob::new();
+    merge.push_ptr(workspace);
+    merge.push_ptr(p.q_with_gate.buf.as_ptr());
+    merge.push_ptr(p.output.buf.as_ptr());
+    for value in [rows, n_heads, head_dim, splits_i] {
+        merge.push_i32(value);
+    }
+    merge.pad_to(16);
+    gpu.launch_blob_recorded(
+        QSA_DECODE_SPLITKV_Q8_PARTIAL,
+        [kv_grid, split_grid, row_grid],
+        [QSA_DECODE_SPLITKV_Q8_PARTIAL_THREADS, 1, 1],
+        QSA_DECODE_SPLITKV_Q8_LDS_BYTES as u32,
+        partial.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    gpu.launch_blob_recorded(
+        QSA_DECODE_SPLITKV_Q8_MERGE,
+        [merge_grid, 1, 1],
+        [QSA_DECODE_SPLITKV_Q8_MERGE_THREADS, 1, 1],
+        0,
+        merge.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Every shape, type and scalar check of the direct q8 split-KV entry.
+/// Stricter than the production route's inline checks: all tensors' dtypes and
+/// byte extents, the full cache capacities and lengths, the 1..=32 row and 1..=32
+/// split limits, the fixed q8 / head_dim 256 / 24-over-2-head shape, the shape
+/// bound against the chunk's longest selected length, a gfx11/gfx12 wave32
+/// device, and no recorder or capture.
+#[cfg(any(test, feature = "lab"))]
+fn qsa_decode_splitkv_q8_validate(
+    gpu: &Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    splits: usize,
+) -> HipResult<()> {
+    let wrong_shape = || HipError::new(0, &ComputeError::WrongShape.to_string());
+    if !gpu.arch_caps.has_gfx11_plus_simt() {
+        return Err(HipError::new(0, "QSA q8 split-KV decode needs a gfx11 or gfx12 wave32 device"));
+    }
+    if !qsa_decode_splitk_eager(gpu) {
+        return Err(HipError::new(0, "QSA q8 split-KV decode is eager-only"));
+    }
+    if splits == 0
+        || splits > QSA_DECODE_SPLITKV_Q8_MAX_SPLITS
+        || !qsa_decode_splitkv_q8_shape_fits(p)
+        || p.rows == 0
+        || p.rows > QSA_DECODE_SPLITK_RESERVE_ROWS
+    {
+        return Err(wrong_shape());
+    }
+    for tensor in [p.q_with_gate, p.output] {
+        ensure_f32(tensor)?;
+    }
+    check_qsa_format(gpu, p.format, p.n_kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
+    if p.selected.dtype != DType::Raw
+        || p.compress == 0
+        || p.capacity == 0
+        || p.full_capacity == 0
+    {
+        return Err(wrong_shape());
+    }
+    let end_position = p.position_start.checked_add(p.rows).ok_or_else(wrong_shape)?;
+    if end_position > i32::MAX as usize || end_position > p.full_capacity {
+        return Err(wrong_shape());
+    }
+    let head_elements = checked_product(p.n_heads, p.head_dim, "QSA q8 split-KV heads")?;
+    let q_elements = checked_product(2, head_elements, "QSA q8 split-KV query")?;
+    let kv_elements = checked_product(
+        p.full_capacity,
+        p.format.kv_row_units(p.n_kv_heads, p.head_dim),
+        "QSA q8 split-KV cache",
+    )?;
+    let q_rows = checked_product(p.rows, q_elements, "QSA q8 split-KV query rows")?;
+    let output_rows = checked_product(p.rows, head_elements, "QSA q8 split-KV output rows")?;
+    let selected_bytes = checked_product(
+        checked_product(p.rows, p.capacity, "QSA q8 split-KV selected rows")?,
+        std::mem::size_of::<i32>(),
+        "QSA q8 split-KV selected",
+    )?;
+    let f32_bytes = std::mem::size_of::<f32>();
+    let kv_bytes = checked_product(
+        p.full_capacity,
+        p.format.kv_row_bytes(p.n_kv_heads, p.head_dim),
+        "QSA q8 split-KV cache bytes",
+    )?;
+    if p.q_with_gate.numel() < q_rows
+        || p.output.numel() < output_rows
+        || p.full_keys.numel() < kv_elements
+        || p.full_values.numel() < kv_elements
+        || p.selected.numel() < selected_bytes
+        || p.q_with_gate.buf.size() < checked_product(q_rows, f32_bytes, "QSA q8 split-KV query bytes")?
+        || p.output.buf.size() < checked_product(output_rows, f32_bytes, "QSA q8 split-KV output bytes")?
+        || p.full_keys.buf.size() < kv_bytes
+        || p.full_values.buf.size() < kv_bytes
+        || p.selected.buf.size() < selected_bytes
+    {
+        return Err(wrong_shape());
+    }
+    let selected_bound = checked_product(p.budget_blocks, p.compress, "QSA q8 split-KV selected bound")?
+        .checked_add(p.compress - 1)
+        .ok_or_else(wrong_shape)?;
+    let max_selected = end_position.min(p.capacity).min(selected_bound);
+    if p.shape_selected < max_selected {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "QSA q8 split-KV shape bound {} is below the active selected length {max_selected}",
+                p.shape_selected
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Direct test route to the q8 split-KV partial + merge kernels with an
+/// explicit `splits` (1..=32), bypassing the knob and the route predicates:
+/// the full validation of [`qsa_decode_splitkv_q8_validate`], then the
+/// production launch pair. q8 K/V, head_dim 256, 24 query heads over 2 KV
+/// heads, 1..=32 rows, eager only; gfx11/gfx12 wave32. Gated behind `lab` (or
+/// test) like [`indexed_attention_attention_batch_exact`]. The F32 split-K
+/// kernels keep [`indexed_attention_attention_splitk_for_test`].
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_attention_splitkv_q8_for_test(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    splits: usize,
+) -> HipResult<()> {
+    qsa_decode_splitkv_q8_validate(gpu, p, splits)?;
+    qsa_decode_splitkv_q8_launch(gpu, p, splits)
 }
 
 /// Whether the dense F16 WMMA attention applies: the Qwen4 F16 route (gfx11 WMMA,
@@ -9473,6 +9801,58 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decode attention policy over the flags and architecture alone:
+    /// F32 K/V keeps split-K, q8 K/V at 24 query heads over 2 KV heads takes
+    /// split-KV, everything else (recorded/captured, kill switch, other
+    /// geometry or architecture) stays per-head. Row counts are not an input.
+    #[test]
+    fn qsa_decode_attention_policy_routes_f32_split_k_and_q8_split_kv() {
+        let policy = |arch: &str, switch: bool, format, heads: usize, kv_heads: usize, head_dim: usize, eager: bool| {
+            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+            flags.qwen4_qsa_decode_splitk = switch;
+            let flags = std::sync::Arc::new(flags);
+            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+            qsa_decode_attention_policy_with(&flags, &caps, format, head_dim, heads, kv_heads, 2051, eager)
+        };
+        let q8 = QsaDecodeAttentionPolicy::SplitKvQ8 { splits: QSA_DECODE_SPLITK_SPLITS };
+        let f32_split_k = QsaDecodeAttentionPolicy::SplitK {
+            splits: QSA_DECODE_SPLITK_SPLITS,
+            layout: QSA_DECODE_SPLITK_SCORING_LAYOUT,
+        };
+        let per_head = QsaDecodeAttentionPolicy::PerHead;
+        // q8: exact gfx1151, eager, 24 / 2 / 256.
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, true), q8);
+        // Recorded or captured launch.
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, false), per_head);
+        // Kill switch.
+        assert_eq!(policy("gfx1151", false, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        // Wrong head geometry.
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 12, 1, 256, true), per_head);
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 4, 256, true), per_head);
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 128, true), per_head);
+        // Another architecture.
+        assert_eq!(policy("gfx1201", true, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        // F32 K/V is unchanged: split-K, never split-KV.
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, true), f32_split_k);
+        assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, false), per_head);
+        assert_eq!(policy("gfx1151", false, QsaKvFormat::F32, 24, 2, 256, true), per_head);
+        assert_eq!(policy("gfx1201", true, QsaKvFormat::F32, 24, 2, 256, true), per_head);
+        // The q8 split-KV LDS is fixed: a selected list far past the F32 slice
+        // limit still takes it.
+        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1151");
+        flags.qwen4_qsa_decode_splitk = true;
+        let flags = std::sync::Arc::new(flags);
+        let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+        assert_eq!(
+            qsa_decode_attention_policy_with(&flags, &caps, QsaKvFormat::Q8, 256, 24, 2, usize::MAX / 4, true),
+            q8
+        );
+        assert_eq!(
+            qsa_decode_attention_policy_with(&flags, &caps, QsaKvFormat::F32, 256, 24, 2, usize::MAX / 4, true),
+            per_head
+        );
+    }
 
     #[test]
     fn qsa_exact_selector_stays_gfx11_plus_only() {
