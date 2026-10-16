@@ -684,8 +684,11 @@ fn expect_kept_entry(
     index: usize,
     expected: ExpertEntryId,
 ) -> Result<&HfqTensorInfo, ExpertSlabTableError> {
-    let info = tensors.get(index).ok_or(ExpertSlabTableError::MissingEntry { index, expected })?;
-    if parse_expert_entry_name(&info.name) != Some((expected.layer, expected.expert, expected.proj)) {
+    let info = tensors
+        .get(index)
+        .ok_or(ExpertSlabTableError::MissingEntry { index, expected })?;
+    if parse_expert_entry_name(&info.name) != Some((expected.layer, expected.expert, expected.proj))
+    {
         return Err(ExpertSlabTableError::MissingEntry { index, expected });
     }
     Ok(info)
@@ -870,8 +873,9 @@ mod tests {
     fn sparse_table_keeps_original_ids_without_payload() {
         let keep = crate::ExpertKeep::new(512, vec![(16..32).collect(); 48], None, 10).unwrap();
         let mut tensors = full_fn_headers(|_, _| ExpertFormat::Mq3I4);
-        tensors.retain(|info| parse_expert_entry_name(&info.name)
-            .map_or(true, |(l, e, _)| keep.is_kept(l, e)));
+        tensors.retain(|info| {
+            parse_expert_entry_name(&info.name).map_or(true, |(l, e, _)| keep.is_kept(l, e))
+        });
         let mut cursor = 4096;
         for info in &mut tensors {
             info.data_offset = cursor;
@@ -883,7 +887,10 @@ mod tests {
         assert_eq!(table.slab(0, 0).unwrap().gate_up.len, 0);
         assert_ne!(table.slab(0, 16).unwrap().gate_up.len, 0);
         let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table).unwrap();
-        assert_eq!(plan.physical_bytes(), (48 * 16 * ExpertFormat::Mq3I4.slab_bytes()) as u64);
+        assert_eq!(
+            plan.physical_bytes(),
+            (48 * 16 * ExpertFormat::Mq3I4.slab_bytes()) as u64
+        );
     }
 
     fn all_w3() -> Vec<HfqTensorInfo> {

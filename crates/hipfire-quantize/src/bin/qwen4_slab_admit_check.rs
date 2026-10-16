@@ -111,12 +111,18 @@ fn main() -> ExitCode {
             }
         }
     }
-    let routed_bytes: usize = hfq.tensors().iter()
+    let routed_bytes: usize = hfq
+        .tensors()
+        .iter()
         .filter(|t| expert_slabs::parse_expert_entry_name(&t.name).is_some())
-        .map(|t| t.data_size).sum();
-    let non_expert_bytes: usize = hfq.tensors().iter()
+        .map(|t| t.data_size)
+        .sum();
+    let non_expert_bytes: usize = hfq
+        .tensors()
+        .iter()
         .filter(|t| expert_slabs::parse_expert_entry_name(&t.name).is_none())
-        .map(|t| t.data_size).sum();
+        .map(|t| t.data_size)
+        .sum();
     let table = match build_expert_slab_table_with_keep(&metadata, hfq.tensors(), keep.as_ref()) {
         Ok(table) => table,
         Err(error) => return fail("span table", error),
@@ -137,9 +143,10 @@ fn main() -> ExitCode {
     }
     let validate_s = start.elapsed().as_secs_f64() - table_s;
     let counts = table.counts();
-    if keep.as_ref().is_some_and(|k| {
-        counts.w3 + counts.w2 + counts.e8p + counts.mq4 != k.total_kept()
-    }) {
+    if keep
+        .as_ref()
+        .is_some_and(|k| counts.w3 + counts.w2 + counts.e8p + counts.mq4 != k.total_kept())
+    {
         return fail("keep counts", "table count differs from keep total");
     }
     match admit_hfqm_artifact(&hfq) {

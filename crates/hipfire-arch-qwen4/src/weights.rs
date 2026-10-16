@@ -1423,8 +1423,12 @@ impl Qwen4Manifest {
         }
         if config.expert_keep.is_some() {
             for entry in &mut weights {
-                if entry.name.ends_with(".experts.gate_up_proj") || entry.name.ends_with(".experts.down_proj") {
-                    if let Some(ids) = config.kept_expert_ids(entry.layer.unwrap_or(0), entry.name.starts_with("mtp.")) {
+                if entry.name.ends_with(".experts.gate_up_proj")
+                    || entry.name.ends_with(".experts.down_proj")
+                {
+                    if let Some(ids) = config
+                        .kept_expert_ids(entry.layer.unwrap_or(0), entry.name.starts_with("mtp."))
+                    {
                         entry.logical_shape[0] = ids.len();
                     }
                 }
@@ -3710,7 +3714,8 @@ fn build_ffn_refs(
             ..
         } => {
             let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
-            let payload_experts = config.kept_expert_ids(layer.unwrap_or(0), prefix.starts_with("mtp."))
+            let payload_experts = config
+                .kept_expert_ids(layer.unwrap_or(0), prefix.starts_with("mtp."))
                 .map_or(experts, <[u16]>::len);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
                 expert_arena: None,

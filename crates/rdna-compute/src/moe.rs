@@ -1952,9 +1952,21 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // The kernel is fixed E512/top-10 and reads only the first 512 mask bytes.
-        require_span(logits, &[tokens, 512, 4], "moe_router_softmax_top10_masked_f32 logits")?;
-        require_span(topk_idx, &[tokens, 10, 4], "moe_router_softmax_top10_masked_f32 ids")?;
-        require_span(topk_w, &[tokens, 10, 4], "moe_router_softmax_top10_masked_f32 weights")?;
+        require_span(
+            logits,
+            &[tokens, 512, 4],
+            "moe_router_softmax_top10_masked_f32 logits",
+        )?;
+        require_span(
+            topk_idx,
+            &[tokens, 10, 4],
+            "moe_router_softmax_top10_masked_f32 ids",
+        )?;
+        require_span(
+            topk_w,
+            &[tokens, 10, 4],
+            "moe_router_softmax_top10_masked_f32 weights",
+        )?;
         if keep == 0 {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -1987,21 +1999,28 @@ impl Gpu {
             &layer_arg as *const _ as *mut c_void,
             &row_base_arg as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func, [tokens as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(lp);
-            b.push_ptr(ip);
-            b.push_ptr(wp);
-            b.push_i32(ne);
-            b.push_i32(kt);
-            b.push_i32(norm);
-            b.push_i32(round);
-            b.push_ptr(kp);
-            b.push_ptr(fault as *const c_void);
-            b.push_i32(layer_arg);
-            b.push_i32(row_base_arg);
-            b
-        })
+        self.launch_maybe_blob(
+            func,
+            [tokens as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(ne);
+                b.push_i32(kt);
+                b.push_i32(norm);
+                b.push_i32(round);
+                b.push_ptr(kp);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
+                b
+            },
+        )
     }
 
     /// Qwen4 indexed combine.  `expert_outputs` stays unweighted until this

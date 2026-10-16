@@ -1628,19 +1628,37 @@ fn pruned_expert_entries(
     dn_bytes: usize,
 ) -> Result<Vec<Qwen4ExpertEntry>, Qwen4GpuForwardError> {
     if !matches!(layout, Qwen4ExpertTableLayout::Single) {
-        return Err(invalid("qwen4.expert_keep requires a single-device non-tier placement"));
+        return Err(invalid(
+            "qwen4.expert_keep requires a single-device non-tier placement",
+        ));
     }
     let mut slot = 0;
     let mut entries = Vec::with_capacity(experts);
     for expert in 0..experts {
         if ids.binary_search(&(expert as u16)).is_err() {
-            entries.push(Qwen4ExpertEntry { origin: Qwen4ExpertOrigin::Local, gate_up_ptr: 0, down_ptr: 0 });
+            entries.push(Qwen4ExpertEntry {
+                origin: Qwen4ExpertOrigin::Local,
+                gate_up_ptr: 0,
+                down_ptr: 0,
+            });
             continue;
         }
         entries.push(Qwen4ExpertEntry {
             origin: Qwen4ExpertOrigin::Local,
-            gate_up_ptr: expert_slot_ptr("pruned gate/up", local.gate_up_base, local.gate_up_bytes, slot, gu_bytes)?,
-            down_ptr: expert_slot_ptr("pruned down", local.down_base, local.down_bytes, slot, dn_bytes)?,
+            gate_up_ptr: expert_slot_ptr(
+                "pruned gate/up",
+                local.gate_up_base,
+                local.gate_up_bytes,
+                slot,
+                gu_bytes,
+            )?,
+            down_ptr: expert_slot_ptr(
+                "pruned down",
+                local.down_base,
+                local.down_bytes,
+                slot,
+                dn_bytes,
+            )?,
         });
         slot += 1;
     }
@@ -2495,11 +2513,15 @@ impl Qwen4MoeLayerRuntime {
         let kept_ids = config.kept_expert_ids(layer_label, moe.gate.name.starts_with("mtp."));
         let source_experts = if let Some(ids) = kept_ids {
             match &layout {
-                Qwen4ExpertTableLayout::Ep { placement, .. } | Qwen4ExpertTableLayout::Full { placement, .. } =>
-                    ids.iter().filter(|&&e| placement.owns(e as usize)).count(),
+                Qwen4ExpertTableLayout::Ep { placement, .. }
+                | Qwen4ExpertTableLayout::Full { placement, .. } => {
+                    ids.iter().filter(|&&e| placement.owns(e as usize)).count()
+                }
                 _ => ids.len(),
             }
-        } else { layout.local_experts(config.num_experts)? };
+        } else {
+            layout.local_experts(config.num_experts)?
+        };
         let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
         let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
         if tier_layer.is_none() && gate_up_source.buf.size() < expected_gate_up_bytes {
@@ -2589,8 +2611,14 @@ impl Qwen4MoeLayerRuntime {
             down_bytes: down_source.buf.size(),
         };
         let table_entries: Vec<Qwen4ExpertEntry> = match &fp8_tables {
-            _ if kept_ids.is_some() => pruned_expert_entries(&layout, local, config.num_experts,
-                kept_ids.unwrap(), gate_up_expert_bytes, down_expert_bytes)?,
+            _ if kept_ids.is_some() => pruned_expert_entries(
+                &layout,
+                local,
+                config.num_experts,
+                kept_ids.unwrap(),
+                gate_up_expert_bytes,
+                down_expert_bytes,
+            )?,
             // The accessor's per-expert block addresses, in expert order: the
             // same pointers the grouped launch reads and the views must name.
             Some(tables) => tables
@@ -2636,7 +2664,8 @@ impl Qwen4MoeLayerRuntime {
         let mut experts = Vec::with_capacity(config.num_experts);
         let mut metadata = Vec::with_capacity(config.num_experts);
         for (expert, entry) in table_entries.iter().enumerate() {
-            let absent = expert_pruned(kept_ids, expert) && entry.gate_up_ptr == 0 && entry.down_ptr == 0;
+            let absent =
+                expert_pruned(kept_ids, expert) && entry.gate_up_ptr == 0 && entry.down_ptr == 0;
             let tier_gate = matches!(entry.origin, Qwen4ExpertOrigin::Tier).then(|| {
                 foreign_packed_source(entry.gate_up_ptr, gate_up_expert_bytes, gate_up_dtype)
             });
@@ -2645,9 +2674,17 @@ impl Qwen4MoeLayerRuntime {
             let (gate_up_backing, gate_up_offset, down_backing, down_offset) = match entry.origin {
                 Qwen4ExpertOrigin::Local => (
                     gate_up_source,
-                    if absent { 0 } else { entry.gate_up_ptr - local.gate_up_base },
+                    if absent {
+                        0
+                    } else {
+                        entry.gate_up_ptr - local.gate_up_base
+                    },
                     down_source,
-                    if absent { 0 } else { entry.down_ptr - local.down_base },
+                    if absent {
+                        0
+                    } else {
+                        entry.down_ptr - local.down_base
+                    },
                 ),
                 Qwen4ExpertOrigin::Tier => (
                     tier_gate.as_ref().expect("tier gate descriptor"),
@@ -2677,22 +2714,30 @@ impl Qwen4MoeLayerRuntime {
                     )
                 }
             };
-            let mut gate_up = if absent { ProjectionView::absent(gate_up_dtype, gate_up_rows, config.hidden_size) } else { ProjectionView::from_packed(
-                gate_up_backing,
-                gate_up_offset,
-                gate_up_expert_bytes,
-                gate_up_dtype,
-                gate_up_rows,
-                config.hidden_size,
-            ) };
-            let mut down = if absent { ProjectionView::absent(down_dtype, config.hidden_size, config.moe_intermediate_size) } else { ProjectionView::from_packed(
-                down_backing,
-                down_offset,
-                down_expert_bytes,
-                down_dtype,
-                config.hidden_size,
-                config.moe_intermediate_size,
-            ) };
+            let mut gate_up = if absent {
+                ProjectionView::absent(gate_up_dtype, gate_up_rows, config.hidden_size)
+            } else {
+                ProjectionView::from_packed(
+                    gate_up_backing,
+                    gate_up_offset,
+                    gate_up_expert_bytes,
+                    gate_up_dtype,
+                    gate_up_rows,
+                    config.hidden_size,
+                )
+            };
+            let mut down = if absent {
+                ProjectionView::absent(down_dtype, config.hidden_size, config.moe_intermediate_size)
+            } else {
+                ProjectionView::from_packed(
+                    down_backing,
+                    down_offset,
+                    down_expert_bytes,
+                    down_dtype,
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                )
+            };
             if let Some(view) = tier_layer.as_ref() {
                 let host =
                     view.placement(expert) == Some(crate::expert_tier_plan::Placement::HostMapped);
@@ -2896,8 +2941,15 @@ impl Qwen4MoeLayerRuntime {
             slab: None,
             label: layer_label,
             retained_identities: Vec::new(),
-            expert_keep_mask: upload_expert_keep_mask(gpu, config,
-                if moe.gate.name.starts_with("mtp.") { config.num_hidden_layers } else { layer_label })?,
+            expert_keep_mask: upload_expert_keep_mask(
+                gpu,
+                config,
+                if moe.gate.name.starts_with("mtp.") {
+                    config.num_hidden_layers
+                } else {
+                    layer_label
+                },
+            )?,
         }
         .seal_retained_identities()?)
     }
@@ -3012,8 +3064,9 @@ impl Qwen4MoeLayerRuntime {
             let (gate_up_bytes, down_bytes) = (format.gate_up_bytes(), format.down_bytes());
             let absent = expert_pruned(config.kept_expert_ids(layer_label, false), expert)
                 && entry.gate_up_offset == entry.down_offset;
-            if !absent && (entry.gate_up_offset + gate_up_bytes != entry.down_offset
-                || entry.down_offset + down_bytes > plan.bytes)
+            if !absent
+                && (entry.gate_up_offset + gate_up_bytes != entry.down_offset
+                    || entry.down_offset + down_bytes > plan.bytes)
             {
                 return Err(invalid(format!(
                     "layer {layer_label} expert {expert} extents leave the arena"
@@ -3236,20 +3289,40 @@ impl Qwen4MoeLayerRuntime {
             return Ok(false);
         }
         if self.expert_keep_mask.is_some() && self.qt44_qt53_formats() {
-            let gu: Vec<u8> = self.expert_gate_up_entries.iter().filter(|&&p| p != 0)
-                .flat_map(|p| p.to_ne_bytes()).collect();
-            let dn: Vec<u8> = self.expert_down_entries.iter().filter(|&&p| p != 0)
-                .flat_map(|p| p.to_ne_bytes()).collect();
+            let gu: Vec<u8> = self
+                .expert_gate_up_entries
+                .iter()
+                .filter(|&&p| p != 0)
+                .flat_map(|p| p.to_ne_bytes())
+                .collect();
+            let dn: Vec<u8> = self
+                .expert_down_entries
+                .iter()
+                .filter(|&&p| p != 0)
+                .flat_map(|p| p.to_ne_bytes())
+                .collect();
             let gu_table = gpu.upload_raw(&gu, &[gu.len()])?;
             let dn_table = match gpu.upload_raw(&dn, &[dn.len()]) {
                 Ok(table) => table,
-                Err(error) => { let _ = gpu.free_tensor(gu_table); return Err(error.into()); }
+                Err(error) => {
+                    let _ = gpu.free_tensor(gu_table);
+                    return Err(error.into());
+                }
             };
             let result = (|| -> Result<bool, Qwen4GpuForwardError> {
-                Ok(gpu.qwen4_moe_sym_check(&gu_table, 2 * config.moe_intermediate_size,
-                    config.hidden_size, gu.len() / 8, 136)?
-                    && gpu.qwen4_moe_sym_check(&dn_table, config.hidden_size,
-                        config.moe_intermediate_size, dn.len() / 8, 68)?)
+                Ok(gpu.qwen4_moe_sym_check(
+                    &gu_table,
+                    2 * config.moe_intermediate_size,
+                    config.hidden_size,
+                    gu.len() / 8,
+                    136,
+                )? && gpu.qwen4_moe_sym_check(
+                    &dn_table,
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                    dn.len() / 8,
+                    68,
+                )?)
             })();
             let _ = gpu.free_tensor(gu_table);
             let _ = gpu.free_tensor(dn_table);
@@ -3312,7 +3385,9 @@ impl Qwen4MoeLayerRuntime {
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         // Tier tables are frozen borrowed sub-views; only the lease frees them.
         if self.tier.is_some() {
-            return self.expert_keep_mask.and_then(|mask| gpu.free_tensor(mask).err());
+            return self
+                .expert_keep_mask
+                .and_then(|mask| gpu.free_tensor(mask).err());
         }
         let mut first = None;
         let tags = self.slab.and_then(|slab| slab.codec_tags);
@@ -3336,15 +3411,21 @@ fn upload_expert_keep_mask(
     config: &Qwen4Config,
     layer: usize,
 ) -> Result<Option<GpuTensor>, Qwen4GpuForwardError> {
-    let Some(keep) = &config.expert_keep else { return Ok(None) };
+    let Some(keep) = &config.expert_keep else {
+        return Ok(None);
+    };
     let ids = if layer < config.num_hidden_layers {
         keep.kept(layer)
     } else {
-        let Some(ids) = keep.mtp_kept() else { return Ok(None) };
+        let Some(ids) = keep.mtp_kept() else {
+            return Ok(None);
+        };
         ids
     };
     let mut mask = vec![0u8; config.num_experts];
-    for &id in ids { mask[id as usize] = 1; }
+    for &id in ids {
+        mask[id as usize] = 1;
+    }
     Ok(Some(gpu.upload_raw(&mask, &[mask.len()])?))
 }
 
@@ -4137,7 +4218,10 @@ pub(crate) fn seal_moe_decode<'a>(
             &shared,
             MoeRouteCapability::Qt44Qt53Grouped,
             None,
-            runtime.expert_keep_mask.as_ref().map_or(0, |mask| mask.buf.as_ptr() as usize),
+            runtime
+                .expert_keep_mask
+                .as_ref()
+                .map_or(0, |mask| mask.buf.as_ptr() as usize),
         )),
         normalization: MoeNormalization::Provided,
         batch_size: 1,

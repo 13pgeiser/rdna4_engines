@@ -44,11 +44,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
-use hipfire_arch_qwen4::ExpertKeep;
 use hipfire_arch_qwen4::expert_slabs::{
     expert_entry_name, parse_expert_entry_name, ExpertFormat, ExpertProj, ExpertSlabsV1,
     DOWN_SHAPE, EXPERTS_PER_LAYER, EXPERT_SLABS_METADATA_KEY, GATE_UP_SHAPE, TRUNK_LAYERS,
 };
+use hipfire_arch_qwen4::ExpertKeep;
 use hipfire_runtime::e8p_i4_reference as e8p;
 use hipfire_runtime::hfq::{write_hfqm_package_streaming, HfqFile, HfqStreamEntry};
 use hipfire_runtime::mq_i4::{self, MqI4Profile};
@@ -279,7 +279,9 @@ pub fn load_allocation_with_keep(
     keep: Option<&ExpertKeep>,
 ) -> Result<Allocation, SlabError> {
     if keep.is_some_and(|k| k.n_layers() != geometry.layers || k.n_experts() != geometry.experts) {
-        return Err(SlabError::Config("allocation keep geometry mismatch".into()));
+        return Err(SlabError::Config(
+            "allocation keep geometry mismatch".into(),
+        ));
     }
     let bytes = std::fs::read(path).map_err(|e| io_err(path.display(), e))?;
     let file_sha256 = hex_lower(&Sha256::digest(&bytes));
@@ -335,7 +337,11 @@ pub fn load_allocation_with_keep(
                 formats.push(ExpertFormat::Mq4Xts);
                 continue;
             }
-            let index = if compact { kept.unwrap().binary_search(&(expert as u16)).unwrap() } else { expert };
+            let index = if compact {
+                kept.unwrap().binary_search(&(expert as u16)).unwrap()
+            } else {
+                expert
+            };
             let v = &row[index];
             formats.push(match v.as_u64() {
                 Some(0) => ExpertFormat::Mq2I4,
@@ -357,31 +363,61 @@ pub fn load_allocation_with_keep(
 }
 
 /// Apply optional original-id `tiers: {layer: {expert: "w3" | "mq4"}}`.
-pub fn apply_keep_tiers(root: &Value, keep: &ExpertKeep, formats: &mut [ExpertFormat]) -> Result<(), SlabError> {
-    let Some(tiers) = root.get("tiers") else { return Ok(()) };
-    if tiers.is_null() { return Ok(()) }
+pub fn apply_keep_tiers(
+    root: &Value,
+    keep: &ExpertKeep,
+    formats: &mut [ExpertFormat],
+) -> Result<(), SlabError> {
+    let Some(tiers) = root.get("tiers") else {
+        return Ok(());
+    };
+    if tiers.is_null() {
+        return Ok(());
+    }
     if formats.len() != keep.n_layers() * keep.n_experts() {
         return Err(SlabError::Config("tier format geometry mismatch".into()));
     }
-    let apply = |layer: usize, expert: usize, value: &Value, formats: &mut [ExpertFormat]| -> Result<(), SlabError> {
-        if value.is_null() { return Ok(()) }
+    let apply = |layer: usize,
+                 expert: usize,
+                 value: &Value,
+                 formats: &mut [ExpertFormat]|
+     -> Result<(), SlabError> {
+        if value.is_null() {
+            return Ok(());
+        }
         if !keep.is_kept(layer, expert) {
-            return Err(SlabError::Config(format!("tier for absent expert L{layer}/E{expert}")));
+            return Err(SlabError::Config(format!(
+                "tier for absent expert L{layer}/E{expert}"
+            )));
         }
         formats[layer * keep.n_experts() + expert] = match value.as_str() {
             Some("w3") => ExpertFormat::Mq3I4,
             Some("mq4") => ExpertFormat::Mq4Xts,
-            _ => return Err(SlabError::Config(format!("invalid tier L{layer}/E{expert}: {value}"))),
+            _ => {
+                return Err(SlabError::Config(format!(
+                    "invalid tier L{layer}/E{expert}: {value}"
+                )))
+            }
         };
         Ok(())
     };
-    let rows = tiers.as_object().ok_or_else(|| SlabError::Config("tiers must be an object keyed by layer id".into()))?;
+    let rows = tiers
+        .as_object()
+        .ok_or_else(|| SlabError::Config("tiers must be an object keyed by layer id".into()))?;
     for (layer, row) in rows {
-        let layer = layer.parse::<usize>().map_err(|_| SlabError::Config("invalid tier layer id".into()))?;
-        if layer >= keep.n_layers() { return Err(SlabError::Config("tier layer outside geometry".into())) }
-        let row = row.as_object().ok_or_else(|| SlabError::Config(format!("invalid tiers row {layer}")))?;
+        let layer = layer
+            .parse::<usize>()
+            .map_err(|_| SlabError::Config("invalid tier layer id".into()))?;
+        if layer >= keep.n_layers() {
+            return Err(SlabError::Config("tier layer outside geometry".into()));
+        }
+        let row = row
+            .as_object()
+            .ok_or_else(|| SlabError::Config(format!("invalid tiers row {layer}")))?;
         for (expert, value) in row {
-            let expert = expert.parse::<usize>().map_err(|_| SlabError::Config("invalid tier expert id".into()))?;
+            let expert = expert
+                .parse::<usize>()
+                .map_err(|_| SlabError::Config("invalid tier expert id".into()))?;
             apply(layer, expert, value, formats)?;
         }
     }
@@ -1158,7 +1194,11 @@ enum EntryKind {
     /// Verbatim source tensor.
     Copy { src_offset: u64 },
     /// Compact original-id MTP aggregate slices.
-    CopySlices { src_offset: u64, stride: u64, experts: Vec<u16> },
+    CopySlices {
+        src_offset: u64,
+        stride: u64,
+        experts: Vec<u16>,
+    },
 }
 
 struct Prepared {
@@ -1510,16 +1550,28 @@ fn build_plan(
         }
         let mut shape = t.shape.clone();
         let mut data_len = t.data_size as u64;
-        let mut kind = EntryKind::Copy { src_offset: t.data_offset as u64 };
+        let mut kind = EntryKind::Copy {
+            src_offset: t.data_offset as u64,
+        };
         if let Some(experts) = keep.and_then(ExpertKeep::mtp_kept) {
             if t.name.starts_with("mtp.") && t.name.contains(".mlp.experts.") {
-                if shape.len() != 3 || shape[0] as usize != g.experts || t.data_size % g.experts != 0 {
-                    return Err(SlabError::Source(format!("invalid MTP aggregate {}", t.name)));
+                if shape.len() != 3
+                    || shape[0] as usize != g.experts
+                    || t.data_size % g.experts != 0
+                {
+                    return Err(SlabError::Source(format!(
+                        "invalid MTP aggregate {}",
+                        t.name
+                    )));
                 }
                 let stride = t.data_size as u64 / g.experts as u64;
                 shape[0] = experts.len() as u32;
                 data_len = stride * experts.len() as u64;
-                kind = EntryKind::CopySlices { src_offset: t.data_offset as u64, stride, experts: experts.to_vec() };
+                kind = EntryKind::CopySlices {
+                    src_offset: t.data_offset as u64,
+                    stride,
+                    experts: experts.to_vec(),
+                };
             }
         }
         entries.push(HfqStreamEntry {
@@ -1560,8 +1612,12 @@ pub fn write_i4_expert_slabs_with_keep(
     cfg: &SlabWriteConfig<'_>,
     keep: Option<&ExpertKeep>,
 ) -> Result<Value, SlabError> {
-    if keep.is_some_and(|k| k.n_layers() != cfg.geometry.layers || k.n_experts() != cfg.geometry.experts) {
-        return Err(SlabError::Config("keep geometry differs from slab geometry".into()));
+    if keep.is_some_and(|k| {
+        k.n_layers() != cfg.geometry.layers || k.n_experts() != cfg.geometry.experts
+    }) {
+        return Err(SlabError::Config(
+            "keep geometry differs from slab geometry".into(),
+        ));
     }
     if cfg.out.symlink_metadata().is_ok() {
         return Err(SlabError::Config(format!(
@@ -1577,9 +1633,16 @@ pub fn write_i4_expert_slabs_with_keep(
 }
 
 /// Exact container size from the real pack plan, without writing an output.
-pub fn size_i4_expert_slabs(cfg: &SlabWriteConfig<'_>, keep: Option<&ExpertKeep>) -> Result<Value, SlabError> {
-    if keep.is_some_and(|k| k.n_layers() != cfg.geometry.layers || k.n_experts() != cfg.geometry.experts) {
-        return Err(SlabError::Config("keep geometry differs from slab geometry".into()));
+pub fn size_i4_expert_slabs(
+    cfg: &SlabWriteConfig<'_>,
+    keep: Option<&ExpertKeep>,
+) -> Result<Value, SlabError> {
+    if keep.is_some_and(|k| {
+        k.n_layers() != cfg.geometry.layers || k.n_experts() != cfg.geometry.experts
+    }) {
+        return Err(SlabError::Config(
+            "keep geometry differs from slab geometry".into(),
+        ));
     }
     write_inner(cfg, keep, true)
 }
@@ -1602,9 +1665,7 @@ fn write_inner(
             cfg_in.formats.len()
         )));
     }
-    let absent = |item: usize| {
-        keep.is_some_and(|k| !k.is_kept(item / g.experts, item % g.experts))
-    };
+    let absent = |item: usize| keep.is_some_and(|k| !k.is_kept(item / g.experts, item % g.experts));
     let mut requested = [0u64; 4];
     for (item, f) in cfg_in.formats.iter().enumerate() {
         if absent(item) {
@@ -1693,7 +1754,11 @@ fn write_inner(
         let obj = metadata
             .as_object_mut()
             .ok_or_else(|| SlabError::Source("metadata JSON is not an object".into()))?;
-        for key in [EXPERT_SLABS_METADATA_KEY, PROVENANCE_METADATA_KEY, "qwen4.expert_keep"] {
+        for key in [
+            EXPERT_SLABS_METADATA_KEY,
+            PROVENANCE_METADATA_KEY,
+            "qwen4.expert_keep",
+        ] {
             if obj.contains_key(key) {
                 return Err(SlabError::Source(format!(
                     "source metadata already has `{key}`; refusing to re-pack"
@@ -1780,14 +1845,24 @@ fn write_inner(
     let metadata_json =
         serde_json::to_string(&metadata).map_err(|e| SlabError::Config(e.to_string()))?;
     if size_only {
-        let index_bytes: u64 = 4 + plan.entries.iter()
+        let index_bytes: u64 = 4 + plan
+            .entries
+            .iter()
             .map(|e| 2 + e.name.len() as u64 + 1 + 1 + 4 * e.shape.len() as u64 + 4 + 8)
             .sum::<u64>();
         let head = (32 + metadata_json.len() as u64 + index_bytes + 4095) & !4095;
-        let routed: u64 = plan.entries[..plan.n_trunk].iter().map(|e| e.data_len).sum();
-        let other: u64 = plan.entries[plan.n_trunk..].iter().map(|e| e.data_len).sum();
-        return Ok(json!({"output":{"bytes":head + routed + other}, "format_counts":format_counts,
-            "total_trunk_payload_bytes":routed, "non_expert":{"payload_bytes":other}}));
+        let routed: u64 = plan.entries[..plan.n_trunk]
+            .iter()
+            .map(|e| e.data_len)
+            .sum();
+        let other: u64 = plan.entries[plan.n_trunk..]
+            .iter()
+            .map(|e| e.data_len)
+            .sum();
+        return Ok(
+            json!({"output":{"bytes":head + routed + other}, "format_counts":format_counts,
+            "total_trunk_payload_bytes":routed, "non_expert":{"payload_bytes":other}}),
+        );
     }
 
     // --- write ----------------------------------------------------------
@@ -1857,7 +1932,8 @@ fn write_inner(
                         digests[i] = sha;
                         if *proj == ExpertProj::Down {
                             current = None;
-                            pipeline.finish_item(work_items.binary_search(item).expect("planned item"));
+                            pipeline
+                                .finish_item(work_items.binary_search(item).expect("planned item"));
                         }
                     }
                     EntryKind::Mq4Slice {
@@ -1869,7 +1945,8 @@ fn write_inner(
                         copy_span(&src_file, *src_offset, len, w, &mut buf, &mut hasher)?;
                         digests[i] = hasher.finalize_reset().into();
                         if *proj == ExpertProj::Down {
-                            pipeline.finish_item(work_items.binary_search(item).expect("planned item"));
+                            pipeline
+                                .finish_item(work_items.binary_search(item).expect("planned item"));
                         }
                     }
                     EntryKind::Copy { src_offset } => {
@@ -1877,10 +1954,21 @@ fn write_inner(
                         copy_span(&src_file, *src_offset, len, w, &mut buf, &mut hasher)?;
                         digests[i] = hasher.finalize_reset().into();
                     }
-                    EntryKind::CopySlices { src_offset, stride, experts } => {
+                    EntryKind::CopySlices {
+                        src_offset,
+                        stride,
+                        experts,
+                    } => {
                         hasher.reset();
                         for &expert in experts {
-                            copy_span(&src_file, *src_offset + u64::from(expert) * stride, *stride, w, &mut buf, &mut hasher)?;
+                            copy_span(
+                                &src_file,
+                                *src_offset + u64::from(expert) * stride,
+                                *stride,
+                                w,
+                                &mut buf,
+                                &mut hasher,
+                            )?;
                         }
                         digests[i] = hasher.finalize_reset().into();
                     }
@@ -2210,12 +2298,24 @@ mod tests {
     use super::*;
     use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 
-    fn keep_config<'a>(fx: &'a Fixture, out: &'a Path, formats: &'a [ExpertFormat], w3: &'a SynthProvider) -> SlabWriteConfig<'a> {
+    fn keep_config<'a>(
+        fx: &'a Fixture,
+        out: &'a Path,
+        formats: &'a [ExpertFormat],
+        w3: &'a SynthProvider,
+    ) -> SlabWriteConfig<'a> {
         SlabWriteConfig {
-            geometry: TINY, source: &fx.source, out, formats,
+            geometry: TINY,
+            source: &fx.source,
+            out,
+            formats,
             allocation: AllocationSource::Uniform(ExpertFormat::Mq4Xts),
-            w3: Some(w3), w2: None, e8p: None, threads: 1,
-            expected_source_sha256: None, progress: false,
+            w3: Some(w3),
+            w2: None,
+            e8p: None,
+            threads: 1,
+            expected_source_sha256: None,
+            progress: false,
         }
     }
 
@@ -2225,18 +2325,29 @@ mod tests {
         let out = fx.dir.join("ragged.hfq");
         let keep = ExpertKeep::new(4, vec![vec![3], vec![0, 2]], Some(vec![1, 3]), 1).unwrap();
         let mut formats = uniform_formats(TINY, ExpertFormat::Mq2I4);
-        apply_keep_tiers(&json!({"tiers":{"0":{"3":"mq4"},"1":{"0":"w3","2":"mq4"}}}), &keep, &mut formats).unwrap();
+        apply_keep_tiers(
+            &json!({"tiers":{"0":{"3":"mq4"},"1":{"0":"w3","2":"mq4"}}}),
+            &keep,
+            &mut formats,
+        )
+        .unwrap();
         let w3 = SynthProvider::new(ExpertFormat::Mq3I4);
         let cfg = keep_config(&fx, &out, &formats, &w3);
         let size = size_i4_expert_slabs(&cfg, Some(&keep)).unwrap();
         assert!(!out.exists());
         let receipt = write_i4_expert_slabs_with_keep(&cfg, Some(&keep)).unwrap();
         assert_eq!(size["output"]["bytes"], receipt["output"]["bytes"]);
-        assert_eq!(receipt["format_counts"], json!({"mq3-i4":1,"mq2-i4":0,"mq4-xts":2}));
+        assert_eq!(
+            receipt["format_counts"],
+            json!({"mq3-i4":1,"mq2-i4":0,"mq4-xts":2})
+        );
         assert_eq!(w3.calls.load(Ordering::Relaxed), 1);
         let hfq = HfqFile::open(&out).unwrap();
         let metadata: Value = serde_json::from_str(&hfq.metadata_json).unwrap();
-        assert_eq!(ExpertKeep::from_metadata(&metadata).unwrap(), Some(keep.clone()));
+        assert_eq!(
+            ExpertKeep::from_metadata(&metadata).unwrap(),
+            Some(keep.clone())
+        );
         let mut seen = 0;
         for t in hfq.tensors() {
             if let Some((l, e, _)) = parse_expert_entry_name(&t.name) {
@@ -2248,7 +2359,14 @@ mod tests {
                 let stride = original.data.len() / 4;
                 assert_eq!(t.shape[0], 2);
                 let (_, bytes) = hfq.tensor_data(&t.name).unwrap();
-                assert_eq!(bytes, [&original.data[stride..2*stride], &original.data[3*stride..]].concat());
+                assert_eq!(
+                    bytes,
+                    [
+                        &original.data[stride..2 * stride],
+                        &original.data[3 * stride..]
+                    ]
+                    .concat()
+                );
             }
         }
         assert_eq!(seen, 6);
@@ -2273,7 +2391,10 @@ mod tests {
             json!({"2":{"0":"w3"}}),
             json!({"0":{"5":"mq4"}}),
         ] {
-            assert!(apply_keep_tiers(&json!({"tiers":tiers}), &keep, &mut alloc.formats.clone()).is_err());
+            assert!(
+                apply_keep_tiers(&json!({"tiers":tiers}), &keep, &mut alloc.formats.clone())
+                    .is_err()
+            );
         }
         let out = fx.dir.join("missing-record.hfq");
         let mut w3 = SynthProvider::new(ExpertFormat::Mq3I4);
@@ -2309,29 +2430,56 @@ mod tests {
         for layer in 0..2 {
             for expert in 0..4 {
                 for proj in [ExpertProj::GateUp, ExpertProj::Down] {
-                    let src = fx.tensors.iter().find(|t| t.name == SlabGeometry::aggregate_name(layer, proj)).unwrap();
+                    let src = fx
+                        .tensors
+                        .iter()
+                        .find(|t| t.name == SlabGeometry::aggregate_name(layer, proj))
+                        .unwrap();
                     let stride = src.data.len() / 4;
-                    tensors.push(mem(&expert_entry_name(layer, expert, proj), src.quant_type,
-                        &TINY.proj_shape(proj), src.group_size, src.data[expert*stride..(expert+1)*stride].to_vec()));
+                    tensors.push(mem(
+                        &expert_entry_name(layer, expert, proj),
+                        src.quant_type,
+                        &TINY.proj_shape(proj),
+                        src.group_size,
+                        src.data[expert * stride..(expert + 1) * stride].to_vec(),
+                    ));
                 }
             }
         }
         for t in &fx.tensors {
-            if !(0..2).any(|l| [ExpertProj::GateUp, ExpertProj::Down].iter()
-                .any(|&p| t.name == SlabGeometry::aggregate_name(l, p))) {
-                tensors.push(mem(&t.name, t.quant_type, &t.shape, t.group_size, t.data.clone()));
+            if !(0..2).any(|l| {
+                [ExpertProj::GateUp, ExpertProj::Down]
+                    .iter()
+                    .any(|&p| t.name == SlabGeometry::aggregate_name(l, p))
+            }) {
+                tensors.push(mem(
+                    &t.name,
+                    t.quant_type,
+                    &t.shape,
+                    t.group_size,
+                    t.data.clone(),
+                ));
             }
         }
         write_hfqm_package_mem(&golden, 9, &meta.to_string(), &tensors).unwrap();
         assert_eq!(receipt["output"]["sha256"], sha256_file(&golden).unwrap().0);
-        assert_eq!(size_i4_expert_slabs(&cfg, None).unwrap()["output"]["bytes"], receipt["output"]["bytes"]);
+        assert_eq!(
+            size_i4_expert_slabs(&cfg, None).unwrap()["output"]["bytes"],
+            receipt["output"]["bytes"]
+        );
     }
 
     #[test]
     fn cpu_loader_kept_table_roundtrip() {
         use hipfire_arch_qwen4::expert_slab_table::build_expert_slab_table_with_keep;
         use hipfire_runtime::hfq::HfqTensorInfo;
-        let keep = ExpertKeep::new(512, (0..48).map(|l| (0..10 + l % 3).collect()).collect(), None, 10).unwrap();
+        let keep = ExpertKeep::new(
+            512,
+            (0..48).map(|l| (0..10 + l % 3).collect()).collect(),
+            None,
+            10,
+        )
+        .unwrap();
         let root = json!({"qwen4.expert_keep":keep.to_metadata_value()});
         let parsed = ExpertKeep::from_metadata(&root).unwrap().unwrap();
         let mut infos = Vec::new();
@@ -2339,28 +2487,39 @@ mod tests {
         for layer in 0..48 {
             for &expert in keep.kept(layer) {
                 for proj in [ExpertProj::GateUp, ExpertProj::Down] {
-                    let len = SlabGeometry::FN.entry_bytes(ExpertFormat::Mq4Xts, proj).unwrap();
+                    let len = SlabGeometry::FN
+                        .entry_bytes(ExpertFormat::Mq4Xts, proj)
+                        .unwrap();
                     infos.push(HfqTensorInfo {
                         name: expert_entry_name(layer, expert as usize, proj),
                         quant_type: SlabGeometry::mq4_qt(proj),
                         shape: SlabGeometry::FN.proj_shape(proj).to_vec(),
                         group_size: SlabGeometry::mq4_group(proj),
-                        data_offset: offset, data_size: len,
+                        data_offset: offset,
+                        data_size: len,
                     });
                     offset += len;
                 }
             }
         }
-        let table = build_expert_slab_table_with_keep(&ExpertSlabsV1::fn_v1(), &infos, Some(&parsed)).unwrap();
+        let table =
+            build_expert_slab_table_with_keep(&ExpertSlabsV1::fn_v1(), &infos, Some(&parsed))
+                .unwrap();
         assert_eq!(table.counts().mq4, keep.total_kept());
         for layer in 0..48 {
             for expert in 0..512 {
                 let slab = table.slab(layer, expert).unwrap();
-                assert_eq!(slab.gate_up.len == 0 && slab.down.len == 0, !keep.is_kept(layer, expert));
+                assert_eq!(
+                    slab.gate_up.len == 0 && slab.down.len == 0,
+                    !keep.is_kept(layer, expert)
+                );
             }
         }
         infos[0].name = expert_entry_name(0, 511, ExpertProj::GateUp);
-        assert!(build_expert_slab_table_with_keep(&ExpertSlabsV1::fn_v1(), &infos, Some(&parsed)).is_err());
+        assert!(
+            build_expert_slab_table_with_keep(&ExpertSlabsV1::fn_v1(), &infos, Some(&parsed))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2372,7 +2531,7 @@ mod tests {
         });
         std::fs::remove_file(&fx.source).unwrap();
         write_hfqm_package_mem(&fx.source, 9, &fx.metadata.to_string(), &fx.tensors).unwrap();
-        let keep = ExpertKeep::new(4, vec![vec![3],vec![0,2]], None, 1).unwrap();
+        let keep = ExpertKeep::new(4, vec![vec![3], vec![0, 2]], None, 1).unwrap();
         let formats = uniform_formats(TINY, ExpertFormat::Mq4Xts);
         let w3 = SynthProvider::new(ExpertFormat::Mq3I4);
         let out = fx.dir.join("coder-base.mq3-xts");
@@ -2383,7 +2542,10 @@ mod tests {
         let hfq = HfqFile::open(&out).unwrap();
         let meta: Value = serde_json::from_str(&hfq.metadata_json).unwrap();
         assert_eq!(meta["hipfire_ple_rows"], fx.metadata["hipfire_ple_rows"]);
-        assert!(!hfq.tensors().iter().any(|t| t.name.contains(".ngram_embedding.shard_")));
+        assert!(!hfq
+            .tensors()
+            .iter()
+            .any(|t| t.name.contains(".ngram_embedding.shard_")));
     }
 
     /// Tiny geometry whose every slab entry is a multiple of 256 B:

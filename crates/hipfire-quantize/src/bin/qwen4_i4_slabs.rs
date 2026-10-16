@@ -146,16 +146,28 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
     let geometry = SlabGeometry::FN;
-    let keep_json = args.expert_keep.as_ref().map(|path| {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
-    }).transpose()?;
-    let keep = keep_json.as_ref().map(ExpertKeep::from_coder_keep_file).transpose()?;
-    if keep.as_ref().is_some_and(|k| k.n_experts() != geometry.experts || k.n_layers() != geometry.layers) {
+    let keep_json = args
+        .expert_keep
+        .as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    let keep = keep_json
+        .as_ref()
+        .map(ExpertKeep::from_coder_keep_file)
+        .transpose()?;
+    if keep
+        .as_ref()
+        .is_some_and(|k| k.n_experts() != geometry.experts || k.n_layers() != geometry.layers)
+    {
         return Err("keep geometry must be 48 layers x 512 original ids".into());
     }
-    if keep.as_ref().is_some_and(|k| (0..k.n_layers()).any(|l| k.kept(l).len() < 10)
-        || k.mtp_kept().is_some_and(|ids| ids.len() < 10)) {
+    if keep.as_ref().is_some_and(|k| {
+        (0..k.n_layers()).any(|l| k.kept(l).len() < 10)
+            || k.mtp_kept().is_some_and(|ids| ids.len() < 10)
+    }) {
         return Err("every kept trunk/MTP layer must retain at least top_k=10 experts".into());
     }
     let (mut formats, allocation) = match (&args.alloc, &args.point, args.uniform) {
@@ -201,15 +213,20 @@ fn run(args: Args) -> Result<(), String> {
     if let Some(k) = keep.as_ref() {
         for item in 0..formats.len() {
             let (layer, expert) = (item / geometry.experts, item % geometry.experts);
-            if !k.is_kept(layer, expert) { continue }
+            if !k.is_kept(layer, expert) {
+                continue;
+            }
             let records = match formats[item] {
                 ExpertFormat::Mq3I4 => args.records_w3.as_ref(),
                 ExpertFormat::Mq2I4 => args.records_w2.as_ref(),
                 // E8P records are one pair of per-layer files, verified by the provider at open.
                 ExpertFormat::E8pI4 | ExpertFormat::Mq4Xts => continue,
-            }.ok_or_else(|| format!("missing records directory for L{layer}/E{expert}"))?;
+            }
+            .ok_or_else(|| format!("missing records directory for L{layer}/E{expert}"))?;
             let path = records.join(format!("L{layer}/E{expert}.npz"));
-            if !path.is_file() { return Err(format!("missing record {}", path.display())) }
+            if !path.is_file() {
+                return Err(format!("missing record {}", path.display()));
+            }
         }
     }
     let w3 = provider(
@@ -252,9 +269,13 @@ fn run(args: Args) -> Result<(), String> {
         size_i4_expert_slabs(&config, keep.as_ref())
     } else {
         write_i4_expert_slabs_with_keep(&config, keep.as_ref())
-    }.map_err(|e| e.to_string())?;
+    }
+    .map_err(|e| e.to_string())?;
     if args.size_only {
-        println!("{}", serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     let text = serde_json::to_string_pretty(&receipt).map_err(|e| e.to_string())?;

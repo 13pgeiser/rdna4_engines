@@ -129,7 +129,9 @@ pub(super) fn tier_stage_layout(
                 ));
             }
             if src % STAGE_ALIGN != 0 {
-                return Err(format!("host expert {eid} source {src:#x} is not {STAGE_ALIGN}-byte aligned"));
+                return Err(format!(
+                    "host expert {eid} source {src:#x} is not {STAGE_ALIGN}-byte aligned"
+                ));
             }
             items.push((src, len, eid, down));
         }
@@ -162,7 +164,10 @@ pub(super) fn tier_stage_layout(
         cursor = run.2 + (run.1 - run.0);
     }
     let mut layout = TierStageLayout {
-        copies: runs.iter().map(|&(src, end, dst)| (src, dst, end - src)).collect(),
+        copies: runs
+            .iter()
+            .map(|&(src, end, dst)| (src, dst, end - src))
+            .collect(),
         gate_up: vec![None; experts.len()],
         down: vec![None; experts.len()],
         used: cursor,
@@ -208,7 +213,9 @@ pub(super) fn tier_stage_table(
 
 /// The next layer after `layer` of the same parity with a staged slot.
 fn next_staged_layer(slots: &[Option<usize>], layer: usize) -> Option<usize> {
-    (layer + 2..slots.len()).step_by(2).find(|&next| slots[next].is_some())
+    (layer + 2..slots.len())
+        .step_by(2)
+        .find(|&next| slots[next].is_some())
 }
 
 /// Bytes of one stage buffer: the largest cold arena plus its tail pad.
@@ -234,7 +241,9 @@ pub(super) fn rebase_stage_entries(
     let mut table = Vec::with_capacity(entries.len() * std::mem::size_of::<u64>());
     for (expert, &entry) in entries.iter().enumerate() {
         if entry == 0
-            && kept.is_some_and(|ids| u16::try_from(expert).is_ok_and(|e| ids.binary_search(&e).is_err()))
+            && kept.is_some_and(|ids| {
+                u16::try_from(expert).is_ok_and(|e| ids.binary_search(&e).is_err())
+            })
         {
             table.extend_from_slice(&0usize.to_ne_bytes());
             continue;
@@ -359,7 +368,10 @@ impl Qwen4ExpertStage {
             ready: Vec::with_capacity(2),
             free: Vec::with_capacity(2),
             state: std::cell::Cell::new([DonorState::Resident; 2]),
-            slab: Some(SlabStageMeta { sources, tier: None }),
+            slab: Some(SlabStageMeta {
+                sources,
+                tier: None,
+            }),
         };
         let result = (|| {
             for _ in 0..2 {
@@ -440,13 +452,16 @@ impl Qwen4ExpertStage {
         if bundle.weights.ep_placement().is_some() {
             return off("expert tiers have no EP route");
         }
-        let (Some((alias_base, alias_bytes)), Some((cpu_base, cpu_bytes))) =
-            (lease.owner_range(Placement::HostMapped), lease.host_cpu_range())
-        else {
+        let (Some((alias_base, alias_bytes)), Some((cpu_base, cpu_bytes))) = (
+            lease.owner_range(Placement::HostMapped),
+            lease.host_cpu_range(),
+        ) else {
             return off("the tier plan has no pinned host owner");
         };
         if alias_bytes != cpu_bytes {
-            return Err(invalid("tier host owner alias and CPU ranges differ in size"));
+            return Err(invalid(
+                "tier host owner alias and CPU ranges differ in size",
+            ));
         }
         let config = &bundle.config;
         let mut slots = Vec::with_capacity(moe.len());
@@ -474,16 +489,21 @@ impl Qwen4ExpertStage {
             }
             let (gate_up, down) = (view.gate_up_ptrs(), view.down_ptrs());
             if gate_up.len() != config.num_experts || down.len() != config.num_experts {
-                return Err(invalid(format!("tier stage: layer {layer} table length differs from num_experts")));
+                return Err(invalid(format!(
+                    "tier stage: layer {layer} table length differs from num_experts"
+                )));
             }
             let len = |bytes: u64| {
-                usize::try_from(bytes).map_err(|_| invalid("tier stage: expert extent overflows usize"))
+                usize::try_from(bytes)
+                    .map_err(|_| invalid("tier stage: expert extent overflows usize"))
             };
             let experts = (0..config.num_experts)
                 .map(|eid| {
-                    let entry = view
-                        .entry(eid)
-                        .ok_or_else(|| invalid(format!("tier stage: layer {layer} expert {eid} has no entry")))?;
+                    let entry = view.entry(eid).ok_or_else(|| {
+                        invalid(format!(
+                            "tier stage: layer {layer} expert {eid} has no entry"
+                        ))
+                    })?;
                     Ok(TierStageExpert {
                         host: entry.tier == Placement::HostMapped,
                         gate_up: gate_up[eid],
@@ -533,7 +553,10 @@ impl Qwen4ExpertStage {
             }
             copies.push(layer_copies);
         }
-        let used = layouts.iter().map(|(_, layout)| layout.used).collect::<Vec<_>>();
+        let used = layouts
+            .iter()
+            .map(|(_, layout)| layout.used)
+            .collect::<Vec<_>>();
         gpu.ensure_capture_stream()?;
         // Staging is an optimisation: stage buffers that do not fit VRAM leave
         // every host-tier expert read in place.
@@ -586,7 +609,12 @@ impl Qwen4ExpertStage {
             state: std::cell::Cell::new([DonorState::Resident; 2]),
             slab: Some(SlabStageMeta {
                 sources: Vec::new(),
-                tier: Some(TierStageMeta { slots, copies, used, _keepalive: lease.keepalive() }),
+                tier: Some(TierStageMeta {
+                    slots,
+                    copies,
+                    used,
+                    _keepalive: lease.keepalive(),
+                }),
             }),
         };
         let result = (|| {
@@ -604,14 +632,20 @@ impl Qwen4ExpertStage {
             for (layer, layout) in &layouts {
                 let view = lease.layer(*layer).expect("checked above");
                 let stage_base = stage.mirrors[layer % 2].buf.as_ptr() as usize;
-                for (entries, offsets) in
-                    [(view.gate_up_ptrs(), &layout.gate_up), (view.down_ptrs(), &layout.down)]
-                {
-                    let table = tier_stage_table(entries, offsets, stage_base)
-                        .map_err(|reason| invalid(format!("tier stage: layer {layer} table: {reason}")))?;
+                for (entries, offsets) in [
+                    (view.gate_up_ptrs(), &layout.gate_up),
+                    (view.down_ptrs(), &layout.down),
+                ] {
+                    let table =
+                        tier_stage_table(entries, offsets, stage_base).map_err(|reason| {
+                            invalid(format!("tier stage: layer {layer} table: {reason}"))
+                        })?;
                     let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
                     stage.tables.push(tensor);
-                    gpu.memcpy_htod_auto(&stage.tables.last().expect("table just allocated").buf, &table)?;
+                    gpu.memcpy_htod_auto(
+                        &stage.tables.last().expect("table just allocated").buf,
+                        &table,
+                    )?;
                 }
             }
             Ok::<(), Qwen4GpuForwardError>(())
@@ -687,7 +721,10 @@ impl Qwen4ExpertStage {
     /// parity's stage buffer once the previous occupant's down released it,
     /// recording `ready`.
     fn slab_enqueue(&self, gpu: &Gpu, layer: usize) -> Result<(), Qwen4GpuForwardError> {
-        let meta = self.slab.as_ref().ok_or_else(|| invalid("not a slab stage"))?;
+        let meta = self
+            .slab
+            .as_ref()
+            .ok_or_else(|| invalid("not a slab stage"))?;
         let parity = layer % 2;
         if let Some(tier) = meta.tier.as_ref() {
             let slot = tier
@@ -696,14 +733,19 @@ impl Qwen4ExpertStage {
                 .copied()
                 .flatten()
                 .ok_or_else(|| invalid("tier stage layer has no host-tier expert"))?;
-            gpu.hip.stream_wait_event(&self.copy_stream, &self.free[parity])?;
+            gpu.hip
+                .stream_wait_event(&self.copy_stream, &self.free[parity])?;
             let buffer = &self.mirrors[parity].buf;
             for copy in &tier.copies[slot] {
                 // SAFETY: `copy.src` lies inside the lease's pinned host owner
                 // (checked against its range in `new_tier`), which `_keepalive`
                 // retains and nothing writes after materialization.
                 let source = unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
-                gpu.hip.memcpy_htod_async(&buffer.byte_view(copy.dst, copy.len), source, &self.copy_stream)?;
+                gpu.hip.memcpy_htod_async(
+                    &buffer.byte_view(copy.dst, copy.len),
+                    source,
+                    &self.copy_stream,
+                )?;
             }
             // The previous occupant may have been larger: re-zero the pad the
             // kernels' tail over-read can reach past the last staged byte.
@@ -713,21 +755,24 @@ impl Qwen4ExpertStage {
                 ARENA_TAIL_PAD_BYTES,
                 &self.copy_stream,
             )?;
-            gpu.hip.event_record(&self.ready[parity], Some(&self.copy_stream))?;
+            gpu.hip
+                .event_record(&self.ready[parity], Some(&self.copy_stream))?;
             return Ok(());
         }
         let &(address, bytes) = meta
             .sources
             .get(layer - self.first_host)
             .ok_or_else(|| invalid("slab stage layer out of range"))?;
-        gpu.hip.stream_wait_event(&self.copy_stream, &self.free[parity])?;
+        gpu.hip
+            .stream_wait_event(&self.copy_stream, &self.free[parity])?;
         // SAFETY: `address` is the registered host allocation of the layer's
         // arena (immutable for the bundle's lifetime) and `bytes` is the arena
         // plus `ARENA_TAIL_PAD_BYTES` of its zeroed tail slack (see `new_slab`).
         let source = unsafe { std::slice::from_raw_parts(address as *const u8, bytes) };
         gpu.hip
             .memcpy_htod_async(&self.mirrors[parity].buf, source, &self.copy_stream)?;
-        gpu.hip.event_record(&self.ready[parity], Some(&self.copy_stream))?;
+        gpu.hip
+            .event_record(&self.ready[parity], Some(&self.copy_stream))?;
         Ok(())
     }
 
@@ -785,7 +830,10 @@ mod tests {
         assert!(rebase_stage_entries(&[arena + 100_000], arena, 100_000, stage, None).is_err());
         let other_arena = 0x9000_0000usize;
         assert!(rebase_stage_entries(&[other_arena + 16], arena, 100_000, stage, None).is_err());
-        assert!(rebase_stage_entries(&[arena, usize::MAX], arena, 100_000, usize::MAX - 8, None).is_err());
+        assert!(
+            rebase_stage_entries(&[arena, usize::MAX], arena, 100_000, usize::MAX - 8, None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -795,19 +843,31 @@ mod tests {
         assert!(rebase_stage_entries(&[arena, 0], arena, 100_000, stage, None).is_err());
         // Pruned: expert 1 is outside the keep row, so its null entry stays null.
         let kept = [0u16, 2];
-        let table = rebase_stage_entries(&[arena, 0, arena + 8], arena, 100_000, stage, Some(&kept)).unwrap();
+        let table =
+            rebase_stage_entries(&[arena, 0, arena + 8], arena, 100_000, stage, Some(&kept))
+                .unwrap();
         let decoded: Vec<usize> = table
             .chunks_exact(8)
             .map(|chunk| usize::from_ne_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(decoded, vec![stage, 0, stage + 8]);
         // A null entry for a kept expert is still an error.
-        assert!(rebase_stage_entries(&[arena, 0, arena + 8], arena, 100_000, stage, Some(&[0, 1, 2])).is_err());
+        assert!(rebase_stage_entries(
+            &[arena, 0, arena + 8],
+            arena,
+            100_000,
+            stage,
+            Some(&[0, 1, 2])
+        )
+        .is_err());
     }
 
     #[test]
     fn stage_buffer_holds_the_largest_arena_and_its_tail_pad() {
-        assert_eq!(stage_buffer_bytes([10, 30, 20]), Some(30 + ARENA_TAIL_PAD_BYTES));
+        assert_eq!(
+            stage_buffer_bytes([10, 30, 20]),
+            Some(30 + ARENA_TAIL_PAD_BYTES)
+        );
         assert_eq!(stage_buffer_bytes(std::iter::empty()), None);
         assert_eq!(stage_buffer_bytes([usize::MAX]), None);
     }
@@ -817,7 +877,13 @@ mod tests {
     const HOST: usize = 0x7000_0000;
 
     fn expert(host: bool, base: usize) -> TierStageExpert {
-        TierStageExpert { host, gate_up: base, gate_up_len: GU, down: base + GU, down_len: DN }
+        TierStageExpert {
+            host,
+            gate_up: base,
+            gate_up_len: GU,
+            down: base + GU,
+            down_len: DN,
+        }
     }
 
     fn decode(table: &[u8]) -> Vec<usize> {
@@ -847,18 +913,28 @@ mod tests {
         let stage = 0x3_0000_0000usize;
         let table = decode(&tier_stage_table(&entries, &layout.gate_up, stage).unwrap());
         // Same length and original local-id order; device entries untouched.
-        assert_eq!(table, vec![device, stage, device + GU + DN, stage + GU + DN]);
+        assert_eq!(
+            table,
+            vec![device, stage, device + GU + DN, stage + GU + DN]
+        );
     }
 
     #[test]
     fn tier_layout_packs_separate_runs_aligned_and_never_reads_device_bytes() {
-        let experts = [expert(true, HOST + 2 * (GU + DN)), expert(true, HOST), expert(false, 0x2_0000_0000)];
+        let experts = [
+            expert(true, HOST + 2 * (GU + DN)),
+            expert(true, HOST),
+            expert(false, 0x2_0000_0000),
+        ];
         let layout = tier_stage_layout(&experts, HOST, 64 << 20).unwrap();
         assert_eq!(layout.copies.len(), 2);
         // Sorted by source address; each run 256-aligned in the stage.
         assert_eq!(layout.copies[0], (HOST, 0, GU + DN));
         assert_eq!(layout.copies[1], (HOST + 2 * (GU + DN), GU + DN, GU + DN));
-        assert!(layout.copies.iter().all(|&(src, dst, _)| src % 256 == 0 && dst % 256 == 0));
+        assert!(layout
+            .copies
+            .iter()
+            .all(|&(src, dst, _)| src % 256 == 0 && dst % 256 == 0));
         // Expert 0 (host, later source) maps to the second run; ids keep their slots.
         assert_eq!(layout.gate_up, vec![Some(GU + DN), Some(0), None]);
     }

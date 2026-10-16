@@ -1827,7 +1827,9 @@ pub fn hotset_aggregate_slabs(
     use crate::expert_slabs::{ExpertFormat, EXPERTS_PER_LAYER, TRUNK_LAYERS};
 
     if config.expert_keep.is_some() {
-        return Err(hotset_refusal("qwen4.expert_keep artifacts do not support expert-hotset/tier placement"));
+        return Err(hotset_refusal(
+            "qwen4.expert_keep artifacts do not support expert-hotset/tier placement",
+        ));
     }
     hotset_source_preflight(hfq)?;
     if !matches!(config.profile, crate::config::Qwen4Profile::FlashNext) {
@@ -2570,8 +2572,10 @@ mod tests {
         use expert_slabs::ExpertFormat;
         let keep = crate::ExpertKeep::new(512, vec![(16..32).collect(); 48], None, 10).unwrap();
         let mut headers = crate::expert_slab_table::full_fn_headers(|_, _| ExpertFormat::Mq3I4);
-        headers.retain(|info| parse_expert_entry_name(&info.name)
-            .map_or(true, |(layer, expert, _)| keep.is_kept(layer, expert)));
+        headers.retain(|info| {
+            parse_expert_entry_name(&info.name)
+                .map_or(true, |(layer, expert, _)| keep.is_kept(layer, expert))
+        });
         let mut cursor = 4096;
         for info in &mut headers {
             info.data_offset = cursor;
@@ -2603,8 +2607,11 @@ mod tests {
             "{error}"
         );
         let table = build_expert_slab_table_with_keep(
-            &expert_slabs::ExpertSlabsV1::fn_v1(), &headers, Some(&keep),
-        ).unwrap();
+            &expert_slabs::ExpertSlabsV1::fn_v1(),
+            &headers,
+            Some(&keep),
+        )
+        .unwrap();
         for expert in [0, 15, 32, 511] {
             let slab = table.slab(0, expert).unwrap();
             assert_eq!(slab.gate_up.len, 0);
@@ -2613,7 +2620,9 @@ mod tests {
         assert_ne!(table.slab(0, 16).unwrap().gate_up.len, 0);
         assert_ne!(table.slab(0, 31).unwrap().down.len, 0);
         for arch in ["gfx1201", "gfx1151"] {
-            let plan = expert_slab_plan(&metadata, &headers, Some(arch)).unwrap().unwrap();
+            let plan = expert_slab_plan(&metadata, &headers, Some(arch))
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 plan.physical_bytes(),
                 (keep.total_kept() * ExpertFormat::Mq3I4.slab_bytes()) as u64,
@@ -2639,9 +2648,8 @@ mod tests {
                 assert_eq!(layer.cold_codec(arch), Ok(crate::expert_arena::CODEC_E8P));
                 assert_eq!(layer.codec_counts(), (0, 0, 16));
                 let table = layer.codec_table().unwrap();
-                assert!(table
-                    .iter()
-                    .all(|c| *c == crate::expert_arena::CODEC_MQ4 || *c == crate::expert_arena::CODEC_E8P));
+                assert!(table.iter().all(|c| *c == crate::expert_arena::CODEC_MQ4
+                    || *c == crate::expert_arena::CODEC_E8P));
             }
         }
     }

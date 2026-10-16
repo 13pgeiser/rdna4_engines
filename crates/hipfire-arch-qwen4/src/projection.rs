@@ -61,7 +61,9 @@ impl ProjectionView {
                 shape: vec![0],
                 dtype,
             },
-            dtype, m, k,
+            dtype,
+            m,
+            k,
             row_stride: row_stride(dtype, k),
             host_mapped: false,
         }
@@ -138,7 +140,10 @@ mod tests {
             dtype: DType::F32,
         };
         let view = ProjectionView::from_packed(&host, 64, 64, DType::F32, 1, 64);
-        assert!(!view.tensor.buf.is_host_mapped(), "a borrowed view must not claim host ownership");
+        assert!(
+            !view.tensor.buf.is_host_mapped(),
+            "a borrowed view must not claim host ownership"
+        );
         assert!(view.host_mapped);
         let device = GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, 256) },

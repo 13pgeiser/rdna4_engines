@@ -648,7 +648,9 @@ impl ExpertMetadata {
         self
     }
 
-    pub fn is_absent(&self) -> bool { self.absent }
+    pub fn is_absent(&self) -> bool {
+        self.absent
+    }
 }
 
 /// Canonical execution string for expert-parallel decode whose root routes
@@ -2399,13 +2401,22 @@ pub(super) fn produce_prefill_route<'a>(
                 gpu.bf16_round_trip_f32(scores)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
-            let keep_mask = params.route_policy.map_or(0, |policy| policy.expert_keep_mask);
+            let keep_mask = params
+                .route_policy
+                .map_or(0, |policy| policy.expert_keep_mask);
             if keep_mask != 0 {
                 gpu.moe_router_softmax_top10_masked_f32(
-                    scores, params.topk_indices, params.topk_weights, params.batch_size,
-                    normalize, keep_mask, params.recipe.bf16_round_trip(),
-                    router_layer, row_base,
-                ).map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    scores,
+                    params.topk_indices,
+                    params.topk_weights,
+                    params.batch_size,
+                    normalize,
+                    keep_mask,
+                    params.recipe.bf16_round_trip(),
+                    router_layer,
+                    row_base,
+                )
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else if grouped {
                 gpu.moe_router_softmax_top10_f32(
                     scores,
@@ -4388,13 +4399,26 @@ fn bind_live_weight(
     role: &str,
 ) -> Result<LiveWeightIdentity, DispatchError> {
     if metadata.is_absent() {
-        if !weight.buf.buf.as_ptr().is_null() || weight.buf.buf.size() != 0 || weight.buf.shape.as_slice() != [0] {
-            return Err(invalid(format!("absent expert {index} {role} must have a null zero-byte view")));
+        if !weight.buf.buf.as_ptr().is_null()
+            || weight.buf.buf.size() != 0
+            || weight.buf.shape.as_slice() != [0]
+        {
+            return Err(invalid(format!(
+                "absent expert {index} {role} must have a null zero-byte view"
+            )));
         }
         return Ok(LiveWeightIdentity {
-            buffer: LiveTensorIdentity { ptr: 0, byte_capacity: 0, tail: 0,
-                shape: vec![0].into_boxed_slice(), dtype: weight.buf.dtype },
-            dtype: weight.dtype, m: weight.m, k: weight.k, row_stride: weight.row_stride,
+            buffer: LiveTensorIdentity {
+                ptr: 0,
+                byte_capacity: 0,
+                tail: 0,
+                shape: vec![0].into_boxed_slice(),
+                dtype: weight.buf.dtype,
+            },
+            dtype: weight.dtype,
+            m: weight.m,
+            k: weight.k,
+            row_stride: weight.row_stride,
         });
     }
     let (rows, cols, dtype, bytes) = expected_live_weight_geometry(metadata, gate_up, index, role)?;
