@@ -122,6 +122,11 @@
 //! and route, with no replay. Each MTP arm must show n-gram windows and at
 //! least one takeover verifying seed + >=4 candidates (>=5 rows); the report
 //! also states whether public window data can count unconfirmed takeovers.
+//! `HIPFIRE_SAMPLED_MTP_COPY_LONG_ARMS` (comma list, unset = both MTP arms)
+//! names the MTP arms the parent runs and compares; each costs about as much
+//! GPU time as the AR reference (~2 s per trial on an R9700), so a run may
+//! name only `copy_long_adaptive`, the product route. Set it identically for
+//! every shard and the parent.
 //!
 //! Run from the repository root (set `MODEL` and `OUT` first). Use the SAME
 //! sampling/penalty/runtime environment and executable for all shards and
@@ -2397,6 +2402,42 @@ fn compare_copy_long(
     }
 }
 
+/// Env var naming the MTP arms the long-copy parent compares with
+/// `copy_long_ar` (see [`copy_long_compared_arms`]).
+const COPY_LONG_ARMS_ENV: &str = "HIPFIRE_SAMPLED_MTP_COPY_LONG_ARMS";
+
+/// MTP arms the long-copy parent runs and compares with `copy_long_ar`:
+/// `HIPFIRE_SAMPLED_MTP_COPY_LONG_ARMS`, a comma list of `copy_long_batched`
+/// / `copy_long_adaptive` (unset = both). `copy_long_adaptive` is the product
+/// route; `copy_long_batched` adds the byte replay of its first seeds. Each
+/// arm costs about as much GPU time as the AR reference, so a run may name
+/// one; the report states which ran.
+fn copy_long_compared_arms() -> Result<Vec<&'static str>, String> {
+    let Ok(raw) = std::env::var(COPY_LONG_ARMS_ENV) else {
+        return Ok(COPY_LONG_ARMS[1..].to_vec());
+    };
+    let mut arms = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        let arm = COPY_LONG_ARMS[1..]
+            .iter()
+            .copied()
+            .find(|&arm| arm == name)
+            .ok_or_else(|| {
+                format!(
+                    "{COPY_LONG_ARMS_ENV}: unknown arm {name:?} (expected one of {:?})",
+                    &COPY_LONG_ARMS[1..]
+                )
+            })?;
+        if !arms.contains(&arm) {
+            arms.push(arm);
+        }
+    }
+    if arms.is_empty() {
+        return Err(format!("{COPY_LONG_ARMS_ENV}={raw:?} names no arm"));
+    }
+    Ok(arms)
+}
+
 #[test]
 #[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4); long: use sampled_mtp_copy_long_distribution_arm shards under fabric holds"]
 fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
@@ -2405,9 +2446,10 @@ fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
     let trials = late_trials().unwrap_or_else(|e| panic!("{e}"));
     let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
     let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let compared = copy_long_compared_arms().unwrap_or_else(|e| panic!("{e}"));
     let mut samples: HashMap<&str, Vec<Vec<u32>>> = HashMap::new();
     let mut stats: HashMap<&str, Vec<Value>> = HashMap::new();
-    for arm in COPY_LONG_ARMS {
+    for arm in std::iter::once(COPY_LONG_ARMS[0]).chain(compared.iter().copied()) {
         let identity = arm_identity(arm, "leviathan", &model_id, &LATE_CONTROL_ENV);
         let shards = ensure_copy_long_shards(&model, &dir, arm, trials, &settings, &identity)
             .unwrap_or_else(|e| panic!("{e}"));
@@ -2441,11 +2483,11 @@ fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
         stats.insert(arm, parts);
     }
     let mut report = format!(
-        "long-copy case: {trials} trials per arm, {COPY_LONG_TOKENS} IDs, product n-gram triple per recorded GPU arch; marginals {COPY_LONG_MARGINALS:?}, joints {COPY_LONG_JOINTS:?}\n"
+        "long-copy case: {trials} trials per arm, {COPY_LONG_TOKENS} IDs, product n-gram triple per recorded GPU arch; marginals {COPY_LONG_MARGINALS:?}, joints {COPY_LONG_JOINTS:?}; MTP arms {compared:?}\n"
     );
     let mut failures = Vec::new();
     let mut coverage = Vec::new();
-    for arm in &COPY_LONG_ARMS[1..] {
+    for arm in &compared {
         compare_copy_long(
             arm, &samples[COPY_LONG_ARMS[0]], &samples[arm], &mut report, &mut failures,
         );

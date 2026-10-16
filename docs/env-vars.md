@@ -1605,8 +1605,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LOAD_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/src/qwen35/weights.rs | developer |
 | `HIPFIRE_LOCAL` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-cli/src/main.rs | stable |
 | `HIPFIRE_LOCK_DIR` | crates/hipfire-cli/src/main.rs, crates/hipfire-daemon/src/gpu_lock.rs | developer |
-| `HIPFIRE_LOG` | crates/hipfire-daemon/src/main.rs | developer |
-| `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/main.rs, scripts/check-env-docs.py | developer |
+| `HIPFIRE_LOG` | crates/hipfire-daemon/src/process_init.rs | developer |
+| `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/process_init.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_LOWBIT_WMMA_WAVES` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_MAGIC` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | harness |
 | `HIPFIRE_MAPLE_DOWN` | crates/hipfire-arch-maple/src/forward.rs | developer |
@@ -1832,11 +1832,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PFLASH_TARGET` | scripts/pflash-gate.sh | deprecated |
 | `HIPFIRE_PING_TIMEOUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_PINNED_XFER_DEFAULT` | crates/hip-bridge/src/ffi.rs | developer |
-| `HIPFIRE_PLE_FORMAT` | crates/hipfire-config/src/lib.rs, scripts/route_plan_walk.py | stable |
+| `HIPFIRE_PLE_FORMAT` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | stable |
 | `HIPFIRE_PLE_HOT_DEBUG` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/external_rows.rs | developer |
 | `HIPFIRE_PLE_HOT_PACK_FILE` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_PLE_HOT_RANK_FILE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/ple_convert.rs | developer |
-| `HIPFIRE_PLE_HOT_STORE_BYTES` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_PLE_HOT_STORE_BYTES` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | stable |
 | `HIPFIRE_PLE_INLINE_FETCH` | crates/hipfire-runtime/src/external_rows.rs | developer |
 | `HIPFIRE_PLE_LOAD_FILL_BYTES` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_PLE_PREWARM_BYTES` | crates/hipfire-config/src/lib.rs | stable |
@@ -1974,7 +1974,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK` | crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_MTP_TIER` | crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK` | crates/hipfire-arch-qwen4/src/npu_trunk/config.rs, crates/hipfire-config/src/lib.rs | experimental |
-| `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | crates/hipfire-config/src/lib.rs, scripts/perf_config_receipt.py | experimental |
 | `HIPFIRE_QWEN4_NPU_TRUNK_FAMILIES` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK_SAMPLE_LOG` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
 | `HIPFIRE_QWEN4_NPU_TRUNK_TRACE` | crates/hipfire-arch-qwen4/src/npu_trunk/forward.rs | developer |
@@ -1988,7 +1988,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_PROFILE_SOURCE_CALLBACK` | crates/hipfire-arch-qwen4/src/state_parity.rs | developer |
 | `HIPFIRE_QWEN4_PROJ_REGIONS` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_QSA_BF16_SPLIT` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/railgun-cert/src/recording.rs | developer |
-| `HIPFIRE_QWEN4_QSA_CODE_CHECK` | crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_QWEN4_QSA_CODE_CHECK` | crates/rdna-compute/examples/qsa_code_check_selftest.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_QSA_DECODE_SPLITK` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_QWEN4_QSA_EXTENT_CHECK` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_QSA_F16_ARENA` | crates/hipfire-arch-qwen4/examples/qwen4_qsa_arena_check.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |
@@ -2166,6 +2166,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_ON` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SAMPLED_MTP_ARM` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_CONFIG` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
+| `HIPFIRE_SAMPLED_MTP_COPY_LONG_ARMS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_GREEDY_TOKENS` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs | harness |
 | `HIPFIRE_SAMPLED_MTP_LATE_TOKENS` | crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
