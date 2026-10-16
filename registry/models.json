@@ -1311,6 +1311,48 @@
       }
     },
 
+    "qwen3.8:flash-next-mq2-xts": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next-base.mq2-xts",
+      "size_gb": 47.0,
+      "min_vram_gb": 48,
+      "desc": "Qwen3.8-Flash-Next MQ2 XTS for 7900 XTX (gfx1100) and R9700 (gfx1201): the 6,306 hot routed experts keep their MQ4 XTS bytes; the other 18,270 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set (Qwen4 HFQM, arch 16). KLD vs FP8: wt2 0.19, code24 0.20, assistant turns 0.14 (MQ4 XTS 0.035, MQ3 XTS 0.097). Split base (47.0 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 76.2 GB with the q4 rows or 101.4 GB with the q8 rows. Needs hipfire at or after @@MQ2_LAND@@.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4"
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8"
+        }
+      }
+    },
+
+    "qwen3.8:flash-next-mq2-xts-4500": {
+      "repo": "hipfire-models/qwen3.8-flash-next",
+      "file": "qwen3.8-flash-next-base.mq2-xts-4500",
+      "size_gb": 44.7,
+      "min_vram_gb": 48,
+      "desc": "Qwen3.8-Flash-Next MQ2 XTS 4500 for 7900 XTX (gfx1100) and R9700 (gfx1201): the 4,500 hot routed experts keep their MQ4 XTS bytes; the other 20,076 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set (Qwen4 HFQM, arch 16). KLD vs FP8: wt2 0.21, code24 0.21, assistant turns 0.20 (MQ4 XTS 0.035, MQ3 XTS 0.097). Split base (44.7 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 73.8 GB with the q4 rows or 99.1 GB with the q8 rows. Needs hipfire at or after @@MQ2_LAND@@.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20
+      },
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4"
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8"
+        }
+      }
+    },
+
     "qwen3.8:flash-next-mq4-xts-zab": {
       "repo": "",
       "file": "qwen3.8-flash-next.mq4-xts-zab",

@@ -118,6 +118,17 @@ def test_flash_next_zab_local_only_quant():
     assert rg.quant_for("unrelated.mq4-xts-zab") is None
 
 
+def test_flash_next_mq2_xts_split_base_quant_and_arch():
+    for tag, file in (
+        ("qwen3.8:flash-next-mq2-xts", "qwen3.8-flash-next-base.mq2-xts"),
+        ("qwen3.8:flash-next-mq2-xts-4500", "qwen3.8-flash-next-base.mq2-xts-4500"),
+    ):
+        assert rg.quant_for(file) == "mq2"
+        assert rg.arch_id_for(tag, {"file": file}) == 16
+    assert rg.quant_for("qwen3.8-flash-next-base.mq3-xts") == "mq3"
+    assert rg.quant_for("x.mq2-xts-abc") is None
+
+
 def test_flash_next_zab_local_identity_roundtrip(monkeypatch):
     curated = _load(REPO_ROOT / "registry" / "models.json")
     tag = "qwen3.8:flash-next-mq4-xts-zab"
