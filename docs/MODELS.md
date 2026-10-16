@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-10-16 against `registry/models.json` (91 tags, 83 aliases) on the 0.4.2 beta line.
+**Last checked:** 2026-10-16 against `registry/models.json` (92 tags, 83 aliases) on the 0.4.2 beta line.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
