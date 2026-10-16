@@ -38,6 +38,7 @@ int rad_reference_ops(const Program& p, std::vector<std::string>* out) {
     int n = 0;
     for (size_t i = 1; i < p.ops.size(); ++i) {
         const OpInfo& oi = p.ops[i];
+        if (oi.lora_declined) continue;   /* never handed out, so never issued (rad_builder.cpp) */
         bool real = false;
         for (const Band& b : oi.bands)
             for (int d = 0; d < RAD_N_DOMAINS && !real; ++d)

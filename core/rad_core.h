@@ -271,6 +271,10 @@ struct OpInfo {
      * plugin op. `lora_site`: on a targeted gemm, its row in Program::lora_sites; -1 otherwise. */
     int32_t               anchor = -1;
     int32_t               lora_site = -1;
+    /* Declined at declare because runtime LoRA targets its weight (a fused GEMM no delta can follow):
+     * recorded unresolved on purpose, its handle never handed to the plugin, so it is never issued
+     * and the reference-kernel gate does not count it. */
+    bool                  lora_declined = false;
 };
 
 struct KVGroupInfo {

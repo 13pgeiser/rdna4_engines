@@ -725,6 +725,13 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
             none.miss[d] = "declined: its weight is a runtime-LoRA target, and a fused GEMM has no "
                            "output for the adapter's delta (the plugin runs the unfused chain)";
         oi.bands.assign(1, none);
+        oi.lora_declined = true;
+        /* AND IT OWNS NO WEIGHT. The planner, the layout pass and the weight-use bookkeeping all
+         * read an op's weights, and an op with no kernel anywhere would tell the planner the weight
+         * cannot be read on the card -- moving the gate_up the unfused chain multiplies on the card
+         * off it. The op stays in the list, by name, so the sizing declare lines up. */
+        oi.weights.clear();
+        oi.weight_opd.clear();
         prog_.ops.push_back(std::move(oi));
         op_bufs_.emplace_back();
         return RAD_NULL_HANDLE;
