@@ -3,9 +3,11 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Exact F4 read-once C8 lane-union decode GEMV over pointer-addressed expert
-//! tensors, emitted with the checked ISA builder for gfx1201 only: four symbols
+//! tensors, emitted with the checked ISA builder for gfx1151 and gfx1201: four symbols
 //! `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}` in the module
-//! `mq_i4_moe_gemv_pm_gfx1201`.
+//! `mq_i4_moe_gemv_pm_<arch>`. The two bodies are one instruction sequence; they differ only where the
+//! architectures do (workgroup-id source, `s_sub`/`s_add` spellings, SMEM zero offset, buffer `soffset`,
+//! wait/hazard instructions the builder inserts).
 //!
 //! Frozen 88-byte kernarg ABI (DESIGN §4.2, identical for all four symbols):
 //! u64 pointers `expert_weight_ptrs@0` (table indexed by expert id; each entry is
@@ -78,6 +80,7 @@
 
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 use crate::insn::{Instruction, MemoryClass};
+use crate::arch::{WgIdSource, WgIds};
 use crate::kernels::common::{add64, bload, gather_offset, lit, op, s, s_add_i32, smem, sop, sr, srd_tail, v, GatherTemps};
 use crate::plan::Access;
 use crate::reg::{Kind as RKind, Live, RegRef};
@@ -121,7 +124,7 @@ impl Kind {
     pub fn chains(self) -> u8 { match self { Self::GateUp => 4, Self::Down => 1 } }
 }
 
-/// One entry: `(arch, codec, kind)`; gfx1201 only.
+/// One entry: `(arch, codec, kind)`; gfx1151 or gfx1201.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec { pub arch: Arch, pub codec: Codec, pub kind: Kind }
 impl Spec {
@@ -131,7 +134,7 @@ impl Spec {
     pub fn tag(&self) -> String { format!("{}_{}", self.codec.tag(), self.kind.tag()) }
     pub fn module(arch: Arch) -> String { format!("mq_i4_moe_gemv_pm_{}", arch.name()) }
     pub fn validate(&self) -> R {
-        if self.arch != Arch::Gfx1201 { return Err("mq_i4_moe_gemv builder is exact-gfx1201 only".into()) }
+        if !matches!(self.arch, Arch::Gfx1151 | Arch::Gfx1201) { return Err("mq_i4_moe_gemv builder is exact-gfx1151 / gfx1201 only".into()) }
         Ok(())
     }
     /// Weights (and X elements) one lane owns per group: eight for the `Mq4Sym` gate G256 group, four otherwise.
@@ -146,8 +149,9 @@ pub fn module_specs(arch: Arch) -> Vec<Spec> {
 }
 
 // ----------------------------------------------------------------------- SGPRs
-// s0:1 kernarg pointer; workgroup ids are ttmp9 (x) and ttmp7[15:0] (y).
-const KARG: u8 = 0;
+// s0:1 kernarg pointer; s2, s3 workgroup ids on gfx11 (the first system SGPRs after the two user SGPRs; gfx12:
+// ttmp9 (x) and ttmp7[15:0] (y)).
+const KARG: u8 = 0; const WGX: u8 = 2; const WGY: u8 = 3;
 /// Kernargs (s_load_b256 @0, b256 @0x20, b128 @0x40, b64 @0x50).
 const WPTRS: u8 = 8; const EIDS: u8 = 10; const OFFS: u8 = 12; const SLOTS: u8 = 14;
 const XROT: u8 = 16; const Y0: u8 = 18; const Y1: u8 = 20; const SM: u8 = 22; const SK: u8 = 23;
@@ -214,8 +218,12 @@ fn declare(regs: &mut RegPlan, name: &str, kind: RKind, base: u8, len: u8) -> R 
     }
     Ok(())
 }
-fn plan(l: &Lay) -> Result<RegPlan, String> {
+fn plan(arch: Arch, l: &Lay) -> Result<RegPlan, String> {
     let mut regs = RegPlan::new(u16::from(l.end), u16::from(SGPRS))?;
+    // gfx11 receives the workgroup ids in the first two system SGPRs; gfx12 in ttmp9 / ttmp7.
+    if !arch.gfx12() {
+        for (name, base) in [("workgroup_id_x", WGX), ("workgroup_id_y", WGY)] { declare(&mut regs, name, RKind::S, base, 1)?; }
+    }
     for (name, base, len) in [
         ("kernarg", KARG, 2), ("kernel_arguments_ptrs", WPTRS, 8), ("kernel_arguments_x_y_m_k", XROT, 8),
         ("kernel_arguments_u_c_div_src", SU, 4), ("kernel_arguments_strides", SXSTR, 2),
@@ -270,7 +278,7 @@ fn emit_with_network(spec: Spec, net: Network) -> Result<Emitted, String> {
         kernargs, user_sgpr_count: 2, system_sgpr_workgroup_id_y: true, workgroup_size: WORKGROUP_SIZE as u16,
         group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan(&l)?);
+    let mut b = Builder::new(kspec, plan(spec.arch, &l)?);
     b.enable_delay_alu();
     prologue(&mut b, spec, &l)?;
     b.wait_all()?;
@@ -326,8 +334,18 @@ fn prologue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
     smem(b, XROT, 8, KARG, 0x20)?;
     smem(b, SU, 4, KARG, 0x40)?;
     smem(b, SXSTR, 2, KARG, 0x50)?;
-    sop(b, format!("s_mov_b32 s{ROW}, ttmp9"), &[ROW], &[])?;
-    sop(b, format!("s_and_b32 s{UIDX}, ttmp7, 0xffff"), &[UIDX], &[])?;
+    // Workgroup ids: gfx12 `ttmp9` (x) and `ttmp7[15:0]` (y); gfx11 the first two system SGPRs after the user SGPRs.
+    match a.workgroup_ids(2)? {
+        WgIds { x: WgIdSource::Ttmp9, y: WgIdSource::Ttmp7 } => {
+            sop(b, format!("s_mov_b32 s{ROW}, ttmp9"), &[ROW], &[])?;
+            sop(b, format!("s_and_b32 s{UIDX}, ttmp7, 0xffff"), &[UIDX], &[])?;
+        }
+        WgIds { x: WgIdSource::Sgpr(x), y: WgIdSource::Sgpr(y) } if (x, y) == (WGX, WGY) => {
+            sop(b, format!("s_mov_b32 s{ROW}, s{WGX}"), &[ROW], &[WGX])?;
+            sop(b, format!("s_mov_b32 s{UIDX}, s{WGY}"), &[UIDX], &[WGY])?;
+        }
+        ids => return Err(format!("mq_i4_moe_gemv: unexpected workgroup id sources {ids:?}")),
+    }
     sop(b, format!("s_cmp_ge_u32 s{ROW}, s{SM}"), &[], &[ROW, SM])?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_cmp_ge_u32 s{UIDX}, s{SU}"), &[], &[UIDX, SU])?;
@@ -612,17 +630,21 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
 /// instructions, the forbidden families, honest register ceilings of the C8 slot
 /// state (accumulators, X registers and per-slot offsets/addresses are inside
 /// `vgpr_max`; the scalar bookkeeping is `sgpr_max`), wave32, no spills, no private
-/// or LDS memory. Committed as `kernels/mq_i4_moe_gemv.gfx1201.<tag>.contract.json`.
+/// or LDS memory. Committed as `kernels/mq_i4_moe_gemv.<arch>.<tag>.contract.json`. The forbidden wait
+/// family is the other architecture's: `s_waitcnt*` on gfx12, the gfx12 counter waits on gfx11.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
     for name in COUNTED {
         let n = e.s_text.lines().filter(|l| l.split_whitespace().next() == Some(name)).count();
         if n > 0 { counts.insert(name.into(), n.into()); }
     }
+    let mut forbidden = vec!["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "ds_read*", "ds_write*", "s_barrier*",
+                             "v_writelane*", "v_wmma*", "v_swmmac*", "v_fma_mix*"];
+    if spec.arch.gfx12() { forbidden.push("s_waitcnt*") } else { forbidden.extend(["s_wait_loadcnt*", "s_wait_storecnt*", "s_wait_dscnt*", "s_wait_kmcnt*", "s_wait_alu*"]) }
+    forbidden.extend(["s_setpc*", "s_swappc*"]);
     serde_json::json!({
         "symbol": spec.symbol(), "counts": counts,
-        "forbidden": ["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "ds_read*", "ds_write*", "s_barrier*",
-                      "v_writelane*", "v_wmma*", "v_swmmac*", "v_fma_mix*", "s_waitcnt*", "s_setpc*", "s_swappc*"],
+        "forbidden": forbidden,
         "vgpr_max": e.shape.next_free_vgpr, "sgpr_max": e.shape.next_free_sgpr,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
         "launch_dynamic_lds_bytes": 0, "group_segment_fixed_bytes": 0,

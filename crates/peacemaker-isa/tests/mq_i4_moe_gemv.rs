@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The gfx1201 pointer-addressed F4 read-once C8 lane-union decode GEMV module
-//! `mq_i4_moe_gemv_pm_gfx1201` (`mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`):
-//! symbols, the frozen 88-byte kernarg ABI and its typed ownership, exact-arch gating,
+//! The gfx1151 and gfx1201 pointer-addressed F4 read-once C8 lane-union decode GEMV modules
+//! `mq_i4_moe_gemv_pm_<arch>` (`mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`):
+//! symbols, the frozen 88-byte kernarg ABI and its typed ownership, exact-arch gating (gfx1100 is refused),
 //! the instruction census of the frozen numerical tree, the read-once structure
 //! (no weight load inside any slot branch), the derived shape contract, native
-//! assembly, and (feature `toolchain`) wait replay, M7, certification and the native
-//! code object / bundle identity against the ROCm oracle for the four entries and the module.
+//! assembly, the per-architecture workgroup-id and wait spellings, and (feature `toolchain`) wait replay, M7,
+//! certification and the native code object / bundle identity against the ROCm oracle for the four entries
+//! and the module of each architecture.
 use peacemaker_isa::Arch;
 use peacemaker_isa::kernels::mq_i4_moe_gemv::{self, Codec, Kind, Spec};
 #[cfg(feature = "toolchain")]
@@ -18,8 +19,10 @@ mod native_compare;
 #[path = "support/rocm.rs"]
 mod rocm;
 
-const ARCH: Arch = Arch::Gfx1201;
-const MODULE: &str = "mq_i4_moe_gemv_pm_gfx1201";
+const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
+fn module(arch: Arch) -> String { format!("mq_i4_moe_gemv_pm_{}", arch.name()) }
+/// Every entry of every supported architecture, module order within an architecture.
+fn all_specs() -> Vec<Spec> { ARCHES.into_iter().flat_map(mq_i4_moe_gemv::module_specs).collect() }
 const SYMBOLS: [&str; 4] = [
     "mq_i4_moe_gemv_mq3i4_r256_gate_up", "mq_i4_moe_gemv_mq3i4_r128_down",
     "mq_i4_moe_gemv_mq4sym_r256_gate_up", "mq_i4_moe_gemv_mq4sym_r128_down",
@@ -38,7 +41,7 @@ fn field(text: &str, key: &str) -> Vec<u32> {
 fn count(text: &str, mnemonic: &str) -> usize {
     text.lines().filter(|l| l.split_whitespace().next() == Some(mnemonic)).count()
 }
-fn spec(codec: Codec, kind: Kind) -> Spec { Spec { arch: ARCH, codec, kind } }
+fn spec(arch: Arch, codec: Codec, kind: Kind) -> Spec { Spec { arch, codec, kind } }
 fn mnemonic(line: &str) -> &str { line.split_whitespace().next().unwrap_or("") }
 /// Operand `n` (0-based) of an instruction line, split on `", "`.
 fn operand(line: &str, n: usize) -> String {
@@ -48,49 +51,75 @@ fn vreg(token: &str) -> u32 { token.trim_start_matches('v').parse().unwrap_or_el
 
 #[test]
 fn module_exports_are_the_four_frozen_symbols_in_order() {
-    let specs = mq_i4_moe_gemv::module_specs(ARCH);
-    assert_eq!(specs, [
-        spec(Codec::Mq3I4, Kind::GateUp), spec(Codec::Mq3I4, Kind::Down),
-        spec(Codec::Mq4Sym, Kind::GateUp), spec(Codec::Mq4Sym, Kind::Down),
-    ]);
-    assert_eq!(specs.iter().map(Spec::symbol).collect::<Vec<_>>(), SYMBOLS);
-    assert_eq!(Spec::module(ARCH), MODULE);
-    let (emitted, text, proof) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-    assert_eq!(emitted.len(), SYMBOLS.len());
-    assert_eq!((proof.module.as_str(), proof.arch), (MODULE, ARCH));
-    assert_eq!(proof.kernels.len(), SYMBOLS.len());
-    assert_eq!(text.matches(".amdhsa_kernel ").count(), SYMBOLS.len());
-    for symbol in SYMBOLS {
-        assert!(text.contains(&format!(".amdhsa_kernel {symbol}\n")), "{symbol}: missing from module source");
-        assert!(text.contains(&format!(".globl {symbol}\n")), "{symbol}: not global");
-        assert!(text.contains(&format!(".name: {symbol}\n")), "{symbol}: missing from module metadata");
+    for arch in ARCHES {
+        let specs = mq_i4_moe_gemv::module_specs(arch);
+        assert_eq!(specs, [
+            spec(arch, Codec::Mq3I4, Kind::GateUp), spec(arch, Codec::Mq3I4, Kind::Down),
+            spec(arch, Codec::Mq4Sym, Kind::GateUp), spec(arch, Codec::Mq4Sym, Kind::Down),
+        ]);
+        assert_eq!(specs.iter().map(Spec::symbol).collect::<Vec<_>>(), SYMBOLS);
+        assert_eq!(Spec::module(arch), module(arch));
+        let (emitted, text, proof) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+        assert_eq!(emitted.len(), SYMBOLS.len());
+        assert_eq!((proof.module.as_str(), proof.arch), (module(arch).as_str(), arch));
+        assert_eq!(proof.kernels.len(), SYMBOLS.len());
+        assert_eq!(text.matches(".amdhsa_kernel ").count(), SYMBOLS.len());
+        for symbol in SYMBOLS {
+            assert!(text.contains(&format!(".amdhsa_kernel {symbol}\n")), "{arch:?} {symbol}: missing from module source");
+            assert!(text.contains(&format!(".globl {symbol}\n")), "{arch:?} {symbol}: not global");
+            assert!(text.contains(&format!(".name: {symbol}\n")), "{arch:?} {symbol}: missing from module metadata");
+        }
     }
 }
 
-/// Emission is bit-deterministic, and every non-gfx1201 architecture is refused (the builder
-/// is exact-gfx1201: no implicit alias for gfx1100 or gfx1151).
+/// Emission is bit-deterministic per architecture, and every other architecture (gfx1100) is refused
+/// (the builder is exact-gfx1151 / gfx1201: no implicit alias).
 #[test]
 fn emission_is_deterministic_and_refuses_other_arches() {
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let (a, b) = (mq_i4_moe_gemv::emit(spec).unwrap(), mq_i4_moe_gemv::emit(spec).unwrap());
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "{spec:?}");
         assert_eq!(a.s_text, b.s_text, "{spec:?}");
     }
-    let (_, ta, pa) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-    let (_, tb, pb) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-    assert_eq!((ta, pa.s_text_sha256), (tb, pb.s_text_sha256));
-    for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+    for arch in ARCHES {
+        let (_, ta, pa) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+        let (_, tb, pb) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+        assert_eq!((ta, pa.s_text_sha256), (tb, pb.s_text_sha256), "{arch:?}");
+    }
+    for arch in [Arch::Gfx1100] {
         for spec in mq_i4_moe_gemv::module_specs(arch) { assert!(mq_i4_moe_gemv::emit(spec).is_err(), "{arch:?} {spec:?}"); }
         assert!(mq_i4_moe_gemv::emit_module(arch).is_err(), "{arch:?}");
+    }
+}
+
+/// The architecture-specific prologue and waits: gfx1201 reads the workgroup ids from `ttmp9` / `ttmp7[15:0]` and
+/// waits with the split counters, gfx1151 reads them from the first two system SGPRs (`s2`, `s3`, no `ttmp`) and
+/// waits with `s_waitcnt`; the arithmetic, shuffle and store spellings are shared.
+#[test]
+fn workgroup_ids_and_waits_follow_the_architecture() {
+    for spec in all_specs() {
+        let t = mq_i4_moe_gemv::emit(spec).unwrap().s_text;
+        let symbol = format!("{:?} {}", spec.arch, spec.symbol());
+        if spec.arch.gfx12() {
+            assert!(t.contains("s_mov_b32 s30, ttmp9") && t.contains("s_and_b32 s31, ttmp7, 0xffff"), "{symbol}: gfx12 workgroup ids");
+            assert!(!t.lines().any(|l| mnemonic(l) == "s_waitcnt" || mnemonic(l) == "s_waitcnt_depctr"), "{symbol}: gfx12 has no s_waitcnt");
+        } else {
+            assert!(t.contains("s_mov_b32 s30, s2") && t.contains("s_mov_b32 s31, s3"), "{symbol}: gfx11 workgroup ids");
+            assert!(!t.contains("ttmp"), "{symbol}: gfx11 never names a trap temporary");
+            assert!(t.lines().any(|l| mnemonic(l) == "s_waitcnt"), "{symbol}: gfx11 waits with s_waitcnt");
+            assert!(!t.lines().any(|l| mnemonic(l).starts_with("s_wait_loadcnt") || mnemonic(l).starts_with("s_wait_dscnt") || mnemonic(l).starts_with("s_wait_kmcnt") || mnemonic(l).starts_with("s_barrier_")), "{symbol}: gfx12-only waits");
+            assert!(t.contains("s_sub_i32 s35, s33, s32") && !t.contains("s_sub_co_i32"), "{symbol}: gfx11 scalar subtract");
+        }
     }
 }
 
 /// Every symbol is wave32, one wave per workgroup, without scratch, spills, LDS or barriers.
 #[test]
 fn every_export_is_wave32_without_scratch_or_lds() {
-    let (emitted, text, _) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
+    for arch in ARCHES {
+    let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
     for (e, symbol) in emitted.iter().zip(SYMBOLS) {
-        assert_eq!(e.proof.arch, ARCH, "{symbol}");
+        assert_eq!(e.proof.arch, arch, "{symbol}");
         assert!(e.s_text.contains(".amdhsa_wavefront_size32 1"), "{symbol}: wave32");
         assert!(e.s_text.contains(".private_segment_fixed_size: 0\n"), "{symbol}: private segment");
         assert!(e.s_text.contains(".sgpr_spill_count: 0\n") && e.s_text.contains(".vgpr_spill_count: 0\n"), "{symbol}: spills");
@@ -101,7 +130,8 @@ fn every_export_is_wave32_without_scratch_or_lds() {
         assert!(ds.is_none(), "{symbol}: LDS access {ds:?}");
         assert!(!e.s_text.lines().any(|l| mnemonic(l).starts_with("scratch_") || mnemonic(l).starts_with("flat_")), "{symbol}: scratch/flat");
     }
-    assert!(text.contains("amdgcn-amd-amdhsa--gfx1201"));
+    assert!(text.contains(&format!("amdgcn-amd-amdhsa--{}", arch.name())));
+    }
 }
 
 /// The 88-byte kernarg block: per-argument offsets/sizes/names, access, the launch bound, the
@@ -111,7 +141,7 @@ fn kernarg_abi_matches_the_frozen_88_byte_layout() {
     assert_eq!(mq_i4_moe_gemv::KERNARG_BYTES, 88);
     assert_eq!(mq_i4_moe_gemv::WORKGROUP_SIZE, 32);
     assert_eq!(mq_i4_moe_gemv::MAX_SLOTS as usize, SLOTS);
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let e = mq_i4_moe_gemv::emit(spec).unwrap();
         let symbol = spec.symbol();
         assert!(e.s_text.contains(".kernarg_segment_size: 88\n"), "{symbol}: kernarg size");
@@ -128,9 +158,10 @@ fn kernarg_abi_matches_the_frozen_88_byte_layout() {
                                ("slot_ids", "read_only"), ("Xrot", "read_only"), ("Y0", "write_only"), ("Y1", "write_only")] {
             assert!(e.s_text.contains(&format!("      - .actual_access: {access}\n        .address_space: global\n        .name: {name}\n")), "{symbol}: {name} access {access}");
         }
-        // The kernarg is loaded as four scalar loads covering offsets 0..88 with no over-read.
-        for load in ["s_load_b256 s[8:15], s[0:1], 0x0", "s_load_b256 s[16:23], s[0:1], 0x20", "s_load_b128 s[24:27], s[0:1], 0x40", "s_load_b64 s[28:29], s[0:1], 0x50"] {
-            assert!(e.s_text.contains(load), "{symbol}: kernarg load {load}");
+        // The kernarg is loaded as four scalar loads covering offsets 0..88 with no over-read (the zero SMEM offset is `0x0` on gfx12, `null` on gfx11).
+        let zero = if spec.arch.gfx12() { "0x0" } else { "null" };
+        for load in [format!("s_load_b256 s[8:15], s[0:1], {zero}"), "s_load_b256 s[16:23], s[0:1], 0x20".into(), "s_load_b128 s[24:27], s[0:1], 0x40".into(), "s_load_b64 s[28:29], s[0:1], 0x50".into()] {
+            assert!(e.s_text.contains(&load), "{symbol}: kernarg load {load}");
         }
         // Typed ownership: the register plan declares the C8 slot state and every access is inside a declared range.
         let plan: Vec<&str> = e.proof.reg_plan.iter().map(|r| r.name.as_ref()).collect();
@@ -145,7 +176,7 @@ fn kernarg_abi_matches_the_frozen_88_byte_layout() {
 /// and X registers, whole-granule VGPR reservation, SGPR bookkeeping, the contract equals the plan.
 #[test]
 fn register_ceilings_reflect_c8_slot_state() {
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let e = mq_i4_moe_gemv::emit(spec).unwrap();
         let symbol = spec.symbol();
         let (nw, chains) = (spec.lane_elems() as u16, spec.kind.chains() as u16);
@@ -164,7 +195,7 @@ fn register_ceilings_reflect_c8_slot_state() {
 /// signed `2c-7` grid (never an XOR rebias).
 #[test]
 fn instruction_census_matches_the_frozen_dag() {
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let t = mq_i4_moe_gemv::emit(spec).unwrap().s_text;
         let symbol = spec.symbol();
         let inst = spec.group_instances() as usize;
@@ -205,7 +236,7 @@ fn instruction_census_matches_the_frozen_dag() {
         }
         // Left-associated chain: p = RN(w0*x0), then fma(w_j, x_j, p) j = 1..nw-1 with adjacent registers.
         // (the builder's `s_delay_alu` issue hints and waits sit between dependent instructions and are not part of the tree)
-        let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !mnemonic(l).starts_with("s_delay_alu") && !mnemonic(l).starts_with("s_wait_") && !mnemonic(l).starts_with("s_nop")).collect();
+        let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !mnemonic(l).starts_with("s_delay_alu") && !mnemonic(l).starts_with("s_wait") && !mnemonic(l).starts_with("s_nop")).collect();
         let first_fmac = lines.iter().position(|l| mnemonic(l) == "v_fmac_f32_e32").unwrap();
         let mul = lines[first_fmac - 1];
         assert_eq!(mnemonic(mul), "v_mul_f32_e32", "{symbol}: first dot term");
@@ -248,7 +279,7 @@ fn instruction_census_matches_the_frozen_dag() {
 /// same group (or the epilogue ladders), so a skipped slot can never skip a weight load.
 #[test]
 fn weights_are_loaded_once_per_group_outside_every_slot_branch() {
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let t = mq_i4_moe_gemv::emit(spec).unwrap().s_text;
         let symbol = spec.symbol();
         let inst = spec.group_instances() as usize;
@@ -278,7 +309,7 @@ fn weights_are_loaded_once_per_group_outside_every_slot_branch() {
 /// descriptor), register ceilings equal to the plan, no private or LDS memory.
 #[test]
 fn shape_contract_is_derived_from_the_emission() {
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let e = mq_i4_moe_gemv::emit(spec).unwrap();
         let c = mq_i4_moe_gemv::contract(spec, &e);
         assert_eq!(c, mq_i4_moe_gemv::contract(spec, &mq_i4_moe_gemv::emit(spec).unwrap()));
@@ -290,7 +321,10 @@ fn shape_contract_is_derived_from_the_emission() {
         assert_eq!((c["launch_dynamic_lds_bytes"].as_u64(), c["group_segment_fixed_bytes"].as_u64()), (Some(0), Some(0)));
         assert_eq!((c["require_wave32"].as_bool(), c["require_zero_spills"].as_bool(), c["require_zero_private"].as_bool()), (Some(true), Some(true), Some(true)));
         let forbidden: Vec<&str> = c["forbidden"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-        for family in ["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "s_barrier*", "v_wmma*", "v_fma_mix*", "s_waitcnt*"] { assert!(forbidden.contains(&family), "{family}"); }
+        for family in ["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "s_barrier*", "v_wmma*", "v_fma_mix*"] { assert!(forbidden.contains(&family), "{family}"); }
+        // The other architecture's wait family is forbidden: `s_waitcnt*` on gfx12, the counter waits on gfx11 (where `s_waitcnt` is the wait).
+        if spec.arch.gfx12() { assert!(forbidden.contains(&"s_waitcnt*")) }
+        else { for family in ["s_wait_loadcnt*", "s_wait_storecnt*", "s_wait_dscnt*", "s_wait_kmcnt*", "s_wait_alu*"] { assert!(forbidden.contains(&family), "{family}"); } assert!(!forbidden.contains(&"s_waitcnt*")) }
         assert!(!forbidden.contains(&"buffer_*") && !forbidden.contains(&"v_readlane*"));
     }
 }
@@ -303,7 +337,7 @@ fn shape_contract_is_derived_from_the_emission() {
 fn optimized_w3_packet_is_the_same_sixteen_bits_as_the_reference_two_byte_network() {
     // Lane l reads group bytes (3l)>>1 and +1: at most byte 47 of 48.
     assert!((0..32u32).all(|l| (3 * l) / 2 + 2 <= 48));
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let (opt, reference) = (mq_i4_moe_gemv::emit_optimized(spec).unwrap().s_text, mq_i4_moe_gemv::emit(spec).unwrap().s_text);
         let symbol = spec.symbol();
         let inst = spec.group_instances() as usize;
@@ -337,7 +371,7 @@ fn codec_and_kind_constants_match_the_frozen_format() {
     assert_eq!((Kind::GateUp.chains(), Kind::Down.chains()), (4, 1));
     assert_eq!(mq_i4_moe_gemv::GROUP, 128);
     // The Mq4Sym gate lane owns eight elements of a G256 group; every other lane owns four.
-    for spec in mq_i4_moe_gemv::module_specs(ARCH) {
+    for spec in all_specs() {
         let wide = spec.codec == Codec::Mq4Sym && spec.kind == Kind::GateUp;
         assert_eq!(spec.lane_elems(), if wide { 8 } else { 4 }, "{spec:?}");
         assert_eq!(spec.group_instances(), if spec.kind == Kind::GateUp { 7 } else { 1 }, "{spec:?}");
@@ -347,14 +381,31 @@ fn codec_and_kind_constants_match_the_frozen_format() {
 /// The module and every entry assemble with the native writer (no ROCm), and the bundle wraps the object.
 #[test]
 fn native_writer_assembles_every_entry_and_the_module() {
-    let (emitted, text, _) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-    for e in &emitted {
-        let elf = peacemaker_isa::native::assemble(&e.s_text, ARCH).unwrap_or_else(|err| panic!("{}: {err}", e.proof.kernel_id));
-        assert!(elf.starts_with(b"\x7fELF"));
+    for arch in ARCHES {
+        let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+        for e in &emitted {
+            let elf = peacemaker_isa::native::assemble(&e.s_text, arch).unwrap_or_else(|err| panic!("{arch:?} {}: {err}", e.proof.kernel_id));
+            assert!(elf.starts_with(b"\x7fELF"));
+        }
+        let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
+        let bundle = peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
+        assert!(bundle.len() > elf.len());
     }
-    let elf = peacemaker_isa::native::assemble(&text, ARCH).unwrap();
-    let bundle = peacemaker_isa::native::bundle(&elf, ARCH, peacemaker_isa::native::DEFAULT_HOST_TARGET);
-    assert!(bundle.len() > elf.len());
+}
+
+/// The shipped `kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco` must be exactly what the builder emits today: the whole
+/// offload bundle, byte for byte (native writer, no ROCm; host entry `host-x86_64-unknown-linux-gnu`, device
+/// `hipv4-amdgcn-amd-amdhsa--gfx1151`, `.comment` `hipfire peacemaker native-emit 0.4.1`).
+#[test]
+fn committed_gfx1151_bundle_equals_fresh_emission() {
+    let arch = Arch::Gfx1151;
+    let module = module(arch);
+    let path = format!("{}/../../kernels/{module}.hxaco", env!("CARGO_MANIFEST_DIR"));
+    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv --arch gfx1151 ... --bundle)"));
+    let (_, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+    let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
+    let fresh = peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
+    assert!(committed == fresh, "{module}: fresh emission differs from the committed bundle {path}");
 }
 
 #[cfg(feature = "toolchain")]
@@ -370,21 +421,23 @@ mod toolchain {
     /// obligations (no ROCm tools).
     #[test]
     fn every_export_passes_wait_hazard_replay_and_m7() {
-        let (emitted, text, _) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-        for e in &emitted {
-            ledger_replay::replay_waits(&e.s_text, ARCH).unwrap_or_else(|err| panic!("{}: {err}", e.proof.variant));
-            assert!(e.s_text.contains(".kernarg_segment_size: 88\n"));
+        for arch in ARCHES {
+            let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+            for e in &emitted {
+                ledger_replay::replay_waits(&e.s_text, arch).unwrap_or_else(|err| panic!("{arch:?} {}: {err}", e.proof.variant));
+                assert!(e.s_text.contains(".kernarg_segment_size: 88\n"));
+            }
+            ledger_replay::replay_waits(&text, arch).unwrap();
+            let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-m7-{}-{}", arch.name(), std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let co = dir.join("module.co");
+            std::fs::write(&co, native::assemble(&text, arch).unwrap()).unwrap();
+            for symbol in SYMBOLS {
+                let m7 = pm_check::m7(&co, arch.name(), symbol).unwrap_or_else(|e| panic!("{arch:?} {symbol}: {e}"));
+                assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{arch:?} {symbol}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        ledger_replay::replay_waits(&text, ARCH).unwrap();
-        let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-m7-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let co = dir.join("module.co");
-        std::fs::write(&co, native::assemble(&text, ARCH).unwrap()).unwrap();
-        for symbol in SYMBOLS {
-            let m7 = pm_check::m7(&co, ARCH.name(), symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
-            assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Native code object and offload bundle against the ROCm oracle (`llvm-mc` + `ld.lld -shared`,
@@ -399,27 +452,31 @@ mod toolchain {
         let _ = require_rocm_tool!("llvm-objdump");
         let _ = require_rocm_tool!("llvm-readobj");
         let toolchain = Toolchain { host_target: HOST.into(), ..Toolchain::default() };
-        let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-identity-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (emitted, module_text, _) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-        let mut units: Vec<(String, String)> = emitted.iter().zip(SYMBOLS).map(|(e, symbol)| (symbol.to_owned(), e.s_text.clone())).collect();
-        units.push((format!("{MODULE} (module)"), module_text));
         let mut failures = Vec::new();
-        for (i, (name, text)) in units.iter().enumerate() {
-            let s = dir.join(format!("u{i}.s"));
-            std::fs::write(&s, text).unwrap();
-            let oracle = oracle_assemble_link_bundle(&toolchain, &s, &dir.join(format!("u{i}.hxaco")), ARCH.name()).unwrap();
-            let (oracle_elf, oracle_bundle) = (std::fs::read(&oracle.elf).unwrap(), std::fs::read(&oracle.hsaco).unwrap());
-            match native::assemble(text, ARCH) {
-                Ok(elf) => {
-                    let bundle = native::bundle(&elf, ARCH, HOST);
-                    if let Some(why) = native_compare::compare_native_to_oracle(&elf, &bundle, &oracle_elf, &oracle_bundle) { failures.push(format!("{name}: {why}")) }
+        let mut total = 0;
+        for arch in ARCHES {
+            let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-identity-{}-{}", arch.name(), std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (emitted, module_text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+            let mut units: Vec<(String, String)> = emitted.iter().zip(SYMBOLS).map(|(e, symbol)| (format!("{} {symbol}", arch.name()), e.s_text.clone())).collect();
+            units.push((format!("{} (module)", module(arch)), module_text));
+            total += units.len();
+            for (i, (name, text)) in units.iter().enumerate() {
+                let s = dir.join(format!("u{i}.s"));
+                std::fs::write(&s, text).unwrap();
+                let oracle = oracle_assemble_link_bundle(&toolchain, &s, &dir.join(format!("u{i}.hxaco")), arch.name()).unwrap();
+                let (oracle_elf, oracle_bundle) = (std::fs::read(&oracle.elf).unwrap(), std::fs::read(&oracle.hsaco).unwrap());
+                match native::assemble(text, arch) {
+                    Ok(elf) => {
+                        let bundle = native::bundle(&elf, arch, HOST);
+                        if let Some(why) = native_compare::compare_native_to_oracle(&elf, &bundle, &oracle_elf, &oracle_bundle) { failures.push(format!("{name}: {why}")) }
+                    }
+                    Err(e) => failures.push(format!("{name}: native: {e}")),
                 }
-                Err(e) => failures.push(format!("{name}: native: {e}")),
             }
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(failures.is_empty(), "{} of {} units differ from the oracle:\n{}", failures.len(), units.len(), failures.join("\n"));
+        assert!(failures.is_empty(), "{} of {total} units differ from the oracle:\n{}", failures.len(), failures.join("\n"));
     }
 
     /// Every symbol certifies against the ROCm oracle build: parse-back, independent wait replay,
@@ -431,23 +488,25 @@ mod toolchain {
         let _ = require_rocm_tool!("clang-offload-bundler");
         let _ = require_rocm_tool!("llvm-objdump");
         let _ = require_rocm_tool!("llvm-readobj");
-        let (emitted, text, _) = mq_i4_moe_gemv::emit_module(ARCH).unwrap();
-        for e in &emitted { ledger_replay::replay_waits(&e.s_text, ARCH).unwrap(); }
-        let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-cert-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = dir.join("module.s");
-        std::fs::write(&s, &text).unwrap();
-        let toolchain = Toolchain::oracle();
-        let build = build(&toolchain, &s, &dir.join("module.hsaco"), ARCH.name()).unwrap();
-        for (spec, e) in mq_i4_moe_gemv::module_specs(ARCH).into_iter().zip(&emitted) {
-            let symbol = spec.symbol();
-            let m7 = pm_check::m7(&build.elf, ARCH.name(), &symbol).unwrap_or_else(|err| panic!("{symbol}: {err}"));
-            assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{symbol}");
-            let tag = spec.tag();
-            let contract: IsaShapeContract = serde_json::from_value(mq_i4_moe_gemv::contract(spec, e)).unwrap();
-            certify(&toolchain, &build, &s, ARCH.name(), &dir.join(format!("{tag}.manifest.json")), Some(&contract), "test", "test")
-                .unwrap_or_else(|err| panic!("{symbol}: {err}"));
+        for arch in ARCHES {
+            let (emitted, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+            for e in &emitted { ledger_replay::replay_waits(&e.s_text, arch).unwrap(); }
+            let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-cert-{}-{}", arch.name(), std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let s = dir.join("module.s");
+            std::fs::write(&s, &text).unwrap();
+            let toolchain = Toolchain::oracle();
+            let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+            for (spec, e) in mq_i4_moe_gemv::module_specs(arch).into_iter().zip(&emitted) {
+                let symbol = spec.symbol();
+                let m7 = pm_check::m7(&build.elf, arch.name(), &symbol).unwrap_or_else(|err| panic!("{arch:?} {symbol}: {err}"));
+                assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{arch:?} {symbol}");
+                let tag = spec.tag();
+                let contract: IsaShapeContract = serde_json::from_value(mq_i4_moe_gemv::contract(spec, e)).unwrap();
+                certify(&toolchain, &build, &s, arch.name(), &dir.join(format!("{tag}.manifest.json")), Some(&contract), "test", "test")
+                    .unwrap_or_else(|err| panic!("{arch:?} {symbol}: {err}"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -79,6 +79,16 @@ fn qwen4_moe_sym_w3(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let e=qwen4_moe_sym::emit(Spec{arch,kind,nt:1,rr:1,codec:WeightCodec::Mq3I4})?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
+/// MQ3-I4 NT4 expert-run entries (`qwen4_moe_sym::w3::nt4`, module `qwen4_moe_iu4_sym_w3_nt4_pm_<arch>`, gfx1151 only): `--epi all` (default)
+/// is the six-entry module (gate/up, down, down nt4r2, down nt4r4, then the F32 `_acc` twins of gate/up and down), `gate_up`/`down` one shipped `rr == 1` entry.
+fn qwen4_moe_sym_w3_nt4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use peacemaker_isa::kernels::qwen4_moe_sym::w3::nt4;
+ if epi=="all"{let (_,text,proof)=nt4::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let want=match epi{"gate_up"|"down"=>epi,_=>return Err(format!("qwen4_moe_sym_w3_nt4 --epi {epi} (gate_up|down|all)"))};
+ let spec=nt4::module_specs(arch).into_iter().find(|s|s.kind.tag()==want).ok_or_else(||format!("qwen4_moe_sym_w3_nt4 has no {want} entry on {}",arch.name()))?;
+ let e=nt4::emit(spec)?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
 /// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
 fn qsa_gather(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  use peacemaker_isa::kernels::qsa_gather::{self,Kind,Spec};
@@ -371,6 +381,7 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "iu4_v2b_a4"=>iu4_v2b_a4(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "qwen4_moe_sym"=>qwen4_moe_sym(epi.as_deref().ok_or("missing --epi")?,arch)?,
   "qwen4_moe_sym_w3"=>qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_moe_sym_w3_nt4"=>qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_gather"=>qsa_gather(epi.as_deref().unwrap_or("all"),arch)?,
   "qsa_select"=>qsa_select(epi.as_deref().unwrap_or("all"),arch)?,
   "dflash_accept"=>dflash_accept(epi.as_deref().unwrap_or("all"),arch)?,

@@ -3,7 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! `WeightCodec::Mq3I4` NT1 entries of the grouped symmetric IU4 MoE GEMM
-//! (gfx1201): gate/up `qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201` (R256, K2560)
+//! (gfx1201; the gfx1151 body is `qwen4_moe_sym_w3_gfx1151.rs`, dispatched from `emit_impl`):
+//! gate/up `qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201` (R256, K2560)
 //! and down `qwen4_moe_down_iu4_sym_w3_pm_gfx1201` (R128, K640).
 //!
 //! Same 60-byte ABI, grid `(M/cta_rows, m_total/16)`, A4 activations, WMMA chain,
@@ -27,6 +28,14 @@
 //! has an odd epoch count: its tail is the MQ4 down entry's `if_else`.
 use super::*;
 
+/// gfx1151 sibling (own file); everything below is the gfx1201 body.
+#[path = "qwen4_moe_sym_w3_gfx1151.rs"]
+mod gfx1151;
+
+/// The NT4 (four 16-slot tiles per weight stream) entries of this codec: a
+/// separate module and code object, the NT1 entries here are unchanged.
+#[path = "qwen4_moe_sym_w3_nt4.rs"]
+pub mod nt4;
 // VGPRs added over the MQ4 layout.
 const SET_LEN: u8 = 28;
 const AOUT: u8 = SET0 + 2 * SET_LEN; // 148: unpacked signed nibbles, 8 dwords per tensor
@@ -132,6 +141,7 @@ pub(super) fn emit(spec: Spec) -> Result<Emitted, String> { emit_impl(spec, fals
 pub fn emit_acc(spec: Spec) -> Result<Emitted, String> { spec.validate()?; emit_impl(spec, true) }
 
 fn emit_impl(spec: Spec, acc: bool) -> Result<Emitted, String> {
+    if spec.arch == Arch::Gfx1151 { return gfx1151::emit_gfx1151(spec, acc) }
     let g = Gen { spec, acc };
     let sfx = if acc { "_acc" } else { "" };
     let kspec = KernelSpec {
