@@ -137,11 +137,11 @@ impl DaemonSession {
         // No download: the doctor writes no file. A missing PLE sidecar is an
         // error naming the pull command.
         crate::ple::ensure_ple_sidecar(
-            &registry,
             entry.as_ref(),
             tag.as_deref(),
             model_path,
             crate::ple::request_from_config(&resolved),
+            &crate::ple::load_target_arch(&resolved),
             false,
         )?;
         let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
