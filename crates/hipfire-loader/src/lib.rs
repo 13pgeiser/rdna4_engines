@@ -46,6 +46,24 @@ use rdna_compute::Gpu;
 use std::any::Any;
 use std::path::Path;
 
+/// Plain-language refusal for a model family that cannot be split across GPUs
+/// in pipeline mode. `family` is the carrier name (kept as the stable prefix),
+/// `pp` is the requested degree. Names the setting that fixes it.
+pub(crate) fn pp_unsupported_message(family: &str, is_dir: bool, pp: usize) -> String {
+    if is_dir {
+        format!(
+            "{family}: a safetensors model directory cannot be split across GPUs in pipeline \
+             mode (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU, or convert it \
+             to a packed .hfq file first"
+        )
+    } else {
+        format!(
+            "{family}: this model family cannot be split across GPUs in pipeline mode \
+             (topology.pp = {pp}). Set topology.pp = 1 to load it on one GPU"
+        )
+    }
+}
+
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
     /// Whether this carrier claims a given `arch_id`. `is_dir` distinguishes
@@ -74,11 +92,7 @@ pub trait Carrier: Send + Sync {
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if pp > 1 {
-            return Err(if is_dir {
-                format!("{}: safetensors + pp>1 unsupported", self.name())
-            } else {
-                format!("{}: pipeline-parallel (pp>1) unsupported", self.name())
-            });
+            return Err(pp_unsupported_message(self.name(), is_dir, pp));
         }
         Ok(())
     }
@@ -1930,7 +1944,7 @@ pub(crate) fn parse_state_quant(
         "fp32" | "f32" => Ok(StateQuant::FP32),
         "q4" | "int4" => Ok(StateQuant::Q4),
         other => Err(format!(
-            "unsupported DeltaNet state_quant '{other}' (expected q8|fp32|q4)"
+            "unsupported state_quant '{other}' for the DeltaNet recurrent state; choose q8 (the default), fp32 or q4"
         )),
     }
 }
@@ -2339,7 +2353,7 @@ fn finish_qwen35_load(
                 if ctx.spec.dflash == Some(true) {
                     return Err(rollback_unfinished_qwen35(
                         format!(
-                            "DFlash draft required (dflash_mode=on) but failed to load ({dp}): {e}"
+                            "DFlash draft required (speculation.dflash = on) but failed to load ({dp}): {e}"
                         ),
                         bundle,
                         vision_weights,
@@ -3133,7 +3147,7 @@ fn begin_route_kernels(
         Err(overlap) => {
             let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
                 .map_err(|e| {
-                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
+                    format!("load refused: not enough free host memory to start even one GPU-kernel compile worker ({overlap}; before weights: {e}). Free some system memory and retry")
                 })?;
             gpu.begin_route_kernel_load(plan, jobs, open)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
@@ -3844,7 +3858,7 @@ pub fn qwen35_ep_moe_topology_refusal(
     }
     if num_experts % tp != 0 {
         return Some(format!(
-            "Qwen3.5-MoE (arch_id={arch_id}) EP tp={tp} does not divide num_experts={num_experts}"
+            "Qwen3.5-MoE (arch_id={arch_id}) expert parallelism: tp={tp} does not divide num_experts={num_experts}; choose a tp that divides the expert count, or set tp=1"
         ));
     }
     None
@@ -3852,9 +3866,9 @@ pub fn qwen35_ep_moe_topology_refusal(
 
 /// Message constructor shared by [`ep_admission`] and the per-entry match
 /// backstops so the refusal text cannot drift between the two.
-fn ep_unsupported_arch_message(arch_id: u32) -> String {
+pub(crate) fn ep_unsupported_arch_message(arch_id: u32) -> String {
     format!(
-        "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
+        "expert parallelism (tp>1) is not supported for arch_id={arch_id}; it works for Qwen3.5 (5|6), DeepSeek V4 (9) and MiniMax (10). Set tp=1 for this model"
     )
 }
 
@@ -4070,12 +4084,12 @@ pub fn load_model_ep_with_compressor_cache(
         10 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_minimax(path, max_seq, tp)
         }
-        10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
+        10 => Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to MiniMax models; remove it for this model".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
             load_model_ep_with_kv_mode(path, max_seq, tp, None, None, None)
         }
         5 | 6 => {
-            Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
+            Err("the DeepSeek V4 compressor-cache setting (memory.kv_cache = f16) does not apply to Qwen3.5 models; remove it for this model".to_string())
         }
         // Backstop: `ep_admission` above already refused these; route through the
         // shared constructor (not `unreachable!`) so the refusal survives a
@@ -4489,7 +4503,7 @@ fn load_model_ep_qwen35(
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
         return Err(format!(
-            "EP qwen35 requires arch 5 or 6, got {}",
+            "expert parallelism (tp>1) via this path needs a Qwen3.5 model (arch 5 or 6), got arch {}",
             hfq_probe.arch_id
         ));
     }
@@ -4547,7 +4561,7 @@ fn load_model_ep_qwen35(
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
     if config.reap_keep.is_some() {
-        return Err("EP qwen35: REAP keep-map incompatible with EP".to_string());
+        return Err("EP qwen35: this REAP-pruned model cannot run with expert parallelism; set tp=1".to_string());
     }
     let arch_id = hfq_probe.arch_id;
     let n_exp = config.num_experts;
@@ -5003,7 +5017,7 @@ fn load_model_tp_qwen35_dense(
 pub fn ensure_vmm_ready_for_load(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     gpu.ensure_vmm_cleaned().map_err(|err| {
         format!(
-            "refusing load: prior VMM teardown still pending ({err}); retry unload or restart the process"
+            "load refused: the previous model's GPU virtual memory is still being released ({err}); retry the unload, or restart the process"
         )
     })
 }
@@ -5488,7 +5502,7 @@ mod ep_admission_tests {
                 Ok(()) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
-            assert!(err.contains("EP not supported"), "reason: {err}");
+            assert!(err.contains("expert parallelism (tp>1) is not supported"), "reason: {err}");
             assert!(
                 err.contains(&arch.to_string()),
                 "reason names the arch: {err}"
@@ -5646,7 +5660,7 @@ mod ep_admission_tests {
             &mut effects,
         )
         .unwrap_err();
-        assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
+        assert!(refusal.contains("vmm") && refusal.contains("not available"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
         let _ = std::fs::remove_file(candidate);

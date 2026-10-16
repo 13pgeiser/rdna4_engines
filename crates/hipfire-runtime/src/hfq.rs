@@ -93,7 +93,7 @@ pub fn append_hfq_metadata_overlay(path: &Path, metadata_json: &str) -> std::io:
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "{}: unsupported HFQ format version {}",
+                "{}: unsupported HFQ format version {}; this model file was written by a newer hipfire. Update hipfire (`hipfire update`) or re-download a compatible build of the model",
                 path.display(),
                 raw_version & !HFQ_METADATA_OVERLAY_FLAG
             ),
@@ -985,7 +985,7 @@ impl HfqFile {
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "HfqFile: truncated or corrupt HFQ container: reading {what} \
-                         needs {end} bytes but the file is only {file_len}"
+                         needs {end} bytes but the file is only {file_len}. The download may be incomplete; re-download the model with `hipfire pull <model>`"
                     ),
                 ))
             } else {
@@ -1018,7 +1018,7 @@ impl HfqFile {
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "HfqFile: unsupported HFQ format version {format_version} \
-                     (raw header word {raw_format_version})"
+                     (raw header word {raw_format_version}); this model file was written by a newer hipfire. Update hipfire (`hipfire update`) or re-download a compatible build of the model"
                 ),
             ));
         }
@@ -1225,7 +1225,7 @@ impl HfqFile {
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "HfqFile: tensor '{name}' payload [{cumulative_offset}, {end}) \
-                         extends past the {file_len}-byte file (truncated container)"
+                         extends past the {file_len}-byte file (truncated container); the download may be incomplete, so re-download the model with `hipfire pull <model>`"
                     ),
                 ));
             }
@@ -1323,7 +1323,7 @@ impl HfqFile {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "qwen3* model ({prov}) stamped arch_id={}; cannot guarantee froggeric pillar — re-quantize with correct arch_id (5=dense, 6=MoE)",
+                        "qwen3* model ({prov}) is stamped arch_id={}, which is wrong for a Qwen3 model; re-quantize it with the correct arch_id (5 = dense, 6 = MoE) or download a corrected build",
                         me.arch_id
                     ),
                 ));
@@ -1602,7 +1602,7 @@ impl HfqFile {
         if end > mmap.len() {
             eprintln!(
                 "HfqFile: tensor {name:?} data region [{}, {}) overruns the \
-                 {}-byte file — truncated or corrupt HFQ container",
+                 {}-byte file — truncated or corrupt HFQ container; re-download the model with `hipfire pull <model>`",
                 info.data_offset,
                 info.data_offset + info.data_size,
                 mmap.len()
@@ -1672,7 +1672,7 @@ impl HfqFile {
             if total_read < info.data_size {
                 eprintln!(
                     "HfqFile: tensor {name:?} short read ({total_read} of {} \
-                     bytes at offset {}) — truncated or corrupt HFQ container{}",
+                     bytes at offset {}) — truncated or corrupt HFQ container; the file may have been cut short on disk, so re-download the model with `hipfire pull <model>`{}",
                     info.data_size,
                     info.data_offset,
                     read_err
@@ -2596,13 +2596,13 @@ pub(crate) fn load_weight_tensor(
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
-            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+            None => Err(HipError::new(0, "weight format qt=52 has no decoder in this hipfire build; update hipfire or re-download a build of the model in a supported format")),
         },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
+                &format!("weight {st_name} uses quant_type {other}, which this hipfire build cannot load; update hipfire or re-download a build of the model in a supported format"),
             )),
         },
     }?;
@@ -2681,13 +2681,13 @@ pub fn load_weight_tensor_pread(
                     .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name, target)
             }
-            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+            None => Err(HipError::new(0, "weight format qt=52 has no decoder in this hipfire build; update hipfire or re-download a build of the model in a supported format")),
         },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name, target),
             None => Err(HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for weight {st_name}"),
+                &format!("weight {st_name} uses quant_type {other}, which this hipfire build cannot load; update hipfire or re-download a build of the model in a supported format"),
             )),
         },
     }?;
@@ -2838,17 +2838,11 @@ pub fn validate_llama_hfq_admission(hfq: &HfqFile) -> HipResult<()> {
             0,
             &format!(
                 "refusing to load Qwen2 HFQ through the LLaMA family path: \
-                 tensor `model.layers.0.self_attn.q_proj.bias` is present, \
-                 which means this is a Qwen2 (attention_bias=true) model. \
-                 The LLaMA loader drops Q/K/V proj bias and would produce \
-                 wrong outputs. \
-                 Current HFQ arch_id = {}. Re-quantise with \
-                 `hipfire-quantize --arch-id 7 ...` so the daemon \
-                 dispatches arch_id=7 to hipfire-arch-qwen2 (once that \
-                 crate is wired in), or — for inspection only — load \
-                 directly via `cargo run --example inspect_hfq -p \
-                 hipfire-arch-qwen2 -- <path>`. \
-                 See docs/plans/dots-ocr-devlog.md §7.",
+                 this file is a Qwen2 model (tensor \
+                 `model.layers.0.self_attn.q_proj.bias` is present, so it has attention \
+                 biases) but it is labelled arch_id = {} (LLaMA). The LLaMA loader drops \
+                 the Q/K/V biases and would produce wrong output. Re-quantize the model \
+                 with `hipfire-quantize --arch-id 7 ...` so it loads as a Qwen2 model.",
                 hfq.arch_id
             ),
         ));

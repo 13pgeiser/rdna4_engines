@@ -247,7 +247,7 @@ fn ensure_accepted(k: KvMode, policy: &KvModePolicy) -> Result<(), KvPairError> 
         Ok(())
     } else {
         Err(KvPairError::new(format!(
-            "K mode {k:?} is not supported at site '{}' (accepted: {:?})",
+            "K mode {k:?} is not supported for this model route '{}' (accepted: {:?}); choose one of those with --kv-mode (memory.kv_cache) or --kv-k",
             policy.site, policy.accepted
         )))
     }
@@ -570,7 +570,7 @@ pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
         }
         other => {
             return Err(format!(
-                "unsupported qwen4 kv mode {other:?}; explicit mode must be one of: auto, bf16, fp8, q8"
+                "unsupported qwen4 kv mode {other:?}; --kv-mode (memory.kv_cache) must be one of: auto, bf16, fp8, q8"
             ))
         }
     };
@@ -599,7 +599,7 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
         Some(m @ (Fp8 | Bf16 | F16)) => (
             m,
             Some(
-                "explicit fp8/bf16/f16 KV requested but unsupported at this site; load will fail closed",
+                "explicit fp8/bf16/f16 KV requested but this model route does not support it; the load will be refused. Use --kv-mode q8 or auto",
             ),
         ),
         _ => {
@@ -610,8 +610,8 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
                 // satisfy the `&'static str` warning type.
                 let leaked: &'static str = Box::leak(
                     format!(
-                        "unrecognized or unsupported kv mode {raw:?} for site {}; \
-                         using site default {:?}",
+                        "unrecognized or unsupported --kv-mode {raw:?} for this model route '{}'; \
+                         using the route default {:?}",
                         policy.site, policy.default
                     )
                     .into_boxed_str(),

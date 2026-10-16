@@ -471,16 +471,16 @@ impl fmt::Display for TokenizerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MetadataMissing { field } => {
-                write!(f, "tokenizer metadata field missing or wrong type: {field}")
+                write!(f, "tokenizer metadata field missing or wrong type: {field}; the model file's tokenizer is damaged or incomplete — re-download the model")
             }
             Self::MalformedJson(e) => write!(f, "tokenizer JSON parse error: {e}"),
             Self::MissingByteSymbol { byte, char } => write!(
                 f,
-                "GPT-2 BPE vocab missing byte symbol: byte 0x{byte:02x} maps to char {char:?} which is not in token_to_id"
+                "GPT-2 BPE vocab missing byte symbol: byte 0x{byte:02x} maps to char {char:?} which is not in token_to_id; the model file's tokenizer vocabulary is damaged — re-download the model"
             ),
             Self::MissingMergeOperand { rank, left, right, missing_side } => write!(
                 f,
-                "merge rule rank {rank} ({left:?}, {right:?}): {missing_side:?} symbol not in vocab"
+                "merge rule rank {rank} ({left:?}, {right:?}): {missing_side:?} symbol not in vocab; the model file's tokenizer is damaged — re-download the model"
             ),
             Self::MissingMergeResult { rank, expected } => write!(
                 f,

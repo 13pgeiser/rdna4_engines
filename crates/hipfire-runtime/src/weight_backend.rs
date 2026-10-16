@@ -15,6 +15,10 @@ use rdna_compute::{
     MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
 };
 
+/// Appended to every fixed-layout blob size refusal: the size only disagrees
+/// when the file is damaged or was written by an older quantizer.
+const BLOB_FIX: &str = "; the model file is corrupt or was written by an older quantizer — re-download it with `hipfire pull <model>` or re-quantize it";
+
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
 /// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
 fn widen_bf16(data: &[u8]) -> Vec<f32> {
@@ -108,10 +112,10 @@ pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "unsupported embedding quant_type {other}; \
-                 handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
-                 40 (TQ2G128→F32), 41 (BQ1G128→F32), 44/45/47-50 (MQ*G256V2→F32). \
-                 Add the format to embed_classify to support it."
+                "unsupported embedding quant_type {other}: this model's embedding table is stored in a \
+                 weight format hipfire cannot load. Supported embedding formats: 1 (F16), 2 (F32), 3 (Q8_0), \
+                 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16), 40 (TQ2G128), 41 (BQ1G128), 44/45/47-50 (MQ*G256V2). \
+                 Update hipfire, or re-quantize / re-download the model with a supported embedding format."
             ),
         )),
     }
@@ -763,7 +767,7 @@ pub(crate) fn decode_raw_codec(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "{:?} tensor has K={k} but kernel requires K%256==0 (caller: {name})",
+                "{:?} tensor {name} has K={k} columns, but this format needs K to be a multiple of 256; the model file does not match its declared format — re-quantize or re-download it",
                 codec.dtype
             ),
         ));
@@ -775,7 +779,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -804,7 +808,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -824,7 +828,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "FP8E4M3B128 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "FP8E4M3B128 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -837,7 +841,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4G256V2Lloyd blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}; stale +32B-prefix artifacts are rejected)",
+                    "MQ4G256V2Lloyd blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}; artifacts from the old +32B-prefix layout are rejected){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -852,7 +856,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -865,7 +869,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -878,7 +882,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -891,7 +895,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -904,7 +908,7 @@ pub(crate) fn decode_raw_codec(
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}){BLOB_FIX}",
                     data.len()
                 ),
             ));
@@ -954,7 +958,7 @@ fn lowbit_expected_bytes(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "{:?} tensor [m={m}, k={k}] (caller: {name}) requires K%128==0: K={k} not divisible by 128",
+                "{:?} tensor {name} [m={m}, k={k}] has K={k} columns, but this format needs K to be a multiple of 128; the model file does not match its declared format — re-quantize or re-download it",
                 dtype
             ),
         ));
@@ -1094,7 +1098,7 @@ pub fn dequant_weight_raw(
             Some(c) => decode_raw_codec(gpu, c, data, m, k, "dequant_weight_raw", target),
             None => Err(hip_bridge::HipError::new(
                 0,
-                &format!("unsupported quant_type {other} for dequant_weight_raw"),
+                &format!("unsupported quant_type {other} in dequant_weight_raw; this hipfire build cannot read that weight format — update hipfire or re-download the model in a supported format"),
             )),
         },
     }
@@ -1400,9 +1404,9 @@ pub enum MemoryTarget {
 /// upload the widened bytes; no host-mapped upload exists, so silently placing
 /// them on the device would consume exactly the VRAM an offloaded layer frees.
 pub const HOST_DECODE_REFUSAL: &str =
-    "quantized weight falls back to the f32 dequant path, which has no \
-     host-localized upload; refusing to silently place it in device memory \
-     inside an offloaded layer";
+    "this quantized weight format has no host-memory (offload) upload path, and placing it \
+     in device memory would defeat the offload; use a model quantized in a supported format, \
+     or unset memory.gpu_layer_budget / memory.moe_expert_budget";
 
 use crate::augmentor::{try_augmentors, DEFAULT_AUGMENTORS};
 use crate::model_source::ModelSource;
@@ -2041,7 +2045,7 @@ mod tests {
         for k in [1, 127, 129, 256 - 1, 255, 257, 1000] {
             let err = lowbit_expected_bytes(DType::TQ2G128, 1, k, "caller_ctx", 34).unwrap_err();
             assert!(
-                err.message.contains("K%128==0") || err.message.contains("requires K%128"),
+                err.message.contains("multiple of 128"),
                 "k={k}: expected K%128 error, got {}",
                 err.message
             );
@@ -2065,7 +2069,7 @@ mod tests {
         let err = lowbit_expected_bytes(DType::BQ1G128, 4, 200, "my_layer", 18).unwrap_err();
         assert!(err.message.contains("BQ1G128"));
         assert!(err.message.contains("my_layer"));
-        assert!(err.message.contains("K%128"));
+        assert!(err.message.contains("multiple of 128"));
     }
 
     #[test]

@@ -6596,7 +6596,7 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
     if avail < want {
         bail!(
             "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
-             A previous backend may not have released its weights.",
+             A previous backend may not have released its weights; stop it with `hipfire stop` or free system memory, then retry.",
             path.display(),
             want as f64 / 1e9,
             avail as f64 / 1e9

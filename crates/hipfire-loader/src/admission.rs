@@ -250,7 +250,9 @@ pub(crate) fn qwen4_native_mtp(
     match spec.mtp {
         Some(false) => Ok(false),
         Some(true) if retained => Err(
-            "qwen4: native MTP cannot be admitted with retained Redline; load the non-MQ4R HFQM artifact or disable MTP"
+            "qwen4: native MTP (speculation.mtp = on) cannot be used with the MQ4R pre-recorded \
+             launch path (retained Redline) this model would run on. Set speculation.mtp = off, \
+             or load the non-MQ4R HFQM build of this model"
                 .into(),
         ),
         Some(true) => Ok(true),
@@ -401,8 +403,9 @@ fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &s
         // RAM. Qwen4 has its own expert-residency route and the other arches have
         // none, so either knob is a request this loader cannot honour.
         Arch(arch_id) => format!(
-            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
-             only; this source is arch id {arch_id}. Unset both keys for this model"
+            "load refused: partial GPU offload ({keys}) only works for Qwen3.5 dense and MoE \
+             models; this model is a different architecture (arch id {arch_id}). Unset both keys \
+             for this model"
         ),
         Tp(tp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
@@ -411,8 +414,8 @@ fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &s
         ),
         Pp(pp) => format!(
             "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
-             pp={pp} would place the first pipeline band's spilled weights in host RAM mapped by \
-             device 0, which has never been run. Unset both keys for this model"
+             pp={pp} would put the first pipeline stage's spilled weights in host RAM, which is \
+             not supported yet. Unset both keys for this model"
         ),
         ExpertParallel(_) => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with expert parallelism \
@@ -421,16 +424,16 @@ fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &s
         ),
         VisionTower => format!(
             "load refused: partial GPU offload ({keys}) cannot place the Qwen3.5-VL vision tower, \
-             which loads through its own lowered loader. Unset both keys for this model"
+             which is loaded by a separate path. Unset both keys for this model"
         ),
         PagedExperts => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with paged experts — \
-             the weight pager owns those buffers and would move them behind the placement's back. \
-             Unset both keys for this model"
+             the weight pager manages those buffers itself and would conflict with the \
+             placement. Unset both keys for this model"
         ),
         ReapKeepMap => format!(
             "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
-             the pruned expert load has no host-placement path. Unset both keys for this model"
+             a pruned-expert model has no host-placement path. Unset both keys for this model"
         ),
     }
 }
@@ -461,14 +464,19 @@ pub fn qwen4_request_admission(
         Qwen4Capabilities::text_ar()
     };
     if !capabilities.supports_modality(modality) {
-        return Err(format!("qwen4: unsupported modality {modality:?}"));
+        return Err(format!(
+            "qwen4: {modality:?} input is not supported by this model route; Qwen4 loads accept \
+             text only"
+        ));
     }
     if native_mtp && !capabilities.native_mtp {
-        return Err("qwen4: native MTP is not supported by this source".into());
+        return Err("qwen4: native MTP is not supported by this model file; set speculation.mtp = off".into());
     }
     if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
-            "qwen4: only pp=1, tp=1 with expert-parallel ep in 1..=8, or tp=1, ep=1 with pipeline-parallel pp in 2..=8 is admitted (pp={}, tp={}, ep={})",
+            "qwen4: this parallelism combination is not supported (topology.pp={}, tp={}, ep={}). \
+             Use pp=1 and tp=1 with topology.ep from 1 to 8, or tp=1 and ep=1 with topology.pp \
+             from 2 to 8",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
         ));
     }
@@ -1096,7 +1104,9 @@ pub fn classify_vision(
         // request or silently downgraded to text.
         QWEN4_ARCH_ID => {
             if has_vision_tensor {
-                Err("qwen4: vision tensors are unsupported by the text-only route".into())
+                Err("qwen4: this model file contains vision tensors, but Qwen4 loads text only; \
+                     use the text-only build of the model"
+                    .into())
             } else {
                 Ok(false)
             }
@@ -1283,8 +1293,10 @@ fn df_lash_lm_head_admission(
             None => "no lm_head/embed_tokens tensor found".to_string(),
         };
         return Err(format!(
-            "DFlash draft requested but target lm_head {qt_desc} is not supported \
-             on gfx11+gfx12 WMMA ({gpu_arch})."
+            "DFlash draft requested but this model's output layer ({qt_desc}) is stored in a \
+             weight format DFlash cannot use on {gpu_arch}. Turn DFlash off \
+             (speculation.dflash = off) or load a build of the model with a supported output \
+             layer format"
         ));
     }
     Ok(())
@@ -1309,7 +1321,7 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     );
     (!gfx11_wmma_w32).then(|| {
         format!(
-            "image generation (arch 40/45) requires RDNA3/3.5 (gfx11 wave32 WMMA); \
+            "image generation (arch 40/45) needs an RDNA3/3.5 GPU (gfx11 wave32 WMMA); \
              detected {gpu_arch}. See docs/IMAGEGEN.md §1."
         )
     })
@@ -1453,7 +1465,7 @@ fn resolve_sequence(
     // Weight upload changes free VRAM; the Qwen carrier remeasures that
     // *after* weights and immediately before KV reservation.
     if projected_card_cap < 512 && requested == 0 {
-        return Err("Qwen VMM load refused: projected weights, minimum prefill scratch and KV do not fit free VRAM".into());
+        return Err("Qwen VMM load refused: the model weights, the minimum prefill scratch and the KV cache do not fit in free VRAM. Free GPU memory, set a smaller memory.max_seq, or use a smaller quantization of this model".into());
     }
     let (max_seq, bound) = if requested != 0 {
         (requested, "user")
@@ -1519,25 +1531,25 @@ fn pp_geometry_refusal(
 ) -> Option<String> {
     if pp == 0 {
         return Some(
-            "load refused: pp=0 is not a valid pipeline-parallel degree \
-             (Gpus::init_uniform requires n_devices >= 1; multi_gpu.rs)"
+            "load refused: topology.pp=0 is not a valid pipeline-parallel degree; use 1 for a \
+             single GPU or the number of GPUs to split across"
                 .to_string(),
         );
     }
     if let Some(layers) = n_layers {
         if pp > layers {
             return Some(format!(
-                "load refused: pp={pp} exceeds n_layers={layers} for this source \
-                 (Gpus::init_uniform refuses n_layers < n_devices — each device must \
-                 own at least one layer; multi_gpu.rs)"
+                "load refused: pp={pp} exceeds n_layers={layers} for this source — each GPU \
+                 needs at least one model layer, so lower topology.pp to at most {layers}"
             ));
         }
     }
     if let Some(devices) = n_devices {
         if pp > devices {
             return Some(format!(
-                "load refused: pp={pp} exceeds visible HIP device count={devices} \
-                 (Gpus::init_uniform cannot bind that many ranks; multi_gpu.rs)"
+                "load refused: pp={pp} exceeds visible HIP device count={devices} — pipeline \
+                 parallelism needs one GPU per stage, so lower topology.pp or make more GPUs \
+                 visible (hardware.devices)"
             ));
         }
     }
@@ -1552,16 +1564,17 @@ fn pp_geometry_refusal(
 fn tp_geometry_refusal(tp: usize, n_devices: Option<usize>) -> Option<String> {
     if tp == 0 {
         return Some(
-            "load refused: tp=0 is not a valid parallel degree \
-             (Gpus::init_ep/init_tp require ep_size/tp_size >= 1; multi_gpu.rs)"
+            "load refused: tp=0 is not a valid parallel degree; use 1 for a single GPU or the \
+             number of GPUs to split across"
                 .to_string(),
         );
     }
     if let Some(devices) = n_devices {
         if tp > devices {
             return Some(format!(
-                "load refused: tp={tp} exceeds visible HIP device count={devices} \
-                 (Gpus::init_ep/init_tp need one device per rank; multi_gpu.rs)"
+                "load refused: tp={tp} exceeds visible HIP device count={devices} — parallel \
+                 loads need one GPU per rank, so lower the degree or make more GPUs visible \
+                 (hardware.devices)"
             ));
         }
     }
@@ -1787,7 +1800,7 @@ pub fn normalize_pp_bands(
     let Some(spec) = requested else {
         if n_layers < pp {
             return Err(format!(
-                "HipError(0): init_uniform: n_layers ({n_layers}) < n_devices ({pp}) — each device must own at least one layer (hipError=0)"
+                "load refused: pp={pp} exceeds n_layers ({n_layers}) — each GPU needs at least one model layer, so lower topology.pp to at most {n_layers}"
             ));
         }
         return Ok(PpBands {
@@ -1813,7 +1826,7 @@ pub fn normalize_pp_bands(
     }
     if counts.contains(&0) {
         return Err(
-            "HipError(0): init_layers: each device must own ≥1 layer (hipError=0)".to_string(),
+            "load refused: every pipeline stage needs at least one layer, but a stage was given zero".to_string(),
         );
     }
     Ok(PpBands {
@@ -2054,7 +2067,7 @@ pub(crate) fn admit_qwen4_pp_mesh(
     .map_err(|e| {
         if policy == EdgeTransportPolicy::Peer {
             format!(
-                "{prefix}: Peer edges for Qwen4 PP need an admission-time qualification step ({MESH_TRANSPORT_ENV}=peer refused: {e}); no byte-qualification evidence exists before side effects (qualifying enables peer access); use auto or host"
+                "{prefix}: peer-to-peer transfers between the pipeline GPUs were requested ({MESH_TRANSPORT_ENV}=peer) but could not be verified: {e}. Use {MESH_TRANSPORT_ENV}=auto or host"
             )
         } else {
             format!("{prefix}: {e}")
@@ -2182,7 +2195,7 @@ pub fn admit_source_with_options(
         && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
     {
         return Err(format!(
-            "HIPFIRE_WEIGHT_HOST=1 supports only a single-device dense Qwen3.5 HFQ (arch 5, tp=pp=1); got arch {arch_id}{}, tp={tp}, pp={pp}",
+            "HIPFIRE_WEIGHT_HOST=1 only supports a single-GPU dense Qwen3.5 HFQ model (arch 5, tp=1, pp=1); this load is arch {arch_id}{}, tp={tp}, pp={pp}. Unset HIPFIRE_WEIGHT_HOST or load a supported model",
             if is_dir { " (directory source)" } else { "" }
         ));
     }
@@ -2295,8 +2308,9 @@ pub fn admit_source_with_options(
         let positions = admitted.config.context_limit();
         if max_seq > positions {
             return Err(format!(
-                "qwen4: max_seq {max_seq} exceeds the model's RoPE context {positions} \
-                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor)"
+                "qwen4: max_seq {max_seq} exceeds the model's trained context of {positions} tokens \
+                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor). \
+                 Lower memory.max_seq to at most {positions}"
             ));
         }
         let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
@@ -2319,14 +2333,12 @@ pub fn admit_source_with_options(
         // and MiniMax (10) refuse it (replicated-KV EP has no VMM path).
         if is_dir {
             return Err(
-                "EP not supported for safetensors directory sources (load as a single HFQ file)"
+                "expert/tensor parallelism (tp>1) is not supported for safetensors directory sources; load a single HFQ file or set tp=1"
                     .into(),
             );
         }
         if !matches!(arch_id, 5 | 6 | 9 | 10) {
-            return Err(format!(
-                "EP not supported for arch_id={arch_id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
-            ));
+            return Err(crate::ep_unsupported_arch_message(arch_id));
         }
         // Qwen3.5 density probe (HFQ-only past the `is_dir` refusal above, so
         // the destructure is infallible): dense (`num_experts == 0`) runs the
@@ -2335,7 +2347,7 @@ pub fn admit_source_with_options(
         // topology gate below reuses it instead of re-opening the source.
         let qwen35_num_experts: Option<usize> = if matches!(arch_id, 5 | 6) {
             let ModelSource::Hfq(hfq) = &source else {
-                return Err("EP qwen35 requires an HFQ source".to_string());
+                return Err("expert parallelism for Qwen3.5 needs an HFQ model file, not a safetensors directory; load a single HFQ file or set tp=1".to_string());
             };
             Some(
                 hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
@@ -2405,11 +2417,11 @@ pub fn admit_source_with_options(
         hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_available)
     } else if heterogeneous_reason {
         Some(
-            "heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout"
+            "this mixed-GPU DeepSeek setup keeps its compressor cache in a layout the VMM backend cannot manage"
                 .to_string(),
         )
     } else if !hints.vmm_runtime_available {
-        Some("HIP VMM symbols/granularity unavailable".to_string())
+        Some("this GPU runtime does not provide the virtual-memory (VMM) support the backend needs".to_string())
     } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
         Some(reason)
     } else if gpu_arch != "gfx1201"
@@ -2425,14 +2437,14 @@ pub fn admit_source_with_options(
         )
     {
         Some(format!(
-            "device {gpu_arch} has no certified VMM KV path for the selected mode"
+            "{gpu_arch} has no tested VMM KV path for the selected --kv-mode"
         ))
     } else if pp > 1 {
-        Some("pipeline-parallel KV owner has no VMM layout".to_string())
+        Some("pipeline parallelism (topology.pp > 1) does not support VMM KV".to_string())
     } else if tp > 1 && (arch_id == 10 || qwen35_ep_experts.is_some_and(|n| n > 0)) {
-        Some("replicated-KV MoE/EP owner has no VMM layout".to_string())
+        Some("multi-GPU MoE/expert-parallel loads keep a full KV copy on every GPU, which VMM KV does not support".to_string())
     } else if tp > 1 && arch_id == 9 {
-        Some("DeepSeek EP VMM requires every rank to have a validated VMM device".to_string())
+        Some("DeepSeek expert parallelism with VMM KV needs VMM support on every GPU, and at least one GPU lacks it".to_string())
     } else if carrier.is_some_and(|c| !matches!(c.name(), "qwen35" | "deepseek4" | "muse_glimmer"))
     {
         Some(format!(
@@ -2440,14 +2452,14 @@ pub fn admit_source_with_options(
             carrier.unwrap().name()
         ))
     } else if arch_id == 14 && hints.cask.is_some_and(|c| c.sidecar.is_some()) {
-        Some("Muse Glimmer VMM does not support a CASK sidecar".to_string())
+        Some("Muse Glimmer does not support a CASK sidecar together with VMM KV".to_string())
     } else {
         None
     };
     let (kv_backend, kv_backend_reason) = match (request, unsupported) {
         (KvBackendRequest::Explicit(KvBackend::Legacy), _) => (KvBackend::Legacy, None),
         (KvBackendRequest::Explicit(KvBackend::Vmm), Some(reason)) => {
-            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy or a validated VMM source/device"));
+            return Err(format!("KV backend 'vmm' is not available for this load: {reason}. Use --kv-backend legacy (memory.kv_backend = legacy), or a model and GPU that support VMM KV"));
         }
         (KvBackendRequest::Explicit(KvBackend::Vmm), None)
         | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
@@ -2460,7 +2472,7 @@ pub fn admit_source_with_options(
             .is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
         && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
     {
-        return Err("kv_adaptive -> CASK handoff requires VMM; disable the sidecar/handoff or use a validated VMM device".into());
+        return Err("kv_adaptive -> CASK handoff needs the VMM KV backend, which is not available for this load; disable the CASK sidecar/handoff or use a GPU that supports VMM KV".into());
     }
     if let Some(carrier) = carrier {
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
@@ -2496,7 +2508,7 @@ pub fn admit_source_with_options(
         // would allocate all of it at load.
         if sequence.bound == "pending" && kv_backend != KvBackend::Vmm {
             return Err(format!(
-                "qwen4: automatic max_seq needs the VMM KV backend ({}); set memory.max_seq for legacy storage",
+                "qwen4: automatic max_seq needs the VMM KV backend, which is not in use ({}); set memory.max_seq to a fixed value to use legacy KV storage",
                 kv_backend_reason.as_deref().unwrap_or("legacy requested")
             ));
         }
@@ -2995,7 +3007,7 @@ mod tests {
             assert_eq!(counts(&bands), [4, 3, 3]);
             assert_eq!(
                 normalize_pp_bands(&pp_mesh(3), 2, None).unwrap_err(),
-                "HipError(0): init_uniform: n_layers (2) < n_devices (3) — each device must own at least one layer (hipError=0)"
+                "load refused: pp=3 exceeds n_layers (2) — each GPU needs at least one model layer, so lower topology.pp to at most 2"
             );
         }
 
@@ -3026,7 +3038,7 @@ mod tests {
             assert_eq!(err("16,15"), "HIPFIRE_PP_LAYERS sum=31 != n_layers=32");
             assert_eq!(
                 err("0,32"),
-                "HipError(0): init_layers: each device must own ≥1 layer (hipError=0)"
+                "load refused: every pipeline stage needs at least one layer, but a stage was given zero"
             );
             assert_eq!(
                 err("18446744073709551615,2"),
@@ -3331,7 +3343,7 @@ mod tests {
         assert_eq!(admit(1, 1, 1, true), Ok(()));
         for ep in [0, 9, 16] {
             assert!(
-                admit(1, 1, ep, false).unwrap_err().contains("ep in 1..=8"),
+                admit(1, 1, ep, false).unwrap_err().contains("topology.ep from 1 to 8"),
                 "ep {ep}"
             );
         }
@@ -3890,13 +3902,13 @@ mod tests {
         let err_zero = pp_geometry_refusal(0, Some(64), Some(4)).expect("pp=0 refuses");
         assert!(err_zero.contains("pp=0"), "reason: {err_zero}");
         assert!(
-            err_zero.contains("init_uniform"),
-            "names deep site: {err_zero}"
+            err_zero.contains("topology.pp"),
+            "names the setting: {err_zero}"
         );
         let err = pp_geometry_refusal(99, Some(64), Some(4)).expect("pp=99 refuses");
         assert!(err.contains("pp=99"), "reason: {err}");
         assert!(err.contains("n_layers=64"), "reason: {err}");
-        assert!(err.contains("init_uniform"), "names deep site: {err}");
+        assert!(err.contains("topology.pp"), "names the setting: {err}");
         let err = pp_geometry_refusal(8, Some(64), Some(4)).expect("pp=8 > 4 devices");
         assert!(err.contains("device count=4"), "reason: {err}");
         // Servable degrees pass untouched.
@@ -3914,7 +3926,7 @@ mod tests {
     fn tp_geometry_checks_degree_and_devices_only() {
         let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
         assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
-        assert!(err_zero.contains("init_ep"), "names deep site: {err_zero}");
+        assert!(err_zero.contains("single GPU"), "names the remedy: {err_zero}");
         let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
         assert!(err.contains("tp=99"), "reason: {err}");
         assert!(err.contains("device count=4"), "reason: {err}");
@@ -4215,7 +4227,7 @@ mod tests {
             assert!(mode_spelling
                 .kv_backend_reason
                 .unwrap()
-                .contains("no certified VMM KV path"));
+                .contains("no tested VMM KV path"));
             let default = admit(auto, "gfx1151", Some("q8"), None, true).unwrap();
             assert_eq!(default.kv_backend, KvBackend::Vmm);
             let unavailable = admit(auto, "gfx1151", Some("q8"), None, false).unwrap();
@@ -4223,7 +4235,7 @@ mod tests {
             assert!(unavailable
                 .kv_backend_reason
                 .unwrap()
-                .contains("HIP VMM symbols/granularity unavailable"));
+                .contains("does not provide the virtual-memory (VMM) support"));
             let gfx1201 = admit(auto, "gfx1201", Some("q8"), Some("fwht3"), true).unwrap();
             assert_eq!(gfx1201.kv_backend, KvBackend::Vmm);
             assert!(gfx1201.kv_backend_reason.is_none());
@@ -5521,7 +5533,7 @@ mod qwen4_pp_admission_tests {
             error.contains("topology.pp = 4")
                 && error.contains(MESH_TRANSPORT_ENV)
                 && error
-                    .contains("Peer edges for Qwen4 PP need an admission-time qualification step"),
+                    .contains("peer-to-peer transfers between the pipeline GPUs"),
             "{error}"
         );
         // Edge ids are logical stage pairs.
@@ -6017,7 +6029,7 @@ mod qwen4_pp_admission_tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("pipeline-parallel pp in 2..=8")
+                error.contains("topology.pp from 2 to 8")
                     && !error.contains("config admission failed"),
                 "{error}"
             );

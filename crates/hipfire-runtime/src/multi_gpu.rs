@@ -3624,7 +3624,7 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
                     0,
                     &format!(
                         "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
-                         Mixed-arch is not supported by default; set HIPFIRE_ALLOW_MIXED_ARCH=1 to override.",
+                         Mixed GPU architectures are not supported by default; set hardware.allow_mixed_arch = true (HIPFIRE_ALLOW_MIXED_ARCH=1) to allow them, or use matching GPUs.",
                         d.device_id, d.arch,
                     ),
                 ));
@@ -3653,8 +3653,8 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
         return Err(HipError::new(
             0,
             &format!(
-                "preflight_vram: VRAM delta {:.1} GiB exceeds tolerance {:.1} GiB. \
-                 Override via HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB or use init_layers().",
+                "preflight_vram: free VRAM differs by {:.1} GiB between the GPUs, more than the {:.1} GiB tolerance. \
+                 Free memory on the card with less free VRAM, or raise hardware.uniform_vram_tolerance_gb (HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB).",
                 delta_gb, tol_gb,
             ),
         ));

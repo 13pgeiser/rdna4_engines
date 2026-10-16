@@ -97,6 +97,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Thin Redline skill hook (workflow only) | [`.agents/skills/redline-retained-replay/`](../.agents/skills/redline-retained-replay/) | shipped / ref-pinned | Must not fork policy from `REDLINE.md`. |
 | Executable agent skills root | [`.agents/skills/`](../.agents/skills/) | shipped / ref-pinned | Sole executable skill root. |
 | Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. Capability is not admission or a performance floor; verify in source before product claims. |
+| Model-load refusal wording inventory | [`docs/load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Audit of the user-reachable model-load refusal strings (before/after, setting named, excluded areas). |
 | Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 fixture/tables report; not current validation. |
 | Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
@@ -158,6 +159,7 @@ Every current top-level page, exactly once.
 | [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. |
+| [`load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Model-load refusal wording inventory. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 durability fixture/tables report. |
 | [`dependency-adoption-log.md`](dependency-adoption-log.md) | historical | Dependency log. |
 | [`upstream-merge-journal.md`](upstream-merge-journal.md) | historical | Merge journal. |

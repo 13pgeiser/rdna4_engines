@@ -378,10 +378,10 @@ fn tokenizer_from_dir(
 ) -> Result<hipfire_runtime::tokenizer::Tokenizer, String> {
     if let Some(tok_path) = source.tokenizer_json_path() {
         hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-            .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
-            .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))
+            .map_err(|e| format!("could not parse the tokenizer at {} (the file may be corrupt; re-download the model): {e}", tok_path.display()))?
+            .ok_or_else(|| format!("the tokenizer file {} has no usable vocabulary; re-download the model", tok_path.display()))
     } else {
-        Err("no tokenizer.json found in model directory".into())
+        Err("no tokenizer.json found in the model directory; add the model's tokenizer.json or re-download the model".into())
     }
 }
 
@@ -478,7 +478,7 @@ impl Carrier for Qwen2Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
+            return Err(crate::pp_unsupported_message("qwen2", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_qwen2::load_qwen2_bundle(src, ctx)?;
@@ -694,7 +694,7 @@ impl Carrier for Qwen4Carrier {
                 ctx.gpu.vmm_recommended_granularity().is_ok(),
             ) {
                 return Err(format!(
-                    "qwen4: KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy"
+                    "qwen4: KV backend 'vmm' is not available: {reason}; use --kv-backend legacy (memory.kv_backend = legacy)"
                 ));
             }
         }
@@ -1708,7 +1708,7 @@ fn load_qwen4_rank_scoped(
         &receipt.config,
     )?;
     if band.is_some() && trunk_overlay.is_some() {
-        return Err("qwen4: topology.pp does not admit a trunk overlay sidecar".into());
+        return Err("qwen4: a trunk overlay sidecar cannot be used with pipeline parallelism (topology.pp > 1); set topology.pp = 1 or remove the overlay".into());
     }
     // The profile is known: the head-free MTP and developer-PLE refusals
     // happen here, before any allocation (source admission applies the
@@ -2060,7 +2060,7 @@ fn load_qwen4_rank_scoped(
             let (plan, budget) = loop {
                 let budget = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
                     format!(
-                        "{} MiB budget cannot hold {} MiB of long-prefill stage buffers",
+                        "the {} MiB expert budget cannot hold the {} MiB of long-prefill stage buffers; free GPU memory or lower the expert placement",
                         total / MIB,
                         stage / MIB
                     )
@@ -2120,7 +2120,7 @@ fn load_qwen4_rank_scoped(
                 > latest_budget
             {
                 return Err(format!(
-                    "free VRAM dropped to {} MiB before materialize; planned device experts exceed the remaining {} MiB budget",
+                    "free VRAM dropped to {} MiB before the experts were placed; the planned GPU-resident experts need more than the remaining {} MiB. Free GPU memory or place fewer experts on the GPU",
                     latest_free as u64 / MIB, latest_budget / MIB,
                 ));
             }
@@ -2168,7 +2168,7 @@ fn load_qwen4_rank_scoped(
         // admitted against the band census before any allocation.
         if explicit.is_some() {
             return Err(format!(
-                "qwen4: topology.pp does not admit {} (host-mapped expert layers)",
+                "qwen4: {} cannot be used with pipeline parallelism (topology.pp > 1) because pipeline stages keep every expert on the GPU; unset it or set topology.pp = 1",
                 residency::EXPERT_VRAM_LAYERS_ENV
             ));
         }
@@ -2202,7 +2202,7 @@ fn load_qwen4_rank_scoped(
                     || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch))
                 {
                     return Err(format!(
-                            "qwen4: unified memory cannot hold the resident load ({detail}); free host memory"
+                            "qwen4: unified memory cannot hold the resident load ({detail}); free host memory, or set memory.oom_guard = off to load anyway"
                         ));
                 }
                 eprintln!("  qwen4: {detail} (memory.oom_guard off: loading anyway)");
@@ -2257,7 +2257,7 @@ fn load_qwen4_rank_scoped(
         if own < layers.min(moe_layers) {
             return Err(format!(
                     "qwen4: the agreed expert VRAM split of {layers} of {moe_layers} MoE layers does not fit this device: \
-                     {} MiB free keeps {own} (trunk {} MiB, {} MiB per expert layer, {} MiB reserve)",
+                     {} MiB free keeps only {own} (trunk {} MiB, {} MiB per expert layer, {} MiB reserve). Free GPU memory or lower the number of expert layers kept on the GPU",
                     free / MIB,
                     non_expert / MIB,
                     layer_experts / MIB,
@@ -2316,7 +2316,7 @@ fn load_qwen4_rank_scoped(
     if let Some(policy) = placement {
         if use_ranges {
             return Err(format!(
-                "qwen4: {} places experts in host RAM, which only a discrete GPU needs",
+                "qwen4: {} puts experts in host RAM, which only a discrete GPU supports; unset it on this unified-memory device",
                 residency::EXPERT_VRAM_LAYERS_ENV
             ));
         }
@@ -3363,7 +3363,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             ctx.gpu.vmm_recommended_granularity().is_ok(),
         ) {
             return Err(format!(
-                "qwen4: KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy"
+                "qwen4: KV backend 'vmm' is not available: {reason}; use --kv-backend legacy (memory.kv_backend = legacy)"
             ));
         }
     }
@@ -3576,7 +3576,7 @@ fn load_qwen35_pp(
         .is_some_and(|v| v != hipfire_runtime::llama::VMode::Q8)
     {
         return Err(format!(
-            "qwen35: V={} requires pp=1 (site {}); multi-GPU has no lloyd-V constructor",
+            "qwen35: --kv-v {} is single-GPU only; with pipeline parallelism (topology.pp > 1) use --kv-v q8 (site {})",
             hipfire_runtime::kv_mode::qwen_v_display_name(pair.v().expect("PP split pair")),
             hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
         ));
@@ -3680,7 +3680,7 @@ impl Carrier for Qwen35Carrier {
         // Qwen3.5 is the only carrier with a pp>1 path (load_qwen35_pp), HFQ
         // only. Dir + pp>1 is refused; VMM + pp>1 is refused globally upstream.
         if pp > 1 && is_dir {
-            return Err("qwen35: safetensors + pp>1 unsupported".into());
+            return Err(crate::pp_unsupported_message("qwen35", true, pp));
         }
         Ok(())
     }
@@ -3795,7 +3795,7 @@ impl Carrier for Qwen35Carrier {
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
             if let ModelSource::Dir(..) = &src {
-                return Err("qwen35: safetensors + pp>1 unsupported".into());
+                return Err(crate::pp_unsupported_message("qwen35", true, ctx.pp));
             }
         }
         // Per-source diagnostics stay at the call site, before resolve_source_meta.
@@ -3888,8 +3888,8 @@ impl Carrier for Qwen35Carrier {
                         if let Some(trunk_dim) = trunk_dim {
                             if vc.out_hidden_size != trunk_dim {
                                 return Err(format!(
-                                    "vision sidecar {} does not match trunk {}: projector \
-                                     output {} != trunk hidden {}",
+                                    "vision sidecar {} does not belong to this model {}: its output width {} \
+                                     does not match the model's hidden size {}. Use the sidecar made for this model",
                                     vl.display(),
                                     ctx.path,
                                     vc.out_hidden_size,
@@ -4396,11 +4396,7 @@ impl Carrier for LlamaCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "llama: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "llama: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("llama", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -4549,16 +4545,16 @@ impl Carrier for LlamaCarrier {
                     let draft_cfg = hipfire_runtime::dflash::DflashConfig::from_hfq(&draft_hfq)
                         .ok_or_else(|| {
                             format!(
-                                "DFlash draft '{}' has arch_id=20 but missing or malformed \
-                                 'dflash' metadata block",
+                                "DFlash draft '{}' is arch_id=20 but its 'dflash' metadata block is \
+                                 missing or malformed; re-download the draft",
                                 dp
                             )
                         })?;
                     if bundle.config.dim != draft_cfg.hidden {
                         return Err(format!(
-                            "DFlash draft '{}' hidden={} != target dim={} \
-                                 (cross-attention concat invariant L4: drafter hidden \
-                                 must equal target residual dim)",
+                            "DFlash draft '{}' has hidden size {} but the target model's is {}; a draft \
+                                 must be made for this exact target model. Use the matching \
+                                 draft or turn DFlash off (speculation.dflash = off)",
                             dp, draft_cfg.hidden, bundle.config.dim
                         ));
                     }
@@ -4739,11 +4735,7 @@ impl Carrier for DotsOcrCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "dots_ocr: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "dots_ocr: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("dots_ocr", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -4794,7 +4786,7 @@ impl Carrier for Deepseek4Carrier {
             .as_ref()
             .is_some_and(|s| (s.as_ref() as &dyn Any).is::<crate::Deepseek4HeterogeneousBundle>())
         {
-            Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
+            Err("deepseek4: this mixed-GPU DeepSeek setup supports plain autoregressive decoding only; speculative decoding is not available".into())
         } else if let Some(b) = state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
         }) {
@@ -4864,11 +4856,7 @@ impl Carrier for Deepseek4Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "deepseek4: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "deepseek4: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("deepseek4", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -4881,7 +4869,7 @@ impl Carrier for Deepseek4Carrier {
         ) {
             if ctx.kv_backend != KvBackend::Legacy {
                 return Err(
-                    "deepseek4 heterogeneous compressor owner requires admitted legacy backend"
+                    "deepseek4: this mixed-GPU compressor placement needs the legacy KV backend; set memory.kv_backend = legacy"
                         .into(),
                 );
             }
@@ -5084,12 +5072,7 @@ impl Carrier for MinimaxCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            // Preserve the two per-source error strings byte-for-byte.
-            return Err(match &src {
-                ModelSource::Hfq(_) => "minimax: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "minimax: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("minimax", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         // Per-source diagnostic stays at the call site, before resolve_source_meta.
         dir_diag(&src);
@@ -5201,11 +5184,7 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "lfm2moe: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "lfm2moe: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("lfm2moe", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5329,12 +5308,12 @@ impl Carrier for Cohere2MoeCarrier {
     fn admit_topology(
         &self,
         _arch_id: u32,
-        _is_dir: bool,
+        is_dir: bool,
         pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if pp > 1 {
-            return Err("cohere2moe: pp>1 unsupported via registry".into());
+            return Err(crate::pp_unsupported_message("cohere2moe", is_dir, pp));
         }
         Ok(())
     }
@@ -5406,7 +5385,7 @@ impl Carrier for Cohere2MoeCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("cohere2moe: pp>1 unsupported via registry".into());
+            return Err(crate::pp_unsupported_message("cohere2moe", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5451,12 +5430,12 @@ impl Carrier for MapleCarrier {
     fn admit_topology(
         &self,
         _arch_id: u32,
-        _is_dir: bool,
+        is_dir: bool,
         pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if pp > 1 {
-            return Err("maple: pp>1 unsupported via registry".into());
+            return Err(crate::pp_unsupported_message("maple", is_dir, pp));
         }
         Ok(())
     }
@@ -5515,7 +5494,7 @@ impl Carrier for MapleCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("maple: pp>1 unsupported via registry".into());
+            return Err(crate::pp_unsupported_message("maple", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5580,12 +5559,12 @@ impl Carrier for Gemma4Carrier {
     fn admit_topology(
         &self,
         _arch_id: u32,
-        _is_dir: bool,
+        is_dir: bool,
         pp: usize,
         _kv_backend: KvBackend,
     ) -> Result<(), String> {
         if pp > 1 {
-            return Err("gemma4: pp>1 unsupported".into());
+            return Err(crate::pp_unsupported_message("gemma4", is_dir, pp));
         }
         Ok(())
     }
@@ -5681,10 +5660,10 @@ impl Carrier for Gemma4Carrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err("gemma4: pp>1 unsupported".into());
+            return Err(crate::pp_unsupported_message("gemma4", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         if ctx.draft_path.is_some() {
-            return Err("params.draft (qwen3.5 DFlash) is not supported on arch_id=13 (Gemma 4). For Gemma 4 spec-decode pass the arch-22 EAGLE drafter via params.drafter instead.".to_string());
+            return Err("params.draft (a Qwen3.5 DFlash draft) is not supported for Gemma 4 (arch_id=13). For Gemma 4 speculative decoding, pass the Gemma 4 EAGLE drafter (arch 22) as params.drafter instead.".to_string());
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
@@ -5916,15 +5895,11 @@ impl Carrier for MuseGlimmerCarrier {
             );
         }
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "muse_glimmer: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "muse_glimmer: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("muse_glimmer", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         if ctx.gemma4_drafter_path.is_some() {
             return Err(
-                "params.drafter (Gemma4 EAGLE) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.drafter for AR-only decode."
+                "params.drafter (a Gemma 4 EAGLE drafter) is not supported for Muse Glimmer (arch_id=14). Remove params.drafter to decode without a draft."
                     .to_string(),
             );
         }
@@ -5993,7 +5968,7 @@ impl Carrier for MuseGlimmerCarrier {
                             != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
                         {
                             return Err(format!(
-                                "glimmer drafter '{}' arch_id {} != {} (muse_glimmer_assistant); a DFlash draft (arch 20) or Gemma4 draft (22) does not match",
+                                "glimmer drafter '{}' has arch_id {} but a Muse Glimmer drafter must be arch_id {} (muse_glimmer_assistant); DFlash drafts (arch 20) and Gemma 4 drafts (arch 22) do not work here",
                                 dp, dhfq.arch_id, hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
                             ));
                         }
@@ -6003,7 +5978,7 @@ impl Carrier for MuseGlimmerCarrier {
                             )?;
                         if dcfg.hidden != config.dim {
                             return Err(format!(
-                                "glimmer drafter hidden {} != target dim {} (cross-attention concat invariant)",
+                                "glimmer drafter hidden size {} does not match the target model's {}; use the drafter made for this model",
                                 dcfg.hidden, config.dim
                             ));
                         }
@@ -6358,11 +6333,7 @@ impl Carrier for Qwen35EmbedCarrier {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
-            return Err(match &src {
-                ModelSource::Hfq(_) => "qwen35-embed: pipeline-parallel (pp>1) unsupported",
-                ModelSource::Dir(_) => "qwen35-embed: safetensors + pp>1 unsupported",
-            }
-            .into());
+            return Err(crate::pp_unsupported_message("qwen35-embed", matches!(src, ModelSource::Dir(_)), ctx.pp));
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;

@@ -784,13 +784,13 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
     if dtype == DType::MQ4G128V2 {
         Err(hip_bridge::HipError::new(
             0,
-            "generic llama GPU decode does not consume MQ4G128V2 (qt=53); qt=53 is admitted only by typed Qwen4 sealed/dense consumers",
+            "this model uses the MQ4G128V2 weight format (qt=53), which only Qwen4 (Flash-Next) models can run; load a Qwen4 model or re-quantize this one to a different format",
         ))
     } else if let Some(name) = dtype.mq_i4_name() {
         Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "generic llama GPU decode does not consume {name}; MQ-I4 / E8P-I4 (qt=131..=136) is a typed-qwen4 expert-slab format with no generic GPU kernel"
+                "this model uses the {name} weight format (MQ-I4 / E8P-I4, qt=131..=136), an expert-slab format only Qwen4 (Flash-Next) models can run, and it has no generic GPU kernel; re-quantize it to a different format"
             ),
         ))
     } else {
