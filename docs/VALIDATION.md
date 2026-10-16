@@ -343,6 +343,47 @@ Use only when the claim class below names them. They are not universal.
 | Path-specific parity / state oracle | Arch-owned example or test named by the change (when one exists) | Hidden-state, logit, KV/conv, or graph parity. If none exists for the surface → **blocked**. |
 | RADV/ACO MQ4 pilot | [`pm_aco_oracle`](../crates/rdna-compute/examples/pm_aco_oracle.rs), with the pinned offline producer under `tools/aco-export/` | Frozen artifact/config/entry-ABI identity; original Vulkan vs PM/HIP vs hipcc whole-buffer and guard equality, negative controls, eager and hipGraph replay. Native-writer relift and raw typed round-trip checks precede GPU execution. Separate matched-data timing is diagnostic only and requires a passing parity report; no product-route admission is implied. |
 
+### Flash-Next product-default receipts (perf claims)
+
+A Flash-Next (`qwen3.8:flash-next`) perf claim MUST state the startup
+configuration it was measured under and whether that configuration equals the
+default pull for the claimed arch (`gfx1151` or `gfx1201`). This applies to
+every published claim, not only gate receipts: a performance number in the
+README, `BENCHMARKS`, release notes, or any other public text MUST name its
+config and say whether it equals the default pull (the product default).
+Generate the
+receipt block with `python3 scripts/perf_config_receipt.py --log <daemon.log>
+--arch <gfx1151|gfx1201> --receipt <receipt.json> [--model <path>]`. It writes
+`startup_config` (raw startup lines plus normalized PLE row format, expert
+hot-set attachment, trunk overlay, NPU trunk state, route plans, model
+sha/path when given) and `product_default_check` (`match`, `mismatch`, or
+`unknown` with reasons) into the receipt, preserving every other field.
+`unknown` means the log lacked the evidence; it is not a pass. The CPU tests
+are `python3 -m unittest tests/test_perf_config_receipt.py`.
+
+The current fresh mq4 pull has no PLE slots (registry `mq4` entry: base,
+trunk-overlay, expert-hotset only), so `memory.ple_format=auto` falls back to
+the **embedded q8** rows on both arches. A historical result measured with
+explicit rank-q4 PLE rows (`qwen4 ple rows: q4 from ...ple-q4`) is **not** the
+fresh-pull product default and MUST NOT be relabelled as embedded q8; on
+gfx1151 the intended q4 differs from what a fresh pull delivers. Product
+defaults by arch: trunk overlay applies on gfx1151 only; expert hot set
+applies on gfx1201 only (absent hot set with whole-layer placement on gfx1201
+is a mismatch); NPU trunk is `auto` on gfx1151 and counts only with an
+eligible calibration/request plan (plans routed `gpu` are not NPU-executed
+evidence); `memory.ple_hot_store_bytes` defaults to 0. Absence of overlay/NPU
+lines on gfx1201 is expected, not a mismatch. Do not combine different
+binaries, K depths, prompt sets, or q4/q8 PLE arms into one band.
+
+Pinned reference bands (source: `product-config-audit.md`, 2026-10-16; each
+is a *historical* band, not a matched product-default baseline):
+
+| Arch / config | Band | Status |
+|---|---|---|
+| R9700 (gfx1201), explicit rank-q4 PLE + expert hot set, greedy, K3, 256 tokens, 16384 seq, eleven prompts (`fn-floor-hotset-r9700/GATE.txt:13-19`, `runs/dec-b-tier-fix-1`) | 50.47–50.77 tok/s (beta 47.14–49.16; hot set disabled 41.29) | Not the product default yet (product auto = embedded q8 + pinned hot set); no matched auto-q8 reference exists. |
+| Halo (gfx1151), nine-prompt MTP, sampled (.7/top-p .8/top-k 20/presence 1.5, seeds 123, 256 tokens, 16384 seq), forced K4 (`pm-wave/mtpdepth/runs/hd-smp-p0/kf4`) | 60.23–60.57 tok/s (sampled beta K4 54.30–58.63 is a separate binary/depth band) | Rank-q4 + overlay; not matched to the nine-prompt product default (fresh pull is embedded q8). |
+| Halo (gfx1151), AR, eight-prompt (`records_parser_1k` absent), hipx `pm-wave/fnds/runs/sar/base/r{1,2,3}/decode.json`, all rank-q4 + overlay | 34.33–34.69 tok/s | Not a matched nine-prompt AR baseline; no matched nine-prompt AR receipt exists. Do not compare against the nine-prompt MTP set. |
+
 ## Claim → route map
 
 | Claim / change class | Minimum route(s) | Evidence kind |
@@ -358,7 +399,7 @@ Use only when the claim class below names them. They are not universal.
 | VL vision-tower forward numerical parity (arch-5 / arch-11 carriers) | Dump-and-diff vs an HF `transformers` reference for the exact checkpoint, pixel inputs pinned by hash (`benchmarks/vision/dump_hf_reference.py` precedent; the archived VL family specs are historical design provenance, not current validation authority, so the route is owned by that script and the source it exercises); **blocked** for a checkpoint with no reference dump. Expected floor on 4:2:0 JPEG inputs: `patches` rel-L1 ≈ 5e-3 (zune-jpeg IDCT/chroma vs PIL's libjpeg-turbo; `jpeg-decoder` only narrows it to ≈ 3.5e-3; since d147fccb3 hipfire decodes JPEG with `libjpeg-turbo-rs`, byte-identical to PIL/libjpeg-turbo on all five committed fixtures, and the `patches` floor is the CatmullRom-vs-PIL-bicubic kernel alone: ≈ 2.6e-3 on doge, max one u8 step; 2026-09-07); 4:4:4 inputs reach ≈ 1e-4. Judge tower parity on the shape of the per-block curve and the serve battery, not on beating that floor | Manual oracle — not `serve_harness.py`; a green VL serve battery is *not* parity evidence |
 | VL image-bearing serve semantics (`generate_vl` over `/v1/chat/completions`) | Manual OpenAI-compatible battery through `hipfire serve` with the exact VL artifact: committed fixtures under [`../benchmarks/vision/images/`](../benchmarks/vision/images/) + the fixed desc/ocr prompts of [`comparison-2026-05-23.md`](../benchmarks/vision/comparison-2026-05-23.md), greedy temp 0; stream **and** non-stream typed-emission check (reasoning vs `content` deltas; no literal `<think>`/`<|im_end|>` chunks in content); client-disconnect probe mid-stream followed by an immediate follow-up turn (no slot wedge); eyeball every decoded output; record artifact sha256, fixture hashes, binary md5s. No scripted harness exists (**blocked** until one lands); `scripts/serve_harness.py` is text-only today and does not exercise this surface | Manual serve (semantics only) |
 | Retained replay / PM4 / AQL graft | `scripts/redline_daemon_harness.py` **and** the certification steps in `docs/REDLINE.md` | Manual Redline; promotion still policy-gated |
-| Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable | Measured; not admission |
+| Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable. Flash-Next claims also carry a [startup-config / product-default receipt](#flash-next-product-default-receipts-perf-claims) (`scripts/perf_config_receipt.py`) | Measured; not admission |
 | Existing sealed MQ4R Redline fixture reproduction | `python3 -m tools.redline golden` for its exact gfx1100/gfx1151/gfx1201 fixture only | Measured reproduction; exact identity + route proof + stationary floor; not admission. Does **not** imply that every default-eligible `.mq4r` model file is one of the sealed fixtures. |
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |
 | Model/route **admission** (registry evidence) | Row in [`admissions.yml`](admissions.yml) | Schema v2; exactly one evidence-bound record (LFM2.5-350M MQ4 gfx1201 retained-PM4). No inferred/wildcard rows. Registry admission/evidence is distinct from runtime wiring: the sealed LFM row does **not** select a runtime default and current automatic selection does not use it. |
