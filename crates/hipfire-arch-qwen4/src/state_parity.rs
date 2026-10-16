@@ -35,6 +35,121 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+// Kept CPU-only so every real-model state/profile loader uses a testable
+// split-base attachment boundary before artifact admission.
+fn attach_state_validation_rows(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    model_path: &Path,
+    request: hipfire_config::memory::PleFormatRequest,
+    arch: &str,
+) -> Result<(), String> {
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(hfq, model_path, request, arch)?;
+    Ok(())
+}
+
+#[test]
+fn state_loader_split_base_refuses_missing_q4_without_derivation() {
+    use hipfire_config::memory::PleFormatRequest;
+    use hipfire_runtime::external_rows::RowEncoding;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+    use hipfire_runtime::ple_hot_pack::{
+        encode_ple_table_header, PackKind, PackOrder, PleHotPackHeader, PleTableFields,
+        TABLE_SEGMENT_BYTES,
+    };
+    use hipfire_runtime::ple_q4::{lm4_codebook_bits, lm4_scale_grid_bits};
+    use sha2::{Digest, Sha256};
+    let dir = std::env::temp_dir().join(format!(
+        "hipfire-state-split-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("state-split.hfqm");
+    let metadata = json!({
+        "qwen4_ple": {
+            "version": 1, "multipliers": [-3, 5, 7],
+            "head_vocab_sizes": vec![0; 16], "head_offsets": vec![0; 16], "padded_rows": 12
+        },
+        "hipfire_ple_rows": {
+            "version": 1, "location": "sidecar", "shard_count": 3,
+            "rows_per_shard": 4, "row_width": 64, "q8_rows_sha256": "ab".repeat(32)
+        }
+    });
+    let tensor = HfqMemTensor {
+        name: "model.language_model.layers.1.ple.ple_embedding.layer_multipliers".into(),
+        quant_type: 54,
+        shape: vec![3],
+        group_size: 0,
+        data: vec![0; 24],
+    };
+    write_hfqm_package_mem(&path, 16, &metadata.to_string(), &[tensor]).unwrap();
+    let mut hfq = HfqFile::open(&path).unwrap();
+    let error =
+        attach_state_validation_rows(&mut hfq, &path, PleFormatRequest::Q4, "gfx1201").unwrap_err();
+    assert!(error.contains(".ple-q4"), "{error}");
+    assert!(hfq.ple_rows().is_none());
+    assert!(!path.with_extension("hfqm.ple-q4").exists());
+    // An existing, correctly bound Q4 table must be selected without deriving
+    // or consulting process-global format/GPU settings.
+    let sidecar = path.with_extension("hfqm.ple-q4");
+    let data = vec![0u8; 12 * RowEncoding::Q4Lm.encoded_row_bytes(64)];
+    let segment_digest = Sha256::digest(&data);
+    let mut header = PleHotPackHeader {
+        padded_rows: 12,
+        rows_per_shard: 4,
+        row_encoding: RowEncoding::Q4Lm,
+        row_width: 64,
+        encoded_row_bytes: RowEncoding::Q4Lm.encoded_row_bytes(64) as u64,
+        ple_fingerprint: hipfire_runtime::ple_sidecar::ple_fingerprint_from_metadata(
+            &metadata.to_string(),
+        )
+        .unwrap(),
+        rank_payload_sha256: "0".repeat(64),
+        tier_group: 256,
+        kept_buckets: 256,
+        tier_rows: vec![12],
+        data_offset: 0,
+        data_bytes: data.len() as u64,
+        shard_offsets: Vec::new(),
+        model_file_bytes: 0,
+        version: 3,
+        kind: PackKind::PleTable,
+        order: PackOrder::Row,
+        rank_offset: 0,
+        rank_bytes: 0,
+        table: Some(PleTableFields {
+            codebook_f32_bits: Some(lm4_codebook_bits()),
+            scale_grid_f32_bits: Some(lm4_scale_grid_bits()),
+            source_encoding: RowEncoding::Q8F16,
+            source_rows_sha256: "ab".repeat(32),
+            segment_bytes: TABLE_SEGMENT_BYTES,
+            segment_sha256: vec![format!("{segment_digest:x}")],
+            data_sha256: format!("{:x}", Sha256::digest(segment_digest)),
+            base_index_sha256: hfq
+                .index_sha256()
+                .unwrap()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            base_file_bytes: hfq.file_len(),
+        }),
+        generator: "hipfire state parity CPU regression".to_string(),
+    };
+    let mut bytes = encode_ple_table_header(&mut header).unwrap();
+    bytes.extend_from_slice(&data);
+    std::fs::write(&sidecar, bytes).unwrap();
+    let mut hfq = HfqFile::open(&path).unwrap();
+    attach_state_validation_rows(&mut hfq, &path, PleFormatRequest::Q4, "gfx1201").unwrap();
+    let rows = hfq.ple_rows().unwrap();
+    assert_eq!(rows.path(), sidecar);
+    assert_eq!(rows.encoding(), RowEncoding::Q4Lm);
+    drop(hfq);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const MAX_SEQ: usize = 8;
 const PREFIX: usize = 4;
 const DRAFTS: [u32; 2] = [1001, 1002];
@@ -1541,8 +1656,16 @@ fn run_profile_inner(
     let gpu_init_ns = profile_duration_ns(gpu_init_started);
     emit_profile_load_checkpoint("gpu_init", gpu_init_ns);
     let admission_started = Instant::now();
-    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let admission_ns = profile_duration_ns(admission_started);
     emit_profile_load_checkpoint("admission", admission_ns);
     let config = receipt.config.clone();
@@ -1551,9 +1674,8 @@ fn run_profile_inner(
     let placements = receipt.placements.clone();
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1603,7 +1725,7 @@ fn run_profile_inner(
 
     let assemble_started = Instant::now();
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -1611,8 +1733,10 @@ fn run_profile_inner(
         &mut gpu,
         1,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let assemble_ns = profile_duration_ns(assemble_started);
@@ -1871,17 +1995,24 @@ pub fn run_state_parity(
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -1901,7 +2032,7 @@ pub fn run_state_parity(
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -1909,8 +2040,10 @@ pub fn run_state_parity(
         &mut gpu,
         2048,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let real = (|| {
@@ -2250,8 +2383,16 @@ pub fn run_mtp_fill_digest(
         .map_err(|error| format!("tokenizer: {error}"))?;
     let prompt_ids = prompt_text.map(|text| tokenizer.encode(text));
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
-    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     let config = receipt.config.clone();
     let manifest = receipt.manifest.clone();
     let metadata = receipt.ple.clone();
@@ -2265,9 +2406,8 @@ pub fn run_mtp_fill_digest(
     );
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode =
-        crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
-            .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
+    let scratch_mode = crate::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+        .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -2288,7 +2428,7 @@ pub fn run_mtp_fill_digest(
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let backend = Qwen4KvBackend::automatic(&gpu);
     let warm = warm_chunks > 0;
-    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -2296,8 +2436,10 @@ pub fn run_mtp_fill_digest(
         &mut gpu,
         max_seq,
         metadata,
+        receipt.ple_rows,
         crate::state::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let run = (|| -> Result<Value, String> {
@@ -2655,7 +2797,10 @@ mod tests {
     fn cache_suffix_refusal_reports_position_zero_cache_hit_refusal() {
         let report = cache_suffix_refusal();
         assert_pass(&report);
-        assert_eq!(field(&report, "case").as_str(), Some("cache_suffix_refusal"));
+        assert_eq!(
+            field(&report, "case").as_str(),
+            Some("cache_suffix_refusal")
+        );
         assert_eq!(field(&report, "cache_hit").as_bool(), Some(true));
         assert_eq!(field(&report, "prompt_len").as_u64(), Some(3));
         assert_eq!(field(&report, "fill_len").as_u64(), Some(3));
@@ -2669,10 +2814,7 @@ mod tests {
 /// Hardware takeover oracle used by `mtp_takeover_fill_hw`. Route knobs must
 /// be set before starting the process. Qwen4 pairs token p with hidden p,
 /// including the seed row; an accepted EOS stays pending, not head-filled.
-pub fn run_mtp_takeover_fill_oracle(
-    model_path: &Path,
-    max_seq: usize,
-) -> Result<Value, String> {
+pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result<Value, String> {
     use crate::bundle::Qwen4Bundle;
     use crate::mtp_spec::Qwen4MtpDrafter;
     use hipfire_runtime::ngram_mod::NgramModConfig;
@@ -2682,7 +2824,11 @@ pub fn run_mtp_takeover_fill_oracle(
 
     // Preserve the existing family/metadata report, and additionally hash
     // storage bytes: dequantized equality alone is not byte identity.
-    fn snapshot(gpu: &Gpu, bundle: &Qwen4Bundle, drafter: &Qwen4MtpDrafter) -> Result<Value, String> {
+    fn snapshot(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        drafter: &Qwen4MtpDrafter,
+    ) -> Result<Value, String> {
         let mut families = bundle_family_json(gpu, bundle)?;
         let mut target = Family::new();
         let mut head = Family::new();
@@ -2745,14 +2891,24 @@ pub fn run_mtp_takeover_fill_oracle(
         }))
     }
 
-    fn head_rows(gpu: &Gpu, bundle: &Qwen4Bundle, start: usize, rows: usize) -> Result<Value, String> {
-        let state = bundle.mtp.as_ref().ok_or("missing MTP head")?.parity_state();
+    fn head_rows(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        start: usize,
+        rows: usize,
+    ) -> Result<Value, String> {
+        let state = bundle
+            .mtp
+            .as_ref()
+            .ok_or("missing MTP head")?
+            .parity_state();
         let buffers = state.parity_buffers();
         let full = bundle.config.num_key_value_heads * bundle.config.head_dim;
         let raw = bundle.config.indexer_kv_heads * bundle.config.indexer_head_dim;
         let mut family = Family::new();
         for (tensor, width) in [
-            (buffers.full_keys, full), (buffers.full_values, full),
+            (buffers.full_keys, full),
+            (buffers.full_values, full),
             (buffers.raw_index_keys, raw),
         ] {
             let view = tensor.sub_offset(start * width, rows * width);
@@ -2763,7 +2919,11 @@ pub fn run_mtp_takeover_fill_oracle(
 
     fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
         assert_eq!(a.len(), b.len(), "hidden dimensions");
-        let numerator: f64 = a.iter().zip(b).map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2)).sum();
+        let numerator: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (f64::from(x) - f64::from(y)).powi(2))
+            .sum();
         let denominator: f64 = b.iter().map(|&x| f64::from(x).powi(2)).sum();
         (numerator / denominator.max(1e-30)).sqrt()
     }
@@ -2785,8 +2945,8 @@ pub fn run_mtp_takeover_fill_oracle(
 
     let mut hfq = hipfire_runtime::hfq::HfqFile::open(model_path)
         .map_err(|error| format!("open {}: {error}", model_path.display()))?;
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|error| error.to_string())?;
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|error| error.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
     let rendered = JinjaChatFrame {
         tokenizer: &tokenizer,
@@ -2800,20 +2960,36 @@ pub fn run_mtp_takeover_fill_oracle(
     }.render()?;
     let prompt = tokenizer.encode(&rendered);
     const REF_STEPS: usize = 40;
-    assert!(!prompt.is_empty() && prompt.len() + REF_STEPS + 8 < max_seq, "oracle context");
-    let mut gpu = Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
-    let receipt = crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
-        .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
+    assert!(
+        !prompt.is_empty() && prompt.len() + REF_STEPS + 8 < max_seq,
+        "oracle context"
+    );
+    let mut gpu =
+        Gpu::init().map_err(|error| format!("hardware oracle requires HIP GPU: {error}"))?;
+    let receipt = {
+        attach_state_validation_rows(
+            &mut hfq,
+            model_path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+        )?;
+        crate::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
+    }
+    .map_err(|error| format!("qwen4 artifact admission failed: {error}"))?;
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
     let scratch_mode = crate::artifact::source_forward_scratch_mode(
-        &gpu, &hfq, &receipt.config, &receipt.manifest,
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
     )
     .map_err(|error| format!("qwen4 forward scratch plan failed: {error}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
-    let mesh = hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
+    let mesh =
+        hipfire_runtime::device_mesh::DeviceMesh::single().map_err(|error| error.to_string())?;
     let expected = hipfire_runtime::weight_store::WeightOrigin::for_single(&mesh, &gpu);
     let use_ranges = gpu.is_uma();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
@@ -2824,14 +3000,22 @@ pub fn run_mtp_takeover_fill_oracle(
         receipt.config.num_hidden_layers,
         &mut gpu,
         expected,
-        |entry| qwen4_oracle_payload(&source, &receipt.manifest.identity.recipe, entry, use_ranges),
-    ).map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
+        |entry| {
+            qwen4_oracle_payload(
+                &source,
+                &receipt.manifest.identity.recipe,
+                entry,
+                use_ranges,
+            )
+        },
+    )
+    .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     // Match run_mtp_fill_digest: the reusable family walker uses logical
     // F32 row widths. This is a head-fill/rollback oracle, not a KV-format
     // admission test; retain the automatic VMM/legacy storage backend.
     let format = crate::state::Qwen4StateFormat::F32;
     let backend = Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -2839,8 +3023,10 @@ pub fn run_mtp_takeover_fill_oracle(
         &mut gpu,
         max_seq,
         receipt.ple,
+        receipt.ple_rows,
         format,
         backend,
+        None,
     )
     .map_err(|error| error.to_string())?;
     // Longer than the entire oracle history: the armed pool is provably
@@ -2852,10 +3038,17 @@ pub fn run_mtp_takeover_fill_oracle(
         n_max: 3,
     }));
     let run = (|| -> Result<Value, String> {
-        bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(|error| error.to_string())?;
-        bundle.attach_mtp(&mut gpu, max_seq).map_err(|error| error.to_string())?;
+        bundle
+            .attach_forward(&mut gpu, max_seq, scratch_mode)
+            .map_err(|error| error.to_string())?;
+        bundle
+            .attach_mtp(&mut gpu, max_seq)
+            .map_err(|error| error.to_string())?;
         map_bundle_context(&mut gpu, &mut bundle, max_seq)?;
-        let dim = bundle.config.hc_count.checked_mul(bundle.config.hidden_size)
+        let dim = bundle
+            .config
+            .hc_count
+            .checked_mul(bundle.config.hidden_size)
             .ok_or("oracle hidden width overflow")?;
         let eos = bundle.config.eos_token_id;
         let interleaved = hipfire_config::developer_var("HIPFIRE_MTP_INCREMENTAL")
@@ -2867,24 +3060,39 @@ pub fn run_mtp_takeover_fill_oracle(
         let mut reference = vec![seed0];
         let mut reference_hidden = Vec::with_capacity(REF_STEPS);
         for i in 0..REF_STEPS {
-            assert_ne!(reference[i], eos, "reference stopped before oracle sequence");
-            let pick = bundle.spec_capture_token(&mut gpu, reference[i])
+            assert_ne!(
+                reference[i], eos,
+                "reference stopped before oracle sequence"
+            );
+            let pick = bundle
+                .spec_capture_token(&mut gpu, reference[i])
                 .map_err(|error| error.to_string())?;
-            let hidden = bundle.spec_hidden.as_ref().ok_or("missing reference hidden")?;
-            reference_hidden.push(gpu.download_f32(&hidden.sub_offset(0, dim))
-                .map_err(|error| error.to_string())?);
+            let hidden = bundle
+                .spec_hidden
+                .as_ref()
+                .ok_or("missing reference hidden")?;
+            reference_hidden.push(
+                gpu.download_f32(&hidden.sub_offset(0, dim))
+                    .map_err(|error| error.to_string())?,
+            );
             reference.push(pick);
         }
         let wrong = |token: u32| if token == 0 { 1 } else { token - 1 };
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
         let mut index = 0usize;
         let mut windows = Vec::new();
         // The first EOS candidate is index 1, so two drafts are emitted but
         // only seed and candidate 0 are consumed.
         for (label, expected, stop) in [
-            ("partial", 1, false), ("full", 3, false), ("zero", 0, false),
+            ("partial", 1, false),
+            ("full", 3, false),
+            ("zero", 0, false),
             ("accepted_eos_index1", 2, true),
-            ("reject_index0", 0, false), ("reject_index1", 1, false),
+            ("reject_index0", 0, false),
+            ("reject_index1", 1, false),
             ("reject_index2", 2, false),
         ] {
             let position = prompt.len() + index;
@@ -2896,23 +3104,44 @@ pub fn run_mtp_takeover_fill_oracle(
             let consumed = expected + 1 - usize::from(stop);
             let untouched = head_rows(&gpu, &bundle, position + consumed, 4 - consumed)?;
             let window = drafter.mtp_takeover_step(
-                &mut gpu, &mut bundle, position, reference[index],
-                &reference[..=index], &candidates, window_eos,
+                &mut gpu,
+                &mut bundle,
+                position,
+                reference[index],
+                &reference[..=index],
+                &candidates,
+                window_eos,
             )?;
             let emitted = if stop { expected } else { expected + 1 };
             assert_eq!(window.accepted, expected, "{label}: accepted prefix");
             assert_eq!(window.drafts_generated, 3, "{label}: candidates offered");
-            assert_eq!(window.committed, reference[index + 1..index + 1 + emitted], "{label}: greedy IDs");
-            assert_eq!(bundle.state.position, position + consumed, "{label}: target position");
-            assert_eq!(bundle.mtp_position().map_err(|error| error.to_string())?, position + consumed, "{label}: head position");
+            assert_eq!(
+                window.committed,
+                reference[index + 1..index + 1 + emitted],
+                "{label}: greedy IDs"
+            );
+            assert_eq!(
+                bundle.state.position,
+                position + consumed,
+                "{label}: target position"
+            );
+            assert_eq!(
+                bundle.mtp_position().map_err(|error| error.to_string())?,
+                position + consumed,
+                "{label}: head position"
+            );
             assert_eq!(
                 head_rows(&gpu, &bundle, position + consumed, 4 - consumed)?,
-                untouched, "{label}: unconsumed head rows must never be written",
+                untouched,
+                "{label}: unconsumed head rows must never be written",
             );
             // Interleaved capture overwrites row 0 each time; that physical
             // row is the logical verify row consumed-1.
             let capture_row = if interleaved { 0 } else { consumed - 1 };
-            let captured = bundle.spec_hidden.as_ref().ok_or("missing verify hidden")?
+            let captured = bundle
+                .spec_hidden
+                .as_ref()
+                .ok_or("missing verify hidden")?
                 .sub_offset(capture_row * dim, dim);
             let pending = drafter.pending_hidden_for_parity()?;
             assert_eq!(
@@ -2930,26 +3159,51 @@ pub fn run_mtp_takeover_fill_oracle(
         }
         // No reset/demotion between the explicit hits and this real native
         // miss. The same request remains armed; history is too short to hit.
-        assert!(drafter.request_stats().mtp_ngram, "modifier request must remain armed");
+        assert!(
+            drafter.request_stats().mtp_ngram,
+            "modifier request must remain armed"
+        );
         let before_stats = drafter.request_stats();
         let miss = drafter.mtp_step(
-            &mut gpu, &mut bundle, prompt.len() + index, reference[index],
-            &reference[..=index], 3, eos, None,
+            &mut gpu,
+            &mut bundle,
+            prompt.len() + index,
+            reference[index],
+            &reference[..=index],
+            3,
+            eos,
+            None,
         )?;
-        assert_eq!(miss.committed.first(), Some(&reference[index + 1]), "native miss resumes at reference token");
+        assert_eq!(
+            miss.committed.first(),
+            Some(&reference[index + 1]),
+            "native miss resumes at reference token"
+        );
         if !interleaved {
-            assert!(miss.drafts_generated >= 1, "native miss must draft, not retire to AR");
+            assert!(
+                miss.drafts_generated >= 1,
+                "native miss must draft, not retire to AR"
+            );
         }
         let after_stats = drafter.request_stats();
-        assert_eq!(after_stats.ngram_mod_windows, before_stats.ngram_mod_windows, "empty pool must miss");
-        assert!(after_stats.mtp_windows > before_stats.mtp_windows, "native window counter must advance");
+        assert_eq!(
+            after_stats.ngram_mod_windows, before_stats.ngram_mod_windows,
+            "empty pool must miss"
+        );
+        assert!(
+            after_stats.mtp_windows > before_stats.mtp_windows,
+            "native window counter must advance"
+        );
 
         // Two identical cold states, same first rejection, different rejected
         // tail. Compare live device families, raw storage and pending bytes.
         let mut starts = Vec::new();
         let mut tails = Vec::new();
         for variant in 0..2 {
-            assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+            assert_eq!(
+                prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+                seed0
+            );
             starts.push(snapshot(&gpu, &bundle, &drafter)?);
             let untouched = head_rows(&gpu, &bundle, prompt.len() + 1, 3)?;
             let mut candidates = reference[1..4].to_vec();
@@ -2959,43 +3213,92 @@ pub fn run_mtp_takeover_fill_oracle(
                 candidates[2] = wrong(candidates[2]);
             }
             let window = drafter.mtp_takeover_step(
-                &mut gpu, &mut bundle, prompt.len(), seed0, &[seed0], &candidates, eos,
+                &mut gpu,
+                &mut bundle,
+                prompt.len(),
+                seed0,
+                &[seed0],
+                &candidates,
+                eos,
             )?;
             assert_eq!(window.accepted, 0, "tail fixture first rejection");
-            assert_eq!(window.committed, reference[1..2], "tail fixture committed IDs");
-            assert_eq!(head_rows(&gpu, &bundle, prompt.len() + 1, 3)?, untouched,
-                "tail fixture: rejected head rows must remain untouched");
+            assert_eq!(
+                window.committed,
+                reference[1..2],
+                "tail fixture committed IDs"
+            );
+            assert_eq!(
+                head_rows(&gpu, &bundle, prompt.len() + 1, 3)?,
+                untouched,
+                "tail fixture: rejected head rows must remain untouched"
+            );
             tails.push(snapshot(&gpu, &bundle, &drafter)?);
         }
-        assert_eq!(starts[0], starts[1], "tail fixture must start byte-identically");
-        assert_eq!(tails[0], tails[1], "rejected tail must not enter committed target/head/pending state");
+        assert_eq!(
+            starts[0], starts[1],
+            "tail fixture must start byte-identically"
+        );
+        assert_eq!(
+            tails[0], tails[1],
+            "rejected tail must not enter committed target/head/pending state"
+        );
 
         // Compare token-p/hidden-p teacher forcing against the existing route.
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
         let pairing_start = snapshot(&gpu, &bundle, &drafter)?;
         let full = drafter.mtp_takeover_step(
-            &mut gpu, &mut bundle, prompt.len(), seed0, &[seed0], &reference[1..4], eos,
+            &mut gpu,
+            &mut bundle,
+            prompt.len(),
+            seed0,
+            &[seed0],
+            &reference[1..4],
+            eos,
         )?;
         assert_eq!(full.accepted, 3, "pairing takeover must fully accept");
-        let takeover = gpu.download_f32(drafter.pending_hidden_for_parity()?)
+        let takeover = gpu
+            .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
         let takeover_state = snapshot(&gpu, &bundle, &drafter)?;
-        assert_eq!(prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?, seed0);
-        assert_eq!(snapshot(&gpu, &bundle, &drafter)?, pairing_start, "pairing starts must match");
-        assert!(drafter.mtp_forced_advance(
-            &mut gpu, &mut bundle, &reference[..4], prompt.len(), &|| false,
-        )?, "teacher-forced route must handle all rows");
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
+        assert_eq!(
+            snapshot(&gpu, &bundle, &drafter)?,
+            pairing_start,
+            "pairing starts must match"
+        );
+        assert!(
+            drafter.mtp_forced_advance(
+                &mut gpu,
+                &mut bundle,
+                &reference[..4],
+                prompt.len(),
+                &|| false,
+            )?,
+            "teacher-forced route must handle all rows"
+        );
         let forced_state = snapshot(&gpu, &bundle, &drafter)?;
-        assert_eq!(takeover_state["target_position"], forced_state["target_position"]);
+        assert_eq!(
+            takeover_state["target_position"],
+            forced_state["target_position"]
+        );
         assert_eq!(takeover_state["mtp_position"], forced_state["mtp_position"]);
-        let forced = gpu.download_f32(drafter.pending_hidden_for_parity()?)
+        let forced = gpu
+            .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
         let correct = rel_l2(&takeover, &forced);
         // h_(P+2), rather than the required h_(P+3), is the off-by-one
         // Qwen3.5-style pairing. Reference uses the same one-row forwards.
         let shifted = rel_l2(&takeover, &reference_hidden[2]);
-        assert!(correct.is_finite() && shifted.is_finite() && correct < 0.1 * shifted,
-            "teacher-forced token-p/hidden-p pairing: rel-L2={correct:e}, shifted={shifted:e}");
+        assert!(
+            correct.is_finite() && shifted.is_finite() && correct < 0.1 * shifted,
+            "teacher-forced token-p/hidden-p pairing: rel-L2={correct:e}, shifted={shifted:e}"
+        );
         Ok(json!({
             "schema": "hipfire.qwen4.mtp_takeover_fill.v1",
             "gpu_arch": gpu.arch,
