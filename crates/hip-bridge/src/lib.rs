@@ -21,9 +21,10 @@ mod rocsolver;
 mod vmm;
 
 pub use error::{
-    HipError, HipErrorCode, HipResult, LaunchContext, HIP_ERROR_INVALID_IMAGE,
-    HIP_ERROR_OUT_OF_MEMORY, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    register_first_illegal_address_hook, HipError, HipErrorCode, HipResult, LaunchContext,
+    HIP_ERROR_ILLEGAL_ADDRESS, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_OUT_OF_MEMORY,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};

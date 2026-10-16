@@ -659,6 +659,8 @@ pub struct FeatureFlags {
     pub qwen4_qsa_extent_check: bool,
     /// Exactly `2` also synchronizes immediately after each checked launch.
     pub qwen4_qsa_extent_sync: bool,
+    /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
+    pub qwen4_qsa_code_check: bool,
 }
 
 impl FeatureFlags {
@@ -1128,6 +1130,7 @@ impl FeatureFlags {
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref() != Some("0"),
             qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
             qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
+            qwen4_qsa_code_check: value("HIPFIRE_QWEN4_QSA_CODE_CHECK").ok().as_deref() == Some("1"),
         }
     }
 
@@ -1572,6 +1575,7 @@ impl FeatureFlags {
             qwen4_qsa_decode_splitk: false,
             qwen4_qsa_extent_check: false,
             qwen4_qsa_extent_sync: false,
+            qwen4_qsa_code_check: false,
         }
     }
 }
@@ -1603,6 +1607,30 @@ mod tests {
             });
             assert_eq!(flags.qwen4_qsa_extent_check, check, "{value:?}");
             assert_eq!(flags.qwen4_qsa_extent_sync, sync, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn qsa_code_check_parses_only_exact_developer_mode() {
+        for (value, enabled) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("2"), false),
+            (Some("0"), false),
+            (Some("true"), false),
+            (Some("01"), false),
+            (Some(" 1"), false),
+            (Some("1 "), false),
+            (Some(""), false),
+        ] {
+            let flags = FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == "HIPFIRE_QWEN4_QSA_CODE_CHECK" {
+                    value.map(str::to_owned).ok_or(())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.qwen4_qsa_code_check, enabled, "{value:?}");
         }
     }
 

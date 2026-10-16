@@ -2786,7 +2786,9 @@ impl HipRuntime {
     pub fn last_error(&self) -> u32 {
         // SAFETY: HIP runtime symbol is live from HipRuntime::load; out-params are
         // stack locals (or caller-provided device ids). No host pointer aliasing.
-        unsafe { (self.fn_get_last_error)() }
+        let code = unsafe { (self.fn_get_last_error)() };
+        crate::error::observe_raw_code(code);
+        code
     }
 
     // ── Async memory ops ────────────────────────────────────────
@@ -3239,11 +3241,13 @@ impl Drop for PinnedHostBuffer {
         let Some(token) = self.token.take() else {
             // SAFETY: unique hipHostMalloc owner; its library is still live. The
             // caller must have drained async copies before dropping the owner.
-            let _ = unsafe { (self.free)(self.ptr) };
+            let code = unsafe { (self.free)(self.ptr) };
+            crate::error::observe_raw_code(code);
             return;
         };
         // SAFETY: as above.
         let code = unsafe { (self.free)(self.ptr) };
+        crate::error::observe_raw_code(code);
         let _ = crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
             if code == HIP_SUCCESS {
                 Ok(())
@@ -3396,14 +3400,22 @@ impl Drop for PinnedTransferBuffer {
         // Bind its device before draining; restore the caller's device so
         // cached thread binding remains valid outside this destructor.
         let drained = unsafe {
-            if (self.get_device)(&mut previous) != HIP_SUCCESS {
-                false
-            } else if (self.set_device)(self.device) != HIP_SUCCESS {
+            let got = (self.get_device)(&mut previous);
+            crate::error::observe_raw_code(got);
+            if got != HIP_SUCCESS {
                 false
             } else {
-                let code = (self.synchronize)();
-                let restored = (self.set_device)(previous);
-                code == HIP_SUCCESS && restored == HIP_SUCCESS
+                let bound = (self.set_device)(self.device);
+                crate::error::observe_raw_code(bound);
+                if bound != HIP_SUCCESS {
+                    false
+                } else {
+                    let code = (self.synchronize)();
+                    crate::error::observe_raw_code(code);
+                    let restored = (self.set_device)(previous);
+                    crate::error::observe_raw_code(restored);
+                    code == HIP_SUCCESS && restored == HIP_SUCCESS
+                }
             }
         };
         if !drained {
@@ -3437,6 +3449,13 @@ pub struct Module(HipModule);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for Module {}
+
+impl Module {
+    /// Raw `hipModule_t` handle, for identity keys only (never dereferenced).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
 
 /// Handle to a specific kernel function within a module.
 pub struct Function(HipFunction);

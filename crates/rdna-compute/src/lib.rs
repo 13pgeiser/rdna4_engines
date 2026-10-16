@@ -60,6 +60,7 @@ pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
 pub mod qsa_pooled_mirror;
+mod loaded_code_check;
 pub mod qwen35_fa_batch;
 pub mod rdna;
 pub mod railgun_check;
@@ -126,6 +127,18 @@ pub fn calib_force_bf16() -> bool {
     // process-global cache here, the versioned `ProcessConfig` snapshot is
     // itself resolved once. Arch callers keep calling this free function.
     developer_bool("HIPFIRE_CALIB_BF16", false)
+}
+
+/// Startup alias/baseline eligibility probe for the `qwen4_qsa_code_check`
+/// registry: runs the same CPU sample + report as the once-only HIP 700
+/// capture over the currently registered modules, labelled
+/// `hipfire: code-check self-test: ...`. Never consumes or changes the
+/// once-only HIP 700 slot (even if it is already consumed); uses `try_lock`
+/// (busy/poisoned registry yields a "skipped" line) and performs no HIP/HSA
+/// call. Returns the one-line report; the caller prints it.
+#[doc(hidden)]
+pub fn qsa_code_check_self_test() -> String {
+    loaded_code_check::self_test_report()
 }
 pub use kernels::GEMV_SRC;
 /// whose gfx11 and gfx12 kernels are separate translation units. Exported so

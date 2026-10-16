@@ -2067,6 +2067,7 @@ impl Gpu {
         );
 
         let flags = Arc::new(FeatureFlags::from_active_config(&arch));
+        crate::scratch::enable_qsa_code_check(&flags);
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
@@ -3793,13 +3794,17 @@ impl Gpu {
                 );
             }
             let module = self.hip.module_load_data(image.as_bytes())?;
+            crate::scratch::qsa_code_check_register(&self.arch, &module, module_name, image.as_bytes());
             self.compiler
                 .code_objects_mut()
                 .admit_module(
                     module_name,
                     crate::code_object::CodeObjectArtifact::native_embedded(module_name, image, None),
                 )
-                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                .map_err(|reason| {
+                    crate::scratch::qsa_code_check_unregister(&module);
+                    hip_bridge::HipError::new(0, &reason)
+                })?;
             self.modules.insert(module_name.to_owned(), module);
         } else if let Some(bound) = self.compiler.code_objects().module(module_name) {
             if bound.id() != crate::code_object::CodeObjectId::of(image.as_bytes()) {
@@ -8098,6 +8103,9 @@ impl Drop for Gpu {
     /// impls call `hipFree` etc. Uses `bind_thread_or_warn` to avoid
     /// panic-in-Drop from `bind_thread`'s `debug_assert!`.
     fn drop(&mut self) {
+        // Before any bind/free: drop every registered module handle while the
+        // runtime and `self.modules` are still alive (no-op unless flagged).
+        crate::scratch::qsa_code_check_unregister_all(&self.modules);
         if std::thread::panicking()
             && self.vmm_allocation_count() == 0
             && self.host_mapped.is_empty()

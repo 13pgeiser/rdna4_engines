@@ -940,6 +940,10 @@ name = "qsa_pm_check"
 required-features = ["lab"]
 
 [[example]]
+name = "qsa_code_check_selftest"
+required-features = ["lab"]
+
+[[example]]
 name = "pm_residual_xbatch_oracle"
 required-features = ["lab"]
 

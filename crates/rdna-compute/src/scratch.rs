@@ -684,13 +684,17 @@ pub(crate) fn load_embedded_module(
             );
         }
         let module = hip.module_load_data(image)?;
+        qsa_code_check_register(compiler.arch(), &module, module_name, image);
         compiler
             .code_objects_mut()
             .admit_module(
                 module_name,
                 crate::code_object::CodeObjectArtifact::native_embedded(module_name, image.into(), radiowave_json),
             )
-            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            .map_err(|reason| {
+                qsa_code_check_unregister(&module);
+                hip_bridge::HipError::new(0, &reason)
+            })?;
         modules.insert(module_name.to_owned(), module);
     } else if let Some(bound) = compiler.code_objects().module(module_name) {
         if bound.id() != crate::code_object::CodeObjectId::of(image) {
@@ -719,6 +723,103 @@ pub(crate) fn bind_loaded_function(
     registry
         .bind_function(func_name, &artifact)
         .map_err(|reason| hip_bridge::HipError::new(0, &reason))
+}
+
+/// Process-wide `qwen4_qsa_code_check` switch, set once at `Gpu` init from the
+/// parsed feature flag. Default off: every site below is one relaxed load.
+static QSA_CODE_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QSA_CODE_CHECK_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Enable the loaded-code check for this process when `flags` asks for it and
+/// install the bridge's first-illegal-address capture hook exactly once. Must
+/// run before the first module load. A disabled flag touches nothing.
+pub(crate) fn enable_qsa_code_check(flags: &crate::FeatureFlags) {
+    if !flags.qwen4_qsa_code_check {
+        return;
+    }
+    QSA_CODE_CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+    QSA_CODE_CHECK_HOOK.call_once(|| {
+        hip_bridge::register_first_illegal_address_hook(|| {
+            crate::loaded_code_check::capture_after_700();
+        });
+    });
+}
+
+#[inline]
+fn qsa_code_check_enabled() -> bool {
+    QSA_CODE_CHECK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The device code object HIP loads from `image`: a raw ELF as is, or the
+/// `arch` entry (`hipv4-amdgcn-amd-amdhsa--<arch>[:features]`) of an
+/// uncompressed clang offload bundle. `None` for anything else (compressed
+/// bundle, missing arch entry, malformed header).
+pub(crate) fn device_code_object<'a>(image: &'a [u8], arch: &str) -> Option<&'a [u8]> {
+    const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+    if image.starts_with(&ELF_MAGIC) {
+        return Some(image);
+    }
+    if !image.starts_with(BUNDLE_MAGIC) {
+        return None;
+    }
+    let u64_at = |at: usize| -> Option<usize> {
+        let bytes: [u8; 8] = image.get(at..at.checked_add(8)?)?.try_into().ok()?;
+        usize::try_from(u64::from_le_bytes(bytes)).ok()
+    };
+    let wanted = format!("hipv4-amdgcn-amd-amdhsa--{arch}");
+    let mut cursor = BUNDLE_MAGIC.len() + 8;
+    let mut found: Option<&[u8]> = None;
+    for _ in 0..u64_at(BUNDLE_MAGIC.len())? {
+        let (offset, size, len) = (u64_at(cursor)?, u64_at(cursor + 8)?, u64_at(cursor + 16)?);
+        let triple = image.get(cursor + 24..cursor.checked_add(24)?.checked_add(len)?)?;
+        cursor += 24 + len;
+        let matches = triple == wanted.as_bytes()
+            || (triple.starts_with(wanted.as_bytes()) && triple[wanted.len()] == b':');
+        if matches {
+            let payload = image.get(offset..offset.checked_add(size)?)?;
+            if found.replace(payload).is_some() {
+                return None;
+            }
+        }
+    }
+    found.filter(|elf| elf.starts_with(&ELF_MAGIC))
+}
+
+/// Register a just-loaded module with the loaded-code registry (flag on only).
+/// `image` is the exact byte slice passed to `hipModuleLoadData`; the caller
+/// invokes this immediately after that call succeeds, at every load site in
+/// this crate. The registry receives the `arch` device ELF extracted from a
+/// bundle; when no ELF can be extracted (compressed or malformed bundle,
+/// missing arch entry) it receives the original image unchanged so it records
+/// the module as unavailable rather than dropping it.
+pub(crate) fn qsa_code_check_register(arch: &str, module: &Module, name: &str, image: &[u8]) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    let image = device_code_object(image, arch).unwrap_or(image);
+    crate::loaded_code_check::register_module(module.raw_ptr() as usize, name, image);
+}
+
+/// Unregister one module handle (flag on only), for a load whose admission
+/// failed after it was registered.
+pub(crate) fn qsa_code_check_unregister(module: &Module) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    crate::loaded_code_check::unregister_module(module.raw_ptr() as usize);
+}
+
+/// Unregister every cached module handle (flag on only). `Gpu` teardown calls
+/// this before the runtime and module map drop. HIP modules are never
+/// unloaded in this crate, so this is the only lifetime event.
+pub(crate) fn qsa_code_check_unregister_all(modules: &HashMap<String, Module>) {
+    if !qsa_code_check_enabled() {
+        return;
+    }
+    for module in modules.values() {
+        crate::loaded_code_check::unregister_module(module.raw_ptr() as usize);
+    }
 }
 
 /// Load a compiled module from its immutable image, self-healing a
@@ -783,10 +884,14 @@ pub(crate) fn module_load_or_recompile(
         }
         Err(e) => return Err(e),
     };
+    qsa_code_check_register(compiler.arch(), &module, module_name, &image);
     compiler
         .code_objects_mut()
         .admit_module(module_name, crate::code_object::CodeObjectArtifact::hip_file(&path, image))
-        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        .map_err(|reason| {
+            qsa_code_check_unregister(&module);
+            hip_bridge::HipError::new(0, &reason)
+        })?;
     Ok(module)
 }
 
@@ -3665,5 +3770,115 @@ mod prefill_workspace_tests {
         assert_eq!(terms[0], ("fp16_x", 4096 * 256 * 2));
         assert_eq!(terms[7], ("mq_fixed", 167_424));
         assert_eq!(terms[10], ("gdn_pair_counters", 1024));
+    }
+}
+
+#[cfg(test)]
+mod device_code_object_tests {
+    use super::device_code_object;
+
+    const ELF: &[u8] = &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40];
+    const MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+
+    /// Uncompressed clang offload bundle: header, entry table, payloads.
+    fn bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let table: usize = entries.iter().map(|(triple, _)| 24 + triple.len()).sum();
+        let mut payload_at = MAGIC.len() + 8 + table;
+        let mut out = MAGIC.to_vec();
+        out.extend((entries.len() as u64).to_le_bytes());
+        for (triple, payload) in entries {
+            out.extend((payload_at as u64).to_le_bytes());
+            out.extend((payload.len() as u64).to_le_bytes());
+            out.extend((triple.len() as u64).to_le_bytes());
+            out.extend(triple.as_bytes());
+            payload_at += payload.len();
+        }
+        for (_, payload) in entries {
+            out.extend(*payload);
+        }
+        out
+    }
+
+    #[test]
+    fn raw_elf_is_returned_unchanged() {
+        assert_eq!(device_code_object(ELF, "gfx1201"), Some(ELF));
+    }
+
+    #[test]
+    fn bundle_yields_the_requested_arch_payload() {
+        let other = [0x7f, b'E', b'L', b'F', 9, 9];
+        let image = bundle(&[
+            ("host-x86_64-unknown-linux-gnu-", &b"HOST"[..]),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1100", &other[..]),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        assert_eq!(device_code_object(&image, "gfx1201"), Some(&ELF[..]));
+        assert_eq!(device_code_object(&image, "gfx1100"), Some(&other[..]));
+    }
+
+    #[test]
+    fn bundle_arch_entry_with_feature_suffix_matches_but_longer_arch_does_not() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201:xnack-", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), Some(&ELF[..]));
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx12010", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn wrong_arch_bundle_is_none() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1100", ELF)]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn duplicate_arch_entries_are_none() {
+        let image = bundle(&[
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn arch_payload_that_is_not_an_elf_is_none() {
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", &b"not an elf"[..])]);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
+    }
+
+    #[test]
+    fn malformed_inputs_are_none() {
+        assert_eq!(device_code_object(&[], "gfx1201"), None);
+        assert_eq!(device_code_object(b"junk", "gfx1201"), None);
+        assert_eq!(device_code_object(MAGIC, "gfx1201"), None);
+        let image = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        for cut in [MAGIC.len() + 4, MAGIC.len() + 8, MAGIC.len() + 20, image.len() - 1] {
+            assert_eq!(device_code_object(&image[..cut], "gfx1201"), None, "truncated at {cut}");
+        }
+    }
+
+    #[test]
+    fn overflowing_fields_are_none_without_panicking() {
+        let base = bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        let header = MAGIC.len();
+        let entry = header + 8;
+        for (at, label) in [(header, "count"), (entry, "offset"), (entry + 8, "size"), (entry + 16, "triple len")] {
+            for value in [u64::MAX, u64::MAX - 7, 1 << 63] {
+                let mut image = base.clone();
+                image[at..at + 8].copy_from_slice(&value.to_le_bytes());
+                assert_eq!(device_code_object(&image, "gfx1201"), None, "{label} = {value:#x}");
+            }
+        }
+        let mut image = base;
+        image[entry..entry + 8].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        image[entry + 8..entry + 16].copy_from_slice(&8u64.to_le_bytes());
+        assert_eq!(device_code_object(&image, "gfx1201"), None, "offset + size wraps");
+    }
+
+    #[test]
+    fn compressed_bundle_is_none() {
+        let mut image = b"CCOB".to_vec();
+        image.extend([2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        image.extend(ELF);
+        assert_eq!(device_code_object(&image, "gfx1201"), None);
     }
 }
