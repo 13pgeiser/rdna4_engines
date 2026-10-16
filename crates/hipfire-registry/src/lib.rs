@@ -1574,52 +1574,71 @@ mod tests {
         }
     }
 
-    /// The pinned monolithic stays catalogued under its own tag whatever the
-    /// canonical `qwen3.8:flash-next` tag maps to (the pinned monolithic, or the
-    /// split base once the registry switches).
-    const BUNDLED_PINNED_TAGS: [&str; 1] = ["qwen3.8:flash-next-mq4-xts"];
+    /// The four stock MQ4 tags are one artifact: the split base on the shared
+    /// PLE pair, never a monolithic.
+    fn assert_stock_split_tags(registry: &RegistryV1) {
+        let first = &registry.models[FLASH_NEXT_FIXTURE_TAGS[0]];
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            let (_, entry) = registry.model(tag).unwrap();
+            assert_eq!(entry, first, "{tag}: identical metadata");
+            assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO, "{tag}");
+            assert_eq!(entry.file, FLASH_NEXT_XTS_SPLIT_BASE_FILE, "{tag}");
+            assert_eq!(
+                entry.sha256.as_deref(),
+                Some(FLASH_NEXT_XTS_SPLIT_BASE_SHA256),
+                "{tag}"
+            );
+            assert_eq!(entry.size_bytes, Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE));
+            assert_eq!(entry.arch_id, Some(16));
+            assert_eq!(entry.quant.as_deref(), Some("mq4"));
+            assert!(entry.desc.contains("MQ4 XTS"), "{tag}");
+            assert_eq!(
+                entry.ple.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["q4", "q8"],
+                "{tag}"
+            );
+            for (key, (file, sha256, size)) in [("q4", STOCK_PLE_Q4), ("q8", STOCK_PLE_Q8)] {
+                let sidecar = entry
+                    .ple_sidecar(key)
+                    .unwrap_or_else(|| panic!("{tag}: ple.{key}"));
+                assert_eq!(sidecar.file, file, "{tag}");
+                assert_eq!(sidecar.sha256.as_deref(), Some(sha256), "{tag}");
+                assert_eq!(sidecar.size_bytes, Some(size), "{tag}");
+            }
+            assert!(!entry.is_flash_next_xts(), "{tag}");
+            assert!(!entry.is_split_only(), "{tag}");
+            assert!(entry.grandfathered_monolithic().is_some(), "{tag}");
+        }
+    }
 
     #[test]
-    fn flash_next_xts_bundle_preserves_wire_compatibility_and_normalizes_locally() {
+    fn bundled_registry_publishes_only_the_split_mq4_xts_base() {
         let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
-        assert_eq!(
-            wire.models["qwen3.8:flash-next-mq4-xts"].file,
-            FLASH_NEXT_XTS_CANONICAL_FILE
-        );
         let parsed = bundled().unwrap();
-        assert_flash_next_xts(&parsed, &BUNDLED_PINNED_TAGS);
+        assert_stock_split_tags(&parsed);
         assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
         let (short_tag, _) = parsed.model("qwen3.8:flash").unwrap();
         assert_eq!(short_tag, "qwen3.8:flash-next");
-        assert!(wire
-            .models
-            .values()
-            .all(|entry| !entry.desc.to_ascii_lowercase().contains("gptq3")));
         for (tag, entry) in &wire.models {
-            let mut expected = entry.clone();
-            if expected.is_flash_next_xts() {
-                assert!(!entry.desc.contains("GPTQ3"), "{tag}");
-                expected.file = FLASH_NEXT_XTS_CANONICAL_FILE.into();
-            }
+            assert_ne!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE, "{tag}");
+            assert_ne!(entry.file, FLASH_NEXT_XTS_LEGACY_FILE, "{tag}");
+            assert!(!entry.is_flash_next_xts(), "{tag}");
+            // The recipe is named MQ4 XTS; the old marketing name stays out of descs
+            // (a desc may still cite the legacy FILE names in lower case).
+            assert!(!entry.desc.contains("GPTQ3"), "{tag}");
+            assert_eq!(&parsed.models[tag], entry, "{tag}: nothing to normalize");
+            assert!(
+                entry.ple.keys().all(|key| is_ple_format_token(key)),
+                "{tag}"
+            );
+            // Only the MQ4 XTS base is a view of a pinned monolithic.
             assert_eq!(
-                &parsed.models[tag], &expected,
-                "{tag}: only filename may change"
+                entry.grandfathered_monolithic().is_some(),
+                FLASH_NEXT_FIXTURE_TAGS.contains(&tag.as_str()),
+                "{tag}"
             );
         }
-        assert!(!parsed.models["qwen3.8:flash-next-rtn-asym"].is_flash_next_xts());
-        assert_eq!(
-            parsed.models["qwen3.8:flash-next-rtn-asym"].file,
-            "qwen3.8-flash-next.mq4"
-        );
-    }
-
-    /// The bundled registry (the monolithic MQ4 tags plus the split-only MQ3
-    /// and MQ2 bases on the shared PLE pair) keeps its split invariants: no
-    /// entry is a grandfather candidate without a compiled-in pin, and every
-    /// PLE map key is a loadable-or-forward-compatible format token.
-    #[test]
-    fn bundled_registry_split_entries_are_split_only_and_use_valid_ple_keys() {
-        let parsed = bundled().unwrap();
+        // The MQ3 and MQ2 bases are split-only on the same shared pair.
         let split_tags = [
             "qwen3.8:flash-next-mq3-xts",
             "qwen3.8:flash-next-mq2-xts",
@@ -1638,20 +1657,19 @@ mod tests {
             assert_eq!(split.ple["q8"].file, "qwen3.8-flash-next.ple-q8", "{tag}");
         }
         for (tag, entry) in &parsed.models {
-            assert!(
-                entry.ple.keys().all(|key| is_ple_format_token(key)),
-                "{tag}"
-            );
-            if !split_tags.contains(&tag.as_str()) {
+            if !split_tags.contains(&tag.as_str())
+                && !FLASH_NEXT_FIXTURE_TAGS.contains(&tag.as_str())
+            {
                 assert!(
                     !entry.has_ple_sidecars(),
-                    "{tag}: only the MQ3 and MQ2 bases are split"
+                    "{tag}: only the MQ4, MQ3 and MQ2 bases are split"
                 );
             }
-            // Pins keyed by the split MQ4 identity stay inert until a registry
-            // entry names that base.
-            assert!(entry.grandfathered_monolithic().is_none(), "{tag}");
         }
+        assert_eq!(
+            parsed.models["qwen3.8:flash-next-rtn-asym"].file,
+            "qwen3.8-flash-next.mq4"
+        );
     }
 
     #[test]
@@ -1692,19 +1710,13 @@ mod tests {
         );
         assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
         assert!(!wire.aliases.values().any(|target| target == tag));
-        for stock in FLASH_NEXT_FIXTURE_TAGS {
-            let entry = &wire.models[stock];
+        let stock = stock_split_base_entry();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            let entry = &wire.models[tag];
             assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO);
-            assert_eq!(entry.sha256.as_deref(), Some(FLASH_NEXT_XTS_SHA256));
-            assert_eq!(entry.size_bytes, Some(FLASH_NEXT_XTS_SIZE));
-            assert_eq!(
-                entry.file,
-                if stock == "qwen3.8:flash-next-mq4-xts" {
-                    FLASH_NEXT_XTS_CANONICAL_FILE
-                } else {
-                    FLASH_NEXT_XTS_LEGACY_FILE
-                }
-            );
+            assert_eq!(entry.sha256, stock.sha256);
+            assert_eq!(entry.size_bytes, stock.size_bytes);
+            assert_eq!(entry.file, FLASH_NEXT_XTS_SPLIT_BASE_FILE);
             assert_eq!(entry.recommended_settings, zab.recommended_settings);
         }
     }
@@ -2722,7 +2734,7 @@ mod tests {
         };
         let offline = load_with_options(&paths, None);
         assert_eq!(offline.source, RegistrySource::Bundled);
-        assert_flash_next_xts(&offline.registry, &BUNDLED_PINNED_TAGS);
+        assert_stock_split_tags(&offline.registry);
         assert!(
             !paths.cache.exists(),
             "bundle-only must not fetch or write cache"
@@ -2781,7 +2793,7 @@ mod tests {
         let loaded = load_with_options(&paths, Some(&old_url));
         server.join().unwrap();
         assert_eq!(loaded.source, RegistrySource::Bundled, "newer bundle wins");
-        assert_flash_next_xts(&loaded.registry, &BUNDLED_PINNED_TAGS);
+        assert_stock_split_tags(&loaded.registry);
         assert!(loaded
             .warnings
             .iter()

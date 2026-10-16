@@ -361,15 +361,23 @@ sha/path when given) and `product_default_check` (`match`, `mismatch`, or
 `unknown` means the log lacked the evidence; it is not a pass. The CPU tests
 are `python3 -m unittest tests/test_perf_config_receipt.py`.
 
-The current fresh mq4 pull has no PLE slots (registry `mq4` entry: base,
-trunk-overlay, expert-hotset only), so `memory.ple_format=auto` falls back to
-the **embedded q8** rows on both arches. A historical result measured with
-explicit rank-q4 PLE rows (`qwen4 ple rows: q4 from ...ple-q4`) is **not** the
-fresh-pull product default and MUST NOT be relabelled as embedded q8; on
-gfx1151 the intended q4 differs from what a fresh pull delivers. Product
-defaults by arch: trunk overlay applies on gfx1151 only; expert hot set
-applies on gfx1201 only (absent hot set with whole-layer placement on gfx1201
-is a mismatch); NPU trunk is `auto` on gfx1151 and counts only with an
+The fresh mq4 pull is the split layout: the base
+`qwen3.8-flash-next-base.mq4-xts` carries no PLE rows, and `hipfire pull` adds
+the shared sidecar chosen by `memory.ple_format=auto`, which is a **q4** sidecar
+(rank order) on gfx1151 and a **q8** sidecar (row order) on gfx1201. A log that
+shows those rows matches. Embedded q8 rows (`qwen4 ple rows: q8 from embedded
+model file`) come from a grandfathered monolithic install, which is not a
+fresh-pull layout, so the receipt reports a mismatch for them. So is q8 on
+gfx1151 or q4 on gfx1201: that is an explicit override, not the default (a
+historical rank-q4 result on gfx1201 MUST NOT be relabelled as the default).
+The receipt also labels which layout produced the log (split base
+`eafaff94…` or grandfathered monolith `8b15b6fe…`, from the hot-set identity,
+the bound base sizes, or `--model`). Flash-Next gates on `mq4-xts` pin
+`HIPFIRE_PLE_FORMAT=q4` explicitly, so on gfx1201 their receipts are expected to
+show the override mismatch; quote the `qwen4 ple rows:` line in the receipt.
+Product defaults by arch: trunk overlay applies on gfx1151 only; expert hot
+set applies on gfx1201 only (absent hot set with whole-layer placement on
+gfx1201 is a mismatch); NPU trunk is `auto` on gfx1151 and counts only with an
 eligible calibration/request plan (plans routed `gpu` are not NPU-executed
 evidence); `memory.ple_hot_store_bytes` defaults to 0. Absence of overlay/NPU
 lines on gfx1201 is expected, not a mismatch. Do not combine different
@@ -380,8 +388,8 @@ is a *historical* band, not a matched product-default baseline):
 
 | Arch / config | Band | Status |
 |---|---|---|
-| R9700 (gfx1201), explicit rank-q4 PLE + expert hot set, greedy, K3, 256 tokens, 16384 seq, eleven prompts (`fn-floor-hotset-r9700/GATE.txt:13-19`, `runs/dec-b-tier-fix-1`) | 50.47–50.77 tok/s (beta 47.14–49.16; hot set disabled 41.29) | Not the product default yet (product auto = embedded q8 + pinned hot set); no matched auto-q8 reference exists. |
-| Halo (gfx1151), nine-prompt MTP, sampled (.7/top-p .8/top-k 20/presence 1.5, seeds 123, 256 tokens, 16384 seq), forced K4 (`pm-wave/mtpdepth/runs/hd-smp-p0/kf4`) | 60.23–60.57 tok/s (sampled beta K4 54.30–58.63 is a separate binary/depth band) | Rank-q4 + overlay; not matched to the nine-prompt product default (fresh pull is embedded q8). |
+| R9700 (gfx1201), explicit rank-q4 PLE + expert hot set, greedy, K3, 256 tokens, 16384 seq, eleven prompts (`fn-floor-hotset-r9700/GATE.txt:13-19`, `runs/dec-b-tier-fix-1`) | 50.47–50.77 tok/s (beta 47.14–49.16; hot set disabled 41.29) | Not the product default (the split-layout default on gfx1201 is a q8 PLE sidecar + pinned hot set; q4 is an explicit override); no matched default-pull reference exists. |
+| Halo (gfx1151), nine-prompt MTP, sampled (.7/top-p .8/top-k 20/presence 1.5, seeds 123, 256 tokens, 16384 seq), forced K4 (`pm-wave/mtpdepth/runs/hd-smp-p0/kf4`) | 60.23–60.57 tok/s (sampled beta K4 54.30–58.63 is a separate binary/depth band) | Rank-q4 + overlay, the gfx1151 default PLE format and overlay, but measured before the split layout and forced K4; not a matched split-layout default-pull receipt. |
 | Halo (gfx1151), AR, eight-prompt (`records_parser_1k` absent), hipx `pm-wave/fnds/runs/sar/base/r{1,2,3}/decode.json`, all rank-q4 + overlay | 34.33–34.69 tok/s | Not a matched nine-prompt AR baseline; no matched nine-prompt AR receipt exists. Do not compare against the nine-prompt MTP set. |
 
 ## Claim → route map

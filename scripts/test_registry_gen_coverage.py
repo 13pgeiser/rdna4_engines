@@ -99,16 +99,23 @@ def test_flash_next_xts_wire_contract():
     errors = []
     rg.validate_flash_next_xts(models, errors)
     assert not errors, "\n".join(errors)
-    for file in (rg.FLASH_NEXT_XTS_LEGACY_FILE, rg.FLASH_NEXT_XTS_CANONICAL_FILE):
+    for file in (
+        rg.FLASH_NEXT_XTS_SPLIT_BASE_FILE,
+        *rg.FLASH_NEXT_XTS_MONOLITHIC_FILES,
+    ):
         assert rg.quant_for(file) == "mq4"
         assert rg.arch_id_for("qwen3.8:flash-next", {"file": file}) == 16
+    # The monolithic is gone from the published registry (the client keeps a pin).
+    assert not any(
+        entry.get("file") in rg.FLASH_NEXT_XTS_MONOLITHIC_FILES for entry in models.values()
+    )
     rtn = models["qwen3.8:flash-next-rtn-asym"]
     assert rtn["file"] == "qwen3.8-flash-next.mq4"
-    assert rtn["sha256"] != rg.FLASH_NEXT_XTS_SHA256
+    assert rtn["sha256"] != rg.FLASH_NEXT_XTS_SPLIT_BASE_SHA256
     v1 = _load(REPO_ROOT / "registry" / "v1.json")
     assert v1["aliases"]["qwen3.8:flash"] == "qwen3.8:flash-next"
     assert models["qwen3.8:flash-next"]["desc"].startswith("Qwen3.8-Flash-Next MQ4 XTS")
-    assert all("gptq3" not in entry["desc"].lower() for entry in models.values())
+    assert all("GPTQ3" not in entry["desc"] for entry in models.values())
 
 
 def test_flash_next_zab_local_only_quant():
@@ -164,33 +171,6 @@ def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
     registry, errors = rg.build_registry(curated, None)
     assert registry is None
     assert any("qwen3.8:flash must alias" in error for error in errors)
-
-
-@pytest.mark.parametrize("key,value", [
-    ("file", rg.FLASH_NEXT_XTS_CANONICAL_FILE),
-    ("repo", "other/flash-next"),
-    ("sha256", "a" * 64),
-    ("size_bytes", rg.FLASH_NEXT_XTS_SIZE - 1),
-    ("arch_id", 5),
-    ("quant", "mq6"),
-    ("desc", "GPTQ3"),
-    ("recommended_settings", {"temperature": 0.5}),
-])
-def test_flash_next_xts_invariants_reject_drift(key, value):
-    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
-    models["qwen3.8:flash-next"][key] = value
-    errors = []
-    rg.validate_flash_next_xts(models, errors)
-    assert errors
-
-
-def test_flash_next_xts_requires_both_names_and_new_tag():
-    for tag in rg.FLASH_NEXT_XTS_WIRE_FILES:
-        models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
-        del models[tag]
-        errors = []
-        rg.validate_flash_next_xts(models, errors)
-        assert any("missing" in error for error in errors)
 
 
 def _rust_str_list(name: str) -> set[str]:

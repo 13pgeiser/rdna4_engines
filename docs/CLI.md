@@ -83,8 +83,7 @@ decode to the q4 `hipfire ple derive` makes locally from the q8 rows).
   fetched when missing. One note says `hipfire ple split <tag>` or
   `hipfire pull <tag> --force` gets the split layout. Verification is cached
   (`<HIPFIRE_HOME>/cache/verified-artifacts.json`: path, device, inode, size,
-  mtime, sha256): an unchanged file is not hashed again on later loads. The pin
-  matches no registry entry until the registry publishes that split base.
+  mtime, sha256): an unchanged file is not hashed again on later loads.
 - **`hipfire ple derive [--format q4] [--rank PATH] <model>`** writes
   `<model>.ple-q4` from the model's Q8 rows (`<model>.ple-q8` when present, else
   the embedded rows), ordered by `--rank` (default `<model>.plehot` when present,

@@ -1408,65 +1408,113 @@
     },
     "qwen3.8:flash-next": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-gptq3.mq4",
-      "size_gb": 125.3,
-      "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Needs hipfire at or after cb566dab9 (qt=54 I64 metadata records).",
+      "file": "qwen3.8-flash-next-base.mq4-xts",
+      "size_gb": 70.9,
+      "min_vram_gb": 72,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20
       },
-      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-      "size_bytes": 125288544792,
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4",
+          "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+          "size_bytes": 29120146432
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8",
+          "sha256": "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+          "size_bytes": 54400269312
+        }
+      },
+      "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+      "size_bytes": 70888270360,
       "arch_id": 16,
       "quant": "mq4"
     },
     "qwen3.8:flash-next-mq4": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-gptq3.mq4",
-      "size_gb": 125.3,
-      "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Needs hipfire at or after cb566dab9 (qt=54 I64 metadata records).",
+      "file": "qwen3.8-flash-next-base.mq4-xts",
+      "size_gb": 70.9,
+      "min_vram_gb": 72,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20
       },
-      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-      "size_bytes": 125288544792,
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4",
+          "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+          "size_bytes": 29120146432
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8",
+          "sha256": "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+          "size_bytes": 54400269312
+        }
+      },
+      "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+      "size_bytes": 70888270360,
       "arch_id": 16,
       "quant": "mq4"
     },
     "qwen3.8:flash-next-gptq3": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-gptq3.mq4",
-      "size_gb": 125.3,
-      "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Needs hipfire at or after cb566dab9 (qt=54 I64 metadata records).",
+      "file": "qwen3.8-flash-next-base.mq4-xts",
+      "size_gb": 70.9,
+      "min_vram_gb": 72,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20
       },
-      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-      "size_bytes": 125288544792,
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4",
+          "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+          "size_bytes": 29120146432
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8",
+          "sha256": "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+          "size_bytes": 54400269312
+        }
+      },
+      "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+      "size_bytes": 70888270360,
       "arch_id": 16,
       "quant": "mq4"
     },
     "qwen3.8:flash-next-mq4-xts": {
       "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next.mq4-xts",
-      "size_gb": 125.3,
-      "min_vram_gb": 128,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Needs hipfire at or after cb566dab9 (qt=54 I64 metadata records).",
+      "file": "qwen3.8-flash-next-base.mq4-xts",
+      "size_gb": 70.9,
+      "min_vram_gb": 72,
+      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to qwen3.8:flash-next-rtn-asym. KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20
       },
-      "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-      "size_bytes": 125288544792,
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4",
+          "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+          "size_bytes": 29120146432
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8",
+          "sha256": "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+          "size_bytes": 54400269312
+        }
+      },
+      "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+      "size_bytes": 70888270360,
       "arch_id": 16,
       "quant": "mq4"
     },

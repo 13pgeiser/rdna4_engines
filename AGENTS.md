@@ -710,18 +710,36 @@ against the A3B MoE DFlash perfmaxx line.
 
 ### Pinned Flash-Next bench fixture
 
-The canonical Flash-Next trunk (MQ4 XTS) is whichever local artifact byte-matches
-`qwen3.8-flash-next.mq4-xts` from HF repo `hipfire-models/qwen3.8-flash-next`
-(registry tag `qwen3.8:flash-next-mq4-xts`; existing tags
-`qwen3.8:flash-next`, `qwen3.8:flash-next-mq4` and
-`qwen3.8:flash-next-gptq3` resolve to the same pinned bytes).
-The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
+The canonical Flash-Next trunk (MQ4 XTS) is the split base
+`qwen3.8-flash-next-base.mq4-xts` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next-mq4-xts`; the tags `qwen3.8:flash-next`,
+`qwen3.8:flash-next-mq4` and `qwen3.8:flash-next-gptq3` resolve to the same
+file). The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
+The base has no PLE rows; they are the shared sidecar rows below.
 
 - HF repo: `hipfire-models/qwen3.8-flash-next`
-- HF / local file: `qwen3.8-flash-next.mq4-xts`
-- File size: `125288544792`
-- SHA-256: `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`
-- MD5: `be007fc3219e9f6cdb1d4dfa8380625f`
+- HF / local file: `qwen3.8-flash-next-base.mq4-xts`
+- File size: `70888270360`
+- SHA-256: `eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45`
+- Shared PLE rows (same repo, the same pair the MQ3/MQ2 split tiers use):
+  `qwen3.8-flash-next.ple-q4` (`29120146432` B, sha256 `fc78d30b…`, 4-bit
+  Lloyd-Max, rank order) and `qwen3.8-flash-next.ple-q8` (`54400269312` B,
+  sha256 `a655edc2…`, exact Q8F16). They attach to the base by source rows
+  `18e2fef1` (derived=false). `hipfire pull --ple auto` fetches q4 on gfx1151
+  and q8 elsewhere: a download of `100008416792` B with q4, `125288539672` B
+  with q8.
+- Provenance: the base is `hipfire ple split` of the previous monolithic pin
+  below. Two independent splits were byte-identical; a tensor walk found 1,197
+  base tensors (`70873841176` B) byte-identical to the monolithic file, with
+  only the 128 PLE n-gram shards (`54400261120` B) removed and a
+  `hipfire_ple_rows` marker added. The shared q8 rows are byte-identical to the
+  monolithic file's embedded rows, so **base + shared q8 rows is byte-equivalent
+  to the previous monolithic pin**; with the q4 rows the rows are not exact.
+- Equivalent monolithic (the previous pin, and the grandfathered identity the
+  client still serves from a verified local copy): `qwen3.8-flash-next.mq4-xts`
+  (also `qwen3.8-flash-next-gptq3.mq4`), size `125288544792`, SHA-256
+  `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`, MD5
+  `be007fc3219e9f6cdb1d4dfa8380625f`.
 - Recipe: MQ4 XTS, the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
   MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows,
   128 shards, external-resident, 54,400,261,120 B), with the routed experts
@@ -730,15 +748,27 @@ The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
   to the prior pin. Needs a build at or after `cb566dab9` (qt=54 I64 metadata
   records); validated on `fe77c0837`.
 
-The old filename `qwen3.8-flash-next-gptq3.mq4` remains a byte-identical alias
-through the 0.4.x line and at least 90 days. During that window, existing tags
-retain the old remote-registry wire filename for old clients; upgraded clients
-normalize this exact repo/size/SHA-256 pin to the canonical filename and migrate
-verified local bytes without downloading or copying the payload. The old HF
-object remains until explicit EOL approval. This is naming, not a recipe change.
+The recipe above describes the monolithic file; the base is the same minus the
+PLE shards. Re-bound sidecars for the base: trunk overlay
+`qwen3.8-flash-next-base.mq4-xts.trunk-overlay` (sha256 `e3e352ca…`) and expert
+hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
+the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
+grandfathered monolithic installs.
+
+HF removal plan: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
+`qwen3.8-flash-next-gptq3.mq4`) are removed last, only on explicit approval,
+and only after the master registry stops referencing them. Until then the old
+objects stay in place. The monolith-bound overlay, hot set,
+`kld/qwen3.8-flash-next.mq4-xts.plehot` and the shared q4 stay on HF. This is
+packaging, not a recipe change.
 
 Before reporting Flash-Next results, verify the candidate trunk with
-`sha256sum` and require the digest above.
+`sha256sum` and require the digest above (the split base, or the equivalent
+monolithic file with its own digest).
+
+Gate receipts must quote the `qwen4 ple rows:` line (rule: Flash-Next gates on
+mq4-xts use `HIPFIRE_PLE_FORMAT=q4` explicitly; R9700 receipts without q4 do
+not count for gates).
 
 Historical: from 2026-09-28 to 2026-10-02 the pin was the RTN-asymmetric
 `qwen3.8-flash-next.mq4` (still on HF under that name, tag

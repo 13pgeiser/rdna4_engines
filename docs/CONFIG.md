@@ -1164,7 +1164,7 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.session_cache_disk_bytes` | `0` | int 0–64 TiB; byte budget of the session cache's disk tier (one budget for the whole `memory.session_cache_dir`, every model and build). Snapshots evicted from memory, and every snapshot at model unload, are written there and restored on demand, surviving daemon restarts of the same build; LRU over leaves, other builds' files evicted first. `0` = off. Env: `HIPFIRE_SESSION_CACHE_DISK_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.session_cache_dir` | `""` | Directory of the session cache's disk tier; empty = `$HIPFIRE_HOME/session-cache`. One process uses it at a time (a second one runs without the disk tier). Env: `HIPFIRE_SESSION_CACHE_DIR`. |
 | `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus the CMA region minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
-| `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, a load never derives it: a missing file is refused naming both searched locations (the model path as given, then its canonical symlink target), `hipfire pull <tag> --ple q4` and `hipfire ple derive --format q4 <model>` (derives it from the local Q8 rows, about 1 minute, progress on stderr). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (the `<model>.ple-q8` sidecar of a split base, which is the stock MQ4 XTS layout, or the rows embedded in a grandfathered monolithic MQ4 XTS install); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, a load never derives it: a missing file is refused naming both searched locations (the model path as given, then its canonical symlink target), `hipfire pull <tag> --ple q4` and `hipfire ple derive --format q4 <model>` (derives it from the local Q8 rows, about 1 minute, progress on stderr). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` is derived from the host RAM left once the model is loaded: the base budget is `MemAvailable` − CMA region − 8 GiB, sampled once after the pinned experts and the rest of the model are loaded (so the weights are already subtracted and the reserve is never charged twice). On a unified-memory GPU and on a discrete GPU whose experts are all resident in VRAM, `auto` = min(15 GiB, that budget) (the hottest rows, where the value per GB of warm rows is highest). Only on a discrete GPU with host-placed experts (pinned or host-mapped expert tensors) is `auto` uncapped, so a host with more free RAM keeps more of the table warm, hottest rows first. Every `auto` budget is capped at the table's data bytes; an unreadable `MemAvailable` resolves `auto` to 0 (off). `0` = off (kill switch); an explicit N is that many bytes, is never capped at 15 GiB or otherwise rewritten, and overrides the RAM derivation (the table still caps it). The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB on every GPU (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.state_quant` | `auto` | `auto` \| `q8` \| `int8` \| `fp32` \| `f32` \| `q4` \| `int4`. GDN/DeltaNet recurrent-state storage; `auto` per-model/arch default (Qwen3.8-Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8). Explicit values honored or refused, never rewritten; q4/int4 Qwen3.5-only. Kill switch: `hipfire config set state_quant q8` or `HIPFIRE_STATE_QUANT=q8`. Env: `HIPFIRE_STATE_QUANT` ([`env-vars.md`](env-vars.md)). See [KV cache](#kv-cache) for the Qwen4 format, numerical and memory-owner semantics. |
@@ -1233,9 +1233,11 @@ is a symlink (`<target>.ple-*`). A models directory that symlinks to an artifact
 stored elsewhere therefore finds the sidecars published beside the link, or
 beside the real file. A missing file is refused naming both locations searched.
 
-The monolithic `qwen3.8:flash-next-mq4-xts` artifact keeps its PLE rows
-embedded: with `q8` (or `auto` off gfx1151) the embedded Q8 rows are read
-exactly as before; `q4` adds `<model>.ple-q4` next to it.
+The previous stock `qwen3.8:flash-next-mq4-xts` artifact, a monolithic file
+(a grandfathered install; the stock MQ4 tags now name the split base
+`qwen3.8-flash-next-base.mq4-xts`), keeps its PLE rows embedded: with `q8` (or
+`auto` off gfx1151) the embedded Q8 rows are read exactly as before; `q4` adds
+`<model>.ple-q4` next to it, which `hipfire pull` links from the shared q4 file.
 
 **Split layout.** `hipfire ple split <model>` rewrites a monolithic model as
 `<model-stem>-base.<ext>` (everything except the 128 PLE shards, about
@@ -1273,7 +1275,7 @@ does not change which format a later load selects, so with both files present
 `auto` still follows the architecture's preference (q8 off gfx1151), not the
 pull. Shared row files: the split bases of the Flash-Next family share one
 published pair of row files in `hipfire-models/qwen3.8-flash-next`,
-`qwen3.8-flash-next.ple-q4` (28,800,142,336 B) and
+`qwen3.8-flash-next.ple-q4` (29,120,146,432 B) and
 `qwen3.8-flash-next.ple-q8` (54,400,269,312 B). A split registry entry names
 its row files in the `ple` map (`"ple": {"q4": {...}, "q8": {...}}`, keyed by
 format token; this replaces the fixed `ple_q4` / `ple_q8` fields, and an
@@ -1285,12 +1287,14 @@ path, which is what the loader reads. A split base binds a sidecar by the base
 marker's row geometry and the SHA-256 of the q8 source rows, not by the base's
 file size and header/index hash, so a base with the same marker geometry and
 q8 source rows can use the same shared file; a mismatch is refused. This
-applies to split bases only: a monolithic model (the MQ4 XTS tags included)
-keeps the file-size plus header/index binding described above, gets no
-shared-file slot, and is unchanged. The MQ3 XTS base file itself is not
+applies to split bases only: a monolithic model (a grandfathered MQ4 XTS install
+included) keeps the file-size plus header/index binding described above and gets
+no shared-file slot; the shared q4 that `hipfire pull` links beside such an
+install as `<monolithic file>.ple-q4` binds the monolith natively. The MQ3 XTS
+base file itself is not
 published yet, pending its release gates. With the q4 rows the MQ3 XTS download
-is about 88.05 GB (base plus `.ple-q4`), with the q8 rows about 113.65 GB; the
-q4 rows are about 25.6 GB smaller on disk and in the download. The PLE rows are
+is about 88.37 GB (base plus `.ple-q4`), with the q8 rows about 113.65 GB; the
+q4 rows are about 25.28 GB smaller on disk and in the download. The PLE rows are
 read from the external file, not held in VRAM, so this is not a VRAM reduction.
 No GPU gate result is claimed here.
 
@@ -1327,8 +1331,8 @@ performance bottleneck that would justify it.
 
 ### Qwen4 trunk overlay sidecar
 
-`<model>.trunk-overlay` (for the stock XTS artifact,
-`qwen3.8-flash-next.mq4-xts.trunk-overlay`, ~305 MB) holds pre-encoded QT44
+`<model>.trunk-overlay` (for the stock XTS split base,
+`qwen3.8-flash-next-base.mq4-xts.trunk-overlay`, ~305 MB) holds pre-encoded QT44
 tensors that replace the base's MQ6 `linear_attn.in_proj_{z,a,b}` matrices at
 load and arm the trunk A4 route default its manifest names
 (`gfx1151-zab-v1`: the GDN Z, alpha and beta projections on exact gfx1151). It

@@ -10236,12 +10236,12 @@ mod tests {
         }
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.8:flash-next").unwrap();
-        assert!(entry.is_flash_next_xts());
+        // The stock tag is the split base; the compiled pin grandfathers the monolithic.
+        assert!(!entry.is_flash_next_xts());
+        let pin = grandfather_pin(entry).expect("the stock MQ4 XTS tag is grandfathered");
         let rtn = paths.models.join("qwen3.8-flash-next.mq4");
         fs::write(&rtn, b"historical RTN").unwrap();
         assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
-        // The compiled grandfather pin never selects the RTN file either.
-        let pin = hipfire_registry::GRANDFATHERED_MONOLITHICS[0];
         assert_eq!(migrate_grandfathered(&paths, &pin).unwrap(), None);
         assert_eq!(
             resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),

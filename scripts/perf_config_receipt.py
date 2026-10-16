@@ -11,7 +11,7 @@ other key untouched:
 Usage:
   perf_config_receipt.py --log daemon.log --arch gfx1151 --receipt result.json
   perf_config_receipt.py --log daemon.log --arch gfx1201 --receipt result.json \\
-      --model /models/qwen3.8-flash-next-gptq3.mq4
+      --model /models/qwen3.8-flash-next-base.mq4-xts
 
 Extracted (all from the log; nothing is assumed when a line is absent):
   PLE rows            `qwen4 ple rows:` format (q4/q8), origin (sidecar path or
@@ -32,15 +32,23 @@ Extracted (all from the log; nothing is assumed when a line is absent):
                       sha256 of the whole file (slow on 100+ GB models); the
                       log's own hotset-identity model_sha256 / overlay base
                       binding are kept as evidence, never relabelled as computed
+  layout              which model layout produced the log, recognised from the
+                      identities the log or --model proves: the split base
+                      (qwen3.8-flash-next-base.mq4-xts, sha256 eafaff94...,
+                      70,888,270,360 B) or the grandfathered monolithic file
+                      (sha256 8b15b6fe..., 125,288,544,792 B)
 
 Missing log line = "unknown" (or "not logged"); an explicit pin / log line that
 turns a feature off = "disabled". Those are never conflated.
 
-Product defaults checked (fresh `mq4` pull, current behaviour):
-  PLE rows       embedded q8 on both arches (the mq4 monolith registry entry has
-                 no PLE slot, so q4 is never fetched).  q4 rows from a sidecar
-                 are flagged MISMATCH on gfx1151 too: auto-q4 on Halo is the
-                 intended product, not what a fresh pull produces.
+Product defaults checked (fresh `mq4` pull: the split base
+`qwen3.8-flash-next-base.mq4-xts` plus the shared PLE sidecar pair; the base has
+no embedded PLE rows):
+  PLE rows       gfx1151: q4 from a sidecar (rank order; `--ple auto` picks q4
+                 there).  gfx1201: q8 from a sidecar (row order).  Embedded q8
+                 rows are a grandfathered monolithic install, not a fresh-pull
+                 layout: MISMATCH.  q8 on gfx1151 or q4 on gfx1201 is an
+                 explicit override, not the default: MISMATCH.
   gfx1151        trunk overlay applied (108 tensors); npu-trunk left at mode auto
                  (not pinned off/on), either armed with an eligible calibration
                  and request plan, or a logged GPU-only fallback (not a mismatch;
@@ -50,6 +58,10 @@ Product defaults checked (fresh `mq4` pull, current behaviour):
                  placement is a MISMATCH; overlay / NPU absent or "not applied
                  on gfx1201" is expected, not a mismatch.
   PLE hot store  default 0 (inactive).
+Layout identity is evidence, not a check: a fresh pull's overlay is bound to the
+split base (eafaff94...) and its hot set carries model_sha256 eafaff94...; the
+old monolith-bound pins (8b15b6fe...) are still recognised and labelled
+"monolith (grandfathered)" in `product_default_check.log_layout`.
 Status is mismatch if any check mismatches, else unknown if any is unknown,
 else match.  Exit status is 0 on success, 1 if --model hashing failed (receipt
 still written), 2 for unusable inputs.
@@ -65,6 +77,17 @@ import tempfile
 SCHEMA_VERSION = 1
 RAW_CAP = 40  # raw lines kept per category (counts always cover every line)
 EXPECTED_OVERLAY_TENSORS = 108
+
+# Model layout identities (whole-file sha256 / byte size).
+SPLIT_BASE_NAME = "qwen3.8-flash-next-base.mq4-xts"
+SPLIT_BASE_SHA256 = "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
+SPLIT_BASE_BYTES = 70888270360
+MONOLITH_NAMES = ("qwen3.8-flash-next.mq4-xts", "qwen3.8-flash-next-gptq3.mq4")
+MONOLITH_SHA256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+MONOLITH_BYTES = 125288544792
+LAYOUT_SPLIT = "split base (fresh pull)"
+LAYOUT_MONOLITH = "monolith (grandfathered)"
+LAYOUT_UNKNOWN = "unknown"
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -465,6 +488,33 @@ def is_off_value(v):
     return v is not None and v.strip().strip('"').lower() in OFF_VALUES
 
 
+def detect_layout(model_sha, ident_sha, bound_bytes, base_paths):
+    """Label the model layout from the strongest identity the log or --model proves.
+
+    Order: whole-file sha256 (computed, then the hot-set identity line), bound
+    base byte counts (hot set, then overlay), then the model file name implied by
+    a sidecar path. Returns {"name", "source"}; unknown when nothing is recognised.
+    """
+    for source, sha in (("computed --model sha256", model_sha),
+                        ("hot-set identity model_sha256", ident_sha)):
+        if sha == SPLIT_BASE_SHA256:
+            return {"name": LAYOUT_SPLIT, "source": source}
+        if sha == MONOLITH_SHA256:
+            return {"name": LAYOUT_MONOLITH, "source": source}
+    for source, size in bound_bytes:
+        if size == SPLIT_BASE_BYTES:
+            return {"name": LAYOUT_SPLIT, "source": source}
+        if size == MONOLITH_BYTES:
+            return {"name": LAYOUT_MONOLITH, "source": source}
+    for source, path in base_paths:
+        name = os.path.basename(path)
+        if name == SPLIT_BASE_NAME:
+            return {"name": LAYOUT_SPLIT, "source": source}
+        if name in MONOLITH_NAMES:
+            return {"name": LAYOUT_MONOLITH, "source": source}
+    return {"name": LAYOUT_UNKNOWN, "source": None}
+
+
 def build_startup_config(st, raw, arch, model_path, model_sha, model_sha_err, model_size):
     ple = st["ple"]
     note = st["ple_fallback_note"]
@@ -642,6 +692,11 @@ def build_startup_config(st, raw, arch, model_path, model_sha, model_sha_err, mo
         "sha256_error": model_sha_err, "size_bytes": model_size,
         "log_evidence": log_evidence,
     }
+    model["layout"] = detect_layout(
+        model_sha, ident.get("model_sha256"),
+        (("hot-set bound base bytes", log_evidence["hotset_bound_base_bytes"]),
+         ("overlay bound base bytes", log_evidence["overlay_bound_base_bytes"])),
+        tuple(("%s path" % c["source"], c["path"]) for c in candidates))
     if model_sha and ident.get("model_sha256"):
         model["sha256_matches_log_identity"] = (model_sha == ident["model_sha256"])
 
@@ -684,35 +739,53 @@ def build_check(cfg, arch):
             check(checks, "arch", arch, cfg["log_arch"], "mismatch",
                   "arch: log shows device %s but --arch is %s" % (",".join(cfg["log_arch"]), arch))
 
-    # PLE rows
+    # PLE rows: the split base has no embedded rows, so a fresh pull always reads a sidecar
     ple = cfg["ple"]["rows"]
-    exp_ple = "q8 embedded (fresh mq4 pull has no PLE slot, so no q4 sidecar)"
+    exp_fmt, exp_order = ("q4", "rank") if halo else ("q8", "row")
+    exp_ple = "%s from a sidecar (%s order); split base has no embedded PLE rows" % (exp_fmt, exp_order)
     if ple is None:
         check(checks, "ple_rows", exp_ple, "no `qwen4 ple rows:` line", "unknown",
               "ple: no `qwen4 ple rows:` line in log; q4 vs q8 unknown")
-    elif ple["format"] == "q8" and ple["origin"] == "embedded":
-        note = " (q4 sidecar not found fallback logged)" if cfg["ple"]["auto_fallback_embedded_q8"] else ""
-        check(checks, "ple_rows", exp_ple, "q8 embedded" + note, "match",
-              "ple: q8 rows embedded in the model file = current fresh-pull product" + note)
-        if halo:
-            notes.append("gfx1151 intended product auto-resolves q4 PLE; a fresh mq4 pull has no q4 slot, "
-                         "so embedded q8 is the actual current behaviour (not the intended q4 configuration)")
-    elif ple["format"] == "q4":
-        where = "sidecar " + ple["path"] if ple["path"] else "embedded"
+    elif ple["origin"] == "embedded" and ple["format"] in ("q4", "q8"):
+        fb = " (q4 sidecar not found fallback logged)" if cfg["ple"]["auto_fallback_embedded_q8"] else ""
+        check(checks, "ple_rows", exp_ple, "%s embedded%s" % (ple["format"], fb), "mismatch",
+              "ple: %s rows embedded in the model file mean a grandfathered monolithic install, which is "
+              "not a fresh-pull layout; a fresh pull is the split base (no embedded rows) with a %s "
+              "sidecar on %s%s" % (ple["format"], exp_fmt, arch, fb))
+    elif ple["format"] in ("q4", "q8"):
+        where = "sidecar " + str(ple["path"])
         pin = cfg["env_pins"]["ple_format_pin"]
         how = "explicit memory.ple_format/HIPFIRE_PLE_FORMAT=%s" % pin if pin else "sidecar present"
-        check(checks, "ple_rows", exp_ple, "q4 from " + where, "mismatch",
-              "ple: q4 rows from %s (%s) but fresh mq4 pull yields embedded q8; q4 is the intended "
-              "configuration, not the current product default%s" %
-              (where, how, " (also on gfx1151: auto-q4 there needs a sibling q4 sidecar the pull does not fetch)"
-               if halo else ""))
-    elif ple["format"] == "q8":
-        check(checks, "ple_rows", exp_ple, "q8 from sidecar " + str(ple["path"]), "mismatch",
-              "ple: q8 rows from external sidecar %s; fresh pull uses the embedded q8 rows, not a q8 sidecar"
-              % ple["path"])
+        observed = "%s from %s" % (ple["format"], where)
+        if ple["format"] != exp_fmt:
+            check(checks, "ple_rows", exp_ple, observed, "mismatch",
+                  "ple: %s rows from %s (%s) on %s; the fresh-pull default there is %s, so this is an "
+                  "explicit override, not the default" % (ple["format"], where, how, arch, exp_fmt))
+        elif ple.get("order") and ple["order"] != exp_order:
+            check(checks, "ple_rows", exp_ple, "%s (%s order)" % (observed, ple["order"]), "mismatch",
+                  "ple: %s rows from %s are in %s order, expected %s order" %
+                  (ple["format"], where, ple["order"], exp_order))
+        else:
+            check(checks, "ple_rows", exp_ple, observed, "match",
+                  "ple: %s rows from a sidecar (%s order) = fresh-pull product on %s" %
+                  (exp_fmt, exp_order, arch))
+            if halo:
+                notes.append("gfx1151 default PLE rows are q4 (Lloyd-Max, rank order), which are not exact: "
+                             "WT2 KLD 0.104865 vs 0.103252 with q8 rows (v0.4.2 measurement); "
+                             "`hipfire pull qwen3.8:flash-next --ple q8` keeps exact rows")
     else:
         check(checks, "ple_rows", exp_ple, ple["format"], "unknown",
               "ple: rows format %r is not q4/q8; cannot compare with the product default" % ple["format"])
+
+    layout = cfg["model"]["layout"]
+    if layout["name"] == LAYOUT_MONOLITH:
+        notes.append("log layout is the grandfathered monolithic file (sha256 8b15b6fe..., %d B; "
+                     "equivalent to split base + shared q8 rows); a fresh pull is the split base "
+                     "%s (sha256 eafaff94..., %d B); identity evidence: %s" %
+                     (MONOLITH_BYTES, SPLIT_BASE_NAME, SPLIT_BASE_BYTES, layout["source"]))
+    elif layout["name"] == LAYOUT_SPLIT:
+        notes.append("log layout is the split base %s (sha256 eafaff94..., %d B); identity evidence: %s" %
+                     (SPLIT_BASE_NAME, SPLIT_BASE_BYTES, layout["source"]))
 
     # expert hot set
     hs = cfg["expert_hotset"]
@@ -887,11 +960,14 @@ def build_check(cfg, arch):
         "status": status,
         "reasons": reasons,
         "arch": arch,
-        "product": "fresh mq4 pull (current behaviour)",
+        "product": "fresh mq4 pull (split base %s + shared PLE sidecar)" % SPLIT_BASE_NAME,
+        "log_layout": layout["name"],
+        "log_layout_source": layout["source"],
         "checks": checks,
         "notes": notes,
-        "intended_product": "gfx1151: q4 PLE (auto) + overlay + npu auto; gfx1201: q8 PLE + hot set",
-        "intended_product_differs_from_current": arch == "gfx1151",
+        "intended_product": (
+            "split base %s; gfx1151: q4 PLE sidecar (rank order, auto) + overlay + npu auto; "
+            "gfx1201: q8 PLE sidecar (row order) + hot set" % SPLIT_BASE_NAME),
     }
 
 
