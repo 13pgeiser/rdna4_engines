@@ -13,13 +13,14 @@
 //! the whole row's operand (16 dwords), so every lane loads all sixteen 8-code chunks of its
 //! row's 48-byte epoch group, chunk `c` (K elements `8c..8c+8`) as one unaligned dword at byte
 //! `3c` whose low 24 bits are the codes. K16 step `i` consumes dwords `2i`, `2i + 1`, the MQ4
-//! gfx11 operand order. Each chunk is spread to eight 4-bit slots in place
-//! (`spread_model`: three bit-field inserts, finished to the signed nibble
-//! `(2c - 7) & 15`); junk above bit 23 never reaches an output.
+//! gfx11 operand order. Each chunk is spread to eight 4-bit slots in place (three bit-field
+//! inserts finished to the clean nibble `2c + 1` by one shift-or and one more insert, then the
+//! `0x88888888` rebias XOR: the signed nibble `(2c - 7) & 15`, eight VALU per chunk); junk above
+//! bit 23 never reaches an output.
 //!
 //! Registers: the MQ4 gfx11 operand set (`Gen::set_len`: 16 dwords per tensor, X, headers, `d`;
-//! two sets) plus four unpack temporaries and the `0x11111111` register: 208 VGPRs for gate/up
-//! (176 down). Row scales: C rows are `2j + hi`, so lane `(hi, k)` loads the scale of row
+//! two sets) plus two unpack temporaries: 200 VGPRs for gate/up
+//! (168 down). Row scales: C rows are `2j + hi`, so lane `(hi, k)` loads the scale of row
 //! `(k & 14) | hi` and the `ds_swizzle` broadcast slot of accumulator `j` is `2j`; the odd epoch's
 //! half of the trip's scale pair is moved down first. The BF16 epilogue is the MQ4 entries' own
 //! (lane exchange so lane `hi` stores rows `8hi..8hi+8`); the `_acc` entry stores each accumulator
@@ -32,25 +33,12 @@ fn set_base(g: &Gen, p: usize) -> u8 {
     SET0 + p as u8 * g.set_len()
 }
 /// Code dword `c` of tensor `t` in set `p` (= chunk `c`; unpacked in place).
-fn raw(g: &Gen, p: usize, t: u8, c: u8) -> u8 {
-    set_base(g, p) + 16 * t + c
-}
-fn xr(g: &Gen, p: usize) -> u8 {
-    set_base(g, p) + 16 * g.t()
-}
-fn hr(g: &Gen, p: usize, t: u8) -> u8 {
-    xr(g, p) + 16 + t
-}
-fn dr(g: &Gen, p: usize) -> u8 {
-    xr(g, p) + 16 + g.t()
-}
-/// Four unpack temporaries, then the `0x11111111` register.
-fn tmp(g: &Gen) -> u8 {
-    set_base(g, 2)
-}
-fn ones(g: &Gen) -> u8 {
-    tmp(g) + 4
-}
+fn raw(g: &Gen, p: usize, t: u8, c: u8) -> u8 { set_base(g, p) + 16 * t + c }
+fn xr(g: &Gen, p: usize) -> u8 { set_base(g, p) + 16 * g.t() }
+fn hr(g: &Gen, p: usize, t: u8) -> u8 { xr(g, p) + 16 + t }
+fn dr(g: &Gen, p: usize) -> u8 { xr(g, p) + 16 + g.t() }
+/// Two unpack temporaries.
+fn tmp(g: &Gen) -> u8 { set_base(g, 2) }
 /// Byte of chunk `c` in the epoch's 48-byte group.
 fn chunk_off(c: u8) -> u32 {
     3 * u32::from(c)
@@ -95,10 +83,7 @@ pub(super) fn plan(g: &Gen) -> Result<RegPlan, String> {
         }
         p.v::<1>("d", dr(g, set), kernel())?;
     }
-    for i in 0..4u8 {
-        p.v::<1>("unpack_tmp", tmp(g) + i, kernel())?;
-    }
-    p.v::<1>("ones", ones(g), kernel())?;
+    for i in 0..2u8 { p.v::<1>("unpack_tmp", tmp(g) + i, kernel())?; }
     // Epilogue registers over the dead K-loop ranges (the MQ4 gfx11 epilogue's).
     for i in 0..8u8 {
         p.v::<1>("rt_tmp", RT_TMP + i, epi())?;
@@ -470,30 +455,8 @@ fn prologue(wg: &mut Wg<Gfx1151>, g: &Gen, end: &End) -> Result<(), String> {
         },
     )?;
     load_set(b, g, 0)?;
-    op(
-        b,
-        format!("v_mov_b32_e32 v{}, 0x11111111", ones(g)),
-        &[v(ones(g))],
-        &[],
-    )?;
-    for j in 0..8u8 {
-        op(
-            b,
-            format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)),
-            &[v(MAGIC8 + j)],
-            &[],
-        )?;
-    }
-    for t in 0..g.t() {
-        for j in 0..8u8 {
-            op(
-                b,
-                format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j),
-                &[v(SUM + 8 * t + j)],
-                &[],
-            )?;
-        }
-    }
+    for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)), &[v(MAGIC8 + j)], &[])?; }
+    for t in 0..g.t() { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", SUM + 8 * t + j), &[v(SUM + 8 * t + j)], &[])?; } }
     Ok(())
 }
 
@@ -544,45 +507,27 @@ fn load_set(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
 }
 
 /// One chunk: the dword at the chunk's byte offset (its low 24 bits are the 8 codes), spread
-/// and sign-finished into `dst`. `dst == code` is fine: `code` is last read by the second
-/// instruction, `dst` first written by the last.
-fn unpack(b: &mut Builder, dst: u8, code: u8, tmp: u8, ones: u8) -> Result<(), String> {
-    let (x, y) = (tmp, tmp + 1);
-    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| {
-        op(
-            b,
-            format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)),
-            &[v(d)],
-            &[v(p), v(q)],
-        )
-    };
-    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| {
-        op(
-            b,
-            format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"),
-            &[v(d)],
-            &[v(sr)],
-        )
-    };
+/// and sign-finished into `dst` in eight VALU. `dst == code` is fine: `code` is last read by
+/// the second instruction, `dst` first written by the third; `y` is the only temporary.
+///
+/// ```text
+/// y   = code << 4;  y = bfi(0xfff, code, y)        fields 0..3 | fields 4..7 << 4
+/// dst = y << 2;     y = bfi(0x003f003f, y, dst)    field pairs, junk between them
+/// dst = y << 1;     y = (y << 2) | 0x11111111      odd fields at bits 5..7, bit 0 / 4 of each nibble = 1
+/// dst = bfi(0x0e0e0e0e, dst, y)                    even fields at bits 1..3: nibble `2c + 1`, no junk
+/// dst ^= 0x88888888                                signed nibble `2c - 7`
+/// ```
+fn unpack(b: &mut Builder, dst: u8, code: u8, y: u8) -> Result<(), String> {
+    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| op(b, format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)), &[v(d)], &[v(p), v(q)]);
+    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| op(b, format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"), &[v(d)], &[v(sr)]);
     shl(b, y, 4, code)?;
     bfi(b, y, 0xfff, code, y)?;
-    shl(b, x, 2, y)?;
-    bfi(b, y, 0x003f_003f, y, x)?;
-    shl(b, x, 1, y)?;
-    bfi(b, y, 0x0707_0707, y, x)?;
-    shl(b, x, 1, y)?;
-    op(
-        b,
-        format!("v_bfi_b32 v{y}, 0x11111111, v{ones}, v{x}"),
-        &[v(y)],
-        &[v(ones), v(x)],
-    )?;
-    op(
-        b,
-        format!("v_xor_b32_e32 v{dst}, {}, v{y}", lit(REBIAS)),
-        &[v(dst)],
-        &[v(y)],
-    )
+    shl(b, dst, 2, y)?;
+    bfi(b, y, 0x003f_003f, y, dst)?;
+    shl(b, dst, 1, y)?;
+    op(b, format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"), &[v(y)], &[v(y)])?;
+    bfi(b, dst, 0x0e0e_0e0e, dst, y)?;
+    op(b, format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)), &[v(dst)], &[v(dst)])
 }
 
 /// Fold set `p` (one K128 epoch) into the sums.
@@ -625,7 +570,7 @@ fn compute(b: &mut Builder, g: &Gen, p: usize) -> Result<(), String> {
         for c in 0..16u8 {
             let n = (usize::from(t) * 16 + usize::from(c)) % 2;
             let r = raw(g, p, t, c);
-            unpack(b, r, r, tmp(g) + 2 * n as u8, ones(g))?;
+            unpack(b, r, r, tmp(g) + n as u8)?;
         }
     }
     for i in 0..8u8 {
@@ -792,11 +737,11 @@ mod tests {
         text.lines().filter(|l| l.contains(needle)).count()
     }
 
-    /// The register file is the MQ4 gfx11 operand set plus five registers; the chunk offsets tile
+    /// The register file is the MQ4 gfx11 operand set plus two registers; the chunk offsets tile
     /// the 48-byte epoch group.
     #[test]
     fn layout_extends_the_mq4_gfx11_operand_set() {
-        for (kind, vgprs) in [(Kind::GateUp, 208u16), (Kind::Down, 176)] {
+        for (kind, vgprs) in [(Kind::GateUp, 200u16), (Kind::Down, 168)] {
             for acc in [false, true] {
                 let g = Gen {
                     spec: spec(Arch::Gfx1151, kind),
@@ -845,10 +790,7 @@ mod tests {
                     .contains(&format!("{}{sfx}", spec(Arch::Gfx1151, kind).symbol())));
                 assert!(!e.s_text.contains("ttmp"));
                 assert!(!e.s_text.contains("v_wmma_i32_16x16x32_iu4"));
-                for (needle12, needle11) in [
-                    ("v_wmma_i32_16x16x32_iu4", "v_wmma_i32_16x16x16_iu4"),
-                    ("0x88888888", "0x88888888"),
-                ] {
+                for (needle12, needle11) in [("v_wmma_i32_16x16x32_iu4", "v_wmma_i32_16x16x16_iu4"), ("0x88888888", "0x88888888"), ("0x88888888", "v_lshl_or_b32")] {
                     let (n12, n11) = (count(&w12.s_text, needle12), count(&e.s_text, needle11));
                     assert!(
                         n12 > 0 && n11 == 2 * n12,

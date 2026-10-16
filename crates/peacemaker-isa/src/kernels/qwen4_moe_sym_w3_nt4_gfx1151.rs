@@ -20,14 +20,16 @@
 //!    qt131/qt132 `[codes: M*K*3/8 B][scales: M*(K/128) f16]`, weight `d * (2c - 7)`. Lanes `r`
 //!    and `r + 16` carry the whole row, so every lane loads all sixteen 8-code chunks of its
 //!    row's 48-byte epoch group, chunk `c` as one unaligned dword at byte `3c` (low 24 bits are
-//!    the codes), spread in place to signed nibbles; K16 step `i` consumes dwords `2i`, `2i+1`.
+//!    the codes), spread in place to signed nibbles (eight VALU per chunk: three bit-field inserts
+//!    finished to the clean nibble `2c + 1`, then the rebias XOR); K16 step `i` consumes dwords
+//!    `2i`, `2i+1`.
 //!    The odd epoch's half of the trip's scale pair is moved down first. Each output keeps the
 //!    NT1 entry's ascending per-epoch fold `sum = fma(RN(d * sc), C - magic, sum)`, so every
 //!    output byte equals the gfx1151 NT1 W3 entry's.
 //!
-//! Resources (exact): 213 VGPRs used, 216 allocated (the MQ4 gfx1151 NT4 layout is 208: weight
-//! nibble sets are 16 dwords per epoch exactly like the raw code sets; this adds four unpack
-//! temporaries at v208..v211 and the `0x11111111` register at v212), 80 SGPRs (highest s79; the
+//! Resources (exact): 208 VGPRs, the MQ4 gfx1151 NT4 layout's (weight nibble sets are 16 dwords
+//! per epoch exactly like the raw code sets; the two unpack temporaries sit at v142..v143, the
+//! pair its `d` and X blocks leave free), 80 SGPRs (highest s79; the
 //! permlane selector sits on the free s73), no scratch, 8192 B LDS (gate/up) / 0 (down, acc).
 //! Every `rr` has the same registers (the row repeat reuses the dead fold registers for its
 //! store temporaries, as the MQ4 entry).
@@ -54,14 +56,13 @@ const MAGIC8: u8 = 40;
 const CACC: u8 = 48;
 const TPROD: u8 = 56;
 const SCF: u8 = 64;
-const SUM0: u8 = 72; // + 8j
-const SETS: u8 = 104; // physical weight set s at SETS + 16 s: 16 code dwords (unpacked in place)
-const WH0: u8 = 136; // + s: scale pair
-const D0: u8 = 138; // + j: activation scale of tile j
-const X0: u8 = 144; // + 16 j: activation nibbles of tile j
-const TMPN: u8 = 208; // 4: unpack temporaries
-const ONES: u8 = 212; // 0x11111111
-                      // Epilogue aliases (dead K-loop ranges).
+const SUM0: u8 = 72;   // + 8j
+const SETS: u8 = 104;  // physical weight set s at SETS + 16 s: 16 code dwords (unpacked in place)
+const WH0: u8 = 136;   // + s: scale pair
+const D0: u8 = 138;    // + j: activation scale of tile j
+const X0: u8 = 144;    // + 16 j: activation nibbles of tile j
+const TMPN: u8 = 142;  // 2: unpack temporaries (the two registers between `d` and X)
+// Epilogue aliases (dead K-loop ranges).
 const SILU_TMP: u8 = 40; // 24: magic, cacc, fold products
 const RT_TMP: u8 = 64; // 8: row scales
 
@@ -339,10 +340,7 @@ impl G {
             }
             p.v::<1>("scale_pair", WH0 + set as u8, kernel())?;
         }
-        for i in 0..4u8 {
-            p.v::<1>("unpack_tmp", TMPN + i, kernel())?;
-        }
-        p.v::<1>("ones", ONES, kernel())?;
+        for i in 0..2u8 { p.v::<1>("unpack_tmp", TMPN + i, kernel())?; }
         for b in 0..rr {
             for i in 0..8u8 {
                 p.v::<1>("rt_tmp", RT_TMP + i, epi(b))?;
@@ -856,30 +854,8 @@ fn prologue(wg: &mut Wg<Gfx1151>, g: &G, end: &End) -> R {
         load_x(b, g, j, SRD_X[0])?;
     }
     let b = wg.isa();
-    op(
-        b,
-        format!("v_mov_b32_e32 v{ONES}, 0x11111111"),
-        &[v(ONES)],
-        &[],
-    )?;
-    for j in 0..8u8 {
-        op(
-            b,
-            format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)),
-            &[v(MAGIC8 + j)],
-            &[],
-        )?;
-    }
-    for t in 0..NT {
-        for j in 0..8u8 {
-            op(
-                b,
-                format!("v_mov_b32_e32 v{}, 0", g.sum(t) + j),
-                &[v(g.sum(t) + j)],
-                &[],
-            )?;
-        }
-    }
+    for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, {}", MAGIC8 + j, lit(MAGIC)), &[v(MAGIC8 + j)], &[])?; }
+    for t in 0..NT { for j in 0..8u8 { op(b, format!("v_mov_b32_e32 v{}, 0", g.sum(t) + j), &[v(g.sum(t) + j)], &[])?; } }
     Ok(())
 }
 
@@ -915,45 +891,27 @@ fn load_x(b: &mut Builder, g: &G, j: u8, srd: u8) -> R {
 }
 
 /// One chunk: the dword at the chunk's byte offset (its low 24 bits are the 8 codes), spread
-/// and sign-finished into `dst`. `dst == code` is fine: `code` is last read by the second
-/// instruction, `dst` first written by the last.
-fn unpack(b: &mut Builder, dst: u8, code: u8, tmp: u8) -> R {
-    let (x, y) = (tmp, tmp + 1);
-    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| {
-        op(
-            b,
-            format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)),
-            &[v(d)],
-            &[v(p), v(q)],
-        )
-    };
-    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| {
-        op(
-            b,
-            format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"),
-            &[v(d)],
-            &[v(sr)],
-        )
-    };
+/// and sign-finished into `dst` in eight VALU. `dst == code` is fine: `code` is last read by
+/// the second instruction, `dst` first written by the third; `y` is the only temporary.
+///
+/// ```text
+/// y   = code << 4;  y = bfi(0xfff, code, y)        fields 0..3 | fields 4..7 << 4
+/// dst = y << 2;     y = bfi(0x003f003f, y, dst)    field pairs, junk between them
+/// dst = y << 1;     y = (y << 2) | 0x11111111      odd fields at bits 5..7, bit 0 / 4 of each nibble = 1
+/// dst = bfi(0x0e0e0e0e, dst, y)                    even fields at bits 1..3: nibble `2c + 1`, no junk
+/// dst ^= 0x88888888                                signed nibble `2c - 7`
+/// ```
+fn unpack(b: &mut Builder, dst: u8, code: u8, y: u8) -> R {
+    let bfi = |b: &mut Builder, d: u8, mask: u32, p: u8, q: u8| op(b, format!("v_bfi_b32 v{d}, {}, v{p}, v{q}", lit(mask)), &[v(d)], &[v(p), v(q)]);
+    let shl = |b: &mut Builder, d: u8, n: u8, sr: u8| op(b, format!("v_lshlrev_b32_e32 v{d}, {n}, v{sr}"), &[v(d)], &[v(sr)]);
     shl(b, y, 4, code)?;
     bfi(b, y, 0xfff, code, y)?;
-    shl(b, x, 2, y)?;
-    bfi(b, y, 0x003f_003f, y, x)?;
-    shl(b, x, 1, y)?;
-    bfi(b, y, 0x0707_0707, y, x)?;
-    shl(b, x, 1, y)?;
-    op(
-        b,
-        format!("v_bfi_b32 v{y}, 0x11111111, v{ONES}, v{x}"),
-        &[v(y)],
-        &[v(ONES), v(x)],
-    )?;
-    op(
-        b,
-        format!("v_xor_b32_e32 v{dst}, {}, v{y}", lit(REBIAS)),
-        &[v(dst)],
-        &[v(y)],
-    )
+    shl(b, dst, 2, y)?;
+    bfi(b, y, 0x003f_003f, y, dst)?;
+    shl(b, dst, 1, y)?;
+    op(b, format!("v_lshl_or_b32 v{y}, v{y}, 2, 0x11111111"), &[v(y)], &[v(y)])?;
+    bfi(b, dst, 0x0e0e_0e0e, dst, y)?;
+    op(b, format!("v_xor_b32_e32 v{dst}, {}, v{dst}", lit(REBIAS)), &[v(dst)], &[v(dst)])
 }
 
 /// Fold weight set `p` (one K128 epoch) into every live tile's sums, the weights dequantized once;
@@ -997,7 +955,7 @@ fn compute(
     }
     for c in 0..16u8 {
         let r = g.raw(p, c);
-        unpack(b, r, r, TMPN + 2 * (c % 2))?;
+        unpack(b, r, r, TMPN + (c % 2))?;
     }
     for j in 0..NT {
         let fold = |w: &mut Wave<'_, Gfx1151, Builder>, ()| -> R {
@@ -1611,8 +1569,8 @@ mod tests {
                 assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
                 let sym = format!("{}{}", spec.symbol(), if acc { "_acc" } else { "" });
                 assert!(a.s_text.contains(&sym), "{sym}");
-                // 213 VGPRs used (the MQ4 gfx1151 NT4 layout's 208, four unpack temporaries, ones): 216 allocated.
-                assert_eq!(a.proof.next_free_vgpr, 216, "{sym}");
+                // 208 VGPRs: the MQ4 gfx1151 NT4 layout's; the two unpack temporaries fill its free v142..v143.
+                assert_eq!(a.proof.next_free_vgpr, 208, "{sym}");
                 assert!(a.shape.next_free_sgpr <= 104, "{sym}");
                 let handoff = spec.kind == Kind::GateUp && !acc;
                 assert_eq!(
