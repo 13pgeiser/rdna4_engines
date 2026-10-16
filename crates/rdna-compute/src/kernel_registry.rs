@@ -5146,8 +5146,10 @@ fn qwen36_27b_plain_rotate(input: &RouteKernelInput<'_>) -> Qwen36PlainRotate {
 /// every (module, symbol) the dispatch bound during a recorded route walk
 /// (`scripts/route_plan_walk.py` + `scripts/route_plan_build.py`). Never
 /// edited by hand; regenerate after a dispatch or kernel-source change.
-const WALKED_ROUTE_PLAN_FILES: &[&str] =
-    &[include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv")];
+const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
+    include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv"),
+    include_str!("route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1201.tsv"),
+];
 
 /// One parsed `route_plans/*.tsv`.
 #[derive(Debug)]
