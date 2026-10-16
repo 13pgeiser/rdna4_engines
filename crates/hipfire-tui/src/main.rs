@@ -272,6 +272,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The Models pull chooser (PLE / draft) is modal as well: every key goes to
+    // the tab handler so q / r / ? / Tab cannot act while it is open.
+    if app.tab == app::Tab::Models && app.pull_choice.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // A Dashboard stop/restart confirmation is modal too: every key goes to the
     // tab handler (y / n / Esc only) so q / r / ? / Tab cannot act while armed.
     if app.tab == app::Tab::Dashboard && app.confirm_serve.is_some() {
@@ -359,6 +366,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                 if tab != app::Tab::Dashboard {
                     // Likewise a pending serve stop/restart confirm.
                     app.confirm_serve = None;
+                }
+                if tab != app::Tab::Models {
+                    // And an open pull chooser (modal; must not reopen on return).
+                    app.pull_choice = None;
                 }
                 app.tab = tab;
             }
@@ -705,5 +716,52 @@ mod tests {
             app.chat.is_input_focused(),
             "cancelling does not also blur the input"
         );
+    }
+
+    #[test]
+    fn pull_chooser_is_modal_q_does_not_quit_and_esc_closes_it() {
+        use crate::hipfire::registry::{ModelEntry, ModelRow};
+        let mut app = test_app();
+        app.tab = Tab::Models;
+        let mut entry = ModelEntry::default();
+        entry.ple.insert(
+            "q4".into(),
+            hipfire_registry::Sidecar {
+                file: "x.ple-q4".into(),
+                sha256: None,
+                size_bytes: Some(1_000_000_000),
+            },
+        );
+        app.registry.models = vec![ModelRow {
+            tag: "zz:ple".into(),
+            entry,
+            downloaded: false,
+            has_mtp: false,
+        }];
+        app.registry.expanded_groups = ["zz".to_string()].into_iter().collect();
+        app.registry.selected = 1;
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('p'))));
+        assert!(app.pull_choice.is_some());
+
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q must not quit"
+        );
+        assert!(!app.confirm_quit);
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('r'))),
+            "r must not reload"
+        );
+        assert!(!handle_key(&mut app, k(KeyCode::Char('?'))));
+        assert!(!app.show_help, "? must not open help");
+        assert!(!handle_key(&mut app, k(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Models, "Tab must not switch");
+        assert!(app.pull_choice.is_some());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Esc)));
+        assert!(app.pull_choice.is_none(), "Esc closes the chooser");
+        assert!(app.pull.is_none(), "Esc starts no pull");
+        assert!(handle_key(&mut app, k(KeyCode::Char('q'))), "q quits again");
     }
 }

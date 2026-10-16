@@ -17,6 +17,7 @@ use crate::{
     hipfire::dashboard::{LoadState, VramState},
     hipfire::knobs,
     hipfire::metrics::MetricsView,
+    hipfire::pull_choice::PullChoice,
     hipfire::registry::ModelListItem,
     hipfire::serve_ctrl::ServeAction,
 };
@@ -276,7 +277,14 @@ fn footer_segments(app: &App) -> Vec<String> {
             }
         }
         Tab::Models => {
-            if app.confirm_delete.is_some() {
+            if app.pull_choice.is_some() {
+                segs(&[
+                    "Up/Down row",
+                    "Left/Right change",
+                    "Enter pull",
+                    "Esc cancel",
+                ])
+            } else if app.confirm_delete.is_some() {
                 segs(&["Delete this model?", "y confirm", "n / Esc cancel"])
             } else if app.pull.is_some() {
                 segs(&[
@@ -1307,6 +1315,108 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     if show_status {
         draw_models_status(frame, app, chunks[2]);
     }
+    if let Some(choice) = &app.pull_choice {
+        draw_pull_choice(frame, choice, area);
+    }
+}
+
+/// The `p` pull chooser popup, centered over the Models tab: a `PLE rows` line
+/// (auto / q4 / q8 with sizes) and a `Draft sidecars` line (yes / no with the
+/// kinds and sizes), the focused row marked with `>`.
+fn draw_pull_choice(frame: &mut Frame, choice: &PullChoice, area: Rect) {
+    use crate::hipfire::pull_choice::{format_size, ChoiceRow};
+
+    let selected = Style::default().fg(GREEN).add_modifier(Modifier::BOLD);
+    let plain = Style::default().fg(MUTED);
+    let label_style = |focused: bool| {
+        if focused {
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        }
+    };
+    let marker = |row: ChoiceRow| if choice.row == row { "> " } else { "  " };
+    let option = |text: String, on: bool| {
+        if on {
+            Span::styled(format!("[{text}]"), selected)
+        } else {
+            Span::styled(format!(" {text} "), plain)
+        }
+    };
+
+    let mut lines: Vec<Line> = vec![Line::from(""), {
+        Line::from(Span::styled(
+            format!("  {}", choice.tag),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+    }];
+    lines.push(Line::from(""));
+    if let Some(ple) = &choice.ple {
+        let mut spans = vec![Span::styled(
+            format!("{}PLE rows        ", marker(ChoiceRow::Ple)),
+            label_style(choice.row == ChoiceRow::Ple),
+        )];
+        for (i, opt) in ple.options.iter().enumerate() {
+            let size = format_size(opt.size_bytes);
+            let text = if size.is_empty() {
+                opt.label.to_string()
+            } else {
+                format!("{} {size}", opt.label)
+            };
+            spans.push(option(text, i == ple.selected));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(draft) = &choice.draft {
+        let kinds = draft
+            .kinds
+            .iter()
+            .map(|k| {
+                let size = format_size(k.size_bytes);
+                if size.is_empty() {
+                    k.label.to_string()
+                } else {
+                    format!("{} {size}", k.label)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}Draft sidecars  ", marker(ChoiceRow::Draft)),
+                label_style(choice.row == ChoiceRow::Draft),
+            ),
+            option("yes".into(), draft.yes),
+            option("no".into(), !draft.yes),
+            Span::styled(format!("  {kinds}"), plain),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Up/Down row \u{b7} Left/Right/Space change \u{b7} Enter pull \u{b7} Esc cancel",
+        plain,
+    )));
+
+    let w = 78u16.min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" Pull options "),
+            )
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        rect,
+    );
 }
 
 /// The Models-tab bottom strip: a delete-confirm prompt (takes priority) or the
@@ -3788,5 +3898,62 @@ mod render_tests {
         assert!(text.contains("Deprecated, read-only here"), "{text}");
         assert!(text.contains("DEPRECATED, REMOVAL 0.5.0"), "{text}");
         assert!(text.contains("hipfire config set cask"), "{text}");
+    }
+
+    #[test]
+    fn pull_chooser_renders_ple_and_draft_rows_at_80x24() {
+        use crate::hipfire::pull_choice::PullChoice;
+        use crate::hipfire::registry::ModelEntry;
+        use hipfire_registry::Sidecar;
+        let sc = |size| Sidecar {
+            file: "x".into(),
+            sha256: None,
+            size_bytes: Some(size),
+        };
+        let mut entry = ModelEntry::default();
+        entry.ple.insert("q4".into(), sc(1_500_000_000));
+        entry.ple.insert("q8".into(), sc(3_000_000_000));
+        entry.mtp = Some(sc(400_000_000));
+        entry.dflash = Some(sc(1_200_000_000));
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Models;
+        app.pull_choice = PullChoice::for_entry("qwen3.8:flash-next-mq4-xts", &entry);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        for needle in [
+            "PLE rows",
+            "auto",
+            "q4 1.5 GB",
+            "q8 3.0 GB",
+            "Draft sidecars",
+            "yes",
+            "MTP 400 MB",
+            "Enter pull",
+            "Esc cancel",
+        ] {
+            assert!(
+                text.contains(needle),
+                "missing {needle:?} in:\n{}",
+                text.as_bytes()
+                    .chunks(80)
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        let segs = footer_segments(&app);
+        assert_eq!(
+            segs,
+            [
+                "Up/Down row",
+                "Left/Right change",
+                "Enter pull",
+                "Esc cancel"
+            ]
+        );
     }
 }

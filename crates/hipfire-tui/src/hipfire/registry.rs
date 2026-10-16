@@ -175,6 +175,11 @@ impl RegistryState {
         }
     }
 
+    /// The registry entry for `tag`, if listed.
+    pub fn entry(&self, tag: &str) -> Option<&ModelEntry> {
+        self.models.iter().find(|m| m.tag == tag).map(|m| &m.entry)
+    }
+
     /// Whether `tag` resolves to a known model (a registry/local entry or an
     /// alias). Used by the Chat `/model <tag>` command.
     pub fn has_model(&self, tag: &str) -> bool {

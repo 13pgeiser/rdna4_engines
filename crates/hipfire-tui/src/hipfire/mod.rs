@@ -12,6 +12,7 @@ pub mod log_tail;
 pub mod metrics;
 pub mod model_actions;
 pub mod profile_wizard;
+pub mod pull_choice;
 pub mod registry;
 pub mod serve_ctrl;
 pub mod status;

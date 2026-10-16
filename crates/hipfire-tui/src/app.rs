@@ -25,6 +25,7 @@ use crate::hipfire::{
     log_tail::{LogSnapshot, LogTailer},
     metrics::MetricsView,
     model_actions::{self, PullEvent, PullHandle, RmOutcome},
+    pull_choice::PullChoice,
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
     status::{start_background_serve, StatusState},
@@ -277,6 +278,9 @@ pub struct App {
     /// A y/n "quit and cancel the running pull?" confirmation is armed. Modal on
     /// every tab; only ever armed while `pull` is `Some`.
     pub confirm_quit: bool,
+    /// Models tab: the `p` pull chooser (PLE format + draft sidecars) is open for
+    /// this model. Modal; `None` when closed.
+    pub pull_choice: Option<PullChoice>,
     /// Text staged by Chat `/copy` for the event loop to emit to the terminal
     /// clipboard (OSC52) after the next render; cleared once emitted.
     pub pending_clipboard: Option<String>,
@@ -344,6 +348,7 @@ impl App {
             confirm_reset_all: false,
             confirm_serve: None,
             confirm_quit: false,
+            pull_choice: None,
             pending_clipboard: None,
             request_log: Vec::new(),
             doctor_cmd: None,
@@ -368,12 +373,12 @@ impl App {
 
     /// Start downloading `tag` on a background worker (Models tab `p`). No-op
     /// (with a toast) if a pull is already running or the model is already local.
-    fn start_pull(&mut self, tag: String) {
+    fn start_pull(&mut self, tag: String, extra_args: Vec<String>) {
         if self.pull.is_some() {
             self.toast_info("a pull is already running");
             return;
         }
-        let handle = model_actions::pull(tag.clone(), Vec::new());
+        let handle = model_actions::pull(tag.clone(), extra_args);
         self.toast_info(format!("pulling {tag}\u{2026}"));
         self.pull = Some(PullJob {
             tag,
@@ -381,6 +386,48 @@ impl App {
             percent: None,
             line: String::new(),
         });
+    }
+
+    /// `p` on a remote model: open the PLE / draft chooser when the registry
+    /// entry has PLE files or draft sidecars, otherwise pull immediately.
+    fn request_pull(&mut self, tag: String) {
+        if self.pull.is_some() {
+            self.toast_info("a pull is already running");
+            return;
+        }
+        let choice = self
+            .registry
+            .entry(&tag)
+            .and_then(|entry| PullChoice::for_entry(&tag, entry));
+        match choice {
+            Some(choice) => self.pull_choice = Some(choice),
+            None => self.start_pull(tag, Vec::new()),
+        }
+    }
+
+    /// Keys while the pull chooser is open (modal): Up/Down pick the row,
+    /// Left/Right/Space change its value, Enter starts the pull, Esc closes.
+    fn handle_pull_choice_key(&mut self, key: KeyEvent) {
+        let Some(choice) = self.pull_choice.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => choice.move_row(false),
+            KeyCode::Down | KeyCode::Char('j') => choice.move_row(true),
+            KeyCode::Left => choice.change(false),
+            KeyCode::Right | KeyCode::Char(' ') => choice.change(true),
+            KeyCode::Enter => {
+                if let Some(choice) = self.pull_choice.take() {
+                    let args = choice.extra_args();
+                    self.start_pull(choice.tag, args);
+                }
+            }
+            KeyCode::Esc => {
+                self.pull_choice = None;
+                self.toast_info("pull not started");
+            }
+            _ => {}
+        }
     }
 
     /// Ask the running pull to stop (Models tab `c`). The worker kills and reaps
@@ -800,6 +847,11 @@ impl App {
     }
 
     fn handle_models_key(&mut self, key: KeyEvent) {
+        // The pull chooser is modal: it owns every key while open.
+        if self.pull_choice.is_some() {
+            self.handle_pull_choice_key(key);
+            return;
+        }
         // A delete confirmation is modal: intercept y / n / Esc.
         if self.confirm_delete.is_some() {
             match key.code {
@@ -876,7 +928,7 @@ impl App {
                 }
             }
             KeyCode::Char('p') => match self.registry.selected_model() {
-                Some((tag, false)) => self.start_pull(tag),
+                Some((tag, false)) => self.request_pull(tag),
                 Some((_, true)) => self.toast_info("already downloaded"),
                 None => self.toast_info("select a model row to pull"),
             },
@@ -3462,7 +3514,10 @@ mod tests {
         assert!(!before_cfg.contains("default_model"));
         assert_eq!(app.config.default_model, before_default);
         assert_eq!(app.active_model, before_active);
-        assert_eq!(app.config.values.get("default_model").cloned(), before_value);
+        assert_eq!(
+            app.config.values.get("default_model").cloned(),
+            before_value
+        );
         assert_eq!(
             app.config.overrides.contains("default_model"),
             before_override
@@ -3849,7 +3904,11 @@ mod tests {
             .lines()
             .filter(|line| line.split_whitespace().next() == Some("serve"))
             .collect();
-        assert_eq!(serve_lines, ["serve -d"], "exactly one background serve start");
+        assert_eq!(
+            serve_lines,
+            ["serve -d"],
+            "exactly one background serve start"
+        );
         assert!(app.has_queued_send(), "prompt stays queued while it boots");
         assert!(app.chat.status.contains("starting hipfire serve -d"));
         let _ = std::fs::remove_dir_all(dir);
@@ -4169,5 +4228,161 @@ mod tests {
         edit.end();
         edit.backspace();
         assert_eq!(edit.buffer, "éß/");
+    }
+
+    /// A Models-tab app over two remote rows: `rich:full` (q4+q8 PLE and an MTP
+    /// sidecar) and `plain:base` (nothing). `rich:full` is selected.
+    fn pull_app() -> (App, std::path::PathBuf) {
+        use crate::hipfire::registry::{ModelEntry, ModelRow};
+        use hipfire_registry::Sidecar;
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Models;
+        let sc = |size| Sidecar {
+            file: "x".into(),
+            sha256: None,
+            size_bytes: Some(size),
+        };
+        let mut rich = ModelEntry::default();
+        rich.ple.insert("q4".into(), sc(1_500_000_000));
+        rich.ple.insert("q8".into(), sc(3_000_000_000));
+        rich.mtp = Some(sc(400_000_000));
+        let row = |tag: &str, entry: ModelEntry| ModelRow {
+            tag: tag.into(),
+            entry,
+            downloaded: false,
+            has_mtp: false,
+        };
+        app.registry.models = vec![
+            row("plain:base", ModelEntry::default()),
+            row("rich:full", rich),
+        ];
+        app.registry.expanded_groups = ["plain".to_string(), "rich".to_string()]
+            .into_iter()
+            .collect();
+        (app, dir)
+    }
+
+    /// Select the model row `tag` among the visible items.
+    fn select_tag(app: &mut App, tag: &str) {
+        let items = app.registry.visible_items();
+        let at = items
+            .iter()
+            .position(|item| match item {
+                crate::hipfire::registry::ModelListItem::Model { model_index } => {
+                    app.registry.models[*model_index].tag == tag
+                }
+                _ => false,
+            })
+            .expect("row visible");
+        app.registry.selected = at;
+    }
+
+    /// Install a fake CLI that records `"$@"` (one line per call) and exits 1
+    /// unless `$1` is `pull`; returns the record path.
+    fn pull_recorder(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let record = dir.join("pull-argv.txt");
+        let bin = dir.join("hipfire-fake");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = pull ] || exit 1\necho \"$@\" >> '{}'\nexit 0\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("HIPFIRE_CLI_BIN", &bin);
+        record
+    }
+
+    fn wait_for_record(record: &std::path::Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(record) {
+                if !text.trim().is_empty() {
+                    return text;
+                }
+            }
+            assert!(Instant::now() < deadline, "fake CLI never recorded argv");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn p_on_ple_model_opens_chooser_and_enter_passes_ple_and_no_draft() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, dir) = pull_app();
+        let record = pull_recorder(&dir);
+        select_tag(&mut app, "rich:full");
+
+        app.handle_tab_key(key(KeyCode::Char('p')));
+        assert!(app.pull.is_none(), "chooser opens before any pull starts");
+        assert!(app.pull_choice.is_some());
+
+        // PLE row: auto -> q4.
+        app.handle_tab_key(key(KeyCode::Right));
+        // Draft row: yes -> no.
+        app.handle_tab_key(key(KeyCode::Down));
+        app.handle_tab_key(key(KeyCode::Char(' ')));
+        app.handle_tab_key(key(KeyCode::Enter));
+        assert!(app.pull_choice.is_none(), "Enter closes the chooser");
+        assert!(app.pull.is_some(), "Enter starts the pull");
+
+        let argv = wait_for_record(&record);
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+        assert_eq!(argv.trim(), "pull rich:full --yes --ple q4 --no-draft");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chooser_defaults_pass_no_extra_flags() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, dir) = pull_app();
+        let record = pull_recorder(&dir);
+        select_tag(&mut app, "rich:full");
+        app.handle_tab_key(key(KeyCode::Char('p')));
+        app.handle_tab_key(key(KeyCode::Enter));
+        let argv = wait_for_record(&record);
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+        assert_eq!(argv.trim(), "pull rich:full --yes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn p_on_model_without_ple_or_draft_pulls_immediately() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, dir) = pull_app();
+        let record = pull_recorder(&dir);
+        select_tag(&mut app, "plain:base");
+        app.handle_tab_key(key(KeyCode::Char('p')));
+        assert!(app.pull_choice.is_none(), "no chooser state");
+        assert!(app.pull.is_some(), "pull started immediately");
+        let argv = wait_for_record(&record);
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+        assert_eq!(argv.trim(), "pull plain:base --yes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn esc_closes_the_chooser_without_pulling() {
+        let (mut app, dir) = pull_app();
+        select_tag(&mut app, "rich:full");
+        app.handle_tab_key(key(KeyCode::Char('p')));
+        assert!(app.pull_choice.is_some());
+        app.handle_tab_key(key(KeyCode::Esc));
+        assert!(app.pull_choice.is_none());
+        assert!(app.pull.is_none(), "Esc must not start a pull");
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("pull not started")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
