@@ -718,7 +718,12 @@ fn layer_program(
             program.push((LaneOp::PleConv, StageName::PleConv));
         }
         program.push((LaneOp::HcRead { layer, mlp: false }, StageName::HcRead));
-        match bundle.weights.layer_refs[layer].kind {
+        match bundle
+            .weights
+            .layer(layer)
+            .ok_or_else(|| invalid(format!("lane layer {layer} is not owned")))?
+            .kind
+        {
             LayerType::LinearAttention => {
                 for (phase, stage) in mixer_phases(StageName::GdnInProj, StageName::GdnOutProj) {
                     program.push((
@@ -855,6 +860,11 @@ fn forward_lanes_scoped(
     if fwd.ep_placement().is_some() {
         return Err(invalid(
             "lane steps do not run under expert parallelism (EP forwards are one-row decode and chunk forwards only)",
+        ));
+    }
+    if *bundle.weights.band_scope() != crate::weights::Qwen4BandScope::single(&bundle.config) {
+        return Err(invalid(
+            "lane steps do not run on a pipeline-parallel band (topology.pp refuses lanes)",
         ));
     }
     // Lanes are the Flash-Next route: the stage policy, row sharing and
@@ -1156,8 +1166,11 @@ fn forward_lanes_scoped(
             for layer_index in 0..config.num_hidden_layers {
                 descs.push(layer_desc(
                     &bundle.weights,
-                    &bundle.weights.layer_refs[layer_index],
-                    fwd.moe.get(layer_index),
+                    bundle
+                        .weights
+                        .layer(layer_index)
+                        .ok_or_else(|| invalid(format!("lane layer {layer_index} is not owned")))?,
+                    fwd.moe.get(layer_index).and_then(Option::as_ref),
                     config,
                     &fwd.decode_q8,
                     rows,
@@ -1171,7 +1184,10 @@ fn forward_lanes_scoped(
             .iter()
             .map(|rows| desc_rows.iter().position(|k| k == rows).unwrap_or(0))
             .collect();
-        let ple_weights = bundle.weights.layer_refs[ple_layer]
+        let ple_weights = bundle
+            .weights
+            .layer(ple_layer)
+            .ok_or_else(|| invalid("lane PLE layer is not owned"))?
             .ple
             .as_ref()
             .ok_or_else(|| invalid("PLE weights missing"))?;

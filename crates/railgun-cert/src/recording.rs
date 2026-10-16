@@ -1199,7 +1199,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ple-async-upload",
         predicates: &[CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) and the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs",
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs) and the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture",
         effect: LaunchMechanism,
         switches: "hipMemcpyAsync on the null stream with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
         kernels: &[],
@@ -1317,6 +1317,17 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "copy-only assignment dst[i] = src[i], bounded by n, with no arithmetic (kernels/src/copy_f32_buffer.hip:7-12); dispatch.rs:6773-6807 records the same source/destination pointers and element count through the blob funnel",
         reaches: &[reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3")],
     },
+    Decision {
+        id: "qwen4-mesh-refuses-retained-replay",
+        predicates: &[ReplayState],
+        condition: "hipfire-arch-qwen4 check_mesh_admission (gpu_forward.rs), run by every pipeline-parallel mesh band forward and by prepare_mesh_capacity: the band forward is refused unless `gpu.replay.state()` is Hip or Fallback, i.e. no retained replay body is armed on that band's device",
+        effect: Refusal,
+        switches: "error before any launch; the mesh band forward runs only eager (HIP launches), never a retained replay body",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branch launches nothing; topology.pp admission never arms retained replay on a band device, so a mesh forward that would reach a recorded body fails loudly instead of replaying a different program",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-deepseek4/src/forward.rs", function: "attention_block_batched_mixed", occurrences: 16, decisions: &["dspark-capture-safe-verify-body"] },
@@ -1367,7 +1378,8 @@ pub const SITES: &[Site] = &[
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "rides_ordinary_prefill", occurrences: 2, decisions: &["widened-prefill-batching", "gdn-chunk-scan"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "verify_dflash_block_inner_body", occurrences: 1, decisions: &["graph-capture-lifecycle"] },
     Site { file: "hipfire-arch-qwen35/src/speculative.rs", function: "write_rows_to_staging", occurrences: 1, decisions: &["dflash-hidden-staging-recorded-copy"] },
-    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 8, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse", "qwen4-ple-async-upload"] },
+    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "check_mesh_admission", occurrences: 1, decisions: &["qwen4-mesh-refuses-retained-replay"] },
+    Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "forward_chunk_scoped", occurrences: 9, decisions: &["replay-recorder-lifecycle", "qwen4-g2-expert-stage", "qwen4-prefill-token-id-reuse", "qwen4-ple-async-upload"] },
     Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "guarded_wide_verify_rows", occurrences: 2, decisions: &["qwen4-wide-verify-recorded-ar-guard"] },
     Site { file: "hipfire-arch-qwen4/src/gpu_forward.rs", function: "qwen4_ar_launch", occurrences: 2, decisions: &["qwen4-wide-verify-recorded-ar-guard"] },
     Site { file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs", function: "forward_lanes_scoped", occurrences: 1, decisions: &["qwen4-ple-async-upload"] },

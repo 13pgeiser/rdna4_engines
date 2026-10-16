@@ -35,7 +35,8 @@ use crate::program::{
 use crate::projection::{row_stride, ProjectionView};
 use crate::weights::{
     Fp8MoeExpertTables, HyperConnectionReadWeights, HyperConnectionWeights, MoeWeights,
-    Qwen4EpPlacement, Qwen4FfnWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef, WeightError,
+    Qwen4BandScope, Qwen4EpPlacement, Qwen4FfnWeights, Qwen4LayerWeights, Qwen4Weights, TensorRef,
+    WeightError,
 };
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
@@ -59,6 +60,7 @@ use hipfire_dispatch::pipeline::{
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::external_rows::{RowFetch, RowTicket};
+use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
 use rdna_compute::moe::Qwen4EpOwnerTables;
 use rdna_compute::replay::{ReplayController, ReplayState, ShadowBodyRoute};
@@ -486,6 +488,26 @@ impl Qwen4OutputPolicy {
             Self::None => None,
         }
     }
+}
+
+/// The head a mesh output band writes after its trunk: the logits (and optional
+/// per-row argmax) destination for `rows` of the chunk. `None` at the call
+/// discards (non-final prefill chunks); a non-output band never has one.
+#[derive(Clone, Copy)]
+pub struct Qwen4MeshHead<'a> {
+    pub logits: &'a GpuTensor,
+    pub top1: Option<&'a GpuTensor>,
+    pub rows: Qwen4OutputRows,
+}
+
+/// Exact geometry of the HC streams a band publishes/receives for one mesh
+/// epoch: the routing rows the epoch's Gpu scope selects, the stream dtype
+/// (`bf16_streams`) and the live bytes (`rows * hc_count * hidden * dtype`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4MeshLayout {
+    pub route_rows: usize,
+    pub bf16_streams: bool,
+    pub stream_bytes: usize,
 }
 
 /// Host-side forward phases timed when profiling is enabled.
@@ -2776,8 +2798,7 @@ impl Qwen4MoeLayerRuntime {
             ExpertFormat::Mq2I4 => (DType::MQ2I4G128R256, DType::MQ2I4G128R128),
         };
         let (gate_up_source_name, down_source_name) = match &weights
-            .layer_refs
-            .get(layer_label)
+            .layer(layer_label)
             .and_then(|layer| layer.ffn.moe())
             .map(|moe| &moe.expert_source_layout)
         {
@@ -3188,7 +3209,7 @@ impl Qwen4ExpertStage {
     fn new(
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
-        moe: &[Qwen4MoeLayerRuntime],
+        moe: &[Option<Qwen4MoeLayerRuntime>],
         chunk_rows: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         if let Some(placement) = bundle.weights.ep_placement() {
@@ -3203,12 +3224,17 @@ impl Qwen4ExpertStage {
         if !hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_ENV, gpu.arch == "gfx1201") {
             return Ok(None);
         }
-        let Some(first_host) = moe.iter().position(RoutedExpertWeights::host_mapped) else {
+        let Some(first_host) = moe
+            .iter()
+            .position(|layer| layer.as_ref().is_some_and(RoutedExpertWeights::host_mapped))
+        else {
             return Ok(None);
         };
         // Slab arenas and tier layers use dedicated VRAM stage buffers.
         // Only legacy aggregate placement may borrow resident donor layers.
-        if moe.iter().any(|layer| layer.slab.is_some()) || bundle.weights.expert_tiers().is_some() {
+        if moe.iter().flatten().any(|layer| layer.slab.is_some())
+            || bundle.weights.expert_tiers().is_some()
+        {
             return Self::new_slab(gpu, bundle, moe, first_host, chunk_rows);
         }
         let config = &bundle.config;
@@ -3217,12 +3243,15 @@ impl Qwen4ExpertStage {
         if config.num_experts != 512
             || config.hidden_size != 2560
             || config.moe_intermediate_size != 640
-            || moe[first_host.saturating_sub(2)..].iter().any(|layer| {
-                layer.experts.iter().any(|expert| {
-                    expert.gate_up.tensor.dtype != DType::MQ4G256V2
-                        || expert.down.tensor.dtype != DType::MQ4G128V2
+            || moe[first_host.saturating_sub(2)..]
+                .iter()
+                .flatten()
+                .any(|layer| {
+                    layer.experts.iter().any(|expert| {
+                        expert.gate_up.tensor.dtype != DType::MQ4G256V2
+                            || expert.down.tensor.dtype != DType::MQ4G128V2
+                    })
                 })
-            })
         {
             return Ok(None);
         }
@@ -3235,7 +3264,7 @@ impl Qwen4ExpertStage {
         if first_host < 2
             || !moe[first_host..]
                 .iter()
-                .all(RoutedExpertWeights::host_mapped)
+                .all(|layer| layer.as_ref().is_some_and(RoutedExpertWeights::host_mapped))
         {
             return off("needs two resident expert layers ahead of every host layer");
         }
@@ -3271,7 +3300,10 @@ impl Qwen4ExpertStage {
         }
         let parts =
             |layer: usize| -> Result<[(&TensorRef, usize, usize); 2], Qwen4GpuForwardError> {
-                let weights = bundle.weights.layer_refs[layer]
+                let weights = bundle
+                    .weights
+                    .layer(layer)
+                    .ok_or_else(|| invalid("G2 stage layer is not owned"))?
                     .ffn
                     .moe()
                     .ok_or_else(|| invalid("G2 stage layer has no MoE FFN"))?;
@@ -3319,7 +3351,11 @@ impl Qwen4ExpertStage {
             compact_tables: Vec::new(),
             compact_keys: if placement.is_some() {
                 moe.iter()
-                    .map(|runtime| runtime.expert_gate_up_ptrs.buf.as_ptr() as usize)
+                    .map(|runtime| {
+                        runtime.as_ref().map_or(0, |runtime| {
+                            runtime.expert_gate_up_ptrs.buf.as_ptr() as usize
+                        })
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -3384,7 +3420,12 @@ impl Qwen4ExpertStage {
                 }
             }
             if placement.is_some() {
-                for (layer, runtime) in moe.iter().enumerate().skip(first_host) {
+                for (layer, runtime) in moe
+                    .iter()
+                    .enumerate()
+                    .skip(first_host)
+                    .filter_map(|(layer, runtime)| runtime.as_ref().map(|runtime| (layer, runtime)))
+                {
                     for (kind, entries) in [
                         &runtime.expert_gate_up_entries,
                         &runtime.expert_down_entries,
@@ -3539,7 +3580,10 @@ impl Qwen4ExpertStage {
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
         let parity = layer % 2;
-        let weights = bundle.weights.layer_refs[layer]
+        let weights = bundle
+            .weights
+            .layer(layer)
+            .ok_or_else(|| invalid("G2 stage layer is not owned"))?
             .ffn
             .moe()
             .ok_or_else(|| invalid("G2 stage layer has no MoE FFN"))?;
@@ -3604,7 +3648,7 @@ impl Qwen4ExpertStage {
         &self,
         gpu: &Gpu,
         bundle: &Qwen4Bundle,
-        moe: &[Qwen4MoeLayerRuntime],
+        moe: &[Option<Qwen4MoeLayerRuntime>],
         layer: usize,
     ) -> Result<(), Qwen4GpuForwardError> {
         if self.slab.is_some() {
@@ -3612,7 +3656,11 @@ impl Qwen4ExpertStage {
         }
         let parity = layer % 2;
         let donor = self.donors[parity] == layer;
-        if !donor && !moe[layer].host_mapped() {
+        if !donor
+            && !moe[layer]
+                .as_ref()
+                .is_some_and(RoutedExpertWeights::host_mapped)
+        {
             return Ok(());
         }
         if donor {
@@ -3623,10 +3671,11 @@ impl Qwen4ExpertStage {
                 .ok_or_else(|| invalid("G2 compute stream missing"))?;
             gpu.hip.event_record(&self.free[parity], Some(compute))?;
         }
-        match (layer + 2..moe.len())
-            .step_by(2)
-            .find(|&next| moe[next].host_mapped())
-        {
+        match (layer + 2..moe.len()).step_by(2).find(|&next| {
+            moe[next]
+                .as_ref()
+                .is_some_and(RoutedExpertWeights::host_mapped)
+        }) {
             Some(next) => self.enqueue_layer(gpu, bundle, next),
             None if self.state.get()[parity] == DonorState::Overwritten => {
                 self.enqueue_restore(gpu, parity)
@@ -3722,7 +3771,7 @@ impl Qwen4ExpertStage {
 struct StagedMoeHooks<'s> {
     stage: &'s Qwen4ExpertStage,
     bundle: &'s Qwen4Bundle,
-    moe: &'s [Qwen4MoeLayerRuntime],
+    moe: &'s [Option<Qwen4MoeLayerRuntime>],
     /// The layer of the next MoE call.
     layer: usize,
     /// The stage error behind a hook failure, returned instead of the
@@ -3744,7 +3793,7 @@ impl MoeStepHooks for StagedMoeHooks<'_> {
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let result = match self.moe.get(self.layer) {
             None => Err(invalid("G2 staged forward ran more MoE calls than layers")),
-            Some(moe) if !moe.host_mapped() => Ok(()),
+            Some(moe) if !moe.as_ref().is_some_and(RoutedExpertWeights::host_mapped) => Ok(()),
             Some(_) => match gpu.active_stream.as_ref() {
                 None => Err(invalid("G2 compute stream missing")),
                 Some(compute) => gpu
@@ -4302,6 +4351,15 @@ pub struct Qwen4GpuForwardScratch {
 }
 
 impl Qwen4GpuForwardScratch {
+    /// [`Self::plan_scoped`] for the whole model: the historical plan.
+    fn plan(
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+    ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
+        Self::plan_scoped(config, max_chunk, mode, &Qwen4BandScope::single(config))
+    }
+
     /// Every field of a `max_chunk`-row scratch in [`ScratchField`] order
     /// (allocation or borrowed view, with its dtype and element count), plus
     /// the host PLE staging bytes.
@@ -4331,10 +4389,11 @@ impl Qwen4GpuForwardScratch {
     ///   `moe_shared_output`; `gdn_recurrent_output` -> `qsa_qgate`.
     ///   `ple_normed` stays dedicated: partial verify rollback reads it after
     ///   the forward.
-    fn plan(
+    fn plan_scoped(
         config: &Qwen4Config,
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
     ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
         use ScratchField as F;
         if max_chunk == 0 {
@@ -4350,7 +4409,34 @@ impl Qwen4GpuForwardScratch {
         let qsa_index = layout.index_width;
         let gdn_value = layout.gdn_value;
         let gdn_qkv = layout.gdn_qkv;
-        let max_projection = wide.max(qsa_qgate).max(gdn_qkv).max(hidden);
+        // A band plans only the fields its operations touch (the S5
+        // `forward_census_scope` terms): GDN/QSA fields for the layer kinds it
+        // owns, token/embedding/PLE fields on the input band, logits on the
+        // output band. An absent field is a zero-element slot: never
+        // allocated, never freed, never read. The whole-model scope keeps
+        // every field, so its plan is the historical one.
+        let single = *scope == Qwen4BandScope::single(config);
+        let has = |kind: LayerType| {
+            single
+                || scope
+                    .band
+                    .clone()
+                    .any(|layer| config.layer_types.get(layer) == Some(&kind))
+        };
+        let (has_gdn, has_qsa) = (
+            has(LayerType::LinearAttention),
+            has(LayerType::FullAttention),
+        );
+        if mode == Qwen4ForwardScratchMode::FnSymGfx1201 && has_gdn && !has_qsa {
+            return Err(invalid(
+                "compact forward scratch aliases the GDN output onto QSA scratch, which a band \
+                 without QSA layers does not own",
+            ));
+        }
+        let max_projection = wide
+            .max(hidden)
+            .max(if has_qsa { qsa_qgate } else { 0 })
+            .max(if has_gdn { gdn_qkv } else { 0 });
         let max_rotation = wide.max(hidden).max(config.ffn.intermediate_size());
         // PLE channels are `hc_count * hidden` (the key projection's rows),
         // not `ple_embed_dim * hc_count`; the staged row width is
@@ -4362,7 +4448,7 @@ impl Qwen4GpuForwardScratch {
         let ple_channels = wide;
         let ffn_batch_rows = layout.routed_rows.max(layout.dense_rows);
         let max_ple_bytes = max_chunk
-            .checked_mul(ple_embed_dim)
+            .checked_mul(if scope.input { ple_embed_dim } else { 0 })
             .and_then(|elements| elements.checked_mul(2))
             .ok_or_else(|| invalid("PLE staging size overflow"))?;
         let i32_bytes = std::mem::size_of::<i32>();
@@ -4392,6 +4478,31 @@ impl Qwen4GpuForwardScratch {
             .ok_or_else(|| invalid("MoE grouped tile scratch overflow"))?;
         let rows = |width: usize| scratch_mul(max_chunk, width);
         let routed_width = scratch_mul(config.num_experts_per_tok, config.moe_intermediate_size)?;
+        let present = |field: ScratchField| match field {
+            F::TokenIds
+            | F::EmbeddingRot
+            | F::Embeddings
+            | F::PleStaged
+            | F::PleRows
+            | F::PleKey
+            | F::PleValue
+            | F::PleQuery
+            | F::PleGated
+            | F::PleNormed
+            | F::PleOutput => scope.input,
+            F::GdnA
+            | F::GdnB
+            | F::GdnGate
+            | F::GdnBeta
+            | F::GdnRecurrentOutput
+            | F::GdnZ
+            | F::GdnOutput => has_gdn,
+            F::QsaIndex | F::QsaQgate | F::QsaK | F::QsaV | F::QsaOutput | F::QsaSelected => {
+                has_qsa
+            }
+            F::Logits => scope.output,
+            _ => true,
+        };
         let mut slots: Vec<ScratchSlot> = Vec::with_capacity(ScratchField::COUNT);
         let mut alloc = |field: ScratchField,
                          elements: usize,
@@ -4405,7 +4516,7 @@ impl Qwen4GpuForwardScratch {
             // Every planned buffer holds at least one element: MoE-only
             // extents are zero for a dense FFN.
             slots.push(ScratchSlot {
-                elements: elements.max(1),
+                elements: if present(field) { elements.max(1) } else { 0 },
                 dtype,
                 owner: None,
                 pitch: None,
@@ -4432,7 +4543,9 @@ impl Qwen4GpuForwardScratch {
             alloc(F::GdnRecurrentOutput, rows(gdn_value)?, DType::F32)?;
             alloc(
                 F::GdnBf16,
-                gdn_value.max(hidden).max(config.hc_lowrank),
+                (if has_gdn { gdn_value } else { 0 })
+                    .max(hidden)
+                    .max(config.hc_lowrank),
                 DType::BF16,
             )?;
             alloc(F::GdnZ, rows(gdn_value)?, DType::F32)?;
@@ -4571,6 +4684,9 @@ impl Qwen4GpuForwardScratch {
                             view_pitch: usize,
                             views: &[F]|
              -> Result<(), Qwen4GpuForwardError> {
+                if !present(owner) {
+                    return Ok(());
+                }
                 let owner_slot = slots[owner as usize];
                 if owner_slot.owner.is_some() {
                     return Err(invalid(format!(
@@ -4586,6 +4702,9 @@ impl Qwen4GpuForwardScratch {
                     slots[owner as usize].pitch = Some(pitch);
                 }
                 for &view in views {
+                    if !present(view) {
+                        continue;
+                    }
                     let slot = slots[view as usize];
                     if slot.owner.is_some() || slot.dtype != owner_slot.dtype {
                         return Err(invalid(format!(
@@ -4645,7 +4764,17 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
     ) -> Result<u64, Qwen4GpuForwardError> {
-        let (slots, _) = Self::plan(config, max_chunk, mode)?;
+        Self::device_bytes_scoped(config, max_chunk, mode, &Qwen4BandScope::single(config))
+    }
+
+    /// [`Self::device_bytes`] for one band: only the fields it plans.
+    pub(crate) fn device_bytes_scoped(
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+    ) -> Result<u64, Qwen4GpuForwardError> {
+        let (slots, _) = Self::plan_scoped(config, max_chunk, mode, scope)?;
         slots
             .iter()
             .filter(|slot| slot.owner.is_none())
@@ -4662,7 +4791,25 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
-        Self::allocate(gpu, config, max_chunk, mode, None)
+        Self::new_scoped(
+            gpu,
+            config,
+            max_chunk,
+            mode,
+            &Qwen4BandScope::single(config),
+        )
+    }
+
+    /// [`Self::new`] for one pipeline-parallel band: allocates only the
+    /// fields [`Self::plan_scoped`] plans for `scope`.
+    pub fn new_scoped(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
+        Self::allocate(gpu, config, max_chunk, mode, None, scope)
     }
 
     /// Allocate only state live across the A/B switch. All borrowed pointers
@@ -4687,6 +4834,7 @@ impl Qwen4GpuForwardScratch {
             bank_a.max_chunk,
             bank_a.mode,
             Some((bank_a, kind)),
+            &Qwen4BandScope::single(config),
         )
     }
 
@@ -4726,14 +4874,16 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
         bank: Option<(&Self, NpuBankKind)>,
+        scope: &Qwen4BandScope,
     ) -> Result<(Self, Vec<u8>, Vec<u8>), Qwen4GpuForwardError> {
         let bank_a = bank.map(|(bank_a, _)| bank_a);
         let bank_kind = bank.map(|(_, kind)| kind);
-        let (slots, max_ple_bytes) = Self::plan(config, max_chunk, mode)?;
+        let (slots, max_ple_bytes) = Self::plan_scoped(config, max_chunk, mode, scope)?;
         // Owners first; a view needs its owner's pointer.
         let mut tensors: Vec<Option<GpuTensor>> = Vec::with_capacity(slots.len());
         for (index, slot) in slots.iter().enumerate() {
             if slot.owner.is_some()
+                || slot.elements == 0
                 || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
             {
                 tensors.push(None);
@@ -4757,6 +4907,18 @@ impl Qwen4GpuForwardScratch {
                     .expect("plan validated that a view's owner owns its allocation")
                     .sub_offset(0, slot.elements);
                 tensors[index] = Some(view);
+            }
+        }
+        // Absent band fields: zero-length borrowed views (never dereferenced,
+        // never freed) so every field stays bound; every use is pin-gated.
+        for (index, slot) in slots.iter().enumerate() {
+            if slot.elements == 0 {
+                let mut placeholder = tensors[ScratchField::Streams as usize]
+                    .as_ref()
+                    .expect("the HC streams are owned by every band")
+                    .sub_offset(0, 0);
+                placeholder.dtype = slot.dtype;
+                tensors[index] = Some(placeholder);
             }
         }
         if let Some(bank_a) = bank_a {
@@ -5011,6 +5173,7 @@ impl Qwen4GpuForwardScratch {
         let mut first = None;
         for (index, (tensor, slot)) in tensors.into_iter().zip(slots).enumerate() {
             if slot.owner.is_some()
+                || slot.elements == 0
                 || bank_kind.is_some_and(|kind| !kind.owns(ScratchField::ALL[index]))
             {
                 continue;
@@ -5113,7 +5276,9 @@ pub struct Qwen4GpuForward {
     /// construction: whether `TokenReadback` queues the id copy at the
     /// argmax instead of at the PLE read.
     token_readback_early: bool,
-    pub(crate) moe: Vec<Qwen4MoeLayerRuntime>,
+    /// MoE runtime of each absolute trunk layer (`None`: a layer without a
+    /// MoE FFN or one this band does not own); length `num_hidden_layers`.
+    pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
@@ -5155,6 +5320,17 @@ pub struct Qwen4GpuForward {
     /// runs always on gfx942 and with `HIPFIRE_PREFILL_PM_INVARIANT` on gfx1151. Never
     /// set for decode, MTP verify or the MTP head.
     pub(crate) prefill_scope: bool,
+    /// The band this forward runs: the weights' and the state's scope (the
+    /// whole model is [`Qwen4BandScope::single`]).
+    scope: Qwen4BandScope,
+    /// `Some(route_rows)` only inside [`Self::forward_mesh_chunk`]: the epoch's
+    /// canonical routing rows. Mesh forwards are enqueue-only: no retained
+    /// body, no blocking token or PLE upload, no context growth.
+    mesh_route_rows: Option<usize>,
+    /// Fenced async upload of a mesh input band's token ids.
+    mesh_tokens: PleHostStage,
+    /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
+    mesh_trunk_ops: std::ops::Range<u32>,
     #[cfg(target_os = "linux")]
     npu_trunk: Option<npu_forward::NpuForward>,
 }
@@ -5358,6 +5534,61 @@ fn cut_boundaries(
     (bounds, count)
 }
 
+/// Op ids of the trunk (no head) the band runs, in issue order, from the pure
+/// step graph: the input `Embed` op leads the input band and the head ops
+/// ([`Qwen4GpuForward::mesh_op_range`]) trail the output band's range.
+fn mesh_trunk_op_range(
+    config: &Qwen4Config,
+    scope: &Qwen4BandScope,
+) -> Result<std::ops::Range<u32>, Qwen4GpuForwardError> {
+    let graph =
+        crate::program::qwen4_step_graph_with_output(config, MeshRoute::Decode, false, false)
+            .map_err(invalid)?;
+    let ids = crate::program::qwen4_rank_op_ids(&graph, scope);
+    let (Some(first), Some(last)) = (ids.first(), ids.last()) else {
+        return Err(invalid("the band owns no step-graph op"));
+    };
+    if (last.0 - first.0) as usize + 1 != ids.len() {
+        return Err(invalid("the band's step-graph ops are not contiguous"));
+    }
+    Ok(first.0..last.0 + 1)
+}
+
+/// Refuse, before any allocation, a band forward this build cannot run:
+/// the state must be scoped exactly like the weights, and a non-single band
+/// has no expert-parallel, tiered-expert or host-mapped route.
+fn check_band_admission(
+    bundle: &Qwen4Bundle,
+    scope: &Qwen4BandScope,
+    single_scope: bool,
+) -> Result<(), Qwen4GpuForwardError> {
+    scope.validate(&bundle.config).map_err(invalid)?;
+    let map = bundle.state.scope_map();
+    if map.band() != scope.band
+        || map.owns_input() != scope.input
+        || map.owns_output() != scope.output
+    {
+        return Err(invalid(format!(
+            "Qwen4 state scope {:?} (input {}, output {}) differs from the weights' band {:?} \
+             (input {}, output {})",
+            map.band(),
+            map.owns_input(),
+            map.owns_output(),
+            scope.band,
+            scope.input,
+            scope.output
+        )));
+    }
+    if !single_scope
+        && (bundle.weights.expert_tiers().is_some() || bundle.weights.ep_placement().is_some())
+    {
+        return Err(invalid(
+            "a pipeline-parallel band refuses expert tiers and expert parallelism",
+        ));
+    }
+    Ok(())
+}
+
 /// Environment knob naming the routing-trace output file (appended).
 pub const ROUTE_TRACE_ENV: &str = "HIPFIRE_QWEN4_ROUTE_TRACE";
 
@@ -5397,7 +5628,7 @@ fn prepare_trunk_iu4(
     let route = rdna_compute::qwen4_trunk_iu4_route(&gpu.arch, bundle.config.trunk_iu4_default)
         .map_err(invalid)?;
     let mask = &route.mask;
-    mask.check_layers(bundle.weights.layer_refs.len())
+    mask.check_layers(bundle.config.num_hidden_layers)
         .map_err(|error| invalid(format!("HIPFIRE_QWEN4_TRUNK_IU4: {error}")))?;
     let mut folds = Vec::new();
     if !gpu.qwen4_trunk_iu4_requested(mask) {
@@ -5419,8 +5650,8 @@ fn prepare_trunk_iu4(
     }
     let weights = &bundle.weights;
     let (mut mq4, mut verified, mut a4, mut other) = (0usize, 0usize, 0usize, 0usize);
-    for (index, layer) in weights.layer_refs.iter().enumerate() {
-        let bits = mask.bits(index);
+    for layer in weights.layer_refs.iter() {
+        let bits = mask.bits(layer.layer);
         let matrices = match (&layer.gdn, &layer.attention) {
             (Some(gdn), _) => {
                 let g = gdn_desc(weights, gdn)?;
@@ -5472,8 +5703,8 @@ fn prepare_trunk_iu4(
         return Ok((folds, Vec::new()));
     }
     let result = (|| {
-        for (index, layer) in weights.layer_refs.iter().enumerate() {
-            let Some(gdn) = &layer.gdn else {
+        for index in 0..bundle.config.num_hidden_layers {
+            let Some(gdn) = weights.layer(index).and_then(|layer| layer.gdn.as_ref()) else {
                 folds.push(None);
                 continue;
             };
@@ -5515,7 +5746,7 @@ fn prepare_trunk_iu4(
     // artifacts record expert symmetry under their own metadata key.
     gpu.mq4v2_symmetric = true;
     gpu.qwen4_trunk_iu4 = true;
-    let layer_bits = (0..weights.layer_refs.len())
+    let layer_bits = (0..bundle.config.num_hidden_layers)
         .map(|layer| mask.bits(layer))
         .collect();
     Ok((folds, layer_bits))
@@ -5575,10 +5806,15 @@ impl Qwen4GpuForward {
         #[cfg(target_os = "linux")] npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
+        let scope = bundle.weights.band_scope().clone();
+        let single_scope = scope == Qwen4BandScope::single(&bundle.config);
+        check_band_admission(bundle, &scope, single_scope)?;
+        let mesh_trunk_ops = mesh_trunk_op_range(&bundle.config, &scope)?;
         let flash_next = bundle.config.profile.is_flash_next();
         let (scratch, host_token_bytes, host_ple_bytes) =
-            Qwen4GpuForwardScratch::new(gpu, &bundle.config, max_chunk, mode)?;
-        let mut moe = Vec::with_capacity(bundle.config.num_hidden_layers);
+            Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
+        let mut moe: Vec<Option<Qwen4MoeLayerRuntime>> =
+            (0..bundle.config.num_hidden_layers).map(|_| None).collect();
         let mut decode_q8 = Vec::new();
         let mut route_trace = None;
         let mut cut_layers: Option<CutLayers> = None;
@@ -5593,7 +5829,7 @@ impl Qwen4GpuForward {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
                 for layer in &bundle.weights.layer_refs {
                     if let Some(weights) = layer.ffn.moe() {
-                        moe.push(Qwen4MoeLayerRuntime::from_moe_ep(
+                        moe[layer.layer] = Some(Qwen4MoeLayerRuntime::from_moe_ep(
                             gpu,
                             &bundle.weights,
                             weights,
@@ -5607,7 +5843,7 @@ impl Qwen4GpuForward {
             } else {
                 for layer in &bundle.weights.layer_refs {
                     if let Some(weights) = layer.ffn.moe() {
-                        moe.push(Qwen4MoeLayerRuntime::from_moe(
+                        moe[layer.layer] = Some(Qwen4MoeLayerRuntime::from_moe(
                             gpu,
                             &bundle.weights,
                             weights,
@@ -5617,8 +5853,19 @@ impl Qwen4GpuForward {
                     }
                 }
             }
+            let moe_count = moe.iter().flatten().count();
+            if !single_scope
+                && moe
+                    .iter()
+                    .flatten()
+                    .any(|layer| layer.host_mapped() || layer.slab.is_some())
+            {
+                return Err(invalid(
+                    "a pipeline-parallel band refuses host-mapped and slab expert layers",
+                ));
+            }
             let compact = mode == Qwen4ForwardScratchMode::FnSymGfx1201;
-            if compact && moe.iter().any(|layer| layer.slab.is_some()) {
+            if compact && moe.iter().flatten().any(|layer| layer.slab.is_some()) {
                 return Err(invalid(
                     "the compact scratch plan has no expert-slab route (K1 decode needs the F32 MoE buffers)",
                 ));
@@ -5672,7 +5919,7 @@ impl Qwen4GpuForward {
             // Stock FP8: no QT44/QT53 headers to verify; the grouped route runs
             // in the Full plan's preallocated F32 buffers, proved here once.
             let stock_fp8 = bundle.weights.manifest.identity.recipe.is_stock_fp8();
-            if stock_fp8 && !moe.is_empty() {
+            if stock_fp8 && moe_count > 0 {
                 check_fp8_grouped_scratch(&scratch, &bundle.config, max_chunk)?;
                 // The stable-scatter grouping scratch is reserved here, before any
                 // forward or capture, so no first decode/prefill grows it per call.
@@ -5684,22 +5931,22 @@ impl Qwen4GpuForward {
                         bundle.config.num_experts,
                     )?;
             }
-            if !stock_fp8 && ep.is_none() && !moe.is_empty() && gpu.qwen4_moe_sym_iu4_requested() {
+            if !stock_fp8 && ep.is_none() && moe_count > 0 && gpu.qwen4_moe_sym_iu4_requested() {
                 let mut verified = 0usize;
-                for layer in &mut moe {
+                for layer in moe.iter_mut().flatten() {
                     verified += usize::from(layer.verify_symmetric(gpu, &bundle.config)?);
                 }
                 eprintln!(
                     "  qwen4 symmetric IU4 MoE: {verified}/{} layers verified symmetric",
-                    moe.len()
+                    moe_count
                 );
                 // The compact scratch has no buffer for the F32 route of a
                 // layer that is not symmetric: never run it silently.
-                if compact && verified != moe.len() {
+                if compact && verified != moe_count {
                     return Err(invalid(format!(
                         "compact scratch was selected from the artifact's source headers, but \
                          the GPU check verified only {verified}/{} layers symmetric",
-                        moe.len()
+                        moe_count
                     )));
                 }
                 if verified > 0 {
@@ -5721,7 +5968,9 @@ impl Qwen4GpuForward {
                             .as_deref(),
                     ) && ep.as_ref().is_some_and(|state| state.tile.is_some()))
                 {
-                    expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk)?;
+                    if single_scope {
+                        expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk)?;
+                    }
                 }
             } else {
                 gpu.qwen4_trunk_iu4 = false;
@@ -5766,6 +6015,11 @@ impl Qwen4GpuForward {
                     .iter()
                     .all(|weight| weight.dtype == DType::BF16 && weight.k % 32 == 0)
             {
+                if !single_scope {
+                    return Err(invalid(
+                        "a pipeline-parallel band refuses the gfx1151 Q8 decode copies",
+                    ));
+                }
                 for weight in sources {
                     decode_q8.push(gpu.quantize_bf16_q8_0(weight.buf, weight.m, weight.k)?);
                 }
@@ -5774,6 +6028,11 @@ impl Qwen4GpuForward {
                 .ok()
                 .filter(|_| flash_next)
             {
+                if !single_scope {
+                    return Err(invalid(format!(
+                        "{ROUTE_TRACE_ENV} has no meaning for a pipeline-parallel band"
+                    )));
+                }
                 let slots = bundle.config.num_hidden_layers * bundle.config.num_experts_per_tok;
                 let file = std::fs::OpenOptions::new()
                     .create(true)
@@ -5788,6 +6047,11 @@ impl Qwen4GpuForward {
                 eprintln!("  qwen4 routing trace -> {path}");
             }
             if let Ok(raw) = hipfire_config::developer_var(CUT_LAYERS_ENV) {
+                if !single_scope {
+                    return Err(invalid(format!(
+                        "{CUT_LAYERS_ENV} cannot be set for a pipeline-parallel band (the band edge is the cut)"
+                    )));
+                }
                 let config = &bundle.config;
                 let ple_layer_index = config
                     .ple
@@ -5809,7 +6073,7 @@ impl Qwen4GpuForward {
             if let Some(stage) = expert_stage {
                 let _ = stage.free_gpu(gpu);
             }
-            for layer in moe {
+            for layer in moe.into_iter().flatten() {
                 let _ = layer.free_gpu(gpu);
             }
             if let Some(ep) = ep {
@@ -5855,6 +6119,10 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             lane_scope: false,
             prefill_scope: false,
+            scope,
+            mesh_route_rows: None,
+            mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
+            mesh_trunk_ops,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
@@ -6006,11 +6274,11 @@ impl Qwen4GpuForward {
                 });
             }
         }
-        if sources.len() != self.moe.len() {
+        if sources.len() != self.moe_count() {
             return Err(invalid(format!(
                 "EP expert sources cover {} layers, the forward has {}",
                 sources.len(),
-                self.moe.len()
+                self.moe_count()
             )));
         }
         Ok(sources)
@@ -6081,7 +6349,7 @@ impl Qwen4GpuForward {
         peers: &[Vec<Qwen4PeerExpertSource>],
         gather: Arc<dyn MoeRowGather + Send + Sync>,
     ) -> Result<(), Qwen4GpuForwardError> {
-        let layers = self.moe.len();
+        let layers = self.moe_count();
         let max_chunk = self.scratch.max_chunk;
         // The EP decode runtime's route-selecting properties per MoE ordinal
         // (host-mapped, symmetric, all-MQ4 gate/up): a balanced layer's live
@@ -6089,6 +6357,7 @@ impl Qwen4GpuForward {
         let moe_traits: Vec<(bool, bool, bool)> = self
             .moe
             .iter()
+            .flatten()
             .map(|moe| (moe.host_mapped, moe.symmetric, moe.experts_all_gate_up_mq4))
             .collect();
         let Some(ep) = self.ep.as_mut() else {
@@ -6327,7 +6596,7 @@ impl Qwen4GpuForward {
         &mut self,
         hook: Arc<dyn MoeTileExchange + Send + Sync>,
     ) -> Result<(), Qwen4GpuForwardError> {
-        let layers = self.moe.len();
+        let layers = self.moe_count();
         let Some(route) = self.ep.as_mut().and_then(|ep| ep.tile.as_mut()) else {
             return Err(invalid(
                 "owner-routed prefill was not admitted on this rank",
@@ -6342,7 +6611,7 @@ impl Qwen4GpuForward {
         let wmma = route.wmma;
         route.hook = Some(hook);
         if !wmma {
-            for layer in &mut self.moe {
+            for layer in self.moe.iter_mut().flatten() {
                 layer.symmetric = true;
             }
         }
@@ -6365,6 +6634,7 @@ impl Qwen4GpuForward {
         let Qwen4GpuForward {
             scratch,
             host_ple,
+            mesh_tokens,
             moe,
             expert_stage,
             ep,
@@ -6386,6 +6656,9 @@ impl Qwen4GpuForward {
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
+        if let Some(error) = mesh_tokens.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
         #[cfg(target_os = "linux")]
         if let Some(npu) = npu_trunk {
             if let Err(e) = npu.free(gpu) {
@@ -6428,7 +6701,7 @@ impl Qwen4GpuForward {
                 }
             }
         }
-        for layer in moe {
+        for layer in moe.into_iter().flatten() {
             if let Some(error) = layer.free_gpu(gpu) {
                 if first.is_none() {
                     first = Some(error);
@@ -7003,6 +7276,253 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// Number of MoE runtimes this forward holds.
+    pub(crate) fn moe_count(&self) -> usize {
+        self.moe.iter().flatten().count()
+    }
+
+    fn npu_trunk_loaded(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.npu_trunk.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// The band this forward runs.
+    pub fn band_scope(&self) -> &Qwen4BandScope {
+        &self.scope
+    }
+
+    /// Op ids of the band program a mesh forward runs, in issue order: the
+    /// trunk ops (input `Embed` first on the input band), then on the output
+    /// band the final HC read and LM head when `head`, and the argmax when
+    /// `top1` (which requires `head`).
+    pub fn mesh_op_range(&self, head: bool, top1: bool) -> std::ops::Range<u32> {
+        let mut range = self.mesh_trunk_ops.clone();
+        if self.scope.output && head {
+            range.end += 2 + u32::from(top1);
+        }
+        range
+    }
+
+    /// The routing/scope flags a forward of `rows` rows runs under, from
+    /// whether the bundle's prefill entry set `prefill_scope`.
+    fn route_scopes(prefill_scope: bool, gpu: &Gpu, rows: usize) -> (bool, bool) {
+        let pm_invariant = trunk_prefill_invariant_scope(
+            prefill_scope,
+            &gpu.arch,
+            gpu.arch == "gfx1151"
+                && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
+        );
+        let append = rdna_compute::prefill_invariant::qwen4_append_wmma_route(
+            rdna_compute::prefill_invariant::qwen4_append_wmma_enabled(),
+            prefill_scope,
+            &gpu.arch,
+            rows,
+            rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows(),
+            pm_invariant,
+        );
+        (pm_invariant, append)
+    }
+
+    /// Exact HC-streams geometry of a `rows`-row mesh forward on `route`:
+    /// the canonical routing rows, the stream dtype and the live bytes. Pure
+    /// of forward state; the same decision `forward_mesh_chunk` re-checks.
+    pub fn mesh_layout(
+        &self,
+        bundle: &Qwen4Bundle,
+        gpu: &mut Gpu,
+        route: MeshRoute,
+        rows: usize,
+    ) -> Result<Qwen4MeshLayout, Qwen4GpuForwardError> {
+        if rows == 0 || rows > self.scratch.max_chunk {
+            return Err(invalid(format!(
+                "mesh forward of {rows} rows exceeds the configured capacity {}",
+                self.scratch.max_chunk
+            )));
+        }
+        let (pm_invariant, append) = Self::route_scopes(route == MeshRoute::Prefill, gpu, rows);
+        let prior = std::mem::replace(&mut gpu.prefill_invariant_scope, pm_invariant || append);
+        let route_rows = gpu.route_rows(rows);
+        let bf16_streams = gpu.qwen4_bf16_streams(rows);
+        gpu.prefill_invariant_scope = prior;
+        let stream_bytes = rows
+            .checked_mul(program_dims(&bundle.config).wide())
+            .and_then(|elements| elements.checked_mul(if bf16_streams { 2 } else { 4 }))
+            .ok_or_else(|| invalid("Qwen4 stream bytes overflow"))?;
+        Ok(Qwen4MeshLayout {
+            route_rows,
+            bf16_streams,
+            stream_bytes,
+        })
+    }
+
+    /// The live HC streams of `layout` as an exact-byte view of
+    /// `scratch.streams`: a non-input band receives into it, a non-output band
+    /// publishes from it (its last `HyperWrite` leaves them there).
+    pub fn mesh_stream_view(
+        &self,
+        layout: &Qwen4MeshLayout,
+    ) -> Result<GpuTensor, Qwen4GpuForwardError> {
+        let elements = layout.stream_bytes / std::mem::size_of::<f32>();
+        if layout.stream_bytes % std::mem::size_of::<f32>() != 0
+            || elements > self.scratch.streams.numel()
+        {
+            return Err(invalid("mesh stream bytes do not fit the stream scratch"));
+        }
+        Ok(view(&self.scratch.streams, 0, elements))
+    }
+
+    /// Refuse every route a mesh forward must not take: retained replay,
+    /// the NPU trunk, expert staging/EP, lanes and developer taps.
+    fn check_mesh_admission(
+        &self,
+        bundle: &Qwen4Bundle,
+        gpu: &Gpu,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.scope != *bundle.weights.band_scope()
+            || bundle.state.scope_map().band() != self.scope.band
+        {
+            return Err(invalid(
+                "mesh forward bundle is not the band this forward was built for",
+            ));
+        }
+        let refused = if self.ep.is_some() {
+            Some("expert parallelism")
+        } else if self.expert_stage.is_some() {
+            Some("expert staging")
+        } else if self.npu_trunk_loaded() {
+            Some("the NPU trunk")
+        } else if self.qsa_tap.is_some() {
+            Some("the QSA parity tap")
+        } else if self.route_trace.is_some() {
+            Some("the routing trace")
+        } else if self.cut_layers.is_some() {
+            Some(CUT_LAYERS_ENV)
+        } else if self.lane_scope {
+            Some("lane scope")
+        } else if !matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback) {
+            Some("a retained replay body")
+        } else {
+            None
+        };
+        match refused {
+            Some(route) => Err(invalid(format!("a mesh forward refuses {route}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Map the QSA context (and the gathered-prefill workspace) a mesh
+    /// forward through `end_position` needs, outside any mesh run: the run
+    /// itself never grows context.
+    pub fn prepare_mesh_capacity(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        end_position: usize,
+        route_rows: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.check_mesh_admission(bundle, gpu)?;
+        if end_position > bundle.state.max_seq_len {
+            return Err(invalid(format!(
+                "Qwen4 forward end position {end_position} exceeds context capacity {}",
+                bundle.state.max_seq_len
+            )));
+        }
+        bundle.release_session_for_growth(gpu, end_position);
+        bundle
+            .state
+            .ensure_mapped_capacity(gpu, end_position)
+            .map_err(|error| {
+                invalid(format!(
+                    "map Qwen4 QSA context through {end_position} tokens: {error}"
+                ))
+            })?;
+        if route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+            if let Some(qsa) = bundle
+                .state
+                .qsa
+                .first()
+                .filter(|qsa| qsa.f16_arena.is_none())
+            {
+                rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
+                    gpu,
+                    qsa.format,
+                    bundle.config.num_key_value_heads,
+                    end_position,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue one band forward of a mesh epoch: `tokens` (read for every
+    /// band's history/position commit; uploaded and embedded only by the input
+    /// band) of canonical routing rows `route_rows` on `route`. A non-input
+    /// band starts from the HC streams already received into
+    /// `scratch.streams`; a non-output band leaves them there after its last
+    /// `HyperWrite`; only the output band takes `head` (final HC collapse, LM
+    /// head, argmax). Position, QSA marks and PLE history commit on every band.
+    /// Nothing here waits on the GPU; capacity comes from
+    /// [`Self::prepare_mesh_capacity`].
+    pub fn forward_mesh_chunk(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        route_rows: usize,
+        route: MeshRoute,
+        head: Option<Qwen4MeshHead<'_>>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        self.check_mesh_admission(bundle, gpu)?;
+        let rows = tokens.len();
+        match route {
+            MeshRoute::Decode if rows != 1 => {
+                return Err(invalid("a mesh Decode forward carries exactly one row"));
+            }
+            MeshRoute::Verify => {
+                return Err(invalid(
+                    "mesh Verify windows are not admitted under pipeline parallelism",
+                ));
+            }
+            _ => {}
+        }
+        let output_policy = match (&head, self.scope.output) {
+            (Some(head), true) => Qwen4OutputPolicy::Rows(head.rows),
+            (None, _) => Qwen4OutputPolicy::None,
+            (Some(_), false) => {
+                return Err(invalid("only the output band takes a mesh head"));
+            }
+        };
+        let layout = self.mesh_layout(bundle, gpu, route, rows)?;
+        if layout.route_rows != route_rows {
+            return Err(invalid(format!(
+                "mesh epoch routing rows {route_rows} differ from this forward's {}",
+                layout.route_rows
+            )));
+        }
+        self.validate_tokens(bundle, tokens)?;
+        let prior = (self.prefill_scope, self.mesh_route_rows);
+        self.prefill_scope = route == MeshRoute::Prefill;
+        self.mesh_route_rows = Some(route_rows);
+        let result = self.forward_chunk_inner(
+            bundle,
+            gpu,
+            tokens,
+            None,
+            head.map(|head| head.logits),
+            head.and_then(|head| head.top1),
+            None,
+            output_policy,
+        );
+        (self.prefill_scope, self.mesh_route_rows) = prior;
+        result
+    }
+
     /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
     /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
@@ -7023,23 +7543,7 @@ impl Qwen4GpuForward {
         // append route below. Every row-count routing decision of this forward
         // then sees the canonical chunk size; launches keep the real row
         // count. Restored below on the single return path.
-        let pm_invariant = trunk_prefill_invariant_scope(
-            self.prefill_scope,
-            &gpu.arch,
-            gpu.arch == "gfx1151"
-                && rdna_compute::prefill_invariant::prefill_pm_invariant_enabled(),
-        );
-        // The agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`, gfx1151): a
-        // prefill tile of `min_rows..512` rows takes the same canonical routing
-        // (the >= 512-row kernel family) with the MoE on the F16 WMMA grouped arm.
-        let append = rdna_compute::prefill_invariant::qwen4_append_wmma_route(
-            rdna_compute::prefill_invariant::qwen4_append_wmma_enabled(),
-            self.prefill_scope,
-            &gpu.arch,
-            tokens.len(),
-            rdna_compute::prefill_invariant::qwen4_append_wmma_min_rows(),
-            pm_invariant,
-        );
+        let (pm_invariant, append) = Self::route_scopes(self.prefill_scope, gpu, tokens.len());
         if append {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -7128,6 +7632,19 @@ impl Qwen4GpuForward {
             stage.restore_blocking(gpu)?;
         }
         let config = bundle.config.clone();
+        let band = self.scope.band.clone();
+        let (input, output) = (self.scope.input, self.scope.output);
+        let mesh_route_rows = self.mesh_route_rows;
+        let mesh_run = mesh_route_rows.is_some();
+        if (!input && argmax_of.is_some())
+            || (!output
+                && (output_policy.requested_rows(n).is_some() || wide_hidden_capture.is_some()))
+        {
+            return Err(invalid(format!(
+                "band {}..{} cannot run an argmax token, head or capture it does not own",
+                band.start, band.end
+            )));
+        }
         let end_position = bundle
             .state
             .position
@@ -7193,40 +7710,50 @@ impl Qwen4GpuForward {
         // unpublished and already mapped pages owned.
         // Session snapshots yield to context growth (only at a growth
         // boundary; no query on the steady path).
-        bundle.release_session_for_growth(gpu, end_position);
-        let mapped_before = bundle.state.mapped_context_tokens();
-        bundle
-            .state
-            .ensure_mapped_capacity(gpu, end_position)
-            .map_err(|error| {
-                invalid(format!(
-                    "map Qwen4 QSA context through {end_position} tokens: {error}"
-                ))
-            })?;
-        if gpu.route_rows(n) >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
-            if let Some(qsa) = bundle
-                .state
-                .qsa
-                .first()
-                .filter(|qsa| qsa.f16_arena.is_none())
-            {
-                rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
-                    gpu,
-                    qsa.format,
-                    config.num_key_value_heads,
-                    end_position,
-                )?;
+        if mesh_run {
+            if bundle.state.mapped_context_tokens() < end_position {
+                return Err(invalid(format!(
+                    "mesh forward needs the QSA context mapped through {end_position} tokens \
+                     (prepare_mesh_capacity), {} are mapped",
+                    bundle.state.mapped_context_tokens()
+                )));
             }
-        }
-        if bundle.state.mapped_context_tokens() != mapped_before {
-            if let Ok((target, mtp)) = bundle.qsa_context_committed_bytes(gpu) {
-                eprintln!(
+        } else {
+            bundle.release_session_for_growth(gpu, end_position);
+            let mapped_before = bundle.state.mapped_context_tokens();
+            bundle
+                .state
+                .ensure_mapped_capacity(gpu, end_position)
+                .map_err(|error| {
+                    invalid(format!(
+                        "map Qwen4 QSA context through {end_position} tokens: {error}"
+                    ))
+                })?;
+            if gpu.route_rows(n) >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS {
+                if let Some(qsa) = bundle
+                    .state
+                    .qsa
+                    .first()
+                    .filter(|qsa| qsa.f16_arena.is_none())
+                {
+                    rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
+                        gpu,
+                        qsa.format,
+                        config.num_key_value_heads,
+                        end_position,
+                    )?;
+                }
+            }
+            if bundle.state.mapped_context_tokens() != mapped_before {
+                if let Ok((target, mtp)) = bundle.qsa_context_committed_bytes(gpu) {
+                    eprintln!(
                     "  qwen4 QSA context mapped for {} tokens: {} MiB target + {} MiB MTP committed, {} MiB gather workspace",
                     bundle.state.mapped_context_tokens(),
                     target >> 20,
                     mtp >> 20,
                     gpu.qsa_gather_scratch_bytes() >> 20
                 );
+                }
             }
         }
         // Without PLE (`config.ple` is `None`) there is no PLE layer, no row
@@ -7295,7 +7822,7 @@ impl Qwen4GpuForward {
         // The PLE row fetch runs on the row store's worker while the step
         // program is built below; a matching retained lookahead is adopted.
         let retained = self.ple_ahead.take();
-        let mut ple = match bundle.ple.as_ref() {
+        let mut ple = match bundle.ple.as_ref().filter(|_| input) {
             None => {
                 drop(retained);
                 None
@@ -7324,6 +7851,11 @@ impl Qwen4GpuForward {
         // Largest row count of a few-row (decode-exact) route in this forward:
         // the historic 8, or the verify scope's row-exact rows.
         let few_row_limit = gpu.few_row_limit();
+        if mesh_route_rows.is_some_and(|expected| expected != route_n) {
+            return Err(invalid(
+                "mesh epoch routing rows differ from the Gpu's routing scope",
+            ));
+        }
         // Expert parallelism picks the MoE table per forward by routing row
         // count, identically on every rank: one row, or a few-row forward
         // (`2..=QWEN4_EP_GATHER_MAX_ROWS` rows that are also the routing rows:
@@ -7349,7 +7881,7 @@ impl Qwen4GpuForward {
                         "EP few-row forward before attach_ep: the row gather is not installed",
                     ));
                 }
-            } else if ep.moe_full.len() != self.moe.len() {
+            } else if ep.moe_full.len() != self.moe_count() {
                 return Err(invalid(
                     "EP chunk forward before attach_ep: the full expert tables are not built",
                 ));
@@ -7455,8 +7987,6 @@ impl Qwen4GpuForward {
         // closure below moves `steps`, so the frame held three copies (~1.7 MiB). That
         // overflowed the 2 MiB stack of an EP peer rank's worker thread in a chunk forward.
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(QWEN4_STEP_INLINE_CAPACITY);
-        let mut gdn_slot = 0usize;
-        let mut qsa_slot = 0usize;
         // `HIPFIRE_QWEN4_PLE_FUSE`: the PLE rows are staged straight as F16 for
         // the BF16 key/value projections (decided once; the step op and the
         // staging closure agree on it).
@@ -7468,14 +7998,17 @@ impl Qwen4GpuForward {
         let cut_layers = self.cut_layers;
         let mut cut_steps = [0usize; MAX_CUT_LAYERS];
         let mut cut_count = 0usize;
-        for layer_index in 0..config.num_hidden_layers {
+        for layer_index in band.clone() {
             if let Some(cuts) = cut_layers.as_ref() {
                 if cuts.contains(layer_index) {
                     cut_steps[cut_count] = steps.len();
                     cut_count += 1;
                 }
             }
-            let layer = &bundle.weights.layer_refs[layer_index];
+            let layer = bundle
+                .weights
+                .layer(layer_index)
+                .ok_or_else(|| invalid(format!("layer {layer_index} is not owned by this band")))?;
             if ple_layer_index == Some(layer_index) {
                 let ple_weights = layer
                     .ple
@@ -7537,12 +8070,12 @@ impl Qwen4GpuForward {
                 (Some(live), _) => Some(live),
                 (None, Some(ep)) if route_n > 1 && !ep_few_rows => {
                     if tile_route.is_some() {
-                        self.moe.get(layer_index)
+                        self.moe.get(layer_index).and_then(Option::as_ref)
                     } else {
                         ep.moe_full.get(layer_index)
                     }
                 }
-                _ => self.moe.get(layer_index),
+                _ => self.moe.get(layer_index).and_then(Option::as_ref),
             };
             if let Some(stage) = expert_stage {
                 stage.prepare_runtime(gpu, layer_index, layer_moe)?;
@@ -7613,12 +8146,11 @@ impl Qwen4GpuForward {
 
             match layer.kind {
                 LayerType::LinearAttention => {
-                    let state = bundle
+                    let gdn_slot = bundle
                         .state
-                        .gdn
-                        .get(gdn_slot)
+                        .gdn_local(layer_index)
                         .ok_or_else(|| invalid("GDN state slot missing"))?;
-                    gdn_slot += 1;
+                    let state = &bundle.state.gdn[gdn_slot];
                     let weights = match &description.attention {
                         Qwen4AttentionWeights::Linear(weights) => weights,
                         _ => return Err(invalid("GDN descriptor kind mismatch")),
@@ -7656,7 +8188,7 @@ impl Qwen4GpuForward {
                         value_dim: dims.linear_value_head_dim,
                         conv_kernel: dims.linear_conv_kernel_dim,
                         input_width: dims.hidden,
-                        row_capture: bundle.state.gdn_row_capture(gdn_slot - 1, n),
+                        row_capture: bundle.state.gdn_row_capture(gdn_slot, n),
                         zba_fold: self.trunk_zba.get(layer_index).and_then(Option::as_ref),
                         trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                         phase: MixerPhase::Whole,
@@ -7665,10 +8197,8 @@ impl Qwen4GpuForward {
                 LayerType::FullAttention => {
                     let state = bundle
                         .state
-                        .qsa
-                        .get(qsa_slot)
+                        .qsa_by_layer(layer_index)
                         .ok_or_else(|| invalid("QSA state slot missing"))?;
-                    qsa_slot += 1;
                     let weights = match &description.attention {
                         Qwen4AttentionWeights::Full(weights) => weights,
                         _ => return Err(invalid("QSA descriptor kind mismatch")),
@@ -7874,6 +8404,7 @@ impl Qwen4GpuForward {
         // A HIP body: no retained tape records or routes this forward.
         let hip_body = n == 1
             && !self.lane_scope
+            && !mesh_run
             && !gpu.prefill_invariant_scope
             && matches!(gpu.replay.state(), ReplayState::Hip | ReplayState::Fallback);
         // `argmax_of` on a HIP body: the GPU argmax writes the token id and the
@@ -7910,7 +8441,12 @@ impl Qwen4GpuForward {
         if let Some(readback) = self.token_readback.as_mut() {
             readback.complete(&gpu.hip)?;
         }
-        let ids = view(&self.scratch.token_ids, 0, n * std::mem::size_of::<i32>());
+        let id_bytes = if input {
+            n * std::mem::size_of::<i32>()
+        } else {
+            0
+        };
+        let ids = view(&self.scratch.token_ids, 0, id_bytes);
         // No claim on the device ids until this forward's own upload lands.
         self.uploaded_id_rows = 0;
         if let Some(previous) = device_token {
@@ -7939,6 +8475,17 @@ impl Qwen4GpuForward {
                     return Err(error.into());
                 }
             }
+        } else if !input {
+            // A non-input band receives HC streams, not token ids.
+        } else if mesh_run {
+            // Fenced async upload: no host wait on the device queue.
+            let ids_bytes = n * std::mem::size_of::<i32>();
+            let staged_ids = self.mesh_tokens.stage_buffer(gpu, ids_bytes)?;
+            for (index, token) in tokens.iter().copied().enumerate() {
+                staged_ids[index * 4..index * 4 + 4].copy_from_slice(&(token as i32).to_ne_bytes());
+            }
+            self.mesh_tokens
+                .upload_async(gpu, &self.scratch.token_ids.buf, ids_bytes)?;
         } else {
             for (index, token) in tokens.iter().copied().enumerate() {
                 let bytes = &mut self.host_token_bytes[index * 4..index * 4 + 4];
@@ -7965,12 +8512,16 @@ impl Qwen4GpuForward {
                 }
             }
         }
-        let embedding_rot = view(&self.scratch.embedding_rot, 0, n * config.hidden_size);
-        let embeddings = view(&self.scratch.embeddings, 0, n * config.hidden_size);
+        let embed_len = if input { n * config.hidden_size } else { 0 };
+        let embedding_rot = view(&self.scratch.embedding_rot, 0, embed_len);
+        let embeddings = view(&self.scratch.embeddings, 0, embed_len);
         // Every fallible step between the readback enqueue and the `attempt`
         // closure: on failure retire the queued id copy (keeping the original
         // error) so a caller's lane/NPU path may rewrite `token_ids`.
         let embedded = (|| -> Result<(), Qwen4GpuForwardError> {
+            if !input {
+                return Ok(());
+            }
             let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
             execute_embedding(
                 gpu,
@@ -8006,22 +8557,16 @@ impl Qwen4GpuForward {
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
         > {
-            let ple_rows = view(
-                &self.scratch.ple_rows,
-                0,
-                n * ple_head_count * ple_row_width,
-            );
-            let staged = view(
-                &self.scratch.ple_staged,
-                0,
-                n * ple_head_count * ple_row_width,
-            );
+            let ple_len = if input { n * ple_head_count * ple_row_width } else { 0 };
+            let ple_rows = view(&self.scratch.ple_rows, 0, ple_len);
+            let staged = view(&self.scratch.ple_staged, 0, ple_len);
 
             // Expand the embedding batch into the row-major stream basis with
             // one broadcast kernel.  The shared HC program consumes
             // [row, branch, hidden], so a launch-per-row/branch memcpy loop is
             // both unnecessary and visible in short AR prefill profiles.
             let wide = dims.wide();
+            if input {
             if bf16_state {
                 gpu.hc_streams_init_from_embed_batched_bf16(
                     &embeddings,
@@ -8038,6 +8583,7 @@ impl Qwen4GpuForward {
                     config.hc_count as i32,
                     n as i32,
                 )?;
+            }
             }
 
             // PLE rows: wait for the host fetch, stage, upload and widen them.
@@ -8111,6 +8657,10 @@ impl Qwen4GpuForward {
                 // the previous forward's upload, so the staging buffer is free.
                 let upload_result = if device_token.is_some() {
                     ple_host.upload_unfenced(gpu, &staged.buf, upload_len)
+                } else if mesh_run && !gpu.graphs.capture_mode {
+                    // Mesh: never block the host on the device queue; the fence
+                    // keeps the staging bytes unwritable until the copy ran.
+                    ple_host.upload_async(gpu, &staged.buf, upload_len)
                 } else if ple_async_upload(
                     ple_host.enabled(),
                     false,
@@ -8176,6 +8726,7 @@ impl Qwen4GpuForward {
                 && !gpu.prefill_invariant_scope
                 && wide_hidden_capture.is_none()
                 && self.qsa_tap.is_none()
+                && !mesh_run
                 && self.cut_layers.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
             // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
@@ -8257,7 +8808,7 @@ impl Qwen4GpuForward {
                 // arena generations) here, before any retained submit.
                 let moe = &self.moe;
                 if let Err(reason) = gpu.replay.validate_route_identities(|key| {
-                    moe.iter()
+                    moe.iter().flatten()
                         .flat_map(|layer| layer.retained_identities.iter())
                         .find(|(bound, _)| *bound == key)
                         .map(|(_, identity)| identity.as_str())
@@ -10382,5 +10933,107 @@ mod ep_rank_generic_tests {
             }
         }
         assert!(claimed.iter().all(|&count| count == 1));
+    }
+}
+
+#[cfg(test)]
+mod mesh_range_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+    use hipfire_runtime::mesh_placement::BandPlacement;
+
+    #[test]
+    fn trunk_op_ranges_tile_the_graph_and_the_head_trails_the_output_band() {
+        let config = compact_test_config();
+        let full =
+            crate::program::qwen4_step_graph_with_output(&config, MeshRoute::Decode, true, true)
+                .unwrap();
+        let total = full.ops().len() as u32;
+        for counts in [vec![24, 24], vec![9, 8, 8, 8, 8, 7]] {
+            let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+            let placement = BandPlacement::from_counts(&mesh, config.num_hidden_layers, &counts)
+                .unwrap()
+                .with_first_band_min(2)
+                .unwrap();
+            let mut next = 0u32;
+            for stage in 0..counts.len() {
+                let scope = Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                let trunk = mesh_trunk_op_range(&config, &scope).unwrap();
+                assert_eq!(trunk.start, next, "bands tile the trunk ops without a gap");
+                next = trunk.end;
+                let ids = crate::program::qwen4_rank_op_ids(&full, &scope);
+                let head_ops = if scope.output { 3 } else { 0 };
+                assert_eq!(ids.len() as u32, trunk.end - trunk.start + head_ops);
+                assert_eq!(ids.first().map(|id| id.0), Some(trunk.start));
+            }
+            assert_eq!(next + 3, total, "the head ops trail the last trunk op");
+        }
+    }
+}
+
+#[cfg(test)]
+mod band_scratch_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+    use crate::expert_residency::forward_census_scope;
+    use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
+    use hipfire_runtime::mesh_placement::BandPlacement;
+
+    /// The scratch a band plans plus the output band's speculative rows is
+    /// exactly the S5 forward census of that band (both modes; a geometry the
+    /// census refuses the plan refuses too), and the whole-model scope is the
+    /// historical plan.
+    #[test]
+    fn band_plan_bytes_equal_the_forward_census() {
+        let config = compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        for mode in [
+            Qwen4ForwardScratchMode::Full,
+            Qwen4ForwardScratchMode::FnSymGfx1201,
+        ] {
+            for rows in [64usize, 256] {
+                assert_eq!(
+                    Qwen4GpuForwardScratch::device_bytes_scoped(&config, rows, mode, &single).ok(),
+                    Qwen4GpuForwardScratch::device_bytes(&config, rows, mode).ok()
+                );
+                for counts in [vec![24, 24], vec![9, 8, 8, 8, 8, 7]] {
+                    let mesh = DeviceMesh::rect(&[(DimKind::Pp, counts.len())]).unwrap();
+                    let placement =
+                        BandPlacement::from_counts(&mesh, config.num_hidden_layers, &counts)
+                            .unwrap()
+                            .with_first_band_min(2)
+                            .unwrap();
+                    for stage in 0..counts.len() {
+                        let scope =
+                            Qwen4BandScope::from_placement(&config, &placement, stage).unwrap();
+                        let planned = Qwen4GpuForwardScratch::device_bytes_scoped(
+                            &config, rows, mode, &scope,
+                        );
+                        let census = forward_census_scope(&config, rows, mode, &scope)
+                            .and_then(|census| census.total());
+                        match (planned, census) {
+                            (Ok(planned), Ok(census)) => {
+                                let spec = if scope.output {
+                                    (qwen4_spec_logit_rows(rows) * (config.vocab_size * 4 + 4))
+                                        as u64
+                                } else {
+                                    0
+                                };
+                                assert_eq!(
+                                    planned + spec,
+                                    census,
+                                    "{mode:?} {rows} rows stage {stage}"
+                                );
+                            }
+                            (Err(_), Err(_)) => {}
+                            (planned, census) => {
+                                panic!("plan {planned:?} and census {census:?} disagree")
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

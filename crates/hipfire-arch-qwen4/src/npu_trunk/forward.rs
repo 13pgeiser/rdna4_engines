@@ -430,6 +430,11 @@ impl NpuForward {
         }
         let result = trunk::admission::prepare_after_checks(
             || {
+                if *bundle.weights.band_scope()
+                    != crate::weights::Qwen4BandScope::single(&bundle.config)
+                {
+                    return Err(fail("requires the whole-model scope; the NPU trunk refuses pipeline-parallel bands"));
+                }
                 if gpu.arch != "gfx1151"
                     || !bundle.config.profile.is_flash_next()
                     || bundle.config.hidden_size != 2560
