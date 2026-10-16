@@ -761,7 +761,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {
             vram_lines.push(Line::from(Span::styled(
-                "Probing rocm-smi…",
+                "Probing GPU stats…",
                 Style::default().fg(MUTED),
             )));
         }
@@ -810,7 +810,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {}
     }
-    frame.render_widget(card("GPU (rocm-smi)", vram_lines), cols[1]);
+    frame.render_widget(card("GPU", vram_lines), cols[1]);
 }
 
 /// "Live metrics" card: windowed rates and quantiles from the worker's
@@ -2082,15 +2082,22 @@ mod render_tests {
     fn renders_offline_state_without_panic_or_stale_numbers() {
         let dash = Dashboard::offline(
             "127.0.0.1:11435".into(),
-            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
-            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
+            VramState::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            LoadState::Unavailable("GPU load unavailable: no GPU stats tool".into()),
         );
         let text = render_dashboard(Some(dash));
         assert!(text.contains("offline"), "expected offline marker");
         assert!(text.contains("hipfire serve"), "expected start hint");
         assert!(
-            text.contains("VRAM unavailable"),
-            "expected honest VRAM-unavailable line"
+            text.contains("GPU stats unavailable"),
+            "expected honest GPU-stats-unavailable line"
+        );
+        assert!(
+            !text.contains("No GPU detected") && !text.contains("not installed"),
+            "a missing stats tool must not read as a missing GPU"
         );
         // No fabricated telemetry: offline must not invent a tok/s or queue.
         assert!(!text.contains("tok/s"), "offline must not show tok/s");
@@ -2237,8 +2244,11 @@ mod render_tests {
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),
-            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
-            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
+            VramState::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            LoadState::Unavailable("GPU load unavailable: no GPU stats tool".into()),
         );
         d.system = Some(system);
         d
@@ -2277,9 +2287,12 @@ mod render_tests {
     #[test]
     fn system_tab_renders_unavailable_states_honestly() {
         let sys = SystemInfo {
-            gpu_name: Probe::Unavailable("unavailable: rocm-smi not installed".into()),
-            gpu_arch: Probe::Unavailable("unavailable: rocminfo not installed".into()),
-            hip_version: Probe::Unavailable("unavailable: hipconfig absent".into()),
+            gpu_name: Probe::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            gpu_arch: Probe::Unavailable("unavailable: rocminfo not found".into()),
+            hip_version: Probe::Unavailable("unavailable: hipconfig not found".into()),
             kernel_cache: Probe::Unavailable(
                 "/home/u/.hipfire_kernels (absent — populated on first run)".into(),
             ),

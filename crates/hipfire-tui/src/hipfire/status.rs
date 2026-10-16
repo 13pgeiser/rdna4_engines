@@ -136,10 +136,11 @@ fn read_serve_pid(paths: &HipfirePaths) -> (Option<u32>, bool) {
 }
 
 /// Derive the Home-tab GPU summary lines from the background-probed
-/// [`SystemInfo`] (rocm-smi product name + gfx arch) rather than running `lspci`
-/// synchronously on the UI thread. The worker probed this OFF the UI thread, so
-/// this is a pure in-memory format. Falls back to an honest hint when neither
-/// field probed cleanly.
+/// [`SystemInfo`] (amd-smi / rocm-smi product name + gfx arch) rather than
+/// running `lspci` synchronously on the UI thread. The worker probed this OFF
+/// the UI thread, so this is a pure in-memory format. When neither field probed
+/// cleanly it reports WHY (e.g. the stats tool is missing) and never claims "no
+/// GPU" — a missing stats tool says nothing about the PCI devices.
 fn gpu_lines_from_system(system: &super::dashboard::SystemInfo) -> Vec<String> {
     let mut lines = Vec::new();
     if system.gpu_name.is_available() {
@@ -149,7 +150,48 @@ fn gpu_lines_from_system(system: &super::dashboard::SystemInfo) -> Vec<String> {
         lines.push(format!("arch  {}", system.gpu_arch.display()));
     }
     if lines.is_empty() {
-        lines.push("No GPU detected via rocm-smi. Run hipfire diag for full probe.".into());
+        lines.push(format!(
+            "{}. Run hipfire diag for the full probe.",
+            system.gpu_name.display().trim_end_matches('.')
+        ));
     }
     lines
+}
+
+#[cfg(test)]
+mod gpu_lines_tests {
+    use super::*;
+    use crate::hipfire::dashboard::{Probe, SystemInfo};
+
+    fn system(gpu_name: Probe, gpu_arch: Probe) -> SystemInfo {
+        SystemInfo {
+            gpu_name,
+            gpu_arch,
+            hip_version: Probe::Unavailable("unavailable".into()),
+            kernel_cache: Probe::Unavailable("unavailable".into()),
+            loaded_model: Probe::Unavailable("no model loaded".into()),
+            model_checksum: Probe::Unavailable("no model loaded".into()),
+        }
+    }
+
+    #[test]
+    fn missing_stats_tool_is_reported_without_claiming_no_gpu() {
+        let reason = "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)";
+        let lines = gpu_lines_from_system(&system(
+            Probe::Unavailable(reason.into()),
+            Probe::Unavailable("unavailable: rocminfo not found".into()),
+        ));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(reason), "{}", lines[0]);
+        assert!(!lines[0].contains("No GPU detected"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn probed_name_and_arch_are_listed() {
+        let lines = gpu_lines_from_system(&system(
+            Probe::Value("AMD Radeon AI PRO R9700".into()),
+            Probe::Value("gfx1201".into()),
+        ));
+        assert_eq!(lines, vec!["AMD Radeon AI PRO R9700", "arch  gfx1201"]);
+    }
 }

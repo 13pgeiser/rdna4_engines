@@ -20,7 +20,7 @@ use crate::hipfire::dashboard::{run_bounded, RocmSmiRun};
 use crate::hipfire::native_cli_command;
 
 /// Hard wall-clock bound on `hipfire diag` — it spawns the daemon (GPU init), so
-/// it is much heavier than rocm-smi, but a hung daemon must not leak the worker
+/// it is much heavier than the amd-smi / rocm-smi probes, but a hung daemon must not leak the worker
 /// thread or an orphan holding VRAM forever.
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
 

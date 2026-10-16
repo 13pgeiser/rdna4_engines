@@ -4,19 +4,19 @@
 
 //! O3c-1 live serve Dashboard data layer.
 //!
-//! The PARSE logic (HTTP JSON → struct, rocm-smi text → VRAM) is factored into
+//! The PARSE logic (HTTP JSON → struct, amd-smi / rocm-smi output → VRAM) is factored into
 //! pure, I/O-free helpers so it can be unit-tested on CPU without a TTY, a
 //! running serve, or a GPU. The fetchers ([`fetch_dashboard`]) do the network /
 //! subprocess I/O and then hand raw text to those pure helpers.
 //!
 //! Honesty contract: every field is either REAL data parsed from the live
-//! serve / rocm-smi, or an explicit unavailable/offline state. We NEVER
+//! serve / GPU stats tool, or an explicit unavailable/offline state. We NEVER
 //! fabricate placeholder numbers and present them as live.
 
 use std::{
     env, fs,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,15 +32,16 @@ use serde_json::Value;
 use super::config::ConfigState;
 use super::metrics::{self, MetricsRing, MetricsView};
 
-/// Hard wall-clock bound on a single `rocm-smi` invocation. Even on the
-/// background thread a zombie / hung rocm-smi must not accumulate forever, so
-/// we spawn it, poll for completion, and `kill()` it past this deadline.
+/// Hard wall-clock bound on a single GPU-tool invocation (`amd-smi`,
+/// `rocm-smi`, `rocminfo`, `hipconfig`). Even on the background thread a
+/// zombie / hung tool must not accumulate forever, so we spawn it, poll for
+/// completion, and `kill()` it past this deadline.
 const ROCM_SMI_TIMEOUT: Duration = Duration::from_millis(2000);
 
-/// Per-GPU VRAM reading parsed from `rocm-smi`. Values are bytes.
+/// Per-GPU VRAM reading parsed from `amd-smi` / `rocm-smi`. Values are bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuMem {
-    /// rocm-smi card index (the `card0`/GPU[0] ordinal).
+    /// GPU index (amd-smi `gpu` / the rocm-smi `card0` ordinal).
     pub index: u32,
     pub used_bytes: u64,
     pub total_bytes: u64,
@@ -62,17 +63,18 @@ impl GpuMem {
 }
 
 /// VRAM availability state — distinguishes "we have real per-GPU numbers" from
-/// the honest "rocm-smi is absent / not Linux / returned garbage" case.
+/// the honest "no stats tool / not Linux / returned garbage" case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VramState {
-    /// Real per-GPU readings parsed from rocm-smi.
+    /// Real per-GPU readings parsed from amd-smi / rocm-smi.
     Available(Vec<GpuMem>),
-    /// rocm-smi missing, non-Linux, or unparseable. Carries an honest reason.
+    /// Stats tool missing, non-Linux, or unparseable. Carries an honest reason.
     Unavailable(String),
 }
 
-/// Per-GPU live load parsed from `rocm-smi --showuse --showtemp --showpower`.
-/// Each field is optional — rocm-smi key names vary by ROCm version, so a
+/// Per-GPU live load parsed from `amd-smi metric` (or `rocm-smi --showuse
+/// --showtemp --showpower`). Each field is optional — key names vary by tool
+/// and version, so a
 /// missing reading is honestly `None`, never fabricated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuLoad {
@@ -115,7 +117,7 @@ pub struct Dashboard {
     /// Models advertised by GET /v1/models (ids).
     pub model_ids: Vec<String>,
     pub vram: VramState,
-    /// Live per-GPU util / temp / power from rocm-smi (independent of serve).
+    /// Live per-GPU util / temp / power from amd-smi / rocm-smi (independent of serve).
     pub gpu_load: LoadState,
     /// When serve is down: an honest hint, e.g. how to start it.
     pub offline_hint: Option<String>,
@@ -126,7 +128,7 @@ pub struct Dashboard {
 
 impl Dashboard {
     /// Offline dashboard: serve unreachable. Carries a start hint and whatever
-    /// VRAM we could still read (rocm-smi works without serve).
+    /// VRAM we could still read (the stats CLI works without serve).
     pub fn offline(endpoint: String, vram: VramState, gpu_load: LoadState) -> Self {
         Self {
             serve_up: false,
@@ -250,13 +252,13 @@ impl Probe {
 }
 
 /// Live system diagnostics for the System tab. Probed OFF the UI thread (by the
-/// DashboardWorker) so a slow `rocm-smi` / `hipcc` invocation never blocks
+/// DashboardWorker) so a slow `amd-smi` / `hipcc` invocation never blocks
 /// render or input. Every field is an honest [`Probe`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemInfo {
-    /// GPU product name(s) from `rocm-smi --showproductname`.
+    /// GPU product name(s) from `amd-smi static --asic` (or `rocm-smi --showproductname`).
     pub gpu_name: Probe,
-    /// GPU arch / gfx target (e.g. `gfx1100`) from `rocm-smi --showhw`/gcnArch.
+    /// GPU arch / gfx target (e.g. `gfx1100`) from `amd-smi static --asic` or `rocminfo`.
     pub gpu_arch: Probe,
     /// HIP / ROCm runtime version (`hipconfig --version` or /opt/rocm/.info).
     pub hip_version: Probe,
@@ -312,28 +314,54 @@ impl SystemInfo {
     }
 }
 
-/// Probe GPU product name + arch via `rocm-smi`. Bounded so a hung rocm-smi
-/// cannot wedge the worker. Returns honest unavailable reasons on failure.
+/// Probe GPU product name + arch. Product name and arch come from `amd-smi`
+/// when present, else `rocm-smi` (name) / `rocminfo` (arch); every tool is
+/// resolved through the ROCm root and bounded so a hung tool cannot wedge the
+/// worker. Returns honest unavailable reasons on failure.
 fn probe_gpu() -> (Probe, Probe) {
-    let mut cmd = Command::new("rocm-smi");
-    cmd.args(["--showproductname", "--json"]);
-    let name = match run_bounded(cmd, ROCM_SMI_TIMEOUT) {
-        RocmSmiRun::Output(text) => parse_rocm_product_name(&text),
-        RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocm-smi not installed".into()),
-        RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocm-smi timed out".into()),
-        RocmSmiRun::SpawnError(e) => {
-            Probe::Unavailable(format!("unavailable: rocm-smi error: {e}"))
+    let (name, smi_arch) = match resolve_smi_tool() {
+        Some(tool @ SmiTool::AmdSmi(_)) => match smi_text(&tool, &AMD_SMI_ASIC_ARGS) {
+            Ok(text) => parse_amd_smi_asic(&text),
+            Err(e) => {
+                let reason = format!("unavailable: {e}");
+                (
+                    Probe::Unavailable(reason.clone()),
+                    Probe::Unavailable(reason),
+                )
+            }
+        },
+        Some(tool @ SmiTool::RocmSmi(_)) => {
+            let name = match smi_text(&tool, &["--showproductname", "--json"]) {
+                Ok(text) => parse_rocm_product_name(&text),
+                Err(e) => Probe::Unavailable(format!("unavailable: {e}")),
+            };
+            (
+                name,
+                Probe::Unavailable("unavailable: rocm-smi reports no gfx target".into()),
+            )
+        }
+        None => {
+            let reason = gpu_tool_missing_reason(hipfire_config::rocm::root().as_deref());
+            (
+                Probe::Unavailable(reason.clone()),
+                Probe::Unavailable(reason),
+            )
         }
     };
+    if smi_arch.is_available() {
+        return (name, smi_arch);
+    }
 
-    let cmd = Command::new("rocminfo");
-    let arch = match run_bounded(cmd, ROCM_SMI_TIMEOUT) {
-        RocmSmiRun::Output(text) => parse_rocminfo_arch(&text),
-        RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocminfo not installed".into()),
-        RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocminfo timed out".into()),
-        RocmSmiRun::SpawnError(e) => {
-            Probe::Unavailable(format!("unavailable: rocminfo error: {e}"))
-        }
+    let arch = match resolve_tool("rocminfo") {
+        None => Probe::Unavailable("unavailable: rocminfo not found".into()),
+        Some(rocminfo) => match run_bounded(Command::new(rocminfo), ROCM_SMI_TIMEOUT) {
+            RocmSmiRun::Output(text) => parse_rocminfo_arch(&text),
+            RocmSmiRun::NotFound => Probe::Unavailable("unavailable: rocminfo not found".into()),
+            RocmSmiRun::TimedOut => Probe::Unavailable("unavailable: rocminfo timed out".into()),
+            RocmSmiRun::SpawnError(e) => {
+                Probe::Unavailable(format!("unavailable: rocminfo error: {e}"))
+            }
+        },
     };
     (name, arch)
 }
@@ -410,27 +438,23 @@ pub fn parse_rocminfo_arch(body: &str) -> Probe {
     Probe::Unavailable("unavailable: no gfx target in rocminfo output".into())
 }
 
-/// Probe the HIP/ROCm version. Prefers `hipconfig --version`, falls back to the
-/// `/opt/rocm/.info/version` file.
+/// Probe the HIP/ROCm version. Prefers `hipconfig --version` (resolved through
+/// the ROCm root), falls back to the selected root's `.info/version`.
 fn probe_hip_version() -> Probe {
-    let mut cmd = Command::new("hipconfig");
-    cmd.arg("--version");
-    if let RocmSmiRun::Output(text) = run_bounded(cmd, ROCM_SMI_TIMEOUT) {
-        let v = text.trim();
-        if !v.is_empty() {
-            return Probe::Value(format!("HIP {v}"));
-        }
-    }
-    // Fallback: ROCm version info file.
-    for path in ["/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"] {
-        if let Ok(v) = fs::read_to_string(path) {
-            let v = v.trim();
+    if let Some(hipconfig) = resolve_tool("hipconfig") {
+        let mut cmd = Command::new(hipconfig);
+        cmd.arg("--version");
+        if let RocmSmiRun::Output(text) = run_bounded(cmd, ROCM_SMI_TIMEOUT) {
+            let v = text.trim();
             if !v.is_empty() {
-                return Probe::Value(format!("ROCm {v}"));
+                return Probe::Value(format!("HIP {v}"));
             }
         }
     }
-    Probe::Unavailable("unavailable: hipconfig absent and /opt/rocm/.info missing".into())
+    if let Some(v) = hipfire_config::rocm::version() {
+        return Probe::Value(format!("ROCm {v}"));
+    }
+    Probe::Unavailable("unavailable: hipconfig not found and no ROCm .info/version".into())
 }
 
 /// Resolve the kernel-cache directory the engine uses and report its presence.
@@ -628,6 +652,188 @@ fn field_u64(card: &Value, key: &str) -> Option<u64> {
     }
 }
 
+// ── amd-smi parsers (pure) ──────────────────────────────────────────────────
+
+/// The per-GPU entries of an `amd-smi … --json` document as `(gpu index,
+/// entry)`. amd-smi versions emit either `{"gpu_data": [...]}` or a bare
+/// top-level array; both are accepted. The index comes from the entry's `gpu`
+/// field, falling back to its position.
+fn amd_smi_entries(v: &Value) -> Option<Vec<(u32, &Value)>> {
+    let arr = match v {
+        Value::Array(a) => a,
+        Value::Object(o) => o.get("gpu_data")?.as_array()?,
+        _ => return None,
+    };
+    Some(
+        arr.iter()
+            .enumerate()
+            .map(|(pos, entry)| {
+                let idx = entry
+                    .get("gpu")
+                    .and_then(Value::as_u64)
+                    .map_or(pos as u32, |g| g as u32);
+                (idx, entry)
+            })
+            .collect(),
+    )
+}
+
+/// A finite number from a JSON number or numeric string. amd-smi's `"N/A"`
+/// (and anything else non-numeric) is `None`.
+fn finite_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|n| n.is_finite())
+}
+
+/// An amd-smi reading: `{"value": N, "unit": "MB"}` (or a bare number), with
+/// the unit when present. `"N/A"` / missing → `None`.
+fn amd_reading(v: Option<&Value>) -> Option<(f64, Option<&str>)> {
+    match v? {
+        Value::Object(o) => {
+            let n = finite_number(o.get("value")?)?;
+            Some((n, o.get("unit").and_then(Value::as_str)))
+        }
+        other => finite_number(other).map(|n| (n, None)),
+    }
+}
+
+/// A memory reading in bytes. amd-smi's "MB" is MiB (a 32 GB card reports
+/// 32624 MB). A reading without a recognised unit is `None` rather than a guess.
+fn amd_bytes(v: Option<&Value>) -> Option<u64> {
+    let (n, unit) = amd_reading(v)?;
+    let unit = unit?.trim().to_ascii_lowercase();
+    let mult = match unit.as_str() {
+        "b" => 1.0,
+        "kb" | "kib" => 1024.0,
+        "mb" | "mib" => 1024.0 * 1024.0,
+        "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    (n >= 0.0).then(|| (n * mult).round() as u64)
+}
+
+/// Parse the JSON of `amd-smi metric --mem-usage --json`
+/// (`gpu_data[].mem_usage.{total_vram,used_vram}`) into per-GPU VRAM.
+pub fn parse_amd_smi_vram(body: &str) -> VramState {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return VramState::Unavailable(format!("amd-smi JSON parse failed: {e}")),
+    };
+    let Some(entries) = amd_smi_entries(&v) else {
+        return VramState::Unavailable("amd-smi JSON has no gpu_data".into());
+    };
+    let mut gpus = Vec::new();
+    for (idx, entry) in entries {
+        let mem = entry.get("mem_usage");
+        let total = amd_bytes(mem.and_then(|m| m.get("total_vram")));
+        let used = amd_bytes(mem.and_then(|m| m.get("used_vram")));
+        if let (Some(total), Some(used)) = (total, used) {
+            if total > 0 {
+                gpus.push(GpuMem {
+                    index: idx,
+                    used_bytes: used,
+                    total_bytes: total,
+                });
+            }
+        }
+    }
+    if gpus.is_empty() {
+        VramState::Unavailable("amd-smi returned no VRAM fields".into())
+    } else {
+        VramState::Available(gpus)
+    }
+}
+
+/// Parse the JSON of `amd-smi metric --usage --power --temperature --json`
+/// (`usage.gfx_activity` %, `power.socket_power` W, `temperature.edge` /
+/// `hotspot` °C) into per-GPU load. Each reading is range-validated; `"N/A"`
+/// is an honest `None`.
+pub fn parse_amd_smi_load(body: &str) -> LoadState {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return LoadState::Unavailable(format!("amd-smi load JSON parse failed: {e}")),
+    };
+    let Some(entries) = amd_smi_entries(&v) else {
+        return LoadState::Unavailable("amd-smi JSON has no gpu_data".into());
+    };
+    let first_reading =
+        |section: Option<&Value>, keys: &[&str], range: std::ops::RangeInclusive<f64>| {
+            keys.iter()
+                .find_map(|k| amd_reading(section.and_then(|s| s.get(*k))))
+                .map(|(n, _)| n)
+                .filter(|n| range.contains(n))
+        };
+    let mut loads = Vec::new();
+    for (idx, entry) in entries {
+        let util = first_reading(entry.get("usage"), &["gfx_activity"], 0.0..=100.0);
+        let temp = first_reading(entry.get("temperature"), &["edge", "hotspot"], 0.0..=200.0);
+        let power = first_reading(
+            entry.get("power"),
+            &["socket_power", "average_socket_power"],
+            0.0..=2000.0,
+        );
+        if util.is_some() || temp.is_some() || power.is_some() {
+            loads.push(GpuLoad {
+                index: idx,
+                util_pct: util,
+                temp_c: temp,
+                power_w: power,
+            });
+        }
+    }
+    if loads.is_empty() {
+        LoadState::Unavailable("amd-smi returned no load fields".into())
+    } else {
+        LoadState::Available(loads)
+    }
+}
+
+/// Parse `amd-smi static --asic --json` (`gpu_data[].asic.market_name`,
+/// `target_graphics_version`) into `(product name, gfx arch)` probes. Repeated
+/// identical values collapse; differing ones are comma-joined in GPU order.
+pub fn parse_amd_smi_asic(body: &str) -> (Probe, Probe) {
+    let fail = |reason: String| {
+        (
+            Probe::Unavailable(reason.clone()),
+            Probe::Unavailable(reason),
+        )
+    };
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return fail("unavailable: amd-smi asic JSON unparseable".into()),
+    };
+    let Some(entries) = amd_smi_entries(&v) else {
+        return fail("unavailable: amd-smi asic JSON has no gpu_data".into());
+    };
+    let text_field = |entry: &Value, key: &str| -> Option<String> {
+        let s = entry.get("asic")?.get(key)?.as_str()?.trim();
+        (!s.is_empty() && !s.eq_ignore_ascii_case("n/a")).then(|| s.to_string())
+    };
+    let mut names: Vec<String> = Vec::new();
+    let mut arches: Vec<String> = Vec::new();
+    for (_, entry) in entries {
+        names.extend(text_field(entry, "market_name"));
+        arches.extend(text_field(entry, "target_graphics_version"));
+    }
+    names.dedup();
+    arches.dedup();
+    let name = if names.is_empty() {
+        Probe::Unavailable("unavailable: no product name in amd-smi output".into())
+    } else {
+        Probe::Value(names.join(", "))
+    };
+    let arch = if arches.is_empty() {
+        Probe::Unavailable("unavailable: no gfx target in amd-smi output".into())
+    } else {
+        Probe::Value(arches.join(", "))
+    };
+    (name, arch)
+}
+
 // ── Fetchers (I/O; thin wrappers around the pure parsers) ───────────────────
 
 /// Result of one authenticated text GET against the serve.
@@ -640,7 +846,10 @@ enum TextFetch {
 }
 
 fn get_text(agent: &ureq::Agent, endpoint: &ServiceEndpoint, path: &str) -> TextFetch {
-    match endpoint.authorize(agent.get(&service_url(endpoint, path))).call() {
+    match endpoint
+        .authorize(agent.get(&service_url(endpoint, path)))
+        .call()
+    {
         Ok(mut resp) => {
             let status = resp.status().as_u16();
             if matches!(status, 401 | 403) {
@@ -678,42 +887,89 @@ pub(crate) enum RocmSmiRun {
     TimedOut,
 }
 
-/// Run `rocm-smi --showmeminfo vram --json` with a hard wall-clock deadline.
-/// Spawns the child, polls `try_wait`, and `kill()`s it if it blows past
-/// [`ROCM_SMI_TIMEOUT`] so a hung rocm-smi can never wedge the caller (even on
-/// the background fetch thread, where it would otherwise leak a zombie probe).
-fn run_rocm_smi_bounded() -> RocmSmiRun {
-    let mut cmd = Command::new("rocm-smi");
-    cmd.args(["--showmeminfo", "vram", "--json"]);
-    run_bounded(cmd, ROCM_SMI_TIMEOUT)
+/// `amd-smi` arguments for the one call that feeds both the VRAM and the load
+/// panels (`gpu_data[].{mem_usage,usage,power,temperature}`).
+const AMD_SMI_METRIC_ARGS: [&str; 6] = [
+    "metric",
+    "--usage",
+    "--power",
+    "--temperature",
+    "--mem-usage",
+    "--json",
+];
+/// `amd-smi` arguments for product name + gfx target (`gpu_data[].asic`).
+const AMD_SMI_ASIC_ARGS: [&str; 3] = ["static", "--asic", "--json"];
+
+/// The GPU-stats CLI the dashboard talks to, with its resolved path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SmiTool {
+    AmdSmi(PathBuf),
+    RocmSmi(PathBuf),
 }
 
-fn run_rocm_smi_load_bounded() -> RocmSmiRun {
-    let mut cmd = Command::new("rocm-smi");
-    cmd.args(["--showuse", "--showtemp", "--showpower", "--json"]);
-    run_bounded(cmd, ROCM_SMI_TIMEOUT)
+impl SmiTool {
+    fn name(&self) -> &'static str {
+        match self {
+            SmiTool::AmdSmi(_) => "amd-smi",
+            SmiTool::RocmSmi(_) => "rocm-smi",
+        }
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            SmiTool::AmdSmi(p) | SmiTool::RocmSmi(p) => p,
+        }
+    }
 }
 
-/// Probe rocm-smi for per-GPU util / temperature / power. Honest
-/// [`LoadState::Unavailable`] on non-Linux, missing binary, timeout, or
-/// unparseable output. Never blocks indefinitely (bounded + killed).
-pub fn fetch_gpu_load() -> LoadState {
-    if !cfg!(target_os = "linux") {
-        return LoadState::Unavailable("GPU load unavailable: rocm-smi is Linux-only".into());
+/// Pure selection over already-resolved candidate paths: `amd-smi` is preferred
+/// (newer ROCm ships only it); `rocm-smi` is the fallback.
+pub(crate) fn select_smi_tool(
+    amd_smi: Option<PathBuf>,
+    rocm_smi: Option<PathBuf>,
+) -> Option<SmiTool> {
+    amd_smi
+        .map(SmiTool::AmdSmi)
+        .or_else(|| rocm_smi.map(SmiTool::RocmSmi))
+}
+
+/// First executable regular file named `name` in `dirs`.
+fn find_executable_in<I: IntoIterator<Item = PathBuf>>(dirs: I, name: &str) -> Option<PathBuf> {
+    dirs.into_iter()
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
     }
-    match run_rocm_smi_load_bounded() {
-        RocmSmiRun::Output(text) => parse_rocm_smi_load_json(&text),
-        RocmSmiRun::NotFound => {
-            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into())
-        }
-        RocmSmiRun::TimedOut => LoadState::Unavailable(format!(
-            "GPU load unavailable: rocm-smi timed out after {}ms (killed)",
-            ROCM_SMI_TIMEOUT.as_millis()
-        )),
-        RocmSmiRun::SpawnError(e) => {
-            LoadState::Unavailable(format!("GPU load unavailable: rocm-smi error: {e}"))
-        }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
     }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve a ROCm tool the way the CLI does: through the selected ROCm root
+/// (`hipfire_config::rocm::tool`, which only consults PATH when no root is
+/// selectable), then a plain PATH search for a tool that root lacks.
+fn resolve_tool(name: &str) -> Option<PathBuf> {
+    hipfire_config::rocm::tool(name).or_else(|| {
+        let path = env::var_os("PATH")?;
+        find_executable_in(env::split_paths(&path), name)
+    })
+}
+
+fn resolve_smi_tool() -> Option<SmiTool> {
+    select_smi_tool(resolve_tool("amd-smi"), resolve_tool("rocm-smi"))
 }
 
 /// Parse `rocm-smi --showuse --showtemp --showpower --json`. Field key names
@@ -871,47 +1127,95 @@ pub(crate) fn run_bounded(mut cmd: Command, timeout: Duration) -> RocmSmiRun {
     }
 }
 
-/// Probe rocm-smi for per-GPU VRAM. Honest [`VramState::Unavailable`] when the
-/// platform is not Linux, the binary is absent, the output doesn't parse, or
-/// the call exceeds [`ROCM_SMI_TIMEOUT`] (hard-killed). Never blocks
-/// indefinitely.
-pub fn fetch_vram() -> VramState {
-    if !cfg!(target_os = "linux") {
-        return VramState::Unavailable("VRAM unavailable: rocm-smi is Linux-only".into());
-    }
-    match run_rocm_smi_bounded() {
-        RocmSmiRun::Output(text) => {
-            let parsed = parse_rocm_smi_json(&text);
-            // If JSON failed but the binary ran, surface a clean reason.
-            match parsed {
-                VramState::Available(_) => parsed,
-                VramState::Unavailable(_) if text.trim().is_empty() => {
-                    VramState::Unavailable("VRAM unavailable: rocm-smi produced no output".into())
-                }
-                other => other,
-            }
-        }
-        RocmSmiRun::NotFound => {
-            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into())
-        }
-        RocmSmiRun::TimedOut => VramState::Unavailable(format!(
-            "VRAM unavailable: rocm-smi timed out after {}ms (killed)",
+/// Why neither GPU stats CLI could be used. Names the ROCm root that was
+/// searched so the message is checkable by hand; deliberately does NOT claim
+/// "no GPU" — a missing stats tool says nothing about the PCI devices.
+pub(crate) fn gpu_tool_missing_reason(root: Option<&Path>) -> String {
+    let root = root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
+    format!("GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: {root})")
+}
+
+/// Run `tool` with `args` under the hard deadline; `Err` carries a short,
+/// tool-named reason ("amd-smi timed out after 2000ms (killed)").
+fn smi_text(tool: &SmiTool, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new(tool.path());
+    cmd.args(args);
+    match run_bounded(cmd, ROCM_SMI_TIMEOUT) {
+        RocmSmiRun::Output(text) => Ok(text),
+        RocmSmiRun::NotFound => Err(format!("{} not found", tool.name())),
+        RocmSmiRun::TimedOut => Err(format!(
+            "{} timed out after {}ms (killed)",
+            tool.name(),
             ROCM_SMI_TIMEOUT.as_millis()
         )),
-        RocmSmiRun::SpawnError(e) => {
-            VramState::Unavailable(format!("VRAM unavailable: rocm-smi error: {e}"))
+        RocmSmiRun::SpawnError(e) => Err(format!("{} error: {e}", tool.name())),
+    }
+}
+
+/// Surface "the tool ran but printed nothing" as its own clean reason instead
+/// of the JSON parser's error.
+fn vram_or_no_output(parsed: VramState, text: &str, tool: &str) -> VramState {
+    match parsed {
+        VramState::Unavailable(_) if text.trim().is_empty() => {
+            VramState::Unavailable(format!("VRAM unavailable: {tool} produced no output"))
+        }
+        other => other,
+    }
+}
+
+/// Probe per-GPU VRAM and live load with whichever stats CLI the ROCm root
+/// provides (`amd-smi` preferred, `rocm-smi` fallback). `amd-smi` serves both
+/// readings from ONE bounded call; `rocm-smi` needs two. Honest
+/// `Unavailable` states on non-Linux, missing tools, timeouts (hard-killed) and
+/// unparseable output. Never blocks indefinitely.
+pub fn fetch_gpu_stats() -> (VramState, LoadState) {
+    if !cfg!(target_os = "linux") {
+        return (
+            VramState::Unavailable("VRAM unavailable: GPU stats are Linux-only".into()),
+            LoadState::Unavailable("GPU load unavailable: GPU stats are Linux-only".into()),
+        );
+    }
+    let Some(tool) = resolve_smi_tool() else {
+        let reason = gpu_tool_missing_reason(hipfire_config::rocm::root().as_deref());
+        return (
+            VramState::Unavailable(reason),
+            LoadState::Unavailable("GPU load unavailable: no GPU stats tool".into()),
+        );
+    };
+    match &tool {
+        SmiTool::AmdSmi(_) => match smi_text(&tool, &AMD_SMI_METRIC_ARGS) {
+            Ok(text) => (
+                vram_or_no_output(parse_amd_smi_vram(&text), &text, tool.name()),
+                parse_amd_smi_load(&text),
+            ),
+            Err(e) => (
+                VramState::Unavailable(format!("VRAM unavailable: {e}")),
+                LoadState::Unavailable(format!("GPU load unavailable: {e}")),
+            ),
+        },
+        SmiTool::RocmSmi(_) => {
+            let vram = match smi_text(&tool, &["--showmeminfo", "vram", "--json"]) {
+                Ok(text) => vram_or_no_output(parse_rocm_smi_json(&text), &text, tool.name()),
+                Err(e) => VramState::Unavailable(format!("VRAM unavailable: {e}")),
+            };
+            let load = match smi_text(&tool, &["--showuse", "--showtemp", "--showpower", "--json"])
+            {
+                Ok(text) => parse_rocm_smi_load_json(&text),
+                Err(e) => LoadState::Unavailable(format!("GPU load unavailable: {e}")),
+            };
+            (vram, load)
         }
     }
 }
 
 /// Build a full live Dashboard snapshot: probes /health, /stats, /v1/models,
-/// and rocm-smi. Tolerant of serve being down (returns [`Dashboard::offline`])
-/// and of rocm-smi being absent (VramState::Unavailable). All timeouts are
+/// and the GPU stats CLI. Tolerant of serve being down (returns
+/// [`Dashboard::offline`]) and of the stats tool being absent
+/// (VramState::Unavailable). All timeouts are
 /// short so the refresh tick never wedges the UI.
 pub fn fetch_dashboard(config: &ConfigState) -> Dashboard {
     let display_endpoint = format!("{}:{}", config.probe_host(), config.port);
-    let vram = fetch_vram();
-    let gpu_load = fetch_gpu_load();
+    let (vram, gpu_load) = fetch_gpu_stats();
 
     // An unloadable key file or malformed endpoint is surfaced as-is — never
     // downgraded to an unauthenticated probe.
@@ -1690,5 +1994,197 @@ mod tests {
         let up = wait_for_health(&worker, Duration::from_secs(3), |h| h.serve_up)
             .expect("new port picked up without restarting the worker");
         assert_eq!(up.model, None);
+    }
+
+    // ── amd-smi parsers + tool selection ────────────────────────────────────
+
+    const AMD_METRIC: &str = include_str!("testdata/amd_smi_metric.json");
+    const AMD_ASIC: &str = include_str!("testdata/amd_smi_static_asic.json");
+
+    /// The fixture's `gpu_data` array re-serialised as a bare top-level array
+    /// (the other JSON root amd-smi versions emit).
+    fn bare_array(fixture: &str) -> String {
+        let v: Value = serde_json::from_str(fixture).unwrap();
+        v["gpu_data"].to_string()
+    }
+
+    #[test]
+    fn amd_smi_asic_fixture_yields_name_and_arch() {
+        let (name, arch) = parse_amd_smi_asic(AMD_ASIC);
+        // Two identical GPUs collapse to one value.
+        assert_eq!(name, Probe::Value("AMD Radeon AI PRO R9700".into()));
+        assert_eq!(arch, Probe::Value("gfx1201".into()));
+        let (name, arch) = parse_amd_smi_asic(&bare_array(AMD_ASIC));
+        assert_eq!(name, Probe::Value("AMD Radeon AI PRO R9700".into()));
+        assert_eq!(arch, Probe::Value("gfx1201".into()));
+    }
+
+    #[test]
+    fn amd_smi_asic_mixed_gpus_join_and_na_is_skipped() {
+        let body = r#"{"gpu_data": [
+            {"gpu": 0, "asic": {"market_name": "A", "target_graphics_version": "gfx1100"}},
+            {"gpu": 1, "asic": {"market_name": "N/A", "target_graphics_version": "gfx1201"}}
+        ]}"#;
+        let (name, arch) = parse_amd_smi_asic(body);
+        assert_eq!(name, Probe::Value("A".into()));
+        assert_eq!(arch, Probe::Value("gfx1100, gfx1201".into()));
+    }
+
+    #[test]
+    fn amd_smi_vram_fixture_converts_mb_to_bytes() {
+        for body in [AMD_METRIC.to_string(), bare_array(AMD_METRIC)] {
+            match parse_amd_smi_vram(&body) {
+                VramState::Available(gpus) => {
+                    assert_eq!(gpus.len(), 2);
+                    assert_eq!(gpus[0].index, 0);
+                    assert_eq!(gpus[1].index, 1);
+                    assert_eq!(gpus[0].total_bytes, 32624 * 1024 * 1024);
+                    assert_eq!(gpus[0].used_bytes, 57 * 1024 * 1024);
+                    assert_eq!(gpus[0].free_bytes(), (32624 - 57) * 1024 * 1024);
+                }
+                other => panic!("expected Available, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn amd_smi_load_fixture_extracts_util_power_temp() {
+        for body in [AMD_METRIC.to_string(), bare_array(AMD_METRIC)] {
+            match parse_amd_smi_load(&body) {
+                LoadState::Available(loads) => {
+                    assert_eq!(loads.len(), 2);
+                    assert_eq!(loads[0].index, 0);
+                    assert_eq!(loads[0].util_pct, Some(0.0));
+                    assert_eq!(loads[0].power_w, Some(23.0));
+                    // Edge temperature is preferred over hotspot.
+                    assert_eq!(loads[0].temp_c, Some(47.0));
+                    assert_eq!(loads[1].index, 1);
+                }
+                other => panic!("expected Available, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn amd_smi_na_fields_become_none() {
+        let body = r#"{"gpu_data": [{"gpu": 3,
+            "usage": {"gfx_activity": "N/A"},
+            "power": {"socket_power": "N/A"},
+            "temperature": {"edge": "N/A", "hotspot": {"value": 51, "unit": "C"}},
+            "mem_usage": {"total_vram": "N/A", "used_vram": {"value": 1, "unit": "MB"}}
+        }]}"#;
+        match parse_amd_smi_load(body) {
+            LoadState::Available(loads) => {
+                assert_eq!(loads.len(), 1);
+                assert_eq!(loads[0].index, 3);
+                assert_eq!(loads[0].util_pct, None);
+                assert_eq!(loads[0].power_w, None);
+                // edge is N/A, so the hotspot reading is used.
+                assert_eq!(loads[0].temp_c, Some(51.0));
+            }
+            other => panic!("expected Available, got {other:?}"),
+        }
+        // N/A total → no VRAM row, honestly unavailable.
+        assert!(matches!(
+            parse_amd_smi_vram(body),
+            VramState::Unavailable(_)
+        ));
+        let all_na = r#"{"gpu_data": [{"gpu": 0, "usage": {"gfx_activity": "N/A"}}]}"#;
+        assert!(matches!(
+            parse_amd_smi_load(all_na),
+            LoadState::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn amd_smi_unit_less_or_unknown_unit_memory_is_not_guessed() {
+        let body = r#"[{"gpu": 0, "mem_usage": {
+            "total_vram": {"value": 100}, "used_vram": {"value": 1, "unit": "MB"}}}]"#;
+        assert!(matches!(
+            parse_amd_smi_vram(body),
+            VramState::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn amd_smi_garbage_is_unavailable_not_panic() {
+        for body in ["not json", "{}", "[]", "42", r#"{"gpu_data": "x"}"#, ""] {
+            assert!(
+                matches!(parse_amd_smi_vram(body), VramState::Unavailable(_)),
+                "vram: {body:?}"
+            );
+            assert!(
+                matches!(parse_amd_smi_load(body), LoadState::Unavailable(_)),
+                "load: {body:?}"
+            );
+            let (name, arch) = parse_amd_smi_asic(body);
+            assert!(!name.is_available(), "name: {body:?}");
+            assert!(!arch.is_available(), "arch: {body:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn stub_dir(tag: &str, tools: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-smistub-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for tool in tools {
+            let p = dir.join(tool);
+            fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lookup_finds_amd_smi_stub_and_selects_it() {
+        let dir = stub_dir("amd-only", &["amd-smi"]);
+        let amd = find_executable_in([dir.clone()], "amd-smi");
+        let rocm = find_executable_in([dir.clone()], "rocm-smi");
+        assert_eq!(amd, Some(dir.join("amd-smi")));
+        assert_eq!(rocm, None);
+        assert_eq!(
+            select_smi_tool(amd, rocm),
+            Some(SmiTool::AmdSmi(dir.join("amd-smi")))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lookup_ignores_non_executable_and_prefers_amd_smi_over_rocm_smi() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = stub_dir("both", &["amd-smi", "rocm-smi"]);
+        let amd = find_executable_in([dir.clone()], "amd-smi");
+        let rocm = find_executable_in([dir.clone()], "rocm-smi");
+        assert_eq!(
+            select_smi_tool(amd, rocm.clone()),
+            Some(SmiTool::AmdSmi(dir.join("amd-smi")))
+        );
+        // Strip the exec bit: amd-smi is no longer a candidate → rocm-smi.
+        fs::set_permissions(dir.join("amd-smi"), fs::Permissions::from_mode(0o644)).unwrap();
+        let amd = find_executable_in([dir.clone()], "amd-smi");
+        assert_eq!(amd, None);
+        assert_eq!(
+            select_smi_tool(amd, rocm),
+            Some(SmiTool::RocmSmi(dir.join("rocm-smi")))
+        );
+        assert_eq!(select_smi_tool(None, None), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_tool_reason_names_root_and_never_claims_no_gpu() {
+        let with_root = gpu_tool_missing_reason(Some(Path::new("/opt/rocm/core")));
+        assert_eq!(
+            with_root,
+            "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: /opt/rocm/core)"
+        );
+        let none = gpu_tool_missing_reason(None);
+        assert!(none.ends_with("(ROCm root: none)"), "{none}");
+        assert!(!none.contains("No GPU"));
     }
 }
