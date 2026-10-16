@@ -273,6 +273,8 @@ pub struct MoeRoutePolicy {
     /// against the live dtype tables in its one pass, so lowering never
     /// rescans a table.
     pub slab_cold_codec: Option<u8>,
+    /// Load-owned device address of E512 u8 membership, zero for the legacy route.
+    pub expert_keep_mask: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

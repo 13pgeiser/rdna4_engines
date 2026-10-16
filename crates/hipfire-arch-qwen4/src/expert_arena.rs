@@ -46,9 +46,26 @@ pub struct ArenaExpert {
 }
 
 impl ArenaExpert {
+    /// A pruned (zero-byte) expert: both spans start at the same offset. It is
+    /// never routed (the masked router excludes it), so it carries the MQ4
+    /// codec: it never names a cold codec for its layer.
+    pub fn is_absent(self) -> bool {
+        self.gate_up_offset == self.down_offset
+    }
+
+    /// The format the layer's dtype tables see: [`ExpertFormat::Mq4Xts`] for an
+    /// absent expert, otherwise its declared format.
+    pub fn effective_format(self) -> ExpertFormat {
+        if self.is_absent() {
+            ExpertFormat::Mq4Xts
+        } else {
+            self.format
+        }
+    }
+
     /// The per-layer codec table byte of this expert's format.
     pub fn codec(self) -> Result<u8, ExpertArenaError> {
-        match self.format {
+        match self.effective_format() {
             ExpertFormat::Mq4Xts => Ok(CODEC_MQ4),
             ExpertFormat::Mq3I4 => Ok(CODEC_W3),
             ExpertFormat::E8pI4 => Ok(CODEC_E8P),
@@ -78,6 +95,7 @@ impl ExpertArenaLayer {
     /// The layer's single cold codec on `arch` (the codec of its W3/E8P experts,
     /// or the arch default for an MQ4-only layer), refusing a W2 expert, a codec
     /// `arch` does not serve and a layer holding two different cold codecs.
+    /// Absent (pruned, zero-byte) experts count as MQ4 and never name a cold codec.
     pub fn cold_codec(&self, arch: &str) -> Result<u8, ExpertArenaError> {
         let codecs = self.codec_table()?;
         for expert in &self.experts {
@@ -103,16 +121,21 @@ impl ExpertArenaLayer {
         })
     }
 
-    /// `(mq4, w3, e8p)` expert counts.
+    /// `(mq4, w3, e8p)` present-expert counts; absent (pruned) experts are not counted.
     pub fn codec_counts(&self) -> (usize, usize, usize) {
         let count = |format| {
             self.experts
                 .iter()
-                .filter(|expert| expert.format == format)
+                .filter(|expert| !expert.is_absent() && expert.format == format)
                 .count()
         };
+        let present = self
+            .experts
+            .iter()
+            .filter(|expert| !expert.is_absent())
+            .count();
         let (w3, e8p) = (count(ExpertFormat::Mq3I4), count(ExpertFormat::E8pI4));
-        (self.experts.len() - w3 - e8p, w3, e8p)
+        (present - w3 - e8p, w3, e8p)
     }
 }
 
