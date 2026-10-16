@@ -4096,6 +4096,7 @@ impl Qwen4MtpDrafter {
                 }
             }
             self.stats.mtp_windows += 1;
+            self.stats.floor_ar_windows += 1;
             self.stats.mtp_retired = self.floor.retired;
         } else {
             self.owe_head_row(gpu, target, position, seed)?;

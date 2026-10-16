@@ -7083,12 +7083,15 @@ fn bench_spec_route(done: &serde_json::Value) -> Option<String> {
 /// The native-MTP window split of a generate `done` event, `None` unless
 /// native MTP speculated: `windows_mtp` (the windows before any AR-floor
 /// retirement: native and n-gram takeover windows plus the floor's timed AR
-/// samples), `windows_ar_retired` (head-free AR tokens after a sticky
-/// retirement, which accept nothing), `retired_at` (index of the first
-/// retired window; `null` when the request never retired) and `tau_mtp`,
-/// accepted drafts per `windows_mtp` window (`null` from a daemon that
-/// does not report `accepted`). `tau` averages over every window, so a
-/// retired request reads near zero whatever its drafts accepted.
+/// tokens), `windows_floor_ar` (those timed AR tokens: the calibration token
+/// and the probes of a would-be retirement), `windows_ar_retired`
+/// (head-free AR tokens after a sticky retirement), `retired_at` (index of
+/// the first retired window; `null` when the request never retired) and
+/// `tau_mtp`, accepted drafts per drafting window (`windows_mtp -
+/// windows_floor_ar`; `null` from a daemon that reports no `accepted` or
+/// `floor_ar_windows`). AR tokens accept nothing, so `tau`, averaged over
+/// every window, reads near zero for a retired request whatever its drafts
+/// accepted.
 fn bench_spec_mtp(done: &serde_json::Value) -> Option<serde_json::Value> {
     bench_spec_route(done)?;
     if done.get("mtp").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -7098,14 +7101,17 @@ fn bench_spec_mtp(done: &serde_json::Value) -> Option<serde_json::Value> {
     let cycles = count("cycles")?;
     let ar_retired = count("ar_windows").unwrap_or(0);
     let windows = cycles.saturating_sub(ar_retired);
+    let floor_ar = count("floor_ar_windows");
     let retired = done.get("mtp_retired").and_then(serde_json::Value::as_bool) == Some(true);
     let accepted = count("accepted");
+    let drafting = floor_ar.map(|floor_ar| windows.saturating_sub(floor_ar));
     let tau_mtp = accepted
-        .filter(|_| windows > 0)
-        .map(|accepted| (accepted as f64 / windows as f64 * 100.0).round() / 100.0);
+        .zip(drafting.filter(|&drafting| drafting > 0))
+        .map(|(accepted, drafting)| (accepted as f64 / drafting as f64 * 100.0).round() / 100.0);
     Some(serde_json::json!({
         "tau_mtp": tau_mtp,
         "windows_mtp": windows,
+        "windows_floor_ar": floor_ar,
         "windows_ar_retired": ar_retired,
         "retired_at": retired.then_some(windows),
         "accepted": accepted,
@@ -17278,42 +17284,52 @@ mod tests {
         assert_eq!(bench_spec_route(&eagle).as_deref(), Some("gemma4_eagle"));
     }
 
-    /// A request the AR floor retired (the 7900 XTX Flash-Next one-card
-    /// offload shape: 177 tokens, 154 windows, done `tau` 0.14) must not read
-    /// as rejected drafts: its 16 drafting windows accepted 22 drafts.
+    /// A request the AR floor retired must not read as rejected drafts. The
+    /// 7900 XTX Flash-Next one-card offload run (j1428, humaneval_0, 128
+    /// tokens): the calibration token, 16 native windows accepting 22 drafts
+    /// and 6 AR probes, then 82 retired AR tokens; done `tau` 0.21.
     #[test]
     fn bench_spec_mtp_splits_retired_ar_windows_from_drafting_windows() {
         let retired = serde_json::json!({
-            "mtp": true, "tau": 0.14, "cycles": 154, "accepted": 22,
-            "mtp_windows": 16, "ar_windows": 138, "mtp_retired": true,
+            "mtp": true, "tau": 0.21, "cycles": 105, "accepted": 22, "mtp_windows": 23,
+            "floor_ar_windows": 7, "ar_windows": 82, "mtp_retired": true,
         });
         assert_eq!(
             bench_spec_mtp(&retired),
             Some(serde_json::json!({
-                "tau_mtp": 1.38, "windows_mtp": 16, "windows_ar_retired": 138,
-                "retired_at": 16, "accepted": 22,
+                "tau_mtp": 1.38, "windows_mtp": 23, "windows_floor_ar": 7,
+                "windows_ar_retired": 82, "retired_at": 23, "accepted": 22,
             }))
         );
-        // Never retired (n-gram composition on): `tau_mtp` is `tau` and every
-        // window, the n-gram takeovers included, is a drafting window.
+        // Never retired (n-gram composition on): only the calibration token
+        // drafts nothing; the n-gram takeovers are drafting windows.
         let live = serde_json::json!({
             "mtp": true, "mtp_ngram": true, "tau": 2.34, "cycles": 53, "accepted": 124,
-            "mtp_windows": 27, "ngram_mod_windows": 26, "ar_windows": 0, "mtp_retired": false,
+            "mtp_windows": 27, "floor_ar_windows": 1, "ngram_mod_windows": 26,
+            "ar_windows": 0, "mtp_retired": false,
         });
         assert_eq!(
             bench_spec_mtp(&live),
             Some(serde_json::json!({
-                "tau_mtp": 2.34, "windows_mtp": 53, "windows_ar_retired": 0,
-                "retired_at": null, "accepted": 124,
+                "tau_mtp": 2.38, "windows_mtp": 53, "windows_floor_ar": 1,
+                "windows_ar_retired": 0, "retired_at": null, "accepted": 124,
             }))
         );
-        // A daemon without `accepted` still splits the windows.
-        let old = serde_json::json!({
-            "mtp": true, "tau": 0.14, "cycles": 154, "ar_windows": 138, "mtp_retired": true,
-        });
-        let split = bench_spec_mtp(&old).unwrap();
-        assert_eq!(split["tau_mtp"], serde_json::Value::Null);
-        assert_eq!(split["retired_at"], 16);
+        // A daemon without `accepted` or `floor_ar_windows` still splits the
+        // windows but prices no drafting window.
+        for old in [
+            serde_json::json!({
+                "mtp": true, "tau": 0.21, "cycles": 105, "ar_windows": 82, "mtp_retired": true,
+            }),
+            serde_json::json!({
+                "mtp": true, "tau": 0.21, "cycles": 105, "accepted": 22, "mtp_windows": 23,
+                "ar_windows": 82, "mtp_retired": true,
+            }),
+        ] {
+            let split = bench_spec_mtp(&old).unwrap();
+            assert_eq!(split["tau_mtp"], serde_json::Value::Null, "{old}");
+            assert_eq!(split["retired_at"], 23, "{old}");
+        }
         // AR, DFlash and idle runs carry no MTP split.
         for done in [
             serde_json::json!({"type": "done", "decode_tok_s": 35.0}),

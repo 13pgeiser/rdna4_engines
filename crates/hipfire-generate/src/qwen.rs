@@ -7164,7 +7164,8 @@ pub fn qwen_dflash_wire_terminal(
     if hit_length_cap {
         // Hidden calls cannot be described by the call-less client echo.
         // Truncated tool bodies also remain unstored.
-        let call_in_body = !finish_summary_held_tool_calls(finish).is_empty() || finish.tool_calls > 0;
+        let call_in_body =
+            !finish_summary_held_tool_calls(finish).is_empty() || finish.tool_calls > 0;
         let store_cache = finish.finish_reason != "truncated_tool_call" && !call_in_body;
         return QwenDflashWireTerminal::Done {
             finish_reason: "length",
@@ -7388,10 +7389,12 @@ pub fn qwen_dflash_done_value(
 /// `mtp: true` in place of `dflash`; `accepted`, the drafts accepted over
 /// every window, so `tau = accepted / cycles` exactly; the n-gram-mod
 /// counters when that composition was armed; and once any window ran, the
-/// window split `mtp_windows` / `ar_windows` / `mtp_retired`. Windows after
-/// a sticky floor retirement are `ar_windows` and accept nothing, so a
-/// client prices the drafting windows as
-/// `accepted / (cycles - ar_windows)` rather than reading `tau`.
+/// window split `mtp_windows` / `floor_ar_windows` / `ar_windows` /
+/// `mtp_retired`. The AR floor's timed tokens (`floor_ar_windows`, part of
+/// `mtp_windows`) and the windows after a sticky retirement (`ar_windows`)
+/// draft nothing, so a client prices the drafting windows as
+/// `accepted / (cycles - ar_windows - floor_ar_windows)` rather than
+/// reading `tau`.
 pub fn qwen_mtp_done_fields(
     done: &mut serde_json::Value,
     accepted: usize,
@@ -7427,6 +7430,10 @@ pub fn qwen_mtp_done_fields(
     }
     if stats.mtp_ngram || stats.mtp_windows != 0 || stats.ar_windows != 0 || stats.mtp_retired {
         obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
+        obj.insert(
+            "floor_ar_windows".into(),
+            serde_json::json!(stats.floor_ar_windows),
+        );
         obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
         obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
     }
@@ -8369,16 +8376,18 @@ mod mtp_done_fields_tests {
         )
     }
 
-    /// A request the AR floor retired (the shape of the 7900 XTX Flash-Next
-    /// one-card offload run: 177 tokens, 154 windows, tau 0.14): `accepted`
-    /// is the exact numerator of `tau`, and the window split tells the
-    /// drafting windows from the retired AR ones.
+    /// A request the AR floor retired (7900 XTX Flash-Next one-card offload,
+    /// humaneval_0, 128 tokens: the calibration token, 16 native windows and
+    /// 6 AR probes, then 82 retired AR tokens; tau 0.21): `accepted` is the
+    /// exact numerator of `tau`, and the window split tells the drafting
+    /// windows from the floor's timed AR tokens and the retired ones.
     #[test]
     fn retired_request_reports_exact_accepted_and_window_split() {
-        let mut value = done(0.14, 154);
+        let mut value = done(0.21, 105);
         let stats = MtpRequestStats {
-            mtp_windows: 16,
-            ar_windows: 138,
+            mtp_windows: 23,
+            floor_ar_windows: 7,
+            ar_windows: 82,
             mtp_retired: true,
             ..MtpRequestStats::default()
         };
@@ -8386,11 +8395,12 @@ mod mtp_done_fields_tests {
         assert!(value.get("dflash").is_none());
         assert_eq!(value["mtp"], true);
         assert_eq!(value["accepted"], 22);
-        assert_eq!(value["mtp_windows"], 16);
-        assert_eq!(value["ar_windows"], 138);
+        assert_eq!(value["mtp_windows"], 23);
+        assert_eq!(value["floor_ar_windows"], 7);
+        assert_eq!(value["ar_windows"], 82);
         assert_eq!(value["mtp_retired"], true);
         assert!(value.get("mtp_ngram").is_none());
-        let tau = 22.0 / 154.0;
+        let tau = 22.0 / 105.0;
         assert_eq!(value["tau"], (tau * 100.0_f64).round() / 100.0);
     }
 
@@ -8421,6 +8431,7 @@ mod mtp_done_fields_tests {
         assert_eq!(ngram["ngram_mod_accepted"], 60);
         assert_eq!(ngram["mtp_windows"], 27);
         assert_eq!(ngram["ar_windows"], 0);
+        assert_eq!(ngram["floor_ar_windows"], 0);
         assert_eq!(ngram["mtp_retired"], false);
         assert_eq!(ngram["accepted"], 124);
     }
@@ -9730,7 +9741,10 @@ mod qwen_history_chain_tests {
             finish_reason: "truncated_tool_call",
             ..FinishSummary::default()
         };
-        assert!(!spec_store(&truncated, true, false), "truncated length body");
+        assert!(
+            !spec_store(&truncated, true, false),
+            "truncated length body"
+        );
     }
 }
 #[cfg(test)]

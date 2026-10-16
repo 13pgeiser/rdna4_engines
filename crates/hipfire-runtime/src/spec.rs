@@ -1107,6 +1107,10 @@ pub struct MtpRequestStats {
     pub ngram_mod_accept_rate: f64,
     /// Native MTP windows (every n-gram miss, or plain MTP).
     pub mtp_windows: usize,
+    /// Of `mtp_windows`, the target-only tokens the native Qwen4 AR floor
+    /// timed before any retirement: the request's calibration token and the
+    /// AR probes of a would-be retirement. They draft nothing.
+    pub floor_ar_windows: usize,
     /// Target-only (`k=0`) windows after sticky native Qwen4 floor retirement.
     /// Qwen35 MTP does not retire after an n-gram accept because the takeover
     /// fills the head KV.
