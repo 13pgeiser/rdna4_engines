@@ -1,6 +1,7 @@
 /* derive.cpp -- the derivation table, one row per name.
  */
 #include "derive.h"
+#include "rad_core.h"
 
 #include <cstring>
 
@@ -81,6 +82,24 @@ static int d_state_chunk_seq(const DeriveInput& in, int32_t* out, int64_t cap, i
     return chunk_walk<true>(in, out, cap, n_out);
 }
 
+/* ------------------------------------------------------------------ lora_slot */
+/* [n_tok] -- the runtime LoRA adapter slot each token's row is multiplied with, -1 for the base
+ * model (core/lora/). A sequence's slot is its request's, fixed when the request was admitted, so
+ * every row of one sequence carries the same value and a step mixing adapters needs nothing but
+ * this array: the LoRA kernels read the slot of each row they touch and leave a -1 row alone. */
+static int d_lora_slot(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
+    if (in.n_tok > cap || !in.plan || (int64_t)in.plan->e.size() < in.n_seq) return RAD_E_FULL;
+    for (int64_t i = 0; i < in.n_seq; ++i) {
+        const Request* r = in.plan->e[(size_t)i].req;
+        const int32_t slot = r ? r->lora_slot : -1;
+        const int64_t b = in.cu_seqlens[i], e = in.cu_seqlens[i + 1];
+        if (b < 0 || e < b || e > in.n_tok) return RAD_E_STATE;
+        for (int64_t k = b; k < e; ++k) out[k] = slot;
+    }
+    *n_out = in.n_tok;
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ the table */
 static const DeriveRow g_rows[] = {
     { "seq_start_index",  d_seq_start_index,
@@ -91,6 +110,8 @@ static const DeriveRow g_rows[] = {
       "[n_chunks+1] token indices bounding each linear-state chunk; never crosses a sequence" },
     { "state_chunk_seq",    d_state_chunk_seq,
       "[n_chunks] the sequence each chunk belongs to" },
+    { "lora_slot",          d_lora_slot,
+      "[n_tok] the runtime LoRA adapter slot of each token's sequence, -1 for the base model" },
 };
 
 int derive_index(const char* name) {

@@ -316,6 +316,7 @@ int Ctx::bind_ops() {
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
+        p.lora_site  = oi.lora_site;
 
         for (const Band& b : oi.bands) band_table_.push_back(b.hi);
 

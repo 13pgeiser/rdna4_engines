@@ -86,6 +86,8 @@ struct OpPlan {
     /* The conventional all_reduce, whose `n` is the message's element count, so its link bytes
      * can be counted (ar_bytes) apart from the expert mover's. */
     bool          billed = false;
+    /* RUNTIME LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
+    int32_t       lora_site = -1;
 };
 
 /* ------------------------------------------------------------------ routing handoff */
@@ -345,6 +347,7 @@ private:
     int  bind_buffers();
     int  bind_weights();
     int  bind_ops();
+    int  issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
     int  bind_routing();
     int  bind_profiling();
     int  check_domain(rad_op h, int domain) const;
