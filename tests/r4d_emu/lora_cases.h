@@ -1,5 +1,5 @@
 /* lora_cases.h -- the runtime-LoRA case matrix and what every implementation is held to, shared by
- * tests/lora_test.cpp (libref and libavx, at every ISA level the machine runs) and
+ * tests/lora_ops_test.cpp (libref and libavx, at every ISA level the machine runs) and
  * tests/r4d_emu/test_lora.cpp (libr4d's source on the SIMT emulator, beside libref and the host
  * restatement in ref_host.cpp). One matrix and one checker, so "the same cases" is a fact and not
  * an intention.

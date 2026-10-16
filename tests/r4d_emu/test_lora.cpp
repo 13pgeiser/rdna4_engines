@@ -1,6 +1,6 @@
 /* tests/r4d_emu: lora_shrink / lora_expand (r4d_lora_bf16.hip) on the host SIMT emulator.
  *
- * The case matrix and every check are lora_cases.h's, shared with tests/lora_test.cpp (libref and
+ * The case matrix and every check are lora_cases.h's, shared with tests/lora_ops_test.cpp (libref and
  * libavx): base rows untouched by bytes, adapter rows against a double-precision sum within the
  * bounds stated there. Here the implementations are the emulated kernels, ref_host.cpp's
  * restatement of libref's arithmetic, and libref itself when $RADIANCE_HOME holds one (ctest sets
