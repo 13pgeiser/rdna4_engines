@@ -47909,22 +47909,16 @@ impl Gpu {
     }
 }
 
-/// `HIPFIRE_QWEN4_MOE_SYM_IU4` selects the grouped symmetric IU4 MoE route
-/// (fn-moe-sym) for gfx1151 / gfx1201 Qwen4 prefill on layers whose every
-/// routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: `1` requests it,
-/// `0` keeps the whole incumbent route (scatter, producers and GEMMs), and
-/// unset requests it on both arches (an asymmetric artifact fails the check
-/// and stays on the incumbent). Read once.
-pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> = LazyLock::new(|| {
-    match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_IU4")
-        .ok()
-        .as_deref()
-    {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    }
-});
+/// `HIPFIRE_QWEN4_MOE_SYM_IU4` (`developer.qwen4_moe_sym_iu4`, a typed
+/// boolean: `true`/`false`/`1`/`0`; any other spelling is rejected when the
+/// process configuration is built) selects the grouped symmetric IU4 MoE
+/// route (fn-moe-sym) for gfx1151 / gfx1201 Qwen4 prefill on layers whose
+/// every routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: true
+/// requests it, false keeps the whole incumbent route (scatter, producers and
+/// GEMMs), and unset requests it on both arches (an asymmetric artifact fails
+/// the check and stays on the incumbent). Read once.
+pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
+    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"));
 
 /// The route's GEMMs run from the certified builder modules
 /// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores

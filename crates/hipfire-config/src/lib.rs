@@ -3936,6 +3936,57 @@ pub fn is_developer_key(key: &str) -> bool {
         .is_some_and(valid_developer_suffix)
 }
 
+/// `developer.*` keys with a typed boolean value: `true`, `false`, `1` or `0`
+/// in the `HIPFIRE_*` environment variable, `config set`, or TOML (a native
+/// boolean, a string spelling, or the integers 0/1). Anything else is
+/// rejected when the layer is built, never silently ignored. Every other
+/// developer key keeps its free-form legacy spelling.
+const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &["developer.qwen4_moe_sym_iu4"];
+
+pub fn is_typed_bool_developer_key(key: &str) -> bool {
+    TYPED_BOOL_DEVELOPER_KEYS.contains(&key)
+}
+
+/// The typed-boolean spellings: `1`/`true` and `0`/`false` (`true`/`false`
+/// ASCII case-insensitive). No other word (`on`, `yes`, `2`, empty) parses.
+pub fn parse_typed_bool(raw: &str) -> Option<bool> {
+    match raw {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ if raw.eq_ignore_ascii_case("true") => Some(true),
+        _ if raw.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Normalise `value` for the typed-boolean developer key `key` to
+/// [`ConfigValue::Bool`] (rendered `1`/`0` to every `HIPFIRE_*` reader), or
+/// fail with the accepted spellings.
+fn typed_bool_developer_value(key: &str, value: ConfigValue) -> Result<ConfigValue> {
+    let parsed = match &value {
+        ConfigValue::Bool(value) => Some(*value),
+        ConfigValue::Integer(0) => Some(false),
+        ConfigValue::Integer(1) => Some(true),
+        ConfigValue::String(raw) => parse_typed_bool(raw),
+        _ => None,
+    };
+    parsed
+        .map(ConfigValue::Bool)
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: format!(
+                "expected a boolean: true, false, 1 or 0 (got {})",
+                match &value {
+                    ConfigValue::String(raw) => format!("'{raw}'"),
+                    ConfigValue::Integer(raw) => raw.to_string(),
+                    ConfigValue::Float(raw) => raw.to_string(),
+                    ConfigValue::Bool(raw) => raw.to_string(),
+                    ConfigValue::Null => "null".to_owned(),
+                }
+            ),
+        })
+}
+
 pub fn developer_key_for_env(name: &str) -> Option<String> {
     let suffix = name.strip_prefix("HIPFIRE_")?.to_ascii_lowercase();
     valid_developer_suffix(&suffix).then(|| format!("{DEVELOPER_PREFIX}{suffix}"))
@@ -3950,11 +4001,8 @@ fn valid_developer_suffix(suffix: &str) -> bool {
 
 /// Key prefixes (canonical names) of the CASK and PFlash research features,
 /// deprecated since 0.4.0 with removal in 0.5.0.
-const DEPRECATED_KEY_PREFIXES: &[&str] = &[
-    "memory.cask.",
-    "speculation.prefill.",
-    "diagnostic.pflash.",
-];
+const DEPRECATED_KEY_PREFIXES: &[&str] =
+    &["memory.cask.", "speculation.prefill.", "diagnostic.pflash."];
 
 /// True when `key` (canonical or legacy flat name) belongs to a deprecated
 /// CASK/PFlash family: `memory.cask.*`, `speculation.prefill.*` or
@@ -4045,6 +4093,11 @@ impl ConfigLayer {
             field.validate(&value)?;
             self.values.insert(field.key.to_owned(), value);
         } else if is_developer_key(key) {
+            let value = if is_typed_bool_developer_key(key) {
+                typed_bool_developer_value(key, value)?
+            } else {
+                value
+            };
             self.values.insert(key.to_owned(), value);
         } else {
             return Err(unknown_key(key));
@@ -4077,7 +4130,11 @@ impl ConfigLayer {
         for (key, value) in &self.values {
             if let Some(field) = field(key) {
                 field.validate(value)?;
-            } else if !is_developer_key(key) {
+            } else if is_developer_key(key) {
+                if is_typed_bool_developer_key(key) {
+                    typed_bool_developer_value(key, value.clone())?;
+                }
+            } else {
                 return Err(ConfigError::UnknownKey(key.clone()));
             }
         }
@@ -4478,6 +4535,23 @@ pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
 /// own predicate.
 pub fn developer_bool(name: &str, default: bool) -> bool {
     parse_developer_bool(process_value(name).as_deref(), default)
+}
+/// Typed-boolean developer read for the keys in `TYPED_BOOL_DEVELOPER_KEYS`:
+/// `None` when unset, else the value of one of the spellings
+/// [`parse_typed_bool`] accepts (`true`/`false`/`1`/`0`). The process snapshot
+/// rejects any other spelling when it is built, so reaching one here is a bug
+/// in the caller (a name not declared typed) and fails loudly instead of being
+/// read as unset.
+pub fn developer_typed_bool(name: &str) -> Option<bool> {
+    typed_developer_bool_value(name, process_value(name).as_deref())
+}
+/// Pure body of [`developer_typed_bool`] for unit tests.
+fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
+    let raw = raw?;
+    match parse_typed_bool(raw) {
+        Some(value) => Some(value),
+        None => panic!("{name}={raw:?} is not a boolean: expected true, false, 1 or 0"),
+    }
 }
 /// Pure truth table behind [`developer_bool`], split out so unit tests can
 /// pin the contract without touching the process-global snapshot.
@@ -6279,7 +6353,9 @@ mod tests {
 
     #[test]
     fn windows_home_never_falls_back_to_relative() {
-        let missing = hipfire_home_from(true, home_env(&[])).unwrap_err().to_string();
+        let missing = hipfire_home_from(true, home_env(&[]))
+            .unwrap_err()
+            .to_string();
         assert!(missing.contains("HIPFIRE_HOME") && missing.contains("USERPROFILE"));
         for bad in [
             ("HIPFIRE_HOME", ".hipfire"),
@@ -6314,7 +6390,9 @@ mod tests {
         ] {
             assert!(is_windows_absolute(Path::new(ok)), "{ok}");
         }
-        for bad in ["", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x"] {
+        for bad in [
+            "", "C:", "C:foo", "\\foo", "/foo", "foo\\bar", "\\\\", "\\\\\\x",
+        ] {
             assert!(!is_windows_absolute(Path::new(bad)), "{bad}");
         }
     }
@@ -6335,6 +6413,210 @@ mod tests {
             assert_eq!(parse_developer_bool(Some(""), default), default);
             assert_eq!(parse_developer_bool(Some("2"), default), default);
         }
+    }
+
+    const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
+    const SYM_IU4_ENV: &str = "HIPFIRE_QWEN4_MOE_SYM_IU4";
+
+    #[test]
+    fn typed_bool_spellings_parse_and_everything_else_is_rejected() {
+        for (raw, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("True", true),
+            ("0", false),
+            ("false", false),
+            ("FALSE", false),
+            ("False", false),
+        ] {
+            assert_eq!(parse_typed_bool(raw), Some(want), "{raw}");
+        }
+        for bad in [
+            "", " ", "2", "-1", "01", "00", "on", "off", "yes", "no", "t", "f", "maybe", " 1",
+            "0 ", "truee", "null",
+        ] {
+            assert_eq!(parse_typed_bool(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_set_cli_accepts_each_spelling() {
+        assert!(is_typed_bool_developer_key(SYM_IU4_KEY));
+        assert!(!is_typed_bool_developer_key("developer.experimental_mode"));
+        for (raw, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("0", false),
+            ("TRUE", true),
+            ("False", false),
+        ] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(SYM_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_rejects_invalid_values_with_a_clear_message() {
+        for bad in ["", "2", "on", "off", "yes", "no", "maybe", "-1", "10"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(SYM_IU4_KEY, bad).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == SYM_IU4_KEY),
+                "{bad:?}: {text}"
+            );
+            assert!(text.contains("developer.qwen4_moe_sym_iu4"), "{text}");
+            assert!(text.contains("true, false, 1 or 0"), "{text}");
+            assert!(text.contains(&format!("'{bad}'")), "{text}");
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        for bad in [
+            ConfigValue::Integer(2),
+            ConfigValue::Integer(-1),
+            ConfigValue::Float(1.0),
+            ConfigValue::Null,
+            ConfigValue::String("on".into()),
+        ] {
+            let mut layer = ConfigLayer::default();
+            assert!(layer.set(SYM_IU4_KEY, bad.clone()).is_err(), "{bad:?}");
+            assert!(layer.values.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_normalizes_every_input_to_the_legacy_one_zero() {
+        for (value, want) in [
+            (ConfigValue::Bool(true), "1"),
+            (ConfigValue::Bool(false), "0"),
+            (ConfigValue::Integer(1), "1"),
+            (ConfigValue::Integer(0), "0"),
+            (ConfigValue::String("true".into()), "1"),
+            (ConfigValue::String("false".into()), "0"),
+            (ConfigValue::String("1".into()), "1"),
+            (ConfigValue::String("0".into()), "0"),
+        ] {
+            let mut layer = ConfigLayer::default();
+            layer.set(SYM_IU4_KEY, value.clone()).unwrap();
+            let process = ProcessConfig {
+                schema_version: CONFIG_SCHEMA_VERSION,
+                values: layer,
+            };
+            assert_eq!(
+                process.legacy_value(SYM_IU4_ENV).as_deref(),
+                Some(want),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_bool_developer_key_is_revalidated_for_deserialized_layers() {
+        let mut layer = ConfigLayer::default();
+        for ok in ["true", "false", "1", "0"] {
+            layer
+                .values
+                .insert(SYM_IU4_KEY.into(), ConfigValue::String(ok.into()));
+            layer.validate().unwrap();
+        }
+        layer
+            .values
+            .insert(SYM_IU4_KEY.into(), ConfigValue::String("maybe".into()));
+        assert!(layer.validate().is_err());
+    }
+
+    #[test]
+    fn typed_bool_developer_key_toml_accepts_bool_and_string_spellings() {
+        let root = temp_root("typed-bool-toml");
+        fs::create_dir_all(&root).unwrap();
+        for (literal, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", true),
+            ("0", false),
+            ("\"true\"", true),
+            ("\"false\"", false),
+            ("\"1\"", true),
+            ("\"0\"", false),
+        ] {
+            let path = root.join("config.toml");
+            fs::write(
+                &path,
+                format!("schema_version = {CONFIG_SCHEMA_VERSION}\n[developer]\nqwen4_moe_sym_iu4 = {literal}\n"),
+            )
+            .unwrap();
+            let layer = load_toml_layer(&path).unwrap();
+            assert_eq!(
+                layer.get(SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{literal}"
+            );
+        }
+        for literal in ["2", "\"on\"", "\"\"", "1.5"] {
+            let path = root.join("config.toml");
+            fs::write(
+                &path,
+                format!("schema_version = {CONFIG_SCHEMA_VERSION}\n[developer]\nqwen4_moe_sym_iu4 = {literal}\n"),
+            )
+            .unwrap();
+            let error = load_toml_layer(&path).unwrap_err().to_string();
+            assert!(error.contains("true, false, 1 or 0"), "{literal}: {error}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn other_developer_keys_keep_their_free_form_spelling() {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("developer.experimental_mode", "on").unwrap();
+        layer.set_cli("developer.qwen4_moe_x_lds", "auto").unwrap();
+        assert_eq!(
+            layer.get("developer.experimental_mode"),
+            Some(&ConfigValue::String("on".into()))
+        );
+        assert_eq!(
+            layer.get("developer.qwen4_moe_x_lds"),
+            Some(&ConfigValue::String("auto".into()))
+        );
+    }
+
+    #[test]
+    fn developer_typed_bool_reads_each_spelling_and_fails_loudly_on_others() {
+        assert_eq!(typed_developer_bool_value(SYM_IU4_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(SYM_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a boolean: expected true, false, 1 or 0")]
+    fn developer_typed_bool_panics_on_an_unparseable_snapshot_value() {
+        typed_developer_bool_value(SYM_IU4_ENV, Some("2"));
+    }
+
+    #[test]
+    fn iu4_prefill_is_process_wide_and_rejected_in_a_model_layer() {
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set("kernel.iu4_prefill", ConfigValue::Bool(false))
+            .unwrap();
+        let error = validate_model_layer(&overrides).unwrap_err().to_string();
+        assert!(error.contains("kernel.iu4_prefill"), "{error}");
+        assert!(
+            error.contains("not valid in a per-model override"),
+            "{error}"
+        );
     }
 
     /// The cached lookup behind `process_value` answers exactly what the
@@ -6434,8 +6716,14 @@ mod tests {
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
         assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
         // Attached verdicts carry no reason; the decline line words it once.
-        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
-        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason,
+            ""
+        );
+        assert_eq!(
+            mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason,
+            ""
+        );
         let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
@@ -6525,7 +6813,10 @@ mod tests {
         assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM_COPY"));
         assert!(matches!(field.default, DefaultValue::String("auto")));
         for raw in ["auto", "on", "off", "1", "0"] {
-            assert!(field.validate(&ConfigValue::String(raw.into())).is_ok(), "{raw}");
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
         }
         assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
         let cases: [(u32, &str); 4] = [
@@ -6553,7 +6844,10 @@ mod tests {
             }
         }
         let none = |_: &str| None;
-        assert_eq!(ngram_mod_triple_resolve(NGRAM_MOD_COPY_TRIPLE, none), (5, 1, 63));
+        assert_eq!(
+            ngram_mod_triple_resolve(NGRAM_MOD_COPY_TRIPLE, none),
+            (5, 1, 63)
+        );
     }
 
     #[test]
@@ -7803,9 +8097,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(layer
             .set("serve.api_key_file", ConfigValue::Integer(1))
             .is_err());
-        assert!(layer
-            .set("serve.api_key_file", ConfigValue::Null)
-            .is_err());
+        assert!(layer.set("serve.api_key_file", ConfigValue::Null).is_err());
     }
 
     #[test]
@@ -8794,18 +9086,12 @@ pub mod memory {
             assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
             assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
             // Both ends of the legal range are pinned shares; 0 disables.
-            assert_eq!(
-                parse_passback_share(Some("0")),
-                PassbackShare::Share(0.0)
-            );
+            assert_eq!(parse_passback_share(Some("0")), PassbackShare::Share(0.0));
             assert_eq!(
                 parse_passback_share(Some("0.375")),
                 PassbackShare::Share(0.375)
             );
-            assert_eq!(
-                parse_passback_share(Some("0.5")),
-                PassbackShare::Share(0.5)
-            );
+            assert_eq!(parse_passback_share(Some("0.5")), PassbackShare::Share(0.5));
             // Out of range and garbage fail closed to scheduling (the schema
             // rejects them earlier; this is the second guard).
             assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
@@ -9123,13 +9409,20 @@ pub mod memory {
         #[test]
         fn budget_keys_default_to_full_and_preserve_explicit_placement() {
             use OffloadBudget::{Auto, Full, Layers};
-            let defaults = crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
             for (key, env) in [
                 ("memory.gpu_layer_budget", "HIPFIRE_GPU_LAYER_BUDGET"),
                 ("memory.moe_expert_budget", "HIPFIRE_MOE_EXPERT_BUDGET"),
             ] {
-                assert_eq!(crate::field(key).unwrap().default.to_value(), crate::ConfigValue::Null);
-                assert_eq!(parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()), Full);
+                assert_eq!(
+                    crate::field(key).unwrap().default.to_value(),
+                    crate::ConfigValue::Null
+                );
+                assert_eq!(
+                    parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()),
+                    Full
+                );
                 for (spelling, expected) in [
                     ("null", Full),
                     ("auto", Auto),
@@ -9144,7 +9437,8 @@ pub mod memory {
                             argument: format!("{key}={spelling}"),
                         },
                         layer,
-                    }]).unwrap();
+                    }])
+                    .unwrap();
                     let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
                     for budget_env in ["HIPFIRE_GPU_LAYER_BUDGET", "HIPFIRE_MOE_EXPERT_BUDGET"] {
                         assert_eq!(
