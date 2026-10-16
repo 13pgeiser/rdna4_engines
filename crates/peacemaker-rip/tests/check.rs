@@ -1,8 +1,10 @@
 //! `check`, `variants` and the located-error plumbing of the evaluator: native
 //! `Err(String)` values are located at the call, entry-contract errors at
 //! `fn emit`, and the four production kernels still emit the exact assembly
-//! recorded before the diagnostics work (SHA-256 of `s_text`, taken with
-//! `sha256sum` from `rip-agent/hashes/base/*.s`).
+//! recorded before the diagnostics work, plus the RDNA code-end guard added by
+//! 906c75705 (128-byte alignment and 96 `s_code_end` dwords). The refreshed
+//! `s_text` hashes preserve all earlier instructions; ELF comparison with
+//! `scripts/check-pm-code-end.py` proved only the guard and derived layout changed.
 
 use peacemaker_isa::kernels::qsa_gather::Spec;
 use peacemaker_isa::Arch;
@@ -13,11 +15,11 @@ const SCORE: &str = include_str!("../../peacemaker-isa/src/kernels/qsa_score.rip
 const SCORE_BF16: &str = include_str!("../../peacemaker-isa/src/kernels/qsa_score_bf16.rip");
 const TOPK: &str = include_str!("../../peacemaker-isa/src/kernels/qsa_topk.rip");
 
-const GATHER_GFX1151: &str = "d3be011b07993c1e40d990df719b2110b56c46713beb9be3f0f432a3b5f5ad0c";
-const GATHER_GFX1201: &str = "78317b4d9832ff8fbe675ecb6bf4b63baa62f7cbb7bada116d8abcd8886e9092";
-const SCORE_GFX1151: &str = "13e17043e46bb2aee3d88527b6ec3ac1ab3c14a173fdb5ad708c4798711da271";
-const SCORE_BF16_GFX1151: &str = "3d5d559957ea36d0c3a214779427ee61b1e3b8dfb47d517395a589346acde218";
-const SELECT_GFX1151: &str = "92e335515c2a595f0d1aa244bdc99ff9fbcb74440af786018a0ebf494cb59e0d";
+const GATHER_GFX1151: &str = "67e4cc5b06fc3ac8f3aa9e2e49505eca020fdb3407fe0b37d03ee0c4b6609876";
+const GATHER_GFX1201: &str = "d2e4a96e7c5a08b85d18d575cf02ba9962d0a0ad8fa912f11e2dda05160e3f52";
+const SCORE_GFX1151: &str = "9129a70e4a6b6b2a8ee199ac18a52912611474284b59ac1583fad611f1064d10";
+const SCORE_BF16_GFX1151: &str = "9891cf93054a2e1fc11dca29bcb735b73e2ce1d7cbbdd1c73b426231d5ad4257";
+const SELECT_GFX1151: &str = "183d802686e532077ce0ae68b0f9904c60578352bc13981393ab7bfda3b08710";
 
 /// A kernel script whose `emit` runs `body` inside a `Workgroup` scope.
 /// `body` starts on line 13, so the position of anything in it is found with

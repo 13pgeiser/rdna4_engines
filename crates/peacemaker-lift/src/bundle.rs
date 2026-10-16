@@ -216,7 +216,8 @@ mod tests {
         assert_eq!(triples, ["host-x86_64-unknown-linux-gnu-", "hipv4-amdgcn-amd-amdhsa--gfx1201"]);
         assert_eq!(bundle.entries.iter().map(|e| e.offset).collect::<Vec<_>>(), [0x1000, 0x1000]);
         let device = bundle.device_entry(Arch::Gfx1201).unwrap();
-        assert_eq!((payloads[0].len(), payloads[device].len()), (0, 0x575f8));
+        // 0x575f8 (357_880 B) before the s_code_end guard (906c75705, images 18909b331): the ELF grew by 0x1b0 = 432 B.
+        assert_eq!((payloads[0].len(), payloads[device].len()), (0, 0x577a8));
         assert!(payloads[device].starts_with(b"\x7fELF"));
         assert_eq!(bundle.write(&payloads).unwrap(), hxaco);
     }
