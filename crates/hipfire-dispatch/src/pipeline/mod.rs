@@ -3872,6 +3872,8 @@ fn decode_route_gpu_stage(
             hip!(gpu.moe_router_softmax_top10_masked_f32(
                 p.router_logits, p.topk_indices, p.topk_weights, 1,
                 p.norm_topk_prob, keep_mask, p.recipe.bf16_round_trip(),
+                // Decode is one row; same fault ABI as the dense router below.
+                p.layer_idx as usize, 0,
             ))?;
         } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(

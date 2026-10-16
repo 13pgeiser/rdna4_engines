@@ -7,11 +7,37 @@
 
 // This separately registered variant preserves the incumbent router's
 // selection, float32 reduction order, normalization and BF16 boundaries.
-// Only the logit loads differ: excluded experts read as negative infinity.
+// Only the logit loads differ: excluded experts read as negative infinity
+// and are exempt from the non-finite fail-closed check; kept experts fault
+// like the dense router.
 __device__ __forceinline__ float router_bf16_rt(float v) {
     if (!isfinite(v)) return v;
     const unsigned int u = __float_as_uint(v);
     return __uint_as_float((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+}
+
+// Router fault word, identical to the dense router's (see
+// moe_router_softmax_top10_f32.hip): 0 = clear, otherwise
+// ((row + 1) << 24) | (layer + 1); the smaller code is kept.
+__device__ __forceinline__ void router_record_fault(
+    unsigned long long* fault, int layer, int row) {
+    if (fault == nullptr) return;
+    const unsigned long long code =
+        ((unsigned long long)(unsigned int)(row + 1) << 24) | (unsigned long long)(unsigned int)(layer + 1);
+    const unsigned long long current =
+        __hip_atomic_load(fault, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    if (current == 0ull || code < current)
+        __hip_atomic_store(fault, code, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ void router_fail_row(
+    int* topk_idx, float* topk_w, int token, unsigned long long* fault, int layer, int row) {
+    const size_t output_base = (size_t)token * 10;
+    for (int rank = 0; rank < 10; ++rank) {
+        topk_idx[output_base + rank] = -1;
+        topk_w[output_base + rank] = 0.0f;
+    }
+    router_record_fault(fault, layer, row);
 }
 
 __device__ __forceinline__ float router_wave_max(float v) {
@@ -50,7 +76,10 @@ extern "C" __global__ void moe_router_softmax_top10_masked_f32(
     int top_k,
     int normalize_topk_prob,
     int round_logits,
-    const unsigned char* __restrict__ keep
+    const unsigned char* __restrict__ keep,
+    unsigned long long* __restrict__ fault, // host-mapped router fault word, or null
+    int layer,                              // sealed call layer index
+    int row_base                            // global row of this launch's row 0
 ) {
     __shared__ float wave_values[80];
     __shared__ int wave_indices[80];
@@ -63,12 +92,23 @@ extern "C" __global__ void moe_router_softmax_top10_masked_f32(
 
     if (n_exp != 512 || top_k != 10) return;
 
+    // Excluded experts are never read: their logits (even NaN/Inf) cannot
+    // fault the row. Only the kept logits are checked, after the optional BF16
+    // round trip, exactly like the dense router: any NaN/Inf kept logit fails
+    // the whole row closed (ids -1, weights 0) and records (layer, row) in
+    // the device fault word. The vote is workgroup-uniform.
     const size_t token_base = (size_t)token * 512;
-    float first_logit = keep[thread] ? logits[token_base + thread] : -INFINITY;
-    float second_logit = keep[thread + 256] ? logits[token_base + thread + 256] : -INFINITY;
+    const bool first_kept = keep[thread] != 0;
+    const bool second_kept = keep[thread + 256] != 0;
+    float first_logit = first_kept ? logits[token_base + thread] : -INFINITY;
+    float second_logit = second_kept ? logits[token_base + thread + 256] : -INFINITY;
     if (round_logits != 0) {
         first_logit = router_bf16_rt(first_logit);
         second_logit = router_bf16_rt(second_logit);
+    }
+    if (__syncthreads_or((first_kept && !isfinite(first_logit)) || (second_kept && !isfinite(second_logit)))) {
+        if (thread == 0) router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+        return;
     }
     float first_value = first_logit;
     float second_value = second_logit;
@@ -133,7 +173,10 @@ extern "C" __global__ void moe_router_softmax_top10_masked_f32(
         float denom = 0.0f;
         for (int expert = 0; expert < 512; ++expert)
             denom += exps[expert];
-        if (!(denom > 0.0f) || !isfinite(denom)) return;
+        if (!(denom > 0.0f) || !isfinite(denom)) {
+            router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+            return;
+        }
 
         const float inv_denom = 1.0f / denom;
         for (int rank = 0; rank < top_k; ++rank)
@@ -143,7 +186,10 @@ extern "C" __global__ void moe_router_softmax_top10_masked_f32(
             float selected_sum = 0.0f;
             for (int rank = 0; rank < top_k; ++rank)
                 selected_sum += probabilities[rank];
-            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) return;
+            if (!(selected_sum > 0.0f) || !isfinite(selected_sum)) {
+                router_fail_row(topk_idx, topk_w, token, fault, layer, row_base + token);
+                return;
+            }
             const float inv_selected = 1.0f / selected_sum;
             for (int rank = 0; rank < top_k; ++rank)
                 probabilities[rank] *= inv_selected;

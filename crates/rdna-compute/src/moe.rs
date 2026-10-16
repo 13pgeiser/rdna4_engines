@@ -1929,6 +1929,15 @@ impl Gpu {
 
     /// Fixed E512/top10 route with a load-owned 512-byte membership mask.
     /// `keep` must remain device-readable until this stream finishes.
+    ///
+    /// Same fail-closed fault ABI as [`Gpu::moe_router_softmax_top10_f32`]
+    /// (`layer`, `row_base`, ids `-1` / weights `0`, the [`crate::router_fault`]
+    /// word), except that excluded experts' logits are never read: they may be
+    /// anything, including NaN/Inf, without faulting the row. A NaN or +/-Inf
+    /// logit of a *kept* expert (after the optional rounding), or a failed
+    /// softmax denominator, faults the row. Rows with finite kept logits are
+    /// bitwise what they were before the fault ABI.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_router_softmax_top10_masked_f32(
         &mut self,
         logits: &GpuTensor,
@@ -1938,8 +1947,20 @@ impl Gpu {
         normalize_topk_prob: bool,
         keep: usize,
         round_logits: bool,
+        layer: usize,
+        row_base: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // The kernel is fixed E512/top-10 and reads only the first 512 mask bytes.
+        require_span(logits, &[tokens, 512, 4], "moe_router_softmax_top10_masked_f32 logits")?;
+        require_span(topk_idx, &[tokens, 10, 4], "moe_router_softmax_top10_masked_f32 ids")?;
+        require_span(topk_w, &[tokens, 10, 4], "moe_router_softmax_top10_masked_f32 weights")?;
+        if keep == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_router_softmax_top10_masked_f32: null keep mask",
+            ));
+        }
         let func = "moe_router_softmax_top10_masked_f32";
         self.ensure_kernel(func, kernels::MOE_ROUTER_SOFTMAX_TOP10_MASKED_F32_SRC, func)?;
         let lp = logits.buf.as_ptr();
@@ -1950,6 +1971,9 @@ impl Gpu {
         let ne = 512i32;
         let kt = 10i32;
         let norm = i32::from(normalize_topk_prob);
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
         let mut params = [
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -1959,6 +1983,9 @@ impl Gpu {
             &norm as *const _ as *mut c_void,
             &round as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(func, [tokens as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -1970,6 +1997,9 @@ impl Gpu {
             b.push_i32(norm);
             b.push_i32(round);
             b.push_ptr(kp);
+            b.push_ptr(fault as *const c_void);
+            b.push_i32(layer_arg);
+            b.push_i32(row_base_arg);
             b
         })
     }
