@@ -513,7 +513,7 @@ When any limiter's residency exceeds 10 % of a measured run, the bench prints on
 
 The command is Linux only. It reads Linux sysfs, proc and device nodes, so on another OS the first checks fail and the report is `blocked`. The checks open neither the GPU nor the NPU; only the calibration and the soak do.
 
-**Checks.** Every check prints `PASS`, `FAIL` or `INFO` with what it found. A failed check blocks: nothing is run and the exit status is 1. `INFO` checks only report. A failed check prints a `fix:` line.
+**Checks.** Every check prints `PASS`, `FAIL`, `WARN` or `INFO` with what it found. A failed check blocks: nothing is run and the exit status is 1. `WARN` and `INFO` checks never block and never change the tier. A failed or warned check prints a `fix:` line.
 
 | Check id | Blocks? | Reads | Fix |
 |---|---|---|---|
@@ -528,6 +528,7 @@ The command is Linux only. It reads Linux sysfs, proc and device nodes, so on an
 | `gpu_free` | yes | Whether `hipfire serve` is running (`serve.pid`) and a non-blocking probe of the GPU's lock file. Reports `INFO` and skips when there is no gfx1151 GPU. | `hipfire stop` |
 | `npu_trunk_config` | no | The effective `fusions.npu_trunk`. | None. |
 | `fclk` | no | The fabric clock state of the GPU (pinned or automatic) and whether it could be pinned without a password (writable attributes or `sudo -n`). Serving runs it on automatic. | None. |
+| `power` | no | Whether the GPU is running below full power: the system power mode (`/sys/firmware/acpi/platform_profile`, else `/sys/class/platform-profile/*/profile`), the GPU power profile (`pp_power_profile_mode`), the power limit against its default (`power1_cap`, `power1_cap_default`; `power1_cap_max` is only shown), the GPU performance level, and the GPU clock ceiling against the hardware maximum (`pp_dpm_sclk`, `pp_od_clk_voltage`), with the current clock for reference. `WARN` when the system mode is `low-power`, `quiet`, `cool` or `balanced`, the GPU profile is `POWER_SAVING`, the power limit is under 80 % of its default (not judged when the card reports no default), the clock ceiling is under 90 % of the hardware maximum, or the performance level is `low`. hipfire's published speeds assume full power. `INFO` when nothing could be read or there is no gfx1151 GPU. A current clock below its maximum is not a warning: an idle GPU clocks down. | The warning names each cause and gives one fix line for each, such as `powerprofilesctl set performance`; raise a lowered power limit in the BIOS or your vendor's power tool. |
 
 **Tiers and profiles.** The tier follows from the checks and a table of validated host profiles compiled into the CLI:
 
@@ -592,7 +593,7 @@ changes no setting and writes no file
 | `profile` | Id of the matched or nearest profile row; absent when blocked. |
 | `profile_diff` | List of `{field, reference, found}`; empty for `reference` and `blocked`. |
 | `host` | `gpu_arch`, `npu`, `kernel`, `iommu` (`gpu`, `npu`), `amdxdna`, `npu_fw`, `kernels`, `memlock` (`soft`, `hard`, `required`, `cap_ipc_lock`; `null` is unlimited) and `fclk` (`pinned`, `pinnable`). |
-| `checks` | List of `{id, status, detail}` with `fix` on a failure; `status` is `pass`, `fail` or `info`. |
+| `checks` | List of `{id, status, detail}` with `fix` on a failure or a warning; `status` is `pass`, `fail`, `warn` or `info`. |
 | `model` | `tag`, `index_sha256` and `calibration` (`builtin` or `file`, the record that admitted it); absent when no model matched. |
 | `npu_trunk` | The effective `fusions.npu_trunk`. |
 | `calibration` | Absent when none ran. `armed`, `off_reason`, `trunk_route`, `sizes` (per size: `rows`, `off` and `auto` as `samples_ms` and `median_ms`, `saved_pct`, `spread_pct`, `verdict`), `rate_scales`, `npu_wait_per_pair`, `guard_trips`, `exactness` (`verdict`, `prompt_rows`, `tokens`, `first_difference`) and `duration_s`. |

@@ -12,6 +12,7 @@
 
 mod calibrate;
 mod checks;
+mod power;
 mod probe;
 mod profiles;
 mod report;
@@ -290,6 +291,7 @@ fn render_head(report: &Report) -> String {
             CheckStatus::Pass => "PASS",
             CheckStatus::Fail => "FAIL",
             CheckStatus::Info => "INFO",
+            CheckStatus::Warn => "WARN",
         };
         let _ = writeln!(text, "{status} {}: {}", check.id, check.detail);
         if let Some(fix) = &check.fix {
@@ -1149,6 +1151,47 @@ mod tests {
         let report = json(&run);
         assert_eq!(report["tier"], "blocked");
         assert_eq!(report["recommendation"]["action"], "none");
+    }
+
+    #[test]
+    fn low_power_warns_in_text_and_json_but_still_calibrates() {
+        let probe = FakeProbe::healthy();
+        probe.put("sys/firmware/acpi/platform_profile", "low-power\n");
+        let mut actions = actions_with(calibration(vec![gain()]));
+        let run = drive(
+            &probe,
+            matching_profiles(),
+            &mut actions,
+            &["--npu", "--yes"],
+            true,
+            "",
+        );
+        assert_eq!(run.status, 0, "{}", run.stdout);
+        assert!(run.stdout.contains("WARN power: "), "{}", run.stdout);
+        assert!(run.stdout.contains("assume full power"));
+        assert!(run
+            .stdout
+            .contains("fix: Switch the system to its performance power mode"));
+        assert!(run.stdout.contains("tier: reference"), "{}", run.stdout);
+        assert!(!run.calls.is_empty());
+
+        let run = drive(
+            &probe,
+            matching_profiles(),
+            &mut actions,
+            &["--npu", "--yes", "--json"],
+            false,
+            "",
+        );
+        let report = json(&run);
+        let power = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "power")
+            .unwrap();
+        assert_eq!(power["status"], "warn");
+        assert_eq!(report["tier"], "reference");
     }
 
     #[test]

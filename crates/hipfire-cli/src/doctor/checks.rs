@@ -9,6 +9,7 @@
 //! (rlimits, capabilities, access(2), the GPU lock, `sudo -n`, the daemon, local
 //! models) is a probe method. Nothing here opens the GPU or the NPU.
 
+use super::power;
 use super::report::{Check, CheckStatus, Fclk, Host, Iommu, Memlock, Model};
 use hipfire_arch_qwen4::npu_trunk::{self, fclk};
 use hipfire_config::devices::{enumerate_gpus, GpuDevice};
@@ -428,6 +429,18 @@ fn fclk_check(probe: &dyn HostProbe, gpu: Option<&GpuDevice>) -> (Check, Fclk) {
     (info("fclk", detail), Fclk { pinned, pinnable })
 }
 
+/// `gpu` is `None` when there is no gfx1151 GPU to read.
+fn power_check(probe: &dyn HostProbe, gpu: Option<&GpuDevice>) -> Check {
+    let Some(gpu) = gpu else {
+        return info("power", "skipped: no gfx1151 GPU to read");
+    };
+    let device = probe
+        .root()
+        .join("sys/bus/pci/devices")
+        .join(gpu.bdf.to_string());
+    power::assess(&power::read(probe.root(), &device))
+}
+
 /// Run every check. Order is the report order.
 pub(crate) fn run(probe: &dyn HostProbe) -> Outcome {
     let root = probe.root();
@@ -465,6 +478,7 @@ pub(crate) fn run(probe: &dyn HostProbe) -> Outcome {
     ));
     let (fclk_info, fclk_facts) = fclk_check(probe, gpu);
     checks.push(fclk_info);
+    checks.push(power_check(probe, gpu));
 
     let unknown = |value: Option<String>| value.unwrap_or_else(|| "unknown".to_owned());
     let host = Host {
@@ -769,7 +783,8 @@ mod tests {
                 "model",
                 "gpu_free",
                 "npu_trunk_config",
-                "fclk"
+                "fclk",
+                "power"
             ]
         );
         let target = outcome.target.as_ref().unwrap();
@@ -815,6 +830,58 @@ mod tests {
         assert_eq!(outcome.host.gpu_arch.as_deref(), Some("gfx1100"));
         assert_eq!(check(&outcome, "gpu_free").status, CheckStatus::Info);
         assert_eq!(check(&outcome, "fclk").status, CheckStatus::Info);
+        let power = check(&outcome, "power");
+        assert_eq!(power.status, CheckStatus::Info);
+        assert_eq!(power.detail, "skipped: no gfx1151 GPU to read");
+    }
+
+    #[test]
+    fn healthy_host_without_power_files_reports_power_as_information() {
+        let outcome = run(&FakeProbe::healthy());
+        let power = check(&outcome, "power");
+        assert_eq!(power.status, CheckStatus::Info);
+        assert!(power.fix.is_none());
+    }
+
+    #[test]
+    fn full_power_host_passes_the_power_check() {
+        let probe = FakeProbe::healthy();
+        probe.put("sys/firmware/acpi/platform_profile", "performance\n");
+        probe.put(
+            "sys/bus/pci/devices/0000:c0:00.0/hwmon/hwmon5/power1_cap",
+            "120000000\n",
+        );
+        probe.put(
+            "sys/bus/pci/devices/0000:c0:00.0/hwmon/hwmon5/power1_cap_default",
+            "120000000\n",
+        );
+        let outcome = run(&probe);
+        let power = check(&outcome, "power");
+        assert_eq!(power.status, CheckStatus::Pass, "{}", power.detail);
+        assert!(failed(&outcome).is_empty());
+    }
+
+    #[test]
+    fn low_power_host_warns_without_blocking_or_changing_the_target() {
+        let probe = FakeProbe::healthy();
+        probe.put("sys/firmware/acpi/platform_profile", "balanced\n");
+        probe.put(
+            "sys/bus/pci/devices/0000:c0:00.0/hwmon/hwmon5/power1_cap",
+            "55000000\n",
+        );
+        probe.put(
+            "sys/bus/pci/devices/0000:c0:00.0/hwmon/hwmon5/power1_cap_default",
+            "120000000\n",
+        );
+        let outcome = run(&probe);
+        let power = check(&outcome, "power");
+        assert_eq!(power.status, CheckStatus::Warn, "{}", power.detail);
+        assert!(power.detail.contains("system power mode is balanced"));
+        assert!(power.detail.contains("55 W"));
+        assert!(power.detail.contains("assume full power"));
+        assert!(power.fix.as_deref().unwrap().contains("performance"));
+        assert!(!outcome.blocked());
+        assert!(outcome.target.is_some());
     }
 
     #[test]

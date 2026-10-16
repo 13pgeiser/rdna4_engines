@@ -27,6 +27,9 @@ pub(crate) enum Tier {
 pub(crate) enum CheckStatus {
     Pass,
     Fail,
+    /// Something is wrong that slows hipfire but does not stop it. Never
+    /// blocks and never changes the tier.
+    Warn,
     /// Reported only; never blocks and never changes the tier by itself.
     Info,
 }
@@ -34,12 +37,12 @@ pub(crate) enum CheckStatus {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct Check {
     /// Stable id: `gpu_arch`, `npu_xdna2`, `accel_node`, `npu_firmware`, `memlock`,
-    /// `rocm_runtime`, `daemon`, `model`, `gpu_free`, `npu_trunk_config`, `fclk`.
+    /// `rocm_runtime`, `daemon`, `model`, `gpu_free`, `npu_trunk_config`, `fclk`, `power`.
     pub id: &'static str,
     pub status: CheckStatus,
     /// What was found, without paths, user or host names.
     pub detail: String,
-    /// The exact fix for a failed check; `None` when it passed or is informational.
+    /// The exact fix for a failed or warned check; `None` when it passed or is informational.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
 }
