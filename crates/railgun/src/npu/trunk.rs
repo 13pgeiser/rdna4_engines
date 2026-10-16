@@ -86,6 +86,27 @@ impl ArenaLayout {
     pub fn c_span(self, shape: Shape) -> usize {
         ((self.padded_rows_for(shape) - 1) * self.pitches[shape.index()] + shape.panel_n()) * 2
     }
+    pub fn set_pitch(&mut self, shape: Shape, pitch: usize) { self.pitches[shape.index()] = pitch; }
+    /// Arena bytes of one bank, `[a_in, a_out, c GdnIn, c QsaIn, c GdnOut, c QsaO]`. An absent shape (or A class)
+    /// keeps only one registration page for the fixed binding table, never a full arena.
+    pub fn bank_arena_bytes(self, has_in: bool, has_out: bool) -> [usize; 6] {
+        let c = |shape: Shape| self.c_bytes(shape).max(4096);
+        [if has_in { self.a_bytes } else { 0 }.max(4096), if has_out { self.a_out_bytes } else { 0 }.max(4096),
+            c(Shape::GdnIn), c(Shape::QsaIn), c(Shape::GdnOut), c(Shape::QsaO)]
+    }
+    /// Bytes `banks` banks of arenas pin against `RLIMIT_MEMLOCK`: every arena rounded up to whole pages.
+    pub fn pinned_bytes(self, banks: usize, has_in: bool, has_out: bool) -> usize {
+        banks * self.bank_arena_bytes(has_in, has_out).iter().map(|&n| n.div_ceil(4096) * 4096).sum::<usize>()
+    }
+    /// [`Self::pinned_bytes`] for a trunk of `banks` banks opened at `rows_max` with one `(shape, compacted pitch)`
+    /// program per shape: exactly what [`NpuTrunkRuntime::open_with_builder`] settles before it allocates.
+    pub fn trunk_pinned_bytes(rows_max: usize, banks: usize, programs: &[(Shape, usize)]) -> Result<usize, String> {
+        let mut layout = Self::new(rows_max)?;
+        layout.pitches = [0; 4];
+        for &(shape, pitch) in programs { layout.set_pitch(shape, pitch); }
+        let (has_in, has_out) = (programs.iter().any(|(s, _)| !s.is_out()), programs.iter().any(|(s, _)| s.is_out()));
+        Ok(layout.pinned_bytes(banks, has_in, has_out))
+    }
 }
 
 /// A view, not ownership: valid only until runtime teardown. The BO itself is
@@ -323,7 +344,7 @@ impl NpuTrunkRuntime {
             }
             // One hardware context per distinct PDI (input shapes and out shapes run different G80 programs); shapes of
             // the same program share a context. Nothing requires the PDIs of different shape classes to be equal.
-            layout.pitches[program.shape.index()] = program.pitch;
+            layout.set_pitch(program.shape, program.pitch);
             shapes.push(program.shape);
         }
         let mut keys = Vec::new();
@@ -337,15 +358,11 @@ impl NpuTrunkRuntime {
         }
         if keys.is_empty() { return Err("no resident B panels".into()); }
         let panel_counts: Vec<usize> = layers.iter().map(|l| l.panels.len()).collect();
-        // Arena bytes of one bank, `[a_in, a_out, c GdnIn, c QsaIn, c GdnOut, c QsaO]`. An absent shape (or A class)
-        // keeps only one registration page for the fixed binding table, never a full arena.
         let (has_in, has_out) = (shapes.iter().any(|s| !s.is_out()), shapes.iter().any(|s| s.is_out()));
-        let c = |shape: Shape| layout.c_bytes(shape).max(4096);
-        let sizes = [if has_in { layout.a_bytes } else { 0 }.max(4096), if has_out { layout.a_out_bytes } else { 0 }.max(4096),
-            c(Shape::GdnIn), c(Shape::QsaIn), c(Shape::GdnOut), c(Shape::QsaO)];
+        let sizes = layout.bank_arena_bytes(has_in, has_out);
         // Every arena becomes a userptr BO whose pages the driver pins against RLIMIT_MEMLOCK; settle the limit
         // before any HIP load, allocation or registration.
-        super::ensure_pin_headroom(banks * sizes.iter().map(|&n| n.div_ceil(4096) * 4096).sum::<usize>())?;
+        super::ensure_pin_headroom(layout.pinned_bytes(banks, has_in, has_out))?;
         let hip = HipRuntime::load_for_pci(pci)?;
         if hip.device_arch()? != "gfx1151" { return Err("trunk transport currently requires gfx1151".into()); }
         let api = hip.relay_api()?;
@@ -892,6 +909,10 @@ mod tests {
         }
         assert_eq!(l.c_bytes(Shape::GdnIn), 272_629_760);
         assert_eq!(l.c_bytes(Shape::QsaIn), 230_686_720);
+        // Two banks x (A 8192x2880, GdnIn + QsaIn C, three 4 KiB placeholders): the shipped trunk's pin.
+        let shipped = [(Shape::GdnIn, Shape::GdnIn.pitch()), (Shape::QsaIn, Shape::QsaIn.pitch())];
+        assert_eq!(ArenaLayout::trunk_pinned_bytes(8192, 2, &shipped).unwrap(), 1_053_843_456);
+        assert!(ArenaLayout::trunk_pinned_bytes(0, 2, &shipped).is_err());
         assert_eq!(ArenaLayout::new(257).unwrap().padded_rows, 512);
         assert!(ArenaLayout::new(0).is_err()); assert!(ArenaLayout::new(65537).is_err());
     }

@@ -555,7 +555,7 @@ impl KernelCompiler {
         let precompiled_dir = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-            .map(|dir| dir.join("kernels").join("compiled").join(arch))
+            .map(|dir| crate::kernel_pack::pack_arch_dir(&dir, arch))
             .filter(|p| p.is_dir())
             .or_else(|| {
                 let cwd_path = PathBuf::from("kernels/compiled").join(arch);

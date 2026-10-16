@@ -5812,12 +5812,10 @@ impl Qwen4GpuForward {
         }
     }
 
-    /// A faulted (latched) route plans nothing: callers take exactly the `off` scheduling.
+    /// Latched faults and diagnostic GPU-only requests take exactly the `off` scheduling.
     pub(crate) fn npu_trunk_planned(&self) -> bool {
         #[cfg(target_os = "linux")]
-        {
-            self.npu_trunk.as_ref().is_some_and(|n| !n.faulted())
-        }
+        { self.npu_trunk.as_ref().is_some_and(|n| !n.route_off()) }
         #[cfg(not(target_os = "linux"))]
         {
             false

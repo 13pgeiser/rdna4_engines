@@ -15,7 +15,7 @@ pub use crate::compiler::KERNEL_CACHE_ABI;
 use crate::kernel_registry::{self, KernelEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Manifest schema version. Bump on any field change.
 pub const PACK_FORMAT: u32 = 1;
@@ -207,6 +207,32 @@ impl PackManifest {
     }
 }
 
+/// The `kernels/compiled/<arch>` directory beside the executable in
+/// `exe_dir`: where the runtime loads a pack from and `kernel-pack install`
+/// writes one.
+pub fn pack_arch_dir(exe_dir: &Path, arch: &str) -> PathBuf {
+    exe_dir.join("kernels").join("compiled").join(arch)
+}
+
+/// Sibling file `<arch_dir>.manifest.json` where `kernel-pack install`
+/// records the manifest of the pack it installed.
+pub fn installed_manifest_path(arch_dir: &Path) -> PathBuf {
+    let name = arch_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    arch_dir.with_file_name(format!("{name}.manifest.json"))
+}
+
+/// Manifest of the pack installed at `arch_dir`, if `kernel-pack install`
+/// recorded one for this architecture. A missing, unreadable or foreign-arch
+/// record is `None`: the directory then has no known provenance.
+pub fn installed_manifest(arch_dir: &Path) -> Option<PackManifest> {
+    let bytes = std::fs::read(installed_manifest_path(arch_dir)).ok()?;
+    let manifest: PackManifest = serde_json::from_slice(&bytes).ok()?;
+    (arch_dir.file_name()?.to_str()? == manifest.arch).then_some(manifest)
+}
+
 /// Numeric components of a dotted version, ignoring a non-numeric tail in each
 /// component (`7.15.26333-0000000` → `[7, 15, 26333]`).
 fn version_parts(version: &str) -> Option<Vec<u64>> {
@@ -327,6 +353,86 @@ mod tests {
         assert_eq!(
             default_rocm_range("7.2.4"),
             Some(("7.2".into(), "8.0".into()))
+        );
+    }
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-kpack-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manifest(arch: &str) -> PackManifest {
+        PackManifest {
+            format: PACK_FORMAT,
+            tag: "v0.4.3".into(),
+            commit: "0".repeat(40),
+            arch: arch.into(),
+            modules: 3,
+            kernel_cache_abi: KERNEL_CACHE_ABI,
+            extra_flags: String::new(),
+            toolchain_id: "HIP version: 7.2".into(),
+            hip_version: "7.2".into(),
+            rocm_version: "7.2.0".into(),
+            code_object_version: 6,
+            rocm_min: "7.2".into(),
+            rocm_max_exclusive: "8.0".into(),
+        }
+    }
+
+    #[test]
+    fn installed_manifest_round_trips_through_the_sibling_file() {
+        let root = scratch("roundtrip");
+        let arch_dir = root.join("gfx1151");
+        let expected = manifest("gfx1151");
+        std::fs::write(
+            installed_manifest_path(&arch_dir),
+            serde_json::to_vec(&expected).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            installed_manifest_path(&arch_dir),
+            root.join("gfx1151.manifest.json")
+        );
+        assert_eq!(installed_manifest(&arch_dir), Some(expected));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_manifest_for_another_arch_is_ignored() {
+        let root = scratch("mismatch");
+        let arch_dir = root.join("gfx1151");
+        std::fs::write(
+            installed_manifest_path(&arch_dir),
+            serde_json::to_vec(&manifest("gfx1201")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(installed_manifest(&arch_dir), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installed_manifest_missing_or_garbled_is_none() {
+        let root = scratch("missing");
+        let arch_dir = root.join("gfx1151");
+        assert_eq!(installed_manifest(&arch_dir), None);
+        std::fs::write(installed_manifest_path(&arch_dir), b"not json").unwrap();
+        assert_eq!(installed_manifest(&arch_dir), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pack_arch_dir_is_the_executable_neighbour_layout() {
+        assert_eq!(
+            pack_arch_dir(Path::new("/opt/hipfire/bin"), "gfx1151"),
+            Path::new("/opt/hipfire/bin/kernels/compiled/gfx1151")
         );
     }
 }

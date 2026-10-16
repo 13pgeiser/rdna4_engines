@@ -114,6 +114,7 @@ pub(crate) fn install(request: &PackRequest<'_>) -> std::result::Result<PackMani
             kernel_pack::verify_dir(request.arch, &extra_flags, &arch_dir, local.as_deref())?;
         manifest.check_verified(&verified)?;
         replace_dir(&arch_dir, request.dest, &nonce)?;
+        write_installed_manifest(request.dest, &manifest_bytes)?;
         Ok(manifest)
     })();
     let _ = fs::remove_dir_all(&staging);
@@ -316,6 +317,29 @@ fn replace_dir(verified: &Path, dest: &Path, nonce: &str) -> std::result::Result
     Ok(())
 }
 
+/// Record the verified manifest bytes in `<dest>.manifest.json` (temp file
+/// plus rename in the same directory, so a reader sees the old or the new
+/// record, never a partial one).
+fn write_installed_manifest(dest: &Path, manifest_bytes: &[u8]) -> std::result::Result<(), String> {
+    let record = kernel_pack::installed_manifest_path(dest);
+    let temp = record.with_file_name(format!(
+        ".{}.tmp-{}",
+        record
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("manifest.json"),
+        unique_suffix()
+    ));
+    let written = fs::write(&temp, manifest_bytes).and_then(|()| fs::rename(&temp, &record));
+    written.map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        format!(
+            "installed the pack but could not record its manifest at {}: {e}",
+            record.display()
+        )
+    })
+}
+
 /// `hipfire kernel-pack install`: the same path `hipfire setup` takes, for
 /// `install.ps1` and for repairing an install without a device compiler.
 pub(crate) fn install_command(
@@ -441,6 +465,31 @@ mod tests {
                 "{label} accepted"
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_records_the_verified_manifest_beside_the_arch_dir() {
+        let root = std::env::temp_dir().join(format!("hipfire-pack-record-{}", unique_suffix()));
+        let dest = root.join("kernels/compiled/gfx1151");
+        fs::create_dir_all(&dest).unwrap();
+        let bytes = br#"{"format":1}"#;
+        write_installed_manifest(&dest, bytes).unwrap();
+        let sibling = root.join("kernels/compiled/gfx1151.manifest.json");
+        assert_eq!(kernel_pack::installed_manifest_path(&dest), sibling);
+        assert_eq!(fs::read(&sibling).unwrap(), bytes);
+        // A rewrite replaces the record and leaves no temp file behind.
+        write_installed_manifest(&dest, b"{}").unwrap();
+        assert_eq!(fs::read(&sibling).unwrap(), b"{}");
+        let leftovers = fs::read_dir(root.join("kernels/compiled"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(leftovers, 0);
+        // An unwritable parent is an error, not a silent skip.
+        let _ = fs::remove_dir_all(root.join("kernels/compiled"));
+        assert!(write_installed_manifest(&dest, bytes).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -3,7 +3,14 @@
 //! Flash-Next NPU trunk. References live in peacemaker-npu; no device opens here.
 
 pub(crate) mod admission;
-pub(crate) use calibration::{host_facts, npu_firmware, runtime_key_with_firmware};
+pub(crate) use calibration::runtime_key_with_firmware;
+pub use calibration::{host_facts, npu_firmware, HostFacts};
+#[cfg(target_os = "linux")]
+pub use calibration::{bounded_memlock_bytes, trunk_pin_bytes};
+#[cfg(target_os = "linux")]
+pub(crate) use calibration::{TRUNK_BANKS, TRUNK_ROWS_MAX};
+#[cfg(target_os = "linux")]
+pub use railgun::npu::fclk;
 mod calibration;
 mod config;
 pub(crate) mod containment;
@@ -12,6 +19,7 @@ mod packing;
 mod plan;
 mod programs;
 mod rates;
+pub mod route;
 mod shapes;
 
 pub(crate) use packing::pack_matrix_direct;
@@ -35,6 +43,7 @@ pub use rates::{
     SCALE_MAX, SCALE_MIN,
 };
 pub use config::{NpuTrunkMode, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV};
+pub use route::{diagnostic_gpu_route, set_diagnostic_gpu_route};
 pub use packing::{
     pack_matrix, pack_out, pack_out_layers, pack_shape, pack_shape_with_contract, pack_trunk, pack_trunk_with_contract,
     LayerTrunkRefs, MatrixRef, PackedB, PackedOut, PackedTrunk,

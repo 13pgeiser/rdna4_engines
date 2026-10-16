@@ -290,7 +290,7 @@ pub fn calibration_key(arch: &str, pci_bdf: &str, firmware: &str, release: &str,
 
 /// Probe the exact accel node railgun opens, without opening the runtime.
 #[cfg(unix)]
-pub(crate) fn npu_firmware() -> Result<String, String> {
+pub fn npu_firmware() -> Result<String, String> {
     use std::os::unix::fs::FileTypeExt;
     let node = fs::metadata("/dev/accel/accel0").map_err(|e| format!("NPU accel0 unavailable: {e}"))?;
     if !node.file_type().is_char_device() { return Err("NPU accel0 is not an accel device".into()); }
@@ -307,7 +307,7 @@ pub(crate) fn npu_firmware() -> Result<String, String> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn npu_firmware() -> Result<String, String> {
+pub fn npu_firmware() -> Result<String, String> {
     Err("NPU accel0 unavailable on this platform".into())
 }
 
@@ -318,31 +318,81 @@ pub(crate) fn npu_firmware() -> Result<String, String> {
 /// out-of-tree xdna-driver version, `in-tree` for the mainline module without a version, else
 /// `unknown`; `<f>` is the NPU firmware version. Values are trimmed, whitespace becomes `_`, and
 /// missing/empty/unreadable values are `unknown`. Reads only unprivileged proc/sysfs files.
-#[cfg(unix)]
-pub(crate) fn host_facts(gpu_pci: Option<&str>) -> String { host_facts_from(Path::new("/"), gpu_pci) }
-
-#[cfg(not(unix))]
-pub(crate) fn host_facts(_gpu_pci: Option<&str>) -> String {
-    "kernel=unknown iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown".into()
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostFacts {
+    pub kernel: Option<String>,
+    pub iommu_gpu: Option<String>,
+    pub iommu_npu: Option<String>,
+    pub amdxdna: Option<String>,
+    pub npu_fw: Option<String>,
 }
 
-#[cfg(unix)]
-fn host_facts_from(root: &Path, gpu_pci: Option<&str>) -> String {
-    fn fact(path: &Path) -> Option<String> {
-        let text = fs::read_to_string(path).ok()?;
-        let text = text.split_whitespace().collect::<Vec<_>>().join("_");
-        (!text.is_empty()).then_some(text)
+impl HostFacts {
+    /// Read the facts under `root` (`/` in production, a fixture in tests).
+    #[cfg(unix)]
+    pub fn read(root: &Path, gpu_pci: Option<&str>) -> Self {
+        fn fact(path: &Path) -> Option<String> {
+            let text = fs::read_to_string(path).ok()?;
+            let text = text.split_whitespace().collect::<Vec<_>>().join("_");
+            (!text.is_empty()).then_some(text)
+        }
+        let accel = root.join("sys/class/accel/accel0/device");
+        let module = root.join("sys/module/amdxdna");
+        Self {
+            kernel: fact(&root.join("proc/sys/kernel/osrelease")),
+            iommu_gpu: gpu_pci.and_then(|pci| {
+                fact(&root.join("sys/bus/pci/devices").join(pci.to_lowercase()).join("iommu_group/type"))
+            }),
+            iommu_npu: fact(&accel.join("iommu_group/type")),
+            amdxdna: fact(&module.join("version")).or_else(|| module.is_dir().then(|| "in-tree".into())),
+            npu_fw: fact(&accel.join("fw_version")),
+        }
     }
-    let unknown = |value: Option<String>| value.unwrap_or_else(|| "unknown".into());
-    let kernel = unknown(fact(&root.join("proc/sys/kernel/osrelease")));
-    let gpu = unknown(gpu_pci.and_then(|pci| fact(&root.join("sys/bus/pci/devices").join(pci.to_lowercase()).join("iommu_group/type"))));
-    let accel = root.join("sys/class/accel/accel0/device");
-    let npu = unknown(fact(&accel.join("iommu_group/type")));
-    let module = root.join("sys/module/amdxdna");
-    let amdxdna = fact(&module.join("version")).unwrap_or_else(|| if module.is_dir() { "in-tree".into() } else { "unknown".into() });
-    let npu_fw = unknown(fact(&accel.join("fw_version")));
-    format!("kernel={kernel} iommu=gpu:{gpu},npu:{npu} amdxdna={amdxdna} npu_fw={npu_fw}")
+
+    #[cfg(not(unix))]
+    pub fn read(_root: &Path, _gpu_pci: Option<&str>) -> Self { Self::default() }
 }
+
+impl std::fmt::Display for HostFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = |value: &Option<String>| value.as_deref().unwrap_or("unknown").to_owned();
+        write!(
+            f,
+            "kernel={} iommu=gpu:{},npu:{} amdxdna={} npu_fw={}",
+            v(&self.kernel), v(&self.iommu_gpu), v(&self.iommu_npu), v(&self.amdxdna), v(&self.npu_fw),
+        )
+    }
+}
+
+pub fn host_facts(gpu_pci: Option<&str>) -> String { HostFacts::read(Path::new("/"), gpu_pci).to_string() }
+
+#[cfg(unix)]
+fn host_facts_from(root: &Path, gpu_pci: Option<&str>) -> String { HostFacts::read(root, gpu_pci).to_string() }
+
+/// Rows and banks of the serving trunk transport (what `forward.rs` opens).
+#[cfg(target_os = "linux")]
+pub(crate) const TRUNK_ROWS_MAX: usize = 8192;
+#[cfg(target_os = "linux")]
+pub(crate) const TRUNK_BANKS: usize = 2;
+
+/// Bytes the armed trunk pins against `RLIMIT_MEMLOCK` (userptr arenas of both banks), computed by
+/// the layout code the transport open itself uses, for the serving 8192-row, all-family programs.
+#[cfg(target_os = "linux")]
+pub fn trunk_pin_bytes() -> u64 {
+    use railgun::npu::trunk::{ArenaLayout, Shape as Transport};
+    use super::shapes::{FamilyMask, Shape};
+    let programs: Vec<(Transport, usize)> = [(Shape::GdnIn, Transport::GdnIn), (Shape::QsaIn, Transport::QsaIn)]
+        .into_iter()
+        .map(|(shape, transport)| (transport, shape.column_map(FamilyMask::ALL).padded_cols()))
+        .filter(|&(_, pitch)| pitch != 0)
+        .collect();
+    ArenaLayout::trunk_pinned_bytes(TRUNK_ROWS_MAX, TRUNK_BANKS, &programs)
+        .expect("serving trunk rows are a valid layout") as u64
+}
+
+// Host memlock bound for `required` pinned bytes: required x1.25 rounded up to the MiB.
+#[cfg(target_os = "linux")]
+pub use railgun::npu::bounded_memlock_bytes;
 
 /// Read only unprivileged metadata, never open a GPU/NPU or time work.
 pub fn runtime_calibration_key(arch: &str, pci_bdf: &str, index: &str, trunk_route: &str) -> Result<CalKey, String> {
@@ -532,5 +582,37 @@ mod host_facts_tests {
         root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "DMA\n");
         root.put("proc/sys/kernel/osrelease", "7.2.8\n");
         assert_eq!(host_facts_from(&root.0, None), "kernel=7.2.8 iommu=gpu:unknown,npu:unknown amdxdna=unknown npu_fw=unknown");
+    }
+
+    #[test]
+    fn host_facts_struct_fields_match_the_line() {
+        let root = TempRoot::new("fields");
+        root.put("proc/sys/kernel/osrelease", "7.3.0-rc7-perfopt+\n");
+        root.put("sys/bus/pci/devices/0000:c0:00.0/iommu_group/type", "identity\n");
+        root.put("sys/class/accel/accel0/device/iommu_group/type", "DMA-FQ\n");
+        fs::create_dir_all(root.0.join("sys/module/amdxdna")).unwrap();
+        let facts = HostFacts::read(&root.0, Some("0000:C0:00.0"));
+        assert_eq!(facts, HostFacts {
+            kernel: Some("7.3.0-rc7-perfopt+".into()),
+            iommu_gpu: Some("identity".into()),
+            iommu_npu: Some("DMA-FQ".into()),
+            amdxdna: Some("in-tree".into()),
+            npu_fw: None,
+        });
+        assert_eq!(facts.to_string(), host_facts_from(&root.0, Some("0000:C0:00.0")));
+        assert_eq!(facts.to_string(),
+            "kernel=7.3.0-rc7-perfopt+ iommu=gpu:identity,npu:DMA-FQ amdxdna=in-tree npu_fw=unknown");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn serving_trunk_pins_two_banks_of_userptr_arenas() {
+        // 2 x (A 8192x2880 + GdnIn C 272,629,760 + QsaIn C 230,686,720 + three 4 KiB pages).
+        assert_eq!(trunk_pin_bytes(), 1_053_843_456);
+        assert_eq!(bounded_memlock_bytes(trunk_pin_bytes()), 1_318_060_032);
     }
 }

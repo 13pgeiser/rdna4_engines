@@ -16,6 +16,9 @@ pub mod decide;
 /// both `LoadedModel` and the arch crates are in scope.
 pub mod spec_build;
 
+#[cfg(target_os = "linux")]
+pub use hipfire_arch_qwen4::npu_trunk::set_diagnostic_gpu_route;
+
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;

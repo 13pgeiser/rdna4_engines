@@ -482,7 +482,7 @@ pub fn ensure_pin_headroom(need: usize) -> Result<(), String> {
 const CAP_IPC_LOCK: u32 = 14;
 
 /// Host limit for `required` pinned bytes plus 25% margin, rounded up to the MiB: a bounded value, not `infinity`.
-fn bounded_memlock_bytes(required: u64) -> u64 {
+pub fn bounded_memlock_bytes(required: u64) -> u64 {
     (required + required.div_ceil(4)).div_ceil(1 << 20) << 20
 }
 
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn memlock_bound_is_required_plus_quarter_rounded_to_mib() {
         // The shipped Flash-Next trunk: 2 banks x (A 8192x2880, C GdnIn + QsaIn, three 4 KiB placeholders).
-        assert_eq!(bounded_memlock_bytes(1_053_843_456), 1257 << 20);
+        assert_eq!(bounded_memlock_bytes(1_053_843_456), 1_318_060_032);
         assert_eq!(bounded_memlock_bytes(4 << 20), 5 << 20);
         let e = pin_limit_error(1_053_843_456, 0, 8 << 20);
         assert!(e.contains("hard limit 8388608 B is below the 1053843456 B"), "{e}");

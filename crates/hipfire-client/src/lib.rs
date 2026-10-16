@@ -565,6 +565,17 @@ pub struct Engine {
 
 impl Engine {
     pub fn spawn(daemon: impl AsRef<Path>, environment: &BTreeMap<String, String>) -> Result<Self> {
+        Self::spawn_with_stderr(daemon, environment, Stdio::inherit())
+    }
+
+    /// `spawn` with a caller-chosen daemon stderr. A piped stderr MUST be
+    /// drained (see [`Engine::take_stderr`]) or the daemon blocks once the
+    /// pipe fills.
+    pub fn spawn_with_stderr(
+        daemon: impl AsRef<Path>,
+        environment: &BTreeMap<String, String>,
+        stderr: Stdio,
+    ) -> Result<Self> {
         let daemon = daemon.as_ref();
         if !daemon.is_file() {
             return Err(ClientError::MissingDaemon(daemon.to_owned()));
@@ -573,7 +584,7 @@ impl Engine {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .envs(environment);
         let mut child = command.spawn().map_err(|source| ClientError::Spawn {
             path: daemon.to_owned(),
@@ -700,7 +711,20 @@ impl Engine {
         config: &hipfire_config::ProcessConfig,
         model: Option<&Path>,
     ) -> Result<Self> {
-        let engine = Self::spawn(daemon, environment)?;
+        Self::spawn_configured_with_stderr(daemon, environment, config, model, Stdio::inherit())
+    }
+
+    /// `spawn_configured` with a caller-chosen daemon stderr. A piped stderr
+    /// MUST be drained (see [`Engine::take_stderr`]) or the daemon blocks once
+    /// the pipe fills.
+    pub fn spawn_configured_with_stderr(
+        daemon: impl AsRef<Path>,
+        environment: &BTreeMap<String, String>,
+        config: &hipfire_config::ProcessConfig,
+        model: Option<&Path>,
+        stderr: Stdio,
+    ) -> Result<Self> {
+        let engine = Self::spawn_with_stderr(daemon, environment, stderr)?;
         let mut configure = serde_json::json!({
             "type": "configure",
             "config": config,
@@ -711,6 +735,13 @@ impl Engine {
         let response = engine.request(&configure)?;
         expect_type(&response, "configured")?;
         Ok(engine)
+    }
+
+    /// Take the daemon's piped stderr (once). `None` when stderr was not
+    /// piped or was already taken. The caller must drain it continuously or
+    /// the daemon blocks on a full pipe.
+    pub fn take_stderr(&self) -> Option<std::process::ChildStderr> {
+        self.inner.child.lock().unwrap().stderr.take()
     }
 
     pub fn send(&self, message: &Value) -> Result<()> {
@@ -1986,6 +2017,47 @@ mod tests {
             .err()
             .expect("missing path fails");
         assert!(matches!(error, ClientError::MissingDaemon(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_stderr_is_taken_once_and_inherit_has_none() {
+        use std::io::BufRead;
+        let root =
+            env::temp_dir().join(format!("hipfire-client-stderr-test-{}", std::process::id()));
+        let daemon = write_fake_daemon(
+            &root,
+            "#!/bin/sh\necho 'npu-trunk: rows=1 route=gpu (diagnostic)' >&2\nwhile IFS= read -r line; do\n case \"$line\" in *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+        );
+        let mut engine = None;
+        for attempt in 0..8u64 {
+            match Engine::spawn_with_stderr(&daemon, &BTreeMap::new(), Stdio::piped()) {
+                Ok(e) => {
+                    engine = Some(e);
+                    break;
+                }
+                // Parallel tests can hold the freshly written script open for writing.
+                Err(ClientError::Spawn { source, .. }) if source.raw_os_error() == Some(26) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5 * (1 + attempt)));
+                }
+                Err(err) => panic!("spawn_with_stderr: {err}"),
+            }
+        }
+        let mut engine = engine.expect("spawn_with_stderr retried out");
+        let stderr = engine.take_stderr().expect("piped stderr");
+        assert!(engine.take_stderr().is_none(), "stderr is taken once");
+        let mut line = String::new();
+        std::io::BufReader::new(stderr)
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "npu-trunk: rows=1 route=gpu (diagnostic)");
+        engine.unload().unwrap();
+
+        // The delegating `spawn` keeps inheriting: nothing to take.
+        let mut inherited = spawn_fake_engine(&daemon);
+        assert!(inherited.take_stderr().is_none());
+        inherited.unload().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
