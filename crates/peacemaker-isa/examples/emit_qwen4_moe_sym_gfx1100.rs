@@ -2,18 +2,20 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! B4-B emitter, certifier and P1 receipt writer for the gfx1100 symmetric IU4 MoE kernels
-//! (`src/kernels/qwen4_moe_sym_gfx1100`, included below by `#[path]`).
+//! B4-B emitter, certifier and P1 receipt writer for the gfx11 symmetric IU4 MoE kernels (gfx1100; the E8P-I4
+//! module also for gfx1151) (`src/kernels/qwen4_moe_sym_gfx1100`, included below by `#[path]`).
 //!
 //! ```text
 //! cargo run -p peacemaker-isa --release --features toolchain --example emit_qwen4_moe_sym_gfx1100 -- \
-//!     [--codec legacy|e8p|all] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
+//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
 //! ```
 //!
 //! `--codec legacy` (default, the original behaviour): three modules `kernels/qwen4_moe_iu4_sym{,_w2,_w3}_pm_gfx1100.hxaco`;
 //! `--codec e8p`: the one E8P-I4 module `kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1100.hxaco` (entries
 //! `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1100[_acc]`, 1,536 B static LDS stage, default receipt
-//! `rcpt/k2e8p.p1.json`); `all`: both. Re-running `legacy` against the committed tree proves the old bytes are unchanged
+//! `rcpt/k2e8p.p1.json`); `all`: both. `--arch gfx1151` (default gfx1100) emits the same E8P module for the Halo
+//! (`kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco`, contracts `crates/peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.*_e8p*.contract.json`,
+//! negatives under `kernels/qwen4_moe_gfx1151_negative/`) and requires `--codec e8p`. Re-running `legacy` against the committed tree proves the old bytes are unchanged
 //! (an identical existing artifact is accepted, a different one is an error). Each module has the
 //! four entries `{gate_up, down} x {BF16, _acc}`. Per module: builder-proof inspection, independent
 //! source wait/hazard replay, native build (+ ROCm assembler/linker `.text` identity), per-symbol M7
@@ -61,10 +63,13 @@ mod app {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    const ARCH: &str = "gfx1100";
+    /// The default target; `--arch gfx1151` selects the Halo E8P module (`--codec e8p` only).
+    const DEFAULT_ARCH: Arch = Arch::Gfx1100;
     const DEFAULT_RECEIPT: &str = "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4.p1.json";
     const DEFAULT_RECEIPT_E8P: &str =
         "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/k2e8p.p1.json";
+    const DEFAULT_RECEIPT_E8P_GFX1151: &str =
+        "/home/kaden/qcal/release-0.4.3/halo-e8p-rcpt/k2e8p.gfx1151.p1.json";
     /// Immutable baselines (lead): the gfx1201 objects and the shared sources. Re-pinned on land-rc5 over beta 12daf4fe9:
     /// the objects are the exact beta 12daf4fe9 blobs (n_experts@60 guard; rc3/rc4 pins were
     /// fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 / 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833).
@@ -123,6 +128,7 @@ mod app {
     }
 
     struct Opts {
+        arch: Arch,
         out_dir: PathBuf,
         receipt: PathBuf,
         work_dir: PathBuf,
@@ -133,6 +139,7 @@ mod app {
     }
 
     struct Ctx {
+        arch: Arch,
         root: PathBuf,
         work: PathBuf,
         evidence: Option<PathBuf>,
@@ -257,6 +264,7 @@ mod app {
     // --------------------------------------------------------------------------------------
     // entries, contracts
     struct Entry {
+        arch: Arch,
         codec: Codec,
         kind: Kind,
         acc: bool,
@@ -274,8 +282,9 @@ mod app {
         "v_writelane*",
     ];
 
-    fn mk(codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
+    fn mk(arch: Arch, codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
         Spec {
+            arch,
             codec,
             kind,
             acc,
@@ -633,9 +642,9 @@ mod app {
             .iter()
             .map(|i| format!("{} {}\n", i.mnemonic, i.operands))
             .collect();
-        ledger_replay::replay_waits(&normalised, Arch::Gfx1100)
+        ledger_replay::replay_waits(&normalised, spec.arch)
             .map_err(|e| format!("{symbol}: object wait replay: {e}"))?;
-        let hazards = ledger_replay::replay_hazards(&normalised, Arch::Gfx1100)
+        let hazards = ledger_replay::replay_hazards(&normalised, spec.arch)
             .map_err(|e| format!("{symbol}: object hazard replay: {e}"))?;
         if !hazards.is_empty() {
             return Err(format!(
@@ -876,8 +885,8 @@ mod app {
         reference: Option<&BTreeMap<String, String>>,
     ) -> R<Built> {
         let candidate = negative == Negative::None;
-        let module = codec.module();
-        let want_module = format!("qwen4_moe_iu4_sym{}_pm_gfx1100", codec.infix());
+        let module = codec.module(ctx.arch);
+        let want_module = format!("qwen4_moe_iu4_sym{}_pm_{}", codec.infix(), ctx.arch.name());
         if module != want_module {
             return Err(format!(
                 "Codec::module() = {module}, expected {want_module}"
@@ -890,16 +899,16 @@ mod app {
         let mut emitted = Vec::new();
         let mut entry_notes: Vec<Option<&'static str>> = Vec::new();
         for (kind, acc) in entry_keys() {
-            let symbol = mk(codec, kind, acc, negative).symbol();
+            let symbol = mk(ctx.arch, codec, kind, acc, negative).symbol();
             let mut note = None;
-            let e = match gfx1100::emit(mk(codec, kind, acc, negative)) {
+            let e = match gfx1100::emit(mk(ctx.arch, codec, kind, acc, negative)) {
                 Ok(e) => e,
                 Err(err) if acc && negative == Negative::WrongPackSelector => {
                     // The `_acc` entries have no pack exchange: nothing to mutate; emitted as the candidate.
                     note = Some(
                         "not-applicable: the _acc entry has no pack exchange; emitted unmutated",
                     );
-                    gfx1100::emit(mk(codec, kind, acc, Negative::None))
+                    gfx1100::emit(mk(ctx.arch, codec, kind, acc, Negative::None))
                         .map_err(|e2| format!("{symbol}: emit failed for the mutation ({err}) and the unmutated entry ({e2})"))?
                 }
                 Err(err) => return Err(format!("{symbol}: emit failed: {err}")),
@@ -914,14 +923,15 @@ mod app {
                     "{symbol}: emitted source has no kernel entry of that name"
                 ));
             }
-            if e.proof.arch != Arch::Gfx1100 {
+            if e.proof.arch != ctx.arch {
                 return Err(format!(
-                    "{symbol}: built for {}, not gfx1100",
-                    e.proof.arch.name()
+                    "{symbol}: built for {}, not {}",
+                    e.proof.arch.name(),
+                    ctx.arch.name()
                 ));
             }
             // Frozen 64-byte ABI (60 bytes plus n_experts@60), identical to the gfx1151 MQ4 entry's layout.
-            let layout = mk(codec, kind, acc, negative).kernargs();
+            let layout = mk(ctx.arch, codec, kind, acc, negative).kernargs();
             if layout.size != 64
                 || serde_json::to_value(&layout).map_err(|e| e.to_string())?
                     != frozen_kernargs(kind)
@@ -936,9 +946,10 @@ mod app {
         let specs: Vec<Entry> = entry_keys()
             .into_iter()
             .map(|(k, a)| {
-                let s = mk(codec, k, a, negative);
-                let threads = mk(codec, k, a, negative).threads();
+                let s = mk(ctx.arch, codec, k, a, negative);
+                let threads = mk(ctx.arch, codec, k, a, negative).threads();
                 Entry {
+                    arch: ctx.arch,
                     codec,
                     kind: k,
                     acc: a,
@@ -951,9 +962,9 @@ mod app {
         // 2. Independent source replay per entry (wait ledger and hazards).
         for (spec, e) in specs.iter().zip(&emitted) {
             let symbol = spec.symbol.clone();
-            ledger_replay::replay_waits(&e.s_text, Arch::Gfx1100)
+            ledger_replay::replay_waits(&e.s_text, ctx.arch)
                 .map_err(|err| format!("{symbol}: source wait replay: {err}"))?;
-            let hz = ledger_replay::replay_hazards(&e.s_text, Arch::Gfx1100)
+            let hz = ledger_replay::replay_hazards(&e.s_text, ctx.arch)
                 .map_err(|err| format!("{symbol}: source hazard replay: {err}"))?;
             if !hz.is_empty() {
                 return Err(format!(
@@ -967,7 +978,7 @@ mod app {
         // 3. The module.
         let (text, mproof) = iu4_gemm::module(&emitted, &module)
             .map_err(|e| format!("{module}: module assembly: {e}"))?;
-        ledger_replay::replay_waits(&text, Arch::Gfx1100)
+        ledger_replay::replay_waits(&text, ctx.arch)
             .map_err(|e| format!("{module}: module wait replay: {e}"))?;
         let denorm32 = text.matches(".amdhsa_float_denorm_mode_32 3").count();
         let denorm1664 = text.matches(".amdhsa_float_denorm_mode_16_64 3").count();
@@ -981,7 +992,7 @@ mod app {
         let hxaco = dir.join(format!("{module}.hxaco"));
 
         // 4. Native build; objdump parse-back is mandatory (oracle toolchain).
-        let build = toolchain::build(&ctx.tc, &source, &hxaco, ARCH)
+        let build = toolchain::build(&ctx.tc, &source, &hxaco, ctx.arch.name())
             .map_err(|e| format!("{module}: build: {e}"))?;
         if !build.parse_back_checked || build.disassembly.is_empty() {
             return Err(format!(
@@ -998,7 +1009,7 @@ mod app {
             &ctx.tc,
             &source,
             &oracle_dir.join(format!("{module}.hxaco")),
-            ARCH,
+            ctx.arch.name(),
         )
         .map_err(|e| format!("{module}: oracle build: {e}"))?;
         let oracle_text = text_section(&std::fs::read(&oracle.elf).map_err(|e| e.to_string())?)?;
@@ -1019,7 +1030,7 @@ mod app {
         for (idx, (spec, e)) in specs.iter().zip(&emitted).enumerate() {
             let symbol = spec.symbol.clone();
             let variant = variant_tag(codec, spec.kind, spec.acc);
-            let m7 = pm_check::m7(&build.elf, ARCH, &symbol)
+            let m7 = pm_check::m7(&build.elf, ctx.arch.name(), &symbol)
                 .map_err(|e| format!("{symbol}: M7: {e}"))?;
             if m7["lift"].as_str() != Some("byte-exact") || m7["obligations"] != json!({}) {
                 return Err(format!("{symbol}: M7 not clean: {m7}"));
@@ -1062,7 +1073,7 @@ mod app {
                     &ctx.tc,
                     &build,
                     &source,
-                    ARCH,
+                    ctx.arch.name(),
                     &manifest,
                     Some(&shape),
                     &mproof.s_text_sha256,
@@ -1090,7 +1101,7 @@ mod app {
                 });
                 row["contract_sha256"] = json!(sha256(&contract_bytes));
                 contract_files.push((
-                    ctx.root.join(format!("crates/peacemaker-isa/kernels/qwen4_moe_sym.gfx1100.{variant}.contract.json")),
+                    ctx.root.join(format!("crates/peacemaker-isa/kernels/qwen4_moe_sym.{}.{variant}.contract.json", ctx.arch.name())),
                     contract_bytes,
                 ));
             }
@@ -1115,7 +1126,8 @@ mod app {
             ctx.root.join(format!("kernels/{module}.hxaco"))
         } else {
             ctx.root.join(format!(
-                "kernels/qwen4_moe_gfx1100_negative/{}/{module}.hxaco",
+                "kernels/qwen4_moe_{}_negative/{}/{module}.hxaco",
+                ctx.arch.name(),
                 negative.tag()
             ))
         };
@@ -1280,16 +1292,16 @@ mod app {
             .canonicalize()
             .map_err(|e| format!("{}: {e}", root.display()))?;
         let mut o = Opts {
+            arch: DEFAULT_ARCH,
             out_dir: root,
             receipt: PathBuf::from(DEFAULT_RECEIPT),
-            work_dir: std::env::temp_dir()
-                .join(format!("peacemaker-b4-gfx1100-{}", std::process::id())),
+            work_dir: PathBuf::new(),
             evidence_dir: None,
             seed: 0x4234_5001,
             p1_only: false,
             codecs: CodecSet::Legacy,
         };
-        let mut receipt_given = false;
+        let (mut receipt_given, mut work_given) = (false, false);
         let mut it = argv.iter();
         while let Some(a) = it.next() {
             let mut value = |name: &str| {
@@ -1298,6 +1310,13 @@ mod app {
                     .ok_or_else(|| format!("{name} needs a value"))
             };
             match a.as_str() {
+                "--arch" => {
+                    o.arch = match value("--arch")?.as_str() {
+                        "gfx1100" => Arch::Gfx1100,
+                        "gfx1151" => Arch::Gfx1151,
+                        other => return Err(format!("--arch {other} (gfx1100|gfx1151)")),
+                    }
+                }
                 "--out-dir" => o.out_dir = PathBuf::from(value("--out-dir")?),
                 "--receipt" => {
                     o.receipt = PathBuf::from(value("--receipt")?);
@@ -1311,7 +1330,10 @@ mod app {
                         other => return Err(format!("--codec {other} (legacy|e8p|all)")),
                     }
                 }
-                "--work-dir" => o.work_dir = PathBuf::from(value("--work-dir")?),
+                "--work-dir" => {
+                    o.work_dir = PathBuf::from(value("--work-dir")?);
+                    work_given = true
+                }
                 "--evidence-dir" => o.evidence_dir = Some(PathBuf::from(value("--evidence-dir")?)),
                 "--seed" => {
                     o.seed = value("--seed")?
@@ -1322,9 +1344,27 @@ mod app {
                 other => return Err(format!("unknown argument {other}")),
             }
         }
+        // gfx1151 builds the E8P module only (its MQ4/W2/W3 are other designs); the legacy trio stays gfx1100.
+        if o.arch == Arch::Gfx1151 && o.codecs != CodecSet::E8p {
+            return Err(
+                "--arch gfx1151 requires --codec e8p (the MQ4/W2/W3 modules are gfx1100-only)"
+                    .into(),
+            );
+        }
+        if !work_given {
+            o.work_dir = std::env::temp_dir().join(format!(
+                "peacemaker-b4-{}-{}",
+                o.arch.name(),
+                std::process::id()
+            ));
+        }
         // The E8P-only run must not collide with the committed B4 receipt.
         if o.codecs == CodecSet::E8p && !receipt_given {
-            o.receipt = PathBuf::from(DEFAULT_RECEIPT_E8P);
+            o.receipt = PathBuf::from(if o.arch == Arch::Gfx1151 {
+                DEFAULT_RECEIPT_E8P_GFX1151
+            } else {
+                DEFAULT_RECEIPT_E8P
+            });
         }
         Ok(o)
     }
@@ -1332,13 +1372,13 @@ mod app {
     /// The kernel's launch admission (`validate_launch`): the frozen sizes are accepted, every other
     /// shape the contract forbids (generic tails, zero or unaligned dimensions, 32-bit extent and gather
     /// overflows) is refused.
-    fn admission(codecs: &[Codec]) -> (Value, Vec<String>) {
+    fn admission(arch: Arch, codecs: &[Codec]) -> (Value, Vec<String>) {
         let mut failures = Vec::new();
         let (mut accepted, mut refused) = (0u32, 0u32);
         for &codec in codecs {
             for acc in [false, true] {
                 for kind in Kind::ALL {
-                    let spec = || mk(codec, kind, acc, Negative::None);
+                    let spec = || mk(arch, codec, kind, acc, Negative::None);
                     let (m, k) = if kind == Kind::GateUp {
                         (2560, 2560)
                     } else {
@@ -1394,7 +1434,7 @@ mod app {
             }
         }
         (
-            json!({"accepted_frozen_launches": accepted, "refused_forbidden_launches": refused, "scope": "gfx1100::validate_launch"}),
+            json!({"accepted_frozen_launches": accepted, "refused_forbidden_launches": refused, "scope": format!("{}::validate_launch", arch.name())}),
             failures,
         )
     }
@@ -1410,6 +1450,7 @@ mod app {
         };
         let mut failures: Vec<Failure> = Vec::new();
         let ctx = Ctx {
+            arch: opts.arch,
             root: opts.out_dir.clone(),
             work: opts.work_dir.clone(),
             evidence: opts.evidence_dir.clone(),
@@ -1419,7 +1460,7 @@ mod app {
         let frozen_before = frozen_objects(&ctx.root, &mut failures);
 
         // P1 arithmetic / address proofs.
-        let (admission_json, admission_failures) = admission(&opts.codecs.codecs());
+        let (admission_json, admission_failures) = admission(opts.arch, &opts.codecs.codecs());
         for f in admission_failures {
             failures.push(Failure {
                 scope: "p1:admission".into(),
@@ -1505,7 +1546,7 @@ mod app {
                         candidates.push(b.json);
                     }
                     Err(e) => failures.push(Failure {
-                        scope: format!("candidate:{}", codec.module()),
+                        scope: format!("candidate:{}", codec.module(ctx.arch)),
                         message: e,
                     }),
                 }
@@ -1526,7 +1567,7 @@ mod app {
                     }
                     let Some(r) = reference.get(&Codec_::of(codec)) else {
                         failures.push(Failure {
-                            scope: format!("negative:{}:{}", negative.tag(), codec.module()),
+                            scope: format!("negative:{}:{}", negative.tag(), codec.module(ctx.arch)),
                             message: "skipped: the candidate module of this codec failed, no reference to compare".into(),
                         });
                         continue;
@@ -1540,7 +1581,7 @@ mod app {
                             modules.push(j);
                         }
                         Err(e) => failures.push(Failure {
-                            scope: format!("negative:{}:{}", negative.tag(), codec.module()),
+                            scope: format!("negative:{}:{}", negative.tag(), codec.module(ctx.arch)),
                             message: e,
                         }),
                     }
@@ -1579,7 +1620,7 @@ mod app {
         let exit_code = i32::from(!failures.is_empty());
         let verdict = |failed: bool| if failed { "fail" } else { "pass" };
         let receipt = json!({
-            "schema": "b4-p1-receipt-v1", "gate": "B4-P1", "arch": ARCH, "device": null,
+            "schema": "b4-p1-receipt-v1", "gate": "B4-P1", "arch": opts.arch.name(), "device": null,
             "scope": "static/CPU only: arithmetic+address model proofs, emitted-object audits; no device execution, no G1 (synthetic or real)",
             "host_link_caveat": "PCIe 4.0 x4 (reported by the lead; not measured by this probe)",
             "command": {
@@ -1588,7 +1629,7 @@ mod app {
             },
             "options": {
                 "out_dir": ctx.root, "work_dir": ctx.work, "evidence_dir": ctx.evidence, "seed": opts.seed, "p1_only": opts.p1_only,
-                "codecs": codecs.iter().map(|c| c.module()).collect::<Vec<_>>(),
+                "codecs": codecs.iter().map(|c| c.module(opts.arch)).collect::<Vec<_>>(),
                 "receipt": opts.receipt,
             },
             "inputs": sources,
@@ -1627,12 +1668,12 @@ mod app {
         code
     }
 
-    /// `Codec` is `Copy + Eq` but not guaranteed `Ord`: key maps by its module name.
+    /// `Codec` is `Copy + Eq` but not guaranteed `Ord`: key maps by its symbol infix.
     #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct Codec_(String);
     impl Codec_ {
         fn of(c: Codec) -> Self {
-            Codec_(c.module())
+            Codec_(c.infix().to_owned())
         }
     }
 }

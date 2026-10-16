@@ -17,7 +17,7 @@
 //! F32 fold order.
 use super::*;
 
-fn cmp(wg: &mut Wg<'_>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
+fn cmp<T: Gfx11>(wg: &mut Wg<'_, T>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(
         text,
         vec![],
@@ -181,7 +181,7 @@ fn load_epoch(b: &mut Builder, g: &Gen) -> Result<(), String> {
 
 /// The epoch loop. Places `k_begin`; leaves the builder at the fall-through
 /// into the caller's `epilogue` label with an empty wait ledger.
-pub(super) fn emit(wg: &mut Wg<'_>, g: &Gen) -> Result<(), String> {
+pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen) -> Result<(), String> {
     wg.label(&g.label("k_begin"))?;
     wg.isa().wait_all()?;
     let (head, done) = (g.label("k_loop"), g.label("k_loop_end"));

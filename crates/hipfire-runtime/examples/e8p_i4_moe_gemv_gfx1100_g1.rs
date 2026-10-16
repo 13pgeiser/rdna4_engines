@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Consumer24 K1 E8P: raw PM **gfx1100** G1 exact oracle for the E8P-on-IU4 pointer-addressed MoE decode GEMV.
+//! Consumer24 K1 E8P: raw PM **gfx1100 / gfx1151** G1 exact oracle for the E8P-on-IU4 pointer-addressed MoE decode GEMV.
 //! Never participates in runtime dispatch.
 //!
-//! Subject: the code object `e8p_i4_moe_gemv_pm_gfx1100` with the symbols
-//! `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1100`, launched with the frozen 96-byte kernarg ABI (7 pointers
+//! Subject: the code object `e8p_i4_moe_gemv_pm_gfx1100` (`--expect-arch gfx1100`, the default) or `e8p_i4_moe_gemv_pm_gfx1151` (`--expect-arch
+//! gfx1151`, Strix Halo) with the symbols `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_<arch>`, launched with the frozen 96-byte kernarg ABI (7 pointers
 //! `table, ids, offs, slots, x, y0, y1`, then `m k u c xdiv xsrc xrs ys n_experts` as u32 and a zero u32; grid `(M, U, 1)`, block 32 = one
 //! wave32). Every output word (all slots, all rows, padded strides, unwritten slots, trailing guard words) is
 //! compared **bit for bit** (signed zeros and NaN payloads included, no tolerance, no NaN exception) with the full
@@ -59,6 +59,36 @@
 //!   `--only` matches `<case>@<placement>`; it is a diagnostic filter: the receipt is marked `gate_eligible: false`.
 //! One JSON receipt (stdout and `--out`); exit code 0 only if every comparison is exact, every control passed and
 //! the coverage requirements hold.
+//!
+//! # gfx1151 (Strix Halo; `--expect-arch gfx1151`)
+//! Same oracle, same arithmetic, same synthetic cases / real-sample cases / five negative controls / exit code. The gfx1151 module is the gfx1100 arm
+//! with only arch-forced deltas, so its outputs must be bit-identical to the gfx1100 / gfx1201 kernels and therefore to the K-E0 twin
+//! (`e8p_i4_reference::decode_gemv_f32_lanepair`); the harness gives no tolerance and no NaN exception there either. What the arch selects:
+//! * module `e8p_i4_moe_gemv_pm_gfx1151`, symbols `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151`, schema `e8p-i4-moe-gemv-gfx1151-g1-v1`,
+//!   default card label `halo`. `--expect-arch gfx1100` (default) keeps every existing default (xtx uuid / bdf, card `xtx`, both `.hfq` pins).
+//! * identity: the device arch must equal `--expect-arch`. gfx1151 has no ROCr UUID (the string `hipDeviceGetUuid` returns is recorded verbatim,
+//!   `uuid_authoritative: false`), so `--expect-uuid` is OPTIONAL there (checked, exact match, only when given) and `--expect-bdf` is REQUIRED (the pin
+//!   that names the card; `lspci -D -d 1002:` on hipx, the Halo is the only gfx1151 function).
+//! * real samples: the Halo slab artifact is hipx `/home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts` (47 038 936 600 B,
+//!   sha256 d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949, 18 270 E8P cold experts), pin tag `c24h6306-d2-mq2-xts`. On gfx1151 ONLY
+//!   that sample set is REQUIRED for a gate-eligible receipt (it supplies the real layers 0 and 47, four cold experts, both projections); the two
+//!   `.hfq` sets `c24-e8p` / `c24h6306-e8p` are accepted as optional extra sets (at most one directory per pin). gfx1100 still accepts only those two
+//!   and requires both.
+//!
+//! Halo, step 1 (CPU only, on hipx; `tools/e8p_k1_extract_samples.py`, whose sha256 54cdfed3e5314b6eb7685c2f35248e59224b3f332f04ea5d287fcb7a985cef0d
+//! is pinned in this harness; the output directory must not exist):
+//!   python3 tools/e8p_k1_extract_samples.py \
+//!     --artifact /home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts \
+//!     --expect-sha256 d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949 --output-dir /abs/halo-e8p-k1-samples
+//! Halo, step 2 (the full gate: synthetic + real, one receipt; `--card halo` is the fabric label, `HIPFIRE_DEVICES=gfx1151`):
+//!   cargo build -p hipfire-runtime --release --example e8p_i4_moe_gemv_gfx1100_g1
+//!   /home/kaden/qcal/locks/fabric/fabric-run.sh --class correct --card halo --mem-gb N --owner NAME -- \
+//!     target/release/examples/e8p_i4_moe_gemv_gfx1100_g1 --codeobject /abs/e8p_i4_moe_gemv_pm_gfx1151.hxaco \
+//!     --samples-dir /abs/halo-e8p-k1-samples --out /abs/r10.k1.g1.e8p-gfx1151.json \
+//!     --expect-arch gfx1151 --expect-bdf 0000:XX:00.0 [--expect-uuid U] [--card halo] [--codeobject-sha256 HEX] \
+//!     [--verify-artifact-range (the artifact is on hipx; re-hashes the four sampled ranges)] [--rehash-artifact (47 GB)] [--overwrite]
+//!   The receipt carries `module`, `symbols_loaded` (both `_pm_gfx1151`), the artifact pin binding (`samples.bound`, `all_pinned_bound`) and
+//!   `byte_exact`; the exit code is 0 only if `pass`. Host-mapped / split placements are exactness runs on the UMA APU (no latency/bandwidth claim).
 use hip_bridge::{DeviceBuffer, Function, HipRuntime, MemoryType, HIP_HOST_MALLOC_MAPPED};
 use hipfire_runtime::e8p_i4_reference as e8p;
 use hipfire_runtime::mq_i4::MqI4Rotation;
@@ -80,7 +110,9 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 const SCHEMA: &str = "e8p-i4-moe-gemv-gfx1100-g1-v1";
+const SCHEMA_GFX1151: &str = "e8p-i4-moe-gemv-gfx1151-g1-v1";
 const MODULE: &str = "e8p_i4_moe_gemv_pm_gfx1100";
+const MODULE_GFX1151: &str = "e8p_i4_moe_gemv_pm_gfx1151";
 const BUILD_COMMAND: &str =
     "cargo build -p hipfire-runtime --release --features lab --example e8p_i4_moe_gemv_gfx1100_g1";
 const HARNESS_SRC: &[u8] = include_bytes!("e8p_i4_moe_gemv_gfx1100_g1.rs");
@@ -90,19 +122,77 @@ const DEFAULT_UUID: &str = "GPU-43390a851e296ee5";
 const DEFAULT_BDF: &str = "0000:67:00.0";
 const DEFAULT_ARCH: &str = "gfx1100";
 const DEFAULT_CARD: &str = "xtx";
-/// The two artifacts every landing G1 binds (`sample.json: artifact_sha256`).
-const ARTIFACT_PINS: [(&str, &str); 2] = [
-    (
-        "c24-e8p",
-        "5f280cff75e1ae29e45bbbdcbeca31bec4eb026fb105d5c3bcd7c5238fe281db",
-    ),
-    (
-        "c24h6306-e8p",
-        "8d30e9d7df324e16f7aa811c114109ba3ad238e630134cdd4a282a7dcc4abc9f",
-    ),
+const DEFAULT_CARD_GFX1151: &str = "halo";
+/// The artifacts a G1 can bind (`sample.json: artifact_sha256`): the two XTX `.hfq` exports and the Halo slab `mq2-xts` (shipped d2 base).
+static ARTIFACT_PINS: [(&str, &str); 3] = [
+    ("c24-e8p", "5f280cff75e1ae29e45bbbdcbeca31bec4eb026fb105d5c3bcd7c5238fe281db"),
+    ("c24h6306-e8p", "8d30e9d7df324e16f7aa811c114109ba3ad238e630134cdd4a282a7dcc4abc9f"),
+    ("c24h6306-d2-mq2-xts", "d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949"),
 ];
 const LINK_CAVEAT: &str = "The XTX endpoint is x16 but its upstream root port 0000:00:03.1 is PCIe 4.0 x4 \
 (16 GT/s, ~7.9 GB/s theoretical): host-mapped runs are exactness runs only, no latency/bandwidth claim.";
+const LINK_CAVEAT_GFX1151: &str = "gfx1151 is the Strix Halo APU: VRAM and host memory are one UMA pool, so host-mapped and split \
+placements are exactness runs only, no latency/bandwidth claim.";
+
+/// The gfx11 targets this oracle serves (`--expect-arch`). The gfx1151 module is the gfx1100 arm with only arch-forced deltas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Gfx1100,
+    Gfx1151,
+}
+impl Target {
+    fn of_name(arch: &str) -> Option<Self> {
+        match arch {
+            "gfx1100" => Some(Self::Gfx1100),
+            "gfx1151" => Some(Self::Gfx1151),
+            _ => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => "gfx1100",
+            Self::Gfx1151 => "gfx1151",
+        }
+    }
+    fn schema(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => SCHEMA,
+            Self::Gfx1151 => SCHEMA_GFX1151,
+        }
+    }
+    fn module(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => MODULE,
+            Self::Gfx1151 => MODULE_GFX1151,
+        }
+    }
+    fn default_card(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => DEFAULT_CARD,
+            Self::Gfx1151 => DEFAULT_CARD_GFX1151,
+        }
+    }
+    fn link_caveat(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => LINK_CAVEAT,
+            Self::Gfx1151 => LINK_CAVEAT_GFX1151,
+        }
+    }
+    /// Pins a sample set may bind on this target (at most one directory per pin).
+    fn pins(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Gfx1100 => &ARTIFACT_PINS[..2],
+            Self::Gfx1151 => &ARTIFACT_PINS[..],
+        }
+    }
+    /// Pins a gate-eligible receipt must have bound.
+    fn required_pins(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Gfx1100 => &ARTIFACT_PINS[..2],
+            Self::Gfx1151 => &ARTIFACT_PINS[2..],
+        }
+    }
+}
 const KERNARG_BYTES: usize = 96;
 const N_EXPERTS: usize = 512;
 /// Expert ids the kernel must reject without a table load or a store: `-1`, the table extent, `INT_MAX`, `INT_MIN`.
@@ -155,8 +245,8 @@ impl Kind {
     fn idx(self) -> usize {
         self as usize
     }
-    fn symbol(self) -> String {
-        format!("e8p_i4_moe_gemv_{}_pm_gfx1100", self.suffix())
+    fn symbol(self, target: Target) -> String {
+        format!("e8p_i4_moe_gemv_{}_pm_{}", self.suffix(), target.name())
     }
     fn m(self) -> usize {
         match self {
@@ -945,6 +1035,7 @@ fn load_sample_set(
     first_id: u32,
     verify_artifact: bool,
     rehash: bool,
+    pins: &'static [(&'static str, &'static str)],
 ) -> Result<SampleSet> {
     let manifest_path = Path::new(dir).join("sample.json");
     let bytes =
@@ -987,12 +1078,13 @@ fn load_sample_set(
             "{dir}: sample.json must record the extractor `argv`"
         ));
     }
-    let (tag, pin_sha) = ARTIFACT_PINS
+    let (tag, pin_sha) = pins
         .iter()
         .find(|(_, s)| *s == art_sha)
         .copied()
         .ok_or_else(|| {
-            format!("{dir}: artifact_sha256 {art_sha} is not one of the pinned artifacts")
+            let allowed: Vec<String> = pins.iter().map(|(t, s)| format!("{t}={s}")).collect();
+            format!("{dir}: artifact_sha256 {art_sha} is not one of the artifacts pinned for this arch ({})", allowed.join(", "))
         })?;
     // No silent fallback: the artifact is only touched when its verification was requested, and then it MUST be reachable.
     let art_size = if verify_artifact || rehash {
@@ -1580,6 +1672,7 @@ fn kernarg(
 struct Ctx {
     hip: HipRuntime,
     funcs: Vec<(Kind, Function)>,
+    target: Target,
 }
 impl Ctx {
     fn func(&self, kind: Kind) -> &Function {
@@ -2452,7 +2545,7 @@ fn run_case_on(
         compared += cmp.compared();
         t.launches += 1;
         let mut kj = cmp.json();
-        kj["symbol"] = json!(kind.symbol());
+        kj["symbol"] = json!(kind.symbol(ctx.target));
         kj["grid"] = json!(prep.grid);
         kj["unique_experts"] = json!(prep.bucket.ids.len());
         kj["listed_slots"] = json!(prep.bucket.slots.len());
@@ -2608,7 +2701,7 @@ fn read_trim(p: &str) -> Option<String> {
 }
 
 /// PCIe link facts of the endpoint and every upstream bridge up to the root port (sysfs).
-fn pcie_info(bdf: &str) -> Value {
+fn pcie_info(bdf: &str, caveat: &str) -> Value {
     let attr = |dev: &str, name: &str| read_trim(&format!("/sys/bus/pci/devices/{dev}/{name}"));
     let mut chain = Vec::new();
     if let Ok(real) = std::fs::canonicalize(format!("/sys/bus/pci/devices/{bdf}")) {
@@ -2625,7 +2718,7 @@ fn pcie_info(bdf: &str) -> Value {
     }
     let root = chain.first().cloned();
     json!({"endpoint": bdf, "root_port": root, "chain_root_to_endpoint": chain,
-        "vram_total_sysfs": attr(bdf, "mem_info_vram_total"), "link_caveat": LINK_CAVEAT})
+        "vram_total_sysfs": attr(bdf, "mem_info_vram_total"), "link_caveat": caveat})
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2640,9 +2733,10 @@ struct Cfg {
     out: String,
     overwrite: bool,
     device: Option<i32>,
-    expect_uuid: String,
-    expect_bdf: String,
+    expect_uuid: Option<String>,
+    expect_bdf: Option<String>,
     expect_arch: String,
+    target: Target,
     card: String,
     fabric_class: Option<String>,
     fabric_owner: Option<String>,
@@ -2656,9 +2750,11 @@ struct Cfg {
 }
 
 const USAGE: &str = "usage: e8p_i4_moe_gemv_gfx1100_g1 --codeobject PATH --samples-dir DIR [--samples-dir DIR2 | \
-DIR1,DIR2] --out RECEIPT.json [--card NAME] [--device N] [--expect-uuid U] [--expect-bdf B] [--expect-arch A] \
+DIR1,DIR2] --out RECEIPT.json [--card NAME] [--device N] [--expect-uuid U] [--expect-bdf B] [--expect-arch gfx1100|gfx1151] \
 [--codeobject-sha256 HEX] [--fabric-class C] [--fabric-owner O] [--fabric-job J] [--fabric-card NAME] \
 [--fabric-cmd STR] [--only SUBSTR]... [--overwrite] [--verify-artifact-range] [--rehash-artifact] [--no-reclaim-arm] \
+(gfx1100 default: xtx uuid/bdf, card xtx, both .hfq sample dirs; gfx1151: --expect-bdf required, --expect-uuid optional (no ROCr UUID), \
+card halo, the mq2-xts slab sample dir required) \
 (fabric flags fall back to env FABRIC_CLASS / FABRIC_OWNER / FABRIC_JOB / FABRIC_CARD / FABRIC_CMD)";
 
 fn parse_args(argv: &[String]) -> Result<Cfg> {
@@ -2669,10 +2765,11 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         out: String::new(),
         overwrite: false,
         device: None,
-        expect_uuid: DEFAULT_UUID.into(),
-        expect_bdf: DEFAULT_BDF.into(),
+        expect_uuid: None,
+        expect_bdf: None,
         expect_arch: DEFAULT_ARCH.into(),
-        card: env_nonempty("FABRIC_CARD").unwrap_or_else(|| DEFAULT_CARD.into()),
+        target: Target::Gfx1100,
+        card: env_nonempty("FABRIC_CARD").unwrap_or_default(),
         fabric_class: env_nonempty("FABRIC_CLASS"),
         fabric_owner: env_nonempty("FABRIC_OWNER"),
         fabric_job: env_nonempty("FABRIC_JOB"),
@@ -2710,8 +2807,8 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
                         .map_err(|e| format!("--device: {e}"))?,
                 )
             }
-            "--expect-uuid" => cfg.expect_uuid = value(&mut i)?,
-            "--expect-bdf" => cfg.expect_bdf = value(&mut i)?.to_ascii_lowercase(),
+            "--expect-uuid" => cfg.expect_uuid = Some(value(&mut i)?),
+            "--expect-bdf" => cfg.expect_bdf = Some(value(&mut i)?.to_ascii_lowercase()),
             "--expect-arch" => cfg.expect_arch = value(&mut i)?,
             "--card" => cfg.card = value(&mut i)?,
             "--fabric-class" => cfg.fabric_class = Some(value(&mut i)?),
@@ -2727,17 +2824,34 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         }
         i += 1;
     }
+    cfg.target = Target::of_name(&cfg.expect_arch)
+        .ok_or_else(|| format!("--expect-arch {:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}", cfg.expect_arch))?;
+    match cfg.target {
+        Target::Gfx1100 => {
+            cfg.expect_uuid.get_or_insert_with(|| DEFAULT_UUID.into());
+            cfg.expect_bdf.get_or_insert_with(|| DEFAULT_BDF.into());
+        }
+        Target::Gfx1151 => {
+            if cfg.expect_bdf.is_none() {
+                return Err(format!("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)\n{USAGE}"));
+            }
+        }
+    }
+    if cfg.card.is_empty() {
+        cfg.card = cfg.target.default_card().into();
+    }
     if cfg.codeobject.is_empty() || cfg.out.is_empty() {
         return Err(USAGE.into());
     }
+    let required: Vec<&str> = cfg.target.required_pins().iter().map(|(t, _)| *t).collect();
     if cfg.samples_dirs.is_empty() && cfg.only.is_empty() {
-        return Err(format!("--samples-dir for BOTH pinned artifacts is required (a full G1 binds real samples)\n{USAGE}"));
-    }
-    if cfg.samples_dirs.len() > ARTIFACT_PINS.len() {
         return Err(format!(
-            "at most {} sample dirs (one per pinned artifact)",
-            ARTIFACT_PINS.len()
+            "--samples-dir for the required pinned artifact(s) {} is required (a full G1 binds real samples)\n{USAGE}",
+            required.join(", ")
         ));
+    }
+    if cfg.samples_dirs.len() > cfg.target.pins().len() {
+        return Err(format!("at most {} sample dirs (one per pinned artifact)", cfg.target.pins().len()));
     }
     if !cfg.overwrite && Path::new(&cfg.out).exists() {
         return Err(format!("{} exists (use --overwrite)", cfg.out));
@@ -2763,7 +2877,7 @@ fn placements_for_synthetic(name: &str) -> Vec<Placement> {
 fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     if !cfg.no_reclaim_arm {
         // Production Qwen4 host-mapped configuration; must precede the first HIP runtime call.
-        hip_bridge::keep_host_memory_out_of_reclaim("gfx1100 E8P G1 host-mapped weights");
+        hip_bridge::keep_host_memory_out_of_reclaim(&format!("{} E8P G1 host-mapped weights", cfg.target.name()));
     }
     let hip = HipRuntime::load().map_err(err)?;
     if let Some(d) = cfg.device {
@@ -2773,10 +2887,12 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     let uuid = hip.device_uuid(id).map_err(err)?;
     let bdf = hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase();
     let arch = hip.get_arch(id).map_err(err)?;
-    let identity_match =
-        uuid == cfg.expect_uuid && bdf == cfg.expect_bdf && arch == cfg.expect_arch;
+    let identity_match = cfg.expect_uuid.as_deref().is_none_or(|u| uuid == u)
+        && cfg.expect_bdf.as_deref().is_none_or(|b| bdf == b)
+        && arch == cfg.expect_arch;
     let device = json!({"index": id, "uuid": uuid, "bdf": bdf, "arch": arch, "card": cfg.card,
         "expected_uuid": cfg.expect_uuid, "expected_bdf": cfg.expect_bdf, "expected_arch": cfg.expect_arch,
+        "uuid_authoritative": cfg.target == Target::Gfx1100, "uuid_checked": cfg.expect_uuid.is_some(),
         "identity_match": identity_match});
     let fabric = json!({"class": cfg.fabric_class, "owner": cfg.fabric_owner, "job": cfg.fabric_job,
         "card": cfg.fabric_card, "cmd": cfg.fabric_cmd});
@@ -2792,10 +2908,10 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
             "reclaim_arm": !cfg.no_reclaim_arm}});
     let sources = json!({"harness_sha256": hex(&sha(HARNESS_SRC)), "e8p_i4_reference_sha256": hex(&sha(REFERENCE_SRC)),
         "mq_i4_reference_tree_sha256": hex(&sha(TREE_SRC))});
-    let pcie = pcie_info(&bdf);
+    let pcie = pcie_info(&bdf, cfg.target.link_caveat());
     if !identity_match {
         return Ok((
-            json!({"schema": SCHEMA, "command": command, "sources": sources, "device": device, "fabric": fabric,
+            json!({"schema": cfg.target.schema(), "command": command, "sources": sources, "device": device, "fabric": fabric,
                 "pcie": pcie, "error": "E8P MoE GEMV device identity mismatch", "byte_exact": false,
                 "pass": false, "rc": 1}),
             false,
@@ -2815,14 +2931,12 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     let mut funcs = Vec::new();
     let mut loads = Vec::new();
     for kind in Kind::ALL {
-        let name = kind.symbol();
-        let f = hip
-            .module_get_function(&module, &name)
-            .map_err(|e| format!("symbol {name}: {e}"))?;
+        let name = kind.symbol(cfg.target);
+        let f = hip.module_get_function(&module, &name).map_err(|e| format!("symbol {name}: {e}"))?;
         loads.push(name);
         funcs.push((kind, f));
     }
-    let ctx = Ctx { hip, funcs };
+    let ctx = Ctx { hip, funcs, target: cfg.target };
     let mut totals = Totals::default();
     let mut cov = Coverage::new();
     let mut rows: Vec<Value> = Vec::new();
@@ -2860,7 +2974,7 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
         for dir in &cfg.samples_dirs {
             eprintln!("[g1] loading E8P samples from {dir}");
             let first = 4 * sets.len() as u32;
-            let s = load_sample_set(dir, first, cfg.verify_artifact, cfg.rehash_artifact)?;
+            let s = load_sample_set(dir, first, cfg.verify_artifact, cfg.rehash_artifact, cfg.target.pins())?;
             if !bound.insert(s.sha) {
                 return Err(format!("{dir}: artifact {} bound twice", s.tag));
             }
@@ -2896,7 +3010,7 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
 
     let vram_after = ctx.hip.get_vram_info().ok();
     let full = cfg.only.is_empty();
-    let all_pinned_bound = ARTIFACT_PINS.iter().all(|(_, s)| bound.contains(s));
+    let all_pinned_bound = cfg.target.required_pins().iter().all(|(_, s)| bound.contains(s));
     let missing_negatives: Vec<String> = NEGATIVES
         .iter()
         .flat_map(|n| {
@@ -2920,8 +3034,9 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
     let samples_ok = guard_violations == 0;
     let pass = byte_exact && controls_pass && coverage_ok && samples_ok;
     let out = json!({
-        "schema": SCHEMA,
-        "module": MODULE,
+        "schema": cfg.target.schema(),
+        "module": cfg.target.module(),
+        "target_arch": cfg.target.name(),
         "command": command,
         "sources": sources,
         "config": {"samples_dirs": cfg.samples_dirs, "only": cfg.only, "out": cfg.out,
@@ -2935,7 +3050,7 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
         "device": device,
         "fabric": fabric,
         "pcie": pcie,
-        "link_caveat": LINK_CAVEAT,
+        "link_caveat": cfg.target.link_caveat(),
         "vram": {"before_free_total": vram_before, "after_free_total": vram_after},
         "case_counts": {"total": totals.cases, "synthetic": totals.synthetic, "real_samples": totals.real_samples,
             "host_mapped": totals.host_mapped_cases, "split_vram_host": totals.split_cases},
@@ -2949,7 +3064,8 @@ fn run(cfg: &Cfg, argv: &[String]) -> Result<(Value, bool)> {
         "coverage_complete": cov.complete(),
         "negative_controls": {"checks": totals.control_checks, "failures": totals.control_failures,
             "required": NEGATIVES, "missing": missing_negatives, "pass": controls_pass},
-        "samples": {"pinned_artifacts": ARTIFACT_PINS.iter().map(|(t, s)| json!({"tag": t, "sha256": s})).collect::<Vec<_>>(),
+        "samples": {"pinned_artifacts": cfg.target.pins().iter().map(|(t, s)| json!({"tag": t, "sha256": s,
+            "required": cfg.target.required_pins().iter().any(|(rt, _)| rt == t)})).collect::<Vec<_>>(),
             "bound": bound.iter().collect::<Vec<_>>(), "all_pinned_bound": all_pinned_bound,
             "writer_guard_violations": guard_violations, "sets": samples_meta},
         "coverage_ok": coverage_ok,
@@ -2985,12 +3101,12 @@ fn main() {
             println!("{v}");
             write_receipt(&cfg.out, &v);
             if !pass {
-                eprintln!("E8P MoE GEMV gfx1100 G1 FAILED");
+                eprintln!("E8P MoE GEMV {} G1 FAILED", cfg.target.name());
                 std::process::exit(1);
             }
         }
         Err(e) => {
-            let v = json!({"schema": SCHEMA, "command": {"argv": argv, "build_command": BUILD_COMMAND},
+            let v = json!({"schema": cfg.target.schema(), "command": {"argv": argv, "build_command": BUILD_COMMAND},
                 "error": e, "byte_exact": false, "pass": false, "rc": 1});
             println!("{v}");
             write_receipt(&cfg.out, &v);
@@ -3036,11 +3152,10 @@ mod tests {
     fn blob_sizes_match_the_extractor() {
         assert_eq!(Kind::GateUp.blob_bytes(), 870_400);
         assert_eq!(Kind::Down.blob_bytes(), 435_200);
-        assert_eq!(
-            Kind::GateUp.symbol(),
-            "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100"
-        );
-        assert_eq!(Kind::Down.symbol(), "e8p_i4_moe_gemv_r128_down_pm_gfx1100");
+        assert_eq!(Kind::GateUp.symbol(Target::Gfx1100), "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100");
+        assert_eq!(Kind::Down.symbol(Target::Gfx1100), "e8p_i4_moe_gemv_r128_down_pm_gfx1100");
+        assert_eq!(Kind::GateUp.symbol(Target::Gfx1151), "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151");
+        assert_eq!(Kind::Down.symbol(Target::Gfx1151), "e8p_i4_moe_gemv_r128_down_pm_gfx1151");
     }
 
     #[test]
@@ -3123,6 +3238,31 @@ mod tests {
         for _ in 0..64 {
             let s = scale_class(2, &mut rng);
             assert!((1..=0x3ff).contains(&s));
+        }
+    }
+
+    #[test]
+    fn targets_keep_the_gfx1100_defaults_and_add_gfx1151() {
+        assert_eq!(Target::of_name("gfx1100"), Some(Target::Gfx1100));
+        assert_eq!(Target::of_name("gfx1151"), Some(Target::Gfx1151));
+        for other in ["gfx1201", "gfx1101", "GFX1151", ""] {
+            assert_eq!(Target::of_name(other), None);
+        }
+        assert_eq!(Target::Gfx1100.module(), "e8p_i4_moe_gemv_pm_gfx1100");
+        assert_eq!(Target::Gfx1151.module(), "e8p_i4_moe_gemv_pm_gfx1151");
+        assert_eq!(Target::Gfx1100.schema(), "e8p-i4-moe-gemv-gfx1100-g1-v1");
+        assert_eq!(Target::Gfx1151.schema(), "e8p-i4-moe-gemv-gfx1151-g1-v1");
+        assert_eq!(Target::Gfx1100.default_card(), "xtx");
+        assert_eq!(Target::Gfx1151.default_card(), "halo");
+        assert_eq!(DEFAULT_ARCH, "gfx1100");
+        let tags = |p: &[(&str, &str)]| p.iter().map(|(t, _)| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(tags(Target::Gfx1100.pins()), ["c24-e8p", "c24h6306-e8p"]);
+        assert_eq!(tags(Target::Gfx1100.required_pins()), ["c24-e8p", "c24h6306-e8p"]);
+        assert_eq!(tags(Target::Gfx1151.pins()), ["c24-e8p", "c24h6306-e8p", "c24h6306-d2-mq2-xts"]);
+        assert_eq!(tags(Target::Gfx1151.required_pins()), ["c24h6306-d2-mq2-xts"]);
+        for (_, sha) in ARTIFACT_PINS.iter() {
+            assert_eq!(sha.len(), 64);
+            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
         }
     }
 }

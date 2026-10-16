@@ -2,17 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Standalone emission of the E8P-I4 K-E2 decode GEMV module for gfx1100 (default) or gfx1201
+//! Standalone emission of the E8P-I4 K-E2 decode GEMV module for gfx1100 (default), gfx1151 or gfx1201
 //! (`kernels/e8p_i4_moe_gemv.rs`, library module `kernels::e8p_i4_moe_gemv`; the gfx1201 emitted
-//! text is unchanged by the gfx1100 arm, so `--arch gfx1201` re-emits the committed object).
+//! text is unchanged by the gfx11 arms, so `--arch gfx1201` re-emits the committed object).
 //!
 //! ```text
 //! cargo run -p peacemaker-isa --features toolchain --example e8p_i4_moe_gemv_gfx1100_emit -- \
-//!     <output-dir> [--arch gfx1100|gfx1201] [--host-target TRIPLE]
+//!     <output-dir> [--arch gfx1100|gfx1151|gfx1201] [--host-target TRIPLE]
 //! ```
 //!
 //! Files written to `<output-dir>` (`<module>` is `e8p_i4_moe_gemv_pm_<arch>`):
-//!  * `<module>.s`: the two-symbol module assembly (gfx1100: `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1100`;
+//!  * `<module>.s`: the two-symbol module assembly (gfx1100 / gfx1151: `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_<arch>`;
 //!    gfx1201: `e8p_i4_moe_gemv_{r256_gate_up,r128_down}`);
 //!  * `<module>.proof.json`: the `ModuleProof` (per-kernel register plan, wait ledger, hazard guards, loop
 //!    fixpoints, `s_text_sha256`, module digest);
@@ -31,7 +31,7 @@ use peacemaker_isa::kernels::e8p_i4_moe_gemv::{contract, emit_module, module_spe
 use peacemaker_isa::{native, Arch};
 use sha2::{Digest, Sha256};
 
-const USAGE: &str = "usage: e8p_i4_moe_gemv_gfx1100_emit <output-dir> [--arch gfx1100|gfx1201] [--host-target TRIPLE]";
+const USAGE: &str = "usage: e8p_i4_moe_gemv_gfx1100_emit <output-dir> [--arch gfx1100|gfx1151|gfx1201] [--host-target TRIPLE]";
 
 fn sha(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let dir = dir.ok_or(USAGE)?;
-    if !matches!(target, Arch::Gfx1100 | Arch::Gfx1201) {
+    if !matches!(target, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(format!("{USAGE}: {} is not an E8P K-E2 target", target.name()).into());
     }
     fs::create_dir_all(&dir)?;

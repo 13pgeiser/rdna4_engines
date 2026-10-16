@@ -6331,6 +6331,126 @@ mod tests {
         }
     }
 
+    /// The E8P slab image matrix: one K1 module and one K2 module per E8P arch (gfx1100, gfx1151,
+    /// gfx1201), each with its own image and symbols, conflict-free as a route plan, and the
+    /// serving selection of every (arch, codec) pair equals table presence AND the shared
+    /// admission matrix (registry presence is not permission).
+    #[test]
+    fn slab_e8p_image_matrix_is_arch_keyed_conflict_free_and_admission_gated() {
+        let embedded = |module: &'static str, image: &'static [u8], symbols: &'static [&'static str]| {
+            PlannedKernel::Embedded { module, image, radiowave_json: None, symbols }
+        };
+        let contains = |haystack: &[u8], needle: &str| haystack.windows(needle.len()).any(|w| w == needle.as_bytes());
+        // (arch, K1 module, K1 [gate/up, down], K2 module, K2 [gate/up, down])
+        let rows: [(&str, &str, [&str; 2], &str, [&str; 2]); 3] = [
+            (
+                "gfx1100",
+                "e8p_i4_moe_gemv_pm_gfx1100",
+                ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100", "e8p_i4_moe_gemv_r128_down_pm_gfx1100"],
+                "qwen4_moe_iu4_sym_e8p_pm_gfx1100",
+                ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1100", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1100"],
+            ),
+            (
+                "gfx1151",
+                "e8p_i4_moe_gemv_pm_gfx1151",
+                ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151", "e8p_i4_moe_gemv_r128_down_pm_gfx1151"],
+                "qwen4_moe_iu4_sym_e8p_pm_gfx1151",
+                ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"],
+            ),
+            (
+                "gfx1201",
+                "e8p_i4_moe_gemv_pm_gfx1201",
+                ["e8p_i4_moe_gemv_r256_gate_up", "e8p_i4_moe_gemv_r128_down"],
+                "qwen4_moe_iu4_sym_e8p_pm_gfx1201",
+                ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1201"],
+            ),
+        ];
+        let mut images: Vec<(&str, &'static [u8])> = Vec::new();
+        for (arch, k1_module, k1_symbols, k2_module, k2_entries) in rows {
+            let k1 = crate::slab_moe::slab_cold_k1_metadata(arch, 3).unwrap();
+            let k2 = crate::gemm::slab_k2_metadata(arch, 3).unwrap();
+            assert_eq!(k1.cold_codec, 3, "{arch}");
+            assert_eq!((k1.k1.module, k1.k1.symbols), (k1_module, k1_symbols), "{arch} K1");
+            assert_eq!((k2.module, k2.entries), (k2_module, k2_entries), "{arch} K2");
+            // The arch-suffixed spellings: every gfx1100/gfx1151 symbol carries its arch, K2 modules and
+            // entries always do, the historical gfx1201 K1 symbols stay unsuffixed.
+            for module in [k1_module, k2_module] {
+                assert!(module.ends_with(&format!("_pm_{arch}")), "{module}");
+            }
+            let k1_checked: &[&str] = if arch == "gfx1201" { &[] } else { &k1_symbols };
+            for symbol in k2_entries.into_iter().chain(k1_checked.iter().copied()) {
+                assert!(symbol.ends_with(&format!("_pm_{arch}")), "{symbol}");
+                assert!(!symbol.ends_with("_acc"), "{symbol}: qualification twin must not be served");
+            }
+            let plan = RouteKernelPlan {
+                entries: vec![
+                    embedded(k1.k1.module, k1.k1.image, &k1.k1.symbols),
+                    embedded(k2.module, k2.image, &k2.entries),
+                ],
+            };
+            validate_route_plan(&plan).unwrap();
+            for planned in &plan.entries {
+                let PlannedKernel::Embedded { image, symbols, .. } = planned else { panic!("hip entry") };
+                for &symbol in *symbols {
+                    assert!(contains(*image, &format!("{symbol}.kd")), "{arch} {symbol}.kd missing");
+                }
+            }
+            images.push((arch, k1.k1.image));
+            images.push((arch, k2.image));
+        }
+        // Six distinct images; the gfx1100 and gfx1151 pairs each name only their own arch.
+        for (i, (arch_a, a)) in images.iter().enumerate() {
+            for (arch_b, b) in &images[i + 1..] {
+                assert_ne!(a, b, "{arch_a} and {arch_b} share an image");
+            }
+        }
+        for ((arch, k1_module, k1_symbols, _, k2_entries), other) in
+            [(rows[0], "gfx1151"), (rows[1], "gfx1100")]
+        {
+            for (other_arch, image) in &images {
+                if *other_arch != other {
+                    continue;
+                }
+                for symbol in k1_symbols.into_iter().chain(k2_entries) {
+                    assert!(!contains(*image, symbol), "{arch} symbol {symbol} inside the {other_arch} image");
+                }
+                assert!(!contains(*image, k1_module), "{k1_module} inside the {other_arch} image");
+            }
+        }
+        // Matrix: serving = table presence AND admission, for the K1 cold table, the K2 table and the
+        // registry inventory. Every admitted E8P arch has both its K1 and its K2 table.
+        for &arch in SUPPORTED_ARCHES {
+            for codec in 0u8..=4 {
+                let admitted = crate::qwen4_slab_codec_admitted(arch, codec);
+                let k1_meta = crate::slab_moe::slab_cold_k1_metadata(arch, codec).is_some();
+                let k2_meta = crate::gemm::slab_k2_metadata(arch, codec).is_some();
+                let k1_served = crate::slab_moe::slab_cold_kernels(arch, codec).is_some();
+                let k2_served = crate::gemm::slab_k2_entry(arch, codec).is_some();
+                assert_eq!(k1_served, k1_meta && codec != 0 && admitted, "{arch} codec {codec} K1");
+                assert_eq!(k2_served, k2_meta && admitted, "{arch} codec {codec} K2");
+                if codec == 3 {
+                    assert_eq!(k1_meta, k2_meta, "{arch}: E8P K1 and K2 tables come as a pair");
+                    if admitted {
+                        assert!(k1_meta && k2_meta, "{arch}: admitted E8P without a K1/K2 table");
+                    }
+                }
+                let plan = slab_embedded_entries(arch, codec);
+                match arch {
+                    "gfx1100" if codec == 0 || (k1_served && k2_served) => {
+                        let modules: Vec<_> = plan.unwrap().iter().map(PlannedKernel::module).collect();
+                        assert_eq!(modules.contains(&"e8p_i4_moe_gemv_pm_gfx1100"), codec == 3);
+                        assert_eq!(modules.contains(&"qwen4_moe_iu4_sym_e8p_pm_gfx1100"), codec == 3);
+                        assert!(!modules.iter().any(|m| m.contains("gfx1151")), "gfx1100 plan names gfx1151");
+                    }
+                    "gfx1100" => assert!(matches!(plan, Err(RegistryError::UnsupportedRoute(_))), "{arch} codec {codec}"),
+                    // The other supported arches keep their historical (non-registry) preload: the
+                    // registry lists nothing, whatever the table or admission says.
+                    _ => assert!(plan.unwrap().is_empty(), "{arch} codec {codec}"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn gfx1100_fa2_split_verifier_is_compiler_free_packaged() {
         let entry = lookup("gfx1100", "attention_q8_0_fa2_gqa_gfx1100", "").unwrap();

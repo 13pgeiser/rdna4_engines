@@ -4308,6 +4308,16 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1100: &[u8] =
 /// superseded by the regenerated 64-byte image.
 pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1100.hxaco");
+/// Certified builder module of the gfx1151 NT1 grouped symmetric IU4 MoE GEMMs over E8P-I4
+/// experts (`qwen4_moe_iu4_sym_e8p_pm_gfx1151`): the gfx1100 K2 arm with only the arch-forced
+/// deltas (module/symbol names, target `amdgcn-amd-amdhsa--gfx1151`, code-end tail), so the same
+/// serving entries `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1151` (64-byte kernarg ABI,
+/// trailing `n_experts@60` with the same uniform invalid-expert skip, block 64 / 128, 1,536 B static LDS, no dynamic LDS; contracts
+/// `peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.{gate_up_e8p,down_e8p}.contract.json`) and the
+/// K-E0 planar `[M*K/8 u16 words][M*K/128 f16 scales]` wire. The `_acc` F32 qualification twins
+/// live in the image but are never served. Presence of the image is not permission.
+pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco");
 /// Certified builder module of the gathered QSA prefill attention
 /// (`peacemaker-isa emit --kernel qsa_gather --arch ARCH`, M7 obligation-free):
 /// the F16 K / block-transposed V producer and the gathered F16 WMMA
@@ -4617,6 +4627,13 @@ pub const MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100: &[u8] =
 /// the admission-gated `slab_cold_kernels`; presence of the image is not permission.
 pub const E8P_I4_MOE_GEMV_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1100.hxaco");
+/// K1 `e8p_i4_moe_gemv_pm_gfx1151` certified builder module for gfx1151: the gfx1100 K1 arm with
+/// only the arch-forced deltas; the cold E8P-I4 entries
+/// `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151` (same 96-byte kernarg ABI, trailing
+/// `n_experts@88` and zero `reserved@92` with the uniform invalid-expert skip, 1,536 B static LDS). Served for codec 3 on gfx1151 only through the admission-gated
+/// `slab_cold_kernels`; presence of the image is not permission.
+pub const E8P_I4_MOE_GEMV_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1151.hxaco");
 /// K3 (`mq_i4_a4`) certified builder module for gfx1100: the row-local R128/K640
 /// `block_i4_128` down-sidecar producer `mq_i4_a4_r128_k640_gfx1100`.
 pub const MQ_I4_A4_PM_GFX1100: &[u8] = include_bytes!("../../../kernels/mq_i4_a4_pm_gfx1100.hxaco");

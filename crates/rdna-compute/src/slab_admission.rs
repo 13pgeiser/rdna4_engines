@@ -9,17 +9,22 @@
 //! `0` = MQ4 symmetric, `1` = MQ3-I4 (W3), `3` = E8P-I4. `2` (MQ2-I4, W2) is
 //! refused on every architecture.
 //!
-//! | arch    | MQ4 (0) | W3 (1) | W2 (2) | E8P (3) |
-//! |---------|---------|--------|--------|---------|
-//! | gfx1201 | yes     | yes    | no     | yes     |
-//! | gfx1151 | yes     | yes    | no     | no      |
-//! | gfx1100 | yes     | no     | no     | yes     |
-//! | other   | no      | no     | no     | no      |
+//! | arch    | MQ4 (0) | W3 (1) | W2 (2) | E8P (3)                                  |
+//! |---------|---------|--------|--------|------------------------------------------|
+//! | gfx1201 | yes     | yes    | no     | yes                                      |
+//! | gfx1151 | yes     | yes    | no     | [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] (no today) |
+//! | gfx1100 | yes     | no     | no     | yes                                      |
+//! | other   | no      | no     | no     | no                                       |
 //!
 //! gfx1100 serves MQ4-only layers (no cold bucket) and MQ4 + E8P layers; W3 is
 //! refused there (no gfx1100 W3 kernels). gfx1151 serves MQ4-only layers and
-//! MQ4 + W3 layers; E8P is refused there (no gfx1151 E8P kernels). Matching is
-//! by exact architecture name, so near misses are refused.
+//! MQ4 + W3 layers; its E8P kernels (`e8p_i4_moe_gemv_pm_gfx1151`,
+//! `qwen4_moe_iu4_sym_e8p_pm_gfx1151`) are the gfx1100 arm re-emitted for gfx1151 and
+//! are selectable, but E8P stays refused there until the one receipts constant
+//! [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] flips to `true`; that single flip is the whole
+//! admission change (every arena, dispatch and launch check goes through
+//! [`qwen4_slab_codec_admitted`]). Matching is by exact architecture name, so near
+//! misses are refused.
 //!
 //! Cold codec `0` (MQ4) means NO cold bucket on every architecture, gfx1151
 //! included. The "no cold kernel preload" promise for such a layer is scoped to
@@ -41,12 +46,30 @@ pub const SLAB_CODEC_W3: u8 = 1;
 /// Codec id of an E8P-I4 expert.
 pub const SLAB_CODEC_E8P: u8 = 3;
 
+/// Whether the gfx1151 E8P-I4 (codec 3) slab kernels have their receipts: the K1/K2 byte
+/// oracles (G1, synthetic and real layer) bit-identical to the K-E0 CPU twin on the Halo card
+/// (exact gfx1151) and the frozen-bytes proof of both gfx1151 E8P images against the gfx1100
+/// arm. `false` until those receipts are in `rcpt/`. The ONE switch of E8P admission on
+/// gfx1151: [`qwen4_slab_codec_admitted`] reads it, and so does every consumer of the matrix
+/// (expert arenas, dispatch selection, K1/K2 tables). gfx1100 and gfx1201 E8P never read it.
+pub const SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED: bool = false;
+
 /// Whether the sealed expert-slab route serves `codec` on GPU architecture
-/// `arch`. Exact architecture names only: no family prefix match.
+/// `arch`. Exact architecture names only: no family prefix match. gfx1151 E8P follows
+/// [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`].
 pub fn qwen4_slab_codec_admitted(arch: &str, codec: u8) -> bool {
+    qwen4_slab_codec_admitted_with(arch, codec, SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+}
+
+/// [`qwen4_slab_codec_admitted`] with the gfx1151 E8P receipts decision given explicitly: the
+/// pure matrix, so both states of [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] are testable.
+pub fn qwen4_slab_codec_admitted_with(arch: &str, codec: u8, gfx1151_e8p_landed: bool) -> bool {
     match arch {
         "gfx1201" => matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_W3 | SLAB_CODEC_E8P),
-        "gfx1151" => matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_W3),
+        "gfx1151" => {
+            matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_W3)
+                || (gfx1151_e8p_landed && codec == SLAB_CODEC_E8P)
+        }
         "gfx1100" => matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_E8P),
         _ => false,
     }
@@ -97,9 +120,19 @@ impl std::error::Error for SlabLayerCodecError {}
 /// the architecture does not serve and a layer holding two different cold
 /// codecs. Computed once per layer at load, never per token.
 pub fn qwen4_slab_layer_cold_codec(arch: &str, codecs: &[u8]) -> Result<u8, SlabLayerCodecError> {
+    qwen4_slab_layer_cold_codec_with(arch, codecs, SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+}
+
+/// [`qwen4_slab_layer_cold_codec`] with the gfx1151 E8P receipts decision given explicitly
+/// (see [`qwen4_slab_codec_admitted_with`]).
+pub fn qwen4_slab_layer_cold_codec_with(
+    arch: &str,
+    codecs: &[u8],
+    gfx1151_e8p_landed: bool,
+) -> Result<u8, SlabLayerCodecError> {
     let mut cold: Option<u8> = None;
     for &codec in codecs {
-        if !qwen4_slab_codec_admitted(arch, codec) {
+        if !qwen4_slab_codec_admitted_with(arch, codec, gfx1151_e8p_landed) {
             return Err(SlabLayerCodecError::NotAdmitted { codec });
         }
         if codec == SLAB_CODEC_MQ4 {
@@ -133,35 +166,35 @@ mod tests {
 
     #[test]
     fn matrix_is_exactly_the_admitted_pairs() {
-        // (arch, admitted among codecs 0, 1, 2, 3 and an unknown byte).
-        let expected: [(&str, [bool; 5]); 5] = [
-            ("gfx1100", [true, false, false, true, false]),
-            ("gfx1201", [true, true, false, true, false]),
-            ("gfx1151", [true, true, false, false, false]),
-            ("gfx942", [false; 5]),
-            ("unknown", [false; 5]),
-        ];
-        for (arch, row) in expected {
-            for (codec, want) in [0u8, 1, 2, 3, 255].into_iter().zip(row) {
-                assert_eq!(
-                    qwen4_slab_codec_admitted(arch, codec),
-                    want,
-                    "{arch} codec {codec}"
-                );
+        // (arch, admitted among codecs 0, 1, 2, 3 and an unknown byte); gfx1151 E8P follows the
+        // receipts switch, every other cell is independent of it.
+        for landed in [false, true] {
+            let expected: [(&str, [bool; 5]); 5] = [
+                ("gfx1100", [true, false, false, true, false]),
+                ("gfx1201", [true, true, false, true, false]),
+                ("gfx1151", [true, true, false, landed, false]),
+                ("gfx942", [false; 5]),
+                ("unknown", [false; 5]),
+            ];
+            for (arch, row) in expected {
+                for (codec, want) in [0u8, 1, 2, 3, 255].into_iter().zip(row) {
+                    assert_eq!(
+                        qwen4_slab_codec_admitted_with(arch, codec, landed),
+                        want,
+                        "{arch} codec {codec} landed={landed}"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn architecture_match_is_exact() {
-        for arch in [
-            "", "gfx1100x", "gfx110", "gfx1101", "gfx1200", "gfx12010", "GFX1201", "gfx1201 ",
-        ] {
-            for codec in 0..=3u8 {
-                assert!(
-                    !qwen4_slab_codec_admitted(arch, codec),
-                    "{arch:?} codec {codec}"
-                );
+        for arch in ["", "gfx1100x", "gfx110", "gfx1101", "gfx1200", "gfx12010", "GFX1201", "gfx1201 "] {
+            for landed in [false, true] {
+                for codec in 0..=3u8 {
+                    assert!(!qwen4_slab_codec_admitted_with(arch, codec, landed), "{arch:?} codec {codec}");
+                }
             }
         }
     }
@@ -234,28 +267,42 @@ mod tests {
             assert!(qwen4_slab_layer_cold_codec(arch, &[mq4]).is_err(), "{arch}");
             assert!(qwen4_slab_layer_cold_codec(arch, &[]).is_err(), "{arch}");
         }
-        // gfx1151 serves MQ4 and W3 (no E8P): uniform MQ4 has no cold bucket, W3 is the cold
-        // codec whether uniform or mixed with MQ4, and E8P is refused in every position.
-        assert_eq!(qwen4_slab_layer_cold_codec("gfx1151", &[mq4, mq4]), Ok(mq4));
-        assert_eq!(qwen4_slab_layer_cold_codec("gfx1151", &[w3, w3]), Ok(w3));
+        // gfx1151 with the E8P receipts not landed (today) serves MQ4 and W3: uniform MQ4 has no
+        // cold bucket, W3 is the cold codec whether uniform or mixed with MQ4, and E8P is
+        // refused in every position.
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, mq4], false), Ok(mq4));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false), Ok(w3));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4, w3], false), Ok(w3));
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, w3, mq4, w3]),
-            Ok(w3)
-        );
-        assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, e8p]),
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
         );
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[e8p, e8p]),
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
         );
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, w3, e8p]),
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
         );
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, w2]),
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w2], false),
+            Err(SlabLayerCodecError::NotAdmitted { codec: w2 })
+        );
+        // gfx1151 with the receipts landed: E8P is a cold codec next to MQ4 (either order) or
+        // alone; W3 + E8P in one layer is the two-cold-codecs refusal; W2 stays refused.
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p, mq4], true), Ok(e8p));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, mq4], true), Ok(e8p));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[e8p, e8p], true), Ok(e8p));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], true), Ok(w3));
+        for codecs in [[mq4, w3, e8p], [e8p, w3, mq4], [w3, e8p, w3]] {
+            assert!(matches!(
+                qwen4_slab_layer_cold_codec_with("gfx1151", &codecs, true),
+                Err(SlabLayerCodecError::MixedCold { .. })
+            ));
+        }
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w2], true),
             Err(SlabLayerCodecError::NotAdmitted { codec: w2 })
         );
     }
@@ -263,44 +310,46 @@ mod tests {
     #[test]
     fn merged_slab_admission_matrix_preserves_certified_arch_pairs() {
         let (mq4, w3, w2, e8p) = (SLAB_CODEC_MQ4, SLAB_CODEC_W3, 2u8, SLAB_CODEC_E8P);
-        // Full final matrix over codecs 0, 1, 2, 3 and an unknown byte:
-        // gfx1100 {0,3}, gfx1151 {0,1}, gfx1201 {0,1,3}; W2 nowhere.
-        let matrix: [(&str, [bool; 5]); 3] = [
-            ("gfx1100", [true, false, false, true, false]),
-            ("gfx1151", [true, true, false, false, false]),
-            ("gfx1201", [true, true, false, true, false]),
-        ];
-        for (arch, row) in matrix {
-            for (codec, want) in [0u8, 1, 2, 3, 255].into_iter().zip(row) {
-                assert_eq!(
-                    qwen4_slab_codec_admitted(arch, codec),
-                    want,
-                    "{arch} codec {codec}"
-                );
+        // Full final matrix over codecs 0, 1, 2, 3 and an unknown byte, for both states of the
+        // gfx1151 E8P receipts switch: gfx1100 {0,3}, gfx1201 {0,1,3}, gfx1151 {0,1} or
+        // {0,1,3}; W2 nowhere. Only the gfx1151 E8P cell reads the switch.
+        for landed in [false, true] {
+            let matrix: [(&str, [bool; 5]); 3] = [
+                ("gfx1100", [true, false, false, true, false]),
+                ("gfx1151", [true, true, false, landed, false]),
+                ("gfx1201", [true, true, false, true, false]),
+            ];
+            for (arch, row) in matrix {
+                for (codec, want) in [0u8, 1, 2, 3, 255].into_iter().zip(row) {
+                    assert_eq!(
+                        qwen4_slab_codec_admitted_with(arch, codec, landed),
+                        want,
+                        "{arch} codec {codec} landed={landed}"
+                    );
+                }
+                assert!(!qwen4_slab_codec_admitted_with(arch, w2, landed), "{arch} W2");
+                // cold0 means no cold bucket on every admitted arch, Halo included.
+                assert_eq!(qwen4_slab_default_cold_codec(arch), Some(SLAB_CODEC_MQ4), "{arch}");
+                assert_eq!(qwen4_slab_layer_cold_codec_with(arch, &[mq4, mq4], landed), Ok(mq4), "{arch}");
             }
-            assert!(!qwen4_slab_codec_admitted(arch, w2), "{arch} W2");
-            // cold0 means no cold bucket on every admitted arch, Halo included.
-            assert_eq!(
-                qwen4_slab_default_cold_codec(arch),
-                Some(SLAB_CODEC_MQ4),
-                "{arch}"
-            );
-            assert_eq!(
-                qwen4_slab_layer_cold_codec(arch, &[mq4, mq4]),
-                Ok(mq4),
-                "{arch}"
-            );
         }
-        // gfx1151 never admits E8P, and W3 is the only cold codec it can select.
-        assert!(!qwen4_slab_codec_admitted("gfx1151", e8p));
-        assert_eq!(qwen4_slab_layer_cold_codec("gfx1151", &[w3, w3]), Ok(w3));
+        // Refused: gfx1151 serves W3 only as its cold codec and E8P is a NotAdmitted refusal in
+        // every position, W3 + E8P included.
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, w3], false), Ok(w3));
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, w3, mq4], false), Ok(w3));
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, w3, mq4]),
-            Ok(w3)
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], false),
+            Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
         );
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[mq4, e8p]),
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, e8p], false),
             Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
+        );
+        // Landed: E8P is gfx1151's second cold codec; a layer still holds ONE cold codec.
+        assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, e8p], true), Ok(e8p));
+        assert_eq!(
+            qwen4_slab_layer_cold_codec_with("gfx1151", &[w3, e8p], true),
+            Err(SlabLayerCodecError::MixedCold { first: w3, second: e8p })
         );
         // Multiple cold codecs: refused where both are admitted, NotAdmitted on the rest.
         assert_eq!(
@@ -311,10 +360,6 @@ mod tests {
             })
         );
         assert_eq!(
-            qwen4_slab_layer_cold_codec("gfx1151", &[w3, e8p]),
-            Err(SlabLayerCodecError::NotAdmitted { codec: e8p })
-        );
-        assert_eq!(
             qwen4_slab_layer_cold_codec("gfx1100", &[e8p, w3]),
             Err(SlabLayerCodecError::NotAdmitted { codec: w3 })
         );
@@ -323,17 +368,40 @@ mod tests {
             "", "unknown", "gfx942", "gfx1150", "gfx1152", "gfx11510", "gfx115", "gfx1151x",
             "gfx1151 ", "GFX1151", "gfx1101", "gfx1200", "gfx1201 ",
         ] {
-            for codec in [0u8, 1, 2, 3, 255] {
-                assert!(
-                    !qwen4_slab_codec_admitted(arch, codec),
-                    "{arch:?} codec {codec}"
-                );
+            for landed in [false, true] {
+                for codec in [0u8, 1, 2, 3, 255] {
+                    assert!(!qwen4_slab_codec_admitted_with(arch, codec, landed), "{arch:?} codec {codec}");
+                }
+                assert!(qwen4_slab_layer_cold_codec_with(arch, &[mq4], landed).is_err(), "{arch:?}");
             }
             assert_eq!(qwen4_slab_default_cold_codec(arch), None, "{arch:?}");
-            assert!(
-                qwen4_slab_layer_cold_codec(arch, &[mq4]).is_err(),
-                "{arch:?}"
+        }
+    }
+
+    /// The receipts constant is the single gfx1151 E8P admission switch (`false` today, so E8P
+    /// is refused on gfx1151): the public matrix and layer decision read exactly it, whichever
+    /// way it is set, and it moves no other cell.
+    #[test]
+    fn gfx1151_e8p_admission_is_the_one_receipts_constant() {
+        let landed = SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;
+        for codec in [0u8, 1, 2, 3, 255] {
+            assert_eq!(
+                qwen4_slab_codec_admitted("gfx1151", codec),
+                qwen4_slab_codec_admitted_with("gfx1151", codec, landed),
+                "codec {codec}"
             );
+        }
+        assert_eq!(qwen4_slab_codec_admitted("gfx1151", SLAB_CODEC_E8P), landed);
+        assert_eq!(
+            qwen4_slab_layer_cold_codec("gfx1151", &[SLAB_CODEC_MQ4, SLAB_CODEC_E8P]).is_ok(),
+            landed
+        );
+        // MQ4 and W3 on gfx1151 and every gfx1100 / gfx1201 cell never read the switch.
+        for codec in [SLAB_CODEC_MQ4, SLAB_CODEC_W3] {
+            assert!(qwen4_slab_codec_admitted("gfx1151", codec));
+        }
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(qwen4_slab_codec_admitted(arch, SLAB_CODEC_E8P), "{arch}");
         }
     }
 }

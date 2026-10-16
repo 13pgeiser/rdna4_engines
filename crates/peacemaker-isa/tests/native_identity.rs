@@ -14,7 +14,7 @@
 //! shared with `peacemaker-rip`'s `qsa` test; the strict whole-file comparison is
 //! kept there as `strict_whole_file_difference`.
 #![cfg(feature = "toolchain")]
-use peacemaker_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4, mq_i4_a4, mq_i4_moe_gemv, mq_i4_moe_gemv_c1, mq_i4_moe_gemv_cn, mq_i4_rows, mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_mq4_x4_gfx11, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
+use peacemaker_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4, mq_i4_a4, mq_i4_moe_gemv, mq_i4_moe_gemv_c1, mq_i4_moe_gemv_cn, e8p_i4_moe_gemv, mq_i4_rows, mtp_dense_det_gfx11, mtp_q8_det_gfx11, qsa_gather, qwen4_mq4_x4_gfx11, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
 use peacemaker_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
 use peacemaker_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use peacemaker_isa::{native, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, reg::Live};
@@ -120,6 +120,20 @@ fn corpus() -> Vec<Unit> {
             if let Ok((_, text, proof)) = mq_i4_moe_gemv_c1::emit_module() { module(&mut units, proof.module, arch, text) }
             for spec in mq_i4_moe_gemv_cn::module_specs() { if let Ok(e) = mq_i4_moe_gemv_cn::emit(spec) { single(&mut units, e) } }
             if let Ok((_, text, proof)) = mq_i4_moe_gemv_cn::emit_module() { module(&mut units, proof.module, arch, text) }
+        }
+        // E8P-I4 pointer-addressed F4 read-once C8 lane-union decode GEMV (gfx1201, gfx1100, gfx1151): the two entries and their module.
+        for spec in e8p_i4_moe_gemv::module_specs(arch) { if let Ok(e) = e8p_i4_moe_gemv::emit(spec) { single(&mut units, e) } }
+        if let Ok((_, text, proof)) = e8p_i4_moe_gemv::emit_module(arch) { module(&mut units, proof.module, arch, text) }
+        // E8P-I4 NT1 grouped WMMA K2 (gfx1100, gfx1151; one arch-parameterised module): the four entries and their module.
+        if peacemaker_isa::kernels::qwen4_moe_sym_gfx11::ARCHES.contains(&arch) {
+            use peacemaker_isa::kernels::qwen4_moe_sym_gfx11 as k2;
+            let mut entries = Vec::new();
+            for acc in [false, true] {
+                for kind in k2::Kind::ALL {
+                    if let Ok(e) = k2::emit(k2::Spec { arch, codec: k2::Codec::E8p, kind, acc, negative: k2::Negative::None }) { entries.push(e.clone()); single(&mut units, e) }
+                }
+            }
+            if let Ok((text, proof)) = iu4_gemm::module(&entries, &k2::Codec::E8p.module(arch)) { module(&mut units, proof.module, arch, text) }
         }
         // MTP append DET dense F16 WMMA GEMM (gfx1151 only): the entry and its module.
         if let Ok(e) = mtp_dense_det_gfx11::emit(mtp_dense_det_gfx11::Spec { arch }) { single(&mut units, e) }

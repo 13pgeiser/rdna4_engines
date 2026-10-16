@@ -3,10 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Exact F4 read-once C1–C8 lane-union decode GEMV over pointer-addressed **E8P-I4** expert
-//! tensors (`WeightCodec::E8pI4`, K-E2), emitted with the checked ISA builder for gfx1201 and
-//! gfx1100: two symbols `e8p_i4_moe_gemv_{r256_gate_up,r128_down}` in the module
-//! `e8p_i4_moe_gemv_pm_gfx1201`, and on gfx1100 the two symbols
-//! `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1100` in the module `e8p_i4_moe_gemv_pm_gfx1100`.
+//! tensors (`WeightCodec::E8pI4`, K-E2), emitted with the checked ISA builder for gfx1201,
+//! gfx1100 and gfx1151: two symbols `e8p_i4_moe_gemv_{r256_gate_up,r128_down}` in the module
+//! `e8p_i4_moe_gemv_pm_gfx1201`, and on gfx1100 / gfx1151 the two symbols
+//! `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_<arch>` in the module `e8p_i4_moe_gemv_pm_<arch>`.
 //!
 //! The ABI, grid, guards, slot semantics, read-once structure and the F4 reduction tree are those of
 //! [`super::mq_i4_moe_gemv`] (`Mq3I4` planar path); only the weight side differs. This file is
@@ -23,6 +23,16 @@
 //! `s_delay_alu` (never hand-placed). The gfx1100 symbols carry a `_pm_gfx1100` suffix so the two architectures'
 //! exports never collide. The arithmetic, the LDS table stage, the decode network and the reduction
 //! tree are unchanged.
+//!
+//! # gfx1151 arm
+//! gfx1151 (RDNA3.5, wave32) is the same gfx11 ISA family as gfx1100 and takes the gfx11 branch of every
+//! fork above unchanged: its emitted text is the gfx1100 text with only the arch-forced deltas
+//! (symbol / module / label names carrying `gfx1151` instead of `gfx1100`, the `.amdgcn_target` /
+//! metadata target, and the builder's hazard model: `VALUTransUseHazard` is a gfx1100-only feature, so
+//! the `s_waitcnt_depctr depctr_va_vdst(0)` the builder places on gfx1100 before the `v_mul_f32` that
+//! consumes each entry's `v_rcp_iflag_f32` result is absent on gfx1151), the same instruction sequence otherwise,
+//! register plan, LDS tables, reduction trees, ABI and launch geometry. The gfx1100 and gfx1201 emitted
+//! text are unchanged.
 //!
 //! # Frozen 96-byte kernarg ABI (identical to `mq_i4_moe_gemv`)
 //! u64 pointers `expert_weight_ptrs@0` (table indexed by expert id; each entry is the planar E8P
@@ -163,14 +173,14 @@ impl Kind {
     }
 }
 
-/// One entry: `(arch, kind)`; gfx1201 and gfx1100.
+/// One entry: `(arch, kind)`; gfx1201, gfx1100 and gfx1151.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec {
     pub arch: Arch,
     pub kind: Kind,
 }
 impl Spec {
-    /// The exported symbol: gfx1201 `e8p_i4_moe_gemv_<kind>`, gfx1100 `e8p_i4_moe_gemv_<kind>_pm_gfx1100`.
+    /// The exported symbol: gfx1201 `e8p_i4_moe_gemv_<kind>`, gfx1100 / gfx1151 `e8p_i4_moe_gemv_<kind>_pm_<arch>`.
     pub fn symbol(&self) -> String {
         if self.arch.gfx12() {
             format!("e8p_i4_moe_gemv_{}", self.tag())
@@ -186,8 +196,8 @@ impl Spec {
         format!("e8p_i4_moe_gemv_pm_{}", arch.name())
     }
     pub fn validate(&self) -> R {
-        if !matches!(self.arch, Arch::Gfx1201 | Arch::Gfx1100) {
-            return Err("e8p_i4_moe_gemv builder is exact-gfx1201 / exact-gfx1100 only".into());
+        if !matches!(self.arch, Arch::Gfx1201 | Arch::Gfx1100 | Arch::Gfx1151) {
+            return Err("e8p_i4_moe_gemv builder is exact-gfx1201 / exact-gfx1100 / exact-gfx1151 only".into());
         }
         Ok(())
     }

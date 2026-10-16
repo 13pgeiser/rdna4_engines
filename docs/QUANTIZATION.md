@@ -372,8 +372,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 132 | MQ3I4G128R128 | MQ3-I4 down — same planar W3 layout, R128 FWHT (seeds 43/1043); **typed-qwen4 expert-slab only, gfx1151/gfx1201** |
 | 133 | MQ2I4G128R256 | MQ2-I4 gate/up — planar `[M·K/4 B codes][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
 | 134 | MQ2I4G128R128 | MQ2-I4 down — same planar W2 layout, R128 FWHT; **typed-qwen4 expert-slab only, serving refused on every arch** |
-| 135 | E8PI4G128R256 | E8P-I4 gate/up — `[M·K/8 LE u16 words][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201** |
-| 136 | E8PI4G128R128 | E8P-I4 down — same planar E8P layout, R128 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201** |
+| 135 | E8PI4G128R256 | E8P-I4 gate/up — `[M·K/8 LE u16 words][M·K/128 f16 scales]`, R256 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201 (gfx1151 once `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`)** |
+| 136 | E8PI4G128R128 | E8P-I4 down — same planar E8P layout, R128 FWHT; **typed-qwen4 expert-slab only, gfx1100/gfx1201 (gfx1151 once `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`)** |
 
 **Never-reuse reserved wire IDs:** 23 and 25–27 (deliberately unassigned). qt 54 is
 held in the register with disposition `reserved` for the Qwen4 I64 metadata
@@ -449,9 +449,11 @@ from the actual spans: 48 × 512 gate/up-down pairs first, canonical names and
 order, frozen shapes/qtype pairs/group sizes/byte sizes, contiguous aligned
 slabs, no trunk aggregates or stray I4 entries. The sealed slab route admits
 MQ4 (codec 0) with E8P (codec 3) on exact gfx1100, MQ4 with W3 (codec 1) on
-exact gfx1151, and MQ4 with W3 or E8P on exact gfx1201. Each layer has at most
+exact gfx1151 (plus E8P once `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is
+`true`; today it is `false`), and MQ4 with W3 or E8P on exact gfx1201. Each
+layer has at most
 one cold codec; W3 and E8P cannot share its cold bucket. W2 is refused
-everywhere, as are W3 on gfx1100, E8P on gfx1151 and all other slab
+everywhere, as are W3 on gfx1100, E8P on gfx1151 (today) and all other slab
 architectures. Missing or malformed v1 metadata fails closed.
 `validate_expert_slab_scales` separately checks W3/W2 payloads through the shared
 codec, including finite non-negative f16 scales, rejection of -0, and canonical
@@ -465,13 +467,24 @@ entries are selected by architecture and the layer's cold codec. gfx1100
 uses its own K1/K2/K3 objects and tile-mask image, with AR only (MTP off).
 Existing gfx1201 W3/MQ4 kernel bytes, the gfx1201-only EP long-prefill staging
 default, and VMM/MTP refusals are unchanged. gfx1151 (Strix Halo) keeps its
-beta MQ4/W3 route (W3 K2 NT4 launcher, hipcc tile mask, E8P refused). Its slab
+beta MQ4/W3 route (W3 K2 NT4 launcher, hipcc tile mask); its E8P kernels are
+selectable by the same matrix but E8P stays refused there until the single
+`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` constant
+(`rdna-compute/src/slab_admission.rs`) is flipped to `true`. Its slab
 kernel preload is unconditional (planner, mask and all four K1 handles, even
 for an MQ4-only layer), the one exception to the no-cold-kernel-preload rule
 that gfx1100 and gfx1201 keep; it is not a W3 bucket launch.
 
 The gfx1100 E8P K2 wiring is CPU-prepared; promotion remains gated on its
 XTX K2 G1. This admission description is not a GPU qualification claim.
+
+The rc5 bounded E8P ABI is shared by gfx1100 and gfx1151: K1 uses a
+96-byte kernarg segment (`n_experts: u32` at byte 88, reserved zero at
+byte 92; 17 kernel parameters), and K2 uses a 64-byte segment
+(`n_experts: u32` at byte 60). Both kernels reject expert IDs with an
+unsigned, uniform bounds check before any expert pointer read, prefetch,
+or barrier. Invalid IDs perform no dereference or output store; the
+gfx1151 port preserves rc5's E8P NaN containment.
 
 ### PARO4G128 probe payload
 

@@ -77,6 +77,29 @@
 //! kernel runs with its tile ids masked to -1 for the other codec's experts and null pointer-table entries for
 //! experts it does not own; the MQ4 anchor (`--mq4-anchor`, else the mq4 mixed module) runs the QT44/QT53-equivalent
 //! union unmasked and must equal the combined output and the CPU twin.
+//!
+//! # gfx1151 (Strix Halo; `--expect-arch gfx1151`)
+//! `--expect-arch gfx1100` (the default) keeps every behaviour above. `--expect-arch gfx1151` retargets the whole oracle at the gfx1151 images: every entry is
+//! `qwen4_moe_{gate_up_silu,down}_iu4_sym{,_w2,_w3,_e8p}_pm_gfx1151[_acc]` (E8P: `kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco`, the gfx1100 arm with only
+//! arch-forced deltas, so the F32 `_acc` sums must equal the K-E0 twin bit for bit exactly as on gfx1100), the epilogue-fixture symbols end in `_gfx1151`, the
+//! device must be gfx1151, `--card halo`, `--expect-bdf` is REQUIRED and `--expect-uuid` OPTIONAL (Halo has no ROCr UUID: checked case-insensitively only when
+//! given, then also required of every probe / divide / intrinsic table; receipt `device.uuid_authoritative: false`), and the receipt schema is
+//! `consumer24.gfx1151.g1-oracle.v1`. Qualification inputs must be gfx1151 observations (`--probe-table`, `--divide-table`, `--intrinsic-table`:
+//! `device.arch == gfx1151`, `identity_match`, the bdf, passing selfcheck, denorm modes 3/3; their schemas keep the historical `consumer24.gfx1100.*` names)
+//! and `--epilogue-codeobject` the gfx1151 fixture. The `Finish::MulUp` NaN rule of the epilogue adapter is the gfx1100 device-pinned one; on gfx1151 the
+//! device run is what confirms it. `--cpu-recheck-fixture` and `--collect-hook-keys` stay gfx1100 CPU modes and refuse `--expect-arch`.
+//! Real layer (E8P) on Halo: `--sample-dir` is the extractor output over the slab artifact (this loader records `artifact_sha256`; it does not pin it):
+//!   python3 tools/e8p_k1_extract_samples.py --artifact /home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts \
+//!     --expect-sha256 d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949 --output-dir /abs/halo-e8p-k1-samples
+//!   /home/kaden/qcal/locks/fabric/fabric-run.sh --class correct --card halo --mem-gb N --owner NAME -- \
+//!     target/release/examples/qwen4_moe_sym_gfx1100_g1_oracle --codeobject /abs/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco --codec e8p \
+//!     --sample-dir /abs/halo-e8p-k1-samples --chain-dir DIR --probe-table OBS.json [--divide-table DIV.json] [--intrinsic-table OBS.json]... \
+//!     [--epilogue-codeobject FIXTURE.hxaco] [--negative-codeobject NAME=PATH]... --card halo --expect-arch gfx1151 --expect-bdf 0000:XX:00.0 \
+//!     [--expect-uuid U] --out RECEIPT.json         (without `--sample-dir`: the synthetic scenario set)
+//!   The gfx1151 probe tables and fixture need gfx1151 builds of the PM probe emitters (`peacemaker-isa` examples `gfx1100_*_probe`, `*_fixture_gfx1100_emit`)
+//!   and observers (`gfx1100_*_observe`); none exists. This table-qualified path is therefore NOT gate eligible for gfx1151: it is arch plumbing only, no
+//!   gfx1151 table qualification is added here. The Halo K2 gate is the self-contained `qwen4_moe_sym_e8p_g1_oracle --expect-arch gfx1151 --samples-dir ...`
+//!   (device probes built from `crates/hipfire-arch-qwen4/examples/oracle_kernels/qwen4_moe_sym_g1_probe.gfx1151.hip`, no tables).
 #![allow(dead_code)]
 
 use hip_bridge::{DeviceBuffer, Function, HipRuntime, Module};
@@ -112,20 +135,87 @@ use scenarios::{Class, RealRef, Scenario};
 
 const SCOPE_REAL: &str = "real weights; synthetic A4/routes; Down input twin-chained";
 const SCHEMA: &str = "consumer24.gfx1100.g1-oracle.v1";
-const ARCH: &str = "gfx1100";
+const SCHEMA_GFX1151: &str = "consumer24.gfx1151.g1-oracle.v1";
 const XTX_UUID: &str = "GPU-43390a851e296ee5";
 const XTX_BDF: &str = "0000:67:00.0";
 /// Every negative-control name any codec accepts; `Codec::negative_names` is the per-codec required subset.
-const NEG_NAMES: [&str; 7] = [
-    "wrong-scale-row",
-    "reversed-epoch",
-    "wrong-pack-selector",
-    "wrong-expert-pointer",
-    "wrong-lut",
-    "wrong-sign-mask",
-    "wrong-fold-epoch",
-];
-const USAGE: &str = "usage: qwen4_moe_sym_gfx1100_g1_oracle (--self-check | (--codeobject PATH --codec mq4|w2|w3|e8p | --mixed-codeobject mq4=PATH --mixed-codeobject w2=PATH|w3=PATH|e8p=PATH) [--mq4-anchor PATH (required for w2/w3 per-codec runs and the w2/w3 anchor union; REFUSED for e8p)] --probe-table PATH --card xtx --expect-uuid UUID --expect-bdf BDF) --out PATH [--sample-dir DIR (required for mixed)] [--divide-table PATH] [--intrinsic-table PATH]... [--negative-codeobject NAME=PATH]... [--epilogue-codeobject PATH] [--seed N] [--only SUBSTR] | qwen4_moe_sym_gfx1100_g1_oracle --collect-hook-keys OUT.json --probe-table PATH [--divide-table PATH] [--intrinsic-table PATH]... --census-sample-dir w2=DIR --census-sample-dir w3=DIR | --census-sample-dir e8p=DIR... [--census-chain-dir mq4=DIR --census-chain-dir w2=DIR --census-chain-dir w3=DIR | e8p=DIR] [--seed N] | qwen4_moe_sym_gfx1100_g1_oracle --cpu-recheck-fixture OUT.json --probe-table PATH [--divide-table PATH] [--intrinsic-table PATH]... [--seed N]";
+const NEG_NAMES: [&str; 7] = ["wrong-scale-row", "reversed-epoch", "wrong-pack-selector", "wrong-expert-pointer", "wrong-lut", "wrong-sign-mask", "wrong-fold-epoch"];
+
+/// `--expect-arch`: gfx1100 (the default; the xtx) or gfx1151 (Strix Halo, fabric label `halo`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    Gfx1100,
+    Gfx1151,
+}
+impl Target {
+    fn of_name(arch: &str) -> Option<Self> {
+        match arch {
+            "gfx1100" => Some(Self::Gfx1100),
+            "gfx1151" => Some(Self::Gfx1151),
+            _ => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => "gfx1100",
+            Self::Gfx1151 => "gfx1151",
+        }
+    }
+    fn schema(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => SCHEMA,
+            Self::Gfx1151 => SCHEMA_GFX1151,
+        }
+    }
+    fn card(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => "xtx",
+            Self::Gfx1151 => "halo",
+        }
+    }
+    fn link_caveat(self) -> &'static str {
+        match self {
+            Self::Gfx1100 => "xtx sits behind a PCIe 4.0 x4 root port (00:03.1); this is a correctness oracle and carries no speed or bandwidth claim",
+            Self::Gfx1151 => "gfx1151 is the Strix Halo APU (UMA: VRAM and host memory are one pool); this is a correctness oracle and carries no speed or bandwidth claim",
+        }
+    }
+}
+
+/// The device identity a run, its probe tables and its fixtures must carry: gfx1100 pins the xtx uuid and bdf; gfx1151 has no ROCr UUID, so its uuid is
+/// optional (checked when given) and a device run requires `--expect-bdf`.
+struct Ident {
+    target: Target,
+    uuid: Option<String>,
+    bdf: Option<String>,
+}
+impl Ident {
+    fn arch(&self) -> &'static str {
+        self.target.name()
+    }
+    /// Whether a recorded `device` object (probe / observation / divide table) is this identity with `identity_match: true`.
+    fn matches(&self, d: &Value) -> bool {
+        d["arch"] == json!(self.arch())
+            && self.uuid.as_ref().is_none_or(|u| d["uuid"] == json!(u))
+            && self.bdf.as_ref().is_none_or(|b| d["bdf"] == json!(b))
+            && d["identity_match"] == json!(true)
+    }
+}
+impl Args {
+    fn target_or_default(&self) -> Target {
+        self.expect_arch.as_deref().and_then(Target::of_name).unwrap_or(Target::Gfx1100)
+    }
+    /// Identity expected of the qualification tables (CPU modes included): the xtx for gfx1100, the optional flags for gfx1151.
+    fn table_ident(&self) -> Ident {
+        match self.target_or_default() {
+            Target::Gfx1100 => Ident { target: Target::Gfx1100, uuid: Some(XTX_UUID.into()), bdf: Some(XTX_BDF.into()) },
+            Target::Gfx1151 => Ident { target: Target::Gfx1151, uuid: self.expect_uuid.clone(), bdf: self.expect_bdf.clone() },
+        }
+    }
+}
+fn schema_of(a: &Args) -> &'static str {
+    a.target_or_default().schema()
+}
+const USAGE: &str = "usage: qwen4_moe_sym_gfx1100_g1_oracle (--self-check | (--codeobject PATH --codec mq4|w2|w3|e8p | --mixed-codeobject mq4=PATH --mixed-codeobject w2=PATH|w3=PATH|e8p=PATH) [--mq4-anchor PATH (required for w2/w3 per-codec runs and the w2/w3 anchor union; REFUSED for e8p)] --probe-table PATH --card xtx|halo [--expect-arch gfx1100|gfx1151 (default gfx1100)] --expect-uuid UUID (optional for gfx1151) --expect-bdf BDF) --out PATH [--sample-dir DIR (required for mixed)] [--divide-table PATH] [--intrinsic-table PATH]... [--negative-codeobject NAME=PATH]... [--epilogue-codeobject PATH] [--seed N] [--only SUBSTR] | qwen4_moe_sym_gfx1100_g1_oracle --collect-hook-keys OUT.json --probe-table PATH [--divide-table PATH] [--intrinsic-table PATH]... --census-sample-dir w2=DIR --census-sample-dir w3=DIR | --census-sample-dir e8p=DIR... [--census-chain-dir mq4=DIR --census-chain-dir w2=DIR --census-chain-dir w3=DIR | e8p=DIR] [--seed N] | qwen4_moe_sym_gfx1100_g1_oracle --cpu-recheck-fixture OUT.json --probe-table PATH [--divide-table PATH] [--intrinsic-table PATH]... [--seed N]";
 
 fn source_hashes() -> Value {
     let files: [(&str, &[u8]); 10] = [
@@ -187,6 +277,7 @@ struct Args {
     card: Option<String>,
     expect_uuid: Option<String>,
     expect_bdf: Option<String>,
+    expect_arch: Option<String>,
     out: Option<String>,
     self_check: bool,
     sample_dir: Option<String>,
@@ -234,6 +325,7 @@ fn parse_args() -> Res<Args> {
             "--card" => a.card = Some(v),
             "--expect-uuid" => a.expect_uuid = Some(v),
             "--expect-bdf" => a.expect_bdf = Some(v.to_ascii_lowercase()),
+            "--expect-arch" => a.expect_arch = Some(v),
             "--out" => a.out = Some(v),
             "--sample-dir" => a.sample_dir = Some(v),
             "--epilogue-codeobject" => a.epilogue_fixture = Some(v),
@@ -307,6 +399,11 @@ fn parse_args() -> Res<Args> {
             _ => return Err(format!("unknown flag {f}\n{USAGE}")),
         }
     }
+    let target = match a.expect_arch.as_deref() {
+        None => Target::Gfx1100,
+        Some(n) => Target::of_name(n).ok_or_else(|| format!("--expect-arch {n:?}: this oracle serves gfx1100 and gfx1151\n{USAGE}"))?,
+    };
+    model::set_arch(target.name());
     Ok(a)
 }
 
@@ -465,19 +562,15 @@ impl Tally {
 
 fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
     let path = a.probe_table.as_ref().ok_or("--probe-table is required")?;
+    let id = a.table_ident();
     let (bytes, doc) = file_json(path)?;
     let mut hooks = QualifiedHooks::from_json(&doc)?;
     let mut problems = Vec::new();
     let mut divide_meta = Value::Null;
     if let Some(dp) = &a.divide_table {
         let (db, dd) = file_json(dp)?;
-        if dd["selfcheck"]["ok"] != json!(true)
-            || dd["device"]["arch"] != json!(ARCH)
-            || dd["device"]["uuid"] != json!(XTX_UUID)
-            || dd["device"]["bdf"] != json!(XTX_BDF)
-            || dd["device"]["identity_match"] != json!(true)
-        {
-            problems.push("supplementary divide table lacks a passing xtx qualification".into());
+        if dd["selfcheck"]["ok"] != json!(true) || !id.matches(&dd["device"]) {
+            problems.push(format!("supplementary divide table lacks a passing {} qualification", id.arch()));
         }
         let added = hooks.merge_divide_extras(&dd)?;
         divide_meta = json!({"path": dp, "sha256": sha256_hex(&db), "new_divide_keys": added});
@@ -493,7 +586,7 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
                 "--intrinsic-table {ip} repeats an earlier table (sha256 {sha})"
             ));
         }
-        for p in probe_table::intrinsic_qualification(&idoc, ARCH, XTX_UUID, XTX_BDF) {
+        for p in probe_table::intrinsic_qualification(&idoc, id.arch(), id.uuid.as_deref(), id.bdf.as_deref()) {
             problems.push(format!("intrinsic table {ip}: {p}"));
         }
         let merged = hooks
@@ -517,12 +610,8 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
     if top["selfcheck"]["ok"] != json!(true) {
         problems.push("probe table lacks a passing independent selfcheck".into());
     }
-    if top["device"]["arch"] != json!(ARCH)
-        || top["device"]["uuid"] != json!(XTX_UUID)
-        || top["device"]["bdf"] != json!(XTX_BDF)
-        || top["device"]["identity_match"] != json!(true)
-    {
-        problems.push("probe table was not qualified on the expected gfx1100 xtx".into());
+    if !id.matches(&top["device"]) {
+        problems.push(format!("probe table was not qualified on the expected {} {}", id.arch(), id.target.card()));
     }
     let observed: std::collections::BTreeSet<u32> = hooks
         .entries
@@ -546,11 +635,11 @@ fn load_table(a: &Args) -> Res<(QualifiedHooks, Value, Vec<String>)> {
 }
 
 fn head_common(a: &Args, mode: &str, scope: &str) -> Value {
-    json!({"schema": SCHEMA, "mode": mode, "scope": scope, "command": format!("qwen4_moe_sym_gfx1100_g1_oracle {}", a.argv.join(" ")),
+    json!({"schema": schema_of(a), "target_arch": a.target_or_default().name(), "mode": mode, "scope": scope, "command": format!("qwen4_moe_sym_gfx1100_g1_oracle {}", a.argv.join(" ")),
            "source_sha256": source_hashes(), "seed": a.seed, "only_filter": a.only,
            "complete": a.only.is_none(),
            "g1c_terms": "closes only for a mixed-codec run over artifact-bound real samples with every Down input twin-chained and zero mismatches; see the final `g1c` object",
-           "link_caveat": "xtx sits behind a PCIe 4.0 x4 root port (00:03.1); this is a correctness oracle and carries no speed or bandwidth claim"})
+           "link_caveat": a.target_or_default().link_caveat()})
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -834,10 +923,7 @@ fn run_self_check(a: &Args) -> Res<bool> {
         "mixed_scenarios": st.tally.mixed_total, "chain_down_scenarios": st.tally.chain_down_total, "negative_controls_all_detected": neg_ok});
     doc["pass"] = json!(pass);
     write_json(out, &doc)?;
-    println!(
-        "{}",
-        json!({"schema": SCHEMA, "mode": "self-check", "out": out, "pass": pass, "summary": doc["summary"], "problems": doc["problems"]})
-    );
+    println!("{}", json!({"schema": schema_of(a), "mode": "self-check", "out": out, "pass": pass, "summary": doc["summary"], "problems": doc["problems"]}));
     Ok(pass)
 }
 
@@ -1533,23 +1619,9 @@ fn run_fixture(hip: &HipRuntime, co: &[u8], hooks: &QualifiedHooks, seed: u32) -
     let mut neg_bad = [0u64; 2];
     let neg_names = ["wrongsel_gate_up", "wrongsel_down"];
     for (ki, kind) in [Kind::GateUp, Kind::Down].into_iter().enumerate() {
-        let tag = if kind == Kind::GateUp {
-            "gate_up"
-        } else {
-            "down"
-        };
-        let f = hip
-            .module_get_function(
-                &module,
-                &format!("qwen4_moe_epilogue_fixture_{tag}_gfx1100"),
-            )
-            .map_err(err)?;
-        let fneg = hip
-            .module_get_function(
-                &module,
-                &format!("qwen4_moe_epilogue_fixture_{tag}_wrongsel_gfx1100"),
-            )
-            .map_err(err)?;
+        let tag = if kind == Kind::GateUp { "gate_up" } else { "down" };
+        let f = hip.module_get_function(&module, &format!("qwen4_moe_epilogue_fixture_{tag}_{}", model::arch_name())).map_err(err)?;
+        let fneg = hip.module_get_function(&module, &format!("qwen4_moe_epilogue_fixture_{tag}_wrongsel_{}", model::arch_name())).map_err(err)?;
         let (m, oc) = (kind.m(), kind.out_cols());
         let p_rows = fixture_p_rows(kind);
         for (pi, pass_name) in FIXTURE_PASSES.iter().enumerate() {
@@ -1665,6 +1737,7 @@ fn run_cpu_recheck_fixture(a: &Args) -> Res<i32> {
         ("--card", a.card.is_some()),
         ("--expect-uuid", a.expect_uuid.is_some()),
         ("--expect-bdf", a.expect_bdf.is_some()),
+        ("--expect-arch", a.expect_arch.is_some()),
         ("--census-sample-dir", !a.census_samples.is_empty()),
         ("--census-chain-dir", !a.census_chains.is_empty()),
     ] {
@@ -1892,16 +1965,25 @@ fn run_device(a: &Args) -> Res<bool> {
         )
     };
     let card = a.card.clone().ok_or("--card is required")?;
-    let expect_uuid = a.expect_uuid.clone().ok_or("--expect-uuid is required")?;
-    let expect_bdf = a.expect_bdf.clone().ok_or("--expect-bdf is required")?;
-    if card != "xtx" {
-        return Err(format!("--card must be xtx, got {card:?}"));
+    let target = a.target_or_default();
+    if card != target.card() {
+        return Err(format!("--card must be {}, got {card:?}", target.card()));
     }
-    if expect_uuid != XTX_UUID || expect_bdf != XTX_BDF {
-        return Err(format!(
-            "xtx identity is {XTX_UUID} / {XTX_BDF}; got {expect_uuid} / {expect_bdf}"
-        ));
-    }
+    let ident = match target {
+        Target::Gfx1100 => {
+            let expect_uuid = a.expect_uuid.clone().ok_or("--expect-uuid is required")?;
+            let expect_bdf = a.expect_bdf.clone().ok_or("--expect-bdf is required")?;
+            if expect_uuid != XTX_UUID || expect_bdf != XTX_BDF {
+                return Err(format!("xtx identity is {XTX_UUID} / {XTX_BDF}; got {expect_uuid} / {expect_bdf}"));
+            }
+            Ident { target, uuid: Some(expect_uuid), bdf: Some(expect_bdf) }
+        }
+        Target::Gfx1151 => Ident {
+            target,
+            uuid: a.expect_uuid.clone(),
+            bdf: Some(a.expect_bdf.clone().ok_or("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)")?),
+        },
+    };
     if !mixed && matches!(codec, Codec::W2 | Codec::W3) && a.anchor.is_none() {
         return Err("--mq4-anchor is required for w2/w3 (the same-device QT44/QT53 anchor)".into());
     }
@@ -1929,9 +2011,11 @@ fn run_device(a: &Args) -> Res<bool> {
     let uuid = hip.device_uuid(id).map_err(err)?;
     let bdf = hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase();
     let arch = hip.get_arch(id).map_err(err)?;
-    let identity_match =
-        arch == ARCH && uuid.eq_ignore_ascii_case(&expect_uuid) && bdf == expect_bdf;
-    let device = json!({"card": card, "uuid": uuid, "bdf": bdf, "arch": arch, "expected_arch": ARCH, "expected_uuid": expect_uuid, "expected_bdf": expect_bdf,
+    let identity_match = arch == ident.arch()
+        && ident.uuid.as_deref().is_none_or(|u| uuid.eq_ignore_ascii_case(u))
+        && ident.bdf.as_deref().is_none_or(|b| bdf == b);
+    let device = json!({"card": card, "uuid": uuid, "bdf": bdf, "arch": arch, "expected_arch": ident.arch(), "expected_uuid": ident.uuid, "expected_bdf": ident.bdf,
+        "uuid_authoritative": target == Target::Gfx1100,
         "identity_match": identity_match, "device_id": id});
     if !identity_match {
         return Err(format!("device identity mismatch: {device}"));
@@ -2025,21 +2109,13 @@ fn run_device(a: &Args) -> Res<bool> {
     let mut problems = problems;
     if let Some(d) = table_meta.get("device") {
         if !d.is_null() {
-            if d.get("arch").and_then(Value::as_str) != Some(ARCH) {
-                problems.push(format!(
-                    "probe table arch {:?} is not {ARCH}",
-                    d.get("arch")
-                ));
+            if d.get("arch").and_then(Value::as_str) != Some(ident.arch()) {
+                problems.push(format!("probe table arch {:?} is not {}", d.get("arch"), ident.arch()));
             }
-            if d.get("uuid")
-                .and_then(Value::as_str)
-                .map(|u| !u.eq_ignore_ascii_case(&expect_uuid))
-                .unwrap_or(false)
-            {
-                problems.push(format!(
-                    "probe table was observed on {:?}, not {expect_uuid}",
-                    d.get("uuid")
-                ));
+            if let Some(eu) = &ident.uuid {
+                if d.get("uuid").and_then(Value::as_str).is_some_and(|u| !u.eq_ignore_ascii_case(eu)) {
+                    problems.push(format!("probe table was observed on {:?}, not {eu}", d.get("uuid")));
+                }
             }
             if d.get("identity_match").and_then(Value::as_bool) == Some(false) {
                 problems.push("probe table device.identity_match is false".into());
@@ -2149,8 +2225,8 @@ fn run_device(a: &Args) -> Res<bool> {
     if let Some((_, b)) = &fixture_bytes {
         let mut v = Vec::new();
         for t in ["gate_up", "down"] {
-            v.push(format!("qwen4_moe_epilogue_fixture_{t}_gfx1100"));
-            v.push(format!("qwen4_moe_epilogue_fixture_{t}_wrongsel_gfx1100"));
+            v.push(format!("qwen4_moe_epilogue_fixture_{t}_{}", model::arch_name()));
+            v.push(format!("qwen4_moe_epilogue_fixture_{t}_wrongsel_{}", model::arch_name()));
         }
         audit_in.push(("epilogue_fixture", b.as_slice(), v));
     }
@@ -2280,9 +2356,7 @@ fn run_device(a: &Args) -> Res<bool> {
     ctx.flush("complete")?;
     let d = ctx.doc("complete");
     let _ = std::fs::remove_file(format!("{out}.progress"));
-    println!(
-        "{}",
-        json!({"schema": SCHEMA, "mode": "device", "out": out, "scope": scope, "mixed_codec_run": mixed, "pass": d["pass"], "g1c_verdict": d["g1c"]["verdict"],
+    println!("{}", json!({"schema": schema_of(a), "mode": "device", "out": out, "scope": scope, "mixed_codec_run": mixed, "pass": d["pass"], "g1c_verdict": d["g1c"]["verdict"],
         "g1c_measured_pass": d["g1c"]["measured_pass"], "g1c_closed": d["g1c"]["closed"], "artifact_binding": d["g1c"]["artifact_binding"]["status"],
         "g1c_blockers": d["g1c"]["blockers"], "summary": d["summary"], "denorm_ok": d["denorm"]["ok"],
         "negative_controls": d["negative_controls"], "coverage_gaps": d["coverage_gaps"], "epilogue_fixture_pass": d.get("epilogue_fixture").map(|f| f["pass"].clone())})
@@ -2543,6 +2617,7 @@ fn run_census(a: &Args) -> Res<i32> {
         ("--card", a.card.is_some()),
         ("--expect-uuid", a.expect_uuid.is_some()),
         ("--expect-bdf", a.expect_bdf.is_some()),
+        ("--expect-arch", a.expect_arch.is_some()),
     ] {
         if given {
             return Err(format!("--collect-hook-keys is the CPU-only full census; {flag} is not accepted (scopes come from --census-sample-dir)"));

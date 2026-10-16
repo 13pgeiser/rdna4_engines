@@ -28,7 +28,7 @@ use super::*;
 
 /// Fold the epoch whose operands are in the registers.
 pub(super) fn compute(b: &mut Builder, g: &Gen) -> Result<(), String> {
-    let a = Arch::Gfx1100;
+    let a = g.spec.arch;
     let tn = g.tn();
     for t in 0..tn {
         op(

@@ -48068,21 +48068,37 @@ static SLAB_K2_GFX1100_E8P: SlabK2 = SlabK2 {
     ],
     code_bits: 2,
 };
+static SLAB_K2_GFX1151_E8P: SlabK2 = SlabK2 {
+    module: "qwen4_moe_iu4_sym_e8p_pm_gfx1151",
+    image: kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151,
+    entries: ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"],
+    code_bits: 2,
+};
 
-/// The sealed-slab NT1 K2 table of slab codec `codec` on `arch`: gfx1100 MQ4 (0) and E8P (3),
-/// gfx1201 E8P (3). `None` for everything else and for every codec
-/// [`crate::qwen4_slab_codec_admitted`] refuses (W2 / codec 2 never, gfx1100 W3 never): a table
+/// The sealed-slab NT1 K2 modules that exist per (`arch`, slab codec `codec`): gfx1100 MQ4 (0) and
+/// E8P (3), gfx1201 E8P (3), gfx1151 E8P (3, `qwen4_moe_iu4_sym_e8p_pm_gfx1151`, the gfx1100 arm
+/// with only arch-forced deltas). Inventory, NOT permission: serving selection goes through
+/// [`slab_k2_entry`] (admission-gated).
+pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2> {
+    match (arch, codec) {
+        ("gfx1100", 0) => Some(&SLAB_K2_GFX1100_MQ4),
+        ("gfx1100", 3) => Some(&SLAB_K2_GFX1100_E8P),
+        ("gfx1201", 3) => Some(&SLAB_K2_GFX1201_E8P),
+        ("gfx1151", 3) => Some(&SLAB_K2_GFX1151_E8P),
+        _ => None,
+    }
+}
+
+/// The sealed-slab NT1 K2 table of slab codec `codec` on `arch` the route SERVES:
+/// [`slab_k2_metadata`] (gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), gfx1151 E8P (3)) restricted to
+/// what [`crate::qwen4_slab_codec_admitted`] admits. `None` for everything else and for every codec
+/// the matrix refuses (W2 / codec 2 never, gfx1100 W3 never, gfx1151 E8P until admitted): a table
 /// entry is not permission.
 pub(crate) fn slab_k2_entry(arch: &str, codec: u8) -> Option<&'static SlabK2> {
     if !crate::qwen4_slab_codec_admitted(arch, codec) {
         return None;
     }
-    match (arch, codec) {
-        ("gfx1100", 0) => Some(&SLAB_K2_GFX1100_MQ4),
-        ("gfx1100", 3) => Some(&SLAB_K2_GFX1100_E8P),
-        ("gfx1201", 3) => Some(&SLAB_K2_GFX1201_E8P),
-        _ => None,
-    }
+    slab_k2_metadata(arch, codec)
 }
 /// gfx1151 builder down entries with a row repeat of 2 and 4 (NT4 expert-run
 /// tiles, `rr` contiguous 64-row blocks per workgroup), `[rr2, rr4]`. Same
@@ -48491,7 +48507,8 @@ impl Gpu {
     }
 
     /// `[gate/up, down]` NT1 serving entries of the sealed expert-slab codec `codec` on this
-    /// device ([`slab_k2_entry`]): gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), `None`
+    /// device ([`slab_k2_entry`]): gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), gfx1151 E8P (3, once
+    /// admitted), `None`
     /// otherwise (the `_acc` twins are never named; gfx1201 MQ4 and W3 keep their own methods).
     /// Independent of the global gfx1100 aggregate MQ4 route.
     pub fn qwen4_moe_sym_slab_gemm_symbols(&self, codec: u8) -> Option<[&'static str; 2]> {
@@ -49273,7 +49290,8 @@ impl Gpu {
     /// padding/sentinel semantics of [`Gpu::gemm_qwen4_moe_gate_up_silu_iu4_sym`]; an expert id outside `[0, n_experts)` skips its tile with no
     /// store. `ptrs[e]`
     /// addresses the planar `[M*K/8 u16 words][M*K/128 f16 scales]` tensor of expert `e`.
-    /// gfx1100 and gfx1201 (`qwen4_moe_iu4_sym_e8p_pm_gfx1100` / `_gfx1201`, [`slab_k2_entry`]);
+    /// gfx1100, gfx1201 and gfx1151 (`qwen4_moe_iu4_sym_e8p_pm_gfx1100` / `_gfx1201` / `_gfx1151`,
+    /// [`slab_k2_entry`], gfx1151 only once admitted);
     /// every other arch refuses; there is no host-mapped width.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_e8p_gate_up_silu_iu4_sym(
@@ -49319,7 +49337,7 @@ impl Gpu {
     /// E8P-I4 grouped IU4 down, NT1: `y` `[grouped_rows, m]` BF16 per grouped row, as
     /// [`Gpu::gemm_qwen4_moe_down_iu4_sym`]. `xq` is the down A4 sidecar handle of
     /// `x_src_rows` flat slots; `x_row_div` = 1. `ptrs[e]` addresses the planar `[m, k]` E8P
-    /// tensor (`k % 128 == 0`). gfx1100 and gfx1201 only ([`slab_k2_entry`]).
+    /// tensor (`k % 128 == 0`). gfx1100, gfx1201 and gfx1151 only ([`slab_k2_entry`]).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qwen4_moe_e8p_down_iu4_sym(
         &mut self,
@@ -49459,7 +49477,7 @@ impl Gpu {
     }
 
     /// [`Gpu::qwen4_moe_sym_nt1_gemm`] over the sealed-slab NT1 K2 entries of slab codec `codec`
-    /// on this device ([`slab_k2_entry`]: gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3));
+    /// on this device ([`slab_k2_entry`]: gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), gfx1151 E8P (3));
     /// refuses every other arch and codec.
     fn qwen4_moe_sym_slab_gemm(
         &mut self,
@@ -49473,7 +49491,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "the sealed-slab NT1 grouped IU4 MoE entries serve MQ4 (0) and E8P (3) on gfx1100 and E8P (3) on gfx1201 only, got codec {codec} on {}",
+                    "the sealed-slab NT1 grouped IU4 MoE entries serve MQ4 (0) and E8P (3) on gfx1100, E8P (3) on gfx1201 and E8P (3) on an admitting gfx1151 only, got codec {codec} on {}",
                     self.arch
                 ),
             ));
@@ -51843,7 +51861,15 @@ mod route_selector_tests {
         assert_eq!(gfx1100_e8p.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100);
         assert_eq!(gfx1100_e8p.code_bits, 2);
         assert_eq!(gfx1201_e8p.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201);
-        for k2 in [gfx1100_mq4, gfx1100_e8p, gfx1201_e8p] {
+        let gfx1151_e8p = slab_k2_metadata("gfx1151", 3).unwrap();
+        assert_eq!(gfx1151_e8p.module, "qwen4_moe_iu4_sym_e8p_pm_gfx1151");
+        assert_eq!(
+            gfx1151_e8p.entries,
+            ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"]
+        );
+        assert_eq!(gfx1151_e8p.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151);
+        assert_eq!(gfx1151_e8p.code_bits, 2);
+        for k2 in [gfx1100_mq4, gfx1100_e8p, gfx1201_e8p, gfx1151_e8p] {
             for name in k2.entries {
                 assert!(
                     !name.ends_with("_acc"),
@@ -51869,11 +51895,14 @@ mod route_selector_tests {
             ("gfx1201", 0),
             ("gfx1201", 1),
             ("gfx1201", 2),
-            ("gfx1151", 3),
+            ("gfx1151", 1),
             ("gfx1151", 0),
         ] {
             assert!(slab_k2_entry(arch, codec).is_none(), "{arch} {codec}");
         }
+        // gfx1151 E8P has a table row (`slab_k2_metadata`) and serves exactly when the shared
+        // admission matrix admits it.
+        assert_eq!(slab_k2_entry("gfx1151", 3).is_some(), crate::qwen4_slab_codec_admitted("gfx1151", 3));
     }
 
     /// `(group_segment_fixed_size, private_segment_fixed_size, kernarg_segment_size)` of the
@@ -51981,6 +52010,88 @@ mod route_selector_tests {
                 Some((0, 64)),
                 "{name}"
             );
+        }
+    }
+
+    /// The gfx1151 E8P K2 image against the 64-byte NT1 launcher: the gfx1100 arm with only
+    /// arch-forced deltas, so the descriptors carry the same 64-byte kernarg segment (`n_experts@60`), the
+    /// contracts' 1,536 B static LDS, no private segment, and the launcher's dynamic LDS is 0.
+    #[test]
+    fn qwen4_moe_sym_gfx1151_e8p_k2_descriptors_match_the_nt1_launcher_and_contracts() {
+        let k2 = slab_k2_metadata("gfx1151", 3).unwrap();
+        for (name, contract) in [
+            (
+                k2.entries[0],
+                include_str!("../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.gate_up_e8p.contract.json"),
+            ),
+            (
+                k2.entries[1],
+                include_str!("../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.down_e8p.contract.json"),
+            ),
+        ] {
+            assert!(contract.contains(&format!("\"symbol\": \"{name}\"")), "{name}: contract symbol");
+            assert!(contract.contains("\"launch_dynamic_lds_bytes\": 0"), "{name}: dynamic LDS");
+            assert!(contract.contains("\"group_segment_fixed_bytes\": 1536"), "{name}: static LDS");
+            assert!(contract.contains("\"require_wave32\": true"), "{name}: wave32");
+            assert!(contract.contains("\"require_zero_private\": true"), "{name}: private segment");
+            assert_eq!(
+                kernel_descriptor(k2.image, name),
+                Some((1536, 0, 64)),
+                "{name}: group / private / kernarg bytes of the embedded descriptor"
+            );
+        }
+        // The never-served `_acc` twins share the kernarg ABI.
+        for name in k2.entries {
+            assert_eq!(kernel_descriptor(k2.image, &format!("{name}_acc")), Some((1536, 0, 64)), "{name}_acc");
+        }
+    }
+
+    /// The K2 table inventory is exactly the served-or-tabled (arch, codec) pairs; the gfx1151
+    /// E8P row is the gfx1100 one under gfx1151 names and serves only through the shared
+    /// admission matrix (a table entry is not permission).
+    #[test]
+    fn qwen4_moe_sym_slab_k2_inventory_is_not_permission_and_gfx1151_is_the_gfx1100_arm() {
+        let mut tabled = Vec::new();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942", "gfx906", "gfx1101", ""] {
+            for codec in 0u8..=255 {
+                if slab_k2_metadata(arch, codec).is_some() {
+                    tabled.push((arch, codec));
+                }
+            }
+        }
+        assert_eq!(tabled, [("gfx1100", 0), ("gfx1100", 3), ("gfx1151", 3), ("gfx1201", 3)]);
+        for (arch, codec) in tabled {
+            let served = slab_k2_entry(arch, codec);
+            assert_eq!(served.is_some(), crate::qwen4_slab_codec_admitted(arch, codec), "{arch} {codec}");
+            if let Some(served) = served {
+                assert!(std::ptr::eq(served, slab_k2_metadata(arch, codec).unwrap()));
+            }
+        }
+        let halo = slab_k2_metadata("gfx1151", 3).unwrap();
+        let xtx = slab_k2_metadata("gfx1100", 3).unwrap();
+        assert_eq!(halo.module, "qwen4_moe_iu4_sym_e8p_pm_gfx1151");
+        assert_eq!(halo.module, xtx.module.replace("gfx1100", "gfx1151"));
+        assert_eq!(
+            halo.entries,
+            ["qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1151", "qwen4_moe_down_iu4_sym_e8p_pm_gfx1151"]
+        );
+        for (halo_name, xtx_name) in halo.entries.iter().zip(xtx.entries) {
+            assert_eq!(*halo_name, xtx_name.replace("gfx1100", "gfx1151"));
+        }
+        assert_eq!(halo.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151);
+        assert!(!std::ptr::eq(halo.image, xtx.image));
+        assert!(!std::ptr::eq(halo.image, kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201));
+        assert_eq!(halo.code_bits, xtx.code_bits);
+        for name in halo.entries {
+            assert!(!name.ends_with("_acc"), "{name}: the qualification twin must not be served");
+            assert!(contains_bytes(halo.image, format!("{name}.kd").as_bytes()), "{name}.kd missing");
+            // The gfx1151 image names no gfx1100 or gfx1201 symbol.
+            assert!(!contains_bytes(halo.image, name.replace("gfx1151", "gfx1100").as_bytes()), "{name} (gfx1100 spelling)");
+            assert!(!contains_bytes(halo.image, name.replace("gfx1151", "gfx1201").as_bytes()), "{name} (gfx1201 spelling)");
+        }
+        // W2 / W3 / MQ4 stay unserved on gfx1151 here (W3 keeps its own launcher, MQ4 the hipcc one).
+        for codec in [0u8, 1, 2, 255] {
+            assert!(slab_k2_metadata("gfx1151", codec).is_none() && slab_k2_entry("gfx1151", codec).is_none());
         }
     }
 }

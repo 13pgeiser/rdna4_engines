@@ -222,12 +222,17 @@ impl Kind {
             Self::GateUp => "qwen4_moe_gate_up_silu_iu4_sym",
             Self::Down => "qwen4_moe_down_iu4_sym",
         };
-        format!(
-            "{base}{}_pm_gfx1100{}",
-            codec.infix(),
-            if acc { "_acc" } else { "" }
-        )
+        format!("{base}{}_pm_{}{}", codec.infix(), arch_name(), if acc { "_acc" } else { "" })
     }
+}
+
+/// Target architecture of every `_pm_<arch>` kernel entry (`--expect-arch`; gfx1100 unless [`set_arch`] ran first).
+static ARCH_NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+pub fn set_arch(name: &'static str) {
+    let _ = ARCH_NAME.set(name);
+}
+pub fn arch_name() -> &'static str {
+    ARCH_NAME.get().copied().unwrap_or("gfx1100")
 }
 
 pub fn profile(planar: MqI4Codec, kind: Kind) -> MqI4Profile {

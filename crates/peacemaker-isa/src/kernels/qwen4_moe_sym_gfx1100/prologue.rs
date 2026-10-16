@@ -28,7 +28,7 @@
 //! extent.
 use super::*;
 
-fn cmp(wg: &mut Wg<'_>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
+fn cmp<T: Gfx11>(wg: &mut Wg<'_, T>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(
         text,
         vec![],
@@ -36,8 +36,8 @@ fn cmp(wg: &mut Wg<'_>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, Str
     ))
 }
 
-pub(super) fn emit(wg: &mut Wg<'_>, g: &Gen, end: &End) -> Result<(), String> {
-    let a = Arch::Gfx1100;
+pub(super) fn emit<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen, end: &End) -> Result<(), String> {
+    let a = g.spec.arch;
     let kind = g.spec.kind;
     let codec = g.spec.codec;
     let planar = codec != Codec::Mq4;

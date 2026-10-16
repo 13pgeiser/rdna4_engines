@@ -7,7 +7,9 @@
 //!
 //! The layer's experts live in one slab arena and carry a codec each: MQ4
 //! symmetric plus at most one cold codec per layer (MQ3-I4 W3 on gfx1201 and gfx1151,
-//! or E8P-I4 on gfx1201 and gfx1100; W2 nowhere). Two kernel families serve them:
+//! or E8P-I4 on gfx1201 and gfx1100, and on gfx1151 once
+//! `rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is true; W2 nowhere).
+//! Two kernel families serve them:
 //!
 //! * `route_rows <= Gpu::few_row_limit()` (decode, MTP verify, a one-row forward): the K1 lane-union
 //!   GEMV over codec buckets ([`rdna_compute::slab_moe`]). The layer sits in the

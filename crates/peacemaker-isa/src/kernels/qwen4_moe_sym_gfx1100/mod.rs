@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 NT1 grouped symmetric IU4 MoE GEMMs (Consumer24 B4): gate/up+SwiGLU
+//! gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs (Consumer24 B4; Halo E8P port): gate/up+SwiGLU
 //! and down, over MQ4 (QT44/QT53 pointer-addressed), planar W2 (`d*(2c-3)`),
 //! planar W3 (`d*(2c-7)`) and planar E8P-I4 (`d*(2C+s)/4`, LUT/MASK stage in LDS; see [`e8p`])
 //! expert tensors, each in a BF16 entry and a
@@ -72,7 +72,8 @@
 //! and the fold is `S = fma(RN(d*sc), (2C + s)/4, S)` (`2a + (s - MAGIC)`, `+ -MAGIC`, `* 0.25`). The
 //! D-only `iu4_fold::fold_pass` is not used for it. Wire/ABI: planar W2 geometry (`K/4` code bytes + `K/64`
 //! scale bytes per row), the same 64-byte kernargs and grid; the entries are
-//! `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1100[_acc]` in `qwen4_moe_iu4_sym_e8p_pm_gfx1100`.
+//! `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_<arch>[_acc]` in `qwen4_moe_iu4_sym_e8p_pm_<arch>` (`<arch>` = `gfx1100` or
+//! `gfx1151`: [`Spec::arch`] selects the typed target and the names; the instruction path is one).
 //!
 //! # Negative controls
 //!
@@ -85,7 +86,7 @@
 //! a plain `-MAGIC`: the activation sum `s` is dropped but the signed dot and the `0.25` multiplier stay,
 //! so each epoch contributes `2C/4` instead of `(2C + s)/4`). The symbol is unchanged so
 //! the object is drop-in; keep these out of every candidate module.
-use peacemaker_author::{End, Gfx1100, Scc, WgUniform, Workgroup};
+use peacemaker_author::{End, Full, Gfx11Waits, Gfx1100, Gfx1151, MmaIu4, Scc, Target, WgUniform, Workgroup};
 use peacemaker_isa::{
     insn::{Instruction, MemoryClass},
     kernels::{
@@ -110,7 +111,14 @@ mod prologue;
 mod unpack;
 pub use unpack::{bfi, mq4_unpack_model, w2_spread_model, w3_spread_model};
 
-type Wg<'b> = Workgroup<'b, Gfx1100, Builder>;
+/// The gfx11 targets this module is authored for (wave32, one `s_barrier`, VMcnt/LGKMcnt, native IU4 WMMA).
+pub trait Gfx11: Target<Waits = Gfx11Waits, Barrier = Full> + MmaIu4 {}
+impl<T: Target<Waits = Gfx11Waits, Barrier = Full> + MmaIu4> Gfx11 for T {}
+
+type Wg<'b, T> = Workgroup<'b, T, Builder>;
+
+/// The architectures [`emit`] builds: gfx1100 (RDNA3) and gfx1151 (RDNA3.5).
+pub const ARCHES: [Arch; 2] = [Arch::Gfx1100, Arch::Gfx1151];
 
 pub const KERNARG_BYTES: u32 = 64;
 pub const VGPR_CEILING: u16 = 256;
@@ -135,9 +143,9 @@ impl Codec {
             Self::E8p => "_e8p",
         }
     }
-    /// Code object module: `qwen4_moe_iu4_sym{,_w2,_w3,_e8p}_pm_gfx1100`.
-    pub fn module(self) -> String {
-        format!("qwen4_moe_iu4_sym{}_pm_gfx1100", self.infix())
+    /// Code object module: `qwen4_moe_iu4_sym{,_w2,_w3,_e8p}_pm_<arch>`.
+    pub fn module(self, arch: Arch) -> String {
+        format!("qwen4_moe_iu4_sym{}_pm_{}", self.infix(), arch.name())
     }
     /// Static LDS bytes of every entry: the E8P `LUT[256]` + `MASK[128]` stage, none otherwise.
     pub fn lds_bytes(self) -> u32 {
@@ -203,9 +211,10 @@ impl Negative {
     }
 }
 
-/// One entry: codec, kind, BF16 or `_acc`, and an optional mutation.
+/// One entry: target arch, codec, kind, BF16 or `_acc`, and an optional mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Spec {
+    pub arch: Arch,
     pub codec: Codec,
     pub kind: Kind,
     pub acc: bool,
@@ -220,14 +229,19 @@ fn tensors(kind: Kind) -> u8 {
 }
 
 impl Spec {
-    /// `qwen4_moe_gate_up_silu_iu4_sym{,_w2,_w3,_e8p}_pm_gfx1100` / `qwen4_moe_down_iu4_sym..`, `_acc` suffixed.
+    /// `qwen4_moe_gate_up_silu_iu4_sym{,_w2,_w3,_e8p}_pm_<arch>` / `qwen4_moe_down_iu4_sym..`, `_acc` suffixed.
     pub fn symbol(self) -> String {
         let base = match self.kind {
             Kind::GateUp => format!(
-                "qwen4_moe_gate_up_silu_iu4_sym{}_pm_gfx1100",
-                self.codec.infix()
+                "qwen4_moe_gate_up_silu_iu4_sym{}_pm_{}",
+                self.codec.infix(),
+                self.arch.name()
             ),
-            Kind::Down => format!("qwen4_moe_down_iu4_sym{}_pm_gfx1100", self.codec.infix()),
+            Kind::Down => format!(
+                "qwen4_moe_down_iu4_sym{}_pm_{}",
+                self.codec.infix(),
+                self.arch.name()
+            ),
         };
         if self.acc {
             format!("{base}_acc")
@@ -274,11 +288,18 @@ impl Spec {
     pub fn grid(self, m: u32, m_total: u32) -> (u32, u32) {
         (m / 64, m_total / 16)
     }
-    /// Spec-level admission (independent of launch dimensions): a mutation must exist for the codec.
+    /// Spec-level admission (independent of launch dimensions): a gfx11 arch, and a mutation that exists for the codec.
     pub fn validate(self) -> Result<(), String> {
+        if !ARCHES.contains(&self.arch) {
+            return Err(format!(
+                "qwen4_moe_sym_gfx11: no gfx11 target for {}",
+                self.arch.name()
+            ));
+        }
         if !self.negative.applies(self.codec) {
             return Err(format!(
-                "gfx1100: mutation {} does not exist for codec {:?}",
+                "{}: mutation {} does not exist for codec {:?}",
+                self.arch.name(),
                 self.negative.tag(),
                 self.codec
             ));
@@ -307,53 +328,54 @@ pub fn validate_launch(
     x_src_rows: u32,
 ) -> Result<(), String> {
     spec.validate()?;
+    let n = spec.arch.name();
     let kmul = match spec.kind {
         Kind::GateUp => 256,
         Kind::Down => 128,
     };
     if k == 0 || k % kmul != 0 {
         return Err(format!(
-            "gfx1100 {}: K {k} must be a positive multiple of {kmul}",
+            "{n} {}: K {k} must be a positive multiple of {kmul}",
             spec.kind.tag()
         ));
     }
     if m == 0 || m % 64 != 0 {
         return Err(format!(
-            "gfx1100 {}: M {m} must be a positive multiple of 64",
+            "{n} {}: M {m} must be a positive multiple of 64",
             spec.kind.tag()
         ));
     }
     if m_total == 0 || m_total % 16 != 0 || m_total > i32::MAX as u32 {
         return Err(format!(
-            "gfx1100: m_total {m_total} must be a positive multiple of 16 below 2^31"
+            "{n}: m_total {m_total} must be a positive multiple of 16 below 2^31"
         ));
     }
     if x_row_div == 0 || x_src_rows == 0 {
-        return Err("gfx1100: x_row_div and x_src_rows must be positive".into());
+        return Err(format!("{n}: x_row_div and x_src_rows must be positive"));
     }
     let slots = u64::from(x_row_div) * u64::from(x_src_rows);
     if slots > u64::from(MAX_SLOTS) {
         return Err(format!(
-            "gfx1100: x_row_div*x_src_rows {slots} exceeds the exact gather limit {MAX_SLOTS}"
+            "{n}: x_row_div*x_src_rows {slots} exceeds the exact gather limit {MAX_SLOTS}"
         ));
     }
     let x_extent = u64::from(k / 128) * u64::from(x_src_rows) * 72;
     if x_extent >= u64::from(GATHER_OOB) {
         return Err(format!(
-            "gfx1100: activation extent {x_extent} reaches the gather out-of-range offset"
+            "{n}: activation extent {x_extent} reaches the gather out-of-range offset"
         ));
     }
     let rowb = u64::from(row_code_bytes(spec.codec, k));
     let srow = u64::from(row_scale_bytes(spec.codec, k));
     if rowb >= 1 << 24 || srow >= 1 << 24 {
         return Err(format!(
-            "gfx1100: row bytes {rowb}/{srow} exceed the 24-bit lane multiply"
+            "{n}: row bytes {rowb}/{srow} exceed the 24-bit lane multiply"
         ));
     }
     let total = tensor_bytes(spec.codec, m, k);
     if total >= 1 << 32 {
         return Err(format!(
-            "gfx1100: tensor extent {total} exceeds the 32-bit descriptor extent"
+            "{n}: tensor extent {total} exceeds the 32-bit descriptor extent"
         ));
     }
     let output_rows = if spec.kind == Kind::GateUp && !spec.acc {
@@ -364,7 +386,7 @@ pub fn validate_launch(
     let output_extent = u64::from(m_total) * u64::from(output_rows) * if spec.acc { 4 } else { 2 };
     if output_extent >= 1 << 32 {
         return Err(format!(
-            "gfx1100: output extent {output_extent} exceeds 32-bit store offsets"
+            "{n}: output extent {output_extent} exceeds 32-bit store offsets"
         ));
     }
     Ok(())
@@ -708,7 +730,7 @@ impl Gen {
     }
 }
 
-fn epilogue_tail(wg: &mut Wg<'_>, g: &Gen) -> Result<(), String> {
+fn epilogue_tail<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen) -> Result<(), String> {
     let b = wg.isa();
     // The epilogue starts from an empty ledger: nothing aliased is still being written.
     b.wait_all()?;
@@ -726,7 +748,7 @@ fn epilogue_tail(wg: &mut Wg<'_>, g: &Gen) -> Result<(), String> {
     Ok(())
 }
 
-fn body(wg: &mut Wg<'_>, g: &Gen) -> Result<(), String> {
+fn body<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen) -> Result<(), String> {
     if g.e8p() {
         // The table region precedes the exit reservation; stage and loop thread its typed state.
         let tables = wg.lds::<e8p::Tables>("e8p_tables", 0, e8p::STAGE_BYTES)?;
@@ -744,14 +766,25 @@ fn body(wg: &mut Wg<'_>, g: &Gen) -> Result<(), String> {
     wg.end(end)
 }
 
-/// Emit one gfx1100 kernel.
+/// Emit one gfx11 kernel for `spec.arch` (gfx1100 or gfx1151): one instruction path, the arch-typed builder and arch names.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
+    match spec.arch {
+        Arch::Gfx1100 => emit_on::<Gfx1100>(spec),
+        Arch::Gfx1151 => emit_on::<Gfx1151>(spec),
+        a => Err(format!(
+            "qwen4_moe_sym_gfx11: no gfx11 target for {}",
+            a.name()
+        )),
+    }
+}
+
+fn emit_on<T: Gfx11>(spec: Spec) -> Result<Emitted, String> {
     let g = Gen { spec };
     let kspec = KernelSpec {
-        kernel_id: "qwen4_moe_sym_gfx1100".into(),
+        kernel_id: format!("qwen4_moe_sym_{}", spec.arch.name()),
         variant: spec.variant(),
-        arch: Arch::Gfx1100,
+        arch: spec.arch,
         symbol: spec.symbol(),
         kernargs: spec.kernargs(),
         user_sgpr_count: 2,
@@ -763,6 +796,6 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     };
     let mut b = Builder::new(kspec, g.plan()?);
     b.enable_delay_alu();
-    body(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, &g)?;
+    body(&mut Workgroup::<T, Builder>::new(&mut b)?, &g)?;
     b.finish()
 }

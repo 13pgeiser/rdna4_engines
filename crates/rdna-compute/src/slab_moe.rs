@@ -4,8 +4,9 @@
 
 //! Sealed expert-slab (ctl3-hot) GPU entries, gfx1201, gfx1100 and gfx1151 (two buckets,
 //! cold = 0 and MQ4 = 1; the cold codec is W3 (1) or E8P (3) on gfx1201, E8P (3) on gfx1100 and
-//! W3 (1) on gfx1151; every arch also serves MQ4-only layers (`cold_codec == 0`); W2 is refused
-//! everywhere, gfx1100 refuses W3, gfx1151 refuses E8P; every other arch refuses). The K1 cold-bucket
+//! W3 (1) on gfx1151, plus E8P (3) on gfx1151 once admitted (its K1/K2 tables exist); every arch also
+//! serves MQ4-only layers (`cold_codec == 0`); W2 is refused
+//! everywhere, gfx1100 refuses W3, gfx1151 refuses E8P until admitted; every other arch refuses). The K1 cold-bucket
 //! table is inventory ([`slab_cold_k1_metadata`]); serving selection is the admission-gated
 //! [`slab_cold_kernels`]. The per-arch modules (with the hot MQ4 K1 bucket) are
 //! [`SlabArchKernels`], the per-cold-codec cold K1 blobs and symbols [`SlabCold`].
@@ -418,6 +419,17 @@ static SLAB_COLD_GFX1151_W3: SlabCold = SlabCold {
     },
 };
 
+/// gfx1151 cold E8P K1 (`e8p_i4_moe_gemv_pm_gfx1151`, the gfx1100 arm with only arch-forced
+/// deltas), served for codec 3 once admitted.
+static SLAB_COLD_GFX1151_E8P: SlabCold = SlabCold {
+    cold_codec: 3,
+    k1: SlabK1 {
+        module: crate::e8p_moe_decode::E8P_I4_MOE_GEMV_GFX1151_MODULE,
+        image: kernels::E8P_I4_MOE_GEMV_PM_GFX1151,
+        symbols: crate::e8p_moe_decode::E8P_I4_MOE_GEMV_GFX1151_SYMBOLS,
+    },
+};
+
 /// The per-arch slab table of `arch` (exact name), `None` off gfx1201/gfx1100/gfx1151.
 pub fn slab_arch_kernels(arch: &str) -> Option<&'static SlabArchKernels> {
     match arch {
@@ -433,7 +445,8 @@ pub fn slab_arch_kernels(arch: &str) -> Option<&'static SlabArchKernels> {
 /// metadata alone never launches or preloads a codec. `None` for MQ4 (0, never cold), every
 /// codec the matrix refuses on that arch, and W2 (2) everywhere. On gfx1100 only E8P (3)
 /// resolves (its K1 [`SLAB_COLD_GFX1100_E8P`]; the matching K2 is `slab_k2_entry`); W3 (1) does not.
-/// On gfx1151 only W3 (1) resolves ([`SLAB_COLD_GFX1151_W3`]); E8P (3) does not.
+/// On gfx1151 W3 (1) resolves ([`SLAB_COLD_GFX1151_W3`]); E8P (3) resolves ([`SLAB_COLD_GFX1151_E8P`])
+/// only when the admission matrix admits it.
 pub fn slab_cold_kernels(arch: &str, cold_codec: u8) -> Option<&'static SlabCold> {
     if cold_codec == 0 || !crate::qwen4_slab_codec_admitted(arch, cold_codec) {
         return None;
@@ -442,7 +455,8 @@ pub fn slab_cold_kernels(arch: &str, cold_codec: u8) -> Option<&'static SlabCold
 }
 
 /// The cold K1 entries that exist per (`arch`, cold codec): gfx1201 W3 (1) and E8P (3), gfx1100
-/// E8P (3, the qualified `e8p_i4_moe_gemv_pm_gfx1100` image), gfx1151 W3 (1). This is inventory, NOT
+/// E8P (3, the qualified `e8p_i4_moe_gemv_pm_gfx1100` image), gfx1151 W3 (1) and E8P (3, the
+/// `e8p_i4_moe_gemv_pm_gfx1151` image). This is inventory, NOT
 /// permission: serving selection goes through [`slab_cold_kernels`] (admission-gated).
 pub fn slab_cold_k1_metadata(arch: &str, cold_codec: u8) -> Option<&'static SlabCold> {
     match (arch, cold_codec) {
@@ -450,6 +464,7 @@ pub fn slab_cold_k1_metadata(arch: &str, cold_codec: u8) -> Option<&'static Slab
         ("gfx1201", 3) => Some(&SLAB_COLD_GFX1201_E8P),
         ("gfx1100", 3) => Some(&SLAB_COLD_GFX1100_E8P),
         ("gfx1151", 1) => Some(&SLAB_COLD_GFX1151_W3),
+        ("gfx1151", 3) => Some(&SLAB_COLD_GFX1151_E8P),
         _ => None,
     }
 }
@@ -535,8 +550,9 @@ impl Gpu {
 
     /// Load the sealed slab's kernels (call before graph capture) for a layer whose cold bucket
     /// is codec `cold_codec`: `0` = no cold bucket (an MQ4-only layer, any arch), gfx1201
-    /// 1 = W3 or 3 = E8P, gfx1100 3 = E8P, gfx1151 1 = W3; every other value (W2 / codec 2 everywhere,
-    /// W3 on gfx1100, E8P on gfx1151, unknown codecs) is refused by the shared admission matrix before
+    /// 1 = W3 or 3 = E8P, gfx1100 3 = E8P, gfx1151 1 = W3 (and 3 = E8P once the matrix admits it); every
+    /// other value (W2 / codec 2 everywhere, W3 on gfx1100, E8P on gfx1151 until admitted, unknown codecs)
+    /// is refused by the shared admission matrix before
     /// anything loads. Loads the planner and,
     /// on gfx1201, the cold (if any) and MQ4 K1 symbols (the historical W3 preload, unchanged);
     /// on gfx1100 the planner and every serving entry of
@@ -585,7 +601,7 @@ impl Gpu {
                 // Beta's gfx1151 preload, unconditional (even `cold_codec == 0`): the planner (ensured
                 // above), the HIP tile mask, then all four handles of the shared K1 image in beta order
                 // (W3 gate/up, W3 down, MQ4 gate/up, MQ4 down). The cold codec was already admission-checked
-                // (only 0 and W3 reach here); this prepares the shared image and is not a W3 bucket launch.
+                // (only 0, W3 and, once admitted, E8P reach here); this prepares the shared image and is not a W3 bucket launch.
                 match arch.tile_mask {
                     SlabTileMask::Hipcc {
                         module,
@@ -602,6 +618,14 @@ impl Gpu {
                 for k1 in [&SLAB_COLD_GFX1151_W3.k1, &arch.mq4_k1] {
                     for symbol in k1.symbols {
                         self.ensure_embedded_kernel(k1.module, k1.image, symbol)?;
+                    }
+                }
+                // An admitted E8P layer (cold codec 3) additionally binds the gfx1151 E8P K1 image's
+                // two symbols. The cold table is `None` for every codec the matrix refuses, so this
+                // is inert until gfx1151 E8P is admitted; K2 stays lazy like every gfx1151 K2.
+                if let Some(cold) = cold.filter(|cold| cold.cold_codec == 3) {
+                    for symbol in cold.k1.symbols {
+                        self.ensure_embedded_kernel(cold.k1.module, cold.k1.image, symbol)?;
                     }
                 }
             }
@@ -1104,7 +1128,8 @@ impl Gpu {
     /// table-driven tile mask: `[cold tiles, MQ4 tiles]`, each the source ids with
     /// every tile of an expert of the other codec set to `-1`. `codec_i32` is the
     /// layer's `[512]` i32 codec table of raw codec ids (`0` = MQ4); the masks use ranks
-    /// `cold_codec` (gfx1201: 1 = W3 or 3 = E8P; gfx1100: 3 = E8P; gfx1151: 1 = W3) and `0`.
+    /// `cold_codec` (gfx1201: 1 = W3 or 3 = E8P; gfx1100: 3 = E8P; gfx1151: 1 = W3, 3 = E8P when
+    /// admitted) and `0`.
     /// The outputs are views of the slab tile scratch, valid until the next call.
     pub fn qwen4_slab_tile_masks(
         &mut self,
@@ -1489,15 +1514,58 @@ mod tests {
                 );
             }
         }
-        // E8P has no gfx1151 image or table row; W2 is refused.
-        assert!(
-            slab_cold_kernels("gfx1151", 3).is_none()
-                && slab_cold_k1_metadata("gfx1151", 3).is_none()
+        // W2 has no gfx1151 table row; the E8P row has its own test (`gfx1151_e8p_k1_table_*`).
+        assert!(slab_cold_kernels("gfx1151", 2).is_none() && slab_cold_k1_metadata("gfx1151", 2).is_none());
+    }
+
+    /// The gfx1151 E8P K1 table row is the gfx1100 one under gfx1151 names (module, symbols,
+    /// image, contracts); the table is inventory and never permission.
+    #[test]
+    fn gfx1151_e8p_k1_table_is_the_gfx1100_arm_under_gfx1151_names() {
+        let e8p = slab_cold_k1_metadata("gfx1151", 3).unwrap();
+        assert_eq!(e8p.cold_codec, 3);
+        assert_eq!(e8p.k1.module, "e8p_i4_moe_gemv_pm_gfx1151");
+        assert_eq!(e8p.k1.module, crate::e8p_moe_decode::E8P_I4_MOE_GEMV_GFX1151_MODULE);
+        assert_eq!(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1151);
+        assert_eq!(
+            e8p.k1.symbols,
+            ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151", "e8p_i4_moe_gemv_r128_down_pm_gfx1151"]
         );
-        assert!(
-            slab_cold_kernels("gfx1151", 2).is_none()
-                && slab_cold_k1_metadata("gfx1151", 2).is_none()
-        );
+        // Symbol for symbol the gfx1100 names with only the arch spelling changed.
+        for (halo, xtx) in e8p.k1.symbols.iter().zip(E8P_I4_MOE_GEMV_GFX1100_SYMBOLS) {
+            assert_eq!(*halo, xtx.replace("gfx1100", "gfx1151"));
+        }
+        assert_eq!(e8p.k1.module, E8P_I4_MOE_GEMV_GFX1100_MODULE.replace("gfx1100", "gfx1151"));
+        let k = slab_arch_kernels("gfx1151").unwrap();
+        assert_ne!(e8p.k1.module, k.mq4_k1.module);
+        assert!(!std::ptr::eq(e8p.k1.image, k.mq4_k1.image));
+        assert!(!std::ptr::eq(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1100));
+        assert!(!std::ptr::eq(e8p.k1.image, kernels::E8P_I4_MOE_GEMV_PM_GFX1201));
+        for symbol in e8p.k1.symbols {
+            assert!(contains_bytes(e8p.k1.image, format!("{symbol}.kd").as_bytes()), "{symbol}.kd missing");
+            assert!(!symbol.contains("mq2i4") && !symbol.ends_with("_acc"));
+            // Each symbol is its own contract: kernels/e8p_i4_moe_gemv.gfx1151.<kind>.contract.json.
+            let kind = if symbol.contains("r256_gate_up") { "r256_gate_up" } else { "r128_down" };
+            let contract = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("../../kernels/e8p_i4_moe_gemv.gfx1151.{kind}.contract.json")),
+            )
+            .unwrap();
+            assert!(contract.contains(&format!("\"symbol\": \"{symbol}\"")), "{kind} contract symbol");
+            assert!(contract.contains("\"group_segment_fixed_bytes\": 1536"), "{kind} contract static LDS");
+            assert!(contract.contains("\"launch_dynamic_lds_bytes\": 0"), "{kind} contract dynamic LDS");
+        }
+        assert!(!e8p.k1.module.contains("mq_i4") && !e8p.k1.module.contains("gfx1201"));
+        assert!(!contains_bytes(e8p.k1.image, b"mq_i4_moe_gemv"));
+        // Serving selection is the shared matrix: the very same table object when admitted.
+        let admitted = crate::qwen4_slab_codec_admitted("gfx1151", 3);
+        assert_eq!(slab_cold_kernels("gfx1151", 3).is_some(), admitted);
+        if admitted {
+            assert!(std::ptr::eq(slab_cold_kernels("gfx1151", 3).unwrap(), e8p));
+        }
+        // W2 stays refused and W3 keeps its own shared-image table.
+        assert!(slab_cold_kernels("gfx1151", 2).is_none() && slab_cold_k1_metadata("gfx1151", 2).is_none());
+        assert!(!std::ptr::eq(slab_cold_k1_metadata("gfx1151", 1).unwrap(), e8p));
     }
 
     /// The gfx1151 mask is beta's hipcc source (never reinterpreted as an image): its kernel is the
@@ -1754,12 +1822,13 @@ mod tests {
             ("gfx1100", 0, false),
             ("gfx1100", 1, false),
             ("gfx1100", 2, false),
-            // gfx1151 serves the W3 cold bucket (K1 metadata AND the admission matrix); E8P and W2
-            // stay refused there and codec 0 is never cold.
+            // gfx1151 serves the W3 cold bucket (K1 metadata AND the admission matrix); W2
+            // stays refused there and codec 0 is never cold.
             ("gfx1151", 1, true),
             ("gfx1151", 0, false),
             ("gfx1151", 2, false),
-            ("gfx1151", 3, false),
+            // gfx1151 E8P has a K1 table row: served exactly when the admission matrix admits it.
+            ("gfx1151", 3, crate::qwen4_slab_codec_admitted("gfx1151", 3)),
             ("gfx1151", 4, false),
         ] {
             let table = slab_cold_kernels(arch, codec);
@@ -1773,8 +1842,8 @@ mod tests {
 
     #[test]
     fn cold_k1_metadata_is_not_permission() {
-        // Metadata inventory: exactly the historical gfx1201 pair, the qualified gfx1100 E8P K1 and the
-        // gfx1151 W3 K1.
+        // Metadata inventory: exactly the historical gfx1201 pair, the qualified gfx1100 E8P K1, the
+        // gfx1151 W3 K1 and the gfx1151 E8P K1 (the gfx1100 arm under gfx1151 names).
         let mut available = Vec::new();
         for arch in [
             "gfx1201", "gfx1100", "gfx1151", "gfx942", "gfx906", "gfx1101", "",
@@ -1788,20 +1857,18 @@ mod tests {
         }
         assert_eq!(
             available,
-            [
-                ("gfx1201", 1),
-                ("gfx1201", 3),
-                ("gfx1100", 3),
-                ("gfx1151", 1)
-            ]
+            [("gfx1201", 1), ("gfx1201", 3), ("gfx1100", 3), ("gfx1151", 1), ("gfx1151", 3)]
         );
         // Runtime selection = metadata AND the shared admission matrix (what
-        // `Gpu::ensure_qwen4_slab_kernels` and `Gpu::mq_i4_moe_gemv_slab` consult): every tabled
-        // entry is admitted today and served by the very same table object, while no other
-        // (arch, codec) pair is admitted or served.
+        // `Gpu::ensure_qwen4_slab_kernels` and `Gpu::mq_i4_moe_gemv_slab` consult): a tabled entry
+        // is served by the very same table object exactly when admitted, and no other
+        // (arch, codec) pair is served. Every tabled entry except gfx1151 E8P is admitted today;
+        // gfx1151 E8P has its K1 table (inventory) but follows the matrix alone.
         for (arch, codec) in available {
             let admitted = crate::qwen4_slab_codec_admitted(arch, codec);
-            assert!(admitted, "{arch} codec {codec}");
+            if (arch, codec) != ("gfx1151", 3) {
+                assert!(admitted, "{arch} codec {codec}");
+            }
             let selected = slab_cold_kernels(arch, codec);
             assert_eq!(selected.is_some(), admitted, "{arch} codec {codec}");
             if let Some(selected) = selected {
@@ -1851,7 +1918,13 @@ mod tests {
         let gfx1100 = slab_arch_kernels("gfx1100").unwrap();
         assert!(!slab_wide_capable(gfx1100, None));
         assert!(!slab_wide_capable(gfx1100, slab_cold_kernels("gfx1100", 3)));
-        assert!(slab_cold_kernels("gfx1151", 3).is_none());
+        // gfx1151 E8P is a served cold table exactly when the shared matrix admits it (the
+        // receipts switch); the table is inventory either way.
+        assert_eq!(
+            slab_cold_kernels("gfx1151", 3).is_some(),
+            crate::qwen4_slab_codec_admitted("gfx1151", 3)
+        );
+        assert!(slab_cold_k1_metadata("gfx1151", 3).is_some());
         for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
             assert!(!contains_bytes(
                 kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
@@ -1875,11 +1948,15 @@ mod tests {
         assert_eq!(slab_bucket_of_codec_on("gfx1100", 2), None);
         // The gfx1100 E8P cold bucket is a served bucket 0 (cold = 0, MQ4 = 1).
         assert_eq!(slab_bucket_of_codec_on("gfx1100", 3), Some(0));
-        // gfx1151 serves MQ4 (hot bucket 1) and W3 (cold bucket 0); W2 and E8P stay refused there.
+        // gfx1151 serves MQ4 (hot bucket 1) and W3 (cold bucket 0); W2 stays refused there. Its E8P
+        // cold bucket (K1 table present) follows the shared admission matrix, never the table.
         assert_eq!(slab_bucket_of_codec_on("gfx1151", 0), Some(1));
         assert_eq!(slab_bucket_of_codec_on("gfx1151", 1), Some(0));
         assert_eq!(slab_bucket_of_codec_on("gfx1151", 2), None);
-        assert_eq!(slab_bucket_of_codec_on("gfx1151", 3), None);
+        assert_eq!(
+            slab_bucket_of_codec_on("gfx1151", 3),
+            crate::qwen4_slab_codec_admitted("gfx1151", 3).then_some(0)
+        );
         // The historical gfx1201 byte mapping is unchanged.
         assert_eq!((slab_bucket_of_codec(1), slab_bucket_of_codec(0)), (0, 1));
     }

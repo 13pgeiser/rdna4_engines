@@ -178,6 +178,42 @@ fn select_grouped_route(
     route_policy: Option<crate::families::moe::MoeRoutePolicy>,
     arch: &str,
 ) -> Option<crate::families::moe::MoeRouteCapability> {
+    select_grouped_route_by(
+        dtypes,
+        n_exp,
+        k_top,
+        hidden,
+        intermediate,
+        shared_intermediate,
+        gate_up_k,
+        down_m,
+        down_k,
+        dtype_tags,
+        has_sidecars,
+        route_policy,
+        &|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec),
+    )
+}
+
+/// [`select_grouped_route`] with the sealed slab route's per-codec admission given as a
+/// predicate (the architecture's `rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`),
+/// so the pure decision is testable for both states of the gfx1151 E8P receipts switch.
+#[allow(clippy::too_many_arguments)]
+fn select_grouped_route_by(
+    dtypes: &crate::families::moe::MoeDtypes<'_>,
+    n_exp: usize,
+    k_top: usize,
+    hidden: usize,
+    intermediate: usize,
+    shared_intermediate: usize,
+    gate_up_k: usize,
+    down_m: usize,
+    down_k: usize,
+    dtype_tags: Option<&GpuTensor>,
+    has_sidecars: bool,
+    route_policy: Option<crate::families::moe::MoeRoutePolicy>,
+    admits: &dyn Fn(u8) -> bool,
+) -> Option<crate::families::moe::MoeRouteCapability> {
     let policy = route_policy?;
     let shared = dtypes.shared?;
     let formats = policy.formats;
@@ -234,7 +270,7 @@ fn select_grouped_route(
         MoeRouteCapability::SlabCodecGrouped
             if policy.capability.admitted_on()
                 && crate::families::moe::slab_route_geometry_supported(
-                    Some(arch),
+                    Some(admits),
                     &policy,
                     n_exp,
                     k_top,
@@ -672,11 +708,15 @@ mod qwen4_route_tests {
         assert_rejected(&dtypes);
     }
 
-    /// The sealed slab route admits gfx1201 MQ4 / W3 / E8P, gfx1151 MQ4 / W3 and gfx1100
-    /// MQ4 / E8P; every other arch, a crossed pair and W2 (everywhere) refuse,
-    /// and a declared cold codec must be the one the dtypes name.
+    /// The sealed slab route admits gfx1201 MQ4 / W3 / E8P, gfx1151 MQ4 / W3 (and E8P once
+    /// `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`) and gfx1100 MQ4 / E8P; every other arch, a
+    /// crossed pair and W2 (everywhere) refuse, and a declared cold codec must be the one the
+    /// dtypes name. Both states of the gfx1151 E8P switch are pure-decided.
     #[test]
     fn slab_route_follows_the_arch_codec_matrix() {
+        use rdna_compute::slab_admission::{
+            qwen4_slab_codec_admitted_with, SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED as RECEIPTS,
+        };
         let pairs = [
             (DType::MQ4G256V2, DType::MQ4G128V2),
             (DType::MQ3I4G128R256, DType::MQ3I4G128R128),
@@ -686,115 +726,139 @@ mod qwen4_route_tests {
             (DType::MQ3I4G128R256, DType::MQ4G128V2),
         ];
         let declared_cold = [None, Some(1), Some(3), None, None, None];
-        let route = |arch: &str, (gate_up, down): (DType, DType), cold: Option<u8>| {
+        // `landed`: `None` is the shipped switch; `Some` is the pure decision for that state.
+        let route = |arch: &str, landed: Option<bool>, (gate_up, down): (DType, DType), cold: Option<u8>| {
             let mut dtypes = canonical_dtypes();
             (dtypes.routed_gate_up, dtypes.routed_down) = (gate_up, down);
             let mut declared = policy(DType::MQ4G128V2);
             declared.capability = MoeRouteCapability::SlabCodecGrouped;
             declared.slab_cold_codec = cold;
-            select_grouped_route(
-                &dtypes,
-                512,
-                10,
-                2560,
-                640,
-                640,
-                2560,
-                2560,
-                640,
-                None,
-                false,
-                Some(declared),
-                arch,
-            )
+            match landed {
+                None => select_grouped_route(
+                    &dtypes, 512, 10, 2560, 640, 640, 2560, 2560, 640, None, false, Some(declared), arch,
+                ),
+                Some(landed) => select_grouped_route_by(
+                    &dtypes,
+                    512,
+                    10,
+                    2560,
+                    640,
+                    640,
+                    2560,
+                    2560,
+                    640,
+                    None,
+                    false,
+                    Some(declared),
+                    &|codec| qwen4_slab_codec_admitted_with(arch, codec, landed),
+                ),
+            }
             .is_some()
         };
         let deltanet = cfg!(feature = "deltanet");
-        for (arch, admitted) in [
-            ("gfx1201", [true, true, true, false, false, false]),
-            ("gfx1100", [true, false, true, false, false, false]),
-            ("gfx1151", [true, true, false, false, false, false]),
-            ("gfx1200", [false; 6]),
-            ("gfx942", [false; 6]),
-        ] {
-            for ((pair, cold), admitted) in pairs.into_iter().zip(declared_cold).zip(admitted) {
-                assert_eq!(
-                    route(arch, pair, cold),
-                    admitted && deltanet,
-                    "{arch} {pair:?}"
-                );
+        // The shipped switch: gfx1151 E8P follows exactly it.
+        assert_eq!(route("gfx1151", None, pairs[2], Some(3)), deltanet && RECEIPTS);
+        assert_eq!(route("gfx1151", None, pairs[1], Some(1)), deltanet);
+        for landed in [false, true] {
+            for (arch, admitted) in [
+                ("gfx1201", [true, true, true, false, false, false]),
+                ("gfx1100", [true, false, true, false, false, false]),
+                ("gfx1151", [true, true, landed, false, false, false]),
+                ("gfx1200", [false; 6]),
+                ("gfx942", [false; 6]),
+            ] {
+                for ((pair, cold), admitted) in pairs.into_iter().zip(declared_cold).zip(admitted) {
+                    assert_eq!(
+                        route(arch, Some(landed), pair, cold),
+                        admitted && deltanet,
+                        "{arch} {pair:?} landed={landed}"
+                    );
+                }
             }
-        }
-        // A declaration that disagrees with the dtypes refuses.
-        for arch in ["gfx1201", "gfx1100"] {
-            assert!(!route(arch, pairs[2], Some(1)), "{arch}");
-            assert!(!route(arch, pairs[2], None), "{arch}");
-            assert!(!route(arch, pairs[0], Some(3)), "{arch}");
-        }
-        assert!(!route("gfx1201", pairs[1], Some(3)));
-        assert!(!route("gfx1201", pairs[1], None));
-        assert!(!route("gfx1201", pairs[0], Some(1)));
-        assert!(!route("gfx1151", pairs[1], Some(3)));
-        assert!(!route("gfx1151", pairs[1], None));
-        assert!(!route("gfx1151", pairs[0], Some(1)));
-        // W2 is refused everywhere, whatever it is declared as.
-        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
-            for cold in [None, Some(0), Some(1), Some(2), Some(3)] {
-                assert!(!route(arch, pairs[4], cold), "{arch} {cold:?}");
+            // A declaration that disagrees with the dtypes refuses.
+            for arch in ["gfx1201", "gfx1100"] {
+                assert!(!route(arch, Some(landed), pairs[2], Some(1)), "{arch}");
+                assert!(!route(arch, Some(landed), pairs[2], None), "{arch}");
+                assert!(!route(arch, Some(landed), pairs[0], Some(3)), "{arch}");
             }
+            assert!(!route("gfx1201", Some(landed), pairs[1], Some(3)));
+            assert!(!route("gfx1201", Some(landed), pairs[1], None));
+            assert!(!route("gfx1201", Some(landed), pairs[0], Some(1)));
+            assert!(!route("gfx1151", Some(landed), pairs[1], Some(3)));
+            assert!(!route("gfx1151", Some(landed), pairs[1], None));
+            assert!(!route("gfx1151", Some(landed), pairs[0], Some(1)));
+            assert!(!route("gfx1151", Some(landed), pairs[2], Some(1)));
+            assert!(!route("gfx1151", Some(landed), pairs[2], None));
+            assert!(!route("gfx1151", Some(landed), pairs[0], Some(3)));
+            // W2 is refused everywhere, whatever it is declared as.
+            for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+                for cold in [None, Some(0), Some(1), Some(2), Some(3)] {
+                    assert!(!route(arch, Some(landed), pairs[4], cold), "{arch} {cold:?}");
+                }
+            }
+            // Cold codec = bucket 0, MQ4 = bucket 1.
+            use crate::families::moe::{slab_bucket_of_pair, slab_bucket_of_pair_by};
+            let bucket = |arch: &str, pair: (DType, DType)| {
+                slab_bucket_of_pair_by(&|codec| qwen4_slab_codec_admitted_with(arch, codec, landed), pair.0, pair.1)
+            };
+            for arch in ["gfx1201", "gfx1100"] {
+                assert_eq!(bucket(arch, pairs[0]), Some(1));
+                assert_eq!(bucket(arch, pairs[2]), Some(0));
+                assert_eq!(bucket(arch, pairs[4]), None);
+            }
+            assert_eq!(bucket("gfx1201", pairs[1]), Some(0));
+            assert_eq!(bucket("gfx1100", pairs[1]), None);
+            // gfx1151: MQ4 = bucket 1, W3 = bucket 0, E8P = bucket 0 only once its receipts landed;
+            // W2 has none.
+            assert_eq!(bucket("gfx1151", pairs[0]), Some(1));
+            assert_eq!(bucket("gfx1151", pairs[1]), Some(0));
+            assert_eq!(bucket("gfx1151", pairs[2]), landed.then_some(0));
+            assert_eq!(bucket("gfx1151", pairs[4]), None);
+            // The shipped entry reads the one switch.
+            assert_eq!(
+                slab_bucket_of_pair("gfx1151", pairs[2].0, pairs[2].1),
+                RECEIPTS.then_some(0)
+            );
         }
-        // Cold codec = bucket 0, MQ4 = bucket 1.
-        use crate::families::moe::slab_bucket_of_pair;
-        for arch in ["gfx1201", "gfx1100"] {
-            assert_eq!(slab_bucket_of_pair(arch, pairs[0].0, pairs[0].1), Some(1));
-            assert_eq!(slab_bucket_of_pair(arch, pairs[2].0, pairs[2].1), Some(0));
-            assert_eq!(slab_bucket_of_pair(arch, pairs[4].0, pairs[4].1), None);
-        }
-        assert_eq!(
-            slab_bucket_of_pair("gfx1201", pairs[1].0, pairs[1].1),
-            Some(0)
-        );
-        assert_eq!(slab_bucket_of_pair("gfx1100", pairs[1].0, pairs[1].1), None);
-        // gfx1151: MQ4 = bucket 1, W3 = bucket 0; E8P and W2 have none.
-        assert_eq!(
-            slab_bucket_of_pair("gfx1151", pairs[0].0, pairs[0].1),
-            Some(1)
-        );
-        assert_eq!(
-            slab_bucket_of_pair("gfx1151", pairs[1].0, pairs[1].1),
-            Some(0)
-        );
-        assert_eq!(slab_bucket_of_pair("gfx1151", pairs[2].0, pairs[2].1), None);
-        assert_eq!(slab_bucket_of_pair("gfx1151", pairs[4].0, pairs[4].1), None);
     }
 
     /// A mixed slab layer (per-expert pairs plus a codec table) is MQ4 plus
     /// exactly one admitted cold codec the policy declares: gfx1100 serves an
-    /// E8P layer (MQ4 first or cold first) and refuses W3, gfx1151 serves a W3 layer and refuses
-    /// E8P, and every arch refuses W3 + E8P in one
+    /// E8P layer (MQ4 first or cold first) and refuses W3, gfx1151 serves a W3 layer and, until
+    /// `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`, refuses E8P (afterwards it serves an E8P layer
+    /// like gfx1100), and every arch refuses W3 + E8P in one
     /// layer, W2 anywhere, and a declaration that disagrees with the table.
     #[test]
     fn slab_route_mixed_layers_follow_the_arch_codec_matrix() {
+        use rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED as RECEIPTS;
         const MQ4: (DType, DType) = (DType::MQ4G256V2, DType::MQ4G128V2);
         const W3: (DType, DType) = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
         const E8P: (DType, DType) = (DType::E8PI4G128R256, DType::E8PI4G128R128);
         const W2: (DType, DType) = (DType::MQ2I4G128R256, DType::MQ2I4G128R128);
         let tags = GpuTensor::null_for_test();
-        let route =
-            |arch: &str, first: (DType, DType), tail: &[(DType, DType)], cold: Option<u8>| {
-                let mut pairs = vec![first; 512];
-                pairs[512 - tail.len()..].copy_from_slice(tail);
-                let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
-                let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
-                let mut dtypes = canonical_dtypes();
-                dtypes.routed_has_mixed_experts = true;
-                (dtypes.routed_gate_up, dtypes.routed_down) = first;
-                dtypes.per_expert_gate_up = Some(&gate_up);
-                dtypes.per_expert_down = Some(&down);
-                let mut declared = policy(DType::MQ4G128V2);
-                declared.capability = MoeRouteCapability::SlabCodecGrouped;
-                declared.slab_cold_codec = cold;
-                select_grouped_route(
+        let route_with = |arch: &str,
+                          landed: Option<bool>,
+                          first: (DType, DType),
+                          tail: &[(DType, DType)],
+                          cold: Option<u8>| {
+            let mut pairs = vec![first; 512];
+            pairs[512 - tail.len()..].copy_from_slice(tail);
+            let gate_up: Vec<DType> = pairs.iter().map(|pair| pair.0).collect();
+            let down: Vec<DType> = pairs.iter().map(|pair| pair.1).collect();
+            let mut dtypes = canonical_dtypes();
+            dtypes.routed_has_mixed_experts = true;
+            (dtypes.routed_gate_up, dtypes.routed_down) = first;
+            dtypes.per_expert_gate_up = Some(&gate_up);
+            dtypes.per_expert_down = Some(&down);
+            let mut declared = policy(DType::MQ4G128V2);
+            declared.capability = MoeRouteCapability::SlabCodecGrouped;
+            declared.slab_cold_codec = cold;
+            match landed {
+                // The shipped switch.
+                None => select_grouped_route(
+                    &dtypes, 512, 10, 2560, 640, 640, 2560, 2560, 640, Some(&tags), false, Some(declared), arch,
+                ),
+                Some(landed) => select_grouped_route_by(
                     &dtypes,
                     512,
                     10,
@@ -807,39 +871,59 @@ mod qwen4_route_tests {
                     Some(&tags),
                     false,
                     Some(declared),
-                    arch,
-                )
-                .is_some()
-            };
-        let deltanet = cfg!(feature = "deltanet");
-        // MQ4-first E8P layer and an E8P-first one.
-        assert_eq!(route("gfx1100", MQ4, &[E8P], Some(3)), deltanet);
-        assert_eq!(route("gfx1100", E8P, &[MQ4], Some(3)), deltanet);
-        assert_eq!(route("gfx1201", MQ4, &[E8P], Some(3)), deltanet);
-        assert_eq!(route("gfx1201", MQ4, &[W3], Some(1)), deltanet);
-        // W3 is not served on gfx1100.
-        assert!(!route("gfx1100", MQ4, &[W3], Some(1)));
-        // W3 + E8P in one layer, W2 anywhere, a mismatched declaration.
-        for arch in ["gfx1201", "gfx1100"] {
-            for cold in [None, Some(1), Some(3)] {
-                assert!(!route(arch, MQ4, &[W3, E8P], cold), "{arch} {cold:?}");
-                assert!(!route(arch, MQ4, &[E8P, W2], cold), "{arch} {cold:?}");
-                assert!(!route(arch, W2, &[MQ4, E8P], cold), "{arch} {cold:?}");
+                    &|codec| {
+                        rdna_compute::slab_admission::qwen4_slab_codec_admitted_with(arch, codec, landed)
+                    },
+                ),
             }
-            assert!(!route(arch, MQ4, &[E8P], Some(1)), "{arch}");
-            assert!(!route(arch, MQ4, &[E8P], None), "{arch}");
-        }
-        // gfx1151 serves W3 next to MQ4 (either order) and refuses a W3 + E8P layer and W2.
-        assert_eq!(route("gfx1151", MQ4, &[W3], Some(1)), deltanet);
-        assert_eq!(route("gfx1151", W3, &[MQ4], Some(1)), deltanet);
-        for cold in [None, Some(1), Some(3)] {
-            assert!(!route("gfx1151", MQ4, &[W3, E8P], cold), "{cold:?}");
-            assert!(!route("gfx1151", MQ4, &[W3, W2], cold), "{cold:?}");
-        }
-        assert!(!route("gfx1151", MQ4, &[W3], Some(3)));
-        assert!(!route("gfx1151", MQ4, &[W3], None));
-        for arch in ["gfx1200", "gfx942", "gfx1030"] {
-            assert!(!route(arch, MQ4, &[E8P], Some(3)), "{arch}");
+            .is_some()
+        };
+        let deltanet = cfg!(feature = "deltanet");
+        // The shipped switch decides the shipped route; the pure form decides both states.
+        assert_eq!(route_with("gfx1151", None, MQ4, &[E8P], Some(3)), deltanet && RECEIPTS);
+        assert_eq!(route_with("gfx1151", None, E8P, &[MQ4], Some(3)), deltanet && RECEIPTS);
+        assert_eq!(route_with("gfx1151", None, MQ4, &[W3], Some(1)), deltanet);
+        assert_eq!(route_with("gfx1100", None, MQ4, &[E8P], Some(3)), deltanet);
+        for landed in [false, true] {
+            let route = |arch: &str, first, tail: &[(DType, DType)], cold| {
+                route_with(arch, Some(landed), first, tail, cold)
+            };
+            // MQ4-first E8P layer and an E8P-first one.
+            assert_eq!(route("gfx1100", MQ4, &[E8P], Some(3)), deltanet);
+            assert_eq!(route("gfx1100", E8P, &[MQ4], Some(3)), deltanet);
+            assert_eq!(route("gfx1201", MQ4, &[E8P], Some(3)), deltanet);
+            assert_eq!(route("gfx1201", MQ4, &[W3], Some(1)), deltanet);
+            // W3 is not served on gfx1100.
+            assert!(!route("gfx1100", MQ4, &[W3], Some(1)));
+            // W3 + E8P in one layer, W2 anywhere, a mismatched declaration.
+            for arch in ["gfx1201", "gfx1100"] {
+                for cold in [None, Some(1), Some(3)] {
+                    assert!(!route(arch, MQ4, &[W3, E8P], cold), "{arch} {cold:?}");
+                    assert!(!route(arch, MQ4, &[E8P, W2], cold), "{arch} {cold:?}");
+                    assert!(!route(arch, W2, &[MQ4, E8P], cold), "{arch} {cold:?}");
+                }
+                assert!(!route(arch, MQ4, &[E8P], Some(1)), "{arch}");
+                assert!(!route(arch, MQ4, &[E8P], None), "{arch}");
+            }
+            // gfx1151 serves W3 next to MQ4 (either order) whatever the E8P receipts say, and
+            // refuses a W3 + E8P layer (the two cold codecs, or the unserved E8P) and W2.
+            assert_eq!(route("gfx1151", MQ4, &[W3], Some(1)), deltanet);
+            assert_eq!(route("gfx1151", W3, &[MQ4], Some(1)), deltanet);
+            for cold in [None, Some(1), Some(3)] {
+                assert!(!route("gfx1151", MQ4, &[W3, E8P], cold), "{landed} {cold:?}");
+                assert!(!route("gfx1151", MQ4, &[W3, W2], cold), "{landed} {cold:?}");
+                assert!(!route("gfx1151", MQ4, &[E8P, W2], cold), "{landed} {cold:?}");
+            }
+            assert!(!route("gfx1151", MQ4, &[W3], Some(3)));
+            assert!(!route("gfx1151", MQ4, &[W3], None));
+            // gfx1151 E8P: refused until the receipts land, then served exactly like gfx1100.
+            assert_eq!(route("gfx1151", MQ4, &[E8P], Some(3)), deltanet && landed, "{landed}");
+            assert_eq!(route("gfx1151", E8P, &[MQ4], Some(3)), deltanet && landed, "{landed}");
+            assert!(!route("gfx1151", MQ4, &[E8P], Some(1)), "{landed}");
+            assert!(!route("gfx1151", MQ4, &[E8P], None), "{landed}");
+            for arch in ["gfx1200", "gfx942", "gfx1030"] {
+                assert!(!route(arch, MQ4, &[E8P], Some(3)), "{arch}");
+            }
         }
     }
 }

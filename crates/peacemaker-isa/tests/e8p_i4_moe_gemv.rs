@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The gfx1201 pointer-addressed E8P-I4 F4 read-once C1–C8 lane-union decode GEMV module
+//! The gfx1201 (and, via the gfx11 arms, gfx1100 / gfx1151) pointer-addressed E8P-I4 F4 read-once C1–C8 lane-union decode GEMV module
 //! `e8p_i4_moe_gemv_pm_gfx1201` (`e8p_i4_moe_gemv_{r256_gate_up,r128_down}`, K-E2): symbols, the frozen
 //! 96-byte kernarg ABI (identical to `mq_i4_moe_gemv`, `n_experts@88` and a zero word at 92), exact-arch gating, the 1,536-byte table-stage LDS
 //! (resource, publication, address bounds), the guard-before-LDS order, the weight/table load census and
@@ -150,7 +150,7 @@ fn module_exports_are_the_two_frozen_symbols_in_order() {
     );
 }
 
-/// Emission is bit-deterministic, and every architecture other than gfx1201 / gfx1100 is refused.
+/// Emission is bit-deterministic, and every architecture other than gfx1201 / gfx1100 / gfx1151 is refused.
 #[test]
 fn emission_is_deterministic_and_refuses_other_arches() {
     for spec in e8p_i4_moe_gemv::module_specs(ARCH) {
@@ -164,7 +164,7 @@ fn emission_is_deterministic_and_refuses_other_arches() {
     let (_, ta, pa) = e8p_i4_moe_gemv::emit_module(ARCH).unwrap();
     let (_, tb, pb) = e8p_i4_moe_gemv::emit_module(ARCH).unwrap();
     assert_eq!((ta, pa.s_text_sha256), (tb, pb.s_text_sha256));
-    for arch in [Arch::Gfx1151] {
+    for arch in [Arch::Gfx942] {
         for spec in e8p_i4_moe_gemv::module_specs(arch) {
             assert!(e8p_i4_moe_gemv::emit(spec).is_err(), "{arch:?} {spec:?}");
         }
@@ -172,17 +172,26 @@ fn emission_is_deterministic_and_refuses_other_arches() {
     }
 }
 
-/// The gfx1100 arm: the two `_pm_gfx1100` symbols, the 96-byte ABI, wave32 and the 1,536-byte table stage, the
+/// The gfx11 arms: the two `_pm_<arch>` symbols, the 96-byte ABI, wave32 and the 1,536-byte table stage, the
 /// system-SGPR workgroup ids (`s2` / `s3`, no `ttmp`), gfx11 `s_barrier` (no gfx12 split barrier or wait
 /// counters), the `.l` convert shared with gfx1201, and a successful native assembly of the module.
 #[test]
 fn gfx1100_arm_emits_the_suffixed_symbols_with_gfx11_ids_and_barrier() {
-    let arch = Arch::Gfx1100;
+    gfx11_arm(Arch::Gfx1100)
+}
+
+#[test]
+fn gfx1151_arm_emits_the_suffixed_symbols_with_gfx11_ids_and_barrier() {
+    gfx11_arm(Arch::Gfx1151)
+}
+
+fn gfx11_arm(arch: Arch) {
+    let name = arch.name();
     let symbols = [
-        "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1100",
-        "e8p_i4_moe_gemv_r128_down_pm_gfx1100",
+        format!("e8p_i4_moe_gemv_r256_gate_up_pm_{name}"),
+        format!("e8p_i4_moe_gemv_r128_down_pm_{name}"),
     ];
-    assert_eq!(Spec::module(arch), "e8p_i4_moe_gemv_pm_gfx1100");
+    assert_eq!(Spec::module(arch), format!("e8p_i4_moe_gemv_pm_{name}"));
     let specs = e8p_i4_moe_gemv::module_specs(arch);
     assert_eq!(specs.iter().map(Spec::symbol).collect::<Vec<_>>(), symbols);
     assert_eq!(
@@ -193,10 +202,10 @@ fn gfx1100_arm_emits_the_suffixed_symbols_with_gfx11_ids_and_barrier() {
     let (emitted, text, proof) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
     assert_eq!(
         (proof.module.as_str(), proof.arch),
-        ("e8p_i4_moe_gemv_pm_gfx1100", arch)
+        (format!("e8p_i4_moe_gemv_pm_{name}").as_str(), arch)
     );
     assert_eq!(text.matches(".amdhsa_kernel ").count(), symbols.len());
-    for symbol in symbols {
+    for symbol in &symbols {
         assert!(
             text.contains(&format!(".amdhsa_kernel {symbol}\n"))
                 && text.contains(&format!(".globl {symbol}\n")),
@@ -277,6 +286,169 @@ fn gfx1100_arm_emits_the_suffixed_symbols_with_gfx11_ids_and_barrier() {
     let bundle =
         peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
     assert!(bundle.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"));
+}
+
+/// The single builder-forced hazard guard: gfx1100 has `VALUTransUseHazard` (a transcendental result read by a
+/// dependent VALU within the window), gfx1151 does not, so the builder inserts this wait on gfx1100 only.
+const TRANS_USE_WAIT: &str = "s_waitcnt_depctr depctr_va_vdst(0)";
+
+/// The gfx1151 arm is the gfx1100 arm with only the arch-forced deltas: every emitted source (each entry and the
+/// module), after replacing `gfx1151` with `gfx1100` and removing the gfx1100-only `VALUTransUseHazard` wait
+/// (one per entry, the `v_rcp_iflag_f32` -> dependent-VALU guard of the `x_row_div` division), is byte-identical
+/// to the gfx1100 text; the shape contracts agree except for the symbol name and that wait's count; the register
+/// plan agrees (so the `n_experts@88` load into `s4` and its guard are the same instructions); and neither text
+/// leaks the other arch's token.
+#[test]
+fn gfx1151_arm_is_the_gfx1100_arm_modulo_the_arch_forced_deltas() {
+    fn strip(text: &str) -> String {
+        text.lines()
+            .filter(|l| l.trim() != TRANS_USE_WAIT)
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+    let (e1100, t1100, p1100) = e8p_i4_moe_gemv::emit_module(Arch::Gfx1100).unwrap();
+    let (e1151, t1151, p1151) = e8p_i4_moe_gemv::emit_module(Arch::Gfx1151).unwrap();
+    assert!(
+        !t1100.contains("gfx1151") && !t1151.contains("gfx1100"),
+        "arch tokens must not leak across the modules"
+    );
+    assert_ne!(t1100, t1151);
+    assert_eq!(
+        count(&t1151, "s_waitcnt_depctr"),
+        0,
+        "gfx1151 has no VALUTransUseHazard"
+    );
+    assert_eq!(
+        t1100
+            .lines()
+            .filter(|l| l.trim() == TRANS_USE_WAIT)
+            .count(),
+        e1100.len(),
+        "one trans-use wait per gfx1100 entry"
+    );
+    assert_eq!(
+        strip(&t1151).replace("gfx1151", "gfx1100"),
+        strip(&t1100),
+        "module source"
+    );
+    assert_eq!(
+        t1100.matches("gfx1100").count(),
+        t1151.matches("gfx1151").count(),
+        "same number of arch tokens"
+    );
+    assert_eq!(p1100.kernels.len(), p1151.kernels.len());
+    for (a, b) in e1100.iter().zip(&e1151) {
+        assert_eq!(
+            strip(&b.s_text).replace("gfx1151", "gfx1100"),
+            strip(&a.s_text),
+            "{}: entry source",
+            b.proof.variant
+        );
+        assert_eq!(
+            (a.shape.next_free_vgpr, a.shape.next_free_sgpr),
+            (b.shape.next_free_vgpr, b.shape.next_free_sgpr),
+            "{}: register plan",
+            b.proof.variant
+        );
+        assert_eq!(
+            a.proof.barriers.len(),
+            b.proof.barriers.len(),
+            "{}: barriers",
+            b.proof.variant
+        );
+    }
+    for (spec, (a, b)) in e8p_i4_moe_gemv::module_specs(Arch::Gfx1100)
+        .into_iter()
+        .zip(e1100.iter().zip(&e1151))
+    {
+        let spec1151 = Spec {
+            arch: Arch::Gfx1151,
+            kind: spec.kind,
+        };
+        let (mut ca, cb) = (
+            e8p_i4_moe_gemv::contract(spec, a),
+            e8p_i4_moe_gemv::contract(spec1151, b),
+        );
+        assert_eq!(
+            ca["counts"]["s_waitcnt_depctr"], 1,
+            "{:?}: gfx1100 trans-use wait",
+            spec.kind
+        );
+        assert!(
+            cb["counts"].get("s_waitcnt_depctr").is_none(),
+            "{:?}: gfx1151 has none",
+            spec.kind
+        );
+        ca["counts"]
+            .as_object_mut()
+            .unwrap()
+            .remove("s_waitcnt_depctr");
+        assert_eq!(
+            cb.to_string().replace("gfx1151", "gfx1100"),
+            ca.to_string(),
+            "{:?}: shape contract",
+            spec.kind
+        );
+    }
+}
+
+/// The committed images and byproducts under `kernels/` are the emitter's output: the module source (`.s`, gfx11
+/// arms), the natively linked + bundled `.hxaco` (every arm), and the shape contracts (gfx11 arms) re-emit
+/// byte-for-byte, so a change of the emitter that moves any committed arch shows up here.
+#[test]
+fn committed_images_and_byproducts_are_byte_identical_to_the_emission() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
+    for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
+        let module = Spec::module(arch);
+        let (emitted, text, proof) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
+        let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
+        let bundle = peacemaker_isa::native::bundle(
+            &elf,
+            arch,
+            peacemaker_isa::native::DEFAULT_HOST_TARGET,
+        );
+        let committed = std::fs::read(dir.join(format!("{module}.hxaco")))
+            .unwrap_or_else(|e| panic!("{module}.hxaco: {e}"));
+        assert!(
+            committed == bundle,
+            "{module}.hxaco differs from the emitted bundle"
+        );
+        if arch.gfx12() {
+            continue;
+        }
+        let source = std::fs::read_to_string(dir.join(format!("{module}.s")))
+            .unwrap_or_else(|e| panic!("{module}.s: {e}"));
+        assert!(source == text, "{module}.s differs from the emitted source");
+        let committed_proof: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("{module}.proof.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            committed_proof,
+            serde_json::to_value(&proof).unwrap(),
+            "{module}.proof.json"
+        );
+        for (spec, e) in e8p_i4_moe_gemv::module_specs(arch)
+            .into_iter()
+            .zip(&emitted)
+        {
+            let file = dir.join(format!(
+                "e8p_i4_moe_gemv.{}.{}.contract.json",
+                arch.name(),
+                spec.tag()
+            ));
+            let committed: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display())),
+            )
+            .unwrap();
+            assert_eq!(
+                committed,
+                e8p_i4_moe_gemv::contract(spec, e),
+                "{}",
+                file.display()
+            );
+        }
+    }
 }
 
 /// The 88-byte kernarg block: per-argument offsets/sizes/names, access, the launch bound, the first
@@ -432,13 +604,13 @@ fn touches_sgpr(line: &str, n: u32) -> bool {
     })
 }
 
-/// The `n_experts` guard on both architectures: the word is loaded once into the spare `s4` (no other instruction
+/// The `n_experts` guard on every architecture: the word is loaded once into the spare `s4` (no other instruction
 /// defines or reads it but the compare), the unsigned compare `s_cmp_ge_u32 s34, s4` of the expert id plus the
 /// existing exit branch sit after the offsets guard and before `expert_id * 8`, the expert-table `s_load_b64` and the
 /// LDS stage / barrier, and the SGPR ceiling is the unchanged 88 (the plan's physical assignment is untouched).
 #[test]
 fn n_experts_guard_precedes_the_table_index_and_the_stage_on_both_arches() {
-    for arch in [Arch::Gfx1201, Arch::Gfx1100] {
+    for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
         for spec in e8p_i4_moe_gemv::module_specs(arch) {
             let e = e8p_i4_moe_gemv::emit(spec).unwrap();
             let symbol = spec.symbol();
@@ -534,6 +706,86 @@ fn n_experts_guard_precedes_the_table_index_and_the_stage_on_both_arches() {
             assert_eq!(
                 between, 1,
                 "{symbol}: one branch between the offsets guard and expert_id*8"
+            );
+        }
+    }
+}
+
+/// Evaluate an emitted scalar compare `s_cmp_<cond>_<ty> a, b` (`a` the routed expert id, `b` `n_experts`) on
+/// concrete values, honouring the instruction's own signedness. Only the `ge`/`lt`/`gt`/`le` conditions of the
+/// `u32`/`i32` forms the kernels can emit are modelled.
+fn scalar_compare(line: &str, a: u32, b: u32) -> bool {
+    let name = mnemonic(line);
+    let (cond, ty) = name
+        .strip_prefix("s_cmp_")
+        .and_then(|r| r.split_once('_'))
+        .unwrap_or_else(|| panic!("not a scalar compare: {line}"));
+    let (x, y) = match ty {
+        "u32" => (i64::from(a), i64::from(b)),
+        "i32" => (i64::from(a as i32), i64::from(b as i32)),
+        other => panic!("unmodelled compare type {other}: {line}"),
+    };
+    match cond {
+        "ge" => x >= y,
+        "gt" => x > y,
+        "le" => x <= y,
+        "lt" => x < y,
+        other => panic!("unmodelled compare condition {other}: {line}"),
+    }
+}
+
+/// CPU model of the emitted `n_experts` guard (the exact compare instruction the builder placed, evaluated on
+/// concrete values, plus the emitted order): for every extent `n`, the invalid ids `-1` (the router's non-finite
+/// marker), `i32::MIN`, `n` and `n + 1` take the exit branch and `n - 1` (and `0`, when `n > 0`) falls through; a
+/// signed compare would let `-1` / `i32::MIN` through, so the model fails any signed spelling. Before the guard the
+/// entry block issues no vector / global / buffer / LDS / scratch memory instruction and no store at all, so an
+/// invalid id never dereferences the weight table or an expert tensor and never writes `Y0` / `Y1`.
+#[test]
+fn n_experts_guard_cpu_model_rejects_minus_one_min_n_and_n_plus_one_and_passes_n_minus_one() {
+    for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
+        for spec in e8p_i4_moe_gemv::module_specs(arch) {
+            let e = e8p_i4_moe_gemv::emit(spec).unwrap();
+            let symbol = spec.symbol();
+            let lines = insns(&e.s_text);
+            let cmp = lines
+                .iter()
+                .position(|l| *l == "s_cmp_ge_u32 s34, s4")
+                .unwrap_or_else(|| panic!("{symbol}: n_experts compare"));
+            assert_eq!(
+                mnemonic(lines[cmp + 1]),
+                "s_cbranch_scc1",
+                "{symbol}: SCC set (id >= n) takes the exit"
+            );
+            for n in [1u32, 2, 5, 512, i32::MAX as u32] {
+                for id in [u32::MAX, i32::MIN as u32, n, n + 1] {
+                    assert!(
+                        scalar_compare(lines[cmp], id, n),
+                        "{symbol}: id {id:#x} against n_experts {n} must exit"
+                    );
+                }
+                for id in [n - 1, 0] {
+                    assert!(
+                        !scalar_compare(lines[cmp], id, n),
+                        "{symbol}: id {id:#x} against n_experts {n} must not exit"
+                    );
+                }
+            }
+            // n_experts == 0: every id, the sentinel included, exits.
+            for id in [0u32, 1, u32::MAX, i32::MIN as u32] {
+                assert!(scalar_compare(lines[cmp], id, 0), "{symbol}: n = 0, id {id:#x}");
+            }
+            let forbidden = |m: &str| {
+                m.starts_with("global_")
+                    || m.starts_with("buffer_")
+                    || m.starts_with("flat_")
+                    || m.starts_with("scratch_")
+                    || m.starts_with("ds_")
+                    || m.starts_with("s_store")
+                    || m.starts_with("s_buffer_store")
+            };
+            assert!(
+                lines[..cmp].iter().all(|l| !forbidden(mnemonic(l))),
+                "{symbol}: a memory instruction precedes the n_experts guard"
             );
         }
     }
@@ -1594,20 +1846,31 @@ mod toolchain {
     };
 
     const HOST: &str = "host-x86_64-unknown-linux-gnu-";
+    const ARCHES: [Arch; 3] = [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151];
 
     /// Waits/hazards replay independently of the builder's ledger, the ABI is unchanged under replay, the
     /// all-lane LDS bound holds over the 1,536-byte allocation, and M7 lifts the natively linked object
     /// byte-exactly with no outstanding obligations (no ROCm tools).
     #[test]
     fn every_export_passes_wait_hazard_replay_lds_bounds_and_m7() {
-        let (emitted, text, _) = e8p_i4_moe_gemv::emit_module(ARCH).unwrap();
+        for arch in ARCHES {
+            wait_hazard_replay_lds_bounds_and_m7(arch)
+        }
+    }
+
+    fn wait_hazard_replay_lds_bounds_and_m7(arch: Arch) {
+        let (emitted, text, _) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
+        let symbols: Vec<String> = e8p_i4_moe_gemv::module_specs(arch)
+            .iter()
+            .map(Spec::symbol)
+            .collect();
         for e in &emitted {
-            ledger_replay::replay_waits(&e.s_text, ARCH)
+            ledger_replay::replay_waits(&e.s_text, arch)
                 .unwrap_or_else(|err| panic!("{}: {err}", e.proof.variant));
             assert!(e.s_text.contains(".kernarg_segment_size: 96\n"));
         }
-        ledger_replay::replay_waits(&text, ARCH).unwrap();
-        for (spec, e) in e8p_i4_moe_gemv::module_specs(ARCH)
+        ledger_replay::replay_waits(&text, arch).unwrap();
+        for (spec, e) in e8p_i4_moe_gemv::module_specs(arch)
             .into_iter()
             .zip(&emitted)
         {
@@ -1616,14 +1879,17 @@ mod toolchain {
                     .unwrap_or_else(|err| panic!("{}: {err}", spec.symbol()));
             assert_eq!(end, e8p_i4_moe_gemv::STAGE_BYTES, "{}", spec.symbol());
         }
-        let dir =
-            std::env::temp_dir().join(format!("peacemaker-isa-e8pi4moe-m7-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "peacemaker-isa-e8pi4moe-m7-{}-{}",
+            arch.name(),
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let co = dir.join("module.co");
-        std::fs::write(&co, native::assemble(&text, ARCH).unwrap()).unwrap();
-        for symbol in SYMBOLS {
-            let m7 =
-                pm_check::m7(&co, ARCH.name(), symbol).unwrap_or_else(|e| panic!("{symbol}: {e}"));
+        std::fs::write(&co, native::assemble(&text, arch).unwrap()).unwrap();
+        for symbol in &symbols {
+            let m7 = pm_check::m7(&co, arch.name(), symbol.as_str())
+                .unwrap_or_else(|e| panic!("{symbol}: {e}"));
             assert_eq!(
                 (m7["lift"].as_str(), &m7["obligations"]),
                 (Some("byte-exact"), &serde_json::json!({})),
@@ -1642,60 +1908,63 @@ mod toolchain {
         let _ = require_rocm_tool!("clang-offload-bundler");
         let _ = require_rocm_tool!("llvm-objdump");
         let _ = require_rocm_tool!("llvm-readobj");
-        let toolchain = Toolchain {
-            host_target: HOST.into(),
-            ..Toolchain::default()
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "peacemaker-isa-e8pi4moe-identity-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (emitted, module_text, _) = e8p_i4_moe_gemv::emit_module(ARCH).unwrap();
-        let mut units: Vec<(String, String)> = emitted
-            .iter()
-            .zip(SYMBOLS)
-            .map(|(e, symbol)| (symbol.to_owned(), e.s_text.clone()))
-            .collect();
-        units.push((format!("{MODULE} (module)"), module_text));
-        let mut failures = Vec::new();
-        for (i, (name, text)) in units.iter().enumerate() {
-            let s = dir.join(format!("u{i}.s"));
-            std::fs::write(&s, text).unwrap();
-            let oracle = oracle_assemble_link_bundle(
-                &toolchain,
-                &s,
-                &dir.join(format!("u{i}.hxaco")),
-                ARCH.name(),
-            )
-            .unwrap();
-            let (oracle_elf, oracle_bundle) = (
-                std::fs::read(&oracle.elf).unwrap(),
-                std::fs::read(&oracle.hsaco).unwrap(),
-            );
-            match native::assemble(text, ARCH) {
-                Ok(elf) => {
-                    let bundle = native::bundle(&elf, ARCH, HOST);
-                    if let Some(why) = native_compare::compare_native_to_oracle(
-                        &elf,
-                        &bundle,
-                        &oracle_elf,
-                        &oracle_bundle,
-                    ) {
-                        failures.push(format!("{name}: {why}"))
+        for arch in ARCHES {
+            let toolchain = Toolchain {
+                host_target: HOST.into(),
+                ..Toolchain::default()
+            };
+            let dir = std::env::temp_dir().join(format!(
+                "peacemaker-isa-e8pi4moe-identity-{}-{}",
+                arch.name(),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (emitted, module_text, _) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
+            let mut units: Vec<(String, String)> = emitted
+                .iter()
+                .zip(e8p_i4_moe_gemv::module_specs(arch))
+                .map(|(e, spec)| (spec.symbol(), e.s_text.clone()))
+                .collect();
+            units.push((format!("{} (module)", Spec::module(arch)), module_text));
+            let mut failures = Vec::new();
+            for (i, (name, text)) in units.iter().enumerate() {
+                let s = dir.join(format!("u{i}.s"));
+                std::fs::write(&s, text).unwrap();
+                let oracle = oracle_assemble_link_bundle(
+                    &toolchain,
+                    &s,
+                    &dir.join(format!("u{i}.hxaco")),
+                    arch.name(),
+                )
+                .unwrap();
+                let (oracle_elf, oracle_bundle) = (
+                    std::fs::read(&oracle.elf).unwrap(),
+                    std::fs::read(&oracle.hsaco).unwrap(),
+                );
+                match native::assemble(text, arch) {
+                    Ok(elf) => {
+                        let bundle = native::bundle(&elf, arch, HOST);
+                        if let Some(why) = native_compare::compare_native_to_oracle(
+                            &elf,
+                            &bundle,
+                            &oracle_elf,
+                            &oracle_bundle,
+                        ) {
+                            failures.push(format!("{name}: {why}"))
+                        }
                     }
+                    Err(e) => failures.push(format!("{name}: native: {e}")),
                 }
-                Err(e) => failures.push(format!("{name}: native: {e}")),
             }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                failures.is_empty(),
+                "{} of {} units differ from the oracle:\n{}",
+                failures.len(),
+                units.len(),
+                failures.join("\n")
+            );
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            failures.is_empty(),
-            "{} of {} units differ from the oracle:\n{}",
-            failures.len(),
-            units.len(),
-            failures.join("\n")
-        );
     }
 
     /// Every symbol certifies against the ROCm oracle build: parse-back, wait replay, its shape contract
@@ -1707,46 +1976,49 @@ mod toolchain {
         let _ = require_rocm_tool!("clang-offload-bundler");
         let _ = require_rocm_tool!("llvm-objdump");
         let _ = require_rocm_tool!("llvm-readobj");
-        let (emitted, text, _) = e8p_i4_moe_gemv::emit_module(ARCH).unwrap();
-        for e in &emitted {
-            ledger_replay::replay_waits(&e.s_text, ARCH).unwrap();
-        }
-        let dir = std::env::temp_dir().join(format!(
-            "peacemaker-isa-e8pi4moe-cert-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = dir.join("module.s");
-        std::fs::write(&s, &text).unwrap();
-        let toolchain = Toolchain::oracle();
-        let build = build(&toolchain, &s, &dir.join("module.hsaco"), ARCH.name()).unwrap();
-        for (spec, e) in e8p_i4_moe_gemv::module_specs(ARCH)
-            .into_iter()
-            .zip(&emitted)
-        {
-            let symbol = spec.symbol();
-            let m7 = pm_check::m7(&build.elf, ARCH.name(), &symbol)
+        for arch in ARCHES {
+            let (emitted, text, _) = e8p_i4_moe_gemv::emit_module(arch).unwrap();
+            for e in &emitted {
+                ledger_replay::replay_waits(&e.s_text, arch).unwrap();
+            }
+            let dir = std::env::temp_dir().join(format!(
+                "peacemaker-isa-e8pi4moe-cert-{}-{}",
+                arch.name(),
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let s = dir.join("module.s");
+            std::fs::write(&s, &text).unwrap();
+            let toolchain = Toolchain::oracle();
+            let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+            for (spec, e) in e8p_i4_moe_gemv::module_specs(arch)
+                .into_iter()
+                .zip(&emitted)
+            {
+                let symbol = spec.symbol();
+                let m7 = pm_check::m7(&build.elf, arch.name(), &symbol)
+                    .unwrap_or_else(|err| panic!("{symbol}: {err}"));
+                assert_eq!(
+                    (m7["lift"].as_str(), &m7["obligations"]),
+                    (Some("byte-exact"), &serde_json::json!({})),
+                    "{symbol}"
+                );
+                let tag = spec.tag();
+                let contract: IsaShapeContract =
+                    serde_json::from_value(e8p_i4_moe_gemv::contract(spec, e)).unwrap();
+                certify(
+                    &toolchain,
+                    &build,
+                    &s,
+                    arch.name(),
+                    &dir.join(format!("{tag}.manifest.json")),
+                    Some(&contract),
+                    "test",
+                    "test",
+                )
                 .unwrap_or_else(|err| panic!("{symbol}: {err}"));
-            assert_eq!(
-                (m7["lift"].as_str(), &m7["obligations"]),
-                (Some("byte-exact"), &serde_json::json!({})),
-                "{symbol}"
-            );
-            let tag = spec.tag();
-            let contract: IsaShapeContract =
-                serde_json::from_value(e8p_i4_moe_gemv::contract(spec, e)).unwrap();
-            certify(
-                &toolchain,
-                &build,
-                &s,
-                ARCH.name(),
-                &dir.join(format!("{tag}.manifest.json")),
-                Some(&contract),
-                "test",
-                "test",
-            )
-            .unwrap_or_else(|err| panic!("{symbol}: {err}"));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

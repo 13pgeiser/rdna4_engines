@@ -333,7 +333,10 @@ pub enum MoeRouteCapability {
     /// 512/10/2560/640/640 geometry over experts whose codec is per expert,
     /// addressed through the layer's pointer tables. gfx1201 admits MQ4
     /// symmetric QT44/QT53, MQ3-I4 planar qt131/qt132 (W3) and E8P-I4
-    /// planar qt135/qt136; gfx1151 admits MQ4 and W3 (not E8P); gfx1100 admits MQ4 and E8P-I4 (not W3); W2 is
+    /// planar qt135/qt136; gfx1151 admits MQ4 and W3, and E8P-I4 only once
+    /// `rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is true (refused
+    /// today; its kernels are selectable, the one constant is the admission); gfx1100 admits
+    /// MQ4 and E8P-I4 (not W3); W2 is
     /// refused on every arch. A layer carries at most one cold codec (W3 or E8P); see
     /// `rdna_compute::qwen4_slab_codec_admitted`. Decode rows
     /// (`route_rows <= 8`) run the K1 lane-union GEMV over the two codec
@@ -478,8 +481,18 @@ pub fn slab_codec_pair(arch: &str, gate_up: DType, down: DType) -> bool {
 /// The K1/K2 codec bucket of an admitted slab dtype pair: the cold codec (W3
 /// or E8P) is bucket 0, MQ4 bucket 1.
 pub fn slab_bucket_of_pair(arch: &str, gate_up: DType, down: DType) -> Option<usize> {
+    slab_bucket_of_pair_by(&|codec| rdna_compute::qwen4_slab_codec_admitted(arch, codec), gate_up, down)
+}
+
+/// [`slab_bucket_of_pair`] over an explicit admission predicate (the pure decision: `admits`
+/// is the architecture's [`rdna_compute::slab_admission::qwen4_slab_codec_admitted_with`]).
+pub(crate) fn slab_bucket_of_pair_by(
+    admits: &dyn Fn(u8) -> bool,
+    gate_up: DType,
+    down: DType,
+) -> Option<usize> {
     let codec = slab_codec_of_pair(gate_up, down)?;
-    rdna_compute::qwen4_slab_codec_admitted(arch, codec).then_some(usize::from(codec == 0))
+    admits(codec).then_some(usize::from(codec == 0))
 }
 
 /// The cold codec a layer's dtype metadata names, in one pass over a mixed
@@ -525,16 +538,17 @@ pub fn slab_launch_cold_codec(arch: &str, declared: Option<u8>) -> Option<u8> {
 }
 
 /// Exact geometry and operand contract of the sealed expert-slab route: the
-/// fixed geometry, and routed experts that are either all one codec `arch`
-/// admits (no per-expert tables) or a per-expert table of admitted codec
+/// fixed geometry, and routed experts that are either all one codec the
+/// architecture admits (no per-expert tables) or a per-expert table of admitted codec
 /// pairs, one entry per expert, holding MQ4 and one cold codec. The
-/// policy's declared cold codec must be the one the dtypes name. `arch:
-/// Some` is selection's one validating pass over the dtype tables; `None` is
+/// policy's declared cold codec must be the one the dtypes name. `admits:
+/// Some` (the architecture's `rdna_compute::qwen4_slab_codec_admitted` per codec) is
+/// selection's one validating pass over the dtype tables; `None` is
 /// the lowering-time shape check, which trusts that pass and never rescans
 /// them (the stage that launches the kernels enforces the device).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn slab_route_geometry_supported(
-    arch: Option<&str>,
+    admits: Option<&dyn Fn(u8) -> bool>,
     policy: &MoeRoutePolicy,
     experts: usize,
     top_k: usize,
@@ -559,9 +573,8 @@ pub(crate) fn slab_route_geometry_supported(
     if !shape {
         return false;
     }
-    if let Some(arch) = arch {
-        let admits = |codec: u8| rdna_compute::qwen4_slab_codec_admitted(arch, codec);
-        if layer_cold_codec(dtypes, &admits) != Some(policy.slab_cold_codec) {
+    if let Some(admits) = admits {
+        if layer_cold_codec(dtypes, admits) != Some(policy.slab_cold_codec) {
             return false;
         }
     }
@@ -3080,6 +3093,27 @@ mod tests {
         // the first expert is MQ4.
         assert_eq!(layer(&[MQ4, MQ4, E8P], &|codec| codec == 0), None);
         assert_eq!(layer(&[MQ4, E8P], &|codec| codec != 3), None);
+        // gfx1151's own admission, with the E8P receipts not landed and landed: the layer's cold
+        // codec is read from every expert; E8P is refused (even far behind MQ4) until the one
+        // switch flips, W3 is served either way, and W3 + E8P is never one layer.
+        let gfx1151 = |landed: bool| {
+            move |codec: u8| {
+                rdna_compute::slab_admission::qwen4_slab_codec_admitted_with("gfx1151", codec, landed)
+            }
+        };
+        let (refused, landed) = (gfx1151(false), gfx1151(true));
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &refused), None);
+        assert_eq!(layer(&[E8P, MQ4], &refused), None);
+        assert_eq!(layer(&[MQ4, MQ4, MQ4, E8P], &landed), Some(Some(3)));
+        assert_eq!(layer(&[E8P, MQ4], &landed), Some(Some(3)));
+        for admits in [&refused as &dyn Fn(u8) -> bool, &landed] {
+            assert_eq!(layer(&[MQ4, W3, MQ4], admits), Some(Some(1)));
+            assert_eq!(layer(&[MQ4, W3, E8P], admits), None);
+            assert_eq!(layer(&[MQ4, MQ4, W2], admits), None);
+        }
+        let uniform_e8p = MoeDtypes { routed_gate_up: E8P.0, routed_down: E8P.1, ..uniform_mq4() };
+        assert_eq!(layer_cold_codec(&uniform_e8p, &refused), None);
+        assert_eq!(layer_cold_codec(&uniform_e8p, &landed), Some(Some(3)));
         // Uniform layers: MQ4 has no cold codec, W3 / E8P are their own.
         let uniform = |pair: (DType, DType)| {
             let dtypes = MoeDtypes {

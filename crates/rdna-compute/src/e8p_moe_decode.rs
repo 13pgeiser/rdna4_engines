@@ -2,11 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV launcher, gfx1201 only.
+//! K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV launcher, gfx1201 and gfx1151.
 //!
-//! Counterpart of `peacemaker-isa::kernels::e8p_i4_moe_gemv` (module
+//! Counterpart of `peacemaker-isa::kernels::e8p_i4_moe_gemv` (gfx1201: module
 //! `e8p_i4_moe_gemv_pm_gfx1201`, symbols `e8p_i4_moe_gemv_r256_gate_up` and
-//! `e8p_i4_moe_gemv_r128_down`). The launch ABI is the frozen F4 96-byte
+//! `e8p_i4_moe_gemv_r128_down`; gfx1151: module `e8p_i4_moe_gemv_pm_gfx1151`, symbols
+//! `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151`, the gfx1100 arm with only the
+//! arch-forced deltas; [`E8pArch`] selects module, symbols and image per device, the launch ABI
+//! and geometry are identical). The launch ABI is the frozen F4 96-byte
 //! kernarg of the `mq_i4_moe_gemv_*` symbols (the 88-byte block plus the trailing `n_experts` and a zero word):
 //!
 //! | offset | field |
@@ -39,7 +42,7 @@
 //! # Interface for the route owner
 //!
 //! * One-time (before graph capture / recording): [`Gpu::ensure_e8p_i4_moe_gemv_kernels`]
-//!   with the code-object bytes of the emitted `e8p_i4_moe_gemv_pm_gfx1201` bundle
+//!   with the code-object bytes of the emitted `e8p_i4_moe_gemv_pm_<arch>` bundle
 //!   (`impl Into<CodeObjectBytes>`: `Arc<[u8]>` read from a file, or a `&'static [u8]`
 //!   `include_bytes!` const). It binds both symbols to that one image digest.
 //! * Per projection: [`Gpu::e8p_i4_moe_gemv_slab`] — argument order
@@ -65,12 +68,71 @@ use hip_bridge::{Function, HipError, HipResult, Module};
 use std::ffi::c_void;
 use std::fmt;
 
-/// Module key of the emitted K-E2 image.
+/// Module key of the emitted K-E2 image (gfx1201; per arch: [`E8pArch::module`]).
 pub const E8P_I4_MOE_GEMV_MODULE: &str = "e8p_i4_moe_gemv_pm_gfx1201";
 
-/// `[gate_up (R256), down (R128)]` entry symbols of the module.
-pub const E8P_I4_MOE_GEMV_SYMBOLS: [&str; 2] =
-    ["e8p_i4_moe_gemv_r256_gate_up", "e8p_i4_moe_gemv_r128_down"];
+/// `[gate_up (R256), down (R128)]` entry symbols of the gfx1201 module (per arch:
+/// [`E8pArch::symbols`]).
+pub const E8P_I4_MOE_GEMV_SYMBOLS: [&str; 2] = ["e8p_i4_moe_gemv_r256_gate_up", "e8p_i4_moe_gemv_r128_down"];
+
+/// Module key of the emitted gfx1151 K-E2 image (the gfx1100 arm with only arch-forced deltas).
+pub const E8P_I4_MOE_GEMV_GFX1151_MODULE: &str = "e8p_i4_moe_gemv_pm_gfx1151";
+
+/// `[gate_up (R256), down (R128)]` entry symbols of the gfx1151 module; contracts
+/// `kernels/e8p_i4_moe_gemv.gfx1151.{r256_gate_up,r128_down}.contract.json`.
+pub const E8P_I4_MOE_GEMV_GFX1151_SYMBOLS: [&str; 2] = [
+    "e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151",
+    "e8p_i4_moe_gemv_r128_down_pm_gfx1151",
+];
+
+/// Architectures this launcher serves: its module key, entry symbols and embedded image.
+/// Everything else about the launch (ABI, geometry, wire) is arch-independent. Presence of a
+/// row is not admission: the sealed slab route is gated by `qwen4_slab_codec_admitted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum E8pArch {
+    Gfx1201,
+    Gfx1151,
+}
+
+impl E8pArch {
+    pub const ALL: [E8pArch; 2] = [E8pArch::Gfx1201, E8pArch::Gfx1151];
+
+    /// Exact architecture name match (`"gfx1201"`, `"gfx1151"`); everything else is `None`.
+    pub fn of_name(arch: &str) -> Option<Self> {
+        match arch {
+            "gfx1201" => Some(Self::Gfx1201),
+            "gfx1151" => Some(Self::Gfx1151),
+            _ => None,
+        }
+    }
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Gfx1201 => "gfx1201",
+            Self::Gfx1151 => "gfx1151",
+        }
+    }
+    /// Module key of the arch's emitted image.
+    pub const fn module(self) -> &'static str {
+        match self {
+            Self::Gfx1201 => E8P_I4_MOE_GEMV_MODULE,
+            Self::Gfx1151 => E8P_I4_MOE_GEMV_GFX1151_MODULE,
+        }
+    }
+    /// `[gate_up (R256), down (R128)]` entry symbols of the arch's module.
+    pub const fn symbols(self) -> [&'static str; 2] {
+        match self {
+            Self::Gfx1201 => E8P_I4_MOE_GEMV_SYMBOLS,
+            Self::Gfx1151 => E8P_I4_MOE_GEMV_GFX1151_SYMBOLS,
+        }
+    }
+    /// The arch's embedded certified builder image.
+    pub const fn image(self) -> &'static [u8] {
+        match self {
+            Self::Gfx1201 => crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1201,
+            Self::Gfx1151 => crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1151,
+        }
+    }
+}
 
 /// Size of the frozen F4 GEMV kernarg (`n_experts@88`, zero `reserved@92`).
 pub const KERNARG_BYTES: usize = 96;
@@ -124,8 +186,13 @@ impl E8pKind {
             E8pKind::Down => 1,
         }
     }
+    /// The gfx1201 entry symbol (see [`E8pKind::symbol_on`] for the other arches).
     pub const fn symbol(self) -> &'static str {
         E8P_I4_MOE_GEMV_SYMBOLS[self.index()]
+    }
+    /// Entry symbol of this projection in `arch`'s module.
+    pub const fn symbol_on(self, arch: E8pArch) -> &'static str {
+        arch.symbols()[self.index()]
     }
     /// Output rows `M` (grid x).
     pub const fn m(self) -> usize {
@@ -187,11 +254,8 @@ pub enum E8pMoeError {
     /// Distinct-expert count outside `1..=min(10 C, 512)`.
     InvalidUnion { u: usize, c: usize },
     /// An operand is null, misaligned, too small, overflowing or aliases another one.
-    Operand {
-        name: &'static str,
-        reason: &'static str,
-    },
-    /// The device is not exactly gfx1201.
+    Operand { name: &'static str, reason: &'static str },
+    /// The device is not exactly gfx1201 or gfx1151.
     Arch(String),
     /// The launch cannot be issued in this execution mode.
     Unavailable(&'static str),
@@ -209,10 +273,7 @@ impl fmt::Display for E8pMoeError {
                 max_union(*c)
             ),
             Self::Operand { name, reason } => write!(f, "operand {name}: {reason}"),
-            Self::Arch(got) => write!(
-                f,
-                "e8p_i4_moe_gemv is exact gfx1201 only, device is {got:?}"
-            ),
+            Self::Arch(got) => write!(f, "e8p_i4_moe_gemv is exact gfx1201 or gfx1151 only, device is {got:?}"),
             Self::Unavailable(why) => write!(f, "{why}"),
             Self::Layout(why) => write!(f, "union layout: {why}"),
         }
@@ -441,9 +502,15 @@ fn disjoint(
 }
 
 /// Validates `req` (lane/union bounds, every operand's extent, alignment and
-/// aliasing) and builds the launch. Performs no device access. The geometry
+/// aliasing) and builds the launch for the gfx1201 module's symbols
+/// ([`plan_launch_on`] with [`E8pArch::Gfx1201`]). Performs no device access. The geometry
 /// (`M`, `K`, `x_row_div`, strides) is the kind's frozen one.
 pub fn plan_launch(req: &E8pDecodeRequest) -> Result<E8pLaunch, E8pMoeError> {
+    plan_launch_on(E8pArch::Gfx1201, req)
+}
+
+/// [`plan_launch`] naming `arch`'s entry symbol; the geometry and kernargs are arch-independent.
+pub fn plan_launch_on(arch: E8pArch, req: &E8pDecodeRequest) -> Result<E8pLaunch, E8pMoeError> {
     let kind = req.kind;
     let c = req.c;
     if !(1..=MAX_LANES).contains(&c) {
@@ -513,7 +580,7 @@ pub fn plan_launch(req: &E8pDecodeRequest) -> Result<E8pLaunch, E8pMoeError> {
     let u = u32_of(req.u, "u")?;
     Ok(E8pLaunch {
         kind,
-        symbol: kind.symbol(),
+        symbol: kind.symbol_on(arch),
         grid: [m, u, 1],
         block: [WORKGROUP, 1, 1],
         kernargs: E8pKernargs {
@@ -611,41 +678,45 @@ impl E8pUnionHost {
 // Loader-independent launch through the HIP module API
 // ---------------------------------------------------------------------------
 
-fn require_gfx1201(gpu: &Gpu) -> Result<(), E8pMoeError> {
+fn require_arch(gpu: &Gpu) -> Result<E8pArch, E8pMoeError> {
     if gpu.arch_caps.is_gfx1201() {
-        Ok(())
+        Ok(E8pArch::Gfx1201)
+    } else if gpu.arch_caps.is_gfx1151() {
+        Ok(E8pArch::Gfx1151)
     } else {
         Err(E8pMoeError::Arch(gpu.arch.clone()))
     }
 }
 
-/// The two K-E2 functions loaded from a gfx1201 code object (`.hxaco` bundle or
+/// The two K-E2 functions loaded from a gfx1201 or gfx1151 code object (`.hxaco` bundle or
 /// bare `.co`), indexed by [`E8pKind::index`]. Independent of the loader, the
 /// route files and the embedded-kernel registry; the HIP module owns its
 /// functions, so this value must outlive every launch enqueued through it.
 pub struct E8pMoeDecodeModule {
     _module: Module,
     functions: [Function; 2],
+    arch: E8pArch,
 }
 
 impl E8pMoeDecodeModule {
-    /// Loads `image` on `gpu`. Refuses any device that is not exactly gfx1201
-    /// and fails closed if a symbol is missing.
+    /// Loads `image` on `gpu`. Refuses any device that is not exactly gfx1201 or gfx1151
+    /// and fails closed if a symbol of that arch's module is missing.
     pub fn load(gpu: &mut Gpu, image: &[u8]) -> HipResult<Self> {
-        require_gfx1201(gpu).map_err(hip_err)?;
+        let arch = require_arch(gpu).map_err(hip_err)?;
         gpu.bind_thread()?;
         gpu.ensure_route_modules_preloaded()?;
         let module = gpu.hip.module_load_data(image)?;
+        let symbols = arch.symbols();
         let functions = [
-            gpu.hip
-                .module_get_function(&module, E8P_I4_MOE_GEMV_SYMBOLS[0])?,
-            gpu.hip
-                .module_get_function(&module, E8P_I4_MOE_GEMV_SYMBOLS[1])?,
+            gpu.hip.module_get_function(&module, symbols[0])?,
+            gpu.hip.module_get_function(&module, symbols[1])?,
         ];
-        Ok(Self {
-            _module: module,
-            functions,
-        })
+        Ok(Self { _module: module, functions, arch })
+    }
+
+    /// The architecture whose symbols this module bound.
+    pub fn arch(&self) -> E8pArch {
+        self.arch
     }
 
     /// Launches exactly `kernargs` over `grid` for `kind` on the active stream,
@@ -666,7 +737,9 @@ impl E8pMoeDecodeModule {
         grid: [u32; 3],
         kernargs: &E8pKernargs,
     ) -> HipResult<()> {
-        require_gfx1201(gpu).map_err(hip_err)?;
+        if require_arch(gpu).map_err(hip_err)? != self.arch {
+            return Err(hip_err(E8pMoeError::Arch(gpu.arch.clone())));
+        }
         if gpu.replay.is_recording() || gpu.graphs.capture_mode {
             return Err(hip_err(E8pMoeError::Unavailable(
                 "E8pMoeDecodeModule launch is not recordable or capturable; use Gpu::e8p_i4_moe_gemv_slab",
@@ -687,14 +760,14 @@ impl E8pMoeDecodeModule {
                 &mut bytes,
             )
         }
-        .map_err(|e| e.with_kernel(kind.symbol()))
+        .map_err(|e| e.with_kernel(kind.symbol_on(self.arch)))
     }
 
-    /// Validates `req` with [`plan_launch`] and launches it.
+    /// Validates `req` with [`plan_launch_on`] (this module's arch) and launches it.
     ///
     /// # Safety
     ///
-    /// `plan_launch` checks only shapes, extents, alignment and aliasing of the
+    /// `plan_launch_on` checks only shapes, extents, alignment and aliasing of the
     /// raw [`DevView`] addresses. The caller guarantees they name live allocations
     /// of at least the declared extent on this device, until the enqueued work
     /// completes; the descriptor arrays and `weight_ptrs` are immutable and
@@ -703,7 +776,7 @@ impl E8pMoeDecodeModule {
     /// exactly [`E8pKind::blob_bytes`] bytes with writer-guarded scales; this value
     /// outlives the work.
     pub unsafe fn launch(&self, gpu: &mut Gpu, req: &E8pDecodeRequest) -> HipResult<()> {
-        let launch = plan_launch(req).map_err(hip_err)?;
+        let launch = plan_launch_on(self.arch, req).map_err(hip_err)?;
         // SAFETY: forwarded contract.
         unsafe { self.launch_kernargs(gpu, launch.kind, launch.grid, &launch.kernargs) }
     }
@@ -714,8 +787,9 @@ impl E8pMoeDecodeModule {
 // ---------------------------------------------------------------------------
 
 impl Gpu {
-    /// Binds both K-E2 symbols to `image` (the emitted gfx1201
-    /// `e8p_i4_moe_gemv_pm_gfx1201` code object) in the shared module/function
+    /// Binds both K-E2 symbols of this device's arch to `image` (the emitted
+    /// `e8p_i4_moe_gemv_pm_gfx1201` / `e8p_i4_moe_gemv_pm_gfx1151` code object, see
+    /// [`E8pArch`]) in the shared module/function
     /// cache. Call before graph capture. `image` is `Arc<[u8]>` (read from a file)
     /// or a `&'static [u8]` embedded constant; a later call with a different image
     /// is refused.
@@ -723,10 +797,10 @@ impl Gpu {
         &mut self,
         image: impl Into<redline_dispatch::aql::CodeObjectBytes> + Clone,
     ) -> HipResult<()> {
-        require_gfx1201(self).map_err(hip_err)?;
+        let arch = require_arch(self).map_err(hip_err)?;
         self.bind_thread()?;
-        for symbol in E8P_I4_MOE_GEMV_SYMBOLS {
-            self.ensure_embedded_kernel(E8P_I4_MOE_GEMV_MODULE, image.clone(), symbol)?;
+        for symbol in arch.symbols() {
+            self.ensure_embedded_kernel(arch.module(), image.clone(), symbol)?;
         }
         Ok(())
     }
@@ -751,7 +825,7 @@ impl Gpu {
         y1: Option<&GpuTensor>,
         lanes: usize,
     ) -> HipResult<()> {
-        require_gfx1201(self).map_err(hip_err)?;
+        let arch = require_arch(self).map_err(hip_err)?;
         if buckets == 0 || bucket >= buckets {
             return Err(hip_err(E8pMoeError::Layout(
                 "bucket index outside the bucket count",
@@ -790,7 +864,7 @@ impl Gpu {
             // `weight_ptrs` required to hold that many entries, re-checked by `plan_launch`), never the bucket's `U`.
             n_experts: crate::slab_moe::SLAB_EXPERTS,
         };
-        let launch = plan_launch(&req).map_err(hip_err)?;
+        let launch = plan_launch_on(arch, &req).map_err(hip_err)?;
         let symbol = launch.symbol;
         if !self.functions.contains_key(symbol) {
             return Err(hip_err(E8pMoeError::Unavailable(
@@ -891,6 +965,64 @@ mod tests {
             E8P_I4_MOE_GEMV_SYMBOLS[E8pKind::Down.index()],
             "e8p_i4_moe_gemv_r128_down"
         );
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn arch_table_is_exactly_gfx1201_and_gfx1151_with_the_gfx1201_names_unchanged() {
+        assert_eq!(E8pArch::of_name("gfx1201"), Some(E8pArch::Gfx1201));
+        assert_eq!(E8pArch::of_name("gfx1151"), Some(E8pArch::Gfx1151));
+        for other in ["gfx1100", "gfx1101", "gfx1152", "gfx1200", "gfx942", "GFX1151", "gfx1151x", ""] {
+            assert_eq!(E8pArch::of_name(other), None, "{other:?}");
+        }
+        for arch in E8pArch::ALL {
+            assert_eq!(E8pArch::of_name(arch.name()), Some(arch));
+        }
+        // gfx1201: the historical module, symbols and image, bit for bit.
+        assert_eq!(E8pArch::Gfx1201.module(), E8P_I4_MOE_GEMV_MODULE);
+        assert_eq!(E8pArch::Gfx1201.module(), "e8p_i4_moe_gemv_pm_gfx1201");
+        assert_eq!(E8pArch::Gfx1201.symbols(), E8P_I4_MOE_GEMV_SYMBOLS);
+        assert_eq!(E8pArch::Gfx1201.image(), crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1201);
+        // gfx1151: its own module, the `_pm_gfx1151` symbols and its own image.
+        assert_eq!(E8pArch::Gfx1151.module(), "e8p_i4_moe_gemv_pm_gfx1151");
+        assert_eq!(
+            E8pArch::Gfx1151.symbols(),
+            ["e8p_i4_moe_gemv_r256_gate_up_pm_gfx1151", "e8p_i4_moe_gemv_r128_down_pm_gfx1151"]
+        );
+        assert_eq!(E8pArch::Gfx1151.image(), crate::kernels::E8P_I4_MOE_GEMV_PM_GFX1151);
+        for kind in E8pKind::ALL {
+            assert_eq!(kind.symbol(), kind.symbol_on(E8pArch::Gfx1201));
+            assert_eq!(kind.symbol_on(E8pArch::Gfx1151), E8pArch::Gfx1151.symbols()[kind.index()]);
+            assert_eq!(kind.symbol_on(E8pArch::Gfx1151), format!("{}_pm_gfx1151", kind.symbol()));
+        }
+        for arch in E8pArch::ALL {
+            for symbol in arch.symbols() {
+                assert!(contains_bytes(arch.image(), format!("{symbol}.kd").as_bytes()), "{} {symbol}.kd", arch.name());
+            }
+        }
+        // Each image carries its own symbols only.
+        for symbol in E8pArch::Gfx1151.symbols() {
+            assert!(!contains_bytes(E8pArch::Gfx1201.image(), symbol.as_bytes()), "{symbol} in the gfx1201 image");
+        }
+        assert_ne!(E8pArch::Gfx1201.image(), E8pArch::Gfx1151.image());
+    }
+
+    #[test]
+    fn plan_launch_on_changes_only_the_symbol_per_arch() {
+        for c in 1..=MAX_LANES {
+            for kind in E8pKind::ALL {
+                let req = views(c, kind);
+                let base = plan_launch(&req).unwrap();
+                assert_eq!(base, plan_launch_on(E8pArch::Gfx1201, &req).unwrap());
+                assert_eq!(base.symbol, kind.symbol());
+                let halo = plan_launch_on(E8pArch::Gfx1151, &req).unwrap();
+                assert_eq!(halo.symbol, kind.symbol_on(E8pArch::Gfx1151));
+                assert_eq!((halo.kind, halo.grid, halo.block, halo.kernargs), (base.kind, base.grid, base.block, base.kernargs));
+            }
+        }
     }
 
     #[test]

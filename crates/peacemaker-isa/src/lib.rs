@@ -8,6 +8,9 @@
 //! `Ledger` plus EXEC/VCC/SCC/M0 capabilities; it reconciles pending counters
 //! and slot states before returning ownership. Foreign bytes become a region
 //! only after disassembly parse-back and independent wait-ledger replay.
+// The gfx11 K2 module (`kernels/qwen4_moe_sym_gfx1100/`) names this crate by its public path so a standalone
+// example or test can still include it with `#[path]`; inside the crate that path is the crate itself.
+extern crate self as peacemaker_isa;
 pub mod aco;
 pub mod aco_cert;
 pub mod aco_hsa;
@@ -70,6 +73,10 @@ pub mod kernels {
     pub mod qwen4_lane_rows_mq6;
     pub mod qwen4_lane_rows_q8;
     pub mod qwen4_moe_sym;
+    /// gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs; the E8P-I4 module is the gfx1151 Halo port (`--kernel qwen4_moe_sym_gfx11_e8p`).
+    #[allow(dead_code, unused_imports)]
+    #[path = "qwen4_moe_sym_gfx1100/mod.rs"]
+    pub mod qwen4_moe_sym_gfx11;
     pub mod qwen4_mq4_x4_gfx11;
     pub mod qwen4_mq6_x4;
     pub mod qwen4_mq6_x4_gfx11;

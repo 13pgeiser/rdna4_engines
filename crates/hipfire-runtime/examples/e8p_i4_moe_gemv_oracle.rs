@@ -2,10 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner, gfx1201, raw PM module (never runtime
+//! K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner, gfx1201 and gfx1151, raw PM module (never runtime
 //! dispatch except the deliberate `Gpu::e8p_i4_moe_gemv_slab` scratch-path check).
 //!
-//! Subject: `e8p_i4_moe_gemv_pm_gfx1201` (`e8p_i4_moe_gemv_r256_gate_up`, `e8p_i4_moe_gemv_r128_down`), launched through the
+//! Subject: `e8p_i4_moe_gemv_pm_gfx1201` (`e8p_i4_moe_gemv_r256_gate_up`, `e8p_i4_moe_gemv_r128_down`) or, with `--expect-arch gfx1151`,
+//! `e8p_i4_moe_gemv_pm_gfx1151` (`e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151`), launched through the
 //! loader-independent launcher `rdna_compute::e8p_moe_decode` (frozen F4 96-byte kernarg, grid `[M, U, 1]`, block 32). Every
 //! F32 output word (all slots, every row, padded strides and trailing guard words) is compared **bit for bit** against the
 //! frozen K-E0 lane-pair twin of `hipfire_runtime::e8p_i4_reference`: `decode_weights_q` (the lane-pair decode of the wire
@@ -22,7 +23,7 @@
 //!   e8p_i4_moe_gemv_oracle timing    --e8p-codeobject OBJ --mq4-codeobject MQ4.hxaco --out RECEIPT.json
 //!       [--records-dir DIR --manifest FILE] [--reps 25] [--warmup 5] [--batch 64] [--evict-mb 256] [--pool-experts 512]
 //!       [--modes resident,cold] [--cs 1,2,3,4,5,6,7,8] [--allow-few-reps]
-//!   common: [--device N] [--card LABEL] [--expect-uuid GPU-..|HEX] [--expect-bdf 0000:..] [--expect-arch gfx1201]
+//!   common: [--device N] [--card LABEL] [--expect-uuid GPU-..|HEX] [--expect-bdf 0000:..] [--expect-arch gfx1201|gfx1151]
 //!       [--e8p-codeobject-sha256 HEX] [--mq4-codeobject-sha256 HEX] [--negative-control] [--overwrite]
 //!       [--fabric-class C --fabric-owner O --fabric-job J --fabric-card CARD --fabric-cmd STR]
 //!       (fabric fields fall back to env FABRIC_CLASS/OWNER/JOB/CARD/CMD and are only recorded in the receipt)
@@ -68,6 +69,22 @@
 //! sha256 of the harness source, of the K-E0 reference source (pinned `17b9e138..`), of the launcher source and of the
 //! code objects, record file/manifest pins, per case input sha256, actual launch / word / mismatch / guard-region counts,
 //! poison checks and `rc`.
+//!
+//! # gfx1151 (Strix Halo; `--expect-arch gfx1151`)
+//! The same oracle against the gfx1151 image: the launcher (`E8pArch::Gfx1151`, chosen from the device) binds module `e8p_i4_moe_gemv_pm_gfx1151` and the
+//! symbols `e8p_i4_moe_gemv_{r256_gate_up,r128_down}_pm_gfx1151`; `plan_launch_on` must reproduce the kernarg bytes and name the gfx1151 symbol; the slab
+//! scratch path (`Gpu::e8p_i4_moe_gemv_slab`) runs through the same arch. The twin, the cases, the poison / guard checks and the exit codes are unchanged
+//! (outputs must be bit-identical to the gfx1201 kernel and the K-E0 twin). Defaults stay gfx1201. gfx1151 has no ROCr UUID: `--expect-uuid` is optional
+//! (checked only when given; the device uuid is recorded verbatim, `uuid_authoritative: false`) and `--expect-bdf` is REQUIRED (`lspci -D -d 1002:` on
+//! hipx). `timing` is refused on gfx1151 (its baseline is the frozen `mq_i4_moe_gemv_pm_gfx1201` MQ4 module; no gfx1151 MQ4 F4 module exists).
+//!   cargo build -p hipfire-runtime --release --features lab --example e8p_i4_moe_gemv_oracle
+//!   /home/kaden/qcal/locks/fabric/fabric-run.sh --class correct --card halo --mem-gb N --owner NAME -- \
+//!     target/release/examples/e8p_i4_moe_gemv_oracle synthetic --e8p-codeobject /abs/e8p_i4_moe_gemv_pm_gfx1151.hxaco \
+//!     --out /abs/r10.k1.e8p-gfx1151.synthetic.json --expect-arch gfx1151 --expect-bdf 0000:XX:00.0 [--expect-uuid U] --card halo [--overwrite]
+//!   `real` (all 512 solved layer-0 vq-e8p records, arch independent) takes the same flags plus `--records-dir DIR --manifest FILE` where those pinned
+//!   records are on the card's host. The real layers of the shipped Halo slab artifact, layers 0 and 47 (four cold experts, both projections) of
+//!   hipx `/home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts`, are covered by the K1 G1 harness
+//!   `e8p_i4_moe_gemv_gfx1100_g1 --expect-arch gfx1151` (its header has the extraction and run commands).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -79,7 +96,7 @@ use hipfire_runtime::mq_i4::MqI4Rotation;
 use hipfire_runtime::mq_i4_reference::gemv_tree_f32_q;
 use rayon::prelude::*;
 use rdna_compute::e8p_moe_decode::{
-    max_union, plan_launch, union_bucket_words, union_words, DevView, E8pDecodeRequest,
+    max_union, plan_launch_on, union_bucket_words, union_words, DevView, E8pArch, E8pDecodeRequest,
     E8pKernargs, E8pKind, E8pMoeDecodeModule, E8pUnionHost, E8P_I4_MOE_GEMV_SYMBOLS, KERNARG_BYTES,
     MAX_EXPERTS, MAX_LANES, MAX_SLOTS, TOP_K,
 };
@@ -1161,12 +1178,12 @@ fn run_kind(
             y0: DevView::new(y0.ptr, n_words * 4),
             y1: y1.map(|b| DevView::new(b.ptr, n_words * 4)),
         };
-        let planned = plan_launch(&req).map_err(|e| format!("{}: plan_launch: {e}", case.name))?;
+        let planned = plan_launch_on(ctx.module.arch(), &req).map_err(|e| format!("{}: plan_launch: {e}", case.name))?;
         t.plan_checks += 1;
         plan_checked = true;
         if planned.kernargs.to_bytes() != ka.to_bytes()
             || planned.grid != [kind.m() as u32, u as u32, 1]
-            || planned.symbol != kind.symbol()
+            || planned.symbol != kind.symbol_on(ctx.module.arch())
         {
             t.plan_mismatches += 1;
         }
@@ -1217,7 +1234,7 @@ fn run_kind(
     t.kind_runs += 1;
 
     let mut row = json!({
-        "kind": kind_name(kind), "symbol": kind.symbol(), "m": kind.m(), "k": kind.k(), "grid": [kind.m(), u, 1],
+        "kind": kind_name(kind), "symbol": kind.symbol_on(ctx.module.arch()), "m": kind.m(), "k": kind.k(), "grid": [kind.m(), u, 1],
         "u": u, "written_slots": exp.written_slots, "twin_rows": exp.twin_rows, "twin_selfcheck_mismatch": exp.selfcheck_bad,
         "launcher_plan_checked": plan_checked, "launcher_path": launcher_path,
         "mismatch_count": mm.count, "first_mismatches": mm.first,
@@ -2073,6 +2090,7 @@ struct Cfg {
     expect_uuid: Option<String>,
     expect_bdf: Option<String>,
     expect_arch: String,
+    target: E8pArch,
     records_dir: Option<String>,
     manifest: Option<String>,
     layer: usize,
@@ -2095,7 +2113,7 @@ struct Cfg {
 const USAGE: &str = "usage: e8p_i4_moe_gemv_oracle <synthetic|real|timing> --e8p-codeobject OBJ --out RECEIPT.json \
 [--mq4-codeobject MQ4.hxaco (timing)] [--records-dir DIR --manifest FILE [--layer 0] (real; optional for timing)] \
 [--seed N] [--only SUBSTR]... [--reps 25 --warmup 5 --batch 64 --evict-mb 256 --pool-experts 512 --modes resident,cold --cs 1,..,8 --allow-few-reps] \
-[--device N] [--card LABEL] [--expect-uuid U] [--expect-bdf B] [--expect-arch A] [--e8p-codeobject-sha256 H] [--mq4-codeobject-sha256 H] \
+[--device N] [--card LABEL] [--expect-uuid U] [--expect-bdf B (required for gfx1151)] [--expect-arch gfx1201|gfx1151] [--e8p-codeobject-sha256 H] [--mq4-codeobject-sha256 H] \
 [--manifest-sha256 H --gate-sha256 H --down-sha256 H (layers other than 0)] [--negative-control] [--overwrite] \
 [--fabric-class C --fabric-owner O --fabric-job J --fabric-card CARD --fabric-cmd STR]";
 
@@ -2125,6 +2143,7 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         expect_uuid: None,
         expect_bdf: None,
         expect_arch: "gfx1201".into(),
+        target: E8pArch::Gfx1201,
         records_dir: None,
         manifest: None,
         layer: 0,
@@ -2229,6 +2248,14 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         i += 1;
     }
     cfg.fabric = fab;
+    cfg.target = E8pArch::of_name(&cfg.expect_arch)
+        .ok_or_else(|| format!("--expect-arch {:?}: this oracle serves gfx1201 and gfx1151\n{USAGE}", cfg.expect_arch))?;
+    if cfg.target == E8pArch::Gfx1151 && cfg.expect_bdf.is_none() {
+        return Err(format!("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)\n{USAGE}"));
+    }
+    if cfg.target == E8pArch::Gfx1151 && cfg.mode == Mode::Timing {
+        return Err("timing is gfx1201 only: its baseline is the frozen mq_i4_moe_gemv_pm_gfx1201 MQ4 module (none exists for gfx1151)".into());
+    }
     if cfg.e8p_co.is_empty() {
         return Err(format!("--e8p-codeobject is required\n{USAGE}"));
     }
@@ -2339,17 +2366,14 @@ fn run() -> Result<(Value, i32)> {
             .map_or(true, |u| uuid.contains(u.trim_start_matches("GPU-")))
         && cfg.expect_bdf.as_ref().map_or(true, |b| &bdf == b);
     let device = json!({"index": id, "uuid": uuid, "bdf": bdf, "arch": arch, "card": cfg.card,
-        "expected_uuid": cfg.expect_uuid, "expected_bdf": cfg.expect_bdf, "expected_arch": cfg.expect_arch, "identity_match": identity_match});
-    let fabric: serde_json::Map<String, Value> = cfg
-        .fabric
-        .iter()
-        .map(|(k, v)| (k.to_string(), json!(v)))
-        .collect();
+        "expected_uuid": cfg.expect_uuid, "expected_bdf": cfg.expect_bdf, "expected_arch": cfg.expect_arch,
+        "uuid_authoritative": cfg.target != E8pArch::Gfx1151, "uuid_checked": cfg.expect_uuid.is_some(), "identity_match": identity_match});
+    let fabric: serde_json::Map<String, Value> = cfg.fabric.iter().map(|(k, v)| (k.to_string(), json!(v))).collect();
     let mut receipt = json!({"schema": SCHEMA, "mode": format!("{:?}", cfg.mode).to_lowercase(),
         "command": {"argv": argv, "build_command": BUILD_COMMAND}, "fabric": Value::Object(fabric), "device": device,
         "harness_sha256": sha_hex(HARNESS_SRC), "reference_sha256": sha_hex(REFERENCE_SRC), "reference_sha256_pinned": REFERENCE_SHA256,
         "launcher_sha256": sha_hex(LAUNCHER_SRC),
-        "codeobject": {"e8p": {"path": cfg.e8p_co, "sha256": e8p_sha, "bytes": image.len(), "symbols": E8P_I4_MOE_GEMV_SYMBOLS},
+        "codeobject": {"e8p": {"path": cfg.e8p_co, "sha256": e8p_sha, "bytes": image.len(), "symbols": cfg.target.symbols(), "module": cfg.target.module()},
             "mq4": mq4.as_ref().map(|(b, s)| json!({"path": cfg.mq4_co, "sha256": s, "bytes": b.len(), "symbols": MQ4_SYMBOLS}))},
         "wire_selfcheck_unpack_swar_vs_ref": selfcheck, "every_word_generator_coverage": coverage});
     if !identity_match {

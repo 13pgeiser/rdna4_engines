@@ -18,9 +18,11 @@
 mod gfx1100;
 
 use gfx1100::{Codec, Kind, Negative, Spec};
+use peacemaker_isa::Arch;
 
 fn spec(codec: Codec, kind: Kind, acc: bool, negative: Negative) -> Spec {
     Spec {
+        arch: Arch::Gfx1100,
         codec,
         kind,
         acc,
@@ -41,7 +43,10 @@ fn e8p_cpu_proofs_pass() {
 
 #[test]
 fn e8p_names_and_abi() {
-    assert_eq!(Codec::E8p.module(), "qwen4_moe_iu4_sym_e8p_pm_gfx1100");
+    assert_eq!(
+        Codec::E8p.module(Arch::Gfx1100),
+        "qwen4_moe_iu4_sym_e8p_pm_gfx1100"
+    );
     assert_eq!(
         spec(Codec::E8p, Kind::GateUp, false, Negative::None).symbol(),
         "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1100"

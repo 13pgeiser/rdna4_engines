@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! K-E1 E8P NT1 **G1 synthetic oracle**: the E8P-on-IU4 grouped symmetric MoE GEMM gate/up
+//! K-E1 E8P NT1 **G1 oracle (synthetic + real-layer samples; gfx1201 and gfx1151)**: the E8P-on-IU4 grouped symmetric MoE GEMM gate/up
 //! (`qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201`, `[1280, 2560]`, `H = [P][640]`) and down
 //! (`qwen4_moe_down_iu4_sym_e8p_pm_gfx1201`, `[2560, 640]`, `Y = [P][2560]`), raw PM module launch (never runtime
 //! dispatch), compared **byte for byte** against the frozen K-E0 arithmetic of `hipfire_runtime::e8p_i4_reference`.
@@ -50,6 +50,40 @@
 //! parities, shift alternating); scales include the guard boundary `0x0400` and low normals where FP16 `d/4` is not
 //! exact (`0x0401`, `0x0403`, ...); activations include all `-8`, all `+7`, alternating and random blocks (nonzero
 //! `s` of both signs and extreme `|2C+s|`), `d_act` in `{1e-20 .. 65536, 0}`.
+//!
+//! # gfx1151 (Strix Halo) and real-layer samples
+//! `--expect-arch gfx1151` (default `gfx1201`, which keeps every existing behaviour: arch check, symbols, probe, synthetic-only receipt) binds the gfx1151
+//! module (`kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco`, the gfx1100 arm of `qwen4_moe_sym_gfx1100/` with only arch-forced deltas) through the symbols
+//! `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1151[_acc]`. Checks (1)-(3) are unchanged and equally bitwise (the gfx1151 kernel must equal the gfx1201 kernel
+//! and the K-E0 twin on every word); the probe object MUST be built for gfx1151 (`--offload-arch=gfx1151`; the gfx1151 source is the byte-identical-body
+//! twin of the gfx1201 probe: `crates/hipfire-arch-qwen4/examples/oracle_kernels/qwen4_moe_sym_g1_probe.gfx1151.hip`, in this worktree, byte-identical to the
+//! R9 copy, sha256 836a4e93cf0afb13dc8857765c8cd53d6b9fc9b31479e05156a81242b93239ee). Identity: the device arch must equal `--expect-arch`; gfx1151 has no ROCr UUID, so
+//! `--expect-uuid` is OPTIONAL (exact case-insensitive match when given; the uuid is recorded verbatim, `uuid_authoritative: false`) and `--expect-bdf` is
+//! REQUIRED there (`lspci -D -d 1002:` on hipx).
+//! Real layers: `--samples-dir DIR` (repeatable / comma separated, one per pinned artifact; the extractor output of `tools/e8p_k1_extract_samples.py`, the
+//! same directory the K1 harness `e8p_i4_moe_gemv_gfx1100_g1` consumes) adds the scenario set `real_*` (the rows/div sweep, expert `n % count` per
+//! tile, and a mixed-expert scenario, over the four cold experts of layers 0 and 47 of the artifact, both projections), with the same F32 `_acc` and
+//! BF16 checks against the K-E0 twin / device-probe epilogue. Every manifest field is verified strictly (`provisional: false`, extractor rc 0 / cpu, pinned
+//! extractor sha256 54cdfed3e5314b6eb7685c2f35248e59224b3f332f04ea5d287fcb7a985cef0d, artifact sha256 in the pin table, qt 135/136, group 128, shape,
+//! bare file name, size, sha256 of every tensor file); `--verify-artifact-range` re-hashes `[artifact_offset, +bytes)` of every tensor in the artifact
+//! (it must be reachable), `--rehash-artifact` re-hashes the whole artifact. Pins: `c24-e8p`, `c24h6306-e8p` (the XTX `.hfq` exports) and
+//! `c24h6306-d2-mq2-xts` = the Halo slab artifact hipx `/home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts`
+//! (sha256 d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949). On gfx1151 `--samples-dir` binding the slab pin is REQUIRED (the receipt's
+//! `gate_eligible` is true only then); `--synthetic-only` runs the synthetic set alone and marks the receipt `gate_eligible: false`. Real scales that fail
+//! `writer_guard` fail the run (`real_samples.writer_guard_violations`).
+//! Halo commands (CPU steps on hipx; the device step through the fabric, class `correct`, label `halo`):
+//!   python3 tools/e8p_k1_extract_samples.py --artifact /home/kaden/pm-wave/consumer24/models/c24h6306-d2/qwen3.8-flash-next.mq2-xts \
+//!     --expect-sha256 d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949 --output-dir /abs/halo-e8p-k1-samples     (must not exist)
+//!   hipcc --genco --offload-arch=gfx1151 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6 -ffp-contract=off \
+//!     -o /abs/qwen4_moe_sym_g1_probe_gfx1151.co \
+//!     crates/hipfire-arch-qwen4/examples/oracle_kernels/qwen4_moe_sym_g1_probe.gfx1151.hip      (run from the repo root)
+//!   cargo build -p hipfire-runtime --release --features lab --example qwen4_moe_sym_e8p_g1_oracle
+//!   /home/kaden/qcal/locks/fabric/fabric-run.sh --class correct --card halo --mem-gb N --owner NAME -- \
+//!     target/release/examples/qwen4_moe_sym_e8p_g1_oracle --e8p /abs/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco \
+//!     --probe-codeobject /abs/qwen4_moe_sym_g1_probe_gfx1151.co --samples-dir /abs/halo-e8p-k1-samples \
+//!     --out /abs/r10.k2.g1.e8p-gfx1151.json --card halo --expect-arch gfx1151 --expect-bdf 0000:XX:00.0 [--expect-uuid U] [--seed N] \
+//!     [--verify-artifact-range] [--rehash-artifact] [--negative-control 1|2] [--overwrite]
+//!   Synthetic only (diagnostic): the same without `--samples-dir`, with `--synthetic-only`. Exit codes unchanged (0 exact, 3 mismatch, 1 error).
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
@@ -68,19 +102,64 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 const SCHEMA: &str = "qwen4-moe-sym-e8p-g1-oracle-v1";
+const SCHEMA_GFX1151: &str = "qwen4-moe-sym-e8p-g1-oracle-gfx1151-v1";
 const FABRIC_RUNNER: &str = "/home/kaden/qcal/locks/fabric/fabric-run.sh";
 const HARNESS_SRC: &[u8] = include_bytes!("qwen4_moe_sym_e8p_g1_oracle.rs");
 const REFERENCE_SRC: &[u8] = include_bytes!("../src/e8p_i4_reference.rs");
 const USAGE: &str = "usage: qwen4_moe_sym_e8p_g1_oracle --e8p MODULE --probe-codeobject PROBE.co --out RECEIPT.json --card LABEL \
-[--expect-bdf BDF] [--seed N] [--negative-control 1|2] [--probe-kernarg-bytes N] [--overwrite]";
+[--expect-arch gfx1201|gfx1151] [--expect-bdf BDF (required for gfx1151)] [--expect-uuid UUID (optional; gfx1151 has no ROCr UUID)] \
+[--samples-dir DIR[,DIR2]]... [--verify-artifact-range] [--rehash-artifact] [--synthetic-only] \
+[--seed N] [--negative-control 1|2] [--probe-kernarg-bytes N] [--overwrite]";
 const BLK: usize = 72;
 const SLAB_ALIGN: usize = 256;
 const GUARD: usize = 256;
 const FIRST_LIMIT: usize = 8;
 const POISON_F32: u32 = 0xa5a5_a5a5;
 const POISON_BF16: u16 = 0xa5a5;
-const SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_e8p_pm_gfx1201";
-const SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_e8p_pm_gfx1201";
+/// Pinned real-sample artifacts (`sample.json: artifact_sha256`): the two XTX `.hfq` exports and the Halo slab `mq2-xts` (shipped d2 base).
+static ARTIFACT_PINS: [(&str, &str); 3] = [
+    ("c24-e8p", "5f280cff75e1ae29e45bbbdcbeca31bec4eb026fb105d5c3bcd7c5238fe281db"),
+    ("c24h6306-e8p", "8d30e9d7df324e16f7aa811c114109ba3ad238e630134cdd4a282a7dcc4abc9f"),
+    ("c24h6306-d2-mq2-xts", "d3d536c040f834699b5a261a5122b67d076461a9493eca16669803757928a949"),
+];
+/// `sample.json: extractor_source_sha256` of `tools/e8p_k1_extract_samples.py`.
+const EXTRACTOR_SHA256: &str = "54cdfed3e5314b6eb7685c2f35248e59224b3f332f04ea5d287fcb7a985cef0d";
+const REAL_LAYERS: [u64; 2] = [0, 47];
+
+/// The architectures served: gfx1201 (default) and gfx1151 (Strix Halo; the gfx1100 arm with only arch-forced deltas).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    Gfx1201,
+    Gfx1151,
+}
+impl Target {
+    fn of_name(arch: &str) -> Option<Self> {
+        match arch {
+            "gfx1201" => Some(Self::Gfx1201),
+            "gfx1151" => Some(Self::Gfx1151),
+            _ => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfx1201 => "gfx1201",
+            Self::Gfx1151 => "gfx1151",
+        }
+    }
+    fn schema(self) -> &'static str {
+        match self {
+            Self::Gfx1201 => SCHEMA,
+            Self::Gfx1151 => SCHEMA_GFX1151,
+        }
+    }
+    /// The sample pin a gate-eligible receipt must bind on this target (`None`: real samples are optional).
+    fn required_pin(self) -> Option<&'static str> {
+        match self {
+            Self::Gfx1201 => None,
+            Self::Gfx1151 => Some("c24h6306-d2-mq2-xts"),
+        }
+    }
+}
 
 fn sha(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -275,12 +354,8 @@ impl Proj {
             "gate_up"
         }
     }
-    fn symbol(self) -> &'static str {
-        if self == Proj::Down {
-            SYM_DOWN
-        } else {
-            SYM_GATE_UP
-        }
+    fn symbol(self, target: Target) -> String {
+        format!("qwen4_moe_{}_iu4_sym_e8p_pm_{}", if self == Proj::Down { "down" } else { "gate_up_silu" }, target.name())
     }
 }
 
@@ -295,6 +370,8 @@ enum Kind {
     Extreme,
     Parity,
     Sentinel(u16),
+    /// Index into the real experts loaded from `--samples-dir`.
+    Real(u8),
 }
 impl Kind {
     fn label(self) -> String {
@@ -304,6 +381,7 @@ impl Kind {
             Kind::Extreme => "extreme".into(),
             Kind::Parity => "parity".into(),
             Kind::Sentinel(f) => format!("sentinel_{f:04x}"),
+            Kind::Real(i) => format!("real{i}"),
         }
     }
 }
@@ -372,11 +450,15 @@ fn make_words(kind: Kind, rng: &mut Rng, n: usize) -> Vec<u16> {
                 let sign7 = ((i * 0x35 + i / 256) & 0x7f) as u8;
                 e8p::pack_word(idx, sign7, (i / 3) % 2 == 1)
             }
+            Kind::Real(_) => unreachable!("real experts are loaded from --samples-dir, never generated"),
         })
         .collect()
 }
 
 fn expert(kind: Kind, proj: Proj, seed: u32) -> Result<Expert> {
+    if let Kind::Real(_) = kind {
+        return Err("real experts are loaded from --samples-dir, never generated".into());
+    }
     let (m, k) = (proj.m(), proj.k());
     let mut rng = Rng((seed ^ fnv64(&kind.label()) as u32) | 1);
     let words = make_words(kind, &mut rng, m * k / 8);
@@ -394,6 +476,11 @@ fn expert(kind: Kind, proj: Proj, seed: u32) -> Result<Expert> {
     for (i, &d) in scales.iter().enumerate() {
         e8p::writer_guard(d).map_err(|e| format!("{} scale {i}: {e}", kind.label()))?;
     }
+    Ok(finish_expert(format!("{}/{}", proj.name(), kind.label()), words, scales))
+}
+
+/// Wire bytes, statistics and sha256 of an expert from its decoded planes.
+fn finish_expert(label: String, words: Vec<u16>, scales: Vec<u16>) -> Expert {
     let mut bytes = Vec::with_capacity(words.len() * 2 + scales.len() * 2);
     bytes.extend(words.iter().flat_map(|w| w.to_le_bytes()));
     bytes.extend(scales.iter().flat_map(|s| s.to_le_bytes()));
@@ -418,15 +505,256 @@ fn expert(kind: Kind, proj: Proj, seed: u32) -> Result<Expert> {
         "odd_parity_rows": words.iter().filter(|&&w| e8p::abs_row_parity((w & 0xff) as u8) == 1).count(),
     });
     let sha256 = sha(&bytes);
-    Ok(Expert {
-        label: format!("{}/{}", proj.name(), kind.label()),
-        words,
-        scales,
-        bytes,
-        sha256,
-        stats,
-        o: OnceCell::new(),
-    })
+    Expert { label, words, scales, bytes, sha256, stats, o: OnceCell::new() }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// real experts (`--samples-dir`: the extractor output of `tools/e8p_k1_extract_samples.py`)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Exact wire size of one projection: `M*K/8` u16 words then `M*K/128` FP16 scales.
+fn blob_bytes(proj: Proj) -> usize {
+    proj.m() * proj.k() / 8 * 2 + proj.m() * proj.k() / 128 * 2
+}
+
+fn expert_from_wire(label: String, proj: Proj, raw: &[u8]) -> Result<Expert> {
+    if raw.len() != blob_bytes(proj) {
+        return Err(format!("{label}: {} bytes != {}", raw.len(), blob_bytes(proj)));
+    }
+    let nw = proj.m() * proj.k() / 8;
+    let le16 = |b: &[u8]| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+    let (words, scales) = (le16(&raw[..nw * 2]), le16(&raw[nw * 2..]));
+    Ok(finish_expert(label, words, scales))
+}
+
+#[derive(Clone)]
+struct RealExpert {
+    label: String,
+    gate: Rc<Expert>,
+    down: Rc<Expert>,
+}
+impl RealExpert {
+    fn proj(&self, p: Proj) -> Rc<Expert> {
+        match p {
+            Proj::GateUp => self.gate.clone(),
+            Proj::Down => self.down.clone(),
+        }
+    }
+}
+
+struct RealSet {
+    tag: &'static str,
+    experts: Vec<RealExpert>,
+    meta: Value,
+    guard_violations: u64,
+}
+
+fn file_sha256(path: &str) -> Result<(String, u64)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let (mut h, mut n) = (Sha256::new(), 0u64);
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let k = f.read(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+        if k == 0 {
+            break;
+        }
+        h.update(&buf[..k]);
+        n += k as u64;
+    }
+    Ok((h.finalize().iter().map(|b| format!("{b:02x}")).collect(), n))
+}
+
+fn range_sha256(path: &str, offset: u64, len: usize) -> Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    f.seek(SeekFrom::Start(offset)).map_err(|e| format!("{path}: seek {offset}: {e}"))?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).map_err(|e| format!("{path}: read {len} bytes at {offset}: {e}"))?;
+    Ok(sha(&buf))
+}
+
+/// One extractor directory: four cold experts (two at layer 0, two at layer 47), both projections, strictly verified.
+fn load_real(dir: &str, verify_range: bool, rehash: bool) -> Result<RealSet> {
+    let mp = Path::new(dir).join("sample.json");
+    let raw = std::fs::read(&mp).map_err(|e| format!("{}: {e}", mp.display()))?;
+    let root: Value = serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", mp.display()))?;
+    let text = |k: &str| -> Result<String> {
+        root.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("{dir}: sample.json lacks string `{k}`"))
+    };
+    let (art_path, art_sha) = (text("artifact_path")?, text("artifact_sha256")?.to_ascii_lowercase());
+    if root.get("provisional").and_then(Value::as_bool) != Some(false) {
+        return Err(format!("{dir}: sample.json must carry `provisional: false`"));
+    }
+    if root.get("rc").and_then(Value::as_i64) != Some(0) || root.get("device").and_then(Value::as_str) != Some("cpu") {
+        return Err(format!("{dir}: extractor binding needs rc 0 and device \"cpu\" (got rc {:?}, device {:?})", root.get("rc"), root.get("device")));
+    }
+    let extractor_sha = text("extractor_source_sha256")?.to_ascii_lowercase();
+    if extractor_sha != EXTRACTOR_SHA256 {
+        return Err(format!("{dir}: extractor_source_sha256 {extractor_sha} != pinned {EXTRACTOR_SHA256}"));
+    }
+    if !root.get("argv").is_some_and(Value::is_array) {
+        return Err(format!("{dir}: sample.json must record the extractor `argv`"));
+    }
+    let (tag, pin_sha) = ARTIFACT_PINS
+        .iter()
+        .find(|(_, s)| *s == art_sha)
+        .copied()
+        .ok_or_else(|| format!("{dir}: artifact_sha256 {art_sha} is not one of the pinned artifacts"))?;
+    // No silent fallback: the artifact is only touched when its verification was requested, and then it MUST be reachable.
+    let art_size = if verify_range || rehash {
+        Some(std::fs::metadata(&art_path).map_err(|e| format!("{dir}: artifact {art_path}: {e}"))?.len())
+    } else {
+        None
+    };
+    let rehash_json = if rehash {
+        let (h, n) = file_sha256(&art_path)?;
+        if h != art_sha {
+            return Err(format!("{dir}: artifact {art_path} sha256 {h} != manifest {art_sha}"));
+        }
+        json!({"performed": true, "sha256": h, "bytes": n, "equal_to_manifest": true})
+    } else {
+        json!({"performed": false})
+    };
+    let list = root.get("samples").and_then(Value::as_array).ok_or_else(|| format!("{dir}: sample.json has no `samples` array"))?;
+    if list.len() != 4 {
+        return Err(format!("{dir}: {} samples; expected 4 (first/last cold expert of layers 0 and 47)", list.len()));
+    }
+    let mut experts: Vec<RealExpert> = Vec::new();
+    let mut recs: Vec<Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
+    let mut guard_violations = 0u64;
+    for (i, s) in list.iter().enumerate() {
+        let field = |k: &str| -> Result<u64> { s.get(k).and_then(Value::as_u64).ok_or_else(|| format!("samples[{i}]: missing integer `{k}`")) };
+        let (layer, expert) = (field("layer")?, field("expert")?);
+        if !REAL_LAYERS.contains(&layer) || expert >= 512 || !seen.insert((layer, expert)) {
+            return Err(format!("samples[{i}]: unexpected or duplicate (layer {layer}, expert {expert})"));
+        }
+        if s.get("hot").and_then(Value::as_bool) != Some(false) {
+            return Err(format!("samples[{i}] L{layer}.E{expert}: E8P samples are cold experts (`hot: false`)"));
+        }
+        let tensors = s.get("tensors").and_then(Value::as_array).ok_or_else(|| format!("samples[{i}]: missing `tensors`"))?;
+        if tensors.len() != 2 {
+            return Err(format!("samples[{i}] L{layer}.E{expert}: needs exactly gate_up_proj and down_proj"));
+        }
+        let mut loaded: [Option<Expert>; 2] = [None, None];
+        let mut trecs: Vec<Value> = Vec::new();
+        for t in tensors {
+            let kind_name = t.get("kind").and_then(Value::as_str).unwrap_or("");
+            let (proj, qt) = match kind_name {
+                "gate_up_proj" => (Proj::GateUp, 135u64),
+                "down_proj" => (Proj::Down, 136u64),
+                other => return Err(format!("samples[{i}] L{layer}.E{expert}: unknown tensor kind `{other}`")),
+            };
+            let who = format!("samples[{i}] L{layer}.E{expert}.{kind_name}");
+            if t.get("qt").and_then(Value::as_u64) != Some(qt) {
+                return Err(format!("{who}: qt {:?} != {qt}", t.get("qt")));
+            }
+            if t.get("group").and_then(Value::as_u64) != Some(128) {
+                return Err(format!("{who}: group {:?} != 128", t.get("group")));
+            }
+            let shape: Option<Vec<u64>> = t.get("shape").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect());
+            if shape.as_deref() != Some(&[proj.m() as u64, proj.k() as u64][..]) {
+                return Err(format!("{who}: shape {:?} != [{}, {}]", t.get("shape"), proj.m(), proj.k()));
+            }
+            let file = t.get("file").and_then(Value::as_str).ok_or_else(|| format!("{who}: missing `file`"))?;
+            if file.contains('/') || file.contains("..") {
+                return Err(format!("{who}: file `{file}` must be a bare name inside the sample dir"));
+            }
+            let path = Path::new(dir).join(file);
+            let bytes = std::fs::read(&path).map_err(|e| format!("{who}: {}: {e}", path.display()))?;
+            if t.get("bytes").and_then(Value::as_u64) != Some(bytes.len() as u64) {
+                return Err(format!("{who}: manifest bytes {:?} != file {}", t.get("bytes"), bytes.len()));
+            }
+            let got = sha(&bytes);
+            if t.get("sha256").and_then(Value::as_str) != Some(got.as_str()) {
+                return Err(format!("{who}: sha256 {got} != manifest {:?}", t.get("sha256")));
+            }
+            let offset = t.get("artifact_offset").and_then(Value::as_u64).ok_or_else(|| format!("{who}: missing integer `artifact_offset`"))?;
+            if verify_range {
+                if art_size.is_none_or(|n| offset + bytes.len() as u64 > n) {
+                    return Err(format!("{who}: artifact range [{offset}, +{}) is outside {art_path}", bytes.len()));
+                }
+                let h = range_sha256(&art_path, offset, bytes.len())?;
+                if h != got {
+                    return Err(format!("{who}: artifact range sha256 {h} != tensor file sha256 {got}"));
+                }
+            }
+            let e = expert_from_wire(format!("real:{tag}:L{layer}.E{expert}/{}", proj.name()), proj, &bytes)?;
+            guard_violations += e.scales.iter().filter(|&&d| e8p::writer_guard(d).is_err()).count() as u64;
+            trecs.push(json!({"kind": kind_name, "qt": qt, "file": file, "sha256": got, "bytes": bytes.len(), "artifact_offset": offset,
+                "artifact_range_reread_here": verify_range}));
+            if loaded[proj.idx()].replace(e).is_some() {
+                return Err(format!("{who}: tensor given twice"));
+            }
+        }
+        let (Some(gate), Some(down)) = (loaded[0].take(), loaded[1].take()) else {
+            return Err(format!("samples[{i}] L{layer}.E{expert}: needs both gate_up_proj and down_proj"));
+        };
+        recs.push(json!({"layer": layer, "expert": expert, "tensors": trecs}));
+        experts.push(RealExpert { label: format!("{tag}:L{layer}.E{expert}"), gate: Rc::new(gate), down: Rc::new(down) });
+    }
+    for layer in REAL_LAYERS {
+        if seen.iter().filter(|(l, _)| *l == layer).count() != 2 {
+            return Err(format!("{dir}: layer {layer} needs exactly two cold experts"));
+        }
+    }
+    let meta = json!({"dir": dir, "artifact_tag": tag, "artifact_path": art_path, "artifact_sha256": art_sha, "artifact_sha256_pinned": pin_sha,
+        "artifact_bytes": art_size, "artifact_full_rehash": rehash_json, "artifact_range_reread_here": verify_range,
+        "sample_manifest_sha256": sha(&raw), "extractor_source_sha256": extractor_sha, "extractor_rc": root.get("rc"),
+        "extractor_device": root.get("device"), "extractor_argv": root.get("argv"), "provisional": false,
+        "writer_guard_violations": guard_violations, "experts": recs});
+    Ok(RealSet { tag, experts, meta, guard_violations })
+}
+
+/// Every `--samples-dir` (at most one per pin), flattened to one expert list in command-line order.
+struct RealSets {
+    experts: Vec<RealExpert>,
+    sets: Vec<Value>,
+    bound: Vec<&'static str>,
+    guard_violations: u64,
+    gate_eligible: bool,
+}
+impl RealSets {
+    fn json(&self) -> Value {
+        if self.sets.is_empty() {
+            return Value::Null;
+        }
+        json!({"n_experts": self.experts.len(), "labels": self.experts.iter().map(|e| e.label.clone()).collect::<Vec<_>>(),
+            "bound_pins": self.bound, "pinned_artifacts": ARTIFACT_PINS.iter().map(|(t, s)| json!({"tag": t, "sha256": s})).collect::<Vec<_>>(),
+            "writer_guard_violations": self.guard_violations, "sets": self.sets})
+    }
+}
+
+fn load_real_sets(args: &Args, target: Target) -> Result<RealSets> {
+    let mut out = RealSets { experts: Vec::new(), sets: Vec::new(), bound: Vec::new(), guard_violations: 0, gate_eligible: true };
+    if args.synthetic_only && !args.samples.is_empty() {
+        return Err("--synthetic-only and --samples-dir are exclusive".into());
+    }
+    if args.samples.len() > ARTIFACT_PINS.len() {
+        return Err(format!("at most {} sample dirs (one per pinned artifact)", ARTIFACT_PINS.len()));
+    }
+    for dir in &args.samples {
+        eprintln!("[real] loading E8P samples from {dir}");
+        let s = load_real(dir, args.verify_range, args.rehash)?;
+        if out.bound.contains(&s.tag) {
+            return Err(format!("{dir}: artifact {} bound twice", s.tag));
+        }
+        out.bound.push(s.tag);
+        out.guard_violations += s.guard_violations;
+        out.sets.push(s.meta);
+        out.experts.extend(s.experts);
+    }
+    if out.experts.len() > usize::from(u8::MAX) {
+        return Err("too many real experts".into());
+    }
+    if let Some(pin) = target.required_pin() {
+        if args.samples.is_empty() && !args.synthetic_only {
+            return Err(format!("{} needs --samples-dir binding the `{pin}` artifact (or --synthetic-only for a diagnostic run)\n{USAGE}", target.name()));
+        }
+        out.gate_eligible = out.bound.contains(&pin);
+    }
+    Ok(out)
 }
 
 fn decode_o(words: &[u16]) -> Vec<i8> {
@@ -550,8 +878,8 @@ struct Scenario {
     kinds: Vec<Kind>,
 }
 
-fn scenarios() -> Vec<Scenario> {
-    let base = vec![Kind::Random, Kind::EveryWord, Kind::Extreme, Kind::Parity];
+/// Row-count sweep: tile expert `n % base.len()`, `x_row_div` 1 and 10, a trailing sentinel tile that must store nothing.
+fn sweep(base: &[Kind], prefix: &str) -> Vec<Scenario> {
     let mut out = Vec::new();
     for (div, rows_per) in [(1usize, 20usize), (10, 4)] {
         for n in [1usize, 2, 7, 8, 15, 16, 17, 33] {
@@ -559,17 +887,15 @@ fn scenarios() -> Vec<Scenario> {
                 .map(|i| ((i * 7 + 3) % (rows_per * div)) as i32)
                 .collect();
             let mut tiles = tiles_for((n % base.len()) as i32, slots);
-            tiles.push(sentinel_tile()); // trailing sentinel tile: must store nothing
-            out.push(Scenario {
-                name: format!("rows{n}_div{div}"),
-                div,
-                rows: rows_per,
-                tiles,
-                kinds: base.clone(),
-            });
+            tiles.push(sentinel_tile());
+            out.push(Scenario { name: format!("{prefix}rows{n}_div{div}"), div, rows: rows_per, tiles, kinds: base.to_vec() });
         }
     }
-    // mixed experts, non-monotone expert and slot order, pad holes, mid-sequence and trailing sentinel tiles
+    out
+}
+
+/// Mixed experts (`kinds[e]` is expert `e`, four of them), non-monotone expert and slot order, pad holes, mid-sequence and trailing sentinel tiles.
+fn mixed(name: String, kinds: Vec<Kind>) -> Scenario {
     let mut tiles = tiles_for(2, vec![5, 3, 19, 0, 1, 2, 11, 12]);
     tiles.push(sentinel_tile());
     tiles.extend(tiles_for(0, (0..17).map(|i| (i * 3 % 20) as i32).collect()));
@@ -577,13 +903,13 @@ fn scenarios() -> Vec<Scenario> {
     tiles.extend(tiles_for(3, vec![14, 6, 9]));
     tiles.push(tile(0, &[-1, 4, -1, 9]));
     tiles.push(sentinel_tile());
-    out.push(Scenario {
-        name: "mixed_experts_unsorted_pad".into(),
-        div: 1,
-        rows: 20,
-        tiles,
-        kinds: vec![Kind::Random, Kind::Extreme, Kind::EveryWord, Kind::Parity],
-    });
+    Scenario { name, div: 1, rows: 20, tiles, kinds }
+}
+
+fn scenarios() -> Vec<Scenario> {
+    let base = vec![Kind::Random, Kind::EveryWord, Kind::Extreme, Kind::Parity];
+    let mut out = sweep(&base, "");
+    out.push(mixed("mixed_experts_unsorted_pad".into(), vec![Kind::Random, Kind::Extreme, Kind::EveryWord, Kind::Parity]));
     for (tag, first) in [("sentinel_ff", 0x3cffu16), ("sentinel_00", 0x3c00u16)] {
         out.push(Scenario {
             name: format!("{tag}_last_row_chunk"),
@@ -594,6 +920,22 @@ fn scenarios() -> Vec<Scenario> {
         });
     }
     out
+}
+
+/// The same sweep and mixed-expert geometry over the `count` (>= 4) real experts loaded from `--samples-dir`.
+fn real_scenarios(count: usize) -> Vec<Scenario> {
+    let base: Vec<Kind> = (0..count).map(|i| Kind::Real(i as u8)).collect();
+    let mut out = sweep(&base, "real_");
+    out.push(mixed("real_mixed_experts_unsorted_pad".into(), vec![Kind::Real(2), Kind::Real(0), Kind::Real(3), Kind::Real(1)]));
+    out
+}
+
+fn all_scenarios(real: usize) -> Vec<Scenario> {
+    let mut v = scenarios();
+    if real > 0 {
+        v.extend(real_scenarios(real));
+    }
+    v
 }
 
 /// One slab buffer: each expert's tensor at a 256-byte aligned offset, 0xFF guards before, between and after.
@@ -943,6 +1285,8 @@ struct Ctx<'a> {
     neg: u8,
     seed: u32,
     experts: RefCell<HashMap<(String, Proj), Rc<Expert>>>,
+    target: Target,
+    real: Vec<RealExpert>,
 }
 
 #[derive(Default)]
@@ -961,6 +1305,9 @@ struct Counts {
 
 impl Ctx<'_> {
     fn expert(&self, kind: Kind, proj: Proj) -> Result<Rc<Expert>> {
+        if let Kind::Real(i) = kind {
+            return self.real.get(usize::from(i)).map(|r| r.proj(proj)).ok_or_else(|| format!("real expert {i} is not loaded"));
+        }
         let key = (kind.label(), proj);
         if let Some(e) = self.experts.borrow().get(&key) {
             return Ok(e.clone());
@@ -1140,7 +1487,7 @@ impl Ctx<'_> {
         }
         let live_slots = slot_ids.iter().filter(|&&s| s >= 0).count();
         let report = json!({
-            "scenario": sc.name, "proj": proj.name(), "symbol": proj.symbol(), "x_row_div": sc.div, "x_rows": sc.rows,
+            "scenario": sc.name, "proj": proj.name(), "symbol": proj.symbol(self.target), "x_row_div": sc.div, "x_rows": sc.rows,
             "tiles": ntiles, "live_slots": live_slots, "pad_slots": m_total - live_slots,
             "sentinel_tiles": sc.tiles.iter().filter(|t| t.0 < 0).count(),
             "experts": experts.iter().map(|e| json!({"label": e.label, "wire_sha256": e.sha256, "wire_bytes": e.bytes.len(), "stats": e.stats})).collect::<Vec<_>>(),
@@ -1168,6 +1515,12 @@ struct Args {
     out: Option<PathBuf>,
     card: Option<String>,
     expect_bdf: Option<String>,
+    expect_arch: Option<String>,
+    expect_uuid: Option<String>,
+    samples: Vec<String>,
+    verify_range: bool,
+    rehash: bool,
+    synthetic_only: bool,
     seed: u32,
     neg: u8,
     probe_ka: Option<usize>,
@@ -1181,8 +1534,13 @@ fn parse_args() -> Result<Args> {
     };
     let mut it = std::env::args().skip(1);
     while let Some(f) = it.next() {
-        if f == "--overwrite" {
-            a.overwrite = true;
+        if matches!(f.as_str(), "--overwrite" | "--verify-artifact-range" | "--rehash-artifact" | "--synthetic-only") {
+            match f.as_str() {
+                "--overwrite" => a.overwrite = true,
+                "--verify-artifact-range" => a.verify_range = true,
+                "--rehash-artifact" => a.rehash = true,
+                _ => a.synthetic_only = true,
+            }
             continue;
         }
         let v = it
@@ -1194,6 +1552,9 @@ fn parse_args() -> Result<Args> {
             "--out" => a.out = Some(v.into()),
             "--card" => a.card = Some(v),
             "--expect-bdf" => a.expect_bdf = Some(v.to_ascii_lowercase()),
+            "--expect-arch" => a.expect_arch = Some(v),
+            "--expect-uuid" => a.expect_uuid = Some(v),
+            "--samples-dir" => a.samples.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
             "--seed" => a.seed = v.parse().map_err(err)?,
             "--negative-control" => a.neg = v.parse().map_err(err)?,
             "--probe-kernarg-bytes" => a.probe_ka = Some(v.parse().map_err(err)?),
@@ -1229,6 +1590,12 @@ fn run() -> Result<i32> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let command: Vec<String> = std::env::args().collect();
+    let target = Target::of_name(args.expect_arch.as_deref().unwrap_or("gfx1201"))
+        .ok_or_else(|| format!("--expect-arch {:?}: this oracle serves gfx1201 and gfx1151\n{USAGE}", args.expect_arch))?;
+    if target == Target::Gfx1151 && args.expect_bdf.is_none() {
+        return Err(format!("gfx1151 has no ROCr UUID: --expect-bdf is required (--expect-uuid is optional)\n{USAGE}"));
+    }
+    let real = load_real_sets(&args, target)?;
 
     // K-E0 self-check: SWAR unpack == reference unpack over every wire word (frozen functions, no new arithmetic).
     let (lut, mask) = (e8p::build_lut(), e8p::build_mask());
@@ -1244,13 +1611,14 @@ fn run() -> Result<i32> {
 
     let hip = HipRuntime::load().map_err(err)?;
     let id = hip.current_device().map_err(err)?;
-    let (uuid, bdf, arch) = (
-        hip.device_uuid(id).map_err(err)?,
-        hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase(),
-        hip.get_arch(id).map_err(err)?,
-    );
-    if arch != "gfx1201" {
-        return Err(format!("expected gfx1201, got {arch}"));
+    let (uuid, bdf, arch) = (hip.device_uuid(id).map_err(err)?, hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase(), hip.get_arch(id).map_err(err)?);
+    if arch != target.name() {
+        return Err(format!("expected {}, got {arch}", target.name()));
+    }
+    if let Some(u) = &args.expect_uuid {
+        if !uuid.eq_ignore_ascii_case(u) {
+            return Err(format!("expected UUID {u}, got {uuid}"));
+        }
     }
     if let Some(b) = &args.expect_bdf {
         if *b != bdf {
@@ -1293,15 +1661,10 @@ fn run() -> Result<i32> {
             .map_err(err)?,
         ka,
     };
-    let getf = |name: &str| {
-        hip.module_get_function(&m_e8p, name)
-            .map_err(|e| format!("{name}: {e}"))
-    };
-    let acc = [
-        getf(&format!("{SYM_GATE_UP}_acc"))?,
-        getf(&format!("{SYM_DOWN}_acc"))?,
-    ];
-    let ship = [getf(SYM_GATE_UP)?, getf(SYM_DOWN)?];
+    let getf = |name: &str| hip.module_get_function(&m_e8p, name).map_err(|e| format!("{name}: {e}"));
+    let (sym_gu, sym_dn) = (Proj::GateUp.symbol(target), Proj::Down.symbol(target));
+    let acc = [getf(&format!("{sym_gu}_acc"))?, getf(&format!("{sym_dn}_acc"))?];
+    let ship = [getf(&sym_gu)?, getf(&sym_dn)?];
     let e8p_kernarg = |sym: &str| -> Result<usize> {
         match metadata_kernarg_size(&e8p_img, sym) {
             Some(64) => Ok(64),
@@ -1310,7 +1673,7 @@ fn run() -> Result<i32> {
             )),
         }
     };
-    let e8p_ka = [e8p_kernarg(SYM_GATE_UP)?, e8p_kernarg(SYM_DOWN)?];
+    let e8p_ka = [e8p_kernarg(&sym_gu)?, e8p_kernarg(&sym_dn)?];
     let hook = Hook {
         hip: &hip,
         probe,
@@ -1322,23 +1685,15 @@ fn run() -> Result<i32> {
         dag_calls: Cell::new(0),
     };
     let (div_kat, div_kat_ok) = hook.divide_known_answer()?;
-    let ctx = Ctx {
-        hip: &hip,
-        hook,
-        acc,
-        ship,
-        ka: e8p_ka,
-        neg: args.neg,
-        seed: args.seed,
-        experts: RefCell::new(HashMap::new()),
-    };
+    let ctx = Ctx { hip: &hip, hook, acc, ship, ka: e8p_ka, neg: args.neg, seed: args.seed, experts: RefCell::new(HashMap::new()), target, real: real.experts.clone() };
 
     let mut rows: Vec<Value> = Vec::new();
     let mut tot = Counts::default();
     let mut first_mismatch: Option<Value> = None;
+    let scs = all_scenarios(ctx.real.len());
     for proj in Proj::ALL {
-        for sc in scenarios() {
-            let (mut r, c) = ctx.run_one(&sc, proj)?;
+        for sc in &scs {
+            let (mut r, c) = ctx.run_one(sc, proj)?;
             if first_mismatch.is_none() {
                 let f = if c.acc_bad > 0 {
                     Some(("acc_f32", r["acc_first"][0].clone()))
@@ -1368,20 +1723,17 @@ fn run() -> Result<i32> {
         }
     }
     let hk = &ctx.hook;
-    let (div_rn_bad, div_ieee_bad) = (
-        hk.div_vs_fdiv_rn_mismatch.get(),
-        hk.div_vs_ieee_mismatch.get(),
-    );
-    let mismatch_total =
-        tot.acc_bad + tot.h_bad + swar_bad + div_rn_bad + div_ieee_bad + u64::from(!div_kat_ok);
-    let pass = mismatch_total == 0;
+    let (div_rn_bad, div_ieee_bad) = (hk.div_vs_fdiv_rn_mismatch.get(), hk.div_vs_ieee_mismatch.get());
+    let mismatch_total = tot.acc_bad + tot.h_bad + swar_bad + div_rn_bad + div_ieee_bad + u64::from(!div_kat_ok);
+    let pass = mismatch_total == 0 && real.guard_violations == 0;
     let rc = if pass { 0 } else { 3 };
-    let scenario_names: Vec<String> = scenarios().iter().map(|s| s.name.clone()).collect();
+    let scenario_names: Vec<String> = scs.iter().map(|s| s.name.clone()).collect();
     let receipt = json!({
-        "schema": SCHEMA, "started_unix": started, "rc": rc, "pass": pass,
+        "schema": target.schema(), "target_arch": target.name(), "started_unix": started, "rc": rc, "pass": pass,
         "command": command.join(" "), "argv": command,
         "fabric": {"runner": FABRIC_RUNNER, "under_fabric": std::env::var_os("FABRIC_JOB").is_some(), "FABRIC_JOB": env_or_null("FABRIC_JOB"), "FABRIC_CARDS": env_or_null("FABRIC_CARDS")},
-        "device": {"uuid": uuid, "bdf": bdf, "arch": arch, "card_arg": card, "expect_bdf": args.expect_bdf,
+        "device": {"uuid": uuid, "bdf": bdf, "arch": arch, "card_arg": card, "expect_bdf": args.expect_bdf, "expect_uuid": args.expect_uuid,
+            "uuid_authoritative": target != Target::Gfx1151,
             "env": {"HIPFIRE_DEVICES": env_or_null("HIPFIRE_DEVICES"), "ROCR_VISIBLE_DEVICES": env_or_null("ROCR_VISIBLE_DEVICES"), "HIP_VISIBLE_DEVICES": env_or_null("HIP_VISIBLE_DEVICES")}},
         "inputs": {
             "e8p_module": {"path": e8p_path.display().to_string(), "bytes": e8p_img.len(), "sha256": sha(&e8p_img), "kernarg_bytes": {"gate_up": e8p_ka[0], "down": e8p_ka[1]}},
@@ -1389,7 +1741,9 @@ fn run() -> Result<i32> {
             "harness": {"source": "crates/hipfire-runtime/examples/qwen4_moe_sym_e8p_g1_oracle.rs", "sha256": sha(HARNESS_SRC), "embedded_at_build": true},
             "k_e0_reference": {"source": "crates/hipfire-runtime/src/e8p_i4_reference.rs", "sha256": sha(REFERENCE_SRC), "embedded_at_build": true, "books_sha256": e8p::E8P_BOOKS_SHA256},
         },
-        "symbols": {"gate_up": SYM_GATE_UP, "down": SYM_DOWN, "acc_suffix": "_acc", "probe": ["g1_probe_exp2", "g1_probe_ldexp", "g1_probe_div"]},
+        "real_samples": real.json(),
+        "gate_eligible": real.gate_eligible,
+        "symbols": {"gate_up": sym_gu, "down": sym_dn, "acc_suffix": "_acc", "probe": ["g1_probe_exp2", "g1_probe_ldexp", "g1_probe_div"]},
         "seed": args.seed, "negative_control": args.neg,
         "geometry": {"gate_up": {"m": 1280, "k": 2560, "threads": 64, "h_cols": 640}, "down": {"m": 2560, "k": 640, "threads": 128, "h_cols": 2560}, "tile_slots": 16, "grid": "(M/64, tiles, 1)", "static_lds_bytes": 1536},
         "checks": {

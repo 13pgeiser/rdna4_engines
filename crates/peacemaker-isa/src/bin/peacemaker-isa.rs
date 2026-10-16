@@ -342,6 +342,53 @@ fn qwen4_moe_sym_e8p(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String>
         serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
     ))
 }
+/// gfx11 NT1 grouped E8P-I4 K2 entries (`kernels::qwen4_moe_sym_gfx11`, gfx1100 and gfx1151; one instruction path, arch-forced deltas
+/// only): `--epi all` (default) is the `qwen4_moe_iu4_sym_e8p_pm_<arch>` module (BF16 gate/up, BF16 down, then the `_acc` pair);
+/// `gate_up`/`down` one shipped-shape entry, `gate_up_acc`/`down_acc` one F32 qualification entry.
+fn qwen4_moe_sym_gfx11_e8p(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
+    use peacemaker_isa::kernels::{
+        iu4_gemm,
+        qwen4_moe_sym_gfx11::{self as k2, Codec, Kind, Negative, Spec},
+    };
+    let spec = |kind, acc| Spec {
+        arch,
+        codec: Codec::E8p,
+        kind,
+        acc,
+        negative: Negative::None,
+    };
+    if epi == "all" {
+        let mut entries = Vec::new();
+        for acc in [false, true] {
+            for kind in Kind::ALL {
+                entries.push(k2::emit(spec(kind, acc))?)
+            }
+        }
+        let (text, proof) = iu4_gemm::module(&entries, &Codec::E8p.module(arch))?;
+        return Ok((
+            text,
+            serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+        ));
+    }
+    let (name, acc) = match epi.strip_suffix("_acc") {
+        Some(n) => (n, true),
+        None => (epi, false),
+    };
+    let kind = match name {
+        "gate_up" => Kind::GateUp,
+        "down" => Kind::Down,
+        _ => {
+            return Err(format!(
+                "qwen4_moe_sym_gfx11_e8p --epi {epi} (gate_up|down|gate_up_acc|down_acc|all)"
+            ))
+        }
+    };
+    let e = k2::emit(spec(kind, acc))?;
+    Ok((
+        e.s_text,
+        serde_json::to_vec_pretty(&e.proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// `--epi all` (default) emits the convert and attention symbols as one module; `convert`/`attend` one symbol.
 fn qsa_gather(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::qsa_gather::{self, Kind, Spec};
@@ -1204,6 +1251,9 @@ fn run() -> Result<(), String> {
         "qwen4_moe_sym_w3" => qwen4_moe_sym_w3(epi.as_deref().unwrap_or("all"), arch)?,
         "qwen4_moe_sym_w3_nt4" => qwen4_moe_sym_w3_nt4(epi.as_deref().unwrap_or("all"), arch)?,
         "qwen4_moe_sym_e8p" => qwen4_moe_sym_e8p(epi.as_deref().unwrap_or("all"), arch)?,
+        "qwen4_moe_sym_gfx11_e8p" => {
+            qwen4_moe_sym_gfx11_e8p(epi.as_deref().unwrap_or("all"), arch)?
+        }
         "qsa_gather" => qsa_gather(epi.as_deref().unwrap_or("all"), arch)?,
         "qsa_select" => qsa_select(epi.as_deref().unwrap_or("all"), arch)?,
         "dflash_accept" => dflash_accept(epi.as_deref().unwrap_or("all"), arch)?,

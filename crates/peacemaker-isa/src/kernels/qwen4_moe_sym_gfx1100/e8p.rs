@@ -269,8 +269,8 @@ pub(super) fn stage_addresses(b: &mut Builder) -> Result<(), String> {
 /// Stage `LUT` and `MASK` once per CTA: every wave writes its share of the typed region, drains, and the
 /// single workgroup barrier publishes it. All waves take the same path to the barrier (the early exits are
 /// workgroup-uniform; the per-wave LUT blocks are `skip_unless` joins before it).
-pub(super) fn stage(
-    wg: &mut Wg<'_>,
+pub(super) fn stage<T: Gfx11>(
+    wg: &mut Wg<'_, T>,
     g: &Gen,
     tables: LdsRegion<Tables, Free>,
 ) -> Result<LdsRegion<Tables, Published>, String> {
@@ -441,8 +441,8 @@ fn load_epoch(b: &mut Builder, g: &Gen) -> Result<(), String> {
 
 /// Unpack step `i` (every tensor's raw dword `i`, two wire words each) into `a_out(t, i)`: the table
 /// addresses and lookups of all words are issued first, then the per-word network runs on the landed values.
-fn unpack_step(
-    w: &mut Wave<'_, Gfx1100, Builder>,
+fn unpack_step<T: Gfx11>(
+    w: &mut Wave<'_, T, Builder>,
     g: &Gen,
     i: u8,
     tables: &LdsRegion<Tables, Published>,
@@ -625,12 +625,12 @@ fn fold(b: &mut Builder, c: u8, sum: u8, sc: u8, d: u8, sm: u8, t: u8) -> Result
 
 /// Fold the epoch whose operands are in the registers: scale broadcast, eight unpack+WMMA steps, `s - MAGIC`,
 /// the `2C + s` / quarter fold.
-fn compute(
-    w: &mut Wave<'_, Gfx1100, Builder>,
+fn compute<T: Gfx11>(
+    w: &mut Wave<'_, T, Builder>,
     g: &Gen,
     tables: &LdsRegion<Tables, Published>,
 ) -> Result<(), String> {
-    let a = Arch::Gfx1100;
+    let a = g.spec.arch;
     let tn = g.tn();
     for t in 0..tn {
         let b = w.isa();
@@ -693,7 +693,7 @@ fn compute(
     Ok(())
 }
 
-fn cmp(wg: &mut Wg<'_>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
+fn cmp<T: Gfx11>(wg: &mut Wg<'_, T>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(
         text,
         vec![],
@@ -704,8 +704,8 @@ fn cmp(wg: &mut Wg<'_>, text: String, uses: &[u8]) -> Result<WgUniform<Scc>, Str
 /// The epoch loop of an E8P entry (one K128 epoch per trip, like the MQ4/W2/W3 loop, with the LDS tables
 /// carried through the loop). Places `k_begin`; leaves the builder at the fall-through into the
 /// caller's `epilogue` label with an empty wait ledger.
-pub(super) fn run_loop(
-    wg: &mut Wg<'_>,
+pub(super) fn run_loop<T: Gfx11>(
+    wg: &mut Wg<'_, T>,
     g: &Gen,
     tables: LdsRegion<Tables, Published>,
 ) -> Result<(), String> {
@@ -1014,7 +1014,9 @@ pub fn prove() -> Proof {
     for kind in [Kind::GateUp, Kind::Down] {
         for acc in [false, true] {
             let g = Gen {
+                // The register plan never reads the arch: one layout serves both gfx11 targets.
                 spec: Spec {
+                    arch: Arch::Gfx1100,
                     codec: Codec::E8p,
                     kind,
                     acc,
