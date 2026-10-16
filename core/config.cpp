@@ -97,6 +97,17 @@ static const Flag g_flags[] = {
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
 
+    { "--lora",               "ADAPTER", "NAME=PATH: serve a PEFT LoRA adapter beside the base model,\n"
+    "                                    as model NAME (repeatable). The base stays as it is; each\n"
+    "                                    request picks its adapter by `model`"},
+    { "--max-loras",          "N",      "adapter slots resident at once (default: the number of\n"
+    "                                    --lora). Each slot holds one adapter's A/B on the card"},
+    { "--max-lora-rank",      "R",      "the rank each slot is sized for (default 16); a smaller\n"
+    "                                    adapter is zero-padded, a larger one refused"},
+    { "--lora-target-modules", "LIST",  "comma-separated HF module names adapters may target\n"
+    "                                    (q_proj,k_proj,...). Default: what the --lora adapters\n"
+    "                                    target. Needed with --max-loras and no --lora"},
+
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
     "                                    set cannot change under the heat engine. The sampler is\n"
@@ -489,6 +500,33 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
+        else if (S("--lora")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            const char* eq = std::strchr(v, '=');
+            if (!eq || eq == v || !eq[1]) {
+                RAD_ERR("--lora wants NAME=PATH, got '%s'", v);
+                return RAD_E_INVAL;
+            }
+            c->lora.adapters.emplace_back(std::string(v, eq), std::string(eq + 1));
+        }
+        else if (S("--max-loras"))             { if (!num(0, 64, &c->lora.max_loras)) return RAD_E_INVAL; }
+        else if (S("--max-lora-rank"))         { if (!num(1, 512, &c->lora.max_rank)) return RAD_E_INVAL; }
+        else if (S("--lora-target-modules")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            c->lora.targets.clear();
+            std::string cur;
+            for (const char* q = v;; ++q) {
+                if (*q == ',' || !*q) {
+                    if (!cur.empty()) c->lora.targets.insert(cur);
+                    cur.clear();
+                    if (!*q) break;
+                } else if (*q != ' ') cur += *q;
+            }
+            if (c->lora.targets.empty()) {
+                RAD_ERR("--lora-target-modules names no module");
+                return RAD_E_INVAL;
+            }
+        }
         /* The prefix cache has no disk tier; the removed flags name their replacements. */
         else if (S("--prefix-cache-host-mib")) {
             RAD_ERR("--prefix-cache-host-mib was renamed: use --prefix-cache-mib");
@@ -902,6 +940,17 @@ const ShowRow kShow[] = {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--lora",               [](const Config& c) {
+          std::string o;
+          for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;
+          return o.empty() ? std::string("none") : o; } },
+    { "--max-loras",          [](const Config& c) {
+          return c.lora.enabled() ? num(c.lora.slots()) : std::string("0 (off)"); } },
+    { "--max-lora-rank",      [](const Config& c) { return num(c.lora.max_rank); } },
+    { "--lora-target-modules", [](const Config& c) {
+          std::string o;
+          for (const std::string& t : c.lora.targets) o += (o.empty() ? "" : ",") + t;
+          return o.empty() ? std::string(c.lora.enabled() ? "the adapters' own" : "-") : o; } },
     { "--placement",          [](const Config& c) { return c.placement; } },
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },

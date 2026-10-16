@@ -461,6 +461,18 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's output view starts inside a "
                                               "row, so its token rows cannot be told");
     const int64_t r0 = ya.offset / yw;
+    /* ...and the activation must be the SAME rows: shrink reads x's row m and expand writes y's
+     * row m with one slot, so a GEMM whose two views start at different tokens cannot be followed. */
+    {
+        const int64_t xw = xd.rank >= 2 ? xd.shape[xd.rank - 1] : 0;
+        if (xw <= 0 || (xa.cols == 0 && xa.offset % xw != 0) || xa.offset / xw != r0)
+            return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's activation and output "
+                                                  "views do not start at the same token row");
+    }
+    if (op_domain_[s.shrink].load(std::memory_order_relaxed) != RAD_DOMAIN_DEVICE ||
+        op_domain_[s.expand].load(std::memory_order_relaxed) != RAD_DOMAIN_DEVICE)
+        return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: the adapter ops were placed off "
+                                                    "the device the gemm runs on");
     if (r0 < 0 || r0 + n > batch_->n_tok)
         return abort_step_msg(h, RAD_E_STATE,
                               fmt("LoRA site: the gemm wrote rows [%lld, %lld) of a %lld-token step",

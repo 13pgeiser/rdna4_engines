@@ -119,6 +119,10 @@ struct ServerOptions {
      * clock only mean something under load: queried during a long prefill, it tells a link parked
      * below its maximum from one at rest. */
     std::function<std::string()> diagnostics_json;
+    /* RUNTIME LoRA (Engine::lora_resolve): a request's `model` naming a loaded adapter gets that
+     * adapter's slot and load uid. Unset with LoRA off, and then any `model` is served by the base. */
+    std::function<int(const std::string&, int32_t*, uint64_t*)> lora_resolve;
+    std::function<std::vector<std::string>()>                  lora_names;
 
     std::string api_key;
     bool        cors = true;

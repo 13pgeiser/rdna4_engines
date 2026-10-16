@@ -2076,6 +2076,12 @@ int Engine::run_server() {
     o.graph_json  = [this] { return dump_graph_json(ranks_[0]->program); };
     /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
+    if (cfg_.lora.enabled()) {
+        o.lora_resolve = [this](const std::string& m, int32_t* slot, uint64_t* uid) {
+            return lora_resolve(m, slot, uid);
+        };
+        o.lora_names = [this] { return lora_names(); };
+    }
 
     /* Media, when the program declared an encoder. The processor's geometry comes from the
      * container and the encoder states its own; patch width and merge must agree, checked here

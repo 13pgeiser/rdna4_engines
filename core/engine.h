@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include <set>
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
@@ -133,6 +134,21 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
+    /* RUNTIME LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
+     * into slots after every rank's Ctx is bound, and a request's `model` names one. */
+    int lora_targets();
+    int lora_start();
+public:
+    int lora_load(const std::string& name, const std::string& dir, std::string* err);
+    /* RAD_OK with the slot and the uid of its load, RAD_E_NOTFOUND for a name no slot holds. */
+    int lora_resolve(const std::string& name, int32_t* slot, uint64_t* uid) const;
+    std::vector<std::string> lora_names() const;
+private:
+    struct LoraSlotState { std::string name, dir; uint64_t uid = 0; };
+    std::vector<LoraSlotState> lora_slots_;
+    uint64_t                   lora_next_uid_ = 1;
+    mutable std::mutex         lora_mu_;
+    std::set<std::string>      lora_targets_;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup

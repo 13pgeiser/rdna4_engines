@@ -284,6 +284,18 @@ struct KVBinding final : IKVManager {
  * and segment: the same picture at the same place hits, two pictures never alias. */
 inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
     out->clear();
+    /* THE RUNTIME LoRA ADAPTER IS PART OF EVERY BLOCK'S KEY. KV written under an adapter is not
+     * the base's, so it rides into the chain as one span over the whole sequence, keyed by the
+     * adapter's load uid -- every block overlaps it, and with uid 0 (the base) there is no span and
+     * every hash is what it was before adapters existed. The uid, never the name: a reload under
+     * the same name is new weights and must start cold. */
+    if (r.lora_uid != 0) {
+        MMContentKey k;
+        k.tok_begin = 0;
+        k.tok_end = INT32_MAX;
+        k.hash = (r.lora_uid * 0x9e3779b97f4a7c15ull) ^ 0x4c6f5241ull;   /* "LoRA" */
+        out->push_back(k);
+    }
     if (!r.media) return;
     const mm::PromptMedia& pm = *r.media;
     for (const mm::RopeLayout::Run& run : pm.rope.runs) {

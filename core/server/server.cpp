@@ -388,6 +388,26 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* RUNTIME LoRA: `model` picks the adapter. The served model's own name, or no name, is the
+     * base; with adapters enabled anything else must be a loaded adapter -- a typo served by the
+     * base would answer as the wrong model and say nothing. */
+    int32_t  lora_slot = -1;
+    uint64_t lora_uid = 0;
+    if (opt_.lora_resolve && !r.model.empty() && r.model != opt_.model_id) {
+        if (opt_.lora_resolve(r.model, &lora_slot, &lora_uid) != RAD_OK) {
+            std::string names = opt_.model_id;
+            if (opt_.lora_names)
+                for (const std::string& n : opt_.lora_names()) names += ", " + n;
+            ApiError e;
+            e.status = 404;
+            e.type = "not_found_error";
+            e.param = "model";
+            e.message = "no such model or adapter: " + r.model + " (served: " + names + ")";
+            *err = e;
+            return RAD_E_NOTFOUND;
+        }
+    }
+
     int idx = 0;
     std::vector<Request> rqs;
     rqs.reserve(r.prompts.size() * (size_t)r.n);
@@ -422,6 +442,8 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;
             rq.session_label = r.session_label;
+            rq.lora_slot = lora_slot;
+            rq.lora_uid = lora_uid;
             rq.sink = g.sink.get();
             rqs.push_back(std::move(rq));
             gens->push_back(std::move(g));

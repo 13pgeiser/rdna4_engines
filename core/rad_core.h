@@ -6,6 +6,7 @@
  */
 #pragma once
 #include "rad_internal.h"
+#include "lora/config.h"
 
 #include <map>
 #include <memory>
@@ -665,6 +666,7 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
