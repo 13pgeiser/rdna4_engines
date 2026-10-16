@@ -883,9 +883,10 @@ Caveats that are part of the fixture, not trivia:
   like the first native window of a depth), taken when at least the native
   chooser's rate; otherwise the window is native. The head's own first draft
   (row-0 argmax, before any sampled draw) must equal the first candidate only
-  until the copy source is established: a take of at least 4 candidates with
+  until the copy source is established: a take of at least 5 candidates with
   depth-1 acceptance at least 0.9 over at least 4 windows of evidence
-  (provisional constants) **and** the last shadow observation having accepted
+  (checked against agentic-chain replays, `NGRAM_UNCONFIRMED_MIN_*`)
+  **and** the last shadow observation having accepted
   its first candidate (`ngram_last_first_accepted`, so a divergence costs at
   most one blind window) runs with no head row-0 step.
   `take_cap = min(n_max, row-exact verify rows - 1)`, where the rows are the

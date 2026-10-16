@@ -810,16 +810,22 @@ const MTP_ROW_COST_PRIOR_WEIGHT: f64 = 0.5;
 const NGRAM_DEPTHS: usize = QWEN4_SPEC_VERIFY_ROWS - 1;
 /// Fewest candidates of a takeover that may skip the head's row-0
 /// confirmation, once the copy source is established (see
-/// [`NGRAM_UNCONFIRMED_MIN_ACCEPT`]). Provisional: not yet tuned against
-/// hardware measurements.
-const NGRAM_UNCONFIRMED_MIN_TAKE: usize = 4;
+/// [`NGRAM_UNCONFIRMED_MIN_ACCEPT`]). Checked against teacher-forced replays
+/// of the real agentic chain (Halo `h1`, 17 requests at 45K-220K, and the
+/// R9700 smoke chain; `release-0.4.3/ngram-copy-research/rowzero-tune.md`,
+/// a simulation, not a hardware measurement): 5 instead of the provisional 4
+/// kept the replay's tokens per AR-cost unit (-0.03% Halo, +0.38% R9700)
+/// and cut blind first-candidate divergences (Halo 10.3% of skipped
+/// confirmations vs 11.5%). Lowering [`NGRAM_UNCONFIRMED_MIN_ACCEPT`] to 0.8
+/// bought at most 1.2% and diverged on 19% of skipped confirmations.
+const NGRAM_UNCONFIRMED_MIN_TAKE: usize = 5;
 /// Depth-1 n-gram acceptance (`ngram_agreement[0]`'s ratio) an unconfirmed
-/// takeover needs. Provisional, as [`NGRAM_UNCONFIRMED_MIN_TAKE`].
+/// takeover needs (kept at 0.9 by the replay grid above).
 const NGRAM_UNCONFIRMED_MIN_ACCEPT: f32 = 0.9;
 /// Decayed windows of evidence (`ngram_agreement[0]`'s weight) behind that
 /// acceptance before an unconfirmed takeover may run: the table starts at the
-/// prior's weight, which no confirmation-free takeover may rest on.
-/// Provisional, as [`NGRAM_UNCONFIRMED_MIN_TAKE`].
+/// prior's weight, which no confirmation-free takeover may rest on (kept at
+/// 4 by the replay grid above; 2 and 8 were no better).
 const NGRAM_UNCONFIRMED_MIN_EVIDENCE: f32 = 4.0;
 /// Draft depths tracked (the drafter's K is clamped to this).
 pub(crate) const MTP_MAX_DEPTH: usize = 10;

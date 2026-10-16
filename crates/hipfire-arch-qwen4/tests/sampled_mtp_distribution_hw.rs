@@ -108,6 +108,51 @@
 //! reaches the n-gram arms and `copy_ar` exactly as above, so a presence-1.5
 //! run checks penalized `p` on the n-gram rows (one output dir per config).
 //!
+//! # Long copy arms
+//!
+//! `sampled_mtp_copy_long_matches_ar_distribution_on_flash_next` compares
+//! `copy_long_batched` and `copy_long_adaptive` with `copy_long_ar` on a longer
+//! verbatim-rewrite fixture: 48 IDs per cold trial, at least 2000 trials,
+//! using the loaded GPU's product `ngram_mod_triple_for_arch` (5/1/63 on
+//! gfx1151/gfx1201), recorded in each config. The pool is CPU-prechecked for
+//! 48 continuation tokens. Marginals at 0,1,2,3,7,11,15,23,31,47 and joints
+//! (0,1), (7,8), (15,16), (31,32) use the same pooled homogeneity test and
+//! `ALPHA`. Batched is forced floor-off and replays the first `REPLAYS` seeds
+//! with identical IDs and window counters; adaptive uses the default floor
+//! and route, with no replay. Each MTP arm must show n-gram windows and at
+//! least one takeover verifying seed + >=4 candidates (>=5 rows); the report
+//! also states whether public window data can count unconfirmed takeovers.
+//!
+//! Run from the repository root (set `MODEL` and `OUT` first). Use the SAME
+//! sampling/penalty/runtime environment and executable for all shards and
+//! the parent; each shard's config/receipt/stats/evidence/text accompanies
+//! `<arm>.<START>-<END>.ids.json`. Smaller disjoint ranges fit 600-second
+//! holds; seeds use global trial indices, not shard-local indices:
+//!
+//! ```sh
+//! export HIPFIRE_MTP_IDENTITY_MODEL="$MODEL" HIPFIRE_SAMPLED_MTP_OUT="$OUT"
+//! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
+//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING
+//! # Repeat START..END ranges to cover 0..2000 for EACH arm.
+//! export HIPFIRE_SAMPLED_MTP_SHARD=0..10
+//! export HIPFIRE_SAMPLED_MTP_ARM=copy_long_ar
+//! unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw sampled_mtp_copy_long_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=copy_long_batched
+//! export HIPFIRE_MTP_INCREMENTAL=0 HIPFIRE_MTP_AR_FLOOR=0
+//! ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw sampled_mtp_copy_long_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! export HIPFIRE_SAMPLED_MTP_ARM=copy_long_adaptive
+//! unset HIPFIRE_MTP_INCREMENTAL HIPFIRE_MTP_AR_FLOOR
+//! ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw sampled_mtp_copy_long_distribution_arm -- --exact --ignored --nocapture --test-threads=1
+//! unset HIPFIRE_SAMPLED_MTP_ARM HIPFIRE_SAMPLED_MTP_SHARD
+//! ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw sampled_mtp_copy_long_matches_ar_distribution_on_flash_next -- --exact --ignored --nocapture --test-threads=1
+//! ```
+//!
+//! The parent config-verifies reusable shards, rejects overlaps and runs only
+//! missing ranges in fresh children. Coverage is aggregate, never used to
+//! select trials or shards. Existing four-token arms and configs are unchanged.
+//!
 //! `naive_sampled_mtp_emits_seeded_ar_ids` checks the stronger property of
 //! `HIPFIRE_MTP_SAMPLED_MODE=naive`: with the same seed, every MTP route
 //! (`batched`, `interleaved`, `adaptive` = route knob unset) emits the AR
@@ -1069,6 +1114,20 @@ impl Loaded {
         cfg: SpecRequestConfig,
         tokens: usize,
     ) -> Result<MtpRun, String> {
+        self.mtp_request_with_budget(drafter, prompt, cfg, tokens, MTP_K)
+    }
+
+    /// [`mtp_request`](Self::mtp_request) with the per-window draft budget
+    /// passed to `mtp_step` (before the remaining-token clamp) given: the
+    /// long-copy arms pass the n-gram take cap's width, every other arm `MTP_K`.
+    fn mtp_request_with_budget(
+        &mut self,
+        drafter: &mut Qwen4MtpDrafter,
+        prompt: &[u32],
+        cfg: SpecRequestConfig,
+        tokens: usize,
+        draft_budget: usize,
+    ) -> Result<MtpRun, String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
         let mut seed_token = drafter.mtp_prefill(
@@ -1085,7 +1144,7 @@ impl Loaded {
         let mut windows = Vec::new();
         while ids.len() < tokens && seed_token != eos {
             let position = self.bundle.state.position;
-            let k = MTP_K.min(tokens - ids.len());
+            let k = draft_budget.min(tokens - ids.len());
             let before = StatsSnap::of(&drafter.request_stats());
             let started = Counters::now();
             let window = drafter.mtp_step(
@@ -2189,6 +2248,215 @@ fn ngram_config(
     config
 }
 
+const COPY_LONG_TOKENS: usize = 48;
+/// Per-window draft budget of the long-copy arms, as the product spec loop
+/// passes it (`mtp_draft_k(proposal_capacity(), max_emit)`): the drafter's
+/// proposal capacity, which follows the n-gram take cap.
+const COPY_LONG_BUDGET: &str = "proposal_capacity";
+const COPY_LONG_ARM_TEST: &str = "sampled_mtp_copy_long_distribution_arm";
+const COPY_LONG_ARMS: [&str; 3] = ["copy_long_ar", "copy_long_batched", "copy_long_adaptive"];
+const COPY_LONG_MARGINALS: [usize; 10] = [0, 1, 2, 3, 7, 11, 15, 23, 31, 47];
+const COPY_LONG_JOINTS: [(usize, usize); 4] = [(0, 1), (7, 8), (15, 16), (31, 32)];
+
+fn copy_long_salt(arm: &str) -> u64 {
+    match arm {
+        "copy_long_ar" => 0xC091_A200,
+        "copy_long_batched" => 0xC091_BA7C,
+        "copy_long_adaptive" => 0xC091_ADA9,
+        _ => unreachable!("unknown long-copy arm {arm}"),
+    }
+}
+
+fn copy_long_config(
+    arm: &str,
+    identity: &Value,
+    settings: &DistSettings,
+    arch: &str,
+    range: (usize, usize),
+) -> Result<Value, String> {
+    let triple = hipfire_config::ngram_mod_triple_for_arch(hipfire_arch_qwen4::ARCH_ID, arch);
+    // Validate the same product config as the child, without loading a GPU.
+    qwen4_ngram_mod_config(triple)?;
+    let mut config = config_base(
+        "copy-long-distribution", arm, &settings.pen, Fixture::Prose, identity,
+    );
+    config["fixture"] = json!("copy-long");
+    config["instruction"] = json!(COPY_LONG_INSTRUCTION);
+    config["passage"] = json!(COPY_LONG_PASSAGE);
+    config["primed"] = json!(COPY_PRIMED);
+    config["gpu_arch"] = json!(arch);
+    config["triple"] = json!([triple.0, triple.1, triple.2]);
+    config["temp"] = json!(settings.temp);
+    config["top_p"] = json!(settings.top_p);
+    config["top_k"] = json!(settings.top_k);
+    config["min_p"] = json!(settings.min_p);
+    config["tokens"] = json!(COPY_LONG_TOKENS);
+    config["draft_budget"] = json!(COPY_LONG_BUDGET);
+    config["shard"] = json!([range.0, range.1]);
+    config["salt"] = json!(copy_long_salt(arm));
+    config["sampled_mode"] = json!("leviathan");
+    config["marginals"] = json!(COPY_LONG_MARGINALS);
+    config["joints"] = json!(COPY_LONG_JOINTS);
+    Ok(config)
+}
+
+/// The receipt supplies the actual loaded GPU's arch, not a guessed default.
+/// All other config fields, including its product triple, are recomputed.
+fn check_copy_long_shard(
+    dir: &Path,
+    arm: &str,
+    range: (usize, usize),
+    identity: &Value,
+    settings: &DistSettings,
+) -> Result<(), String> {
+    let path = late_file(dir, arm, range, "ids.json");
+    let receipt = read_json(&path.with_extension("receipt.json"))?;
+    let arch = receipt["gpu"]["arch"]
+        .as_str()
+        .ok_or_else(|| format!("{}: missing GPU arch receipt", path.display()))?;
+    check_config(&path, &copy_long_config(arm, identity, settings, arch, range)?)
+}
+
+fn ensure_copy_long_shards(
+    model: &Path,
+    dir: &Path,
+    arm: &str,
+    trials: usize,
+    settings: &DistSettings,
+    identity: &Value,
+) -> Result<Vec<(usize, usize)>, String> {
+    let shards = late_shards(dir, arm)?;
+    for &range in &shards {
+        check_copy_long_shard(dir, arm, range, identity, settings)?;
+    }
+    for gap in shard_gaps(&shards, trials)? {
+        eprintln!("{arm}: running missing shard {}..{}", gap.0, gap.1);
+        spawn_arm(
+            COPY_LONG_ARM_TEST, arm, "leviathan", model, dir, Some(gap),
+            &format!("{arm}.{}-{}", gap.0, gap.1),
+        )?;
+    }
+    let shards = late_shards(dir, arm)?;
+    for &range in &shards {
+        check_copy_long_shard(dir, arm, range, identity, settings)?;
+    }
+    if !shard_gaps(&shards, trials)?.is_empty() {
+        return Err(format!("{arm}: shards {shards:?} do not cover 0..{trials}"));
+    }
+    Ok(shards)
+}
+
+fn copy_long_coverage(arm: &str, parts: &[Value], report: &mut String) -> Vec<String> {
+    let total = |key: &str| -> usize {
+        parts.iter().map(|part| part[key].as_u64().expect("long-copy stats count") as usize).sum()
+    };
+    let windows = total("ngram_mod_windows");
+    let wide = total("takeover_verified_ge5");
+    let line = format!(
+        "{arm}: trials={} ngram_mod_windows={windows} drafts={} accepted={} mtp_windows={} takeover_verified_ge5={wide}; unconfirmed_takeovers=not countable from public per-window data (confirmation/head calls are not exposed; HIP call deltas are not an unambiguous discriminator)\n",
+        total("trials"), total("ngram_mod_drafts"), total("ngram_mod_accepted"), total("mtp_windows"),
+    );
+    report.push_str(&line);
+    let mut failures = Vec::new();
+    if windows == 0 || wide == 0 {
+        failures.push(format!(
+            "{line}  requires n-gram windows > 0 and at least one seed + >=4-candidate takeover\n"
+        ));
+    }
+    failures
+}
+
+/// Keep the old arms' threshold behavior untouched; long-copy explicitly
+/// requires every marginal and joint p-value to be strictly above ALPHA.
+fn compare_copy_long(
+    arm: &str,
+    ar: &[Vec<u32>],
+    mtp: &[Vec<u32>],
+    report: &mut String,
+    failures: &mut Vec<String>,
+) {
+    let positions = COPY_LONG_MARGINALS.iter().map(|&first| (first, None))
+        .chain(COPY_LONG_JOINTS.iter().map(|&(first, second)| (first, Some(second))));
+    for (first, second) in positions {
+        let cells = |samples: &[Vec<u32>]| -> Vec<(u32, Option<u32>)> {
+            samples.iter().map(|ids| (ids[first], second.map(|index| ids[index]))).collect()
+        };
+        let (stat, df, p) = homogeneity(&cells(ar), &cells(mtp));
+        let label = second.map_or_else(
+            || format!("position {first}"),
+            |second| format!("joint ({first},{second})"),
+        );
+        let line = format!(
+            "{arm} vs copy_long_ar, {label}: chi2={stat:.2} df={df} p={p:.6} (n={}+{})\n",
+            ar.len(), mtp.len(),
+        );
+        if !(p > ALPHA) {
+            failures.push(line.clone());
+        }
+        report.push_str(&line);
+    }
+}
+
+#[test]
+#[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4); long: use sampled_mtp_copy_long_distribution_arm shards under fabric holds"]
+fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
+    let model = model_path();
+    let dir = out_dir();
+    let trials = late_trials().unwrap_or_else(|e| panic!("{e}"));
+    let settings = DistSettings::from_env().unwrap_or_else(|e| panic!("{e}"));
+    let model_id = hw_identity::model_identity(&model, &dir).unwrap_or_else(|e| panic!("{e}"));
+    let mut samples: HashMap<&str, Vec<Vec<u32>>> = HashMap::new();
+    let mut stats: HashMap<&str, Vec<Value>> = HashMap::new();
+    for arm in COPY_LONG_ARMS {
+        let identity = arm_identity(arm, "leviathan", &model_id, &LATE_CONTROL_ENV);
+        let shards = ensure_copy_long_shards(&model, &dir, arm, trials, &settings, &identity)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut all = Vec::with_capacity(trials);
+        let mut parts = Vec::new();
+        for range in shards {
+            let path = late_file(&dir, arm, range, "ids.json");
+            let ids: Vec<Vec<u32>> = serde_json::from_value(
+                read_json(&path).unwrap_or_else(|e| panic!("{e}")),
+            ).expect("long-copy shard ids");
+            assert_eq!(ids.len(), range.1 - range.0, "{arm}: shard {range:?} trials");
+            assert!(ids.iter().all(|ids| ids.len() == COPY_LONG_TOKENS),
+                "{arm}: shard {range:?} generated length");
+            all.extend(ids);
+            if arm != COPY_LONG_ARMS[0] {
+                let part = read_json(&late_file(&dir, arm, range, "stats.json"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(part["trials"].as_u64(), Some((range.1 - range.0) as u64),
+                    "{arm}: shard {range:?} stats trials");
+                // Require the corresponding per-window evidence, not IDs alone.
+                let evidence = read_json(&late_file(&dir, arm, range, "evidence.json"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                assert_eq!(evidence["trials"], part["trials"], "{arm}: evidence trials");
+                assert_eq!(evidence["ngram_windows"], part["ngram_mod_windows"],
+                    "{arm}: evidence n-gram windows");
+                parts.push(part);
+            }
+        }
+        assert_eq!(all.len(), trials, "{arm}: aggregate trials");
+        samples.insert(arm, all);
+        stats.insert(arm, parts);
+    }
+    let mut report = format!(
+        "long-copy case: {trials} trials per arm, {COPY_LONG_TOKENS} IDs, product n-gram triple per recorded GPU arch; marginals {COPY_LONG_MARGINALS:?}, joints {COPY_LONG_JOINTS:?}\n"
+    );
+    let mut failures = Vec::new();
+    let mut coverage = Vec::new();
+    for arm in &COPY_LONG_ARMS[1..] {
+        compare_copy_long(
+            arm, &samples[COPY_LONG_ARMS[0]], &samples[arm], &mut report, &mut failures,
+        );
+        coverage.extend(copy_long_coverage(arm, &stats[arm], &mut report));
+    }
+    eprint!("{report}");
+    fs::write(dir.join("copy-long-report.txt"), &report).expect("long-copy report");
+    assert!(failures.is_empty() && coverage.is_empty(), "{}",
+        failure_message(&dir, &failures, &coverage));
+}
+
 #[test]
 #[ignore = "requires a real HIP GPU and HIPFIRE_MTP_IDENTITY_MODEL (qwen3.8-flash-next-gptq3.mq4)"]
 fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
@@ -2301,6 +2569,348 @@ fn sampled_mtp_ngram_distribution_arm() {
     if let Err(error) = run_ngram_arm(&arm, &model_path(), &out_dir()) {
         panic!("{arm} arm: {error}");
     }
+}
+
+/// The long-copy fixture's instruction (the passage follows it verbatim).
+const COPY_LONG_INSTRUCTION: &str =
+    "Rewrite the following passage exactly, keeping every word and punctuation mark.\n\n";
+/// A passage of well over `COPY_PRIMED + 1 + 63` tokens (about 160) with no
+/// repeated five-token run, so the pool's proposal after the primed prefix is
+/// the passage's own continuation.
+const COPY_LONG_PASSAGE: &str = "Before the harbour woke each morning, the lighthouse keeper climbed the narrow spiral stairs, carrying a tin lantern and a loaf of yesterday's bread. At the top he trimmed the wick, wiped the salt from the great glass lens, and logged the weather in a small blue notebook. Gulls wheeled below him while fishing boats slid out past the breakwater, their engines murmuring across the cold grey water. Around noon a freighter signalled twice, and he answered with the old brass flag lamp his grandfather had once used. In the evening the beam swept slowly over the rocks, the village, and the dark line of the hills, and only when the last boat had returned did he finally sit down to eat.";
+/// A takeover window counts as "verified >= 5 rows" when its `[seed,
+/// candidates..]` block holds at least this many rows: `drafts + 1`, since a
+/// takeover window's `drafts_generated` is its candidate count.
+const COPY_LONG_ROWS_MIN: usize = 5;
+/// Wide-takeover windows whose full row a shard's stats keep as proof (all
+/// of them are counted).
+const COPY_LONG_PROOF_ROWS: usize = 8;
+
+/// The long-copy prompt: the rendered rewrite request plus the passage's first
+/// `COPY_PRIMED` tokens as the start of the assistant turn. Fails unless the
+/// passage tokens occur in the request and the pool (the product `pool`
+/// config), seeded from this prompt, proposes the passage's continuation after
+/// the passage's token `COPY_PRIMED` (the first window's seed when sampled):
+/// at least `COPY_LONG_TOKENS` candidates, each equal to the passage. A pool
+/// config with `n_max < COPY_LONG_TOKENS` (a product env override) is rejected.
+fn copy_long_fixture(loaded: &Loaded, pool: NgramModConfig) -> Result<Vec<u32>, String> {
+    if pool.n_max < COPY_LONG_TOKENS {
+        return Err(format!(
+            "long-copy needs a pool proposal of {COPY_LONG_TOKENS} tokens, but the product n_max is {}",
+            pool.n_max
+        ));
+    }
+    let need = COPY_PRIMED + 1 + pool.n_max;
+    let passage = loaded.tokenizer.encode(COPY_LONG_PASSAGE);
+    if passage.len() < need {
+        return Err(format!(
+            "long-copy passage has {} tokens, need {need}",
+            passage.len()
+        ));
+    }
+    let mut prompt = loaded.render(&format!("{COPY_LONG_INSTRUCTION}{COPY_LONG_PASSAGE}"))?;
+    if !prompt
+        .windows(passage.len())
+        .any(|window| window == passage.as_slice())
+    {
+        return Err("the long passage's own tokens do not occur in the rendered request".into());
+    }
+    prompt.extend_from_slice(&passage[..COPY_PRIMED]);
+    let mut context = MtpCopyContext::new(pool).map_err(|e| e.to_string())?;
+    context.begin_request(&prompt);
+    let seed = &passage[COPY_PRIMED..=COPY_PRIMED];
+    let at_least = COPY_LONG_TOKENS;
+    match context.propose(seed, pool.n_max) {
+        Some(candidates)
+            if candidates.len() >= at_least
+                && candidates == &passage[COPY_PRIMED + 1..COPY_PRIMED + 1 + candidates.len()] =>
+        {
+            Ok(prompt)
+        }
+        other => Err(format!(
+            "long-copy fixture: the pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected the passage's next >= {at_least} tokens"
+        )),
+    }
+}
+
+/// A shard's n-gram counters and its verified-row takeover proof. A window is
+/// a takeover iff `ngram_mod_windows` moved by one across it (only
+/// `finish_takeover` moves it), and it verified >= `COPY_LONG_ROWS_MIN` rows iff
+/// `drafts + 1 >= COPY_LONG_ROWS_MIN`. Both long arms run batched takeovers
+/// (`require_arm_env` pins `HIPFIRE_MTP_INCREMENTAL` to 0 / unset; only 1
+/// selects the interleaved takeover), so all those rows go through one verify
+/// forward. Whether a takeover skipped the head's row-0 confirmation is not
+/// public per-window data, so it is not counted.
+#[derive(Default)]
+struct CopyLongStats {
+    trials: usize,
+    ngram_mod_windows: usize,
+    ngram_mod_drafts: usize,
+    ngram_mod_accepted: usize,
+    mtp_windows: usize,
+    takeover_verified_ge5: usize,
+    examples: Vec<Value>,
+}
+
+impl CopyLongStats {
+    fn observe(&mut self, trial: usize, seed: u64, run: &MtpRun) -> Result<(), String> {
+        self.trials += 1;
+        self.ngram_mod_windows += run.stats.ngram_mod_windows;
+        self.ngram_mod_drafts += run.stats.ngram_mod_drafts;
+        self.ngram_mod_accepted += run.stats.ngram_mod_accepted;
+        self.mtp_windows += run.stats.mtp_windows;
+        let mut takeovers = 0usize;
+        for window in &run.windows {
+            let moved = window
+                .after
+                .ngram_windows
+                .checked_sub(window.before.ngram_windows)
+                .ok_or_else(|| format!("trial {trial}: ngram_mod_windows went backwards in a window"))?;
+            match moved {
+                0 => {}
+                1 => {
+                    takeovers += 1;
+                    if window.drafts + 1 >= COPY_LONG_ROWS_MIN {
+                        self.takeover_verified_ge5 += 1;
+                        if self.examples.len() < COPY_LONG_PROOF_ROWS {
+                            self.examples.push(json!({
+                                "trial": trial,
+                                "seed": seed,
+                                "window": window.row(),
+                            }));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "trial {trial}: ngram_mod_windows moved by {moved} in one window"
+                    ))
+                }
+            }
+        }
+        if takeovers != run.stats.ngram_mod_windows {
+            return Err(format!(
+                "trial {trial}: windows record {takeovers} takeovers, request_stats {}",
+                run.stats.ngram_mod_windows
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_json(&self, range: (usize, usize)) -> Value {
+        let mut columns: Vec<&str> = WINDOW_COLUMNS.to_vec();
+        columns.extend(hw_identity::COUNTER_COLUMNS);
+        json!({
+            "trials": self.trials,
+            "shard": [range.0, range.1],
+            "ngram_mod_windows": self.ngram_mod_windows,
+            "ngram_mod_drafts": self.ngram_mod_drafts,
+            "ngram_mod_accepted": self.ngram_mod_accepted,
+            "mtp_windows": self.mtp_windows,
+            "draft_budget": COPY_LONG_BUDGET,
+            "takeover_verified_ge5": self.takeover_verified_ge5,
+            "takeover_verified_ge5_predicate": format!(
+                "window with ngram_windows_after == ngram_windows_before + 1 (a takeover) and drafts + 1 >= {COPY_LONG_ROWS_MIN} ([seed, candidates..] rows, all verified in one batched forward: both long arms run batched takeovers)"
+            ),
+            "takeover_verified_ge5_examples": self.examples,
+            "window_columns": columns,
+            "unconfirmed_takeovers": Value::Null,
+            "unconfirmed_takeovers_note": "not countable: the head-confirmation decision is not public per-window data and HIP call deltas do not discriminate it",
+        })
+    }
+}
+
+/// The deterministic columns of every window row (`WINDOW_COLUMNS`, no HIP
+/// call counts): what an identical-seed replay must reproduce.
+fn window_prefix_rows(run: &MtpRun) -> Vec<Vec<Value>> {
+    run.windows
+        .iter()
+        .map(|window| match window.row() {
+            Value::Array(row) => row[..WINDOW_COLUMNS.len()].to_vec(),
+            _ => unreachable!("WindowRec::row is an array"),
+        })
+        .collect()
+}
+
+/// One long-copy shard in a fresh process; spawned by the parent test.
+#[test]
+#[ignore = "child process of sampled_mtp_copy_long_matches_ar_distribution_on_flash_next; runs one shard when run directly"]
+fn sampled_mtp_copy_long_distribution_arm() {
+    let Ok(arm) = std::env::var(ARM_ENV) else {
+        return;
+    };
+    if let Err(error) = run_copy_long_arm(&arm, &model_path(), &out_dir()) {
+        panic!("{arm} arm: {error}");
+    }
+}
+
+fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
+    if !COPY_LONG_ARMS.contains(&arm) {
+        return Err(format!("unknown long-copy arm {arm}"));
+    }
+    require_arm_env(arm, "leviathan")?;
+    let settings = DistSettings::from_env()?;
+    let trials = late_trials()?;
+    let range = shard_range(arm, trials)?;
+    let env = own_env(&LATE_CONTROL_ENV);
+    let identity = own_identity(model, dir, &LATE_CONTROL_ENV)?;
+    let ids_path = late_file(dir, arm, range, "ids.json");
+    if ids_path.exists() {
+        check_copy_long_shard(dir, arm, range, &identity, &settings)?;
+        println!(
+            "ARM {arm} shard {}..{} already complete under this config",
+            range.0, range.1
+        );
+        return Ok(());
+    }
+    let mut loaded = load(model)?;
+    let triple =
+        hipfire_config::ngram_mod_triple_for_arch(hipfire_arch_qwen4::ARCH_ID, &loaded.gpu.arch);
+    let pool_config = qwen4_ngram_mod_config(triple)?;
+    let config = copy_long_config(arm, &identity, &settings, &loaded.gpu.arch, range)?;
+    let prompt = copy_long_fixture(&loaded, pool_config)?;
+    let DistSettings {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        pen,
+        ..
+    } = settings;
+    let eos = loaded.bundle.config.eos_token_id;
+    let budget = floor_probe_budget()?;
+    println!(
+        "ARM {arm} arch={} prompt_tokens={} shard={}..{} tokens={COPY_LONG_TOKENS} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={triple:?} draft_budget={COPY_LONG_BUDGET} state={} route_class={} probe_budget={budget}",
+        loaded.gpu.arch,
+        prompt.len(),
+        range.0,
+        range.1,
+        loaded.state,
+        hw_identity::route_class(&env)
+    );
+    println!("ARM {arm} config {config}");
+    let started = std::time::Instant::now();
+    let (start, end) = range;
+    let mut samples: Vec<Vec<u32>> = Vec::with_capacity(end - start);
+    let progress = |trial: usize| {
+        if (trial + 1 - start) % 25 == 0 {
+            println!(
+                "ARM {arm} {}/{} trials in {:.0}s",
+                trial + 1 - start,
+                end - start,
+                started.elapsed().as_secs_f64()
+            );
+        }
+    };
+    let salt = copy_long_salt(arm);
+    if arm == COPY_LONG_ARMS[0] {
+        let logits = loaded
+            .gpu
+            .zeros(&[loaded.bundle.config.vocab_size], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
+        for trial in start..end {
+            let seed = trial_seed(salt, trial) as u32;
+            samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, COPY_LONG_TOKENS)?);
+            progress(trial);
+        }
+        loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
+    } else {
+        let mut drafter = new_drafter_with(&mut loaded, Some(pool_config))?;
+        let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
+        let mut stats = CopyLongStats::default();
+        // Only a forced floor-off route replays byte for byte; the adaptive
+        // route's choices depend on wall-clock prices and are never replayed.
+        let replays = hw_identity::forced_floor_off(&env);
+        let mut firsts: Vec<(usize, u64, MtpRun)> = Vec::new();
+        let run = |loaded: &mut Loaded, drafter: &mut Qwen4MtpDrafter, seed: u64| {
+            let cfg = spec_request_ngram(temp, top_p, top_k, min_p, seed, &pen);
+            let draft_budget = MtpDrafter::proposal_capacity(drafter);
+            loaded.mtp_request_with_budget(drafter, &prompt, cfg, COPY_LONG_TOKENS, draft_budget)
+        };
+        for trial in start..end {
+            let seed = trial_seed(salt, trial);
+            let result = run(&mut loaded, &mut drafter, seed)?;
+            if !result.stats.mtp_ngram {
+                return Err(format!("trial {trial}: the n-gram pool was not armed"));
+            }
+            stats.observe(trial, seed, &result)?;
+            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            if replays && trial < REPLAYS {
+                samples.push(result.ids.clone());
+                firsts.push((trial, seed, result));
+            } else {
+                samples.push(result.ids);
+            }
+            progress(trial);
+        }
+        for (trial, seed, first) in &firsts {
+            let replay = run(&mut loaded, &mut drafter, *seed)?;
+            if replay.ids != first.ids
+                || replay.stats != first.stats
+                || window_prefix_rows(&replay) != window_prefix_rows(first)
+            {
+                return Err(format!(
+                    "trial {trial} replayed {:?} / {:?} / {:?}, first run {:?} / {:?} / {:?}",
+                    replay.ids,
+                    replay.stats,
+                    window_prefix_rows(&replay),
+                    first.ids,
+                    first.stats,
+                    window_prefix_rows(first)
+                ));
+            }
+        }
+        if replays {
+            println!(
+                "ARM {arm} replayed {} seeds identically (ids, request stats, window rows)",
+                firsts.len()
+            );
+        } else {
+            println!(
+                "ARM {arm} replay not asserted (route class {})",
+                hw_identity::route_class(&env)
+            );
+        }
+        println!(
+            "ARM {arm} ngram_mod_windows={} drafts={} accepted={} mtp_windows={} takeover_verified_ge5={} unconfirmed_takeovers=unknown",
+            stats.ngram_mod_windows,
+            stats.ngram_mod_drafts,
+            stats.ngram_mod_accepted,
+            stats.mtp_windows,
+            stats.takeover_verified_ge5
+        );
+        write_json(&late_file(dir, arm, range, "stats.json"), &stats.to_json(range))?;
+        evidence.write(
+            dir,
+            &format!("{arm}.{}-{}", range.0, range.1),
+            budget,
+            LATE_MARGINALS[0],
+        )?;
+        Box::new(drafter).mtp_free(&mut loaded.gpu);
+    }
+    // Positions after an EOS read as EOS; every trial is kept.
+    for ids in &mut samples {
+        ids.resize(COPY_LONG_TOKENS, eos);
+    }
+    println!(
+        "ARM {arm} shard {}..{} in {:.1}s; first sample: {:?}",
+        range.0,
+        range.1,
+        started.elapsed().as_secs_f64(),
+        loaded.tokenizer.decode(&samples[0])
+    );
+    fs::write(
+        &ids_path,
+        serde_json::to_vec(&samples).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    write_config(&ids_path, &config)?;
+    write_receipt(&ids_path, &hw_identity::receipt(&loaded.gpu, model))?;
+    loaded
+        .bundle
+        .free_gpu(&mut loaded.gpu)
+        .map_err(|e| e.to_string())
 }
 
 fn sampling_from_env() -> Result<(f32, f32, Option<u32>, f32), String> {
