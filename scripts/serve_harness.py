@@ -27,7 +27,13 @@ Modes:
             answered from frozen tool_results; rows carry per-request
             cached/prefill_ms/ttft for session-cache reuse A/B (diff two --out dumps).
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
-            session_coding.json the coherence gate uses.
+            session_coding.json the coherence gate uses. A turn's "expect" list
+            holds case-insensitive substrings that must all appear in the reply.
+            Expect what the conversation pins, never a name the model picks:
+            the recall turn asks for "the FIRST function", which the user
+            specified as a streaming blake3 hasher but the model names itself
+            (e.g. `hash_file_streaming`), so it expects "blake3", not "dedupe";
+            the summary expects "dedup" (dedupe, deduplication, dedup).
   prefix-fanout — opt-in shared-header concurrency/alternating-session workload.
             Use --fanout-calibrate to size the header by canonical prompt usage;
             invoke separately with --fanout-shared-tokens 2048 and 8192.
