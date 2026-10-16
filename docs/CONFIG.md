@@ -439,23 +439,21 @@ sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
 recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
 arch, `fp32` through the `state_quant` load parameter.
 
-| `kv_cache` | gfx1201 | gfx1100 (7900 XTX) | gfx1151 (Halo), other gfx11/gfx12 | gfx942 (MI300X) | other arches |
+| `kv_cache` | gfx1201 | gfx1151 (Halo), gfx1100 (7900 XTX) | other gfx11/gfx12 | gfx942 (MI300X) | other arches |
 |---|---|---|---|---|---|
 | `auto` / unset | `fp8` | `q8` (Q8_0 K/V, split-KV decode attention) | `bf16` | `bf16` (never `fp8`) | `bf16` |
-| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | exact F32 state (opt-in) | same as gfx1201 (gfx1151: F32 split-K decode attention) | same | same |
+| `bf16` | exact reference state (F32 K/V arenas, BF16-valued index keys) | exact F32 state (opt-in); F32 split-K decode attention on gfx1151 only | same as gfx1201 | same | same |
 | `fp8` | E4M3 K/V with one f16 scale per head and token; indexer raw/pooled keys stored as BF16 (the same values) | refused | refused | explicit opt-in: the same row (E4M3 codes plus one f16 scale per head and token) in the gfx942 FNUZ-hardware format; indexer raw/pooled keys stay F32 | refused |
 | `q8` | Q8_0 K/V: the dense q8 KV row (32-element blocks of one f16 scale and 32 int8 codes, encoded as `kv_cache_write_q8_0`); indexer keys stored as BF16 (the same values) | same (the `auto` default) | same (explicit opt-in) | refused | refused |
 | anything else (`fwhtN`, `asymN`, `f16`, …) | refused | refused | refused | refused |
 
 `auto` picks fp8 only on exact gfx1201 and only for a head geometry the
 kernels implement (head_dim 256, even KV-head count; Flash-Next qualifies);
-otherwise it stays `bf16`. On exact gfx1100 `auto`/unset picks `q8` where the
+otherwise it stays `bf16`. On exact gfx1151 and exact gfx1100 `auto`/unset picks `q8` where the
 model has head_dim 256 (Flash-Next qualifies) and falls back to the exact
 `bf16` state where it does not; an explicit `kv_cache = "q8"` with another
 geometry is refused rather than rewritten. `kv_cache = "bf16"` is the way back
-to the exact F32 state on every arch, gfx1100 included. On exact gfx1151
-(Strix Halo) `auto`/unset stays the exact `bf16` state; `kv_cache = "q8"` is an
-explicit opt-in there. On exact gfx942
+to the exact F32 state on every arch, gfx1151 and gfx1100 included. On exact gfx942
 `auto`/unset stays the exact `bf16` state; fp8 is served only by an explicit
 `kv_cache = "fp8"` (same geometry requirement, refused rather than rewritten
 when the model does not meet it). On every other arch `auto` never picks

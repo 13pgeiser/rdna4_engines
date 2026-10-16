@@ -540,10 +540,10 @@ pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201,
-/// q8 on exact gfx1100 (7900 XTX; the model's geometry is checked where the
-/// state is built, and an auto request the geometry cannot serve falls back to
-/// the F32 state there) and bf16 everywhere else (gfx942 and gfx1151 included:
-/// auto never selects fp8 there, and Strix Halo keeps the F32 state); an
+/// q8 on exact gfx1151 (Strix Halo) and exact gfx1100 (7900 XTX; the model's
+/// geometry is checked where the state is built, and an auto request the
+/// geometry cannot serve falls back to the F32 state there) and bf16
+/// everywhere else (gfx942 included: auto never selects fp8 there); an
 /// explicit `bf16` is the exact F32 state on every arch; explicit `fp8` is
 /// accepted on exact gfx1201 and exact gfx942 and refused elsewhere, explicit
 /// `q8` is refused off gfx11/gfx12, and any other unsupported explicit mode
@@ -555,7 +555,7 @@ pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
 /// the reduced FP8 K/V rows; `q8` is not supported there.
 pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
     let auto_fp8_arch = arch == "gfx1201";
-    let auto_q8_arch = arch == "gfx1100";
+    let auto_q8_arch = matches!(arch, "gfx1151" | "gfx1100");
     let explicit_fp8_arch = auto_fp8_arch || arch == "gfx942";
     let q8_arch = arch.starts_with("gfx11") || arch.starts_with("gfx12");
     let mode = match raw.trim() {
@@ -1265,11 +1265,11 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_auto_fp8_gfx1201_q8_gfx1100_bf16_elsewhere_rejects_before_fallback() {
+    fn qwen4_auto_fp8_gfx1201_q8_gfx1151_gfx1100_bf16_elsewhere_rejects_before_fallback() {
         let p = &QWEN4_POLICY;
         // (raw, arch) -> mode. Only exact gfx1201 selects fp8 (not gfx1200);
-        // only exact gfx1100 (the XTX) selects q8 under auto; every other arch,
-        // gfx1151 (the Halo) included, keeps bf16 (the F32 state). Explicit
+        // only exact gfx1151 (the Halo) and exact gfx1100 (the XTX) select q8
+        // under auto; every other arch keeps bf16 (the F32 state). Explicit
         // bf16 is the F32 state on every arch; explicit q8 is served on every
         // gfx11/gfx12 arch.
         for (raw, arch, mode) in [
@@ -1279,9 +1279,11 @@ mod tests {
             ("bf16", "gfx1201", KvMode::Bf16),
             ("fp8", "gfx1201", KvMode::Fp8),
             ("q8", "gfx1201", KvMode::Q8),
-            ("", "gfx1151", KvMode::Bf16),
-            ("auto", "gfx1151", KvMode::Bf16),
+            ("", "gfx1151", KvMode::Q8),
+            ("auto", "gfx1151", KvMode::Q8),
+            (" auto ", "gfx1151", KvMode::Q8),
             ("bf16", "gfx1151", KvMode::Bf16),
+            (" bf16 ", "gfx1151", KvMode::Bf16),
             (" q8 ", "gfx1151", KvMode::Q8),
             ("", "gfx1100", KvMode::Q8),
             ("auto", "gfx1100", KvMode::Q8),
