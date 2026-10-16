@@ -856,6 +856,7 @@ impl Carrier for Qwen4Carrier {
                 max_seq,
                 &ctx.gpu.arch,
                 meta.tokenizer.special_token_id("<|im_end|>"),
+                meta.tokenizer.special_token_id("</think>"),
                 true,
                 verify_rows,
             )
@@ -1010,9 +1011,10 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
 }
 
 /// The generic speculator around the native Qwen4 MTP head, with the load log
-/// lines. `end_of_turn` is the tokenizer's `<|im_end|>` id. `ngram_modifier`
-/// false (a pipeline-parallel load) builds it without an n-gram pool whatever
-/// `speculation.mtp_ngram` resolves to, so no request can arm a takeover.
+/// lines. `end_of_turn` is the tokenizer's `<|im_end|>` id and `think_close`
+/// its `</think>` id. `ngram_modifier` false (a pipeline-parallel load) builds
+/// it without an n-gram pool whatever `speculation.mtp_ngram` resolves to,
+/// so no request can arm a takeover.
 /// `verify_rows` is the verify window the n-gram copy lane's take cap reads:
 /// the per-GPU row-exact rows, or the 4-row CPU splice window when host-placed
 /// routed experts run on the CPU.
@@ -1021,6 +1023,7 @@ fn qwen4_native_mtp_speculator(
     max_seq: usize,
     gpu_arch: &str,
     end_of_turn: Option<u32>,
+    think_close: Option<u32>,
     ngram_modifier: bool,
     verify_rows: usize,
 ) -> Box<dyn hipfire_runtime::spec::Speculator> {
@@ -1062,6 +1065,7 @@ fn qwen4_native_mtp_speculator(
         max_k,
         max_seq,
         end_of_turn,
+        think_close,
         ngram,
         copy_lane,
     )
@@ -3689,6 +3693,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             max_seq,
             &ctx.gpu.arch,
             meta.tokenizer.special_token_id("<|im_end|>"),
+            meta.tokenizer.special_token_id("</think>"),
             false,
             rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch),
         )

@@ -1923,6 +1923,16 @@ impl MtpFloor {
         self.retired
     }
 
+    /// Start a new probe phase with this request's original thresholds.
+    fn rearm(&mut self) {
+        let mut samples = std::mem::take(&mut self.probe_samples);
+        samples.clear();
+        *self = Self::with_retire_after(self.retire_after)
+            .with_decay(self.decay)
+            .with_retire_evidence(self.probe_tokens);
+        self.probe_samples = samples;
+    }
+
     /// Native window cost at `depth` drafts in AR-step units, once probing
     /// finishes: the measured mean, else the request's cost fit.
     fn batched_cost(&self, depth: usize) -> Option<f32> {
@@ -3838,6 +3848,10 @@ pub struct Qwen4MtpDrafter {
     /// strict-prefix terminal this drafter cannot repair (the spec terminal
     /// reset path).
     end_of_turn: Option<u32>,
+    /// Tokenizer's `</think>` token; only newly emitted closes may re-arm.
+    think_close: Option<u32>,
+    /// History length at the last plan; the first plan observes only its seed.
+    emitted_seen: Option<usize>,
     /// N-gram pool configuration resolved at load for this GPU
     /// (`hipfire_config::ngram_mod_triple_for_arch`); `None` disables the
     /// n-gram takeover for every request.
@@ -3904,9 +3918,9 @@ pub struct Qwen4MtpDrafter {
     agreement_decay: f32,
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
-    /// Same-request AR floor model; reset only by `configure_request`
-    /// (sticky retirement survives `mtp_reset`, prefill realignment and
-    /// head refills).
+    /// Same-request AR floor; reset by request configuration or a newly
+    /// emitted think-close after retirement. Realignment and head refills
+    /// otherwise preserve sticky retirement.
     floor: MtpFloor,
     /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read once per request by
     /// `configure_request`; false restores the pre-floor chooser.
@@ -3999,6 +4013,8 @@ impl Qwen4MtpDrafter {
             sampled: None,
             append_scratch: None,
             end_of_turn,
+            think_close: None,
+            emitted_seen: None,
             ngram_config: None,
             row_exact_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
             spec_rows_cap: usize::MAX,
@@ -4468,9 +4484,14 @@ impl Qwen4MtpDrafter {
         observe_agreement(&mut self.agreement, window, self.agreement_decay);
     }
 
-    /// See the free [`batched_depth`].
+    /// With no agreement evidence, start at K=3 (or the smaller budget);
+    /// evidence may still grow the chooser to the unchanged configured cap.
     fn batched_depth(&self, k: usize) -> usize {
-        batched_depth(&self.agreement, k)
+        if self.agreement == [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH] {
+            k.min(3)
+        } else {
+            batched_depth(&self.agreement, k)
+        }
     }
 
     /// Price both sources on the same clock; unsupported arches retain the
@@ -6698,6 +6719,26 @@ impl Qwen4MtpDrafter {
         self.plan_window_with(emitted, k, incremental.as_deref(), trace)
     }
 
+    /// Observe only newly emitted tokens, never a close in the prompt or a
+    /// close already seen by an earlier plan. No sampler or hidden state moves.
+    fn observe_think_close(&mut self, emitted: &[u32], floor_active: bool) {
+        let start = self
+            .emitted_seen
+            .unwrap_or_else(|| emitted.len().saturating_sub(1))
+            .min(emitted.len());
+        self.emitted_seen = Some(emitted.len());
+        if floor_active
+            && self.floor.retired()
+            && self
+                .think_close
+                .is_some_and(|close| emitted[start..].contains(&close))
+        {
+            self.floor.rearm();
+            self.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            self.stats.mtp_retired = false;
+        }
+    }
+
     /// [`Self::plan_window`] with the environment already read.
     fn plan_window_with(
         &mut self,
@@ -6727,6 +6768,7 @@ impl Qwen4MtpDrafter {
         // floor the same way and restores the pre-floor chooser.
         let forced = matches!(incremental, Some("0" | "1"));
         let floor_active = self.floor_enabled && !forced;
+        self.observe_think_close(emitted, floor_active);
         // Otherwise the window drafts natively, within the head's own K.
         let native_k = k.min(self.max_k);
         let ar = |route| WindowPlan {
@@ -7023,6 +7065,10 @@ impl Qwen4MtpDrafter {
             );
         }
         self.ensure_resources(ops, target)?;
+        // Re-arming may leave retired AR rows owed on every EP rank. Catch
+        // them up before calibration or any draft overwrites spec hidden;
+        // pending stays the head's predecessor hidden until catch-up uses it.
+        self.catch_up_head(ops, target)?;
         let depth = match plan.route {
             WindowRoute::Native { depth } => depth,
             WindowRoute::ArCalibrate => return self.mtp_ar_step(ops, target, position, seed, true),
@@ -8236,6 +8282,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
+        self.emitted_seen = None;
         self.head_lag.clear();
         self.retained = None;
         self.floor_pending = None;
@@ -8311,6 +8358,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
 
 /// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
 /// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one;
+/// `think_close` is the tokenizer's `</think>` id, when it has one;
 /// `ngram` is the n-gram pool configuration requests may arm, and
 /// `copy_lane` runs that pool as the copy lane
 /// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`).
@@ -8318,14 +8366,15 @@ pub fn build_qwen4_mtp_speculator(
     max_k: usize,
     ctx_capacity: usize,
     end_of_turn: Option<u32>,
+    think_close: Option<u32>,
     ngram: Option<NgramModConfig>,
     copy_lane: bool,
 ) -> Box<dyn Speculator> {
-    Box::new(MtpSpeculator::new(
-        Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn)
-            .with_ngram(ngram)
-            .with_copy_lane(copy_lane),
-    ))
+    let mut drafter = Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn)
+        .with_ngram(ngram)
+        .with_copy_lane(copy_lane);
+    drafter.think_close = think_close;
+    Box::new(MtpSpeculator::new(drafter))
 }
 
 /// The n-gram pool configuration for a `(n_match, n_min, n_max)` triple
@@ -9329,6 +9378,195 @@ mod tests {
         drafter
             .plan_window_with(&[0, 1], k, incremental, false)
             .expect("plan")
+    }
+
+    #[test]
+    fn rearm_retired_thinking_recalibrates_then_probes_with_original_thresholds() {
+        for temp in [0.0, 0.8] {
+            let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+            drafter.think_close = Some(99);
+            drafter.sampled_enabled = true;
+            drafter.sampled_mode = Ok(SampledMode::Leviathan);
+            let cfg = SpecRequestConfig {
+                temp,
+                rng_seed: 123,
+                ..Default::default()
+            };
+            drafter.configure_request(cfg);
+            drafter.floor_enabled = true;
+            drafter.floor = MtpFloor::with_retire_after(5)
+                .with_decay(0.97)
+                .with_retire_evidence(2);
+            assert_eq!(
+                drafter
+                    .plan_window_with(&[10], 7, None, false)
+                    .unwrap()
+                    .route,
+                WindowRoute::ArCalibrate
+            );
+            drafter.agreement = agreement(0.0, 2.0);
+            drafter.floor.observe_calibration(30.0, &drafter.agreement);
+            for _ in 0..5 {
+                drafter.floor.observe_native(
+                    NativeWindow::Interleaved,
+                    &window(0, 1),
+                    90.0,
+                    7,
+                    &drafter.agreement,
+                );
+            }
+            run_probes(&mut drafter.floor, &drafter.agreement, 2, 30.0);
+            assert!(drafter.floor.retired());
+            drafter.stats.mtp_retired = true;
+            drafter.head_lag.push(100, 10);
+            let next_draw = |drafter: &Qwen4MtpDrafter| {
+                drafter.sampled.as_ref().map(|state| {
+                    let mut rng = state.rng;
+                    rng.next_u64()
+                })
+            };
+            let sampled_draw = next_draw(&drafter);
+            assert_eq!(
+                drafter
+                    .plan_window_with(&[10, 11], 7, None, false)
+                    .unwrap()
+                    .route,
+                WindowRoute::ArRetired
+            );
+            assert_eq!(
+                drafter
+                    .plan_window_with(&[10, 11, 99], 7, None, false)
+                    .unwrap()
+                    .route,
+                WindowRoute::ArCalibrate
+            );
+            assert!(!drafter.floor.retired() && !drafter.stats.mtp_retired);
+            assert!(!drafter.floor.calibrated);
+            assert_eq!((drafter.floor.observed, drafter.floor.probes), (0, 0));
+            assert_eq!(drafter.floor.retire_after, 5);
+            assert_eq!(drafter.floor.probe_tokens, 2);
+            assert_eq!(drafter.floor.decay, 0.97);
+            assert_eq!(drafter.floor.combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.slow, (0.0, 0.0));
+            assert_eq!(
+                drafter.floor.caps,
+                [CapStats::default(); MTP_WINDOW_COST.len()]
+            );
+            assert_eq!(drafter.request, cfg);
+            assert_eq!(
+                next_draw(&drafter),
+                sampled_draw,
+                "re-arm must not advance or reseed RNG"
+            );
+            // Planning preserves owed rows/pending: run_window catches up every
+            // rank before the new calibration can overwrite their hidden rows.
+            assert_eq!(drafter.head_lag.tokens, vec![10]);
+            drafter.floor.observe_calibration(30.0, &drafter.agreement);
+            assert_eq!(
+                drafter
+                    .plan_window_with(&[10, 11, 99], 7, None, false)
+                    .unwrap()
+                    .route,
+                WindowRoute::Native { depth: 3 }
+            );
+        }
+    }
+
+    #[test]
+    fn rearm_each_think_close_is_consumed_once_even_after_another_retirement() {
+        let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+        drafter.think_close = Some(99);
+        drafter.floor.retired = true;
+        drafter.observe_think_close(&[10, 99], true);
+        assert!(!drafter.floor.retired());
+        drafter.floor.retired = true;
+        drafter.observe_think_close(&[10, 99], true);
+        drafter.observe_think_close(&[10, 99, 12], true);
+        assert!(
+            drafter.floor.retired(),
+            "the old close must not re-arm again"
+        );
+        drafter.observe_think_close(&[10, 99, 12, 99], true);
+        assert!(!drafter.floor.retired(), "a distinct new close may re-arm");
+        drafter.configure_request(SpecRequestConfig::default());
+        assert_eq!(drafter.emitted_seen, None);
+    }
+
+    #[test]
+    fn rearm_requires_a_new_close_and_an_active_retired_floor() {
+        for (close, retired, active) in [
+            (None, true, true),
+            (Some(99), false, true),
+            (Some(99), true, false),
+        ] {
+            let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+            drafter.think_close = close;
+            drafter.floor.retired = retired;
+            drafter.floor.observed = 42;
+            drafter.observe_think_close(&[99], active);
+            assert_eq!(drafter.floor.retired(), retired);
+            assert_eq!(drafter.floor.observed, 42);
+        }
+        let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+        drafter.think_close = Some(99);
+        drafter.floor.retired = true;
+        // A first plan may carry a prompt prefix in a direct caller's history:
+        // only its pending seed is newly generated, not that older close.
+        drafter.observe_think_close(&[99, 10], true);
+        assert!(drafter.floor.retired());
+    }
+
+    #[test]
+    fn rearm_fresh_chooser_starts_at_three_without_lowering_the_halo_cap() {
+        let cap = hipfire_config::mtp_k_default_for_arch(16, "gfx1151");
+        assert_eq!(cap, 7);
+        let mut drafter = Qwen4MtpDrafter::new(cap, 4096, None);
+        drafter.floor.observe_calibration(100.0, &drafter.agreement);
+        for k in 1..=cap {
+            let plan = plan_of(&mut drafter, k, None);
+            assert_eq!(plan.route, WindowRoute::Native { depth: k.min(3) });
+            assert_eq!(plan.k, k);
+        }
+        assert_eq!(drafter.k(), 7);
+        assert_eq!(
+            plan_of(&mut drafter, cap, Some("0")).route,
+            WindowRoute::Native { depth: 7 }
+        );
+        assert_eq!(
+            plan_of(&mut drafter, cap, Some("1")).route,
+            WindowRoute::Native { depth: 0 }
+        );
+    }
+
+    #[test]
+    fn rearm_fresh_chooser_can_grow_from_three_to_seven() {
+        let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+        drafter.floor.observe_calibration(30.0, &drafter.agreement);
+        let mut reached = false;
+        for i in 0..100 {
+            let plan = plan_of(&mut drafter, 7, None);
+            let WindowRoute::Native { depth } = plan.route else {
+                panic!("native route");
+            };
+            if i == 0 {
+                assert_eq!(depth, 3);
+            }
+            reached |= depth == 7;
+            let kept = window(depth, depth);
+            drafter.observe_agreement(&kept);
+            drafter.floor.observe_window(
+                NativeWindow::Batched,
+                WindowStats::of(&kept, depth),
+                60.0 + depth as f32 * 2.0,
+                7,
+                &drafter.agreement,
+            );
+        }
+        assert!(
+            reached,
+            "positive measured evidence must still reach the cap"
+        );
+        assert_eq!(drafter.k(), 7);
     }
 
     #[test]
