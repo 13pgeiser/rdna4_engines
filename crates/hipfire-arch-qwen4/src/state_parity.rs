@@ -2819,8 +2819,9 @@ mod tests {
 }
 
 /// Hardware takeover oracle used by `mtp_takeover_fill_hw`. Route knobs must
-/// be set before starting the process. Qwen4 pairs token p with hidden p,
-/// including the seed row; an accepted EOS stays pending, not head-filled.
+/// be set before starting the process. Qwen4 head rows pair token p with the
+/// target hidden of p-1 (a prompt's position 0 with its own hidden); an
+/// accepted EOS stays pending, not head-filled.
 pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result<Value, String> {
     use crate::bundle::Qwen4Bundle;
     use crate::mtp_spec::Qwen4MtpDrafter;
@@ -2933,6 +2934,80 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
             .sum();
         let denominator: f64 = b.iter().map(|&x| f64::from(x).powi(2)).sum();
         (numerator / denominator.max(1e-30)).sqrt()
+    }
+
+    /// K, V and index-key rows `start..start + rows` of the MTP head, F32.
+    fn head_values(
+        gpu: &Gpu,
+        bundle: &Qwen4Bundle,
+        start: usize,
+        rows: usize,
+    ) -> Result<Vec<f32>, String> {
+        let state = bundle
+            .mtp
+            .as_ref()
+            .ok_or("missing MTP head")?
+            .parity_state();
+        let buffers = state.parity_buffers();
+        let full = bundle.config.num_key_value_heads * bundle.config.head_dim;
+        let raw = bundle.config.indexer_kv_heads * bundle.config.indexer_head_dim;
+        let mut values = Vec::new();
+        for (tensor, width) in [
+            (buffers.full_keys, full),
+            (buffers.full_values, full),
+            (buffers.raw_index_keys, raw),
+        ] {
+            // The head's K/V/index caches are allocated F32 unconditionally
+            // (the target's fp8 QSA format does not reach them); refuse to
+            // read raw bytes as floats should that ever change.
+            if tensor.dtype != DType::F32 {
+                return Err(format!(
+                    "MTP head row cache is {:?}, expected F32",
+                    tensor.dtype
+                ));
+            }
+            let view = tensor.sub_offset(start * width, rows * width);
+            values.extend(gpu.download_f32(&view).map_err(|error| error.to_string())?);
+        }
+        Ok(values)
+    }
+
+    /// Head-only one-row appends of `tokens` at `start..` after a fresh
+    /// prefill, with explicit hiddens: `lag` pairs token `i` with
+    /// `hidden[i - 1]` (token 0 with the prefill's `pending`, the hidden of
+    /// `start - 1`), otherwise with `hidden[i]`. Returns the rows' values.
+    fn one_row_head(
+        gpu: &mut Gpu,
+        bundle: &mut Qwen4Bundle,
+        drafter: &Qwen4MtpDrafter,
+        tokens: &[u32],
+        hidden: &[Vec<f32>],
+        lag: bool,
+        start: usize,
+    ) -> Result<Vec<f32>, String> {
+        for (row, &token) in tokens.iter().enumerate() {
+            let uploaded = if lag && row == 0 {
+                None
+            } else {
+                let values = &hidden[row - usize::from(lag)];
+                Some(
+                    gpu.upload_f32(values, &[values.len()])
+                        .map_err(|error| error.to_string())?,
+                )
+            };
+            let source = match &uploaded {
+                Some(tensor) => tensor,
+                None => drafter.pending_hidden_for_parity()?,
+            };
+            let appended = bundle
+                .mtp_append_token(gpu, token, Some(source), start + row)
+                .map_err(|error| error.to_string());
+            if let Some(tensor) = uploaded {
+                let _ = gpu.free_tensor(tensor);
+            }
+            appended?;
+        }
+        head_values(gpu, bundle, start, tokens.len())
     }
 
     fn prefill(
@@ -3252,7 +3327,28 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
             "rejected tail must not enter committed target/head/pending state"
         );
 
-        // Compare token-p/hidden-p teacher forcing against the existing route.
+        // Teacher-forced pairing: head row p is (token p, target hidden p-1),
+        // so `pending` always holds the hidden of the head's position - 1 and
+        // a fill consumes it before replacing it with its own row's hidden.
+        // A draft step is exactly this shape (the seed at position p with the
+        // pending hidden of p-1, which is what `probe_first_draft` runs), and
+        // the head learned it that way: the Qwen3.5 MTP head fuses the
+        // embedding of the token being predicted-from with the trunk hidden
+        // one position back, and vLLM's proposer builds the same inputs by
+        // shifting the token ids left by one against the target hiddens.
+        // Filling the head with (token p, hidden p) instead would train its
+        // cache on rows no draft step ever reads. Only a prompt's own first
+        // row (position 0) has no previous hidden and takes its own; this
+        // oracle starts after a prefill (position >= 1), so row 0 here takes
+        // the prefill's `pending` = hidden of P-1.
+        //
+        // Discriminator: after the same window the head's K/V/index rows must
+        // match the one-row references built with explicit hiddens, the paired
+        // one (row 0: prefill's pending, row i: h_(P+i-1)) and the shifted one
+        // (row i: h_(P+i)). Reference hiddens are the one-row AR forwards, so
+        // the one-row forced route is compared at the same time and must match
+        // the paired reference essentially exactly; the 4-row verify takeover
+        // differs only by batch-vs-single-row numerics, hence the 0.1 ratio.
         assert_eq!(
             prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
             seed0
@@ -3271,6 +3367,7 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
         let takeover = gpu
             .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
+        let takeover_head = head_values(&gpu, &bundle, prompt.len(), 4)?;
         let takeover_state = snapshot(&gpu, &bundle, &drafter)?;
         assert_eq!(
             prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
@@ -3291,6 +3388,7 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
             )?,
             "teacher-forced route must handle all rows"
         );
+        let forced_head = head_values(&gpu, &bundle, prompt.len(), 4)?;
         let forced_state = snapshot(&gpu, &bundle, &drafter)?;
         assert_eq!(
             takeover_state["target_position"],
@@ -3300,14 +3398,63 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
         let forced = gpu
             .download_f32(drafter.pending_hidden_for_parity()?)
             .map_err(|error| error.to_string())?;
-        let correct = rel_l2(&takeover, &forced);
-        // h_(P+2), rather than the required h_(P+3), is the off-by-one
-        // Qwen3.5-style pairing. Reference uses the same one-row forwards.
-        let shifted = rel_l2(&takeover, &reference_hidden[2]);
-        assert!(
-            correct.is_finite() && shifted.is_finite() && correct < 0.1 * shifted,
-            "teacher-forced token-p/hidden-p pairing: rel-L2={correct:e}, shifted={shifted:e}"
+        // Head-only references from the same prefill state.
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
         );
+        let paired_head = one_row_head(
+            &mut gpu,
+            &mut bundle,
+            &drafter,
+            &reference[..4],
+            &reference_hidden,
+            true,
+            prompt.len(),
+        )?;
+        assert_eq!(
+            prefill(&mut gpu, &mut bundle, &mut drafter, &prompt)?,
+            seed0
+        );
+        let shifted_head = one_row_head(
+            &mut gpu,
+            &mut bundle,
+            &drafter,
+            &reference[..4],
+            &reference_hidden,
+            false,
+            prompt.len(),
+        )?;
+        let head_correct = rel_l2(&takeover_head, &paired_head);
+        let head_shifted = rel_l2(&takeover_head, &shifted_head);
+        let forced_correct = rel_l2(&forced_head, &paired_head);
+        let forced_shifted = rel_l2(&forced_head, &shifted_head);
+        // The window consumed rows P..=P+3, so the pending hidden is h_(P+3)
+        // (the head's position - 1); h_(P+2) would be a pending one row behind.
+        let pending_correct = rel_l2(&takeover, &forced);
+        let pending_lag = rel_l2(&takeover, &reference_hidden[2]);
+        for (label, correct, wrong) in [
+            (
+                "takeover head rows (token p, hidden p-1)",
+                head_correct,
+                head_shifted,
+            ),
+            (
+                "forced head rows (token p, hidden p-1)",
+                forced_correct,
+                forced_shifted,
+            ),
+            (
+                "pending hidden = last consumed row",
+                pending_correct,
+                pending_lag,
+            ),
+        ] {
+            assert!(
+                correct.is_finite() && wrong.is_finite() && correct < 0.1 * wrong,
+                "{label}: rel-L2={correct:e}, wrong pairing/lag={wrong:e}"
+            );
+        }
         Ok(json!({
             "schema": "hipfire.qwen4.mtp_takeover_fill.v1",
             "gpu_arch": gpu.arch,
@@ -3319,8 +3466,16 @@ pub fn run_mtp_takeover_fill_oracle(model_path: &Path, max_seq: usize) -> Result
             "windows": windows,
             "rejected_tail": {"same_state": true, "before": starts[0], "after": tails[0]},
             "pairing": {
-                "rel_l2": correct, "shifted_rel_l2": shifted,
-                "shifted_row": -1,
+                // Token p pairs with the target hidden of row p-1. `rel_l2` /
+                // `shifted_rel_l2` are the takeover head's rows against the
+                // one-row references; `forced_*` are the same for the one-row
+                // teacher-forced route; `pending_*` the pending hidden after
+                // the window against the forced route's and against the row
+                // one behind it (a pending that lags the head).
+                "paired_hidden_row": -1,
+                "rel_l2": head_correct, "shifted_rel_l2": head_shifted,
+                "forced_rel_l2": forced_correct, "forced_shifted_rel_l2": forced_shifted,
+                "pending_rel_l2": pending_correct, "pending_lag_rel_l2": pending_lag,
                 "pending_byte_identical": takeover_state["pending_hidden"] == forced_state["pending_hidden"],
                 "families_byte_identical": takeover_state["families"] == forced_state["families"],
                 "takeover": takeover_state, "forced": forced_state,

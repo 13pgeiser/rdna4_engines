@@ -3171,7 +3171,8 @@ mod tests {
         );
         // The request now outweighs the build scratch at every K.
         let hidden_row = (config.hc_count * config.hidden_size * 4) as u64;
-        let verify = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row;
+        // Verify rows plus the pending, row and retained-pending hidden carries.
+        let verify = (AUTO_VRAM_RESERVE_CHUNK as u64 + 3) * hidden_row;
         assert!(verify > scratch);
         let capture4 =
             crate::state::Qwen4State::row_capture_bytes(&config, crate::GdnStateFormat::Q8, 4)
@@ -3196,7 +3197,7 @@ mod tests {
         for gdn in [crate::GdnStateFormat::Q8, crate::GdnStateFormat::F32] {
             let capture =
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
-            let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
+            let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 3) * hidden_row + capture;
             assert_eq!(
                 native(&measured, 10, Some((gdn, 11))),
                 resident + scratch.max(request)

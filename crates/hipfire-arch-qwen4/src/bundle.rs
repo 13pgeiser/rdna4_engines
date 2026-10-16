@@ -294,7 +294,9 @@ pub fn session_snapshot_bytes(
             .checked_add(2 * part(p.checked_mul(full_width * 4)?)?)?
             .checked_add(part(p.checked_mul(raw_width * 4)?)?)?
             .checked_add(part(pooled_rows.checked_mul(raw_width * 4)?)?)?
-            .checked_add(selected + part(4)? + part(feedback)?)?;
+            .checked_add(selected + part(4)? + part(feedback)?)?
+            // The head's target boundary-hidden row.
+            .checked_add(part(feedback)?)?;
     }
     u64::try_from(total).ok()
 }
@@ -453,10 +455,19 @@ impl SessionState for Qwen4Bundle {
         if self.pp.is_some() {
             return Err("session restore is not supported under qwen4 topology.pp yet".into());
         }
-        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         let (target_meta, mtp_meta) = meta
             .split_at_checked(self.state.session_meta_bytes())
             .ok_or("qwen4 session snapshot shape mismatch")?;
+        if route == SessionRoute::Mtp {
+            // Refuse an MTP snapshot of another shape or without a boundary
+            // row for its position before any owner mutates.
+            self.mtp
+                .as_ref()
+                .ok_or("Qwen4 MTP resources are not attached")?
+                .check_session_restore(mtp_meta)
+                .map_err(|e| e.to_string())?;
+        }
+        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
         let mut layout = self
             .state
             .prepare_session_restore(gpu, target_meta)
@@ -2267,32 +2278,6 @@ impl Qwen4Bundle {
         .map_err(BundleError::Forward)
     }
 
-    pub(crate) fn mtp_advance_token(
-        &mut self,
-        gpu: &mut Gpu,
-        token: u32,
-        backbone_hidden: Option<&GpuTensor>,
-        position: usize,
-        fresh_qsa_selection: bool,
-    ) -> Result<(), BundleError> {
-        mapped_mtp(self.mtp.as_mut(), gpu, position)?
-            .forward_token(
-                gpu,
-                &self.weights,
-                &self.config,
-                token,
-                backbone_hidden,
-                position,
-                fresh_qsa_selection,
-                MtpStep::Advance,
-                self.execution
-                    .as_ref()
-                    .and_then(Qwen4GpuForward::mtp_ep_gather),
-            )
-            .map(|_| ())
-            .map_err(|error| BundleError::Forward(error.to_string()))
-    }
-
     /// The last MTP step of a chain: append only its K/V and index-key cache
     /// rows (see [`MtpStep::Append`]); the next step must bring its own
     /// backbone hidden and a fresh selection.
@@ -2339,9 +2324,49 @@ impl Qwen4Bundle {
         mapped_mtp(self.mtp.as_mut(), gpu, last_position).map(|_| ())
     }
 
+    /// Save the target boundary hidden into the head's snapshot state: call
+    /// right before the session capture at a prompt boundary, after the chunk's
+    /// append left `pending` holding the target hidden of the boundary's last
+    /// row (position `end - 1`). Reads `pending` only. A capture at a position
+    /// this was not called for stores no usable row (see
+    /// [`Self::session_restore_boundary_hidden`]).
+    pub(crate) fn session_save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .save_boundary_hidden(gpu, pending)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// After `session_begin`: when the head was just restored from a snapshot
+    /// (restores refuse snapshots without a boundary row for their position),
+    /// copy that row into `pending` and return `true`. `false` means no
+    /// restore happened since (a live continuation, an AR route, or a repeat
+    /// call): `pending` is untouched and already the live hidden.
+    pub(crate) fn session_restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, BundleError> {
+        match self.mtp.as_mut() {
+            Some(mtp) => mtp
+                .restore_boundary_hidden(gpu, pending)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(false),
+        }
+    }
+
     /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
     /// `position..position + tokens.len()`, row `i` paired with captured spec
-    /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
+    /// hidden row `hidden_row0 + i`. The caller supplies the rows: the token
+    /// at position `p` pairs with the target hidden of position `p - 1`
+    /// (prompt position 0 pairs with its own hidden), the same rows as
     /// calling [`Self::mtp_append_token`] per row after `copy_spec_hidden_row_to`.
     ///
     /// `trunk_ids_row` is `Some(r)` when `tokens` are rows `r..` of the spec
@@ -2365,11 +2390,6 @@ impl Qwen4Bundle {
         prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
-        if tokens.is_empty() {
-            return Err(BundleError::Forward(
-                "Qwen4 MTP batched append has no rows".to_string(),
-            ));
-        }
         let width = self
             .config
             .hc_count
@@ -2394,6 +2414,41 @@ impl Qwen4Bundle {
             ));
         }
         let hidden = source.sub_offset(offset, len);
+        self.mtp_append_rows_hidden(
+            gpu,
+            context,
+            scratch,
+            tokens,
+            &hidden,
+            trunk_ids_row,
+            prompt_ids,
+            position,
+        )
+    }
+
+    /// [`Self::mtp_append_rows`] over an explicit F32 `hidden` tensor instead
+    /// of captured spec rows: row `i` of `tokens` pairs with `hidden` row `i`
+    /// (`hc_count * hidden_size` elements each; at least `tokens.len()` rows).
+    /// This is how a prompt chunk's first row takes the carried `pending`
+    /// hidden (position `p - 1`, from the previous chunk) through the same
+    /// DET kernels as the rest of the chunk. `trunk_ids_row`, `prompt_ids` and
+    /// `context` behave as in [`Self::mtp_append_rows`].
+    pub(crate) fn mtp_append_rows_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        context: MtpFillContext,
+        scratch: &mut MtpAppendScratch,
+        tokens: &[u32],
+        hidden: &GpuTensor,
+        trunk_ids_row: Option<usize>,
+        prompt_ids: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<(), BundleError> {
+        if tokens.is_empty() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP batched append has no rows".to_string(),
+            ));
+        }
         // The ids the trunk forward already uploaded stand in for the head's
         // own copy; no forward runs between that upload and this call.
         let trunk_ids = trunk_ids_row.and_then(|row| {
@@ -2413,7 +2468,7 @@ impl Qwen4Bundle {
                 context,
                 scratch,
                 tokens,
-                &hidden,
+                hidden,
                 device_ids,
                 position,
             )
@@ -5061,12 +5116,14 @@ mod tests {
                 ..Qwen4StateFormat::F32
             };
             let fixed = session_snapshot_bytes(&config, format, true, 0).unwrap();
-            assert_eq!(fixed, 34_180_608);
+            // The 34,180,608 B of fixed parts before the head's snapshot also
+            // kept the target boundary-hidden row (one 40,960 B part).
+            assert_eq!(fixed, 34_180_608 + 40_960);
             let bounded = session_snapshot_bytes(&config, format, true, 8192).unwrap();
             assert_eq!(bounded, fixed + 8192 * row_bytes);
         }
         let full_f32 = session_snapshot_bytes(&config, Qwen4StateFormat::F32, true, 0).unwrap();
-        assert_eq!(full_f32, 118_230_528);
+        assert_eq!(full_f32, 118_230_528 + 40_960);
     }
 
     #[test]

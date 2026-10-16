@@ -50,8 +50,8 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
-/// Metadata words of an MTP head session snapshot: a reserved zero word and
-/// the state mark.
+/// Metadata words of an MTP head session snapshot: the boundary-row word
+/// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
 /// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
 /// launch sequence: the capacity of [`MtpAppendScratch`].
@@ -1114,6 +1114,9 @@ pub struct MtpGpuState {
     selected_indices: GpuTensor,
     selected_len_out: GpuTensor,
     wide_hidden: GpuTensor,
+    /// The target's boundary hidden (row `position - 1`) kept for the
+    /// session snapshot; no snapshot backup of its own.
+    boundary_hidden: GpuTensor,
     full_capacity: usize,
     raw_capacity: usize,
     pooled_capacity: usize,
@@ -1131,6 +1134,12 @@ pub struct MtpGpuState {
     selected_len: usize,
     step_index: usize,
     request_epoch: u64,
+    /// Position `boundary_hidden` was saved for ([`Self::save_boundary_hidden`]),
+    /// or restored with at a session restore.
+    boundary_saved: Option<usize>,
+    /// Set by a session restore whose snapshot held a boundary row for its
+    /// position, until [`Self::restore_boundary_hidden`] takes it.
+    boundary_restored: Option<usize>,
     generation: u64,
     model_id: u64,
     snapshot_arena: MtpGpuStateSnapshotArena,
@@ -1184,24 +1193,24 @@ impl MtpGpuState {
     /// QSA arenas as `context` commits them (legacy: all of them; VMM: the
     /// first chunk's mapped pages, the rest being virtual until forwards
     /// map it), then the selection and wide-hidden carry, twice with their
-    /// snapshot backups.
+    /// snapshot backups, and the one target boundary-hidden row.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
         context: &Qwen4ContextCommit,
     ) -> Option<usize> {
+        let row = config
+            .hc_count
+            .checked_mul(config.hidden_size)?
+            .checked_mul(std::mem::size_of::<f32>())?;
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
             .checked_add(std::mem::size_of::<i32>())?
-            .checked_add(
-                config
-                    .hc_count
-                    .checked_mul(config.hidden_size)?
-                    .checked_mul(std::mem::size_of::<f32>())?,
-            )?;
+            .checked_add(row)?;
         context
             .committed_layer_bytes(config, QsaKvFormat::F32)?
-            .checked_add(carry.checked_mul(2)?)
+            .checked_add(carry.checked_mul(2)?)?
+            .checked_add(row)
     }
     /// Legacy full-capacity state; see [`Self::new_with_backend`].
     pub(crate) fn new(
@@ -1240,6 +1249,7 @@ impl MtpGpuState {
             ),
             (std::mem::size_of::<i32>(), DType::Raw, false),
             (config.hc_count * config.hidden_size, DType::F32, false),
+            (config.hc_count * config.hidden_size, DType::F32, false),
         ];
         let mut allocated = Vec::with_capacity(shapes.len());
         for (elements, dtype, context) in shapes {
@@ -1266,7 +1276,8 @@ impl MtpGpuState {
         let mut next = || tensors.next().expect("one tensor per MTP state shape");
         let (full_keys, full_values, raw_index_keys, pooled_keys) =
             (next(), next(), next(), next());
-        let (selected_indices, selected_len_out, wide_hidden) = (next(), next(), next());
+        let (selected_indices, selected_len_out, wide_hidden, boundary_hidden) =
+            (next(), next(), next(), next());
         let model_id = next_mtp_model_id();
         let snapshot_arena = match MtpGpuStateSnapshotArena::new(
             gpu,
@@ -1293,6 +1304,7 @@ impl MtpGpuState {
                     selected_indices,
                     selected_len_out,
                     wide_hidden,
+                    boundary_hidden,
                 ] {
                     let _ = gpu.free_tensor(tensor);
                 }
@@ -1307,6 +1319,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
             full_capacity: max_seq,
             raw_capacity: max_seq,
             pooled_capacity,
@@ -1327,6 +1340,8 @@ impl MtpGpuState {
             generation: 0,
             model_id,
             snapshot_arena,
+            boundary_saved: None,
+            boundary_restored: None,
         })
     }
 
@@ -1455,6 +1470,7 @@ impl MtpGpuState {
             &self.selected_indices,
             &self.selected_len_out,
             &self.wide_hidden,
+            &self.boundary_hidden,
         ]
         .into_iter()
         .enumerate()
@@ -1474,6 +1490,8 @@ impl MtpGpuState {
         self.pooled_len = 0;
         self.selected_len = 0;
         self.step_index = 0;
+        self.boundary_saved = None;
+        self.boundary_restored = None;
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
         Ok(())
@@ -1692,13 +1710,15 @@ impl MtpGpuState {
     }
 
     /// Layout of the state at `mark`: full K/V, raw and pooled rows below it,
-    /// then selection, device selected length and wide hidden.
+    /// then selection, device selected length, wide hidden and the target
+    /// boundary hidden.
     fn session_layout(&self, mark: &MtpStateMark) -> StateLayout<'_> {
         StateLayout {
             fixed: vec![
                 whole_part(&self.selected_indices),
                 whole_part(&self.selected_len_out),
                 whole_part(&self.wide_hidden),
+                whole_part(&self.boundary_hidden),
             ],
             rows: [
                 (&self.full_keys, self.full_capacity, mark.full_len),
@@ -1717,7 +1737,11 @@ impl MtpGpuState {
     }
 
     /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
-    /// device ranges of the live state.
+    /// device ranges of the live state. Word 0 is the boundary row's
+    /// position plus one when [`Self::save_boundary_hidden`] saved it for
+    /// exactly this position, else 0 (the row is then stale). A capture
+    /// without the row is allowed (digest contexts read it only), but such a
+    /// snapshot is refused by every restore ([`Self::parse_session_mark`]).
     fn session_parts(&self) -> Result<(Vec<u64>, StateLayout<'_>), MtpGpuError> {
         let mark = self.mark();
         validate_mtp_mark(&mark, self)?;
@@ -1730,8 +1754,12 @@ impl MtpGpuState {
             mark.step_index,
         ]
         .map(|value| value as u64);
+        let boundary = match self.boundary_saved {
+            Some(position) if position == mark.position => position as u64 + 1,
+            _ => 0,
+        };
         Ok((
-            [0].into_iter().chain(words).collect(),
+            [boundary].into_iter().chain(words).collect(),
             self.session_layout(&mark),
         ))
     }
@@ -1749,6 +1777,15 @@ impl MtpGpuState {
             step_index: words[6] as usize,
         };
         validate_mtp_mark(&mark, self)?;
+        // Word 0 is the boundary row's position plus one: a snapshot whose
+        // row was not saved for its own position cannot be restored (the
+        // row would be stale), so the cache entry is refused.
+        if words[0] != mark.position as u64 + 1 {
+            return Err(invalid(format!(
+                "MTP session snapshot at {} holds no boundary hidden for its position",
+                mark.position
+            )));
+        }
         Ok(mark)
     }
 
@@ -1771,6 +1808,9 @@ impl MtpGpuState {
         self.snapshot_arena.invalidate();
         self.request_epoch = self.request_epoch.wrapping_add(1);
         self.generation = self.generation.wrapping_add(1);
+        // The boundary row is overwritten by the copy this layout drives.
+        self.boundary_saved = None;
+        self.boundary_restored = None;
         Ok(self.session_layout(&mark))
     }
 
@@ -1782,6 +1822,65 @@ impl MtpGpuState {
         self.selected_len = mark.selected_len;
         self.position = mark.position;
         self.step_index = mark.step_index;
+        // `parse_session_mark` proved word 0 names this position: the row the
+        // restore just copied in is the boundary hidden for it.
+        self.boundary_saved = Some(mark.position);
+        self.boundary_restored = Some(mark.position);
+        Ok(())
+    }
+
+    /// Keep the target's boundary hidden for the position the head is at: the
+    /// target hidden of row `position - 1`, which the caller holds in
+    /// `pending` right after a prompt chunk's append and before the session
+    /// capture at this boundary. Written into the head's own row so the
+    /// capture carries it; a live `pending` is only read, never changed.
+    pub(crate) fn save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), MtpGpuError> {
+        self.boundary_row_matches(pending)?;
+        self.boundary_saved = None;
+        gpu.copy_d2d(
+            pending,
+            &self.boundary_hidden,
+            self.boundary_hidden.byte_size(),
+        )?;
+        self.boundary_saved = Some(self.position);
+        Ok(())
+    }
+
+    /// After an actual session restore (never a live continuation, which
+    /// leaves `pending` as the live hidden), copy the restored boundary row
+    /// into `pending` and report `true` (a restore refuses any snapshot
+    /// without a boundary row for its position, so a restored head always
+    /// holds one). `false`: no restore since, or the row was already taken;
+    /// `pending` is then untouched.
+    pub(crate) fn restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, MtpGpuError> {
+        if self.boundary_restored != Some(self.position) {
+            return Ok(false);
+        }
+        self.boundary_row_matches(pending)?;
+        gpu.copy_d2d(
+            &self.boundary_hidden,
+            pending,
+            self.boundary_hidden.byte_size(),
+        )?;
+        self.boundary_restored = None;
+        Ok(true)
+    }
+
+    fn boundary_row_matches(&self, pending: &GpuTensor) -> Result<(), MtpGpuError> {
+        if pending.dtype != DType::F32 || pending.numel() != self.boundary_hidden.numel() {
+            return Err(invalid(format!(
+                "MTP boundary hidden needs one F32 row of {} elements",
+                self.boundary_hidden.numel()
+            )));
+        }
         Ok(())
     }
 
@@ -1824,6 +1923,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
             snapshot_arena,
             ..
         } = self;
@@ -1836,6 +1936,7 @@ impl MtpGpuState {
             selected_indices,
             selected_len_out,
             wide_hidden,
+            boundary_hidden,
         ] {
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(error);
@@ -1962,8 +2063,6 @@ const DRAFT_FULL_HOLD: u32 = 64;
 pub(crate) enum MtpStep {
     /// The full step and its argmax draft token.
     Predict,
-    /// The full step: its head state feeds a following step without hidden.
-    Advance,
     /// Only this position's K/V and index-key cache rows. For the last step
     /// of a chain: the next step brings its own backbone hidden and reselects
     /// (the head state and selection are left stale; a reuse is refused).
@@ -2289,6 +2388,16 @@ impl Qwen4MtpGpu {
             .ok_or_else(|| invalid("MTP session snapshot shape mismatch"))
     }
 
+    /// Validate a snapshot's head metadata (shape, mark, boundary row)
+    /// without touching any state: a restore is refused here before any owner
+    /// mutates.
+    pub(crate) fn check_session_restore(&self, meta: &[u8]) -> Result<(), MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .parse_session_mark(&words[..MTP_SESSION_WORDS])
+            .map(|_| ())
+    }
+
     pub(crate) fn prepare_session_restore(
         &mut self,
         gpu: &mut Gpu,
@@ -2317,6 +2426,24 @@ impl Qwen4MtpGpu {
     /// See [`MtpGpuState::context_growth_bytes`].
     pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
         self.state.context_growth_bytes(through)
+    }
+
+    /// See [`MtpGpuState::save_boundary_hidden`].
+    pub(crate) fn save_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<(), MtpGpuError> {
+        self.state.save_boundary_hidden(gpu, pending)
+    }
+
+    /// See [`MtpGpuState::restore_boundary_hidden`].
+    pub(crate) fn restore_boundary_hidden(
+        &mut self,
+        gpu: &mut Gpu,
+        pending: &GpuTensor,
+    ) -> Result<bool, MtpGpuError> {
+        self.state.restore_boundary_hidden(gpu, pending)
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)
@@ -2814,8 +2941,10 @@ impl Qwen4MtpGpu {
     }
 
     /// [`MtpStep::Append`] for `tokens.len()` consecutive prompt rows starting
-    /// at `position`, row `i` paired with `hidden` row `i` (the per-row loop's
-    /// (token p, hidden p) pairing). Runs the per-row `forward_token` Append
+    /// at `position`, row `i` paired with `hidden` row `i` (the caller supplies
+    /// the pairing: the token at position `p` pairs with the target hidden of
+    /// position `p - 1`, prompt position 0 with its own hidden, as the per-row
+    /// loop does). Runs the per-row `forward_token` Append
     /// op sequence once over all rows, calling the rdna-compute entry points
     /// directly (never the `Step` dispatcher or `project_weight`, whose
     /// multi-row routes change the arithmetic): each op is the single-row

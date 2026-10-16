@@ -36,12 +36,11 @@ use crate::lane::{LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState};
 use crate::lane_exec::{LaneDraft, LaneRoute};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
-    accept_native_greedy, batched_depth, draft_accept_estimate, draft_pairing,
-    finish_native_window, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
-    mtp_reuse_prefill_ids_enabled, mtp_skip_intermediate_pick_enabled, observe_agreement,
-    Agreement, DraftPairing, FloorRoute, HeadTicket, MtpFloor, NativeFinish, NativeWindow,
-    Qwen4Ops, TargetTicket, WindowStats, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY,
-    MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH, MTP_ROW_WORTH,
+    accept_native_greedy, batched_depth, draft_accept_estimate, finish_native_window,
+    mtp_prefill_chunk, mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
+    mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, FloorRoute, HeadTicket,
+    MtpFloor, NativeFinish, NativeWindow, Qwen4Ops, TargetTicket, WindowStats, DRAFT_ACCEPT_MAX,
+    MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH, MTP_ROW_WORTH,
 };
 
 use hipfire_runtime::slot_batch::RequestEpoch;
@@ -667,7 +666,7 @@ pub(crate) fn finish_lane_window(
     let mut block = Vec::with_capacity(rows);
     block.push(window.seed);
     block.extend_from_slice(&drafts);
-    let (position, steps) = (window.position, window.steps);
+    let position = window.position;
     let verify_hidden = hidden.sub_offset(row_begin * wide, rows * wide);
     // Taken before `with_lane`: it names the forward scratch.
     let ple_normed = bundle
@@ -701,7 +700,6 @@ pub(crate) fn finish_lane_window(
             NativeFinish {
                 position,
                 block: &block,
-                steps,
                 acceptance: finish_acceptance,
                 target_snapshot,
                 mtp_ticket,
@@ -719,8 +717,8 @@ pub(crate) fn finish_lane_window(
 }
 
 /// The head work of an `ArSynced` lane after its AR row: append the seed
-/// with the `DraftPairing` conditioning, then keep the AR row's wide hidden
-/// as the pending hidden. `dec_row` is the lane's row in `hidden`.
+/// with the previous position's target hidden, then keep the AR row's wide
+/// hidden as pending for the next head row. `dec_row` is the lane's row in `hidden`.
 pub(crate) fn ar_synced_head(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -762,12 +760,10 @@ pub(crate) fn ar_synced_head(
         ));
     }
     let row = hidden.sub_offset(dec_row * wide, wide);
-    let conditioning = match draft_pairing() {
-        DraftPairing::HeadState => None,
-        DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(&row),
-    };
+    // Fills use the same (token p, target hidden p - 1) pairing as drafting.
+    // Keep `pending_hidden` intact until the append has consumed it.
     lane_call(bundle.with_lane(state, Some((&mut *head, draft)), |b| {
-        b.mtp_append_token(gpu, seed, conditioning, position)
+        b.mtp_append_token(gpu, seed, Some(pending_hidden), position)
     }))
     .map_err(|e| format!("ar_synced_head: head append: {e}"))?;
     if head.position() != position + 1 {

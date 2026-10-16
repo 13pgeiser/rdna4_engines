@@ -1196,9 +1196,6 @@ fn main() -> Result<()> {
     // The GPU arch drives `memory.ple_format = auto`; initialising it allocates
     // no model memory, so admission still precedes every upload.
     let mut gpu = Gpu::init().map_err(err)?;
-    // Admission is GPU-arch aware: an expert-slab artifact admits only on a
-    // supported arch. Initialising the GPU allocates no model memory.
-    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(err)?;
     eprintln!("gpu {} uma={} n_ctx={n_ctx}", gpu.arch, gpu.is_uma());
     // `<model>.ple-q4` / `.ple-q8` sidecar rows (a split base is refused by
     // admission without one); never derived here (`hipfire ple derive` first).
@@ -1224,7 +1221,10 @@ fn main() -> Result<()> {
     if let Some(note) = &choice.note {
         eprintln!("qwen4_qsa_ctx: ple rows: {note}");
     }
-    let receipt = admit_hfqm_artifact(&hfq).map_err(err)?;
+    // Admission is GPU-arch aware (an expert-slab artifact admits only on a
+    // supported arch) and runs after the PLE rows are attached, which the
+    // receipt's `ple_rows` records.
+    let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(err)?;
     // `<model>.trunk-overlay`, bound to this base while it is open and applied
     // by `attach_forward`.
     let trunk_overlay =
@@ -1377,6 +1377,7 @@ fn main() -> Result<()> {
         receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .map_err(err)?;
     bundle.attach_npu_trunk_identity(npu_identity);

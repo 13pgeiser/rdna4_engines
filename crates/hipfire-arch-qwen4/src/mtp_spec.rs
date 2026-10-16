@@ -1185,7 +1185,13 @@ impl Qwen4Bundle {
         scratch: &mut dyn SpecScratch,
         read_picks: bool,
     ) -> Result<Vec<u32>, String> {
-        self.verify_block_rows(gpu, block, position, scratch, read_picks)
+        self.verify_block_rows(
+            &mut Qwen4Ops::Single(gpu),
+            block,
+            position,
+            scratch,
+            read_picks,
+        )
     }
 
     /// Rewind a finished verify without committing: restore the scratch's
@@ -1203,7 +1209,8 @@ impl Qwen4Bundle {
             .ok_or("Qwen4 rollback: scratch is not Qwen4SpecScratch")?
             .target_snapshot
             .take()
-            .ok_or("Qwen4 rollback: target snapshot is not active")?;
+            .ok_or("Qwen4 rollback: target snapshot is not active")?
+            .local()?;
         self.restore(gpu, snapshot)
             .map_err(|error| error.to_string())
     }
@@ -1388,29 +1395,6 @@ impl SpecTarget for Qwen4Bundle {
             remaining_new_tokens,
             max_draft_rows,
         );
-    }
-}
-
-/// Draft-step hidden conditioning mode; see [`draft_pairing`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DraftPairing {
-    HeadState,
-    AlignedHead,
-    AlignedTarget,
-}
-
-/// Native MTP draft-step conditioning.  `HeadState` is the historical
-/// chain: row 0 is fed the window's pending hidden and every later row is
-/// fed the head's own previous-step hidden (`forward_token` with no target hidden).
-/// `AlignedHead` feeds the target's hidden of the token being processed at
-/// row 0 and the head's own hidden afterwards; `AlignedTarget` feeds the
-/// target's same-row hidden at every row.  Selectable so the pairing can be
-/// measured rather than argued: `HIPFIRE_MTP_PAIRING=aligned-head|aligned`.
-pub(crate) fn draft_pairing() -> DraftPairing {
-    match hipfire_config::developer_var("HIPFIRE_MTP_PAIRING").as_deref() {
-        Ok("aligned-head") => DraftPairing::AlignedHead,
-        Ok("aligned") => DraftPairing::AlignedTarget,
-        _ => DraftPairing::HeadState,
     }
 }
 
@@ -3703,7 +3687,8 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
 /// its AR tokens advance the target alone (no head work per token); each
 /// token's target wide hidden is captured into spec hidden row `i` while the
 /// head stays at `start`. [`Qwen4MtpDrafter::catch_up_head`] appends the owed
-/// rows teacher-forced, as a takeover appends its kept rows, when they fill
+/// rows teacher-forced (token `p` with the target hidden of `p - 1`, as a
+/// takeover appends its kept rows), when they fill
 /// one batched fill and before every teacher-forced advance (the terminal
 /// pending-seed flush among them). A retired request therefore still ends
 /// with its head at the target, and the conversation's next turn continues
@@ -3711,13 +3696,18 @@ fn window_key(window: Result<MtpWindow, String>) -> Result<(Vec<u32>, usize, usi
 ///
 /// While rows are owed nothing else writes spec hidden: a retired request
 /// runs only head-free AR tokens until it catches up, and every reset or
-/// prefill drops the record (its owners are reset or restored). Host only.
+/// prefill drops the record (its owners are reset or restored). Nothing
+/// writes the drafter's pending hidden either: it stays the hidden of
+/// `start - 1` (the head's position - 1), which owed token 0 pairs with
+/// (token `i` pairs with spec hidden row `i - 1`); the catch-up ends it on
+/// row `owed - 1`. Host only.
 #[derive(Debug, Default)]
 struct HeadLag {
     /// The head position: where the first owed row goes.
     start: usize,
     /// The owed tokens, at positions `start..start + tokens.len()`; token
-    /// `i`'s target hidden is spec hidden row `i`.
+    /// `i`'s own target hidden is spec hidden row `i` (the pair of token
+    /// `i + 1`).
     tokens: Vec<u32>,
 }
 
@@ -3771,7 +3761,10 @@ struct WindowSpan {
 /// and replay only the consumed prefix. Held until the next window, forced
 /// advance, prefill, reset or request configuration; the next snapshot, reset
 /// or session restore of either owner also supersedes the tickets, which then
-/// stop validating.
+/// stop validating. The drafter's `retained_pending` holds the window's
+/// pre-window pending hidden (the target hidden of `span.start - 1`, which
+/// the seed's head row pairs with): the replay needs it after the window
+/// moved `pending_hidden` on.
 #[derive(Clone, Copy)]
 struct RetainedWindow {
     span: WindowSpan,
@@ -3782,8 +3775,8 @@ struct RetainedWindow {
 /// The tokens a terminal repair replays after restoring `span`'s pre-window
 /// state: `seed` plus all but the last of `consumed` (the last stays pending
 /// for the terminal flush). `None` when the repair does not apply: it is for
-/// another window, nothing was consumed (the pre-window pending hidden is not
-/// kept), or the replay would pass the rows the window committed.
+/// another window, nothing was consumed (there is nothing to replay), or the
+/// replay would pass the rows the window committed.
 fn terminal_repair_replay(
     span: WindowSpan,
     window_start: usize,
@@ -3798,8 +3791,9 @@ fn terminal_repair_replay(
 }
 
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
-/// target bundle; this adapter owns only the reusable verifier scratch and one
-/// pending target-hidden row needed to seed each MTP window.
+/// target bundle; this adapter owns only the reusable verifier scratch, the
+/// pending target-hidden row that seeds each MTP window (the hidden of the
+/// head's position - 1) and a pre-window copy of it for a terminal repair.
 pub struct Qwen4MtpDrafter {
     max_k: usize,
     ctx_capacity: usize,
@@ -3940,6 +3934,11 @@ pub struct Qwen4MtpDrafter {
     /// repairable ([`RetainedWindow`]). Dropped by the next window, forced
     /// advance, prefill, reset or request configuration.
     retained: Option<RetainedWindow>,
+    /// The target hidden of `retained`'s `span.start - 1`: the pending hidden
+    /// the window began from, saved before the window moved `pending_hidden`
+    /// on (a terminal replay's first head row pairs with it). Valid only
+    /// while `retained` is `Some`.
+    retained_pending: Option<GpuTensor>,
     /// Bit `d`: this drafter already ran a batched window drafting `d`
     /// tokens, so that row count's one-time verify work is done (see
     /// [`Self::floor_observe_native`]). Lives as long as the drafter, across
@@ -4027,6 +4026,7 @@ impl Qwen4MtpDrafter {
             follower: false,
             replay: Vec::new(),
             retained: None,
+            retained_pending: None,
             warm_depths: 0,
             warm_ar: false,
             floor_pending: None,
@@ -4182,6 +4182,15 @@ impl Qwen4MtpDrafter {
                     .map_err(|error| format!("Qwen4 MTP row hidden allocation: {error}"))?,
             );
         }
+        if self.retained_pending.is_none() {
+            self.retained_pending = Some(
+                ops.gpu()?
+                    .zeros(&[width], rdna_compute::DType::F32)
+                    .map_err(|error| {
+                        format!("Qwen4 MTP retained pending hidden allocation: {error}")
+                    })?,
+            );
+        }
         if self.append_scratch.is_none() && mtp_fill_scratch_wanted(ops.gpu()?) {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(ops.gpu()?) {
@@ -4254,11 +4263,6 @@ impl Qwen4MtpDrafter {
             .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())
     }
 
-    /// Native MTP draft-step conditioning; see the free [`draft_pairing`].
-    fn draft_pairing() -> DraftPairing {
-        draft_pairing()
-    }
-
     /// Incremental verify: interleave one target row with one draft step and
     /// stop at the first rejection.
     ///
@@ -4285,7 +4289,6 @@ impl Qwen4MtpDrafter {
         trace: bool,
         mut sampled: Option<&mut SampledVerify>,
     ) -> Result<MtpWindow, String> {
-        let pairing = Self::draft_pairing();
         let mut timers = MtpPhaseTimers::new().silenced(self.follower);
         let window_start = Instant::now();
         let mut committed: Vec<u32> = Vec::with_capacity(k + 1);
@@ -4331,14 +4334,12 @@ impl Qwen4MtpDrafter {
                 // the committed end, exactly as the batched path's full-accept
                 // branch does with one extra `mtp_forward_token`.
                 timers.mark(ops.gpu()?, "draft_step");
-                let hidden = match pairing {
-                    DraftPairing::HeadState => None,
-                    DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
-                };
                 {
+                    // `pending` is the target hidden of `token_position - 1`.
+                    let pending = self.pending_hidden()?;
                     let bundle = Self::bundle(target)?;
                     bundle
-                        .mtp_append_token(ops.gpu()?, token, hidden, token_position)
+                        .mtp_append_token(ops.gpu()?, token, Some(pending), token_position)
                         .map_err(|error| error.to_string())?;
                 }
                 committed.push(match sampled.as_deref_mut() {
@@ -4349,16 +4350,15 @@ impl Qwen4MtpDrafter {
                 break;
             }
             timers.mark(ops.gpu()?, "draft_step");
-            let hidden = match pairing {
-                DraftPairing::HeadState if row > 0 => None,
-                DraftPairing::AlignedHead if row > 0 => None,
-                DraftPairing::HeadState => Some(self.pending_hidden()?),
-                DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
-            };
+            // Every row pairs its token with the target hidden of the row
+            // before it, which this route has verified by now: `pending`
+            // carries it (the window's pending hidden for row 0, then the
+            // previous row's own, moved on when its draft is accepted).
             let mut draft = {
+                let pending = self.pending_hidden()?;
                 let bundle = Self::bundle(target)?;
                 bundle
-                    .mtp_forward_token(ops.gpu()?, token, hidden, token_position, row == 0)
+                    .mtp_forward_token(ops.gpu()?, token, Some(pending), token_position, row == 0)
                     .map_err(|error| error.to_string())?
             };
             let verdict = match sampled.as_deref_mut() {
@@ -4385,6 +4385,15 @@ impl Qwen4MtpDrafter {
                     }
                     if draft == eos {
                         break;
+                    }
+                    // The next row pairs with this row's own target hidden.
+                    {
+                        let pending = self.pending_hidden()?;
+                        ops.gpu()?
+                            .copy_d2d(row_hidden, pending, pending.byte_size())
+                            .map_err(|error| {
+                                format!("Qwen4 MTP incremental pending hidden copy: {error}")
+                            })?;
                     }
                     token = draft;
                     row += 1;
@@ -4440,15 +4449,10 @@ impl Qwen4MtpDrafter {
         if timers.enabled() {
             let window_us = synced_wall_us(ops.gpu()?, window_start);
             let fields = format!(
-                "\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"pairing\":\"{}\",\"t_end\":{}",
+                "\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{},\"accepted\":{accepted},\"emitted\":{},\"window_us\":{window_us:.1},\"pairing\":\"teacher-forced\",\"t_end\":{}",
                 accept_route_label(sampled.as_deref()),
                 drafts.len(),
                 committed.len(),
-                match pairing {
-                    DraftPairing::HeadState => "head-state",
-                    DraftPairing::AlignedHead => "aligned-head",
-                    DraftPairing::AlignedTarget => "aligned-target",
-                },
                 unix_micros()
             );
             timers.finish(ops.gpu()?, "QWEN4_MTP_PHASE", &fields);
@@ -4642,7 +4646,8 @@ impl Qwen4MtpDrafter {
     /// `calibrate` (the request's first window) times the token including
     /// that draw, then, outside the timing, keeps the head synced exactly as
     /// a `k = 0` interleaved window does (the ordinary forward's wide hidden,
-    /// head append with the same `DraftPairing` conditioning, pending hidden)
+    /// head append of the seed with the pending hidden of `position - 1`, then
+    /// the pending hidden moves to the seed's own)
     /// before recording the AR price.  Otherwise (retired) it does no head
     /// work and never checks the head position: the head owes the token's
     /// row ([`Self::owe_head_row`]).
@@ -4704,7 +4709,6 @@ impl Qwen4MtpDrafter {
             ));
         }
         if calibrate {
-            let pairing = Self::draft_pairing();
             let row_hidden = self.row_hidden()?;
             let pending = self.pending_hidden()?;
             {
@@ -4712,12 +4716,9 @@ impl Qwen4MtpDrafter {
                 bundle
                     .copy_ar_hidden_to(ops.gpu()?, row_hidden)
                     .map_err(|error| error.to_string())?;
-                let hidden = match pairing {
-                    DraftPairing::HeadState => None,
-                    DraftPairing::AlignedHead | DraftPairing::AlignedTarget => Some(row_hidden),
-                };
+                // The seed pairs with the target hidden of `position - 1`.
                 bundle
-                    .mtp_append_token(ops.gpu()?, seed, hidden, position)
+                    .mtp_append_token(ops.gpu()?, seed, Some(pending), position)
                     .map_err(|error| error.to_string())?;
                 let mtp_end = bundle.mtp_position().map_err(|error| error.to_string())?;
                 if mtp_end != end {
@@ -4785,9 +4786,11 @@ impl Qwen4MtpDrafter {
     }
 
     /// Append the head rows a retired request owes ([`HeadLag`]),
-    /// teacher-forced (token `p`, target hidden `p`) exactly as a takeover
-    /// appends its kept rows: one batched decode fill from two rows when it
-    /// runs, else one Append per row. Head and target then sit at the same
+    /// teacher-forced (token `p` with the target hidden of `p - 1`: the
+    /// pending hidden, still the head's position - 1, for the first owed
+    /// token) exactly as a takeover appends its kept rows: one batched decode
+    /// fill from two rows when it runs, else one Append per row. Head and
+    /// target then sit at the same
     /// position, and the pending hidden is the last row's, as after any
     /// teacher-forced advance. A no-op when nothing is owed.
     fn catch_up_head(
@@ -4809,37 +4812,24 @@ impl Qwen4MtpDrafter {
                 bundle.state.position
             ));
         }
-        let fill = self
-            .append_scratch
-            .as_mut()
-            .filter(|fill| owed >= 2 && owed <= fill.rows() && mtp_batched_fill_enabled());
-        match fill {
-            Some(fill) => bundle
-                .mtp_append_rows(
-                    ops.gpu()?,
-                    MtpFillContext::DecodeFill,
-                    fill,
-                    &self.head_lag.tokens,
-                    0,
-                    None,
-                    None,
-                    start,
-                )
-                .map_err(|error| error.to_string())?,
-            None => {
-                let row_hidden = self
-                    .row_hidden
-                    .as_ref()
-                    .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
-                for (row, &token) in self.head_lag.tokens.iter().enumerate() {
-                    bundle
-                        .copy_spec_hidden_row_to(ops.gpu()?, row, row_hidden)
-                        .map_err(|error| error.to_string())?;
-                    bundle
-                        .mtp_append_token(ops.gpu()?, token, Some(row_hidden), start + row)
-                        .map_err(|error| error.to_string())?;
-                }
-            }
+        {
+            let row_hidden = self
+                .row_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+            let pending = self
+                .pending_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+            fill_head_rows(
+                bundle,
+                ops.gpu()?,
+                self.append_scratch.as_mut(),
+                row_hidden,
+                pending,
+                &self.head_lag.tokens,
+                start,
+            )?;
         }
         let head = bundle.mtp_position().map_err(|error| error.to_string())?;
         if head != end {
@@ -4909,6 +4899,36 @@ impl Qwen4MtpDrafter {
         }
     }
 
+    /// Save the pending hidden (the target hidden of the coming window's
+    /// `start - 1`) into `retained_pending`, before the window moves
+    /// `pending_hidden` on: a terminal repair replays from it.
+    fn save_retained_pending(&self, gpu: &Gpu) -> Result<(), String> {
+        let pending = self.pending_hidden()?;
+        let saved = self
+            .retained_pending
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP retained pending hidden is not allocated".to_string())?;
+        gpu.copy_d2d(pending, saved, pending.byte_size())
+            .map_err(|error| format!("Qwen4 MTP retained pending hidden copy: {error}"))
+    }
+
+    /// The tickets of a one-row window when the request keeps them
+    /// ([`Self::keeps_one_row_windows`]), with the pre-window pending hidden
+    /// saved beside them. `rows` is the mesh aggregate window's span (see
+    /// [`Self::open_window_tickets`]).
+    fn open_one_row_tickets(
+        &self,
+        ops: &mut Qwen4Ops<'_>,
+        target: &mut dyn SpecTarget,
+        rows: usize,
+    ) -> Result<Option<(TargetTicket, HeadTicket)>, String> {
+        if !self.keeps_one_row_windows(target) {
+            return Ok(None);
+        }
+        self.save_retained_pending(ops.gpu()?)?;
+        Self::open_window_tickets(ops, target, rows).map(Some)
+    }
+
     /// End a one-row window's tickets: a committed window retains them (it
     /// ended at the target's position), a failed one releases them; the
     /// window's own error handling is unchanged.
@@ -4949,8 +4969,11 @@ impl Qwen4MtpDrafter {
     /// The restore-and-replay body of [`MtpDrafter::mtp_repair_terminal_prefix`]:
     /// both owners back to the window's start, then `replay` forwarded through
     /// the target and appended to the head teacher-forced, exactly as a
-    /// takeover appends its kept rows. The retained tickets stay active for
-    /// the caller to release.
+    /// takeover appends its kept rows ([`fill_head_rows`]): the seed's head
+    /// row pairs with the window's pre-window pending hidden
+    /// (`retained_pending`; `pending_hidden` has moved on since), each later
+    /// row with the replayed row before it. The retained tickets stay active
+    /// for the caller to release.
     fn replay_window_prefix(
         &mut self,
         ops: &mut Qwen4Ops<'_>,
@@ -4985,36 +5008,34 @@ impl Qwen4MtpDrafter {
         bundle
             .ops_spec_rows(ops, replay, false)
             .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))?;
-        let fill = self.append_scratch.as_mut().filter(|fill| {
-            replay.len() >= 2 && replay.len() <= fill.rows() && mtp_batched_fill_enabled()
-        });
-        match fill {
-            Some(fill) => bundle
-                .mtp_append_rows(
-                    ops.gpu()?,
-                    MtpFillContext::DecodeFill,
-                    fill,
-                    replay,
-                    0,
-                    None,
-                    None,
-                    start,
-                )
-                .map_err(|error| format!("Qwen4 terminal repair head fill: {error}"))?,
-            None => {
-                let row_hidden = self
-                    .row_hidden
-                    .as_ref()
-                    .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
-                for (row, &token) in replay.iter().enumerate() {
-                    bundle
-                        .copy_spec_hidden_row_to(ops.gpu()?, row, row_hidden)
-                        .map_err(|error| error.to_string())?;
-                    bundle
-                        .mtp_append_token(ops.gpu()?, token, Some(row_hidden), start + row)
-                        .map_err(|error| format!("Qwen4 terminal repair head fill: {error}"))?;
-                }
-            }
+        {
+            let row_hidden = self
+                .row_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+            let pending = self
+                .pending_hidden
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+            let saved = self
+                .retained_pending
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP retained pending hidden is not allocated".to_string())?;
+            // The head is back at `start`: its row pairs with the hidden of
+            // `start - 1`, which the window saved.
+            ops.gpu()?
+                .copy_d2d(saved, pending, pending.byte_size())
+                .map_err(|error| format!("Qwen4 terminal repair pending restore: {error}"))?;
+            fill_head_rows(
+                bundle,
+                ops.gpu()?,
+                self.append_scratch.as_mut(),
+                row_hidden,
+                pending,
+                replay,
+                start,
+            )
+            .map_err(|error| format!("Qwen4 terminal repair head fill: {error}"))?;
         }
         let pending = self
             .pending_hidden
@@ -5305,8 +5326,9 @@ impl Qwen4MtpDrafter {
     /// The head never proposed these rows, so after the target keeps its
     /// consumed rows (`seed` plus the accepted candidates; an accepted
     /// end-of-turn stays pending) the MTP head appends exactly those rows,
-    /// teacher-forced: token `p` paired with the target hidden of row `p`,
-    /// the pairing of the prompt fill and `mtp_forced_advance`, through the
+    /// teacher-forced: token `p` paired with the target hidden of position
+    /// `p - 1` (the seed with the pending hidden), the pairing of the draft
+    /// steps, the prompt fill and `mtp_forced_advance`, through the
     /// batched append where it runs. The pending hidden becomes the last
     /// consumed row's, so the next native window drafts as it would after a
     /// prompt fill ending there. A rejected tail never reaches either owner.
@@ -5385,15 +5407,11 @@ impl Qwen4MtpDrafter {
             .is_ok_and(|value| value == "1");
         let mut sampled = self.sampled.take();
         let window = if interleaved {
-            let tickets = if self.keeps_one_row_windows(target) {
-                Some(Self::open_window_tickets(
-                    &mut Qwen4Ops::Single(&mut *gpu),
-                    target,
-                    candidates.len() + 1,
-                )?)
-            } else {
-                None
-            };
+            let tickets = self.open_one_row_tickets(
+                &mut Qwen4Ops::Single(&mut *gpu),
+                target,
+                candidates.len() + 1,
+            )?;
             let window = self.takeover_interleaved(
                 gpu,
                 target,
@@ -5793,36 +5811,24 @@ impl Qwen4MtpDrafter {
             // The kept rows' captured hiddens are spec hidden rows
             // `0..consumed` (the verify's, or the replay's).
             timers.mark(gpu, "head_fill");
-            let fill = self.append_scratch.as_mut().filter(|fill| {
-                consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled()
-            });
-            match fill {
-                Some(fill) => bundle
-                    .mtp_append_rows(
-                        gpu,
-                        MtpFillContext::DecodeFill,
-                        fill,
-                        &block[..consumed],
-                        0,
-                        None,
-                        None,
-                        position,
-                    )
-                    .map_err(|error| error.to_string())?,
-                None => {
-                    let row_hidden = self
-                        .row_hidden
-                        .as_ref()
-                        .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
-                    for (row, &token) in block[..consumed].iter().enumerate() {
-                        bundle
-                            .copy_spec_hidden_row_to(gpu, row, row_hidden)
-                            .map_err(|error| error.to_string())?;
-                        bundle
-                            .mtp_append_token(gpu, token, Some(row_hidden), position + row)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
+            {
+                let row_hidden = self
+                    .row_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())?;
+                let pending = self
+                    .pending_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+                fill_head_rows(
+                    bundle,
+                    gpu,
+                    self.append_scratch.as_mut(),
+                    row_hidden,
+                    pending,
+                    &block[..consumed],
+                    position,
+                )?;
             }
             timers.mark(gpu, "commit");
             let committed_end = position + consumed;
@@ -5837,6 +5843,14 @@ impl Qwen4MtpDrafter {
                 .pending_hidden
                 .as_ref()
                 .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
+            // The window's pre-window pending hidden, kept for a terminal
+            // repair before the copy below moves `pending_hidden` on.
+            let retained_pending = self
+                .retained_pending
+                .as_ref()
+                .ok_or_else(|| "Qwen4 MTP retained pending hidden is not allocated".to_string())?;
+            gpu.copy_d2d(pending_hidden, retained_pending, pending_hidden.byte_size())
+                .map_err(|error| format!("Qwen4 MTP retained pending hidden copy: {error}"))?;
             bundle
                 .copy_spec_hidden_row_to(gpu, target_accept_len, pending_hidden)
                 .map_err(|error| error.to_string())?;
@@ -6037,8 +6051,14 @@ impl Qwen4MtpDrafter {
                 bundle
                     .copy_spec_hidden_row_to(gpu, 0, row_hidden)
                     .map_err(|error| error.to_string())?;
+                // (token p, hidden p - 1): `pending` carries the previous
+                // row's hidden (the window's pending hidden for row 0).
+                let pending = self
+                    .pending_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 MTP pending hidden is not allocated".to_string())?;
                 bundle
-                    .mtp_append_token(gpu, token, Some(row_hidden), token_position)
+                    .mtp_append_token(gpu, token, Some(pending), token_position)
                     .map_err(|error| error.to_string())?;
             }
             if row == n {
@@ -6074,6 +6094,14 @@ impl Qwen4MtpDrafter {
                     }
                     if candidate == eos {
                         break;
+                    }
+                    // The next row pairs with this row's own target hidden.
+                    {
+                        let pending = self.pending_hidden()?;
+                        gpu.copy_d2d(row_hidden, pending, pending.byte_size())
+                            .map_err(|error| {
+                                format!("Qwen4 MTP takeover pending hidden copy: {error}")
+                            })?;
                     }
                     token = candidate;
                     row += 1;
@@ -6141,6 +6169,8 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
 /// every row (`append_scratch` given and batched fill or the DET prompt fill
 /// on: sub-chunks of `scratch.rows()` rows, a lone row per-row except under
 /// DET, which takes it through the same rows kernels; otherwise per-row),
+/// with token `p` paired with the target hidden of `p - 1` (`pending` for the
+/// chunk's first row, which prompt position 0 takes from its own row),
 /// leaving `pending` on the chunk's last
 /// row. Returns the trunk pick when `needs_pick`. The boundary, session and
 /// pick bookkeeping stay with the caller; `abort` is polled before every
@@ -6266,9 +6296,46 @@ fn mtp_append_prefill_chunk(
             .map_err(|error| error.to_string())?;
         // One Append pass per sub-chunk of `prompt_fill_sub_rows` rows
         // (`scratch.rows()` batched; one row at a time with batched fill
-        // off under DET); row `i` is still paired with spec hidden row `i`.
+        // off under DET). Token `p` pairs with the target hidden of
+        // `p - 1`: chunk row 0 with `pending` (the previous chunk's last
+        // row; prompt position 0 has no predecessor and takes its own
+        // hidden), row `i` with spec hidden row `i - 1`.
         let sub_rows = prompt_fill_sub_rows(batched, scratch.rows());
-        let mut off = 0;
+        if pos == 0 {
+            bundle
+                .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0, pending)
+                .map_err(|error| error.to_string())?;
+        }
+        if prompt_fill_uses_rows(det, 1) {
+            // DET: the first row takes the same rows kernels as every other
+            // prompt row, so its bytes do not depend on the chunk boundary.
+            let prompt_ids = if chunk_ids_uploaded {
+                Some(
+                    scratch
+                        .prompt_ids_view(0, 1)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            bundle
+                .mtp_append_rows_hidden(
+                    ops.gpu()?,
+                    MtpFillContext::PromptFill,
+                    scratch,
+                    &chunk[..1],
+                    pending,
+                    prefill_trunk_ids_row(reuse_trunk_ids, 0),
+                    prompt_ids.as_ref(),
+                    pos,
+                )
+                .map_err(|error| error.to_string())?;
+        } else {
+            bundle
+                .mtp_append_token(ops.gpu()?, chunk[0], Some(pending), pos)
+                .map_err(|error| error.to_string())?;
+        }
+        let mut off = 1;
         while off < chunk.len() {
             if abort() {
                 bundle.ops_reset(ops)?;
@@ -6285,7 +6352,7 @@ fn mtp_append_prefill_chunk(
                 // one). Under DET a lone row takes the rows route below
                 // instead, through the same kernels as every other row.
                 bundle
-                    .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0 + off, pending)
+                    .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0 + off - 1, pending)
                     .map_err(|error| error.to_string())?;
                 bundle
                     .mtp_append_token(ops.gpu()?, chunk[off], Some(pending), position)
@@ -6306,7 +6373,7 @@ fn mtp_append_prefill_chunk(
                         MtpFillContext::PromptFill,
                         scratch,
                         &chunk[off..off + n],
-                        hidden_row0 + off,
+                        hidden_row0 + off - 1,
                         prefill_trunk_ids_row(reuse_trunk_ids, off),
                         prompt_ids.as_ref(),
                         position,
@@ -6329,15 +6396,77 @@ fn mtp_append_prefill_chunk(
             let position = pos
                 .checked_add(index)
                 .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-            bundle
-                .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0 + index, pending)
-                .map_err(|error| error.to_string())?;
+            // (token p, hidden p - 1): `pending` still holds the hidden of
+            // `p - 1`; prompt position 0 has no predecessor and takes its own.
+            if position == 0 {
+                bundle
+                    .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0 + index, pending)
+                    .map_err(|error| error.to_string())?;
+            }
             bundle
                 .mtp_append_token(ops.gpu()?, token, Some(pending), position)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(ops.gpu()?, hidden_row0 + index, pending)
                 .map_err(|error| error.to_string())?;
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+/// Teacher-forced head rows for `tokens` at `start..`, whose target hiddens
+/// are spec hidden rows `0..tokens.len()` while `pending` holds the hidden of
+/// `start - 1` (the head's position - 1): token `i` pairs with the hidden of
+/// position `start + i - 1`, so token 0 with `pending` and token `i` with spec
+/// row `i - 1`. Token 0 is one Append; the rest take one batched decode fill
+/// when `fill` takes them, else one Append per row through `row_hidden`.
+/// `pending` is left as it was: the caller moves it to the last row's hidden.
+#[allow(clippy::too_many_arguments)]
+fn fill_head_rows(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    fill: Option<&mut MtpAppendScratch>,
+    row_hidden: &GpuTensor,
+    pending: &GpuTensor,
+    tokens: &[u32],
+    start: usize,
+) -> Result<(), String> {
+    let Some((&first, rest)) = tokens.split_first() else {
+        return Ok(());
+    };
+    bundle
+        .mtp_append_token(gpu, first, Some(pending), start)
+        .map_err(|error| error.to_string())?;
+    if rest.is_empty() {
+        return Ok(());
+    }
+    match fill
+        .filter(|fill| rest.len() >= 2 && rest.len() <= fill.rows() && mtp_batched_fill_enabled())
+    {
+        Some(fill) => bundle
+            .mtp_append_rows(
+                gpu,
+                MtpFillContext::DecodeFill,
+                fill,
+                rest,
+                0,
+                None,
+                None,
+                start + 1,
+            )
+            .map_err(|error| error.to_string()),
+        None => {
+            for (row, &token) in rest.iter().enumerate() {
+                bundle
+                    .copy_spec_hidden_row_to(gpu, row, row_hidden)
+                    .map_err(|error| error.to_string())?;
+                bundle
+                    .mtp_append_token(gpu, token, Some(row_hidden), start + 1 + row)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// What [`finish_native_window`] needs from a batched window's verify.
@@ -6346,15 +6475,14 @@ pub(crate) struct NativeFinish<'a> {
     pub position: usize,
     /// `[seed, drafts..]`, the verify's rows.
     pub block: &'a [u32],
-    /// Draft steps the head ran (one more than the kept drafts when the
-    /// last step drafted a dropped token).
-    pub steps: usize,
     pub acceptance: GreedyAccept,
     /// The target ticket taken before the verify.
     pub target_snapshot: TargetTicket,
     /// The head ticket taken before the window's draft steps.
     pub mtp_ticket: HeadTicket,
-    /// Destination of the next window's row-0 hidden.
+    /// Destination of the next window's row-0 hidden; on entry the
+    /// pre-window pending hidden (the target hidden of `position - 1`), and
+    /// the teacher-forced rebuild's scratch row in between.
     pub pending_hidden: &'a GpuTensor,
     /// Row `i` = block row `i`'s wide hidden (F32, `hc_count * hidden`).
     pub verify_hidden: &'a GpuTensor,
@@ -6370,7 +6498,7 @@ pub(crate) struct NativeFinish<'a> {
 
 /// A batched window's tail, from the target's accepted length through the
 /// ticket commit: ring rollback (or the replay when the ring does not cover
-/// the verify), head commit (append, truncate or restore-and-replay), the
+/// the verify), head commit (truncate to the seed's row, then the kept drafts' rows rebuilt teacher-forced), the
 /// position checks, the pending hidden copy and the commit of both tickets.
 /// `mtp_step` and the lane executor both end their windows here; the caller
 /// clears its own scratch ticket and head ticket after `Ok`.
@@ -6383,7 +6511,6 @@ pub(crate) fn finish_native_window(
     let NativeFinish {
         position,
         block,
-        steps,
         acceptance,
         target_snapshot,
         mtp_ticket,
@@ -6430,50 +6557,42 @@ pub(crate) fn finish_native_window(
         picks.ops_spec_rows(ops, &block[..target_accept_len + 1], true)?;
     }
     mark_phase(&mut timers, ops.gpu()?, "mtp_commit");
-    match head_finish(full_accept, steps, k, head_at_start) {
-        HeadFinish::Consumed => {
-            // The step that drafted the dropped token already consumed
-            // the last kept draft at its position.
-        }
-        HeadFinish::AppendLast => {
-            let last_draft = *drafts
-                .last()
-                .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
-            let last_position = position
-                .checked_add(k)
-                .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-            picks
-                .mtp_append_token(ops.gpu()?, last_draft, None, last_position)
-                .map_err(|error| error.to_string())?;
-        }
-        HeadFinish::Truncate => {
-            // The draft steps already consumed the kept prefix with the
-            // replay's exact inputs: keep them, drop the rejected tail.
-            picks.ops_head_truncate_retain(mtp_ticket, target_accept_len + 1)?;
-        }
-        HeadFinish::Replay { restore } => {
+    // The draft chain's row 0 (the seed with the pending hidden of
+    // `position - 1`) is the only head row of the window kept as written: its
+    // later rows were conditioned on the head's own previous-step hidden.
+    // Keep it (or write it again when the head is back at the window's start)
+    // and rebuild the kept drafts' rows teacher-forced, (token `block[i + 1]`,
+    // target verify hidden row `i`), the pairing of the prompt fill, the
+    // takeover fill and the AR catch-up. Head rows feed drafts only; target
+    // state is untouched.
+    match head_finish(k, head_at_start) {
+        HeadFinish::SeedFromStart { restore } => {
+            // No draft step ran (`k == 0`) or a mesh target restore already
+            // rewound the head: the head appends the seed with the pending
+            // hidden of `position - 1`, on a fresh selection.
             if restore {
                 picks.ops_head_restore_retain(ops, mtp_ticket)?;
             }
-            // Snapshot restore brings back the pre-window QSA selection;
-            // replay must reselect on its first row.
-            for (index, &token) in block[..target_accept_len + 1].iter().enumerate() {
-                let hidden = if index == 0 {
-                    Some(pending_hidden)
-                } else {
-                    None
-                };
-                let token_position = position
-                    .checked_add(index)
-                    .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                let result = if index == target_accept_len {
-                    picks.mtp_append_token(ops.gpu()?, token, hidden, token_position)
-                } else {
-                    picks.mtp_advance_token(ops.gpu()?, token, hidden, token_position, index == 0)
-                };
-                result.map_err(|error| error.to_string())?;
-            }
+            picks
+                .mtp_append_token(ops.gpu()?, block[0], Some(pending_hidden), position)
+                .map_err(|error| error.to_string())?;
         }
+        HeadFinish::KeepSeedRow => {
+            picks.ops_head_truncate_retain(mtp_ticket, 1)?;
+        }
+    }
+    for row in 0..target_accept_len {
+        picks
+            .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
+            .map_err(|error| error.to_string())?;
+        picks
+            .mtp_append_token(
+                ops.gpu()?,
+                block[row + 1],
+                Some(pending_hidden),
+                position + 1 + row,
+            )
+            .map_err(|error| error.to_string())?;
     }
     mark_phase(&mut timers, ops.gpu()?, "commit");
     let committed_end = position
@@ -6506,36 +6625,31 @@ pub(crate) fn finish_native_window(
     Ok(window)
 }
 
-/// How a batched window's head reaches the committed position.
+/// How a batched window's head reaches the committed position. Every route
+/// ends with the kept drafts' rows rebuilt teacher-forced after the seed's
+/// row ([`finish_native_window`]); the routes differ only in how the seed's
+/// row stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeadFinish {
-    /// The last draft step already consumed the last kept draft.
-    Consumed,
-    /// Full accept: append the last kept draft.
-    AppendLast,
-    /// Partial accept: the draft steps consumed the kept prefix with the
-    /// replay's exact inputs; drop the rejected tail.
-    Truncate,
-    /// Restore the head to the window's start (`restore`; a mesh target
-    /// restore has already done it) and replay the kept rows teacher-forced.
-    Replay { restore: bool },
+    /// The draft chain's row 0 is the seed's row as written: truncate the
+    /// head to it.
+    KeepSeedRow,
+    /// The head is back (or goes back: `restore`; a mesh target restore has
+    /// already done it) at the window's start: append the seed's row.
+    SeedFromStart { restore: bool },
 }
 
-/// The head branch of [`finish_native_window`]. `head_at_start`: the target
-/// restore of a mesh window (the replay route, ring not eligible) already put
-/// the head back at the window's start, so a partial accept replays instead of
-/// truncating.
-fn head_finish(full_accept: bool, steps: usize, k: usize, head_at_start: bool) -> HeadFinish {
-    if full_accept && steps > k {
-        HeadFinish::Consumed
-    } else if full_accept && k > 0 {
-        HeadFinish::AppendLast
-    } else if !full_accept && !head_at_start {
-        HeadFinish::Truncate
-    } else {
-        HeadFinish::Replay {
+/// The head branch of [`finish_native_window`]. A window that drafted nothing
+/// (`k == 0`) has no row 0 to keep, and `head_at_start` (the target restore
+/// of a mesh window, the replay route, ring not eligible, already put the
+/// head back at the window's start) leaves none either.
+fn head_finish(k: usize, head_at_start: bool) -> HeadFinish {
+    if k == 0 || head_at_start {
+        HeadFinish::SeedFromStart {
             restore: !head_at_start,
         }
+    } else {
+        HeadFinish::KeepSeedRow
     }
 }
 
@@ -6944,11 +7058,7 @@ impl Qwen4MtpDrafter {
                     );
                 }
             }
-            let tickets = if self.keeps_one_row_windows(target) {
-                Some(Self::open_window_tickets(ops, target, k + 1)?)
-            } else {
-                None
-            };
+            let tickets = self.open_one_row_tickets(ops, target, k + 1)?;
             let mut sampled = self.sampled.take();
             let window = self.mtp_step_incremental(
                 ops,
@@ -7039,7 +7149,6 @@ impl Qwen4MtpDrafter {
             // Probability the whole draft prefix is accepted, from each
             // draft's exact logit margin over its runner-up.
             let mut prefix = 1.0f32;
-            let mut steps = 0usize;
             // Every proposal starts with a fresh QSA selection; only later
             // draft rows within this window reuse it.
             for index in 0..k_max {
@@ -7073,7 +7182,6 @@ impl Qwen4MtpDrafter {
                 if let Some(s) = sampled.as_mut().filter(|s| s.draws_drafts()) {
                     input = s.sample_draft(ops.gpu()?, Self::bundle(target)?, index, index)?;
                 }
-                steps += 1;
                 let margin = Self::bundle(target)?.mtp_draft_margin();
                 prefix *= draft_accept_estimate(margin);
                 // A verify row pays only while its whole prefix is likely
@@ -7176,6 +7284,16 @@ impl Qwen4MtpDrafter {
                 .as_ref()
                 .copied()
                 .expect("MTP snapshot remains active until transaction commit");
+            // The window's pre-window pending hidden, kept for a terminal
+            // repair before the finish moves `pending_hidden` on.
+            let retained_pending = self.retained_pending.as_ref().ok_or_else(|| {
+                "Qwen4 native MTP retained pending hidden is not allocated".to_string()
+            })?;
+            ops.gpu()?
+                .copy_d2d(pending_hidden, retained_pending, pending_hidden.byte_size())
+                .map_err(|error| {
+                    format!("Qwen4 native MTP retained pending hidden copy: {error}")
+                })?;
             // The whole captured hidden and the verify's PLE rows from row 0.
             let verify_hidden = {
                 let hidden = picks
@@ -7199,7 +7317,6 @@ impl Qwen4MtpDrafter {
                 NativeFinish {
                     position,
                     block: &block,
-                    steps,
                     acceptance,
                     target_snapshot,
                     mtp_ticket,
@@ -7360,6 +7477,17 @@ impl Qwen4MtpDrafter {
                 ));
             }
         }
+        // The first fill row pairs with the target hidden of `start_pos - 1`,
+        // which the session snapshot carries (saved at its boundary below)
+        // and a live continuation already holds in `pending`: a snapshot
+        // restore puts it there; `false` (live, no restore) leaves the live one.
+        // A mesh prefill is cold only (checked above), so it has no restore.
+        if cache_hit && start_pos > 0 {
+            let pending = self.pending_hidden()?;
+            Self::bundle(target)?
+                .session_restore_boundary_hidden(ops.gpu()?, pending)
+                .map_err(|error| error.to_string())?;
+        }
         // Field borrows (not `pending_hidden()`): the batched fill below also
         // borrows `append_scratch` mutably.
         let pending = self
@@ -7438,6 +7566,11 @@ impl Qwen4MtpDrafter {
             // due snapshot boundary is reported here, after the forward and the
             // head append of this chunk.
             if !ops.is_mesh() && Self::bundle(target)?.session_next_boundary() == Some(end) {
+                // `pending` is the target hidden of `end - 1` now: the
+                // snapshot keeps it for the restore's first fill row.
+                Self::bundle(target)?
+                    .session_save_boundary_hidden(ops.gpu()?, pending)
+                    .map_err(|error| error.to_string())?;
                 Self::bundle(target)?
                     .session_at_boundary(ops.gpu()?, &prompt_tokens[..end])
                     .map_err(|error| error.to_string())?;
@@ -7498,11 +7631,13 @@ impl Qwen4MtpDrafter {
                 .ok_or_else(|| "Qwen4 native MTP forced position overflow".to_string())?;
             let bundle = Self::bundle(target)?;
             bundle.ops_capture_token(ops, token, true)?;
-            bundle
-                .copy_spec_hidden_row_to(ops.gpu()?, 0, pending)
-                .map_err(|error| error.to_string())?;
+            // The token pairs with the target hidden of `position - 1`, which
+            // `pending` holds; `pending` then takes this token's own.
             bundle
                 .mtp_append_token(ops.gpu()?, token, Some(pending), position)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(ops.gpu()?, 0, pending)
                 .map_err(|error| error.to_string())?;
         }
         Ok(true)
@@ -7943,8 +8078,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
     /// one-row window without `SpecRequestConfig::stop_sequences`, an AR
     /// window, an EP mesh, anything between the window and this call), a
     /// different window, no consumed token, or a state that moved since the
-    /// window. An `Err` means the restore or replay itself failed and the
-    /// owners are in an unknown state.
+    /// window (the head's seed row pairs with the pre-window pending hidden
+    /// the window saved in `retained_pending`). An `Err` means the restore or
+    /// replay itself failed and the owners are in an unknown state.
     fn mtp_repair_terminal_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -7988,12 +8124,16 @@ impl MtpDrafter for Qwen4MtpDrafter {
             append_scratch,
             sampled,
             device_spare,
+            retained_pending,
             ..
         } = *self;
         if let Some(scratch) = scratch {
             scratch.free(gpu);
         }
         if let Some(hidden) = pending_hidden {
+            let _ = gpu.free_tensor(hidden);
+        }
+        if let Some(hidden) = retained_pending {
             let _ = gpu.free_tensor(hidden);
         }
         if let Some(scratch) = append_scratch {
@@ -8396,7 +8536,7 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
 /// (`Qwen4MtpGpu`) commits, plus the larger of its build scratch (released
 /// at attach) and what the first speculative request allocates after it —
 /// the verify hidden rows (`max_k + 1` rows or one forward chunk, whichever
-/// is larger), the pending and row hidden carries, with `row_capture`
+/// is larger), the pending, row and retained-pending hidden carries, with `row_capture`
 /// (the GDN state format and ring rows, [`native_mtp_capture`]) the GDN
 /// capture ring in that format, and with `batched_fill`
 /// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
@@ -8436,7 +8576,7 @@ pub(crate) fn native_mtp_window_rows(max_k: usize) -> usize {
 /// Device bytes the first speculative request of a native MTP load of
 /// `max_seq` tokens allocates once and keeps (after the head attached): the
 /// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
-/// whichever is larger; `on` reserves two chunks), the pending and row hidden
+/// whichever is larger; `on` reserves two chunks), the pending, row and retained-pending hidden
 /// carries, with
 /// `row_capture` (format, ring rows) the GDN capture ring, and with
 /// `batched_fill` the batched prompt-fill scratch and one chunk of prompt ids.
@@ -8474,7 +8614,7 @@ pub fn native_mtp_request_bytes(
         0
     };
     let request = verify_rows
-        .checked_add(2)?
+        .checked_add(3)?
         .checked_mul(hidden_row)?
         .checked_add(capture)?
         .checked_add(fill)?;
@@ -8492,32 +8632,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn head_finish_single_card_branches_are_the_historical_chain() {
-        // Full accept: the dropped-token step already consumed the last draft,
-        // else the last draft is appended.
-        assert_eq!(head_finish(true, 4, 3, false), HeadFinish::Consumed);
-        assert_eq!(head_finish(true, 3, 3, false), HeadFinish::AppendLast);
-        // Partial accept: truncate the draft steps' kept prefix.
-        assert_eq!(head_finish(false, 3, 3, false), HeadFinish::Truncate);
-        assert_eq!(head_finish(false, 2, 3, false), HeadFinish::Truncate);
-        // A zero-draft full accept restores and replays its one row.
+    fn head_finish_single_card_keeps_the_seed_row_and_rebuilds_the_rest() {
+        // A window that drafted keeps its draft chain's row 0 (the seed with
+        // the pending hidden of `position - 1`) whatever the acceptance.
+        assert_eq!(head_finish(3, false), HeadFinish::KeepSeedRow);
+        assert_eq!(head_finish(1, false), HeadFinish::KeepSeedRow);
+        // A zero-draft window has no row 0: restore and append the seed.
         assert_eq!(
-            head_finish(true, 0, 0, false),
-            HeadFinish::Replay { restore: true }
+            head_finish(0, false),
+            HeadFinish::SeedFromStart { restore: true }
         );
     }
 
     #[test]
-    fn head_finish_after_a_mesh_restore_replays_without_restoring_again() {
+    fn head_finish_after_a_mesh_restore_appends_the_seed_without_restoring_again() {
         // The mesh replay route restored target and head together: the head is
-        // at the window's start, so a partial accept replays it as it is.
+        // at the window's start, so the seed's row is appended as it is.
         assert_eq!(
-            head_finish(false, 3, 3, true),
-            HeadFinish::Replay { restore: false }
+            head_finish(3, true),
+            HeadFinish::SeedFromStart { restore: false }
         );
         assert_eq!(
-            head_finish(false, 1, 3, true),
-            HeadFinish::Replay { restore: false }
+            head_finish(1, true),
+            HeadFinish::SeedFromStart { restore: false }
         );
     }
 
@@ -8815,7 +8952,7 @@ mod tests {
             end: 14,
             seed: 7,
         };
-        // Nothing consumed: the pre-window pending hidden is not kept.
+        // Nothing consumed: there is nothing to replay.
         assert!(terminal_repair_replay(span, 10, 7, &[]).is_none());
         // Another window (position or seed).
         assert!(terminal_repair_replay(span, 11, 7, &[20]).is_none());
@@ -9666,7 +9803,9 @@ mod tests {
     fn retired_head_lag_owes_contiguous_rows_from_the_head_position() {
         let mut lag = HeadLag::default();
         // The first owed token fixes the head position; later tokens must
-        // continue it row by row (spec hidden row i = position start + i).
+        // continue it row by row (spec hidden row i = the hidden of position
+        // start + i, which pairs with token i + 1; token 0 pairs with the
+        // pending hidden of start - 1).
         assert_eq!(lag.next_row(34_120, 4), Ok(0));
         lag.push(34_120, 11);
         assert_eq!(lag.next_row(34_121, 4), Ok(1));
