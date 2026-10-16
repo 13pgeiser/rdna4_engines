@@ -23,6 +23,10 @@
  *     half an ulp of y's dtype relative (2^-8 bf16, 2^-11 f16, 0 f32).
  *   * An implementation marked `ref_bytes` must also produce, for expand, exactly the bytes of the
  *     first implementation in the list -- the claim libr4d's expand makes about libref's order.
+ *
+ * A shrink row with a scratch hook (libr4d's WMMA row keeps its K split's partials there) is handed
+ * the scratch the hook asks for, filled with a non-zero pattern, as the core would hand it a slice of
+ * its arena.
  */
 #pragma once
 
@@ -39,12 +43,27 @@
 namespace lora_cases {
 
 typedef int (*LaunchFn)(const RadArgs*, RadStream);
+typedef int64_t (*ScratchFn)(const RadArgs*);
 
 struct Impl {
     const char* name;
     LaunchFn    shrink, expand;
     bool        ref_bytes;          /* expand must match the first implementation bit for bit */
+    ScratchFn   shrink_scratch;     /* the row's scratch hook, or null: none */
 };
+
+/* The scratch a launch is handed, sized by the row's own hook from the call's parameters -- what
+ * the core does at declare with the band's M. Host memory: every implementation here runs on the
+ * host. */
+static inline void with_scratch(RadArgs& a, ScratchFn fn, std::vector<uint8_t>& keep) {
+    a.scratch = nullptr;
+    a.scratch_bytes = 0;
+    const int64_t need = fn ? fn(&a) : 0;
+    if (need <= 0) return;
+    keep.assign((size_t)need, 0xA5);               /* not zeros: a split must write its partials */
+    a.scratch = keep.data();
+    a.scratch_bytes = need;
+}
 
 struct Tally {
     int cases = 0, fails = 0;
@@ -173,6 +192,8 @@ static inline void shrink_case(Tally& T, const std::vector<Impl>& impls, std::mt
         for (auto& x : tv) std::memcpy(&x, &kSentinel, 4);
         t[4] = mk(tv.data(), RAD_F32, {M, R}, {R, 1});
         ++T.cases;
+        std::vector<uint8_t> scr;
+        with_scratch(a, im.shrink_scratch, scr);
         const int rc = im.shrink(&a, nullptr);
         if (rc != RAD_OK) {
             fail(T, im, "shrink returned an error", M, R, K, adt, rc, -1);
