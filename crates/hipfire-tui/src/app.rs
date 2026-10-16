@@ -20,7 +20,7 @@ use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
     chat_history::ChatHistory,
     config::ConfigState,
-    dashboard::{Dashboard, DashboardWorker},
+    dashboard::{Dashboard, DashboardWorker, HealthSnapshot},
     doctor::{self, DoctorReport},
     log_tail::{LogSnapshot, LogTailer},
     metrics::MetricsView,
@@ -55,6 +55,25 @@ pub struct PendingEnum {
 pub enum ToastLevel {
     Info,
     Error,
+}
+
+/// What a queued Chat send will do once the serve is online.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueuedKind {
+    /// Send this prompt as a new user turn.
+    Prompt(String),
+    /// Re-stream the last user turn (`/regen`).
+    Regen,
+}
+
+/// A Chat send held back because the serve is not (yet) online. Sent
+/// automatically when `/health` turns online; Esc on Chat cancels it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedSend {
+    kind: QueuedKind,
+    /// `hipfire serve -d` was already requested (or found running) for this
+    /// queue entry; never re-spawn it every frame.
+    serve_start_handled: bool,
 }
 
 /// A transient status line shown over the footer for a few seconds after an
@@ -203,6 +222,8 @@ pub struct App {
     /// Background fetch thread. Owns the network + rocm-smi I/O off the UI
     /// thread. Dropped (joined) when the App is dropped.
     dashboard_worker: DashboardWorker,
+    /// Chat send waiting for the serve to come online (see [`QueuedSend`]).
+    queued_send: Option<QueuedSend>,
 }
 
 impl App {
@@ -257,6 +278,7 @@ impl App {
             logs: LogSnapshot::default(),
             log_tailer,
             dashboard_worker,
+            queued_send: None,
         })
     }
 
@@ -586,21 +608,51 @@ impl App {
     /// tells the worker whether the Dashboard tab is currently focused so the
     /// worker only fetches while the tab is visible.
     pub fn sync_dashboard(&mut self) {
-        // The worker feeds both the Dashboard tab (serve/VRAM telemetry) and
-        // the System tab (live GPU/HIP/kernel-cache/loaded-model diagnostics),
-        // so it must run while either is focused.
+        // The full fetch (stats, models, VRAM/GPU, SystemInfo) feeds the
+        // Dashboard and System tabs only, so it is gated to them.
         self.dashboard_worker
             .set_active(self.tab == Tab::Dashboard || self.tab == Tab::System);
         if let Some(snap) = self.dashboard_worker.snapshot() {
-            // Fold the worker's off-thread /health + rocm-smi results into the
-            // live status fields (serve_http_ok / health_text / gpu_lines) so the
-            // Home + System tabs render live data without any synchronous probe.
+            // Fold the worker's off-thread rocm-smi results into the live
+            // status fields (gpu_lines) so the Home + System tabs render live
+            // data without any synchronous probe.
             self.status.overlay_live(&snap);
             self.dashboard = Some(snap);
         }
+        // Serve health is polled on every tab by its own cheap thread and
+        // wins over the (possibly stale) full snapshot.
+        let health = self.dashboard_worker.health();
+        self.apply_health(health);
         if self.tab == Tab::Dashboard {
             self.live_metrics = self.dashboard_worker.metrics();
         }
+    }
+
+    /// Fold a `/health` result into the status, keep the stored full snapshot
+    /// from contradicting it, and advance any queued Chat send.
+    fn apply_health(&mut self, health: HealthSnapshot) {
+        let was_up = self.status.serve_http_ok;
+        self.status.overlay_health(&health);
+        if health.checked {
+            if let Some(dash) = self.dashboard.as_mut() {
+                if dash.serve_up && !health.serve_up {
+                    dash.mark_offline(&health);
+                }
+            }
+            // On a flip, don't leave a visible full-snapshot tab waiting for
+            // its next cadence tick.
+            if was_up != health.serve_up && (self.tab == Tab::Dashboard || self.tab == Tab::System)
+            {
+                self.dashboard_worker.force_refresh();
+            }
+        }
+        self.drive_queued_send();
+    }
+
+    /// Test seam: feed a health result without the background thread.
+    #[cfg(test)]
+    fn inject_health(&mut self, health: HealthSnapshot) {
+        self.apply_health(health);
     }
 
     pub fn reload(&mut self) {
@@ -619,12 +671,13 @@ impl App {
         let expanded = self.registry.expanded_groups.clone();
         self.registry = RegistryState::load(&self.paths);
         self.registry.expanded_groups = expanded;
-        // Preserve the live overlay (serve_http_ok / health_text / gpu_lines)
-        // already mirrored from the worker; only the local fields are refreshed.
+        // Preserve the live overlay (serve health / gpu_lines) already mirrored
+        // from the workers; only the local fields are refreshed.
         let mut status = StatusState::load_local(&self.paths);
         if let Some(snap) = self.dashboard.as_ref() {
             status.overlay_live(snap);
         }
+        status.overlay_health(&self.dashboard_worker.health());
         self.status = status;
         // Keep the worker pointed at the (possibly changed) host/port and kick
         // an immediate non-blocking re-fetch; the snapshot updates on a later frame.
@@ -776,11 +829,7 @@ impl App {
                 // literal message whose text starts with a single '/'.
                 if let Some(rest) = input.strip_prefix('/') {
                     if let Some(literal) = rest.strip_prefix('/') {
-                        if !self.status.serve_http_ok {
-                            self.start_serve_for_chat();
-                            return;
-                        }
-                        self.send_chat(format!("/{literal}"));
+                        self.submit_chat_prompt(format!("/{literal}"));
                         self.chat.focus_input();
                         return;
                     }
@@ -790,11 +839,7 @@ impl App {
                     self.chat.focus_input();
                     return;
                 }
-                if !self.status.serve_http_ok {
-                    self.start_serve_for_chat();
-                    return;
-                }
-                self.send_chat(input);
+                self.submit_chat_prompt(input);
                 self.chat.focus_input();
             }
             KeyCode::Backspace => {
@@ -813,6 +858,131 @@ impl App {
             KeyCode::Home => self.chat.scroll_to_top(),
             KeyCode::End => self.chat.scroll = 0,
             _ => {}
+        }
+    }
+
+    /// Enter on a prompt: send now when the serve is online, otherwise queue it
+    /// (it sends automatically once `/health` turns online; Esc cancels).
+    fn submit_chat_prompt(&mut self, prompt: String) {
+        if self.queued_send.is_some() {
+            self.toast_info("a message is already queued — Esc cancels it");
+            return;
+        }
+        if self.status.serve_http_ok {
+            self.send_chat(prompt);
+            return;
+        }
+        // The prompt leaves the input box while queued; Esc puts it back.
+        self.chat.input.clear();
+        self.queue_send(QueuedKind::Prompt(prompt));
+    }
+
+    /// Hold `kind` until the serve is online and let `drive_queued_send` start
+    /// the serve if that is safe.
+    fn queue_send(&mut self, kind: QueuedKind) {
+        self.chat.status = if self.status.health_known {
+            "serve offline — starting hipfire serve -d; your message sends when it is online (Esc cancels)"
+        } else {
+            "checking serve health — your message sends when it is online (Esc cancels)"
+        }
+        .into();
+        self.queued_send = Some(QueuedSend {
+            kind,
+            serve_start_handled: false,
+        });
+        self.drive_queued_send();
+    }
+
+    /// Whether a Chat send is waiting for the serve to come online.
+    pub fn has_queued_send(&self) -> bool {
+        self.queued_send.is_some()
+    }
+
+    /// Esc on Chat: drop the queued send. A queued prompt goes back into the
+    /// input box. Returns whether anything was queued.
+    pub fn cancel_queued_send(&mut self) -> bool {
+        let Some(queued) = self.queued_send.take() else {
+            return false;
+        };
+        self.restore_queued_input(queued);
+        self.chat.status = "queued message cancelled".into();
+        true
+    }
+
+    fn restore_queued_input(&mut self, queued: QueuedSend) {
+        if let QueuedKind::Prompt(text) = queued.kind {
+            self.chat.input = if self.chat.input.is_empty() {
+                text
+            } else {
+                format!("{text}\n{}", self.chat.input)
+            };
+        }
+        self.chat.focus_input();
+    }
+
+    /// Advance the queued send: send it once the serve is online; otherwise,
+    /// only after the first `/health` result is in, start `hipfire serve -d`
+    /// exactly once — unless a serve.pid is alive or the serve rejects us (a
+    /// serve is answering or on its way), in which case just wait / report.
+    fn drive_queued_send(&mut self) {
+        if self.queued_send.is_none() || self.chat.sending {
+            return;
+        }
+        if self.status.serve_http_ok {
+            if let Some(queued) = self.queued_send.take() {
+                match queued.kind {
+                    QueuedKind::Prompt(text) => self.send_chat(text),
+                    QueuedKind::Regen => self.regenerate_now(),
+                }
+            }
+            return;
+        }
+        if !self.status.health_known {
+            return;
+        }
+        if let Some(reason) = self.status.health_failure.clone() {
+            if let Some(queued) = self.queued_send.take() {
+                self.restore_queued_input(queued);
+            }
+            self.chat.status = reason.clone();
+            self.toast_error(reason);
+            return;
+        }
+        if self
+            .queued_send
+            .as_ref()
+            .is_some_and(|q| q.serve_start_handled)
+        {
+            return;
+        }
+        if let Some(queued) = self.queued_send.as_mut() {
+            queued.serve_start_handled = true;
+        }
+        // A serve started since the last reload (e.g. from another terminal)
+        // must be seen before we decide to spawn one.
+        self.status.refresh_pid(&self.paths);
+        if self.status.serve_pid_alive {
+            self.chat.status =
+                "serve process is starting — your message sends when it is online (Esc cancels)"
+                    .into();
+            return;
+        }
+        match start_background_serve() {
+            Ok(()) => {
+                self.chat.status =
+                    "serve offline — starting hipfire serve -d; your message sends when it is online (Esc cancels)"
+                        .into();
+                self.last_reload = "requested background serve start".into();
+                self.status.refresh_pid(&self.paths);
+                self.dashboard_worker.force_refresh();
+            }
+            Err(err) => {
+                if let Some(queued) = self.queued_send.take() {
+                    self.restore_queued_input(queued);
+                }
+                self.chat.status = format!("{err}");
+                self.toast_error(format!("serve start failed: {err}"));
+            }
         }
     }
 
@@ -918,8 +1088,23 @@ impl App {
         }
         // Check serve readiness BEFORE the destructive pop, so an offline serve
         // doesn't lose the existing reply.
+        if self.queued_send.is_some() {
+            self.toast_info("a message is already queued — Esc cancels it");
+            return;
+        }
         if !self.status.serve_http_ok {
-            self.start_serve_for_chat();
+            self.queue_send(QueuedKind::Regen);
+            return;
+        }
+        self.regenerate_now();
+    }
+
+    /// Drop the last assistant reply (if any) and re-stream the last user turn.
+    /// The serve is known online; the tail is re-validated because a queued
+    /// regen may have waited while the conversation changed.
+    fn regenerate_now(&mut self) {
+        if !self.tail_is_redoable() {
+            self.toast_error("nothing to regenerate");
             return;
         }
         if self.chat.messages.last().map(|m| m.role.as_str()) == Some("assistant") {
@@ -1192,37 +1377,6 @@ impl App {
                 self.chat.status = format!("{label}: {v}");
             }
             _ => self.toast_error(format!("{label} must be a number in {lo}..={hi}")),
-        }
-    }
-
-    fn start_serve_for_chat(&mut self) {
-        if self.status.serve_pid_alive {
-            self.chat.status =
-                "serve process exists; waiting for HTTP health, press r to refresh".into();
-            self.toast_info("serve offline — process exists, waiting for HTTP; press r to refresh");
-            return;
-        }
-
-        match start_background_serve() {
-            Ok(()) => {
-                self.chat.status =
-                    "starting serve -d; keep your prompt and retry after health is online".into();
-                self.last_reload = "requested background serve start".into();
-                self.toast_info("serve offline — starting `hipfire serve -d`; retry when online");
-                // Refresh only the fast local serve.pid status (the just-spawned
-                // pid). Live HTTP health arrives via the worker's next fetch — no
-                // synchronous /health probe on the UI thread here.
-                let mut status = StatusState::load_local(&self.paths);
-                if let Some(snap) = self.dashboard.as_ref() {
-                    status.overlay_live(snap);
-                }
-                self.status = status;
-                self.dashboard_worker.force_refresh();
-            }
-            Err(err) => {
-                self.chat.status = format!("{err}");
-                self.toast_error(format!("serve start failed: {err}"));
-            }
         }
     }
 
@@ -3358,6 +3512,289 @@ mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ── Chat serve-readiness queue ─────────────────────────────────────────
+
+    fn health(up: bool) -> HealthSnapshot {
+        HealthSnapshot {
+            checked: true,
+            serve_up: up,
+            model: up.then(|| "m".to_string()),
+            text: if up {
+                r#"{"status":"ok","model":"m"}"#.into()
+            } else {
+                String::new()
+            },
+            failure: None,
+        }
+    }
+
+    /// A Chat-tab app isolated from the real `~/.hipfire` (serve.pid) and from
+    /// any real serve (config port points at a free, closed port).
+    fn chat_app() -> (App, std::path::PathBuf) {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.paths.serve_pid = dir.join("serve.pid");
+        app.config.port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        (app, dir)
+    }
+
+    fn type_and_enter(app: &mut App, text: &str) {
+        app.chat.input = text.into();
+        app.handle_tab_key(key(KeyCode::Enter));
+    }
+
+    /// Fake `hipfire` that appends its arguments to `<dir>/serve-calls.log`.
+    fn fake_cli(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("serve-calls.log");
+        let bin = dir.join("fake-hipfire");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    /// `serve …` invocations the fake CLI logged. Other tests running in
+    /// parallel may route a `stop`/`diag` through the same HIPFIRE_CLI_BIN
+    /// while it is set, so only lines that start a serve are counted.
+    fn serve_calls(log: &std::path::Path) -> usize {
+        std::fs::read_to_string(log).map_or(0, |s| {
+            s.lines()
+                .filter(|line| line.split_whitespace().next() == Some("serve"))
+                .count()
+        })
+    }
+
+    #[test]
+    fn chat_enter_with_unknown_health_queues_and_sends_when_online() {
+        let (mut app, dir) = chat_app();
+        assert!(!app.status.health_known);
+        type_and_enter(&mut app, "hello");
+
+        assert!(app.has_queued_send());
+        assert!(app.chat.input.is_empty(), "prompt leaves the input box");
+        assert!(app.chat.messages.is_empty(), "not pushed into messages yet");
+        assert!(!app.chat.sending);
+        assert!(
+            app.toast.is_none(),
+            "no 'serve start failed' / 'starting' toast while health is unknown: {:?}",
+            app.toast
+        );
+        assert!(app.chat.status.contains("sends when it is online"));
+        assert!(!app.chat.status.contains("press r"));
+
+        // Still unknown: nothing happens.
+        app.inject_health(HealthSnapshot::default());
+        assert!(app.has_queued_send() && !app.chat.sending);
+
+        app.inject_health(health(true));
+        assert!(!app.has_queued_send());
+        assert!(app.chat.sending, "queued prompt sent once online");
+        let last_user = app
+            .chat
+            .messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .unwrap();
+        assert_eq!(last_user.content, "hello");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_literal_slash_prompt_queues_and_sends_when_online() {
+        let (mut app, dir) = chat_app();
+        type_and_enter(&mut app, "//not-a-command");
+        assert!(app.has_queued_send());
+        assert!(app.chat.messages.is_empty());
+        app.inject_health(health(true));
+        assert!(app.chat.sending);
+        assert_eq!(app.chat.messages[0].content, "/not-a-command");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_enter_while_online_sends_immediately() {
+        let (mut app, dir) = chat_app();
+        app.inject_health(health(true));
+        type_and_enter(&mut app, "now");
+        assert!(!app.has_queued_send());
+        assert!(app.chat.sending);
+        assert_eq!(app.chat.messages[0].content, "now");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelling_a_queued_send_restores_the_input() {
+        let (mut app, dir) = chat_app();
+        type_and_enter(&mut app, "keep me");
+        assert!(app.has_queued_send());
+        assert!(app.cancel_queued_send());
+        assert!(!app.has_queued_send());
+        assert_eq!(app.chat.input, "keep me");
+        assert_eq!(app.chat.status, "queued message cancelled");
+        assert!(!app.cancel_queued_send(), "nothing left to cancel");
+        // Going online afterwards must not resurrect it.
+        app.inject_health(health(true));
+        assert!(!app.chat.sending && app.chat.messages.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn health_known_down_without_pid_starts_serve_exactly_once() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, dir) = chat_app();
+        let (bin, log) = fake_cli(&dir);
+        std::env::set_var("HIPFIRE_CLI_BIN", &bin);
+
+        type_and_enter(&mut app, "hi");
+        assert_eq!(serve_calls(&log), 0, "health unknown: never spawns");
+        app.inject_health(health(false));
+        for _ in 0..5 {
+            app.inject_health(health(false));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while serve_calls(&log) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(150));
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        let serve_lines: Vec<&str> = log_text
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some("serve"))
+            .collect();
+        assert_eq!(serve_lines, ["serve -d"], "exactly one background serve start");
+        assert!(app.has_queued_send(), "prompt stays queued while it boots");
+        assert!(app.chat.status.contains("starting hipfire serve -d"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn health_known_down_with_live_pid_waits_instead_of_spawning() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut app, dir) = chat_app();
+        let (bin, log) = fake_cli(&dir);
+        std::env::set_var("HIPFIRE_CLI_BIN", &bin);
+        // Our own pid is guaranteed alive under /proc.
+        std::fs::write(&app.paths.serve_pid, std::process::id().to_string()).unwrap();
+
+        app.inject_health(health(false));
+        type_and_enter(&mut app, "hi");
+        app.inject_health(health(false));
+        thread::sleep(Duration::from_millis(200));
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+
+        assert_eq!(serve_calls(&log), 0, "live serve.pid: no second serve");
+        assert!(app.has_queued_send());
+        assert!(app.chat.status.contains("sends when it is online"));
+
+        app.inject_health(health(true));
+        assert!(app.chat.sending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spawn_failure_gives_the_prompt_back() {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("HIPFIRE_CLI_BIN");
+        let (mut app, dir) = chat_app();
+        app.inject_health(health(false));
+        type_and_enter(&mut app, "hi");
+        assert!(!app.has_queued_send(), "nothing will ever send it");
+        assert_eq!(app.chat.input, "hi");
+        assert!(app
+            .toast
+            .as_ref()
+            .is_some_and(|t| t.text.contains("serve start failed")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejected_bearer_does_not_start_a_serve_and_gives_the_prompt_back() {
+        let (mut app, dir) = chat_app();
+        type_and_enter(&mut app, "hi");
+        let mut h = health(false);
+        h.failure = Some("serve rejected the bearer token (HTTP 401)".into());
+        h.text = h.failure.clone().unwrap();
+        app.inject_health(h);
+        assert!(!app.has_queued_send());
+        assert_eq!(app.chat.input, "hi");
+        assert!(app.chat.status.contains("rejected the bearer"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn regen_queues_without_popping_the_reply_then_runs_when_online() {
+        let (mut app, dir) = chat_app();
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "q".into(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "a".into(),
+                reasoning_content: None,
+            },
+        ];
+        app.handle_chat_command("regen");
+        assert!(app.has_queued_send());
+        assert_eq!(app.chat.messages.len(), 2);
+        assert_eq!(app.chat.messages[1].content, "a", "reply kept while queued");
+        assert!(app.toast.is_none());
+
+        app.inject_health(health(true));
+        assert!(app.chat.sending);
+        assert_eq!(app.chat.messages.len(), 2);
+        assert_eq!(app.chat.messages[0].content, "q");
+        assert!(
+            app.chat.messages[1].content.is_empty(),
+            "old reply replaced"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn health_wins_over_a_stale_full_snapshot() {
+        use crate::hipfire::dashboard::{LoadState, VramState};
+        let (mut app, dir) = chat_app();
+        let mut snap = Dashboard::offline(
+            "127.0.0.1:1".into(),
+            VramState::Unavailable("x".into()),
+            LoadState::Unavailable("x".into()),
+        );
+        snap.serve_up = true;
+        snap.model = Some("old".into());
+        app.dashboard = Some(snap.clone());
+        app.status.overlay_live(&snap);
+        app.inject_health(health(true));
+        assert!(app.status.serve_http_ok);
+
+        app.inject_health(health(false));
+        assert!(!app.status.serve_http_ok);
+        let dash = app.dashboard.as_ref().unwrap();
+        assert!(!dash.serve_up && dash.model.is_none());
+        // overlay_live (full snapshot) never rewrites serve_http_ok.
+        app.status.overlay_live(&snap);
+        assert!(!app.status.serve_http_ok);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

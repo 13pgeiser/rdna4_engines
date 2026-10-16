@@ -6,14 +6,26 @@ use std::{fs, process::Stdio};
 
 use anyhow::{anyhow, Result};
 
-use super::{dashboard::Dashboard, HipfirePaths};
+use super::{
+    dashboard::{Dashboard, HealthSnapshot},
+    HipfirePaths,
+};
 
 #[derive(Clone, Debug)]
 pub struct StatusState {
     pub serve_pid: Option<u32>,
     pub serve_pid_alive: bool,
+    /// `/health` answered. Owned by the always-on health poller
+    /// ([`StatusState::overlay_health`]); the full dashboard snapshot never
+    /// writes it, so a stale one cannot override fresher health.
     pub serve_http_ok: bool,
     pub health_text: String,
+    /// At least one `/health` probe has completed (`serve_http_ok == false`
+    /// before that means "unknown", not "down").
+    pub health_known: bool,
+    /// Why the serve cannot be probed (bad key file, rejected bearer) — a serve
+    /// may be answering, so Chat must not start another one.
+    pub health_failure: Option<String>,
     pub gpu_lines: Vec<String>,
     pub paths_ok: Vec<(String, bool)>,
 }
@@ -26,12 +38,7 @@ impl StatusState {
     /// `gpu_lines`) start empty and are filled in by [`StatusState::overlay_live`]
     /// from the background `DashboardWorker` snapshot.
     pub fn load_local(paths: &HipfirePaths) -> Self {
-        let serve_pid = fs::read_to_string(&paths.serve_pid)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        let serve_pid_alive = serve_pid
-            .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
-            .unwrap_or(false);
+        let (serve_pid, serve_pid_alive) = read_serve_pid(paths);
         let paths_ok = vec![
             ("~/.hipfire".into(), paths.root.exists()),
             ("models".into(), paths.models.exists()),
@@ -53,19 +60,26 @@ impl StatusState {
             serve_pid_alive,
             serve_http_ok: false,
             health_text: String::new(),
+            health_known: false,
+            health_failure: None,
             gpu_lines: Vec::new(),
             paths_ok,
         }
     }
 
-    /// Fold the latest background `DashboardWorker` snapshot into the live
-    /// fields. This is the ONLY path through which `serve_http_ok` / `health_text`
-    /// / `gpu_lines` are populated — the worker did the /health + rocm-smi probes
-    /// OFF the UI thread, so this is a cheap in-memory copy with no I/O. Called
-    /// every frame from `App::sync_dashboard`.
+    /// Re-read serve.pid (pure file I/O) so a serve started since the last
+    /// reload is seen. Call sparingly, not every frame.
+    pub fn refresh_pid(&mut self, paths: &HipfirePaths) {
+        let (pid, alive) = read_serve_pid(paths);
+        self.serve_pid = pid;
+        self.serve_pid_alive = alive;
+    }
+
+    /// Fold the latest background snapshot into the live fields. Only the
+    /// system-derived `gpu_lines` come from the full [`Dashboard`]; serve health
+    /// comes from [`StatusState::overlay_health`]. A cheap in-memory copy with no
+    /// I/O, called every frame from `App::sync_dashboard`.
     pub fn overlay_live(&mut self, dash: &Dashboard) {
-        self.serve_http_ok = dash.serve_up;
-        self.health_text = dash.health_text.clone();
         self.gpu_lines = dash
             .system
             .as_ref()
@@ -73,9 +87,20 @@ impl StatusState {
             .unwrap_or_default();
     }
 
+    /// Fold the always-on `/health` poller result (every tab) into
+    /// `serve_http_ok` / `health_text`.
+    pub fn overlay_health(&mut self, health: &HealthSnapshot) {
+        self.health_known = health.checked;
+        self.serve_http_ok = health.serve_up;
+        self.health_text = health.text.clone();
+        self.health_failure = health.failure.clone();
+    }
+
     pub fn serve_label(&self) -> String {
         if self.serve_http_ok {
             "online".into()
+        } else if !self.health_known {
+            "checking...".into()
         } else if self.serve_pid_alive {
             "pid alive, HTTP not ready".into()
         } else if self.serve_pid.is_some() {
@@ -98,6 +123,16 @@ pub fn start_background_serve() -> Result<()> {
         .spawn()
         .map_err(|err| anyhow!("failed to launch `hipfire serve -d`: {err}"))?;
     Ok(())
+}
+
+fn read_serve_pid(paths: &HipfirePaths) -> (Option<u32>, bool) {
+    let serve_pid = fs::read_to_string(&paths.serve_pid)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let alive = serve_pid
+        .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .unwrap_or(false);
+    (serve_pid, alive)
 }
 
 /// Derive the Home-tab GPU summary lines from the background-probed

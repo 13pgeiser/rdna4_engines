@@ -491,7 +491,10 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 
     let serve_color = if app.status.serve_http_ok {
         GREEN
-    } else if app.status.serve_pid_alive || app.status.serve_pid.is_some() {
+    } else if !app.status.health_known
+        || app.status.serve_pid_alive
+        || app.status.serve_pid.is_some()
+    {
         YELLOW
     } else {
         RED

@@ -150,6 +150,83 @@ impl Dashboard {
         self.health_text = reason;
         self
     }
+
+    /// Demote a stale "up" snapshot when the always-on `/health` poller has
+    /// since seen the serve go down, so no tab shows live stats for a dead
+    /// serve. VRAM / GPU load (independent of the serve) are kept.
+    pub fn mark_offline(&mut self, health: &HealthSnapshot) {
+        self.serve_up = false;
+        self.model = None;
+        self.stats = None;
+        self.model_ids.clear();
+        self.health_text = health.text.clone();
+        self.offline_hint = Some(
+            health
+                .failure
+                .clone()
+                .unwrap_or_else(|| "serve offline — start it with `hipfire serve -d`".into()),
+        );
+    }
+}
+
+/// Result of the lightweight `/health` poller. Published independently of the
+/// full [`Dashboard`] snapshot so serve status is known on every tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HealthSnapshot {
+    /// At least one probe has completed. Until then `serve_up == false` means
+    /// "unknown", not "down".
+    pub checked: bool,
+    /// `/health` answered with a success status.
+    pub serve_up: bool,
+    /// Loaded model from the `/health` body (None when idle or serve down).
+    pub model: Option<String>,
+    /// Raw `/health` body on success; the failure reason for a config error or
+    /// a rejected bearer; empty when the serve is simply unreachable.
+    pub text: String,
+    /// Set when the serve cannot be probed for a reason a restart would not fix
+    /// (unloadable key file, malformed endpoint, bearer rejected). A serve may
+    /// well be answering in that case, so callers must not start another one.
+    pub failure: Option<String>,
+}
+
+/// One cheap, authenticated `GET /health`. Never panics, never blocks past the
+/// agent's global timeout.
+fn probe_health(agent: &ureq::Agent, config: &ConfigState) -> HealthSnapshot {
+    let endpoint = match config.service_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            return HealthSnapshot {
+                checked: true,
+                text: reason.clone(),
+                failure: Some(reason),
+                ..HealthSnapshot::default()
+            };
+        }
+    };
+    match get_text(agent, &endpoint, "/health") {
+        TextFetch::Body(body) => HealthSnapshot {
+            checked: true,
+            serve_up: true,
+            model: parse_health_model(&body),
+            text: body,
+            failure: None,
+        },
+        TextFetch::Rejected(status) => {
+            let reason = format!(
+                "serve rejected the bearer token (HTTP {status}); check serve.api_key_file"
+            );
+            HealthSnapshot {
+                checked: true,
+                text: reason.clone(),
+                failure: Some(reason),
+                ..HealthSnapshot::default()
+            }
+        }
+        TextFetch::Unavailable => HealthSnapshot {
+            checked: true,
+            ..HealthSnapshot::default()
+        },
+    }
 }
 
 /// A single live system-diagnostic field. Each is either a real probed value
@@ -898,6 +975,8 @@ const WORKER_REFRESH: Duration = Duration::from_millis(1500);
 /// Poll cadence for the worker's "is the tab active?" / "should I exit?" flags
 /// while it is idle (Dashboard tab not focused).
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(150);
+/// Cadence of the always-on `/health` poller (every tab, whole TUI lifetime).
+const HEALTH_REFRESH: Duration = Duration::from_secs(2);
 
 /// Owns the background fetch threads. The UI thread NEVER calls
 /// [`fetch_dashboard`] / rocm-smi / HTTP directly; it only reads the latest
@@ -911,6 +990,8 @@ pub struct DashboardWorker {
     snapshot: Arc<Mutex<Option<Dashboard>>>,
     /// Latest Live metrics view, published by the `/metrics` thread.
     metrics: Arc<Mutex<MetricsView>>,
+    /// Latest `/health` result, published by the always-on health thread.
+    health: Arc<Mutex<HealthSnapshot>>,
     /// Whether the Dashboard tab is currently focused. The worker only fetches
     /// when this is true (plus an immediate fetch when it flips on).
     active: Arc<AtomicBool>,
@@ -923,6 +1004,7 @@ pub struct DashboardWorker {
     shutdown: Arc<AtomicBool>,
     wake: mpsc::Sender<()>,
     metrics_wake: mpsc::Sender<()>,
+    health_wake: mpsc::Sender<()>,
     handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -938,6 +1020,8 @@ impl DashboardWorker {
         let config = Arc::new(Mutex::new(config));
         let (wake, wake_rx) = mpsc::channel::<()>();
         let (metrics_wake, metrics_wake_rx) = mpsc::channel::<()>();
+        let health = Arc::new(Mutex::new(HealthSnapshot::default()));
+        let (health_wake, health_wake_rx) = mpsc::channel::<()>();
 
         let handle = {
             let snapshot = Arc::clone(&snapshot);
@@ -955,17 +1039,25 @@ impl DashboardWorker {
             let config = Arc::clone(&config);
             thread::spawn(move || metrics_loop(metrics, shutdown, config, metrics_wake_rx))
         };
+        let health_handle = {
+            let health = Arc::clone(&health);
+            let shutdown = Arc::clone(&shutdown);
+            let config = Arc::clone(&config);
+            thread::spawn(move || health_loop(health, shutdown, config, health_wake_rx))
+        };
 
         Self {
             snapshot,
             metrics,
+            health,
             active,
             force,
             config,
             shutdown,
             wake,
             metrics_wake,
-            handles: vec![handle, metrics_handle],
+            health_wake,
+            handles: vec![handle, metrics_handle, health_handle],
         }
     }
 
@@ -988,6 +1080,16 @@ impl DashboardWorker {
             .clone()
     }
 
+    /// Latest `/health` result (cheap clone). `checked == false` until the
+    /// first probe completes. Runs on every tab, independent of the full
+    /// snapshot's focus gating.
+    pub fn health(&self) -> HealthSnapshot {
+        self.health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Mark the Dashboard tab focused / unfocused. Flipping to active wakes the
     /// worker so the first fetch starts immediately instead of after an idle
     /// poll.
@@ -1003,12 +1105,14 @@ impl DashboardWorker {
     pub fn force_refresh(&self) {
         self.force.store(true, Ordering::SeqCst);
         let _ = self.wake.send(());
+        let _ = self.health_wake.send(());
     }
 
     /// Update the config the worker fetches against (e.g. after a port change
     /// on reload).
     pub fn update_config(&self, config: ConfigState) {
         *self.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+        let _ = self.health_wake.send(());
     }
 }
 
@@ -1017,6 +1121,7 @@ impl Drop for DashboardWorker {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = self.wake.send(());
         let _ = self.metrics_wake.send(());
+        let _ = self.health_wake.send(());
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -1122,6 +1227,33 @@ fn metrics_loop(
         let next = ring.record(Instant::now(), scrape);
         *view.lock().unwrap_or_else(|e| e.into_inner()) = next;
         let _ = wake_rx.recv_timeout(WORKER_REFRESH);
+    }
+}
+
+/// Probe `/health` immediately, then every [`HEALTH_REFRESH`], on every tab.
+/// The endpoint is re-read from the shared config each cycle so a port change
+/// is picked up; `force_refresh` / `update_config` wake it early.
+fn health_loop(
+    health: Arc<Mutex<HealthSnapshot>>,
+    shutdown: Arc<AtomicBool>,
+    config: Arc<Mutex<ConfigState>>,
+    wake_rx: mpsc::Receiver<()>,
+) {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(450)))
+        .http_status_as_error(false)
+        // Never forward the bearer to another origin.
+        .max_redirects(0)
+        .build()
+        .into();
+    while !shutdown.load(Ordering::SeqCst) {
+        // Clone out of the lock so the probe never holds it.
+        let cfg = config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let next = probe_health(&agent, &cfg);
+        *health.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        let _ = wake_rx.recv_timeout(HEALTH_REFRESH);
+        // Coalesce a burst of wakes into a single re-probe.
+        while wake_rx.try_recv().is_ok() {}
     }
 }
 
@@ -1421,5 +1553,142 @@ mod tests {
             parse_rocm_smi_json(r#"{"card0":{"GPU use (%)":"50"}}"#),
             VramState::Unavailable(_)
         ));
+    }
+
+    /// Minimal `/health` server on an ephemeral loopback port. Dropping the
+    /// returned guard stops it and closes the listener.
+    struct HealthServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl HealthServer {
+        fn start(body: &'static str) -> Self {
+            use std::io::Write;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let mut request = Vec::new();
+                            let mut buf = [0u8; 512];
+                            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                match stream.read(&mut buf) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                                }
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+                // `listener` drops here: the port stops accepting.
+            });
+            Self {
+                port,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for HealthServer {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    fn config_for_port(port: u16) -> ConfigState {
+        ConfigState {
+            host: "127.0.0.1".into(),
+            port,
+            default_model: String::new(),
+            values: Default::default(),
+            overrides: Default::default(),
+            per_model_count: 0,
+            loaded_from_disk: false,
+            warning: None,
+        }
+    }
+
+    fn wait_for_health(
+        worker: &DashboardWorker,
+        timeout: Duration,
+        pred: impl Fn(&HealthSnapshot) -> bool,
+    ) -> Option<HealthSnapshot> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let h = worker.health();
+            if pred(&h) {
+                return Some(h);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn health_poller_reports_up_then_down_while_tab_inactive() {
+        let mut server = HealthServer::start(r#"{"status":"ok","model":"m"}"#);
+        let worker = DashboardWorker::spawn(config_for_port(server.port));
+        worker.set_active(false);
+
+        let up = wait_for_health(&worker, Duration::from_secs(3), |h| h.checked && h.serve_up)
+            .expect("health snapshot reports serve up within 3s");
+        assert_eq!(up.model.as_deref(), Some("m"));
+        assert!(up.failure.is_none());
+        assert!(up.text.contains(r#""status":"ok""#));
+
+        server.shutdown();
+        worker.force_refresh();
+        let down = wait_for_health(&worker, Duration::from_secs(3), |h| {
+            h.checked && !h.serve_up
+        })
+        .expect("health snapshot reports serve down once the listener is closed");
+        assert!(down.model.is_none());
+        assert!(down.failure.is_none(), "unreachable is down, not a failure");
+    }
+
+    #[test]
+    fn health_poller_picks_up_a_port_change_from_update_config() {
+        let server = HealthServer::start(r#"{"status":"ok","model":null}"#);
+        // Start pointed at a port nothing listens on (the server's port + 1
+        // could collide; bind-and-drop gives a free one).
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let worker = DashboardWorker::spawn(config_for_port(dead));
+        wait_for_health(&worker, Duration::from_secs(3), |h| {
+            h.checked && !h.serve_up
+        })
+        .expect("first probe lands immediately and reports down");
+        worker.update_config(config_for_port(server.port));
+        let up = wait_for_health(&worker, Duration::from_secs(3), |h| h.serve_up)
+            .expect("new port picked up without restarting the worker");
+        assert_eq!(up.model, None);
     }
 }

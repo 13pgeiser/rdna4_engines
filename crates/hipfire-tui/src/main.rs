@@ -279,6 +279,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 && (app.settings_edit.is_some() || app.settings_pending.is_some())
             {
                 app.handle_tab_key(key);
+            } else if app.tab == app::Tab::Chat && app.has_queued_send() {
+                // A queued send (serve not online yet) is cancelled before
+                // Esc can blur the input or stop a generation.
+                app.cancel_queued_send();
             } else if app.chat.sending {
                 app.chat.request_abort();
             } else if chat_capturing {
@@ -624,5 +628,25 @@ mod tests {
         assert!(handle_key(&mut app, k(KeyCode::Char('q'))));
         assert!(!app.confirm_quit);
         assert!(handle_key(&mut app, ctrl_c()));
+    }
+
+    #[test]
+    fn esc_on_chat_cancels_a_queued_send_instead_of_blurring_or_quitting() {
+        let mut app = test_app();
+        app.tab = Tab::Chat;
+        // Health is unknown at this point, so Enter queues (and starts nothing).
+        app.chat.input = "hello".into();
+        assert!(!handle_key(&mut app, k(KeyCode::Enter)));
+        assert!(app.has_queued_send());
+        assert!(app.chat.input.is_empty());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Esc)), "Esc must not quit");
+        assert!(!app.has_queued_send());
+        assert_eq!(app.chat.input, "hello", "text is back in the input box");
+        assert_eq!(app.chat.status, "queued message cancelled");
+        assert!(
+            app.chat.is_input_focused(),
+            "cancelling does not also blur the input"
+        );
     }
 }
