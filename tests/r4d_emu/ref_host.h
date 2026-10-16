@@ -19,3 +19,5 @@ int host_norm_add_norm(const RadArgs* a);
 int host_norm_add_norm_route(const RadArgs* a);
 int host_join_add_scale(const RadArgs* a);
 int host_expert_scale(const RadArgs* a);
+int host_lora_shrink(const RadArgs* a);
+int host_lora_expand(const RadArgs* a);
