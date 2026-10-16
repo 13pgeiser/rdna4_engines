@@ -20,12 +20,13 @@
 //!    `gemv_bf16_xf32_k4_rows` at rows 1..=32 with the `Bf16` wide-twin switch
 //!    on and the verify gate opened (`set_wide_verify_rows(32)`); the launched
 //!    symbol is asserted per row count (9..=16 -> `_wide_r16`, 17..=32 ->
-//!    `_wide_r32`; x4 with K % 8 != 0 keeps the exact <=8-row group loop, and
-//!    the four-column HC gate may report the tiled fallback).
+//!    `_wide_r32`; x4 with K % 8 != 0 keeps the exact <=8-row group loop on
+//!    gfx1201 and takes the admitted PM twin on gfx1151, and the four-column
+//!    HC gate may report the tiled fallback).
 //!  * `direct16` / `direct32`: the wide kernels launched by name for every
 //!    R in 1..=16 / 1..=32 (R below the capacity exercises the row masks),
 //!    including the K % 8 != 0 scalar domain of x4 that the launcher never
-//!    routes to the wide kernel; eager with X contents A, then X contents B
+//!    routes to the HIP wide kernel; eager with X contents A, then X contents B
 //!    rewritten at the same device address, then a HIP graph captured with the
 //!    B contents and replayed after the X buffer is rewritten to A.
 //!  * HC handoff: `hyper_write_norm` producing gate quarters into both
@@ -428,21 +429,22 @@ fn replay_graph(
 }
 
 fn x4_symbol_ok(sym: &str, rows: usize, k: usize) -> bool {
+    let wide = if rows <= 16 {
+        "gemv_bf16_xf32_x4_rows_wide_r16"
+    } else {
+        "gemv_bf16_xf32_x4_rows_wide_r32"
+    };
+    // gfx1151 prefers the admitted PeaceMaker twin (`*_pm_gfx1151`, an
+    // exact-gfx1151 image, never loaded elsewhere) for K % 8 == 0 and the
+    // scalar domain alike (`gemv.rs` x4 rows route); bytes are checked either way.
+    let pm = sym == format!("{wide}_pm_gfx1151");
     match rows {
         1 => sym == "gemv_bf16_xf32_x4",
         2..=8 => sym == format!("gemv_bf16_xf32_x4_rows_r{rows}"),
-        // gfx1151 prefers the admitted PeaceMaker twin (`*_pm_gfx1151`, an
-        // exact-gfx1151 image, never loaded elsewhere); bytes are checked either way.
-        _ if k % 8 == 0 => {
-            let wide = if rows <= 16 {
-                "gemv_bf16_xf32_x4_rows_wide_r16"
-            } else {
-                "gemv_bf16_xf32_x4_rows_wide_r32"
-            };
-            sym == wide || sym == format!("{wide}_pm_gfx1151")
-        }
-        // K % 8 != 0: the incumbent scalar domain keeps the exact group loop.
-        _ => sym == "gemv_bf16_xf32_x4" || sym.starts_with("gemv_bf16_xf32_x4_rows_r"),
+        _ if k % 8 == 0 => sym == wide || pm,
+        // K % 8 != 0: the HIP wide kernel never serves the scalar domain; the
+        // incumbent exact group loop does, or the gfx1151 PM twin.
+        _ => pm || sym == "gemv_bf16_xf32_x4" || sym.starts_with("gemv_bf16_xf32_x4_rows_r"),
     }
 }
 
