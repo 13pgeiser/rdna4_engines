@@ -1464,30 +1464,38 @@ mod tests {
     }
 
     /// The bundled registry (the monolithic MQ4 tags plus the split-only MQ3
-    /// base on the shared PLE pair) keeps its split invariants: no entry is a
-    /// grandfather candidate without a compiled-in pin, and every PLE map key
-    /// is a loadable-or-forward-compatible format token.
+    /// and MQ2 bases on the shared PLE pair) keeps its split invariants: no
+    /// entry is a grandfather candidate without a compiled-in pin, and every
+    /// PLE map key is a loadable-or-forward-compatible format token.
     #[test]
     fn bundled_registry_split_entries_are_split_only_and_use_valid_ple_keys() {
         let parsed = bundled().unwrap();
-        let mq3 = &parsed.models["qwen3.8:flash-next-mq3-xts"];
-        assert!(mq3.has_ple_sidecars());
-        assert!(mq3.is_split_only());
-        assert_eq!(
-            mq3.ple.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["q4", "q8"]
-        );
-        assert_eq!(mq3.ple["q4"].file, "qwen3.8-flash-next.ple-q4");
-        assert_eq!(mq3.ple["q8"].file, "qwen3.8-flash-next.ple-q8");
+        let split_tags = [
+            "qwen3.8:flash-next-mq3-xts",
+            "qwen3.8:flash-next-mq2-xts",
+            "qwen3.8:flash-next-mq2-xts-4500",
+        ];
+        for tag in split_tags {
+            let split = &parsed.models[tag];
+            assert!(split.has_ple_sidecars(), "{tag}");
+            assert!(split.is_split_only(), "{tag}");
+            assert_eq!(
+                split.ple.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["q4", "q8"],
+                "{tag}"
+            );
+            assert_eq!(split.ple["q4"].file, "qwen3.8-flash-next.ple-q4", "{tag}");
+            assert_eq!(split.ple["q8"].file, "qwen3.8-flash-next.ple-q8", "{tag}");
+        }
         for (tag, entry) in &parsed.models {
             assert!(
                 entry.ple.keys().all(|key| is_ple_format_token(key)),
                 "{tag}"
             );
-            if tag != "qwen3.8:flash-next-mq3-xts" {
+            if !split_tags.contains(&tag.as_str()) {
                 assert!(
                     !entry.has_ple_sidecars(),
-                    "{tag}: only the MQ3 base is split"
+                    "{tag}: only the MQ3 and MQ2 bases are split"
                 );
             }
             // Pins keyed by the split MQ4 identity stay inert until a registry
