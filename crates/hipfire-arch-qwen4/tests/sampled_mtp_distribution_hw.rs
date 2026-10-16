@@ -80,9 +80,17 @@
 //!
 //! `sampled_mtp_ngram_matches_ar_distribution_on_flash_next` repeats the
 //! comparison with the request-local n-gram pool armed (drafter built
-//! `.with_ngram(Some(qwen4_ngram_mod_config((5, 3, 3))?))`, request
+//! `.with_ngram(Some(qwen4_ngram_mod_config((5, 3, 3))?))
+//! .with_copy_lane(copy)`, request
 //! `allow_ngram_modifier: true`, the same neutral T/top_p/top_k/min_p, no
-//! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm:
+//! penalties), `HIPFIRE_SAMPLED_MTP_TRIALS` (>= 2000) cold trials per arm.
+//! These arms follow the product switch: `copy` is
+//! `hipfire_config::mtp_ngram_copy_enabled_for_arch` of the loaded GPU
+//! (`speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by default:
+//! the native-MTP n-gram takeover; `HIPFIRE_MTP_NGRAM_COPY=on` runs them on
+//! the copy lane). The mode is recorded as `copy_lane` in every arm's config,
+//! and the parent resolves it from each arm's receipt GPU, so ids of one mode
+//! are never reused as the other's:
 //!
 //! - `ngram_batched` / `ngram_interleaved`: the prose prompt, so the pool
 //!   mostly misses and the native window runs; compared with the existing
@@ -93,7 +101,8 @@
 //!   prompt is a "rewrite this passage" request with the passage's first
 //!   `COPY_PRIMED` tokens already in the assistant turn, so the pool proposes
 //!   the passage's continuation on the first window (the fixture is
-//!   pre-checked on the CPU against `MtpCopyContext` for the prompt). Hits
+//!   pre-checked on the CPU against `MtpCopyContext` (copy lane) or
+//!   `MtpNgramContext` (otherwise) for the prompt). Hits
 //!   are REQUIRED: `request_stats().ngram_mod_windows`, summed over the
 //!   trials, and the offered drafts must both be nonzero, in the arm and again
 //!   in the parent from `<arm>.stats.json`.
@@ -112,9 +121,11 @@
 //!
 //! `sampled_mtp_copy_long_matches_ar_distribution_on_flash_next` compares
 //! `copy_long_batched` and `copy_long_adaptive` with `copy_long_ar` on a longer
-//! verbatim-rewrite fixture: 48 IDs per cold trial, at least 2000 trials,
-//! using the loaded GPU's product `ngram_mod_triple_for_arch` (5/1/63 on
-//! gfx1151/gfx1201), recorded in each config. The pool is CPU-prechecked for
+//! verbatim-rewrite fixture: 48 IDs per cold trial, at least 2000 trials.
+//! These arms always run the copy lane (`.with_copy_lane(true)`, config
+//! `copy_lane: true`, whatever the product switch says) with the copy triple
+//! `hipfire_config::ngram_mod_copy_triple()` (5/1/63 plus its env
+//! overrides), recorded in each config. The pool is CPU-prechecked for
 //! 48 continuation tokens. Marginals at 0,1,2,3,7,11,15,23,31,47 and joints
 //! (0,1), (7,8), (15,16), (31,32) use the same pooled homogeneity test and
 //! `ALPHA`. Batched is forced floor-off and replays the first `REPLAYS` seeds
@@ -231,7 +242,7 @@ use hipfire_arch_qwen4::Qwen4KvBackend;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
-use hipfire_runtime::ngram_mod::{MtpCopyContext, NgramModConfig};
+use hipfire_runtime::ngram_mod::{MtpCopyContext, MtpNgramContext, NgramModConfig};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{MtpDrafter, MtpRequestStats, SpecRequestConfig};
@@ -281,8 +292,9 @@ const REPLAYS: usize = 5;
 const ALPHA: f64 = 1e-3;
 const ARMS: [&str; 4] = ["ar", "batched", "interleaved", "adaptive"];
 
-/// The n-gram triple under test (`n_match`, `n_min`, `n_max`): the arch-16
-/// default of `hipfire_config::ngram_mod_triple_for_arch`.
+/// The n-gram triple the pre-existing n-gram arms run (`n_match`, `n_min`,
+/// `n_max`): the arch-16 default of `hipfire_config::ngram_mod_triple_for_arch`
+/// with the copy lane off, on either lane.
 const NGRAM_TRIPLE: (usize, usize, usize) = (5, 3, 3);
 /// Fewest independent seeded trials per n-gram arm.
 const NGRAM_MIN_TRIALS: usize = 2000;
@@ -1251,20 +1263,24 @@ fn spec_request_ngram(
 }
 
 fn new_drafter(loaded: &mut Loaded) -> Result<Qwen4MtpDrafter, String> {
-    new_drafter_with(loaded, None)
+    new_drafter_with(loaded, None, false)
 }
 
 /// A sampled-verify drafter; `ngram` is the pool configuration requests that
-/// arm `allow_ngram_modifier` use (`None`: every window native).
+/// arm `allow_ngram_modifier` use (`None`: every window native) and
+/// `copy_lane` runs that pool as the n-gram copy lane.
 fn new_drafter_with(
     loaded: &mut Loaded,
     ngram: Option<NgramModConfig>,
+    copy_lane: bool,
 ) -> Result<Qwen4MtpDrafter, String> {
     loaded
         .bundle
         .attach_mtp(&mut loaded.gpu, MAX_SEQ)
         .map_err(|e| e.to_string())?;
-    let drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None).with_ngram(ngram);
+    let drafter = Qwen4MtpDrafter::new(MTP_K, MAX_SEQ, None)
+        .with_ngram(ngram)
+        .with_copy_lane(copy_lane);
     if !drafter.supports_temp_verify() {
         return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
     }
@@ -2229,7 +2245,9 @@ fn compare_to_reference(
     compare_positions(arm, reference, ar, mtp, &marginals, &[(0, 1)], report, failures);
 }
 
-/// An n-gram arm's recorded config (the `ar` arm uses [`dist_config`]).
+/// An n-gram arm's recorded config (the `ar` arm uses [`dist_config`]):
+/// `copy_lane` is the product switch the arm ran under
+/// (`hipfire_config::mtp_ngram_copy_enabled_for_arch` of its GPU).
 fn ngram_config(
     arm: &str,
     spec: Option<&NgramArm>,
@@ -2237,6 +2255,7 @@ fn ngram_config(
     sampling: (f32, f32, Option<u32>, f32),
     pen: &Penalties,
     trials: usize,
+    copy_lane: bool,
 ) -> Value {
     let copy = spec.is_none_or(|spec| spec.copy);
     let mut config = config_base("ngram-distribution", arm, pen, Fixture::Prose, identity);
@@ -2249,6 +2268,7 @@ fn ngram_config(
     config["tokens"] = json!(TOKENS);
     config["sampled_mode"] = json!("leviathan");
     config["triple"] = json!([NGRAM_TRIPLE.0, NGRAM_TRIPLE.1, NGRAM_TRIPLE.2]);
+    config["copy_lane"] = json!(copy_lane);
     config["salt"] = json!(spec.map_or(COPY_AR_SALT, |spec| spec.salt));
     config
 }
@@ -2279,8 +2299,10 @@ fn copy_long_config(
     arch: &str,
     range: (usize, usize),
 ) -> Result<Value, String> {
-    let triple = hipfire_config::ngram_mod_triple_for_arch(hipfire_arch_qwen4::ARCH_ID, arch);
-    // Validate the same product config as the child, without loading a GPU.
+    // The long-copy arms always run the copy lane, whatever the product
+    // switch resolves to: its triple, not the arch's.
+    let triple = hipfire_config::ngram_mod_copy_triple();
+    // Validate the same pool config as the child, without loading a GPU.
     qwen4_ngram_mod_config(triple)?;
     let mut config = config_base(
         "copy-long-distribution", arm, &settings.pen, Fixture::Prose, identity,
@@ -2291,6 +2313,7 @@ fn copy_long_config(
     config["primed"] = json!(COPY_PRIMED);
     config["gpu_arch"] = json!(arch);
     config["triple"] = json!([triple.0, triple.1, triple.2]);
+    config["copy_lane"] = json!(true);
     config["temp"] = json!(settings.temp);
     config["top_p"] = json!(settings.top_p);
     config["top_k"] = json!(settings.top_k);
@@ -2305,8 +2328,17 @@ fn copy_long_config(
     Ok(config)
 }
 
+/// The GPU arch an arm's receipt (`<ids stem>.receipt.json`) recorded.
+fn receipt_arch(ids_path: &Path) -> Result<String, String> {
+    let receipt = read_json(&ids_path.with_extension("receipt.json"))?;
+    receipt["gpu"]["arch"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{}: missing GPU arch receipt", ids_path.display()))
+}
+
 /// The receipt supplies the actual loaded GPU's arch, not a guessed default.
-/// All other config fields, including its product triple, are recomputed.
+/// All other config fields, including its copy triple, are recomputed.
 fn check_copy_long_shard(
     dir: &Path,
     arm: &str,
@@ -2518,11 +2550,6 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
     for (name, spec) in arms {
         let ids_path = dir.join(format!("{name}.ids.json"));
         let identity = arm_identity(name, "leviathan", &model_id, &CONTROL_ENV);
-        let expected = if name == "ar" {
-            settings.config("ar", &identity)
-        } else {
-            ngram_config(name, spec, &identity, sampling, &settings.pen, trials)
-        };
         if ids_path.exists() {
             eprintln!("reusing {}", ids_path.display());
         } else {
@@ -2534,7 +2561,17 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
             spawn_arm(test, name, "leviathan", &model, &dir, None, name)
                 .unwrap_or_else(|e| panic!("{e}"));
         }
-        // Reused and fresh results alike must carry the config expected now.
+        // Reused and fresh results alike must carry the config expected now;
+        // an n-gram arm's copy-lane mode is the product switch resolved for
+        // the GPU its receipt names.
+        let expected = if name == "ar" {
+            settings.config("ar", &identity)
+        } else {
+            let arch = receipt_arch(&ids_path).unwrap_or_else(|e| panic!("{e}"));
+            let copy_lane =
+                hipfire_config::mtp_ngram_copy_enabled_for_arch(hipfire_arch_qwen4::ARCH_ID, &arch);
+            ngram_config(name, spec, &identity, sampling, &settings.pen, trials, copy_lane)
+        };
         check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
         let ids: Vec<Vec<u32>> =
             serde_json::from_slice(&fs::read(&ids_path).expect("arm ids")).expect("arm ids json");
@@ -2806,8 +2843,8 @@ fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> 
         return Ok(());
     }
     let mut loaded = load(model)?;
-    let triple =
-        hipfire_config::ngram_mod_triple_for_arch(hipfire_arch_qwen4::ARCH_ID, &loaded.gpu.arch);
+    // The long-copy arms always run the copy lane (see `copy_long_config`).
+    let triple = hipfire_config::ngram_mod_copy_triple();
     let pool_config = qwen4_ngram_mod_config(triple)?;
     let config = copy_long_config(arm, &identity, &settings, &loaded.gpu.arch, range)?;
     let prompt = copy_long_fixture(&loaded, pool_config)?;
@@ -2858,7 +2895,7 @@ fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> 
         }
         loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
     } else {
-        let mut drafter = new_drafter_with(&mut loaded, Some(pool_config))?;
+        let mut drafter = new_drafter_with(&mut loaded, Some(pool_config), true)?;
         let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
         let mut stats = CopyLongStats::default();
         // Only a forced floor-off route replays byte for byte; the adaptive
@@ -2968,10 +3005,11 @@ fn sampling_from_env() -> Result<(f32, f32, Option<u32>, f32), String> {
 
 /// The copied-span fixture's prompt: the rendered rewrite request plus the
 /// passage's first `COPY_PRIMED` tokens as the start of the assistant turn.
-/// Fails unless the passage tokens occur in the request and the pool, seeded
-/// from this prompt, proposes the passage's next `n_max` tokens after the
-/// passage token `COPY_PRIMED` (the first window's seed when sampled).
-fn copy_fixture(loaded: &Loaded) -> Result<Vec<u32>, String> {
+/// Fails unless the passage tokens occur in the request and the pool of the
+/// arm's lane (`MtpCopyContext` with `copy_lane`, else `MtpNgramContext`),
+/// seeded from this prompt, proposes the passage's next `n_max` tokens after
+/// the passage token `COPY_PRIMED` (the first window's seed when sampled).
+fn copy_fixture(loaded: &Loaded, copy_lane: bool) -> Result<Vec<u32>, String> {
     let (_, n_min, n_max) = NGRAM_TRIPLE;
     let passage = loaded.tokenizer.encode(COPY_PASSAGE);
     if passage.len() < COPY_PRIMED + 1 + n_max.max(n_min) {
@@ -2989,12 +3027,19 @@ fn copy_fixture(loaded: &Loaded) -> Result<Vec<u32>, String> {
         return Err("the passage's own tokens do not occur in the rendered request".into());
     }
     prompt.extend_from_slice(&passage[..COPY_PRIMED]);
-    let mut pool = MtpCopyContext::new(qwen4_ngram_mod_config(NGRAM_TRIPLE)?)
-        .map_err(|e| e.to_string())?;
-    pool.begin_request(&prompt);
+    let pool_config = qwen4_ngram_mod_config(NGRAM_TRIPLE)?;
     let seed = &passage[COPY_PRIMED..=COPY_PRIMED];
     let want = &passage[COPY_PRIMED + 1..COPY_PRIMED + 1 + n_max];
-    match pool.propose(seed, n_max) {
+    let proposed: Option<Vec<u32>> = if copy_lane {
+        let mut pool = MtpCopyContext::new(pool_config).map_err(|e| e.to_string())?;
+        pool.begin_request(&prompt);
+        pool.propose(seed, n_max).map(<[u32]>::to_vec)
+    } else {
+        let mut pool = MtpNgramContext::new(pool_config).map_err(|e| e.to_string())?;
+        pool.begin_request(&prompt);
+        pool.propose(seed, n_max).map(<[u32]>::to_vec)
+    };
+    match proposed {
         Some(candidates) if candidates == want => Ok(prompt),
         other => Err(format!(
             "copy fixture: the pool proposed {other:?} after the passage's token {COPY_PRIMED}, expected {want:?}"
@@ -3020,21 +3065,26 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     let pen = Penalties::from_env()?;
     let env = own_env(&CONTROL_ENV);
     let identity = own_identity(model, dir, &CONTROL_ENV)?;
-    let config = ngram_config(arm, spec, &identity, sampling, &pen, trials);
     let ids_path = dir.join(format!("{arm}.ids.json"));
+    let mut loaded = load(model)?;
+    // The n-gram arms follow the product switch of the loaded GPU.
+    let copy_lane = hipfire_config::mtp_ngram_copy_enabled_for_arch(
+        hipfire_arch_qwen4::ARCH_ID,
+        &loaded.gpu.arch,
+    );
+    let config = ngram_config(arm, spec, &identity, sampling, &pen, trials, copy_lane);
     if ids_path.exists() {
         check_config(&ids_path, &config)?;
     }
-    let mut loaded = load(model)?;
     let copy = spec.is_none_or(|spec| spec.copy);
     let prompt = if copy {
-        copy_fixture(&loaded)?
+        copy_fixture(&loaded, copy_lane)?
     } else {
         loaded.render(PROSE)?
     };
     let eos = loaded.bundle.config.eos_token_id;
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={NGRAM_TRIPLE:?} state={} route_class={}",
+        "ARM {arm} arch={} prompt_tokens={} trials={trials} temp={temp} top_p={top_p} top_k={top_k:?} min_p={min_p} triple={NGRAM_TRIPLE:?} copy_lane={copy_lane} state={} route_class={}",
         loaded.gpu.arch,
         prompt.len(),
         loaded.state,
@@ -3058,7 +3108,7 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         }
         Some(spec) => {
             let pool_config = qwen4_ngram_mod_config(NGRAM_TRIPLE)?;
-            let mut drafter = new_drafter_with(&mut loaded, Some(pool_config))?;
+            let mut drafter = new_drafter_with(&mut loaded, Some(pool_config), copy_lane)?;
             let budget = floor_probe_budget()?;
             let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
             let mut run = |loaded: &mut Loaded, trial: usize| {

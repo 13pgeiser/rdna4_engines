@@ -788,27 +788,30 @@ impl Carrier for Qwen4Carrier {
         let speculator = if native_mtp {
             eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
             let arch = hipfire_arch_qwen4::ARCH_ID;
+            let copy_lane = hipfire_config::mtp_ngram_copy_enabled_for_arch(arch, &ctx.gpu.arch);
             let ngram = match hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
                 hipfire_config::ngram_mod_triple_for_arch(arch, &ctx.gpu.arch),
             ) {
                 Ok(config) => {
+                    let ngram_on = hipfire_config::mtp_ngram_enabled_for_arch(arch, &ctx.gpu.arch);
                     eprintln!(
-                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={} take_cap={})",
-                        if hipfire_config::mtp_ngram_enabled_for_arch(arch, &ctx.gpu.arch) {
-                            "on"
-                        } else {
-                            "off"
-                        },
+                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={})",
+                        if ngram_on { "on" } else { "off" },
                         config.n_match,
                         config.n_min,
-                        config.n_max,
-                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
-                            &config,
-                            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(
-                                &ctx.gpu.arch,
-                            ),
-                        )
+                        config.n_max
                     );
+                    if ngram_on && copy_lane {
+                        eprintln!(
+                            "  qwen4 native MTP n-gram copy lane: on (take_cap={})",
+                            hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
+                                &config,
+                                rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(
+                                    &ctx.gpu.arch,
+                                ),
+                            )
+                        );
+                    }
                     Some(config)
                 }
                 Err(error) => {
@@ -821,6 +824,7 @@ impl Carrier for Qwen4Carrier {
                 max_seq,
                 meta.tokenizer.special_token_id("<|im_end|>"),
                 ngram,
+                copy_lane,
             ))
         } else {
             None

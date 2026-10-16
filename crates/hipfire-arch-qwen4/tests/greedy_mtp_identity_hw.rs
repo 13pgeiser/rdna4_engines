@@ -27,8 +27,12 @@
 //! - `adaptive`: route knob unset;
 //! - `full-head`: `HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_DRAFT_HEAD=full`.
 //! - `ngram-batched`, `ngram-incremental`, `ngram-adaptive`: the drafter is built
-//!   `.with_ngram(Some(qwen4_ngram_mod_config(ngram_mod_triple_for_arch(16, arch))))`
-//!   and the request armed with `allow_ngram_modifier: true`, with route knob
+//!   `.with_ngram(Some(qwen4_ngram_mod_config(ngram_mod_triple_for_arch(16, arch))))
+//!   .with_copy_lane(mtp_ngram_copy_enabled_for_arch(16, arch))` (the product
+//!   switch `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY`, off by
+//!   default: the native-MTP n-gram takeover, `on` runs the copy lane; the
+//!   `NGRAM` line prints `copy_lane=`) and the request armed with
+//!   `allow_ngram_modifier: true`, with route knob
 //!   `HIPFIRE_MTP_INCREMENTAL` `0` / `1` / unset;
 //! - `ngram-long`: `ngram-adaptive` with the inherited triple
 //!   `HIPFIRE_NGRAM_MOD_N_MATCH=24 HIPFIRE_NGRAM_MOD_N_MIN=48 HIPFIRE_NGRAM_MOD_N_MAX=64`
@@ -948,11 +952,12 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
                 ));
             }
             let config = qwen4_ngram_mod_config(triple)?;
+            let copy_lane = hipfire_config::mtp_ngram_copy_enabled_for_arch(16, &gpu.arch);
             println!(
-                "NGRAM triple={triple:?} n_match={} n_min={} n_max={}",
+                "NGRAM triple={triple:?} n_match={} n_min={} n_max={} copy_lane={copy_lane}",
                 config.n_match, config.n_min, config.n_max
             );
-            drafter = drafter.with_ngram(Some(config));
+            drafter = drafter.with_ngram(Some(config)).with_copy_lane(copy_lane);
             drafter.configure_request(SpecRequestConfig {
                 allow_ngram_modifier: true,
                 ..SpecRequestConfig::default()

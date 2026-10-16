@@ -24,7 +24,7 @@ use crate::mtp_gpu::{
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
 use crate::state::Qwen4StateSnapshot;
-use hipfire_runtime::ngram_mod::{MtpCopyContext, NgramModConfig};
+use hipfire_runtime::ngram_mod::{MtpCopyContext, MtpNgramContext, NgramModConfig};
 use hipfire_runtime::sampler::{sample_cpu, PenaltyTable, SamplerConfig};
 use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{
@@ -804,6 +804,13 @@ const MTP_ROW_COST_PRIOR: f64 = 0.27;
 /// the fit's depth-spread units (`Σw(d - d̄)²`): two windows one depth
 /// apart, so a handful of windows at two depths outweigh it.
 const MTP_ROW_COST_PRIOR_WEIGHT: f64 = 0.5;
+/// Emitted tokens a request's first takeover is assumed to yield (one
+/// pseudo-window): the offline 5/3/3 TC/Hermes accepted-prefix-plus-bonus on
+/// a pool hit was 2.9-3.2 (`release-0.4.1/mtp-ngram-plan.md` §1).
+const NGRAM_YIELD_PRIOR: f32 = 3.0;
+/// Per declined pool hit, the takeover yield history decays by this, so a
+/// source that lost to native MTP is re-tried once the evidence ages out.
+const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths of the request-local n-gram acceptance table: one per verify
 /// row of the spec capacity below the seed, the longest proposal the pool
 /// can make (`qwen4_ngram_mod_config` caps `n_max` there).
@@ -1514,6 +1521,34 @@ impl MtpFloor {
     /// committed, `wall_us` including its verify).  Returns `true` when the
     /// caller must not take over again this request: the floor retired, or
     /// external windows cost no less per token than AR.
+    fn observe_external(
+        &mut self,
+        emitted: usize,
+        wall_us: f32,
+        drafts: usize,
+        agreement: &Agreement,
+    ) -> bool {
+        if !self.retired && drafts > 0 {
+            if valid_us(wall_us) {
+                let decay = self.decay;
+                if self.calibrated {
+                    decay_add(&mut self.combined, wall_us, emitted as f32, decay);
+                    decay_add(&mut self.slow, wall_us, emitted as f32, decay.max(MTP_FLOOR_RETIRE_DECAY));
+                }
+                if emitted > 0 {
+                    decay_add(&mut self.external, wall_us, emitted as f32, decay);
+                }
+            }
+            self.count_probe();
+            self.decide(agreement);
+        }
+        self.retired || self.external_blocked
+    }
+
+    /// One finished external window of the n-gram copy lane (`drafts > 0`
+    /// offered, `emitted` tokens committed, `wall_us` including its verify).
+    /// Returns `true` when the caller must not take over again this request:
+    /// the floor retired, or external windows cost no less per token than AR.
     ///
     /// A retired floor keeps pricing external windows (`external`,
     /// `external_depth`, `external_blocked`): retirement says native
@@ -1521,7 +1556,7 @@ impl MtpFloor {
     /// un-retires, nor counts probes, nor touches native routing, and it
     /// returns `external_blocked` alone, so the caller stops taking over only
     /// when takeovers themselves lose to AR.
-    fn observe_external(
+    fn observe_external_copy(
         &mut self,
         emitted: usize,
         wall_us: f32,
@@ -1534,7 +1569,12 @@ impl MtpFloor {
                 let decay = self.decay;
                 if self.calibrated && !was_retired {
                     decay_add(&mut self.combined, wall_us, emitted as f32, decay);
-                    decay_add(&mut self.slow, wall_us, emitted as f32, decay.max(MTP_FLOOR_RETIRE_DECAY));
+                    decay_add(
+                        &mut self.slow,
+                        wall_us,
+                        emitted as f32,
+                        decay.max(MTP_FLOOR_RETIRE_DECAY),
+                    );
                 }
                 if emitted > 0 {
                     decay_add(&mut self.external, wall_us, emitted as f32, decay);
@@ -2882,12 +2922,14 @@ pub(crate) struct WindowPlan {
     pub(crate) trace: bool,
     /// The floor is neither bypassed by a forced route nor opted out.
     pub(crate) floor_active: bool,
-    /// The pool proposed a takeover this window and the take-length chooser
-    /// accepted it.
+    /// The pool proposed a takeover this window (the head's first draft still
+    /// has to confirm it). With the copy lane the take-length chooser
+    /// accepted it as well.
     pub(crate) ngram_hit: bool,
     /// The head's row-0 first draft must equal the first candidate before
-    /// the takeover runs ([`NGRAM_UNCONFIRMED_MIN_TAKE`]). Meaningful only
-    /// with `ngram_hit`.
+    /// the takeover runs: always so without the copy lane, and with it until
+    /// the copy source is established ([`NGRAM_UNCONFIRMED_MIN_TAKE`]).
+    /// Meaningful only with `ngram_hit`.
     pub(crate) ngram_confirm: bool,
     /// The takeover candidates. Filled only for replication
     /// ([`Qwen4MtpDrafter::attach_candidates`]); rank 0 reads its own pool copy.
@@ -2910,6 +2952,7 @@ pub(crate) struct ReplicaParams {
     ctx_capacity: usize,
     end_of_turn: Option<u32>,
     ngram_config: Option<NgramModConfig>,
+    copy_lane: bool,
 }
 
 /// The host-visible part of a window every EP rank must agree on:
@@ -3023,9 +3066,10 @@ pub struct Qwen4MtpDrafter {
     max_k: usize,
     ctx_capacity: usize,
     /// Rows a 2+ row verify forward of the target runs row-exact on this GPU
-    /// ([`Qwen4Bundle::row_exact_verify_rows`]); the n-gram take cap is one
-    /// below it. Starts at the few-row limit and is refreshed at every
-    /// window entry that has the GPU and the target.
+    /// ([`Qwen4Bundle::row_exact_verify_rows`]); the copy lane's n-gram take
+    /// cap is one below it. Starts at the few-row limit and, with
+    /// `copy_lane`, is refreshed at every window entry that has the GPU and
+    /// the target.
     row_exact_rows: usize,
     request: SpecRequestConfig,
     scratch: Option<Box<dyn SpecScratch>>,
@@ -3059,20 +3103,38 @@ pub struct Qwen4MtpDrafter {
     /// (`hipfire_config::ngram_mod_triple_for_arch`); `None` disables the
     /// n-gram takeover for every request.
     ngram_config: Option<NgramModConfig>,
-    /// Request-local n-gram proposal owner, allocated on the first armed
-    /// request and reused (cleared and reseeded) by every later one.
-    ngram: Option<MtpCopyContext>,
+    /// The copy lane (`hipfire_config::mtp_ngram_copy_enabled_for_arch`,
+    /// [`Self::with_copy_lane`]) runs the n-gram source only when set, and
+    /// only with `ngram_config` and a request that arms n-gram. Unset: the
+    /// native-MTP n-gram takeover (`ngram`, the yield gate `ngram_yield`, the
+    /// head's row-0 confirmation of every takeover).
+    copy_lane: bool,
+    /// Request-local n-gram proposal owner of the takeover without the copy
+    /// lane, allocated on the first armed request and reused (cleared and
+    /// reseeded) by every later one.
+    ngram: Option<MtpNgramContext>,
+    /// Request-local n-gram proposal owner of the copy lane, allocated on the
+    /// first armed request and reused (cleared and reseeded) by every later
+    /// one. Only the pool of the active mode is ever allocated.
+    ngram_copy: Option<MtpCopyContext>,
     /// This request may take a window from the n-gram pool
-    /// (`SpecRequestConfig::allow_ngram_modifier`). A hit takes the window
-    /// when the take-length chooser ([`Self::ngram_hit`]) prices a takeover
-    /// at least as well as the native window it displaces; the head's own
-    /// first draft must then equal the first candidate, unless the copy
-    /// source is established ([`NGRAM_UNCONFIRMED_MIN_TAKE`]).
+    /// (`SpecRequestConfig::allow_ngram_modifier`). Without the copy lane a
+    /// pool hit takes the window only if the head's own first draft equals
+    /// the hit's first candidate and the yield gate passes; otherwise the
+    /// window is native. With it a hit takes the window when the take-length
+    /// chooser ([`Self::ngram_hit`]) prices a takeover at least as well as
+    /// the native window it displaces; the head's own first draft must then
+    /// equal the first candidate, unless the copy source is established
+    /// ([`NGRAM_UNCONFIRMED_MIN_TAKE`]).
     ngram_active: bool,
-    /// The current window's takeover candidates, copied out of the pool
-    /// (reused). Valid only when `ngram_hit` returned true for the window.
+    /// The current window's pool candidates, copied out of the pool (reused).
+    /// Valid only when `ngram_hit` returned true for the window.
     ngram_candidates: Vec<u32>,
-    /// This request's decayed (accepted, compared) counts of the n-gram
+    /// Decayed (emitted tokens, windows) of this request's takeover windows:
+    /// the n-gram source's own yield, kept apart from the native per-depth
+    /// agreement (see `ngram_wins`). Unused by the copy lane.
+    ngram_yield: (f32, f32),
+    /// Copy lane: this request's decayed (accepted, compared) counts of the n-gram
     /// source per candidate depth, the pool's own acceptance kept apart from
     /// the native per-depth agreement and observed by shadow on every window
     /// that had a proposal, whichever source ran it
@@ -3191,9 +3253,12 @@ impl Qwen4MtpDrafter {
             end_of_turn,
             ngram_config: None,
             row_exact_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+            copy_lane: false,
             ngram: None,
+            ngram_copy: None,
             ngram_active: false,
             ngram_candidates: Vec::new(),
+            ngram_yield: (0.0, 0.0),
             ngram_agreement: [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS],
             ngram_proposal: Vec::new(),
             ngram_proposed_at: None,
@@ -3223,6 +3288,16 @@ impl Qwen4MtpDrafter {
         self
     }
 
+    /// Run the n-gram source as the copy lane (`on`: take-length chooser,
+    /// shadow acceptance, retired requests keeping it, confirmation skipped
+    /// once the source is established) instead of the native-MTP takeover.
+    /// It runs only when an n-gram config is present
+    /// ([`Self::with_ngram`]) and the request arms n-gram; off by default.
+    pub fn with_copy_lane(mut self, on: bool) -> Self {
+        self.copy_lane = on;
+        self
+    }
+
     /// A sampled request needs sampled verification enabled (and a valid
     /// `HIPFIRE_MTP_SAMPLED_MODE`).
     fn require_supported_request(&self) -> Result<(), String> {
@@ -3248,7 +3323,9 @@ impl Qwen4MtpDrafter {
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
         self.bind_arch(gpu);
-        self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
+        if self.copy_lane {
+            self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
+        }
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -3259,33 +3336,47 @@ impl Qwen4MtpDrafter {
                 .ok_or_else(|| "Qwen4 MTP hidden width overflow".to_string())?
         };
         let capacity = self.proposal_capacity();
+        let copy_lane = self.copy_lane;
         let prefill_rows = {
             let bundle = Self::bundle(target)?;
             let config = &bundle.config;
             if native_mtp_row_capture(gpu, config) {
-                bundle
-                    .state
-                    .ensure_row_capture(gpu, capacity + 1, config.linear_conv_kernel_dim - 1)
-                    .map_err(|error| error.to_string())?;
+                if copy_lane {
+                    bundle
+                        .state
+                        .ensure_row_capture(gpu, capacity + 1, config.linear_conv_kernel_dim - 1)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    bundle
+                        .state
+                        .ensure_row_capture(gpu, self.max_k + 1, config.linear_conv_kernel_dim - 1)
+                        .map_err(|error| error.to_string())?;
+                }
             }
             bundle.spec_chunk_rows().unwrap_or(1).max(1)
         };
-        // An armed takeover verifies up to `take_cap + 1` rows, which can
-        // exceed `max_k + 1` (and a request may arm n-gram after the first
-        // one allocated): a scratch too small for it is replaced.
-        let block_rows = (capacity + 1).max(prefill_rows);
-        let too_small = self
-            .scratch
-            .as_mut()
-            .and_then(|scratch| scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>())
-            .is_some_and(|scratch| scratch.block_size < block_rows);
-        if too_small {
-            if let Some(old) = self.scratch.take() {
-                old.free(gpu);
+        if copy_lane {
+            // An armed copy-lane takeover verifies up to `take_cap + 1`
+            // rows, which can exceed `max_k + 1` (and a request may arm
+            // n-gram after the first one allocated): a scratch too small for
+            // it is replaced.
+            let block_rows = (capacity + 1).max(prefill_rows);
+            let too_small = self
+                .scratch
+                .as_mut()
+                .and_then(|scratch| scratch.as_any_mut().downcast_mut::<Qwen4SpecScratch>())
+                .is_some_and(|scratch| scratch.block_size < block_rows);
+            if too_small {
+                if let Some(old) = self.scratch.take() {
+                    old.free(gpu);
+                }
             }
-        }
-        if self.scratch.is_none() {
-            let scratch = target.new_spec_scratch(gpu, block_rows)?;
+            if self.scratch.is_none() {
+                let scratch = target.new_spec_scratch(gpu, block_rows)?;
+                self.scratch = Some(scratch);
+            }
+        } else if self.scratch.is_none() {
+            let scratch = target.new_spec_scratch(gpu, (self.max_k + 1).max(prefill_rows))?;
             self.scratch = Some(scratch);
         }
         self.prefill_rows = prefill_rows;
@@ -3652,11 +3743,59 @@ impl Qwen4MtpDrafter {
         best
     }
 
-    /// Candidates a takeover may take at most ([`qwen4_ngram_take_cap`] at
-    /// this GPU's row-exact verify rows); 0 with no pool configured.
+    /// Whether an `n`-candidate takeover is expected to emit at least as much
+    /// per unit cost as the native window it displaces. N-gram hits and native
+    /// drafts can succeed on the same spans (a pool hit on a span the model
+    /// rewrites displaces a better native window), so the source is chosen by
+    /// each source's own measured yield: the takeover's decayed emitted per
+    /// window (prior `NGRAM_YIELD_PRIOR` tokens, one pseudo-window) against
+    /// the native agreement's best rate. Declined hits let the takeover
+    /// history decay back toward the prior, so the n-gram source is re-tried.
+    fn ngram_wins(&self, n: usize, k: usize) -> bool {
+        let (emitted, windows) = self.ngram_yield;
+        let expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
+        let cost = self.ngram_window_cost(n);
+        expected / cost >= self.native_rate(k.min(self.max_k))
+    }
+
+    /// Extend only a well-established copy source, never a fresh or uncertain
+    /// match. Configured n_max remains the hard bound, so defaults stay 5/3/3.
+    fn ngram_takeover_depth(&self, matched: usize, current: usize) -> usize {
+        let base = matched.min(current);
+        if matched <= current
+            || self.ngram_row_cost.is_none()
+            || self.stats.ngram_mod_windows < 5
+            || self.stats.ngram_mod_drafts == 0
+        {
+            return base;
+        }
+        let acceptance =
+            self.stats.ngram_mod_accepted as f32 / self.stats.ngram_mod_drafts as f32;
+        if acceptance < 0.95 {
+            return base;
+        }
+        let (emitted, windows) = self.ngram_yield;
+        let mut expected = (emitted + NGRAM_YIELD_PRIOR) / (windows + 1.0);
+        let mut best = (base, expected / self.ngram_window_cost(base));
+        let mut prefix = acceptance.powi(base as i32);
+        for depth in base + 1..=matched {
+            prefix *= acceptance;
+            expected += prefix;
+            let rate = expected / self.ngram_window_cost(depth);
+            if rate > best.1 && rate >= self.native_rate(current.min(self.max_k)) {
+                best = (depth, rate);
+            }
+        }
+        best.0
+    }
+
+    /// Candidates a copy-lane takeover may take at most
+    /// ([`qwen4_ngram_take_cap`] at this GPU's row-exact verify rows); 0 with
+    /// no pool configured.
     fn ngram_take_cap(&self) -> usize {
-        self.ngram_config
-            .map_or(0, |config| qwen4_ngram_take_cap(&config, self.row_exact_rows))
+        self.ngram_config.map_or(0, |config| {
+            qwen4_ngram_take_cap(&config, self.row_exact_rows)
+        })
     }
 
     /// Window cost of a takeover of `d` candidates in AR-step units: the
@@ -4199,6 +4338,12 @@ impl Qwen4MtpDrafter {
         self.floor_enabled && self.floor.needs_ar_sample() && !Self::floor_forced()
     }
 
+    /// `floor_retired() || floor_needs_calibration()`: the exact guard an
+    /// external takeover must pass before it runs.
+    pub(crate) fn floor_takeover_blocked(&self) -> bool {
+        self.floor.retired || self.floor_needs_calibration()
+    }
+
     /// What a promoted singleton hands its lane: the next window's row-0
     /// hidden, the per-depth agreement and whether the floor retired the
     /// request (the head then lags the target, so the lane must stay
@@ -4246,23 +4391,30 @@ impl Qwen4MtpDrafter {
         wall_us: f32,
         drafts: usize,
     ) -> bool {
-        // The first takeover of a candidate count binds that row count's
-        // specialised verify symbols, as the first native batched window of
-        // a drafted depth does ([`Self::finish_floor_window`]): observed
-        // unpriced, so it spends the probe and records no cost.
-        let first_use = {
+        // With the copy lane, the first takeover of a candidate count binds
+        // that row count's specialised verify symbols, as the first native
+        // batched window of a drafted depth does
+        // ([`Self::finish_floor_window`]): observed unpriced, so it spends
+        // the probe and records no cost.
+        let first_use = if self.copy_lane {
             let bit = 1u64 << drafts.min(NGRAM_DEPTHS);
             let first = self.ngram_warm_depths & bit == 0;
             self.ngram_warm_depths |= bit;
             first
+        } else {
+            false
         };
         if !self.floor_enabled || self.follower {
             return false;
         }
-        let priced_us = if first_use { f32::NAN } else { wall_us };
-        let stop = self
-            .floor
-            .observe_external(emitted, priced_us, drafts, &self.agreement);
+        let stop = if self.copy_lane {
+            let priced_us = if first_use { f32::NAN } else { wall_us };
+            self.floor
+                .observe_external_copy(emitted, priced_us, drafts, &self.agreement)
+        } else {
+            self.floor
+                .observe_external(emitted, wall_us, drafts, &self.agreement)
+        };
         if floor_trace_enabled() {
             eprintln!(
                 "{}",
@@ -4307,9 +4459,10 @@ impl Qwen4MtpDrafter {
     /// prompt fill ending there. A rejected tail never reaches either owner.
     ///
     /// This takes the window unconditionally; `mtp_step` calls it (through
-    /// `run_takeover`) only for a pool hit the take-length chooser accepted
-    /// and, until the copy source is established, the head's own first draft
-    /// confirmed.
+    /// `run_takeover`) only for a pool hit the head's own first draft
+    /// confirmed (with the copy lane: a pool hit the take-length chooser
+    /// accepted and, until the copy source is established, the head's own
+    /// first draft confirmed).
     #[allow(clippy::too_many_arguments)]
     pub fn mtp_takeover_step(
         &mut self,
@@ -4406,7 +4559,51 @@ impl Qwen4MtpDrafter {
         window
     }
 
-    /// With the request armed, ask the pool for a proposal over the
+    /// With the request armed, ask the pool for a candidate run over the
+    /// authoritative history (prompt plus `emitted`, which holds the seed) and
+    /// copy it into `ngram_candidates`. A hit is reported only if the yield
+    /// gate (`ngram_wins`) passes; a declined hit decays the takeover yield
+    /// history toward its prior (`NGRAM_YIELD_RECOVERY`). A hit is not yet a
+    /// takeover: `mtp_step` runs it only after the head's own first draft
+    /// equals `ngram_candidates[0]`. With the copy lane the decision is
+    /// [`Self::copy_hit`]'s.
+    fn ngram_hit(&mut self, emitted: &[u32], k: usize) -> bool {
+        if self.copy_lane {
+            self.copy_hit(emitted, k)
+        } else {
+            // The floor's calibration token must be the request's first window,
+            // and a retired request's head lags the target: no takeover then.
+            if !self.ngram_active || self.floor_takeover_blocked() {
+                return false;
+            }
+            // `k` already includes the remaining emit budget: n-gram extension may
+            // exceed the native depth but never this caller cap (a takeover commits
+            // seed + candidates to both device owners before the host sees them).
+            let limit = self.ngram_config.map_or(k, |config| config.n_max.min(k));
+            let Some(ctx) = self.ngram.as_mut() else {
+                return false;
+            };
+            let Some(candidates) = ctx.propose(emitted, limit) else {
+                return false;
+            };
+            self.ngram_candidates.clear();
+            self.ngram_candidates.extend_from_slice(candidates);
+            let native_depth = k.min(self.max_k);
+            let depth = self.ngram_takeover_depth(self.ngram_candidates.len(), native_depth);
+            if self.ngram_config.is_some_and(|config| depth < config.n_min) {
+                return false;
+            }
+            self.ngram_candidates.truncate(depth);
+            if depth <= native_depth && !self.ngram_wins(self.ngram_candidates.len(), k) {
+                self.ngram_yield.0 *= NGRAM_YIELD_RECOVERY;
+                self.ngram_yield.1 *= NGRAM_YIELD_RECOVERY;
+                return false;
+            }
+            true
+        }
+    }
+
+    /// The copy lane's pool decision: ask the pool for a proposal over the
     /// authoritative history (prompt plus `emitted`, which holds the seed),
     /// up to `n_max` tokens: the whole proposal is kept for the shadow
     /// observation of [`Self::observe_ngram_shadow`], but at most
@@ -4423,7 +4620,7 @@ impl Qwen4MtpDrafter {
     /// confirm the take is decided here too
     /// ([`NGRAM_UNCONFIRMED_MIN_TAKE`]). Only the floor's AR calibration
     /// (and its probes) bars the pool.
-    fn ngram_hit(&mut self, emitted: &[u32], k: usize) -> bool {
+    fn copy_hit(&mut self, emitted: &[u32], k: usize) -> bool {
         self.ngram_decision = None;
         // The floor's calibration token must be the request's first window.
         if !self.ngram_active || self.floor_needs_calibration() {
@@ -4432,7 +4629,7 @@ impl Qwen4MtpDrafter {
         let Some(config) = self.ngram_config else {
             return false;
         };
-        let Some(ctx) = self.ngram.as_mut() else {
+        let Some(ctx) = self.ngram_copy.as_mut() else {
             return false;
         };
         // The extra length past the take is only observed, never taken.
@@ -4538,9 +4735,11 @@ impl Qwen4MtpDrafter {
     /// The takeover window over `ngram_candidates` (a chosen take), with the
     /// `ngram_mod_*` counters and the floor updated
     /// ([`Self::finish_takeover`]). Takeover results never feed the native
-    /// agreement table, and the pool is never cleared on low acceptance: the
-    /// take-length chooser backs off on the measured acceptance, where the
-    /// pool's five-low-window clear would drop the request's prompt for good.
+    /// agreement table. Without the copy lane the takeover's own yield and
+    /// the pool's low-acceptance clear are updated too; the copy lane never
+    /// clears the pool on low acceptance: the take-length chooser backs off
+    /// on the measured acceptance, where the pool's five-low-window clear
+    /// would drop the request's prompt for good.
     #[allow(clippy::too_many_arguments)]
     fn run_takeover(
         &mut self,
@@ -4573,11 +4772,23 @@ impl Qwen4MtpDrafter {
     /// The host-side bookkeeping of a finished takeover: the request's
     /// `ngram_mod_*` counters and the floor's external-window price
     /// (`wall_us`, drafting through the drained head fill), which may stop
-    /// takeovers for the rest of the request.
+    /// takeovers for the rest of the request. Without the copy lane it also
+    /// updates the takeover yield (`ngram_yield`) and feeds the pool's
+    /// low-acceptance clear (`observe_result`).
     fn finish_takeover(&mut self, window: &MtpWindow, wall_us: f32) {
+        if !self.copy_lane {
+            let decay = self.agreement_decay;
+            self.ngram_yield.0 = self.ngram_yield.0 * decay + window.committed.len() as f32;
+            self.ngram_yield.1 = self.ngram_yield.1 * decay + 1.0;
+        }
         self.stats.ngram_mod_windows += 1;
         self.stats.ngram_mod_drafts += window.drafts_generated;
         self.stats.ngram_mod_accepted += window.accepted;
+        if !self.copy_lane {
+            if let Some(ctx) = self.ngram.as_mut() {
+                ctx.observe_result(window.drafts_generated, window.accepted);
+            }
+        }
         if self.floor_enabled
             && !Self::floor_forced()
             && self.floor_observe_external_window(
@@ -5373,7 +5584,8 @@ impl Qwen4MtpDrafter {
 
     /// Every timing- or host-state-dependent decision of the next window,
     /// host only: the forced-route environment, the floor's retirement and
-    /// calibration, the n-gram pool's take length, the floor's
+    /// calibration, the n-gram pool's hit (and its yield gate; with the copy
+    /// lane its take length), the floor's
     /// route and depth, and the trace flag. Rank 0 only: it mutates the floor,
     /// the n-gram history and the request stats exactly as the decision chain
     /// of a single-card window did, in the same order. `emitted` holds the
@@ -5399,7 +5611,9 @@ impl Qwen4MtpDrafter {
         let plan_start = Instant::now();
         self.close_floor_window(plan_start);
         // The window that followed the last proposal has committed: compare.
-        self.observe_ngram_shadow(emitted);
+        if self.copy_lane {
+            self.observe_ngram_shadow(emitted);
+        }
         self.require_supported_request()?;
         if k > self.proposal_capacity() {
             return Err(format!(
@@ -5425,6 +5639,9 @@ impl Qwen4MtpDrafter {
             ngram_candidates: Vec::new(),
         };
         if floor_active && self.floor.retired {
+            if !self.copy_lane {
+                return Ok(ar(WindowRoute::ArRetired));
+            }
             // The copy source may still take the window: the head is caught
             // up before a takeover ([`Self::run_window`]).
             let ngram_hit = self.ngram_hit(emitted, k);
@@ -5435,22 +5652,26 @@ impl Qwen4MtpDrafter {
                 trace,
                 floor_active,
                 ngram_hit,
-                ngram_confirm: !ngram_hit || self.ngram_decision.map_or(true, |d| d.confirm),
+                ngram_confirm: !ngram_hit || self.ngram_decision.is_none_or(|d| d.confirm),
                 ngram_candidates: Vec::new(),
             });
         }
         if floor_active && self.floor.needs_ar_sample() {
             return Ok(ar(WindowRoute::ArCalibrate));
         }
-        // A pool proposal may take this window at a take length the chooser
-        // prices at least as well as native. Until the copy source is
-        // established the head's own first draft must still equal the first
-        // candidate: confirmed on the route the window runs (batched: inside
-        // the drafting loop, reusing the row-0 step; interleaved: a
-        // standalone probe). `mtp_windows` counts only the windows that end
-        // native.
+        // A pool hit may take this window, but only if the head's own first
+        // draft equals the hit's first candidate: confirmed on the route the
+        // window runs (batched: inside the drafting loop, reusing the row-0
+        // step; interleaved: a standalone probe). `mtp_windows` counts only
+        // the windows that end native, and a confirmation miss leaves the
+        // takeover yield history untouched. With the copy lane a pool
+        // proposal takes the window at a take length the chooser prices at
+        // least as well as native, and until the copy source is established
+        // the head's own first draft must still equal the first candidate.
         let ngram_hit = self.ngram_hit(emitted, k);
-        self.trace_ngram_plan(trace, emitted, plan_start, false);
+        if self.copy_lane {
+            self.trace_ngram_plan(trace, emitted, plan_start, false);
+        }
         let k = native_k;
         // Route: a (k+1)-row batched verify costs about 2.5 single-row
         // forwards, so it pays only while drafts keep being accepted; the
@@ -5478,7 +5699,7 @@ impl Qwen4MtpDrafter {
             trace,
             floor_active,
             ngram_hit,
-            ngram_confirm: !ngram_hit || self.ngram_decision.map_or(true, |d| d.confirm),
+            ngram_confirm: !ngram_hit || self.ngram_decision.is_none_or(|d| d.confirm),
             ngram_candidates: Vec::new(),
         })
     }
@@ -5519,13 +5740,15 @@ impl Qwen4MtpDrafter {
             ctx_capacity: self.ctx_capacity,
             end_of_turn: self.end_of_turn,
             ngram_config: self.ngram_config,
+            copy_lane: self.copy_lane,
         }
     }
 
     /// An EP peer's drafter: rank 0's construction parameters, as a follower.
     pub(crate) fn new_replica(params: ReplicaParams) -> Self {
         let mut replica = Self::new(params.max_k, params.ctx_capacity, params.end_of_turn)
-            .with_ngram(params.ngram_config);
+            .with_ngram(params.ngram_config)
+            .with_copy_lane(params.copy_lane);
         replica.follower = true;
         replica
     }
@@ -5647,7 +5870,7 @@ impl Qwen4MtpDrafter {
             self.catch_up_head(gpu, target)?;
             if plan.ngram_confirm {
                 let matched = self.probe_first_draft(gpu, target, position, seed)?;
-                if trace && !self.follower {
+                if trace && self.copy_lane && !self.follower {
                     eprintln!(
                         "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
                     );
@@ -5679,7 +5902,7 @@ impl Qwen4MtpDrafter {
             let window_start = Instant::now();
             if hit {
                 let matched = self.probe_first_draft(gpu, target, position, seed)?;
-                if trace && !self.follower {
+                if trace && self.copy_lane && !self.follower {
                     eprintln!(
                         "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
                     );
@@ -5788,7 +6011,7 @@ impl Qwen4MtpDrafter {
                 // window is abandoned here; the target was never touched.
                 if index == 0 && hit {
                     let matched = self.ngram_candidates.first() == Some(&argmax);
-                    if trace && !self.follower {
+                    if trace && self.copy_lane && !self.follower {
                         eprintln!(
                             "QWEN4_MTP_TRACE {{\"event\":\"ngram_confirm\",\"position\":{position},\"match\":{matched}}}"
                         );
@@ -6079,6 +6302,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
             if let Some(ctx) = self.ngram.as_mut().filter(|ctx| !ctx.is_begun()) {
                 ctx.begin_request(prompt_tokens);
             }
+            if let Some(ctx) = self.ngram_copy.as_mut().filter(|ctx| !ctx.is_begun()) {
+                ctx.begin_request(prompt_tokens);
+            }
         }
         // A miss resets target, head and draft policy; a hit restores the
         // session snapshot at `start_pos` into all three. Either way no head
@@ -6216,7 +6442,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // The floor's n-gram pricing and decay read the arch before the
         // window's resource pass sets them again (to the same values).
         self.bind_arch(gpu);
-        self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
+        if self.copy_lane {
+            self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
+        }
         let mut plan = self.plan_window(emitted, k)?;
         if !ep {
             return self.run_window(gpu, target, position, seed, emitted, eos, &plan);
@@ -6395,14 +6623,21 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.max_k
     }
 
-    /// An armed n-gram pool may take up to [`qwen4_ngram_take_cap`]
-    /// candidates (never the longer proposal it observes); native windows
-    /// still draft at most K.
+    /// An armed n-gram pool may offer up to its `n_max` candidates (with the
+    /// copy lane: take up to [`qwen4_ngram_take_cap`] candidates, never the
+    /// longer proposal it observes); native windows still draft at most K.
     fn proposal_capacity(&self) -> usize {
-        if self.ngram_active {
-            self.max_k.max(self.ngram_take_cap())
+        if self.copy_lane {
+            if self.ngram_active {
+                self.max_k.max(self.ngram_take_cap())
+            } else {
+                self.max_k
+            }
         } else {
-            self.max_k
+            match (self.ngram_active, self.ngram_config) {
+                (true, Some(config)) => self.max_k.max(config.n_max),
+                _ => self.max_k,
+            }
         }
     }
 
@@ -6439,6 +6674,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // allocation is reused; its history restarts with this request.
         self.stats = MtpRequestStats::default();
         self.ngram_active = false;
+        self.ngram_yield = (0.0, 0.0);
         self.ngram_agreement = [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS];
         self.ngram_proposal.clear();
         self.ngram_proposed_at = None;
@@ -6447,11 +6683,29 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if let Some(ctx) = self.ngram.as_mut() {
             ctx.reset_request();
         }
+        if let Some(ctx) = self.ngram_copy.as_mut() {
+            ctx.reset_request();
+        }
         if let (true, Some(config)) = (cfg.allow_ngram_modifier, self.ngram_config) {
-            if self.ngram.as_ref().is_none_or(|ctx| ctx.config() != &config) {
-                self.ngram = MtpCopyContext::new(config).ok();
+            if self.copy_lane {
+                if self
+                    .ngram_copy
+                    .as_ref()
+                    .is_none_or(|ctx| ctx.config() != &config)
+                {
+                    self.ngram_copy = MtpCopyContext::new(config).ok();
+                }
+                self.ngram_active = self.ngram_copy.is_some();
+            } else {
+                if self
+                    .ngram
+                    .as_ref()
+                    .is_none_or(|ctx| ctx.config() != &config)
+                {
+                    self.ngram = MtpNgramContext::new(config).ok();
+                }
+                self.ngram_active = self.ngram.is_some();
             }
-            self.ngram_active = self.ngram.is_some();
         }
         self.stats.mtp_ngram = self.ngram_active;
         self.push_replay(ReplayOp::Configure(cfg));
@@ -6475,23 +6729,30 @@ impl MtpDrafter for Qwen4MtpDrafter {
 
 /// Build the generic runtime adapter around the native Qwen4 GPU MTP core.
 /// `end_of_turn` is the tokenizer's `<|im_end|>` id, when it has one;
-/// `ngram` is the n-gram pool configuration requests may arm.
+/// `ngram` is the n-gram pool configuration requests may arm, and
+/// `copy_lane` runs that pool as the copy lane
+/// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`).
 pub fn build_qwen4_mtp_speculator(
     max_k: usize,
     ctx_capacity: usize,
     end_of_turn: Option<u32>,
     ngram: Option<NgramModConfig>,
+    copy_lane: bool,
 ) -> Box<dyn Speculator> {
     Box::new(MtpSpeculator::new(
-        Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn).with_ngram(ngram),
+        Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn)
+            .with_ngram(ngram)
+            .with_copy_lane(copy_lane),
     ))
 }
 
 /// The n-gram pool configuration for a `(n_match, n_min, n_max)` triple
-/// (`hipfire_config::ngram_mod_triple_for_arch`). `n_max` is the proposal
-/// length, capped one below the spec verify capacity (and `n_min` with it);
-/// [`qwen4_ngram_take_cap`] is the shorter take. A triple the pool cannot
-/// run is an error, never a silently different policy.
+/// (`hipfire_config::ngram_mod_triple_for_arch`). Without the copy lane a
+/// takeover verifies `n + 1` rows, so `n_max` is capped one below the spec
+/// verify capacity (and `n_min` with it); with it `n_max` is the proposal
+/// length under the same cap and [`qwen4_ngram_take_cap`] is the shorter
+/// take. A triple the pool cannot run is an error, never a silently
+/// different policy.
 pub fn qwen4_ngram_mod_config(
     (n_match, n_min, n_max): (usize, usize, usize),
 ) -> Result<NgramModConfig, String> {
@@ -6509,7 +6770,7 @@ pub fn qwen4_ngram_mod_config(
     })
 }
 
-/// Candidates a takeover takes at most for `config`: its `n_max`, and never
+/// Candidates a copy-lane takeover takes at most for `config`: its `n_max`, and never
 /// more rows (the seed included) than a verify forward runs bitwise like
 /// the single-row decode (`row_exact_rows`,
 /// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`).
@@ -6518,14 +6779,20 @@ pub fn qwen4_ngram_take_cap(config: &NgramModConfig, row_exact_rows: usize) -> u
 }
 
 /// The most drafts any window of a native MTP request on `gpu_arch` verifies
-/// (the seed row excluded): the head's `max_k`, or the n-gram copy lane's
-/// take cap ([`qwen4_ngram_take_cap`] at the arch's row-exact verify rows)
-/// where the n-gram source arms (`hipfire_config::mtp_ngram_enabled_for_arch`).
-/// Admission sizes the verify rows and the GDN row capture by it: on gfx1201
-/// (K=3) an armed takeover verifies 8 rows where native windows verify 4.
+/// (the seed row excluded): the head's `max_k` (at most [`MTP_MAX_DEPTH`]),
+/// or, with the n-gram copy lane on
+/// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`) where the n-gram
+/// source arms (`hipfire_config::mtp_ngram_enabled_for_arch`), the copy
+/// lane's take cap ([`qwen4_ngram_take_cap`] at the arch's row-exact verify
+/// rows). Admission sizes the verify rows and the GDN row capture by it: on
+/// gfx1201 (K=3) with the copy lane on, an armed takeover verifies 8 rows
+/// where native windows verify 4; without it admission sizes the native
+/// windows alone.
 pub fn native_mtp_proposal_drafts(max_k: usize, gpu_arch: &str) -> usize {
-    if !hipfire_config::mtp_ngram_enabled_for_arch(crate::ARCH_ID, gpu_arch) {
-        return max_k;
+    if !(hipfire_config::mtp_ngram_enabled_for_arch(crate::ARCH_ID, gpu_arch)
+        && hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch))
+    {
+        return max_k.min(MTP_MAX_DEPTH);
     }
     qwen4_ngram_mod_config(hipfire_config::ngram_mod_triple_for_arch(
         crate::ARCH_ID,
@@ -7148,61 +7415,34 @@ mod tests {
         assert_eq!(s.history.row(0), &[1, 2, 3, 7]);
     }
 
-    /// An n-gram acceptance table with `ratio` at every depth backed by
-    /// `weight` windows of evidence.
-    fn ngram_table(ratio: f32, weight: f32) -> [(f32, f32); NGRAM_DEPTHS] {
-        [(ratio * weight, weight); NGRAM_DEPTHS]
-    }
-
     #[test]
-    fn ngram_take_runs_only_while_its_acceptance_beats_native() {
-        let emitted = [0u32, 1];
-        // A fresh request (the prior's 0.8 at the prior's weight) prices the
-        // pool below native MTP agreeing at 0.9, but the proposal is still
-        // kept for the shadow observation.
-        let mut drafter = armed_ngram_drafter(1, 8);
-        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
-        drafter.ngram_agreement = [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS];
-        assert!(!drafter.ngram_hit(&emitted, 8));
-        assert_eq!(drafter.ngram_proposed_at, Some(2));
-        assert_eq!(drafter.ngram_proposal.len(), 8);
-        assert_eq!(drafter.ngram_decision.map(|d| d.take), Some(0));
-        // A source measured at the native acceptance pays from a long take
-        // (the best rate sits at 6 of the 7 candidates the cap allows)...
-        drafter.ngram_agreement = ngram_table(0.9, 20.0);
-        assert!(drafter.ngram_hit(&emitted, 8));
-        assert_eq!(drafter.ngram_candidates.len(), 6);
-        // ... a measured 0.8 source does not ...
-        drafter.ngram_agreement = ngram_table(0.8, 20.0);
-        assert!(!drafter.ngram_hit(&emitted, 8));
-        // ... and the budget `k` bounds the take.
-        drafter.ngram_agreement = ngram_table(0.99, 20.0);
-        assert!(drafter.ngram_hit(&emitted, 4));
-        assert_eq!(drafter.ngram_candidates.len(), 4);
-    }
-
-    #[test]
-    fn ngram_take_length_follows_the_arch_row_price() {
-        let emitted = [0u32, 1];
-        for ((single, extra), takes) in [((30.5, 6.9), true), ((30.3, 14.8), false)] {
-            let mut drafter = armed_ngram_drafter(1, 8);
-            drafter.ngram_row_cost = Some((single, extra));
-            drafter.agreement = [(0.92, 1.0); MTP_MAX_DEPTH];
-            drafter.ngram_agreement = ngram_table(0.9, 20.0);
-            // Halo's cheap rows pay for the long take; the R9700's dearer
-            // rows leave the 0.9 source below the native window at every
-            // length.
-            assert_eq!(drafter.ngram_hit(&emitted, 8), takes, "{single} {extra}");
-            if takes {
-                assert_eq!(drafter.ngram_candidates.len(), 6);
-            }
-        }
+    fn ngram_source_runs_only_while_its_yield_matches_native() {
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        assert!(drafter.ngram_wins(3, 3), "a fresh request tries the pool");
+        // A pool emitting 2 tokens per 3-candidate window (the Halo smoke's
+        // code_edit_rewrite_copy pattern) loses to native MTP agreeing at 0.95.
+        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.ngram_yield = (16.0, 8.0);
+        assert!(!drafter.ngram_wins(3, 3));
+        // A verbatim copy (4 tokens per window) beats it.
+        drafter.ngram_yield = (32.0, 8.0);
+        assert!(drafter.ngram_wins(3, 3));
+    }
+
+    #[test]
+    fn ngram_arch_pricing_refuses_r9700_copy_but_keeps_halo_winner() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.agreement = [(0.95, 1.0); MTP_MAX_DEPTH];
+        drafter.agreement[1] = (0.86 / 0.95, 1.0);
+        // Five takeovers averaging 2.4 emitted tokens; preserve the prior.
+        drafter.ngram_yield = (12.0, 5.0);
         drafter.ngram_row_cost = Some((30.3, 14.8));
         assert!((drafter.ngram_window_cost(3) - 74.7 / 30.3).abs() < 1e-5);
+        assert!(!drafter.ngram_wins(3, 2));
         drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.ngram_yield = (17.0, 5.0);
         assert!((drafter.ngram_window_cost(3) - 51.2 / 30.5).abs() < 1e-5);
-        assert!(drafter.ngram_window_cost(8).is_infinite());
+        assert!(drafter.ngram_wins(3, 2));
     }
 
     #[test]
@@ -7212,46 +7452,36 @@ mod tests {
         drafter.floor.ar_us = 30_000.0;
         drafter.floor.batched[3] = (240_000.0, 2.0);
         assert!(drafter.floor.batched_cost(3).is_none());
-        assert!(drafter.floor.takeover_cost(3).is_none());
         drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
         assert_eq!(drafter.floor.batched_cost(3), Some(4.0));
         assert_eq!(drafter.ngram_window_cost(3), 4.0);
-        // A takeover with no measured takeover window is priced as the
-        // native window of its row count.
-        assert_eq!(drafter.takeover_cost(3), 4.0);
-        drafter.floor.external_depth[3] = (60_000.0, 2.0);
-        assert_eq!(drafter.takeover_cost(3), 1.0);
-        drafter.floor_enabled = false;
-        assert!((drafter.takeover_cost(3) - 74.7 / 30.3).abs() < 1e-5);
+        assert!(!drafter.ngram_wins(3, 2));
+        drafter.floor.batched[3] = (30_000.0, 2.0);
+        assert!(drafter.ngram_wins(3, 2));
         drafter.ngram_row_cost = None;
         assert_eq!(drafter.ngram_window_cost(3), MTP_WINDOW_COST[3]);
-        assert_eq!(drafter.takeover_cost(3), MTP_WINDOW_COST[3]);
     }
 
     #[test]
-    fn ngram_take_length_stops_where_the_chain_stops_paying() {
-        let emitted = [0u32, 1];
-        let mut drafter = armed_ngram_drafter(1, 8);
-        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
-        // Depths 1-3 accept at 0.99, deeper ones at 0.3: the fourth row adds
-        // 0.29 tokens for a 0.55 AR-step dearer window.
-        let mut table = ngram_table(0.99, 20.0);
-        for entry in &mut table[3..] {
-            *entry = (6.0, 20.0);
-        }
-        drafter.ngram_agreement = table;
-        assert!(drafter.ngram_hit(&emitted, 8));
-        assert_eq!(drafter.ngram_candidates, vec![2, 3, 4]);
-        // The chosen take is the one the decision recorded.
-        let decision = drafter.ngram_decision.expect("decision");
-        assert_eq!((decision.available, decision.take), (8, 3));
-        assert!(decision.rate >= decision.native_rate);
+    fn cost_aware_ngram_depth_extends_only_confident_long_matches() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.ngram_yield = (20.0, 5.0);
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 3);
+        drafter.stats.ngram_mod_windows = 5;
+        drafter.stats.ngram_mod_drafts = 15;
+        drafter.stats.ngram_mod_accepted = 15;
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 7);
+        assert_eq!(drafter.ngram_takeover_depth(3, 3), 3);
+        assert_eq!(drafter.ngram_takeover_depth(63, 3), 7);
+        assert!(drafter.ngram_window_cost(8).is_infinite());
+        drafter.stats.ngram_mod_accepted = 12;
+        assert_eq!(drafter.ngram_takeover_depth(8, 3), 3);
     }
 
     /// A drafter whose pool is trained on `0..21` (so `[0, 1]` continues as
-    /// `[2, 3, 4, ..]`) and whose n-gram source is measured confident and
-    /// well-established (0.99 over 20 windows) on the static Halo prices
-    /// (floor off): the chooser takes the longest chain that pays.
+    /// `[2, 3, 4, ..]`) and whose takeover history is confident and
+    /// well-established: the cost-aware chooser extends past the native depth.
     fn armed_ngram_drafter(n_min: usize, n_max: usize) -> Qwen4MtpDrafter {
         let config = NgramModConfig {
             capacity: 1024,
@@ -7260,13 +7490,16 @@ mod tests {
             n_max,
         };
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_ngram(Some(config));
-        let mut pool = MtpCopyContext::new(config).expect("pool");
+        let mut pool = MtpNgramContext::new(config).expect("pool");
         pool.begin_request(&(0..21u32).collect::<Vec<_>>());
         drafter.ngram = Some(pool);
         drafter.ngram_active = true;
         drafter.floor_enabled = false;
         drafter.ngram_row_cost = Some((30.5, 6.9));
-        drafter.ngram_agreement = ngram_table(0.99, 20.0);
+        drafter.stats.ngram_mod_windows = 5;
+        drafter.stats.ngram_mod_drafts = 15;
+        drafter.stats.ngram_mod_accepted = 15;
+        drafter.ngram_yield = (20.0, 5.0);
         drafter
     }
 
@@ -7362,45 +7595,26 @@ mod tests {
 
     #[test]
     fn plan_window_checks_retirement_then_calibration_before_the_ngram_pool() {
-        // A retired request still asks the pool: native drafting lost to AR,
-        // not the copy source, which must beat AR's 1.0 token per step.
+        // A retired request runs head-free AR: the pool is never asked and the
+        // takeover yield history is untouched.
         let mut drafter = armed_ngram_drafter(1, 8);
         drafter.floor_enabled = true;
-        drafter.floor.calibrated = true;
-        drafter.floor.ar_us = 30_000.0;
-        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
         drafter.floor.retired = true;
-        // Retired and cold (no shadow observation has accepted a first
-        // candidate yet): the pool proposes, the shadow state is set, and
-        // nothing is taken.
+        drafter.ngram_yield = (20.0, 5.0);
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(plan.route, WindowRoute::ArRetired);
         assert!(plan.floor_active && !plan.ngram_hit);
-        assert_eq!(drafter.ngram_proposed_at, Some(2));
-        // Once the last observation accepted its first candidate, it takes.
-        drafter.ngram_last_first_accepted = true;
-        let mut plan = plan_of(&mut drafter, 3, None);
-        assert_eq!(plan.route, WindowRoute::ArRetired);
-        assert!(plan.floor_active && plan.ngram_hit);
-        assert_eq!(drafter.ngram_proposed_at, Some(2));
-        assert_eq!(drafter.ngram_decision.map(|d| d.native_rate), Some(1.0));
-        // The replicas get the candidates on demand.
-        drafter.attach_candidates(&mut plan);
-        assert!(!plan.ngram_candidates.is_empty());
-        assert_eq!(plan.ngram_candidates, drafter.ngram_candidates);
-        // A source that loses to AR itself is declined.
-        drafter.ngram_agreement = ngram_table(0.0, 20.0);
-        let plan = plan_of(&mut drafter, 3, None);
-        assert_eq!(plan.route, WindowRoute::ArRetired);
-        assert!(!plan.ngram_hit && plan.ngram_confirm);
+        assert!(drafter.ngram_candidates.is_empty(), "the pool was never asked");
+        assert_eq!(drafter.ngram_yield, (20.0, 5.0));
 
         // The request's first window calibrates AR before any pool hit.
         let mut drafter = armed_ngram_drafter(1, 8);
         drafter.floor_enabled = true;
+        drafter.ngram_yield = (20.0, 5.0);
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(plan.route, WindowRoute::ArCalibrate);
         assert!(!plan.ngram_hit && drafter.ngram_candidates.is_empty());
-        assert!(drafter.ngram_proposed_at.is_none() && drafter.ngram_decision.is_none());
+        assert_eq!(drafter.ngram_yield, (20.0, 5.0));
 
         // A developer-forced route bypasses the floor entirely.
         let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
@@ -7464,17 +7678,14 @@ mod tests {
         assert!(!plan.ngram_candidates.is_empty());
         assert_eq!(plan.ngram_candidates, drafter.ngram_candidates);
 
-        // A declined proposal is no takeover, but it stays set for the
-        // shadow observation and the plan's confirm flag defaults safe.
+        // A declined hit decays the takeover yield history in the plan, as the
+        // old chain did before routing.
         let mut drafter = armed_ngram_drafter(1, 8);
-        drafter.ngram_agreement = ngram_table(0.1, 20.0);
+        drafter.stats.ngram_mod_windows = 0;
+        drafter.ngram_yield = (0.0, 100.0);
         let plan = plan_of(&mut drafter, 3, None);
-        assert!(!plan.ngram_hit && plan.ngram_confirm);
-        assert_eq!(drafter.ngram_proposed_at, Some(2));
-        assert_eq!(
-            drafter.ngram_decision.map(|d| (d.available, d.take)),
-            Some((8, 0))
-        );
+        assert!(!plan.ngram_hit);
+        assert!(drafter.ngram_yield.1 < 100.0);
         let mut declined = plan.clone();
         drafter.attach_candidates(&mut declined);
         assert!(declined.ngram_candidates.is_empty());
@@ -7653,9 +7864,7 @@ mod tests {
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
             drafter.floor.retired = true;
-            drafter.ngram_agreement = ngram_table(0.9, 20.0);
-            drafter.ngram_proposal = vec![1, 2, 3];
-            drafter.ngram_proposed_at = Some(3);
+            drafter.ngram_yield = (8.0, 2.0);
             let agreement = drafter.agreement;
             MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
             assert_eq!(drafter.agreement_decay, decay);
@@ -7667,8 +7876,7 @@ mod tests {
             assert_eq!(drafter.floor.external, (0.0, 0.0));
             assert_eq!(drafter.floor.interleaved, (0.0, 0.0));
             assert_eq!(drafter.floor.batched, [(0.0, 0.0); MTP_WINDOW_COST.len()]);
-            assert_eq!(drafter.ngram_agreement, [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS]);
-            assert!(drafter.ngram_proposal.is_empty() && drafter.ngram_proposed_at.is_none());
+            assert_eq!(drafter.ngram_yield, (0.0, 0.0));
             // Agreement restarts during prefill, not configure_request.
             assert_eq!(drafter.agreement, agreement);
         }
@@ -7851,8 +8059,7 @@ mod tests {
         batched_windows(&mut floor, &bad, 2, 90.0, MTP_FLOOR_PROBE_WINDOWS);
         assert!(floor.retired);
         batched_windows(&mut floor, &good, 3, 5.0, 10);
-        // A good takeover does not stop the lane of a retired request.
-        assert!(!floor.observe_external(8, 10.0, 8, &good));
+        assert!(floor.observe_external(8, 10.0, 8, &good));
         floor.observe_calibration(1000.0, &good);
         assert!(floor.retired);
         assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
@@ -7952,7 +8159,7 @@ mod tests {
         assert!(floor.combined.0 / floor.combined.1 >= 30.0);
         assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
         assert!(floor.retired);
-        assert!(!floor.observe_external(4, 40.0, 4, &bad));
+        assert!(floor.observe_external(4, 40.0, 4, &bad));
         assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
     }
 
@@ -8653,12 +8860,14 @@ mod tests {
         drafter.floor.ar_us = 30_000.0;
         drafter.floor.probe_left = 2;
         assert!(drafter.floor_needs_calibration());
+        assert!(drafter.floor_takeover_blocked());
         assert_eq!(
             plan_of(&mut drafter, 3, None).route,
             WindowRoute::ArCalibrate
         );
         drafter.floor.probe_left = 0;
         assert!(!drafter.floor_needs_calibration());
+        assert!(!drafter.floor_takeover_blocked());
     }
 
     fn floor_drafter(floor_enabled: bool) -> Qwen4MtpDrafter {
@@ -8672,6 +8881,7 @@ mod tests {
         let drafter = floor_drafter(false);
         assert!(!drafter.floor.calibrated);
         assert!(!drafter.floor_needs_calibration());
+        assert!(!drafter.floor_takeover_blocked());
         assert!(!drafter.floor_retired());
     }
 
@@ -8686,6 +8896,7 @@ mod tests {
         assert_eq!(drafter.floor.probes, 0);
         assert!(!drafter.request_stats().mtp_retired);
         assert_eq!(drafter.request_stats().ar_windows, 0);
+        assert!(!drafter.floor_takeover_blocked());
     }
 
     #[test]
@@ -9209,6 +9420,352 @@ mod tests {
         assert_eq!(accept_route_label(Some(&s)), "host");
     }
 
+    /// An n-gram acceptance table with `ratio` at every depth backed by
+    /// `weight` windows of evidence.
+    fn ngram_table(ratio: f32, weight: f32) -> [(f32, f32); NGRAM_DEPTHS] {
+        [(ratio * weight, weight); NGRAM_DEPTHS]
+    }
+
+    #[test]
+    fn ngram_take_runs_only_while_its_acceptance_beats_native() {
+        let emitted = [0u32, 1];
+        // A fresh request (the prior's 0.8 at the prior's weight) prices the
+        // pool below native MTP agreeing at 0.9, but the proposal is still
+        // kept for the shadow observation.
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
+        drafter.ngram_agreement = [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS];
+        assert!(!drafter.ngram_hit(&emitted, 8));
+        assert_eq!(drafter.ngram_proposed_at, Some(2));
+        assert_eq!(drafter.ngram_proposal.len(), 8);
+        assert_eq!(drafter.ngram_decision.map(|d| d.take), Some(0));
+        // A source measured at the native acceptance pays from a long take
+        // (the best rate sits at 6 of the 7 candidates the cap allows)...
+        drafter.ngram_agreement = ngram_table(0.9, 20.0);
+        assert!(drafter.ngram_hit(&emitted, 8));
+        assert_eq!(drafter.ngram_candidates.len(), 6);
+        // ... a measured 0.8 source does not ...
+        drafter.ngram_agreement = ngram_table(0.8, 20.0);
+        assert!(!drafter.ngram_hit(&emitted, 8));
+        // ... and the budget `k` bounds the take.
+        drafter.ngram_agreement = ngram_table(0.99, 20.0);
+        assert!(drafter.ngram_hit(&emitted, 4));
+        assert_eq!(drafter.ngram_candidates.len(), 4);
+    }
+
+    #[test]
+    fn ngram_take_length_follows_the_arch_row_price() {
+        let emitted = [0u32, 1];
+        for ((single, extra), takes) in [((30.5, 6.9), true), ((30.3, 14.8), false)] {
+            let mut drafter = armed_copy_drafter(1, 8);
+            drafter.ngram_row_cost = Some((single, extra));
+            drafter.agreement = [(0.92, 1.0); MTP_MAX_DEPTH];
+            drafter.ngram_agreement = ngram_table(0.9, 20.0);
+            // Halo's cheap rows pay for the long take; the R9700's dearer
+            // rows leave the 0.9 source below the native window at every
+            // length.
+            assert_eq!(drafter.ngram_hit(&emitted, 8), takes, "{single} {extra}");
+            if takes {
+                assert_eq!(drafter.ngram_candidates.len(), 6);
+            }
+        }
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.ngram_row_cost = Some((30.3, 14.8));
+        assert!((drafter.ngram_window_cost(3) - 74.7 / 30.3).abs() < 1e-5);
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        assert!((drafter.ngram_window_cost(3) - 51.2 / 30.5).abs() < 1e-5);
+        assert!(drafter.ngram_window_cost(8).is_infinite());
+    }
+
+    #[test]
+    fn ngram_pricing_uses_request_measurements_after_probing_copy_lane() {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_copy_lane(true);
+        drafter.ngram_row_cost = Some((30.3, 14.8));
+        drafter.floor.ar_us = 30_000.0;
+        drafter.floor.batched[3] = (240_000.0, 2.0);
+        assert!(drafter.floor.batched_cost(3).is_none());
+        assert!(drafter.floor.takeover_cost(3).is_none());
+        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
+        assert_eq!(drafter.floor.batched_cost(3), Some(4.0));
+        assert_eq!(drafter.ngram_window_cost(3), 4.0);
+        // A takeover with no measured takeover window is priced as the
+        // native window of its row count.
+        assert_eq!(drafter.takeover_cost(3), 4.0);
+        drafter.floor.external_depth[3] = (60_000.0, 2.0);
+        assert_eq!(drafter.takeover_cost(3), 1.0);
+        drafter.floor_enabled = false;
+        assert!((drafter.takeover_cost(3) - 74.7 / 30.3).abs() < 1e-5);
+        drafter.ngram_row_cost = None;
+        assert_eq!(drafter.ngram_window_cost(3), MTP_WINDOW_COST[3]);
+        assert_eq!(drafter.takeover_cost(3), MTP_WINDOW_COST[3]);
+    }
+
+    #[test]
+    fn ngram_take_length_stops_where_the_chain_stops_paying() {
+        let emitted = [0u32, 1];
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.agreement = [(0.9, 1.0); MTP_MAX_DEPTH];
+        // Depths 1-3 accept at 0.99, deeper ones at 0.3: the fourth row adds
+        // 0.29 tokens for a 0.55 AR-step dearer window.
+        let mut table = ngram_table(0.99, 20.0);
+        for entry in &mut table[3..] {
+            *entry = (6.0, 20.0);
+        }
+        drafter.ngram_agreement = table;
+        assert!(drafter.ngram_hit(&emitted, 8));
+        assert_eq!(drafter.ngram_candidates, vec![2, 3, 4]);
+        // The chosen take is the one the decision recorded.
+        let decision = drafter.ngram_decision.expect("decision");
+        assert_eq!((decision.available, decision.take), (8, 3));
+        assert!(decision.rate >= decision.native_rate);
+    }
+
+    /// A drafter whose pool is trained on `0..21` (so `[0, 1]` continues as
+    /// `[2, 3, 4, ..]`) and whose n-gram source is measured confident and
+    /// well-established (0.99 over 20 windows) on the static Halo prices
+    /// (floor off): the chooser takes the longest chain that pays.
+    fn armed_copy_drafter(n_min: usize, n_max: usize) -> Qwen4MtpDrafter {
+        let config = NgramModConfig {
+            capacity: 1024,
+            n_match: 2,
+            n_min,
+            n_max,
+        };
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None)
+            .with_ngram(Some(config))
+            .with_copy_lane(true);
+        let mut pool = MtpCopyContext::new(config).expect("pool");
+        pool.begin_request(&(0..21u32).collect::<Vec<_>>());
+        drafter.ngram_copy = Some(pool);
+        drafter.ngram_active = true;
+        drafter.floor_enabled = false;
+        drafter.ngram_row_cost = Some((30.5, 6.9));
+        drafter.ngram_agreement = ngram_table(0.99, 20.0);
+        drafter
+    }
+
+    #[test]
+    fn plan_window_checks_retirement_then_calibration_before_the_ngram_pool_copy_lane() {
+        // A retired request still asks the pool: native drafting lost to AR,
+        // not the copy source, which must beat AR's 1.0 token per step.
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.floor_enabled = true;
+        drafter.floor.calibrated = true;
+        drafter.floor.ar_us = 30_000.0;
+        drafter.floor.probes = MTP_FLOOR_PROBE_WINDOWS;
+        drafter.floor.retired = true;
+        // Retired and cold (no shadow observation has accepted a first
+        // candidate yet): the pool proposes, the shadow state is set, and
+        // nothing is taken.
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRetired);
+        assert!(plan.floor_active && !plan.ngram_hit);
+        assert_eq!(drafter.ngram_proposed_at, Some(2));
+        // Once the last observation accepted its first candidate, it takes.
+        drafter.ngram_last_first_accepted = true;
+        let mut plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRetired);
+        assert!(plan.floor_active && plan.ngram_hit);
+        assert_eq!(drafter.ngram_proposed_at, Some(2));
+        assert_eq!(drafter.ngram_decision.map(|d| d.native_rate), Some(1.0));
+        // The replicas get the candidates on demand.
+        drafter.attach_candidates(&mut plan);
+        assert!(!plan.ngram_candidates.is_empty());
+        assert_eq!(plan.ngram_candidates, drafter.ngram_candidates);
+        // A source that loses to AR itself is declined.
+        drafter.ngram_agreement = ngram_table(0.0, 20.0);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRetired);
+        assert!(!plan.ngram_hit && plan.ngram_confirm);
+
+        // The request's first window calibrates AR before any pool hit.
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.floor_enabled = true;
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArCalibrate);
+        assert!(!plan.ngram_hit && drafter.ngram_candidates.is_empty());
+        assert!(drafter.ngram_proposed_at.is_none() && drafter.ngram_decision.is_none());
+
+        // A developer-forced route bypasses the floor entirely.
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_copy_lane(true);
+        let plan = plan_of(&mut drafter, 3, Some("1"));
+        assert_eq!(plan.route, WindowRoute::Native { depth: 0 });
+        assert!(!plan.floor_active);
+        let plan = plan_of(&mut drafter, 2, Some("0"));
+        assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
+        assert_eq!(plan.k, 2);
+        assert!(!drafter.floor.calibrated && !drafter.floor.retired);
+    }
+
+    #[test]
+    fn plan_window_runs_the_ngram_gate_exactly_as_the_old_chain_and_shares_candidates_on_demand_copy_lane(
+    ) {
+        // Floor off: the pre-floor chooser; the hit is the pool's.
+        let mut drafter = armed_copy_drafter(1, 8);
+        let mut plan = plan_of(&mut drafter, 3, None);
+        assert!(plan.ngram_hit && !plan.floor_active);
+        assert_eq!(
+            plan.route,
+            WindowRoute::Native {
+                depth: batched_depth(&drafter.agreement, 3)
+            }
+        );
+        // Single card allocates nothing for the plan; EP attaches the copy.
+        assert!(plan.ngram_candidates.is_empty());
+        drafter.attach_candidates(&mut plan);
+        assert!(!plan.ngram_candidates.is_empty());
+        assert_eq!(plan.ngram_candidates, drafter.ngram_candidates);
+
+        // A declined proposal is no takeover, but it stays set for the
+        // shadow observation and the plan's confirm flag defaults safe.
+        let mut drafter = armed_copy_drafter(1, 8);
+        drafter.ngram_agreement = ngram_table(0.1, 20.0);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert!(!plan.ngram_hit && plan.ngram_confirm);
+        assert_eq!(drafter.ngram_proposed_at, Some(2));
+        assert_eq!(
+            drafter.ngram_decision.map(|d| (d.available, d.take)),
+            Some((8, 0))
+        );
+        let mut declined = plan.clone();
+        drafter.attach_candidates(&mut declined);
+        assert!(declined.ngram_candidates.is_empty());
+    }
+
+    #[test]
+    fn singleton_decay_is_long_on_gfx1151_only_and_reaches_the_request_floor_copy_lane() {
+        assert_eq!(MTP_AGREEMENT_DECAY, 0.875);
+        assert_eq!(MTP_AGREEMENT_DECAY_GFX1151, 0.97);
+        assert_eq!(singleton_agreement_decay("gfx1151"), 0.97);
+        for arch in [
+            "",
+            "gfx1150",
+            "gfx1152",
+            "gfx1201",
+            "gfx1200",
+            "gfx1100",
+            "gfx942",
+            "gfx1151:sramecc+",
+            "GFX1151",
+        ] {
+            assert_eq!(singleton_agreement_decay(arch), 0.875, "{arch}");
+        }
+        assert_eq!(MtpFloor::new().decay, 0.875);
+        // Binding an arch selects one decay for agreement and every floor
+        // cost pair; configuring another request must preserve that choice.
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        assert_eq!(drafter.agreement_decay, 0.875);
+        for arch in ["gfx1151", "gfx1201", "gfx1151", "gfx942"] {
+            let decay = singleton_agreement_decay(arch);
+            drafter.agreement_decay = decay;
+            drafter.agreement = [MTP_AGREEMENT_PRIOR; MTP_MAX_DEPTH];
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert_eq!(drafter.floor.decay, decay, "{arch}");
+            drafter.observe_agreement(&window(0, 1));
+            let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
+            assert_eq!(
+                drafter.agreement[0],
+                (prior_accepted * decay, prior_total * decay + 1.0),
+                "{arch}"
+            );
+            drafter.floor.observe_calibration(100.0, &drafter.agreement);
+            let mut combined = (0.0, 0.0);
+            for route in [NativeWindow::Interleaved, NativeWindow::Batched] {
+                for _ in 0..2 {
+                    drafter
+                        .floor
+                        .observe_native(route, &window(1, 1), 40.0, 3, &drafter.agreement);
+                    combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
+                }
+            }
+            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(
+                drafter.floor.interleaved,
+                (40.0 * decay + 40.0, 2.0 * decay + 2.0)
+            );
+            assert_eq!(drafter.floor.batched[1], (40.0 * decay + 40.0, decay + 1.0));
+            for _ in 0..2 {
+                assert!(!drafter
+                    .floor
+                    .observe_external_copy(2, 40.0, 1, &drafter.agreement));
+                combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
+            }
+            assert_eq!(drafter.floor.combined, combined);
+            assert_eq!(
+                drafter.floor.external,
+                (40.0 * decay + 40.0, 2.0 * decay + 2.0)
+            );
+            drafter.floor.retired = true;
+            drafter.ngram_agreement = ngram_table(0.9, 20.0);
+            drafter.ngram_proposal = vec![1, 2, 3];
+            drafter.ngram_proposed_at = Some(3);
+            let agreement = drafter.agreement;
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert_eq!(drafter.agreement_decay, decay);
+            assert_eq!(drafter.floor.decay, decay);
+            assert!(!drafter.floor.retired);
+            assert!(!drafter.floor.calibrated);
+            assert_eq!(drafter.floor.observed, 0);
+            assert_eq!(drafter.floor.combined, (0.0, 0.0));
+            assert_eq!(drafter.floor.external, (0.0, 0.0));
+            assert_eq!(drafter.floor.interleaved, (0.0, 0.0));
+            assert_eq!(drafter.floor.batched, [(0.0, 0.0); MTP_WINDOW_COST.len()]);
+            assert_eq!(drafter.ngram_agreement, [MTP_AGREEMENT_PRIOR; NGRAM_DEPTHS]);
+            assert!(drafter.ngram_proposal.is_empty() && drafter.ngram_proposed_at.is_none());
+            // Agreement restarts during prefill, not configure_request.
+            assert_eq!(drafter.agreement, agreement);
+        }
+    }
+
+    #[test]
+    fn floor_retirement_is_sticky_copy_lane() {
+        let bad = agreement(0.0, 2.0);
+        let good = agreement(1.8, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        batched_windows(&mut floor, &bad, 2, 90.0, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(floor.retired);
+        batched_windows(&mut floor, &good, 3, 5.0, 10);
+        // A good takeover does not stop the lane of a retired request.
+        assert!(!floor.observe_external_copy(8, 10.0, 8, &good));
+        floor.observe_calibration(1000.0, &good);
+        assert!(floor.retired);
+        assert_eq!(floor.route(&good, 7, 3), FloorRoute::Ar);
+    }
+
+    #[test]
+    fn floor_good_external_keeps_a_losing_native_route_alive_while_the_mixture_beats_ar_copy_lane()
+    {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = calibrated(30.0, &bad);
+        // 10 us per external token beats AR.
+        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
+        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
+        // One losing native window (90 us for one token) spends the budget;
+        // the realized mixture (~20.6 us per token) still beats AR.
+        floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
+        assert_eq!(floor.probes, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(!floor.retired);
+        // The measured native route loses to AR, yet it keeps running while
+        // the mixture wins.
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
+        assert!(!floor.retired);
+        // Losing native windows drag the mixture up to AR; it then retires at
+        // the first window where the mixture stops beating AR, stickily.
+        let mut kept_alive = 0;
+        while !floor.retired {
+            assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Batched(1));
+            floor.observe_native(NativeWindow::Batched, &window(0, 1), 90.0, 7, &bad);
+            kept_alive += 1;
+            assert!(kept_alive < 50, "never retired");
+        }
+        assert!(kept_alive > 0);
+        assert!(floor.combined.0 / floor.combined.1 >= 30.0);
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
+        assert!(floor.retired);
+        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
+        assert_eq!(floor.route(&bad, 7, 5), FloorRoute::Ar);
+    }
+
     // ---- The n-gram copy lane (CPU: the real planner and take-length
     // chooser, simulated windows).
 
@@ -9306,7 +9863,9 @@ mod tests {
     /// the n-gram pool seeded with `prompt` and armed when `ngram`.
     fn copy_drafter(prompt: &[u32], ngram: bool) -> Qwen4MtpDrafter {
         let config = qwen4_ngram_mod_config((5, 1, 63)).expect("copy-lane triple");
-        let mut drafter = Qwen4MtpDrafter::new(5, 4096, None).with_ngram(Some(config));
+        let mut drafter = Qwen4MtpDrafter::new(5, 4096, None)
+            .with_ngram(Some(config))
+            .with_copy_lane(true);
         drafter.agreement_decay = MTP_AGREEMENT_DECAY_GFX1151;
         drafter.ngram_row_cost = Some((30.5, 6.9));
         MtpDrafter::configure_request(
@@ -9316,7 +9875,7 @@ mod tests {
                 ..SpecRequestConfig::default()
             },
         );
-        if let Some(pool) = drafter.ngram.as_mut() {
+        if let Some(pool) = drafter.ngram_copy.as_mut() {
             pool.begin_request(prompt);
         }
         assert_eq!(drafter.ngram_active, ngram);
@@ -9477,17 +10036,14 @@ mod tests {
         for (rows, cap) in [(8usize, 7usize), (16, 15), (32, 31)] {
             assert_eq!(qwen4_ngram_take_cap(&config, rows), cap, "rows={rows}");
         }
-        let short = NgramModConfig {
-            n_max: 5,
-            ..config
-        };
+        let short = NgramModConfig { n_max: 5, ..config };
         assert_eq!(qwen4_ngram_take_cap(&short, 32), 5);
         assert_eq!(qwen4_ngram_take_cap(&config, 0), 0);
     }
 
     #[test]
     fn drafter_take_cap_and_capacity_follow_its_row_exact_rows() {
-        let mut drafter = armed_ngram_drafter(1, 63);
+        let mut drafter = armed_copy_drafter(1, 63);
         assert_eq!(
             drafter.row_exact_rows,
             rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS
@@ -9517,9 +10073,7 @@ mod tests {
         let run = copy_run(&prompt, &out, true);
         let native = copy_run(&prompt, &out, false);
         let cap = qwen4_ngram_mod_config((5, 1, 63))
-            .map(|c| {
-                qwen4_ngram_take_cap(&c, rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
-            })
+            .map(|c| qwen4_ngram_take_cap(&c, rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS))
             .unwrap();
         assert_eq!(cap, rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1);
 
@@ -9623,9 +10177,8 @@ mod tests {
     fn take_never_exceeds_budget_or_row_exact_cap() {
         for n_max in [3usize, 7, 63] {
             for k in 0..=10usize {
-                let mut drafter = armed_ngram_drafter(1, n_max);
-                let take_cap =
-                    n_max.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1);
+                let mut drafter = armed_copy_drafter(1, n_max);
+                let take_cap = n_max.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1);
                 assert_eq!(drafter.ngram_take_cap(), take_cap);
                 assert_eq!(
                     MtpDrafter::proposal_capacity(&drafter),
@@ -9638,7 +10191,7 @@ mod tests {
                     let take = drafter.ngram_candidates.len();
                     assert!(take <= k, "n_max={n_max} k={k} take={take}");
                     assert!(
-                        take <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1,
+                        take < rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
                         "n_max={n_max} k={k}"
                     );
                     assert!(take <= take_cap, "n_max={n_max} k={k}");
@@ -9653,7 +10206,7 @@ mod tests {
             }
         }
         // Disarmed, the capacity is the head's own K.
-        let mut drafter = armed_ngram_drafter(1, 63);
+        let mut drafter = armed_copy_drafter(1, 63);
         drafter.ngram_active = false;
         assert_eq!(MtpDrafter::proposal_capacity(&drafter), drafter.max_k);
     }
@@ -9739,7 +10292,7 @@ mod tests {
         ));
 
         // (a) A measured takeover depth is its own mean.
-        floor.observe_external(8, 90_000.0, 7, &good);
+        floor.observe_external_copy(8, 90_000.0, 7, &good);
         assert!(close(floor.takeover_cost(7).unwrap(), 90_000.0 / ar));
         // (b) Neighbours move the nearest measured takeover by the row slope,
         // ahead of the native model.
@@ -9758,22 +10311,22 @@ mod tests {
 
         // An unusable timing (a drafter's first takeover of a row count)
         // records nothing: the neighbour still prices it.
-        floor.observe_external(6, f32::NAN, 5, &good);
+        floor.observe_external_copy(6, f32::NAN, 5, &good);
         assert_eq!(floor.external_depth[5], (0.0, 0.0));
         assert!(close(
             floor.takeover_cost(5).unwrap(),
             (90_000.0 - 2.0 * row_us) / ar
         ));
-        floor.observe_external(6, 80_000.0, 5, &good);
+        floor.observe_external_copy(6, 80_000.0, 5, &good);
         assert!(close(floor.takeover_cost(5).unwrap(), 80_000.0 / ar));
 
         // Equidistant measured depths: the one with more windows prices it.
         let mut floor = calibrated(ar, &good);
         batched_windows(&mut floor, &good, 3, 75_000.0, MTP_FLOOR_PROBE_WINDOWS);
         let row_us = floor.fit_line().expect("a priced native depth").2 as f32;
-        floor.observe_external(3, 60_000.0, 2, &good);
+        floor.observe_external_copy(3, 60_000.0, 2, &good);
         for _ in 0..3 {
-            floor.observe_external(7, 100_000.0, 6, &good);
+            floor.observe_external_copy(7, 100_000.0, 6, &good);
         }
         assert!(close(
             floor.takeover_cost(4).unwrap(),
@@ -9782,6 +10335,7 @@ mod tests {
 
         // The drafter observes its first takeover of each row count unpriced.
         let mut drafter = floor_drafter(true);
+        drafter.copy_lane = true;
         drafter.floor.observe_calibration(ar, &drafter.agreement);
         for _ in 0..3 {
             drafter.floor_observe_external_window(8, 90_000.0, 7);
@@ -9962,18 +10516,74 @@ mod tests {
         let (probes, observed) = (floor.probes, floor.observed);
         // Takeovers beating AR (10 us per token against 30) are priced and do
         // not stop the lane, the retirement and the routing stay.
-        assert!(!floor.observe_external(4, 40.0, 4, &bad));
+        assert!(!floor.observe_external_copy(4, 40.0, 4, &bad));
         assert!(floor.retired && floor.external.1 > 0.0 && floor.external_depth[4].1 > 0.0);
         assert_eq!((floor.probes, floor.observed), (probes, observed));
         assert_eq!(floor.route(&bad, 3, 3), FloorRoute::Ar);
         // Takeovers losing to AR block the lane.
         let mut stopped = false;
         for _ in 0..30 {
-            if floor.observe_external(1, 200.0, 4, &bad) {
+            if floor.observe_external_copy(1, 200.0, 4, &bad) {
                 stopped = true;
                 break;
             }
         }
         assert!(stopped && floor.retired && floor.external_blocked);
+    }
+
+    /// A request that arms the n-gram source.
+    fn ngram_request() -> SpecRequestConfig {
+        SpecRequestConfig {
+            allow_ngram_modifier: true,
+            ..SpecRequestConfig::default()
+        }
+    }
+
+    #[test]
+    fn copy_lane_off_is_beta_defaults() {
+        for n_max in [3usize, 8] {
+            let config = qwen4_ngram_mod_config((5, 3, n_max)).expect("beta-style triple");
+            let mut drafter = Qwen4MtpDrafter::new(3, 4096, None).with_ngram(Some(config));
+            assert!(!drafter.copy_lane);
+            assert_eq!(MtpDrafter::proposal_capacity(&drafter), 3);
+            MtpDrafter::configure_request(&mut drafter, ngram_request());
+            assert!(drafter.ngram_active);
+            assert_eq!(
+                MtpDrafter::proposal_capacity(&drafter),
+                drafter.max_k.max(config.n_max)
+            );
+            assert_eq!(drafter.ngram_yield, (0.0, 0.0));
+        }
+        if !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, "gfx1201") {
+            assert_eq!(native_mtp_proposal_drafts(3, "gfx1201"), 3);
+        }
+    }
+
+    #[test]
+    fn copy_lane_arms_its_own_pool_only() {
+        let config = qwen4_ngram_mod_config((5, 3, 3)).expect("triple");
+        for copy in [false, true] {
+            let mut drafter = Qwen4MtpDrafter::new(3, 4096, None)
+                .with_ngram(Some(config))
+                .with_copy_lane(copy);
+            assert_eq!(drafter.copy_lane, copy);
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert!(
+                !drafter.ngram_active && drafter.ngram.is_none() && drafter.ngram_copy.is_none()
+            );
+            MtpDrafter::configure_request(&mut drafter, ngram_request());
+            assert!(drafter.ngram_active, "copy={copy}");
+            assert_eq!(drafter.ngram.is_some(), !copy, "copy={copy}");
+            assert_eq!(drafter.ngram_copy.is_some(), copy, "copy={copy}");
+            // A later request that does not arm n-gram disarms it and keeps the
+            // pool of the lane's mode only.
+            MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
+            assert!(!drafter.ngram_active);
+            assert_eq!(drafter.ngram.is_some(), !copy, "copy={copy}");
+            assert_eq!(drafter.ngram_copy.is_some(), copy, "copy={copy}");
+            // An EP peer's replica runs the same lane.
+            let replica = Qwen4MtpDrafter::new_replica(drafter.replica_params());
+            assert_eq!(replica.copy_lane, copy);
+        }
     }
 }

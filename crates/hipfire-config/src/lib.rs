@@ -2091,6 +2091,18 @@ pub static FIELDS: &[ConfigField] = &[
         "N-gram takeover windows inside native MTP (greedy and sampled, thinking on or off). auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves other producers off; on/1 arms every MTP producer that supports it; off/0 disables it."
     ),
     field!(
+        "speculation.mtp_ngram_copy",
+        "mtp_ngram_copy",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_MTP_NGRAM_COPY"),
+        "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover; auto (default) is off on every GPU for now."
+    ),
+    field!(
         "speculation.mtp_sampled",
         "mtp_sampled",
         Speculation,
@@ -4664,22 +4676,58 @@ pub fn mtp_own_prefill() -> bool {
 pub fn ngram_mod_triple() -> (usize, usize, usize) {
     ngram_mod_triple_with_defaults((24, 48, 64))
 }
-/// Arch-aware `(n_match, n_min, n_max)` triple. `5/1/63` is the arch-16
-/// (native Qwen4 MTP) default on gfx1151 and gfx1201: there `n_max` is the
-/// proposal and shadow-observation length, not the takeover cap (the drafter
-/// takes at most `min(n_max, row-exact verify rows - 1)` candidates, chosen
-/// per window from this request's own measured acceptance and costs); every
-/// other family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
-/// N_MIN,N_MAX}` override wins per component. Validation stays with the
-/// consumer.
+/// Arch-aware `(n_match, n_min, n_max)` triple. `5/3/3` is the approved
+/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; with the copy
+/// lane armed ([`mtp_ngram_copy_enabled_for_arch`]) arch 16 resolves
+/// [`NGRAM_MOD_COPY_TRIPLE`] instead. Every other family keeps the
+/// production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}`
+/// override wins per component. Validation stays with the consumer.
 pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    if model_arch == 16 && mtp_ngram_copy_enabled_for_arch(model_arch, gpu_arch) {
+        return ngram_mod_copy_triple();
+    }
     ngram_mod_triple_with_defaults(ngram_mod_default_triple(model_arch, gpu_arch))
 }
 fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
     if ngram_mod_arch_admitted(model_arch, gpu_arch) {
-        (5, 1, 63)
+        (5, 3, 3)
     } else {
         (24, 48, 64)
+    }
+}
+/// The native Qwen4 MTP n-gram copy lane's default triple: `n_max` is the
+/// proposal and shadow-observation length, not the takeover cap (the drafter
+/// takes at most `min(n_max, row-exact verify rows - 1)` candidates, chosen
+/// per window from the request's own measured acceptance and costs), and a
+/// one-candidate take is allowed.
+pub const NGRAM_MOD_COPY_TRIPLE: (usize, usize, usize) = (5, 1, 63);
+/// [`NGRAM_MOD_COPY_TRIPLE`] with the `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,
+/// N_MAX}` overrides applied per component: the triple of an armed copy lane.
+pub fn ngram_mod_copy_triple() -> (usize, usize, usize) {
+    ngram_mod_triple_with_defaults(NGRAM_MOD_COPY_TRIPLE)
+}
+/// Native Qwen4 MTP n-gram copy lane arming (`speculation.mtp_ngram_copy`,
+/// env override `HIPFIRE_MTP_NGRAM_COPY`). `on`/`1` arms it wherever the
+/// native Qwen4 n-gram source is armed ([`mtp_ngram_enabled_for_arch`]),
+/// `off`/`0` keeps the 5/3/3 pool with row-0 confirmation on every takeover,
+/// and `auto` (the schema default; an unset key also resolves to `auto`) is
+/// off on every GPU until a GPU's own receipts flip it.
+pub fn mtp_ngram_copy_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
+    mtp_ngram_copy_enabled_for_arch_value(
+        process_value("HIPFIRE_MTP_NGRAM_COPY").as_deref(),
+        model_arch,
+        gpu_arch,
+    )
+}
+fn mtp_ngram_copy_enabled_for_arch_value(
+    value: Option<&str>,
+    _model_arch: u32,
+    _gpu_arch: &str,
+) -> bool {
+    match value {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => false,
     }
 }
 fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
@@ -6308,8 +6356,8 @@ mod tests {
 
     #[test]
     fn ngram_mod_triple_defaults_per_arch_with_env_override() {
-        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 1, 63));
-        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 1, 63));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 3, 3));
         assert_eq!(ngram_mod_default_triple(16, "gfx1100"), (24, 48, 64));
         assert_eq!(ngram_mod_default_triple(5, "gfx1151"), (24, 48, 64));
 
@@ -6324,6 +6372,43 @@ mod tests {
         };
         assert_eq!(ngram_mod_triple_resolve((5, 3, 3), env), (7, 3, 3));
         assert_eq!(ngram_mod_triple_resolve((24, 48, 64), env), (7, 48, 64));
+    }
+
+    #[test]
+    fn mtp_ngram_copy_key_and_arch_resolver() {
+        let field = field("speculation.mtp_ngram_copy").expect("mtp_ngram_copy schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM_COPY"));
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        for raw in ["auto", "on", "off", "1", "0"] {
+            assert!(field.validate(&ConfigValue::String(raw.into())).is_ok(), "{raw}");
+        }
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+        let cases: [(u32, &str); 4] = [
+            (16, "gfx1151"),
+            (16, "gfx1201"),
+            (16, "gfx1100"),
+            (5, "gfx1151"),
+        ];
+        // auto/unset: off on every GPU until a GPU's receipts flip it.
+        let auto = [false; 4];
+        for (raw, expect) in [
+            (Some("on"), [true; 4]),
+            (Some("1"), [true; 4]),
+            (Some("off"), [false; 4]),
+            (Some("0"), [false; 4]),
+            (Some("auto"), auto),
+            (None, auto),
+        ] {
+            for (i, (model_arch, gpu)) in cases.iter().enumerate() {
+                assert_eq!(
+                    mtp_ngram_copy_enabled_for_arch_value(raw, *model_arch, gpu),
+                    expect[i],
+                    "{raw:?} arch={model_arch} gpu={gpu}"
+                );
+            }
+        }
+        let none = |_: &str| None;
+        assert_eq!(ngram_mod_triple_resolve(NGRAM_MOD_COPY_TRIPLE, none), (5, 1, 63));
     }
 
     #[test]

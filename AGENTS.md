@@ -855,7 +855,30 @@ Caveats that are part of the fixture, not trivia:
   and off for every other producer; `on`/`1` arms every MTP producer that
   supports it, `off`/`0` is the opt-out (env beats TOML beats default). It
   serves greedy and sampled requests, thinking on or off (Qwen4 and
-  Qwen3.5/3.x). On Qwen4 the proposal source is `MtpCopyContext`
+  Qwen3.5/3.x). The Qwen4 proposal source is switched by
+  `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
+  also `1`/`0`; default `auto`, which is **off on every GPU for now**; env
+  beats TOML beats default). **Off is beta's lane exactly.** On Qwen4 a pool
+  hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
+  from the full prompt every request, so earlier requests never influence
+  candidates, and cleared after five low-acceptance windows) takes the window
+  only when the head's own first draft (row-0 argmax, before any sampled draw)
+  equals the first candidate (the row-0 confirmation runs on every takeover)
+  and the takeover's decayed emitted tokens per window over its verify cost
+  (the measured mean, else the request's window-cost fit, not the static
+  per-arch row table; the yield gate, `ngram_yield` / `ngram_wins` /
+  `ngram_takeover_depth`) is at least the native chooser's expected rate (the
+  floor's cheapest candidate once the floor is measured); otherwise the window
+  is native (the batched route reuses that row-0 step). A takeover ends when
+  the AR floor retires the request, and load admission sizes the verify rows
+  and row capture by `max_k`. The drafter holds `ngram:
+  Option<MtpNgramContext>` in this lane and the floor observes takeovers
+  through `MtpFloor::observe_external`; no `ngram_plan` / `ngram_confirm`
+  trace events are emitted.
+  **`on` arms the copy lane** (`Qwen4MtpDrafter::with_copy_lane(true)`, the
+  drafter's `ngram_copy: Option<MtpCopyContext>` instead of `ngram`, floor
+  observation through `MtpFloor::observe_external_copy`, triple 5/1/63). In
+  that lane the proposal source is `MtpCopyContext`
   (`hipfire_runtime::ngram_mod`), a request-local verbatim-copy
   (prompt-lookup) matcher: one direct-mapped table per key length (32, 16, 8
   and `n_match`, longest first), each hash → the position just past the key's
@@ -918,8 +941,8 @@ Caveats that are part of the fixture, not trivia:
   `external_blocked`) without un-retiring, counting probes or changing native
   routing, and reports `external_blocked` alone, so the lane disarms only when
   takeovers themselves cost at least AR per token. `stats.mtp_retired` stays
-  true and the `ngram_mod_*` counters count retired takeovers. A
-  takeover verifies `[seed, candidates..]` on the same batched verify
+  true and the `ngram_mod_*` counters count retired takeovers.
+  A takeover verifies `[seed, candidates..]` on the same batched verify
   executor as native MTP windows (interleaved one-row route under
   `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows,
   and appends exactly those rows to the head teacher-forced (token p, hidden
@@ -933,18 +956,22 @@ Caveats that are part of the fixture, not trivia:
   depth's own, `MTP_AGREEMENT_RELAX` (0.95) when below, so a depth rejected
   once is re-explored instead of staying frozen below its threshold, and an
   unreached depth is priced at the request's own deepest observed acceptance
-  (conditional acceptance is flat in depth past the first draft); the n-gram
-  table uses the same rule. Triple
-  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/1/63 on admitted Qwen4
-  targets and 24/48/64 elsewhere (per-component overrides; Qwen4 `n_max`
-  capped at 63, the 64-row spec verify capacity; it is the proposal and
-  observation length, the take cap is `min(n_max, 7)`). The load log prints
-  `qwen4 native MTP n-gram: on|off (n_match=.. n_min=.. n_max=.. take_cap=..)`;
+  (conditional acceptance is flat in depth past the first draft); with the
+  copy lane on the n-gram table uses the same rule. Triple
+  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
+  targets with the copy lane off and 5/1/63 with it on (24/48/64 elsewhere;
+  per-component overrides; Qwen4 `n_max` capped at 63, the 64-row spec verify
+  capacity; with the copy lane on it is the proposal and observation length
+  and the take cap is `min(n_max, 7)`). The load log prints
+  `qwen4 native MTP n-gram: on|off (n_match=.. n_min=.. n_max=..)`, plus
+  `qwen4 native MTP n-gram copy lane: on (take_cap=N)` only when the n-gram
+  source is on and the copy lane is armed;
   `HIPFIRE_MTP_TRACE=1` window events carry `source` (`ngram`/`mtp`) and
-  `verify_route`, plus `ngram_plan` (`emitted`, `available`, `take`,
-  `confirm`, `rate`, `native_rate`, `a1`, `plan_us`, `retired`) per window
-  with a proposal (retired plans included) and `ngram_confirm` (`position`,
-  `match`) wherever the row-0 confirmation ran.
+  `verify_route`; with the copy lane on they also carry `ngram_plan`
+  (`emitted`, `available`, `take`, `confirm`, `rate`, `native_rate`, `a1`,
+  `plan_us`, `retired`) per window with a proposal (retired plans included)
+  and `ngram_confirm` (`position`, `match`) wherever the row-0 confirmation
+  ran; with it off neither event is emitted.
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus
