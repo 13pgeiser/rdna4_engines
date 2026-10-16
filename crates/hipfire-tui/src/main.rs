@@ -77,7 +77,8 @@ fn print_help() {
                                       Select/create profiles and browse config variables\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
-         Tabs: Home, Dashboard, Chat, Models, Settings, System. Tab/Shift+Tab to switch, q to quit."
+         Tabs: Home, Dashboard, Chat, Models, Settings, System, Logs. Tab/Shift+Tab to switch, ? for help, q to quit.\n\
+         Esc never quits: it only closes/cancels (help, prompts, edits, chat)."
     );
 }
 
@@ -232,6 +233,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // A Dashboard stop/restart confirmation is modal too: every key goes to the
+    // tab handler (y / n / Esc only) so q / r / ? / Tab cannot act while armed.
+    if app.tab == app::Tab::Dashboard && app.confirm_serve.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // The Settings reset-all confirmation is likewise modal: route every key to
     // the tab handler (which acts only on y / n / Esc) so a global `q` or `r`
     // can't quit or reload while the destructive prompt is armed.
@@ -257,8 +265,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') if !chat_capturing => return true,
         KeyCode::Esc => {
-            // While editing a settings value OR previewing an enum (5b), Esc
-            // cancels that instead of quitting / blurring chat.
+            // Esc only closes or cancels (a settings edit / enum preview, a chat
+            // generation, the chat input focus); it never quits. With nothing to
+            // cancel it does nothing. Help and the y/n modals are handled above.
             if app.tab == app::Tab::Settings
                 && (app.settings_edit.is_some() || app.settings_pending.is_some())
             {
@@ -266,11 +275,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             } else if app.chat.sending {
                 app.chat.request_abort();
             } else if chat_capturing {
-                // Only blur the chat input when the Chat tab is the one focused;
-                // on other tabs Esc quits as before.
                 app.chat.blur_input();
-            } else {
-                return true;
             }
         }
         KeyCode::Tab => app.next_tab(),
@@ -307,6 +312,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     // uncommitted enum preview (neither should linger off-tab).
                     app.confirm_reset_all = false;
                     app.settings_pending = None;
+                }
+                if tab != app::Tab::Dashboard {
+                    // Likewise a pending serve stop/restart confirm.
+                    app.confirm_serve = None;
                 }
                 app.tab = tab;
             }
@@ -443,5 +452,101 @@ mod tests {
         );
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!(app.settings_selected, 0, "scroll up retreats it");
+    }
+    #[test]
+    fn esc_never_quits_on_any_non_chat_tab() {
+        for tab in [
+            Tab::Home,
+            Tab::Dashboard,
+            Tab::Models,
+            Tab::Settings,
+            Tab::System,
+            Tab::Logs,
+        ] {
+            let mut app = test_app();
+            app.tab = tab;
+            app.settings_edit = None;
+            app.settings_pending = None;
+            assert!(
+                !handle_key(&mut app, k(KeyCode::Esc)),
+                "Esc quit on {tab:?}"
+            );
+            assert_eq!(app.tab, tab);
+        }
+    }
+
+    #[test]
+    fn dashboard_restart_then_n_starts_no_serve_command() {
+        let mut app = test_app();
+        app.tab = Tab::Dashboard;
+        assert!(!handle_key(&mut app, k(KeyCode::Char('R'))));
+        assert!(app.confirm_serve.is_some(), "R arms the confirm");
+        assert!(!app.serve_cmd_running(), "arming starts nothing");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('n'))));
+        assert!(app.confirm_serve.is_none());
+        assert!(!app.serve_cmd_running(), "n starts no serve command");
+        assert!(app.serve_cmd_label.is_empty());
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn dashboard_stop_then_y_starts_the_stop_command() {
+        let mut app = test_app();
+        app.tab = Tab::Dashboard;
+        handle_key(&mut app, k(KeyCode::Char('x')));
+        assert!(app.confirm_serve.is_some());
+        assert!(!app.serve_cmd_running(), "x alone runs nothing");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('y'))));
+        assert!(app.confirm_serve.is_none());
+        assert!(app.serve_cmd_running(), "y runs the stop command");
+        assert_eq!(app.serve_cmd_label, "stop");
+    }
+
+    #[test]
+    fn armed_serve_confirm_is_modal_and_disarms_on_tab_leave() {
+        let mut app = test_app();
+        app.tab = Tab::Dashboard;
+        handle_key(&mut app, k(KeyCode::Char('R')));
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q must not quit"
+        );
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('r'))),
+            "r must not reload"
+        );
+        assert!(!handle_key(&mut app, k(KeyCode::Char('?'))));
+        assert!(!app.show_help, "? must not open help while armed");
+        handle_key(&mut app, k(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Dashboard, "Tab is swallowed while armed");
+        assert!(app.confirm_serve.is_some(), "still armed after stray keys");
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Esc)),
+            "Esc cancels, never quits"
+        );
+        assert!(app.confirm_serve.is_none());
+
+        // Leaving by Tab or mouse disarms.
+        handle_key(&mut app, k(KeyCode::Char('x')));
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Stop);
+        app.next_tab();
+        assert!(app.confirm_serve.is_none(), "Tab disarms");
+        app.tab = Tab::Dashboard;
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Restart);
+        app.tab_row_y = 3;
+        app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+        );
+        assert_eq!(app.tab, Tab::Home);
+        assert!(app.confirm_serve.is_none(), "mouse tab switch disarms");
+        app.tab = Tab::Dashboard;
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Restart);
+        app.prev_tab();
+        assert!(app.confirm_serve.is_none(), "BackTab disarms");
     }
 }

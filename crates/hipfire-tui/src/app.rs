@@ -173,6 +173,10 @@ pub struct App {
     /// Single-key reset is reversible so it commits immediately; wiping the whole
     /// file is gated behind this prompt (mirrors the Models delete-confirm modal).
     pub confirm_reset_all: bool,
+    /// Dashboard tab: a stop/restart y/n confirmation is armed for this action.
+    /// Stop and restart are destructive (`R` force-reaps this install's serve
+    /// daemons), so they wait for an explicit y; `s` start stays immediate.
+    pub confirm_serve: Option<ServeAction>,
     /// Text staged by Chat `/copy` for the event loop to emit to the terminal
     /// clipboard (OSC52) after the next render; cleared once emitted.
     pub pending_clipboard: Option<String>,
@@ -236,6 +240,7 @@ impl App {
             rm_cmd: None,
             confirm_delete: None,
             confirm_reset_all: false,
+            confirm_serve: None,
             pending_clipboard: None,
             request_log: Vec::new(),
             doctor_cmd: None,
@@ -408,12 +413,37 @@ impl App {
 
     /// Dashboard-tab keys: serve lifecycle controls.
     fn handle_dashboard_key(&mut self, key: KeyEvent) {
+        // An armed stop/restart confirm is modal: only y / n / Esc act.
+        if let Some(action) = self.confirm_serve {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_serve = None;
+                    self.start_serve_command(action);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_serve = None;
+                    self.toast_info("cancelled");
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char('s') => self.start_serve_command(ServeAction::Start),
-            KeyCode::Char('x') => self.start_serve_command(ServeAction::Stop),
-            KeyCode::Char('R') => self.start_serve_command(ServeAction::Restart),
+            KeyCode::Char('x') => self.arm_serve_confirm(ServeAction::Stop),
+            KeyCode::Char('R') => self.arm_serve_confirm(ServeAction::Restart),
             _ => {}
         }
+    }
+
+    /// Arm the y/n confirm for a stop/restart (unless one is already running).
+    fn arm_serve_confirm(&mut self, action: ServeAction) {
+        if self.serve_cmd.is_some() {
+            self.toast_info("a serve command is already running");
+            return;
+        }
+        self.toast = None;
+        self.confirm_serve = Some(action);
     }
 
     /// Test seam: inject an in-flight serve-command receiver without spawning a
@@ -529,14 +559,17 @@ impl App {
     }
 
     pub fn next_tab(&mut self) {
-        // Leaving Settings discards an uncommitted enum preview (5b).
+        // Leaving Settings discards an uncommitted enum preview (5b); leaving
+        // the Dashboard disarms a pending stop/restart confirm.
         self.settings_pending = None;
+        self.confirm_serve = None;
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = Tab::ALL[(idx + 1) % Tab::ALL.len()];
     }
 
     pub fn prev_tab(&mut self) {
         self.settings_pending = None;
+        self.confirm_serve = None;
         let idx = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
         self.tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
     }

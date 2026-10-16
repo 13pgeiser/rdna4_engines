@@ -18,6 +18,7 @@ use crate::{
     hipfire::knobs,
     hipfire::metrics::MetricsView,
     hipfire::registry::ModelListItem,
+    hipfire::serve_ctrl::ServeAction,
 };
 
 const BG: Color = Color::Rgb(7, 7, 9);
@@ -66,8 +67,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Centered modal listing the global + active-tab keybindings. Dismissed by any
-/// key (handled in main::handle_key). Reuses `footer_hints` for the per-tab line
-/// so there is a single source of truth for tab keys.
+/// key (handled in main::handle_key). Reuses `footer_segments` for the per-tab
+/// lines so there is a single source of truth for tab keys.
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -75,7 +76,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from("  Tab / Shift+Tab  switch tabs"),
-        Line::from("  ?                toggle this help"),
+        Line::from("  ?                toggle this help (in Chat: Esc first)"),
+        Line::from("  Esc              close / cancel (never quits)"),
         Line::from("  r                refresh live data"),
         Line::from("  q                quit"),
         Line::from("  mouse            click a tab · scroll to move in a list"),
@@ -87,13 +89,22 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     ];
     // The active-tab keys, one per line — keeps each short so nothing wraps and
     // clips inside the modal, and makes the line count (hence height) exact. The
-    // globally-listed keys (Tab/Shift+Tab, q) are skipped to avoid duplication.
-    for part in footer_hints(app).split('·') {
+    // globally-listed keys (Tab/Shift+Tab, ?, r, q) are skipped to avoid
+    // duplication.
+    for part in footer_segments(app) {
         let part = part.trim();
-        if part.is_empty() || part.starts_with("Tab/Shift+Tab") || part == "q quit" {
+        if part.is_empty()
+            || part.starts_with("Tab/Shift+Tab")
+            || part == "q quit"
+            || part == "r refresh"
+            || part.contains("? help")
+        {
             continue;
         }
         lines.push(Line::from(format!("  {part}")));
+    }
+    if app.tab == Tab::Dashboard {
+        lines.push(Line::from("  x / R ask y / n first; R force-reaps serve"));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -191,57 +202,211 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
-/// the global `Tab/Shift+Tab switch · q quit` suffix is appended for non-edit
-/// states. Kept here (not in App) so the hint text lives next to the renderer.
-fn footer_hints(app: &App) -> String {
-    let global = "Tab/Shift+Tab switch · q quit";
+/// Separator between footer segments.
+const FOOTER_SEP: &str = " · ";
+
+/// What the footer shows for the current tab/state: an ordered list of whole
+/// segments, highest priority first. [`fit_segments`] drops the ones that do not
+/// fit the footer width (never cutting one mid-word), so list order IS priority
+/// order: put the keys that matter most (and `? help`) near the front. Other
+/// slices extend a tab by inserting one segment into its arm.
+///
+/// Segments must not contain the ` · ` separator themselves.
+fn footer_segments(app: &App) -> Vec<String> {
+    fn segs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
     match app.tab {
-        Tab::Home => format!("r refresh · {global}"),
+        Tab::Home => segs(&["? help", "r refresh", "Tab/Shift+Tab switch", "q quit"]),
         Tab::Dashboard => {
-            if app.serve_cmd_running() {
-                format!("serve {}\u{2026} · {global}", app.serve_cmd_label)
+            if let Some(action) = app.confirm_serve {
+                vec![serve_confirm_prompt(action).to_string()]
+            } else if app.serve_cmd_running() {
+                vec![
+                    format!("serve {}\u{2026}", app.serve_cmd_label),
+                    "? help".to_string(),
+                    "Tab/Shift+Tab switch".to_string(),
+                    "q quit".to_string(),
+                ]
             } else {
-                format!("s start · x stop · R restart · r refresh · {global}")
+                segs(&[
+                    "s start",
+                    "x stop",
+                    "R restart",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::Chat => {
-            // Chat owns q/r as text input, so it has its own exit hints.
-            "Enter send (/help for commands) · Ctrl+O newline · Up/Down scroll · Esc stop / blur"
-                .to_string()
+            // Chat owns q/r/? as text input while the input is focused, so help
+            // is reached via Esc (blur) first.
+            if app.chat.sending {
+                segs(&["Esc stop reply", "Up/Down scroll"])
+            } else if app.chat.is_input_focused() {
+                segs(&[
+                    "Enter send",
+                    "Esc then ? help",
+                    "Ctrl+O newline",
+                    "Up/Down scroll",
+                    "/help commands",
+                    "Esc stop / blur",
+                ])
+            } else {
+                segs(&[
+                    "Enter send",
+                    "? help",
+                    "Up/Down scroll",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
+            }
         }
         Tab::Models => {
             if app.confirm_delete.is_some() {
-                "Delete this model?  y confirm · n / Esc cancel".to_string()
+                segs(&["Delete this model?", "y confirm", "n / Esc cancel"])
             } else {
-                format!(
-                    "Up/Down select · Enter open/expand · p pull · d delete · r refresh · {global}"
-                )
+                segs(&[
+                    "Up/Down select",
+                    "Enter open/expand",
+                    "p pull",
+                    "d delete",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::Settings => {
             if app.confirm_reset_all {
-                "Reset ALL settings to defaults?  y confirm · n / Esc cancel".to_string()
+                segs(&[
+                    "Reset ALL settings to defaults?",
+                    "y confirm",
+                    "n / Esc cancel",
+                ])
             } else if app.settings_pending.is_some() {
-                "Preview: Left/Right/Space change · Enter commit · Esc cancel".to_string()
+                segs(&[
+                    "Preview: Left/Right/Space change",
+                    "Enter commit",
+                    "Esc cancel",
+                ])
             } else if app.settings_edit.is_some() {
-                "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
+                segs(&[
+                    "Editing: type value",
+                    "Enter save",
+                    "Backspace delete",
+                    "Esc cancel",
+                ])
             } else {
-                format!("e easy · a advanced · Up/Down select · Left/Right/Space change · Enter commit/edit · Del reset · R reset-all · r refresh · {global}")
+                segs(&[
+                    "e easy",
+                    "a advanced",
+                    "? help",
+                    "Up/Down select",
+                    "Enter commit/edit",
+                    "Left/Right/Space change",
+                    "Del reset",
+                    "R reset-all",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::System => {
             if app.doctor_running() {
-                format!("doctor running… · live diagnostics · r refresh · {global}")
+                segs(&[
+                    "doctor running\u{2026}",
+                    "? help",
+                    "live diagnostics",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
-                format!("d doctor · live diagnostics (auto ~1.5s) · r refresh · {global}")
+                segs(&[
+                    "d doctor",
+                    "? help",
+                    "live diagnostics (auto ~1.5s)",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
-        Tab::Logs => format!("serve.log tail (auto ~1s) · r refresh · {global}"),
+        Tab::Logs => segs(&[
+            "? help",
+            "serve.log tail (auto ~1s)",
+            "r refresh",
+            "Tab/Shift+Tab switch",
+            "q quit",
+        ]),
     }
 }
 
+/// Prompt shown while a Dashboard stop/restart confirm is armed.
+fn serve_confirm_prompt(action: ServeAction) -> &'static str {
+    match action {
+        ServeAction::Restart => {
+            "Restart runs `hipfire stop --force` (force-reaps this install's serve daemons), then starts serve. y / n"
+        }
+        _ => "Stop hipfire serve? y / n",
+    }
+}
+
+/// Display width of `s` in terminal columns (all footer text is single-width).
+fn text_cols(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Join the leading-priority segments that fit in `width` columns, keeping list
+/// order and skipping (not cutting) any segment that does not fit.
+fn fit_segments(segs: &[String], width: usize) -> String {
+    let mut out = String::new();
+    for seg in segs {
+        let extra = if out.is_empty() {
+            text_cols(seg)
+        } else {
+            text_cols(FOOTER_SEP) + text_cols(seg)
+        };
+        if text_cols(&out) + extra <= width {
+            if !out.is_empty() {
+                out.push_str(FOOTER_SEP);
+            }
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
+/// The footer's hint text for `width` columns plus the status text, which is
+/// `Some` only when it fits entirely in the room left after the hints.
+fn footer_text(app: &App, width: u16) -> (String, Option<String>) {
+    let width = width as usize;
+    let hints = fit_segments(&footer_segments(app), width);
+    let gap = "    ";
+    let status = (!app.last_reload.is_empty()
+        && text_cols(&hints) + text_cols(gap) + text_cols(&app.last_reload) <= width)
+        .then(|| format!("{gap}{}", app.last_reload));
+    (hints, status)
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // An armed serve stop/restart confirm owns the whole footer (wrapped over
+    // both rows) and outranks any toast, so the prompt cannot be hidden.
+    if let (Tab::Dashboard, Some(action)) = (app.tab, app.confirm_serve) {
+        frame.render_widget(
+            Paragraph::new(serve_confirm_prompt(action))
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(YELLOW).bg(BG)),
+            area,
+        );
+        return;
+    }
+
     // A live toast takes over the footer line entirely (colored by severity);
     // otherwise show the per-tab hints + the last persistent status line.
     if let Some(toast) = &app.toast {
@@ -266,15 +431,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let (hints, status) = footer_text(app, area.width);
+    let mut spans = vec![Span::styled(hints, Style::default().fg(MUTED))];
+    if let Some(status) = status {
+        spans.push(Span::styled(status, Style::default().fg(Color::DarkGray)));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(footer_hints(app), Style::default().fg(MUTED)),
-            Span::styled(
-                format!("    {}", app.last_reload),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-        .style(Style::default().bg(BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
     );
 }
@@ -284,13 +447,9 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(pad(area, 1, 0));
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(8)])
-        .split(cols[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(6)])
+        .constraints([Constraint::Min(8), Constraint::Length(7)])
         .split(cols[1]);
 
     let serve_color = if app.status.serve_http_ok {
@@ -300,55 +459,79 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         RED
     };
-    let mut status = vec![
-        Line::from(vec![
-            Span::raw("Serve      "),
-            Span::styled(app.status.serve_label(), Style::default().fg(serve_color)),
-        ]),
-        Line::from(format!(
-            "Endpoint   {}:{}",
-            app.config.probe_host(),
-            app.config.port
-        )),
-        Line::from(format!(
-            "PID        {}",
-            app.status
+    // Lines are laid out here to fit the card's inner width (long values keep
+    // their tail, long warnings wrap under their label), so the card height is
+    // exactly the line count and nothing is cut off at the bottom.
+    let inner_w = (cols[0].width as usize).saturating_sub(2);
+    let plain = Style::default();
+    let mut status = wrap_labeled(
+        "Serve      ",
+        &app.status.serve_label(),
+        inner_w,
+        Style::default().fg(serve_color),
+    );
+    status.extend([
+        fit_line(
+            "Endpoint   ",
+            &format!("{}:{}", app.config.probe_host(), app.config.port),
+            inner_w,
+            plain,
+        ),
+        fit_line(
+            "PID        ",
+            &app.status
                 .serve_pid
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into())
-        )),
-        Line::from(format!("Active     {}", app.active_model)),
-        Line::from(format!(
-            "Config     {} ({})",
-            app.config.default_model,
-            if app.config.loaded_from_disk {
-                "custom"
-            } else {
-                "defaults"
-            }
-        )),
-        Line::from(format!(
-            "Overrides  {} model overlays",
-            app.config.per_model_count
-        )),
-        Line::from(format!(
-            "Models     {} local / {} registry",
-            app.registry.local_files.len(),
-            app.registry.models.len()
-        )),
-    ];
-    if let Some(warning) = &app.config.warning {
-        status.push(Line::from(vec![
-            Span::styled("Config     ", Style::default().fg(YELLOW)),
-            Span::styled(warning.clone(), Style::default().fg(YELLOW)),
-        ]));
+                .unwrap_or_else(|| "-".into()),
+            inner_w,
+            plain,
+        ),
+        fit_line("Active     ", &app.active_model, inner_w, plain),
+        fit_line(
+            "Config     ",
+            &format!(
+                "{} · {} overlays",
+                if app.config.loaded_from_disk {
+                    "custom"
+                } else {
+                    "defaults"
+                },
+                app.config.per_model_count
+            ),
+            inner_w,
+            plain,
+        ),
+        fit_line(
+            "Models     ",
+            &format!(
+                "{} local / {} registry",
+                app.registry.local_files.len(),
+                app.registry.models.len()
+            ),
+            inner_w,
+            plain,
+        ),
+    ]);
+    // Warnings wrap but are capped at two rows each so they cannot push the
+    // Tabs list off a short terminal (the full text lives on Settings / Models).
+    let warn = Style::default().fg(YELLOW);
+    for (label, warning) in [
+        ("Config     ", &app.config.warning),
+        ("Registry   ", &app.registry.warning),
+    ] {
+        if let Some(warning) = warning {
+            let mut rows = wrap_labeled(label, warning, inner_w, warn);
+            rows.truncate(2);
+            status.extend(rows);
+        }
     }
-    if let Some(warning) = &app.registry.warning {
-        status.push(Line::from(vec![
-            Span::styled("Registry   ", Style::default().fg(YELLOW)),
-            Span::styled(warning.clone(), Style::default().fg(YELLOW)),
-        ]));
-    }
+    // Size the Runtime card from its line count (+2 borders); the Tabs list
+    // takes whatever height is left.
+    let runtime_h = (status.len() as u16).saturating_add(2);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(runtime_h), Constraint::Min(0)])
+        .split(cols[0]);
     frame.render_widget(card("Runtime", status), left[0]);
 
     let actions = vec![
@@ -356,11 +539,11 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         ListItem::new("Chat — stream a conversation through your local serve."),
         ListItem::new("Models — browse the registry and your downloads."),
         ListItem::new("Settings — edit config (easy/advanced); persists to ~/.hipfire."),
-        ListItem::new("System — GPU, HIP, kernel cache, and path checks."),
+        ListItem::new("System / Logs — GPU, HIP, path checks; serve.log tail."),
     ];
     frame.render_widget(
         List::new(actions)
-            .block(block("Tabs  (Tab / Shift+Tab to switch)"))
+            .block(block("Tabs  (Tab / Shift+Tab, ? help)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         left[1],
     );
@@ -374,12 +557,9 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("2. Start serving  ·  hipfire serve -d"),
         Line::from("3. Chat           ·  open the Chat tab and type"),
         Line::from(""),
+        Line::from("Press ? on any tab for its keys."),
         Line::from(Span::styled(
-            "Everything here reads your live local state and the",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            "running daemon — edits persist to ~/.hipfire.",
+            "(in Chat, press Esc first)",
             Style::default().fg(MUTED),
         )),
     ]);
@@ -393,10 +573,9 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 
     let keys = vec![
         Row::new(["Tab / Shift+Tab", "switch tabs"]),
-        Row::new(["\u{2191}  \u{2193}", "move within a tab"]),
-        Row::new(["Enter", "select / send"]),
-        Row::new(["r", "refresh live data"]),
-        Row::new(["q", "quit"]),
+        Row::new(["\u{2191}  \u{2193} · Enter", "move · select / send"]),
+        Row::new(["?", "help for this tab"]),
+        Row::new(["r · q", "refresh · quit"]),
     ];
     frame.render_widget(
         Table::new(keys, [Constraint::Length(16), Constraint::Min(20)])
@@ -1509,6 +1688,47 @@ fn probe_line(label: &str, probe: &crate::hipfire::dashboard::Probe) -> Line<'st
     ])
 }
 
+/// `label` + `value` on one row `width` columns wide. An over-long value keeps
+/// its tail (`…` prefix), which is the informative end of a path or tag.
+fn fit_line(label: &str, value: &str, width: usize, style: Style) -> Line<'static> {
+    let room = width.saturating_sub(label.chars().count()).max(1);
+    let n = value.chars().count();
+    let shown: String = if n <= room {
+        value.to_string()
+    } else {
+        let tail: String = value.chars().skip(n - (room - 1)).collect();
+        format!("\u{2026}{tail}")
+    };
+    Line::from(vec![
+        Span::raw(label.to_string()),
+        Span::styled(shown, style),
+    ])
+}
+
+/// `label` + `value` wrapped to `width` columns, continuation rows indented
+/// under the value, so the returned line count is the exact rendered height.
+fn wrap_labeled(label: &str, value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = label.chars().count();
+    let room = width.saturating_sub(indent).max(1);
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = Vec::new();
+    for (i, chunk) in chars.chunks(room).enumerate() {
+        let lead = if i == 0 {
+            label.to_string()
+        } else {
+            " ".repeat(indent)
+        };
+        out.push(Line::from(vec![
+            Span::styled(lead, style),
+            Span::styled(chunk.iter().collect::<String>(), style),
+        ]));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(label.to_string(), style)));
+    }
+    out
+}
+
 fn card(title: &str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
     Paragraph::new(lines)
         .block(block(title))
@@ -2476,5 +2696,168 @@ mod render_tests {
             text.contains("last 2 lines"),
             "title reflects the line count"
         );
+    }
+    /// Render at `w`x`h` and return each buffer row as a string.
+    fn render_rows(w: u16, h: u16, setup: impl FnOnce(&mut App)) -> Vec<String> {
+        let mut app = App::load().expect("App::load");
+        setup(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The footer's first row (the hints row) of a render.
+    fn footer_row(rows: &[String]) -> String {
+        rows[rows.len() - 2].trim_end().to_string()
+    }
+
+    #[test]
+    fn footers_fit_whole_segments_and_advertise_help_at_80x24() {
+        let mut checked = 0;
+        for tab in Tab::ALL {
+            let mut segs = Vec::new();
+            let rows = render_rows(80, 24, |app| {
+                app.tab = tab;
+                app.last_reload.clear();
+                segs = footer_segments(app);
+            });
+            let row = footer_row(&rows);
+            assert!(
+                row.contains("? help"),
+                "{tab:?} footer advertises help: {row:?}"
+            );
+            assert!(
+                row.chars().count() <= 80,
+                "{tab:?} footer fits the width: {row:?}"
+            );
+            for part in row.split(FOOTER_SEP) {
+                assert!(
+                    segs.iter().any(|s| s == part),
+                    "{tab:?} footer piece {part:?} is not a whole segment of {segs:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, Tab::ALL.len());
+    }
+
+    #[test]
+    fn chat_footer_variant_advertises_help_via_esc() {
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Chat;
+            app.chat.focus_input();
+            app.last_reload.clear();
+        });
+        assert!(footer_row(&rows).contains("Esc then ? help"));
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Chat;
+            app.chat.blur_input();
+            app.last_reload.clear();
+        });
+        assert!(footer_row(&rows).contains("? help"));
+    }
+
+    #[test]
+    fn footer_status_text_only_appears_when_it_fits() {
+        let status = "STATUS-MARKER reloaded config";
+        let wide = render_rows(160, 48, |app| {
+            app.tab = Tab::Dashboard;
+            app.last_reload = status.into();
+        });
+        let row = footer_row(&wide);
+        let help = row.find("? help").expect("hints present");
+        let at = row.find(status).expect("status renders when room remains");
+        assert!(at > help, "status comes after the hints: {row:?}");
+
+        let narrow = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.last_reload = status.into();
+        });
+        assert!(
+            !footer_row(&narrow).contains("STATUS-MARKER"),
+            "status is dropped, never cut, when the hints use the width"
+        );
+    }
+
+    #[test]
+    fn segments_are_dropped_not_cut() {
+        let segs: Vec<String> = ["alpha one", "beta", "gamma three"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(fit_segments(&segs, 80), "alpha one · beta · gamma three");
+        assert_eq!(fit_segments(&segs, 14), "alpha one");
+        assert_eq!(fit_segments(&segs, 18), "alpha one · beta");
+        // A later, shorter segment still fits after a long one is skipped.
+        let mixed: Vec<String> = ["alpha one", "a long segment here", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(fit_segments(&mixed, 16), "alpha one · b");
+        assert_eq!(fit_segments(&segs, 0), "");
+    }
+
+    #[test]
+    fn serve_confirm_prompts_render_in_footer() {
+        use crate::hipfire::serve_ctrl::ServeAction;
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.confirm_serve = Some(ServeAction::Stop);
+        });
+        assert!(footer_row(&rows).contains("Stop hipfire serve? y / n"));
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.confirm_serve = Some(ServeAction::Restart);
+        });
+        let both = format!("{} {}", rows[22], rows[23]);
+        assert!(both.contains("hipfire stop --force"), "{both:?}");
+        assert!(both.contains("force-reaps"), "{both:?}");
+        assert!(both.contains("y / n"), "{both:?}");
+    }
+
+    #[test]
+    fn home_lists_logs_and_shows_runtime_models_and_registry_lines() {
+        for (w, h) in [(80u16, 24u16), (160, 48)] {
+            let rows = render_rows(w, h, |app| {
+                app.tab = Tab::Home;
+                app.registry.warning = Some("registry note".into());
+            });
+            let text = rows.join("\n");
+            assert!(text.contains("Logs"), "{w}x{h}: Home tab list names Logs");
+            assert!(
+                text.contains("Models     "),
+                "{w}x{h}: Runtime Models line visible"
+            );
+            assert!(
+                text.contains("Registry   "),
+                "{w}x{h}: Runtime Registry line visible"
+            );
+            assert!(
+                text.contains("? help") || text.contains("? help for"),
+                "{w}x{h}: Home mentions ? help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_documents_esc_confirms_and_help_key() {
+        let text = render_rows(80, 30, |app| {
+            app.tab = Tab::Dashboard;
+            app.show_help = true;
+        })
+        .join("\n");
+        assert!(text.contains("close / cancel"), "Esc is close / cancel");
+        assert!(!text.contains("Esc              quit"));
+        assert!(text.contains("ask y / n"), "x / R confirms are documented");
+        assert!(text.contains("this help"), "? is documented");
     }
 }
