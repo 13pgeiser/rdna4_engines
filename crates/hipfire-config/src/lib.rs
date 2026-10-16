@@ -257,6 +257,16 @@ impl ConfigValue {
         }
     }
 
+    /// Render as a TOML scalar (`"q8"`, `4096`, `true`, `0.42`), the form a
+    /// user would see in `config.toml`. `Null` has no TOML form and renders as
+    /// `null`.
+    pub fn to_toml_string(&self) -> String {
+        match self.clone().into_toml() {
+            Some(value) => value.to_string(),
+            None => "null".to_owned(),
+        }
+    }
+
     fn from_toml(value: &toml::Value) -> Option<Self> {
         match value {
             toml::Value::Boolean(v) => Some(Self::Bool(*v)),
@@ -5833,17 +5843,64 @@ pub fn load_config_profile(paths: &ConfigPaths, name: &str) -> Result<ConfigLaye
     load_toml_layer(&path)
 }
 
-/// Replace `layer` entirely with the selected profile contents.
+/// Merge the selected profile into `layer`.
 ///
-/// Selection is a deterministic full cutover of the sparse global config: every
-/// previous override is discarded and only the profile layer remains.
+/// Every key the profile sets is written to `layer`, overwriting that key's
+/// previous value. Every key the profile does not set is left untouched, so
+/// applying a profile never drops unrelated global overrides (devices, ports,
+/// default model, kernel flags, ...). Returns the number of keys the profile
+/// sets. On error `layer` is unchanged.
 pub fn apply_config_profile(
     layer: &mut ConfigLayer,
     paths: &ConfigPaths,
     name: &str,
-) -> Result<()> {
-    *layer = load_config_profile(paths, name)?;
-    Ok(())
+) -> Result<usize> {
+    let profile = load_config_profile(paths, name)?;
+    let count = profile.values.len();
+    layer.values.extend(profile.values);
+    Ok(count)
+}
+
+/// Key-level difference between two layers, in key order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigLayerDiff {
+    /// Keys present only in the new layer: `(key, new)`.
+    pub added: Vec<(String, ConfigValue)>,
+    /// Keys present in both with different values: `(key, old, new)`.
+    pub changed: Vec<(String, ConfigValue, ConfigValue)>,
+    /// Keys present only in the old layer: `(key, old)`.
+    pub removed: Vec<(String, ConfigValue)>,
+}
+
+impl ConfigLayerDiff {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.added.len() + self.changed.len() + self.removed.len()
+    }
+}
+
+/// Compute what changing `old` into `new` adds, overwrites, and removes.
+pub fn diff_config_layers(old: &ConfigLayer, new: &ConfigLayer) -> ConfigLayerDiff {
+    let mut diff = ConfigLayerDiff::default();
+    for (key, value) in &new.values {
+        match old.values.get(key) {
+            None => diff.added.push((key.clone(), value.clone())),
+            Some(previous) if previous != value => {
+                diff.changed
+                    .push((key.clone(), previous.clone(), value.clone()))
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, value) in &old.values {
+        if !new.values.contains_key(key) {
+            diff.removed.push((key.clone(), value.clone()));
+        }
+    }
+    diff
 }
 
 /// Snapshot `layer` as a new custom profile. Fails when the name is a built-in,
@@ -5906,33 +5963,47 @@ pub fn list_config_profiles(paths: &ConfigPaths) -> Result<Vec<ConfigProfileEntr
     Ok(entries)
 }
 
-/// Detect which named profile, if any, exactly matches `layer`.
+/// Detect which named profile, if any, is currently applied to `layer`.
 ///
-/// Built-ins are checked first; custom profiles are matched by exact layer
-/// equality against files under `paths.profiles`.
+/// Profiles merge into the global layer, so a profile counts as applied when
+/// every key it sets is present and equal in `layer` (a subset match; extra
+/// keys in `layer` are fine). Empty profiles never match. When several
+/// profiles match, the one that sets the most keys wins; ties go to the
+/// earlier entry (built-ins first, then custom profiles sorted by name).
 pub fn detect_config_profile(paths: &ConfigPaths, layer: &ConfigLayer) -> Option<String> {
+    let applied = |profile: &ConfigLayer| {
+        !profile.values.is_empty()
+            && profile
+                .values
+                .iter()
+                .all(|(key, value)| layer.values.get(key) == Some(value))
+    };
+    let mut best: Option<(usize, String)> = None;
+    let mut consider = |name: &str, profile: &ConfigLayer| {
+        if !applied(profile) {
+            return;
+        }
+        let size = profile.values.len();
+        if best.as_ref().is_none_or(|(best_size, _)| size > *best_size) {
+            best = Some((size, name.to_owned()));
+        }
+    };
     for name in CONFIG_PROFILE_NAMES {
         if let Some(bundle) = builtin_config_profile_layer(name) {
-            if &bundle == layer {
-                return Some((*name).to_owned());
+            consider(name, &bundle);
+        }
+    }
+    if let Ok(entries) = list_config_profiles(paths) {
+        for entry in entries {
+            if entry.kind != ConfigProfileKind::Custom {
+                continue;
+            }
+            if let Ok(candidate) = load_config_profile(paths, &entry.name) {
+                consider(&entry.name, &candidate);
             }
         }
     }
-    let Ok(entries) = list_config_profiles(paths) else {
-        return None;
-    };
-    for entry in entries {
-        if entry.kind != ConfigProfileKind::Custom {
-            continue;
-        }
-        let Ok(candidate) = load_config_profile(paths, &entry.name) else {
-            continue;
-        };
-        if &candidate == layer {
-            return Some(entry.name);
-        }
-    }
-    None
+    best.map(|(_, name)| name)
 }
 
 fn builtin_config_profile_layer(name: &str) -> Option<ConfigLayer> {
@@ -5946,27 +6017,27 @@ fn builtin_config_profile_layer(name: &str) -> Option<ConfigLayer> {
     Some(layer)
 }
 
+/// Built-in profile contents.
+///
+/// The "default" bundle pins nothing that has a per-architecture, per-model, or
+/// registry-card default. Rule: a key is excluded when its schema field is
+/// `registry_allowed` (the registry recommendation may supply the value, e.g.
+/// `memory.kv_cache` resolves per arch, `speculation.dflash` per registry
+/// card). Pinning such a key here would shadow the card/arch default for every
+/// model. Dropped for that reason: `generation.max_tokens`, `reasoning.mode`,
+/// `reasoning.budget`, `reasoning.max_total_tokens`, `memory.kv_cache`,
+/// `memory.max_seq`, `attention.flash`, `prompt.normalize`,
+/// `prompt.default_chatml`, `speculation.mode`, `speculation.dflash`,
+/// `speculation.mtp`, `speculation.mtp_k`, `speculation.ngram`. What remains is
+/// process-level policy with one fixed default. Enforced by
+/// `default_profile_pins_nothing_registry_or_arch_resolved`.
 fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>> {
     Some(match name {
         "default" => vec![
-            ("generation.max_tokens", ConfigValue::Integer(4096)),
             ("generation.loop_guard_threshold", ConfigValue::Integer(0)),
             ("generation.loop_guard_window", ConfigValue::Integer(256)),
-            ("reasoning.mode", ConfigValue::String("on".to_owned())),
-            ("reasoning.budget", ConfigValue::String("xhigh".to_owned())),
-            ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
-            ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
-            ("memory.max_seq", ConfigValue::Integer(32768)),
             ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
             ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
-            ("attention.flash", ConfigValue::String("auto".to_owned())),
-            ("prompt.normalize", ConfigValue::Bool(true)),
-            ("prompt.default_chatml", ConfigValue::Bool(true)),
-            ("speculation.mode", ConfigValue::String("auto".to_owned())),
-            ("speculation.dflash", ConfigValue::String("off".to_owned())),
-            ("speculation.mtp", ConfigValue::String("auto".to_owned())),
-            ("speculation.mtp_k", ConfigValue::String("auto".to_owned())),
-            ("speculation.ngram", ConfigValue::String("off".to_owned())),
             ("serve.host", ConfigValue::String("127.0.0.1".to_owned())),
             ("serve.port", ConfigValue::Integer(11435)),
             ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
@@ -7337,14 +7408,11 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             Some(&ConfigValue::String("lloyd3".into()))
         );
 
-        // Default profile still authors only memory.kv_cache = q8, not K/V axes.
+        // Default profile authors no KV keys at all (kv_cache stays at auto).
         let default =
             load_config_profile(&ConfigPaths::under(temp_root("profile-kv-axes")), "default")
                 .unwrap();
-        assert_eq!(
-            default.get("memory.kv_cache"),
-            Some(&ConfigValue::String("q8".into()))
-        );
+        assert!(default.get("memory.kv_cache").is_none());
         assert!(default.get("memory.kv_k").is_none());
         assert!(default.get("memory.kv_v").is_none());
     }
@@ -7361,31 +7429,173 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn apply_config_profile_replaces_entire_sparse_layer() {
-        let root = temp_root("profile-replace");
+    fn apply_config_profile_merges_and_keeps_unrelated_keys() {
+        let root = temp_root("profile-merge");
         let paths = ConfigPaths::under(&root);
         let mut layer = ConfigLayer::default();
+        layer.set_cli("hardware.devices", "1,2").unwrap();
+        layer.set_cli("serve.port", "11527").unwrap();
+        layer.set_cli("serve.default_model", "qwen3.6:27b").unwrap();
+        layer.set_cli("kernel.prefill_batched", "false").unwrap();
+        layer.set_cli("memory.max_seq", "262144").unwrap();
         layer
             .set("generation.temperature", ConfigValue::Float(0.42))
             .unwrap();
         layer
             .set(
                 "developer.custom_experiment",
-                ConfigValue::String("drop-me".into()),
+                ConfigValue::String("keep-me".into()),
             )
             .unwrap();
+        let before = layer.clone();
 
-        apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        // "dev" overwrites kernel.prefill_batched and sets hardware.devices.
+        let count = apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        let dev = load_config_profile(&paths, "dev").unwrap();
+        assert_eq!(count, dev.values.len());
 
-        let expected = load_config_profile(&paths, "dev").unwrap();
-        assert_eq!(layer, expected);
-        assert!(layer.get("generation.temperature").is_none());
-        assert!(layer.get("developer.custom_experiment").is_none());
+        for (key, value) in &dev.values {
+            assert_eq!(layer.values.get(key), Some(value), "{key}");
+        }
+        for key in [
+            "serve.port",
+            "serve.default_model",
+            "memory.max_seq",
+            "generation.temperature",
+            "developer.custom_experiment",
+        ] {
+            assert_eq!(layer.values.get(key), before.values.get(key), "{key}");
+        }
+        assert_eq!(
+            layer.get("hardware.devices"),
+            Some(&ConfigValue::String("0".into())),
+            "profile key overwrites the old value"
+        );
+        assert_eq!(
+            layer.get("kernel.prefill_batched"),
+            Some(&ConfigValue::Bool(true))
+        );
+        assert_eq!(
+            layer.values.len(),
+            before.values.len() + dev.values.len() - 2,
+            "only hardware.devices and kernel.prefill_batched overlap"
+        );
         assert_eq!(
             detect_config_profile(&paths, &layer).as_deref(),
             Some("dev")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn default_profile_pins_nothing_registry_or_arch_resolved() {
+        let bundle = config_profile_bundle("default").unwrap();
+        assert!(!bundle.is_empty());
+        for (key, _) in &bundle {
+            let field = field(key).unwrap_or_else(|| panic!("{key} is not a schema field"));
+            assert!(
+                !field.registry_allowed,
+                "default profile pins registry-overridable key {key}"
+            );
+        }
+        let layer = builtin_config_profile_layer("default").unwrap();
+        assert!(layer.get("memory.kv_cache").is_none());
+        assert!(layer.get("speculation.dflash").is_none());
+    }
+
+    #[test]
+    fn detect_config_profile_matches_subsets_and_prefers_largest() {
+        let root = temp_root("profile-detect");
+        let paths = ConfigPaths::under(&root);
+
+        // Empty layer: nothing applied.
+        assert_eq!(detect_config_profile(&paths, &ConfigLayer::default()), None);
+
+        // Extra unrelated keys do not defeat a match.
+        let mut layer = ConfigLayer::default();
+        apply_config_profile(&mut layer, &paths, "redline").unwrap();
+        layer.set_cli("serve.port", "11527").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("redline")
+        );
+
+        // A profile whose key has a different value is not applied.
+        layer.set_cli("replay.transport", "aql").unwrap();
+        assert_eq!(detect_config_profile(&paths, &layer), None);
+
+        // hip and redline both set replay.backend; the layer holds hip's.
+        let mut layer = ConfigLayer::default();
+        apply_config_profile(&mut layer, &paths, "hip").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("hip")
+        );
+
+        // Most keys wins: dev (16 keys) over hip when both are subsets.
+        apply_config_profile(&mut layer, &paths, "dev").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("dev")
+        );
+
+        // Custom profile with more keys than every built-in subset wins; an
+        // empty custom profile never matches; ties keep list order.
+        let mut small = ConfigLayer::default();
+        small.set_cli("serve.port", "12000").unwrap();
+        create_config_profile(&paths, "aaa-empty", &ConfigLayer::default()).unwrap();
+        create_config_profile(&paths, "alpha", &small).unwrap();
+        create_config_profile(&paths, "beta", &small).unwrap();
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("serve.port", "12000").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("alpha")
+        );
+        let mut big = small.clone();
+        big.set_cli("serve.host", "0.0.0.0").unwrap();
+        create_config_profile(&paths, "big", &big).unwrap();
+        layer.set_cli("serve.host", "0.0.0.0").unwrap();
+        assert_eq!(
+            detect_config_profile(&paths, &layer).as_deref(),
+            Some("big")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diff_config_layers_reports_added_changed_removed_in_toml_form() {
+        let mut old = ConfigLayer::default();
+        old.set_cli("serve.port", "11527").unwrap();
+        old.set_cli("memory.kv_cache", "q8").unwrap();
+        old.set_cli("serve.local", "true").unwrap();
+        let mut new = old.clone();
+        new.set_cli("serve.port", "11435").unwrap();
+        new.set_cli("serve.host", "127.0.0.1").unwrap();
+        new.remove("serve.local").unwrap();
+        let diff = diff_config_layers(&old, &new);
+        assert_eq!(
+            diff.added,
+            vec![("serve.host".into(), ConfigValue::String("127.0.0.1".into()))]
+        );
+        assert_eq!(
+            diff.changed,
+            vec![(
+                "serve.port".into(),
+                ConfigValue::Integer(11527),
+                ConfigValue::Integer(11435)
+            )]
+        );
+        assert_eq!(
+            diff.removed,
+            vec![("serve.local".into(), ConfigValue::Bool(true))]
+        );
+        assert_eq!(diff.len(), 3);
+        assert!(diff_config_layers(&new, &new).is_empty());
+        assert_eq!(ConfigValue::String("q8".into()).to_toml_string(), "\"q8\"");
+        assert_eq!(ConfigValue::Integer(7).to_toml_string(), "7");
+        assert_eq!(ConfigValue::Bool(false).to_toml_string(), "false");
+        assert_eq!(ConfigValue::Float(0.42).to_toml_string(), "0.42");
     }
 
     #[test]

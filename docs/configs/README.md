@@ -24,8 +24,9 @@ hipfire config profile set dev       # docs/configs/developer.toml
 hipfire config profile set redline   # docs/configs/redline-pm4.toml
 ```
 
-`hipfire config profile set <name>` replaces the entire sparse global
-`config.toml` with the selected built-in or custom profile. Profile names are
+`hipfire config profile set <name>` merges the selected built-in or custom
+profile into the sparse global `config.toml`: its keys overwrite the same keys,
+every other key is kept. Profile names are
 control-plane identifiers only; they are never stored inside the TOML file.
 Snapshot the current global layer as a custom profile with:
 

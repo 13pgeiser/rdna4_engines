@@ -32,8 +32,16 @@ hipfire config profile create lab
 hipfire config profile              # interactive wizard
 ```
 
-Selection replaces the complete sparse global `config.toml` with the chosen
-built-in or custom profile layer (no stale keys remain). Custom snapshots live
+Selection **merges** the chosen built-in or custom profile into the global
+`config.toml`: every key the profile sets is written (overwriting that key's old
+value) and every other key (devices, ports, default model, kernel flags, ...) is
+kept. The `default` profile pins only process-level policy with a single fixed
+default (loop guard, prompt-cache size, `serve.*`); it never sets keys the
+registry card or the GPU architecture resolves on its own (`memory.kv_cache`,
+`memory.max_seq`, `speculation.*`, `reasoning.*`, `attention.flash`,
+`prompt.*`, `generation.max_tokens`), so those stay at auto. The profile wizard
+lists the changes and asks `y/n` before writing. A profile counts as applied
+when all its keys are present with the same values. Custom snapshots live
 under `~/.hipfire/profiles/<name>.toml`. Profile names are not schema fields and
 are never written into `config.toml`. The Settings TUI and CLI share the
 hipfire-config helpers. Profiles are global-only.

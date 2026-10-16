@@ -1427,9 +1427,12 @@ fn config_profile_command(paths: &Paths, action: Option<ConfigProfileAction>) ->
     match action {
         ConfigProfileAction::Set { name } => {
             let mut loaded = load_global(&paths.config)?;
-            apply_config_profile(&mut loaded.layer, &paths.config, &name)?;
+            let set = apply_config_profile(&mut loaded.layer, &paths.config, &name)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            println!("applied configuration profile '{name}'");
+            println!(
+                "applied configuration profile '{name}' (set {set} key{})",
+                if set == 1 { "" } else { "s" }
+            );
             if loaded.format == ConfigFormat::LegacyJson {
                 println!(
                     "migrated active configuration to {}; preserved {} as a rollback copy",
@@ -14579,7 +14582,7 @@ mod tests {
     }
 
     #[test]
-    fn config_profile_helpers_replace_layer_and_are_global_only() {
+    fn config_profile_helpers_merge_layer_and_are_global_only() {
         assert_eq!(CONFIG_PROFILE_NAMES, &["default", "dev", "hip", "redline"]);
         let root = env::temp_dir().join(format!("hipfire-cli-profile-{}", std::process::id()));
         let config_paths = ConfigPaths::under(&root);
@@ -14590,8 +14593,15 @@ mod tests {
                 hipfire_config::ConfigValue::Float(0.5),
             )
             .unwrap();
-        apply_config_profile(&mut layer, &config_paths, "redline").unwrap();
-        assert!(layer.get("generation.temperature").is_none());
+        let set = apply_config_profile(&mut layer, &config_paths, "redline").unwrap();
+        let redline = hipfire_config::load_config_profile(&config_paths, "redline").unwrap();
+        assert_eq!(set, redline.values.len());
+        assert_eq!(
+            layer.get("generation.temperature"),
+            Some(&hipfire_config::ConfigValue::Float(0.5)),
+            "profile merge keeps unrelated keys"
+        );
+        assert_eq!(layer.values.len(), redline.values.len() + 1);
         assert_eq!(
             layer.get("replay.backend"),
             Some(&hipfire_config::ConfigValue::String("redline".into()))
