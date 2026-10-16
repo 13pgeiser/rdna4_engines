@@ -244,13 +244,14 @@ fn footer_segments(app: &App) -> Vec<String> {
             // Chat owns q/r/? as text input while the input is focused, so help
             // is reached via Esc (blur) first.
             if app.chat.sending {
-                segs(&["Esc stop reply", "Up/Down scroll"])
+                segs(&["Esc stop reply", "Up/Down/PgUp/PgDn scroll", "End follow"])
             } else if app.chat.is_input_focused() {
                 segs(&[
                     "Enter send",
                     "Esc then ? help",
                     "Ctrl+O newline",
-                    "Up/Down scroll",
+                    "Up/Down/PgUp/PgDn scroll",
+                    "End follow",
                     "/help commands",
                     "Esc stop / blur",
                 ])
@@ -258,7 +259,8 @@ fn footer_segments(app: &App) -> Vec<String> {
                 segs(&[
                     "Enter send",
                     "? help",
-                    "Up/Down scroll",
+                    "Up/Down/PgUp/PgDn scroll",
+                    "End follow",
                     "Tab/Shift+Tab switch",
                     "q quit",
                 ])
@@ -877,6 +879,36 @@ fn fmt_uptime(secs: u64) -> String {
     }
 }
 
+/// Hard-wrap chat input to `width` display columns. Returns the rows to draw;
+/// the cursor sits at the end of the last row (a trailing newline, or a last
+/// row that exactly fills the width, yields a fresh empty row for it). Wrapping
+/// is by character (not word) so the cursor position is exact.
+fn wrap_input_rows(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut col = 0usize;
+    for c in input.chars() {
+        if c == '\n' {
+            rows.push(String::new());
+            col = 0;
+            continue;
+        }
+        let w = Span::raw(c.to_string()).width();
+        if col + w > width && col > 0 {
+            rows.push(String::new());
+            col = 0;
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push(c);
+        }
+        col += w;
+    }
+    if col >= width {
+        rows.push(String::new());
+    }
+    rows
+}
+
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -903,30 +935,81 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             comment: MUTED,
             fence: YELLOW,
         };
-        for msg in &app.chat.messages {
+        let thinking = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        for (idx, msg) in app.chat.messages.iter().enumerate() {
             let color = if msg.role == "user" { ACCENT } else { GREEN };
             lines.push(Line::from(Span::styled(
                 format!("{}:", msg.role),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
-            // Reasoning is rendered before content in the same bubble, preserving
-            // today's visual order (reasoning streamed first, then answer).
+            // Reasoning is rendered before content in the same bubble, in a
+            // muted italic style under a `thinking` label so it reads apart from
+            // the answer.
             if let Some(rc) = msg.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
-                lines.extend(crate::ui_chat::render_body(rc, &code_theme));
+                lines.push(Line::from(Span::styled(
+                    "thinking",
+                    thinking.add_modifier(Modifier::DIM),
+                )));
+                lines.extend(
+                    rc.lines()
+                        .map(|l| Line::from(Span::styled(l.to_string(), thinking))),
+                );
                 // Thin separator when both channels present.
                 if !msg.content.is_empty() {
                     lines.push(Line::from(""));
                 }
             }
             lines.extend(crate::ui_chat::render_body(&msg.content, &code_theme));
+            if app.chat.stopped.contains(&idx) {
+                lines.push(Line::from(Span::styled(
+                    "[stopped]",
+                    Style::default().fg(YELLOW).add_modifier(Modifier::DIM),
+                )));
+            }
             lines.push(Line::from(""));
         }
     }
+    if let Some(notice) = &app.chat.notice {
+        let dim = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
+        lines.extend(
+            notice
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), dim))),
+        );
+    }
+
+    // Scroll is measured from the bottom (0 = follow the newest output): measure
+    // the wrapped transcript at the current inner width, then offset from the end.
+    let transcript_block = block("Chat shell");
+    let inner = transcript_block.inner(chunks[0]);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = if inner.width == 0 {
+        0
+    } else {
+        para.line_count(inner.width)
+    };
+    let max_scroll = total
+        .saturating_sub(usize::from(inner.height))
+        .min(usize::from(u16::MAX)) as u16;
+    app.chat.view.set(Some(crate::app::ChatView {
+        viewport: inner.height,
+        max_scroll,
+    }));
+    let scroll = app.chat.scroll.min(max_scroll);
+    let transcript_block = if scroll > 0 {
+        transcript_block.title_bottom(
+            Line::from(Span::styled(
+                format!(" \u{2193} {scroll} more (End to follow) "),
+                Style::default().fg(YELLOW),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        transcript_block
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block("Chat shell"))
-            .scroll((app.chat.scroll, 0))
-            .wrap(Wrap { trim: false })
+        para.block(transcript_block)
+            .scroll((max_scroll - scroll, 0))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         chunks[0],
     );
@@ -945,15 +1028,37 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             extras.push(format!("top_p {p}"));
         }
         if let Some(s) = app.chat.last_stats {
-            extras.push(format!("{} tok @ {:.0} tok/s", s.tokens, s.tps));
+            let unit = s.unit();
+            extras.push(format!("{} {unit} @ {:.0} {unit}/s", s.tokens, s.tps));
         }
         format!("Input - {} - {}", app.chat.status, extras.join(" · "))
     };
-    let input = Paragraph::new(app.chat.input.as_str())
-        .block(block(&input_title))
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(TEXT).bg(PANEL_2));
+    let input_block = block(&input_title);
+    let input_inner = input_block.inner(chunks[1]);
+    // Pre-wrapped rows: show the tail so the cursor row is always visible.
+    let rows = wrap_input_rows(&app.chat.input, usize::from(input_inner.width));
+    let visible = usize::from(input_inner.height).max(1);
+    let first = rows.len().saturating_sub(visible);
+    let input = Paragraph::new(
+        rows[first..]
+            .iter()
+            .map(|r| Line::from(r.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .block(input_block)
+    .style(Style::default().fg(TEXT).bg(PANEL_2));
     frame.render_widget(input, chunks[1]);
+    if app.chat.is_input_focused()
+        && !app.show_help
+        && input_inner.width > 0
+        && input_inner.height > 0
+    {
+        let last = rows.len() - 1;
+        let col = Span::raw(rows[last].as_str()).width();
+        let x = input_inner.x + (col as u16).min(input_inner.width - 1);
+        let y = input_inner.y + (last - first) as u16;
+        frame.set_cursor_position((x, y));
+    }
 }
 
 fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
@@ -1611,8 +1716,13 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         for r in app.request_log.iter().take(8) {
             diagnostic_lines.push(Line::from(format!(
-                "{}  {} tok · {:.0} tok/s · {:.1}s",
-                r.model, r.tokens, r.tps, r.secs
+                "{}  {} {} · {:.0} {}/s · {:.1}s",
+                r.model,
+                r.tokens,
+                r.unit(),
+                r.tps,
+                r.unit(),
+                r.secs
             )));
         }
     }
@@ -2632,6 +2742,7 @@ mod render_tests {
                 tokens: 128,
                 tps: 151.0,
                 secs: 0.85,
+                exact: true,
             }];
         });
         assert!(
@@ -2859,5 +2970,245 @@ mod render_tests {
         assert!(!text.contains("Esc              quit"));
         assert!(text.contains("ask y / n"), "x / R confirms are documented");
         assert!(text.contains("this help"), "? is documented");
+    }
+
+    fn chat_key(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_tab_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    /// Draw `app` at `w`×`h`; return the flattened buffer text and the terminal
+    /// cursor position set by the frame.
+    fn draw_at(app: &mut App, w: u16, h: u16) -> (String, ratatui::layout::Position) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw must not panic");
+        let cursor = terminal.get_cursor_position().expect("cursor");
+        let buf = terminal.backend().buffer().clone();
+        (buf.content().iter().map(|c| c.symbol()).collect(), cursor)
+    }
+
+    fn msg(role: &str, content: &str) -> crate::hipfire::chat::ChatMessage {
+        crate::hipfire::chat::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
+
+    fn long_reply_app() -> App {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        let mut body: Vec<String> = (1..=40).map(|i| format!("line {i:02} xxxx")).collect();
+        body.push("END-OF-REPLY".into());
+        app.chat.messages = vec![msg("user", "go"), msg("assistant", &body.join("\n"))];
+        app
+    }
+
+    fn visible_lines(text: &str) -> Vec<usize> {
+        (1..=40)
+            .filter(|i| text.contains(&format!("line {i:02} x")))
+            .collect()
+    }
+
+    fn chat_follows_and_scrolls_from_bottom(w: u16, h: u16) {
+        let mut app = long_reply_app();
+        let (text, _) = draw_at(&mut app, w, h);
+        assert!(
+            text.contains("END-OF-REPLY"),
+            "{w}x{h}: newest output visible with no key presses"
+        );
+        assert!(
+            !text.contains("more (End to follow)"),
+            "no hint while following"
+        );
+        let before = visible_lines(&text);
+
+        for _ in 0..5 {
+            chat_key(&mut app, crossterm::event::KeyCode::Up);
+        }
+        assert_eq!(app.chat.scroll, 5, "Up scrolls toward older text");
+        let (scrolled, _) = draw_at(&mut app, w, h);
+        let after = visible_lines(&scrolled);
+        assert!(
+            after.first() < before.first(),
+            "{w}x{h}: an older line is visible after Up (before {before:?}, after {after:?})"
+        );
+        assert!(
+            !scrolled.contains("END-OF-REPLY"),
+            "{w}x{h}: end of reply scrolled out of view"
+        );
+        assert!(scrolled.contains("5 more (End to follow)"), "hint shown");
+
+        chat_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.chat.scroll, 4, "Down scrolls toward newer text");
+
+        chat_key(&mut app, crossterm::event::KeyCode::End);
+        assert_eq!(app.chat.scroll, 0);
+        let (followed, _) = draw_at(&mut app, w, h);
+        assert!(followed.contains("END-OF-REPLY"), "End resumes following");
+    }
+
+    #[test]
+    fn chat_scrolls_from_bottom_80x24() {
+        chat_follows_and_scrolls_from_bottom(80, 24);
+    }
+
+    #[test]
+    fn chat_scrolls_from_bottom_160x48() {
+        chat_follows_and_scrolls_from_bottom(160, 48);
+    }
+
+    #[test]
+    fn chat_scroll_clamps_pages_and_jumps_home() {
+        let mut app = long_reply_app();
+        let (_, _) = draw_at(&mut app, 80, 24);
+        let view = app.chat.view.get().expect("view recorded by draw");
+        assert!(view.max_scroll > 0 && view.viewport > 0);
+
+        for _ in 0..500 {
+            chat_key(&mut app, crossterm::event::KeyCode::Up);
+        }
+        assert_eq!(app.chat.scroll, view.max_scroll, "Up clamps at the top");
+        let (top, _) = draw_at(&mut app, 80, 24);
+        assert!(top.contains("line 01 x"), "oldest text visible at the top");
+
+        chat_key(&mut app, crossterm::event::KeyCode::PageDown);
+        assert_eq!(
+            app.chat.scroll,
+            view.max_scroll - view.viewport.min(view.max_scroll)
+        );
+        chat_key(&mut app, crossterm::event::KeyCode::End);
+        chat_key(&mut app, crossterm::event::KeyCode::PageUp);
+        assert_eq!(app.chat.scroll, view.viewport.min(view.max_scroll));
+        chat_key(&mut app, crossterm::event::KeyCode::Home);
+        assert_eq!(app.chat.scroll, view.max_scroll);
+    }
+
+    #[test]
+    fn chat_long_input_tail_and_cursor_visible() {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        app.chat.input = format!("{}END", "x".repeat(400));
+        let (text, cursor) = draw_at(&mut app, 80, 24);
+        assert!(text.contains("END"), "tail of a long input is visible");
+        // Input box: rows h-7..h-3 (footer takes the last 2), inner rows h-6..=h-4.
+        assert!(
+            (18..=20).contains(&cursor.y),
+            "cursor row {} inside the input box",
+            cursor.y
+        );
+        assert!(cursor.x >= 2 && cursor.x < 79, "cursor col {}", cursor.x);
+    }
+
+    #[test]
+    fn wrap_input_rows_places_cursor_row() {
+        assert_eq!(wrap_input_rows("abcdefgh", 4), vec!["abcd", "efgh", ""]);
+        assert_eq!(wrap_input_rows("ab\n", 4), vec!["ab", ""]);
+        assert_eq!(wrap_input_rows("", 4), vec![""]);
+    }
+
+    #[test]
+    fn chat_help_goes_to_transcript_not_input_title() {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![msg("user", "hi"), msg("assistant", "hello")];
+        app.chat.input = "/help".into();
+        chat_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.chat.messages.len(), 2, "help is not a message");
+        assert!(app.chat.input.is_empty());
+        assert!(
+            !app.chat.status.contains("/model"),
+            "status/input title carries no command list"
+        );
+        let (text, _) = draw_at(&mut app, 80, 24);
+        assert!(
+            text.contains("/regen"),
+            "help text rendered in the transcript"
+        );
+        assert!(text.contains("Commands"));
+        assert!(
+            !text.contains("/model · /system"),
+            "old one-line title is gone"
+        );
+    }
+
+    #[test]
+    fn chat_reasoning_is_labelled_and_styled_apart() {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            msg("user", "hi"),
+            crate::hipfire::chat::ChatMessage {
+                role: "assistant".into(),
+                content: "the answer".into(),
+                reasoning_content: Some("pondering".into()),
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("thinking"), "reasoning label shown");
+        let find = |needle: &str| {
+            buf.content()
+                .iter()
+                .enumerate()
+                .find(|(i, _)| {
+                    let start = *i;
+                    let w = needle.chars().count();
+                    start + w <= buf.content().len()
+                        && buf.content()[start..start + w]
+                            .iter()
+                            .map(|c| c.symbol())
+                            .collect::<String>()
+                            == needle
+                })
+                .map(|(_, c)| c.style())
+                .expect("needle on screen")
+        };
+        let think = find("pondering");
+        let answer = find("the answer");
+        assert!(think.add_modifier.contains(Modifier::ITALIC));
+        assert!(!answer.add_modifier.contains(Modifier::ITALIC));
+        assert_ne!(think.fg, answer.fg, "reasoning uses the muted colour");
+    }
+
+    #[test]
+    fn chat_abort_marks_stopped_in_transcript_only() {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![msg("user", "hi"), msg("assistant", "partial reply")];
+        app.chat.sending = true;
+        app.chat.request_abort();
+        assert!(!app.chat.sending);
+        assert_eq!(app.chat.messages[1].content, "partial reply");
+        assert!(!app.chat.messages[1].content.contains("[stopped]"));
+        let (text, _) = draw_at(&mut app, 80, 24);
+        assert!(text.contains("[stopped]"), "stopped marker rendered");
+    }
+
+    #[test]
+    fn chat_stats_label_is_honest_about_chunks() {
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Chat;
+        app.chat.last_stats = Some(crate::app::GenStats {
+            tokens: 7,
+            tps: 3.0,
+            exact: false,
+        });
+        let (text, _) = draw_at(&mut app, 160, 24);
+        assert!(text.contains("7 chunks @ 3 chunks/s"));
+        assert!(!text.contains("7 tok"));
+        app.chat.last_stats = Some(crate::app::GenStats {
+            tokens: 5,
+            tps: 2.0,
+            exact: true,
+        });
+        let (text, _) = draw_at(&mut app, 160, 24);
+        assert!(text.contains("5 tok @ 2 tok/s"));
     }
 }

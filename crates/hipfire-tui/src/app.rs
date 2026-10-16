@@ -3,6 +3,7 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
+    cell::Cell,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
@@ -678,11 +679,8 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
-        if self.chat.sending {
-            self.chat.status = "generation in progress".into();
-            return;
-        }
-
+        // Typing, Backspace, Ctrl+O and scrolling stay live while a reply
+        // streams; only Enter (send / command) is blocked until it finishes.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
             self.chat.input.push('\n');
             self.chat.focus_input();
@@ -690,6 +688,9 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Enter if self.chat.sending => {
+                self.chat.status = "generation in progress — Esc stops it".into();
+            }
             KeyCode::Enter => {
                 let input = self.chat.input.trim().to_string();
                 if input.is_empty() {
@@ -729,12 +730,13 @@ impl App {
                 self.chat.input.push(c);
                 self.chat.focus_input();
             }
-            KeyCode::Up => {
-                self.chat.scroll = self.chat.scroll.saturating_add(1);
-            }
-            KeyCode::Down => {
-                self.chat.scroll = self.chat.scroll.saturating_sub(1);
-            }
+            // Scroll is measured from the bottom: 0 follows the newest output.
+            KeyCode::Up => self.chat.scroll_by(1),
+            KeyCode::Down => self.chat.scroll_by(-1),
+            KeyCode::PageUp => self.chat.scroll_by(self.chat.page_rows()),
+            KeyCode::PageDown => self.chat.scroll_by(-self.chat.page_rows()),
+            KeyCode::Home => self.chat.scroll_to_top(),
+            KeyCode::End => self.chat.scroll = 0,
             _ => {}
         }
     }
@@ -756,6 +758,11 @@ impl App {
     /// regenerate (the user turn is already last). Applies the session system
     /// prompt + sampling overrides and resets per-generation stats.
     fn spawn_stream(&mut self) {
+        // Drop stale [stopped] marks (a /regen popped the reply they pointed at),
+        // dismiss any help note, and follow the new reply.
+        self.chat.prune_stopped();
+        self.chat.notice = None;
+        self.chat.scroll = 0;
         self.chat.messages.push(ChatMessage {
             role: "assistant".into(),
             content: String::new(),
@@ -766,6 +773,7 @@ impl App {
         self.chat.gen_start = Some(Instant::now());
         self.chat.gen_model = self.active_model.clone();
         self.chat.gen_tokens = 0;
+        self.chat.gen_usage = None;
         self.chat.last_stats = None;
 
         let (tx, rx) = mpsc::channel();
@@ -864,6 +872,7 @@ impl App {
             .messages
             .pop()
             .expect("tail validated as user turn");
+        self.chat.prune_stopped();
         self.chat.input = last.content;
         self.chat.reset_stats();
         self.chat.focus_input();
@@ -907,6 +916,7 @@ impl App {
                 tokens: stats.tokens,
                 tps: stats.tps,
                 secs,
+                exact: stats.exact,
             },
         );
         self.request_log.truncate(REQUEST_LOG_CAP);
@@ -991,6 +1001,8 @@ impl App {
             "top_p" => self.set_sampling(false, arg),
             "clear" => {
                 self.chat.messages.clear();
+                self.chat.stopped.clear();
+                self.chat.notice = None;
                 self.chat.scroll = 0;
                 self.chat.reset_stats();
                 self.chat.status = "conversation cleared".into();
@@ -1003,7 +1015,8 @@ impl App {
             "edit" => self.edit_last(),
             "copy" => self.copy_last(),
             "help" | "" => {
-                self.chat.status = "/model · /system · /temp · /top_p · /clear · /save · /load · /sessions · /delete · /regen · /edit · /copy".into();
+                self.chat.notice = Some(CHAT_HELP.to_string());
+                self.chat.scroll = 0;
             }
             other => self.toast_error(format!("unknown command: /{other} (try /help)")),
         }
@@ -1037,6 +1050,8 @@ impl App {
         match h.get(name) {
             Some(msgs) => {
                 self.chat.messages = msgs.to_vec();
+                self.chat.stopped.clear();
+                self.chat.notice = None;
                 self.chat.scroll = 0;
                 self.chat.reset_stats();
                 self.chat.status =
@@ -1578,6 +1593,9 @@ impl App {
                         }
                         self.chat.gen_tokens += 1;
                     }
+                    ChatEvent::Usage { completion_tokens } => {
+                        self.chat.gen_usage = Some(completion_tokens);
+                    }
                     ChatEvent::Done => {
                         // Normalize empty reasoning to None so serialization omits it.
                         if let Some(last) = self.chat.messages.last_mut() {
@@ -1628,12 +1646,34 @@ impl App {
     }
 }
 
-/// Throughput of one completed generation (≈ tokens counted from streamed
-/// deltas, over the wall-clock generation time).
+/// Help note shown in the Chat transcript by `/help` (never a message).
+const CHAT_HELP: &str = concat!(
+    "Commands: /model [tag] · /system [text] · /temp [x] · /top_p [x] · /clear\n",
+    "          /save [name] · /load [name] · /sessions · /delete [name] · /regen · /edit · /copy\n",
+    "          //text sends a message that starts with a literal '/'\n",
+    "Keys:     Enter send · Ctrl+O newline · Up/Down/PgUp/PgDn scroll · End follow · Esc stop",
+);
+
+/// Throughput of one completed generation over the wall-clock generation time.
+/// `exact` is true when `tokens` is the server-reported completion token count
+/// (stream usage chunk); otherwise it counts streamed SSE chunks, which can be
+/// fewer or more than tokens, and is labelled as such.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenStats {
     pub tokens: usize,
     pub tps: f64,
+    pub exact: bool,
+}
+
+impl GenStats {
+    /// Unit for `tokens` / `tps`: `tok` when server-reported, else `chunks`.
+    pub fn unit(&self) -> &'static str {
+        if self.exact {
+            "tok"
+        } else {
+            "chunks"
+        }
+    }
 }
 
 /// One finished chat request, for the System-tab request inspector. All fields
@@ -1644,17 +1684,49 @@ pub struct RequestRecord {
     pub tokens: usize,
     pub tps: f64,
     pub secs: f64,
+    /// `tokens` is the server-reported count (else streamed chunks).
+    pub exact: bool,
+}
+
+impl RequestRecord {
+    pub fn unit(&self) -> &'static str {
+        if self.exact {
+            "tok"
+        } else {
+            "chunks"
+        }
+    }
 }
 
 /// Cap on retained request records (newest kept).
 const REQUEST_LOG_CAP: usize = 20;
+
+/// Geometry of the last drawn chat transcript, recorded by the renderer (which
+/// only has `&App`) so the key handler can page and clamp scrolling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatView {
+    /// Transcript viewport height in rows.
+    pub viewport: u16,
+    /// Largest useful `scroll` (wrapped lines above the viewport when at top).
+    pub max_scroll: u16,
+}
 
 pub struct ChatState {
     pub input: String,
     pub messages: Vec<ChatMessage>,
     pub status: String,
     pub sending: bool,
+    /// Transcript scroll in rows measured from the bottom: 0 follows the newest
+    /// output; larger values show older text.
     pub scroll: u16,
+    /// Geometry of the last rendered transcript (None before the first draw).
+    pub view: Cell<Option<ChatView>>,
+    /// Local note shown after the messages (e.g. `/help`). Never a message: not
+    /// sent upstream, saved, or considered by /regen or /edit.
+    pub notice: Option<String>,
+    /// Indices into `messages` of replies the user aborted with Esc (render-only
+    /// `[stopped]` marker; the message content is untouched).
+    pub stopped: Vec<usize>,
     /// Session system prompt, prepended to the request when non-empty (/system).
     pub system_prompt: String,
     /// Per-session sampling overrides (/temp, /top_p); None = serve default.
@@ -1665,8 +1737,11 @@ pub struct ChatState {
     /// Model the in-flight generation was sent to (captured at send, since
     /// active_model can change mid-stream via /model).
     gen_model: String,
-    /// Streamed deltas counted so far this generation (≈ tokens).
+    /// Streamed deltas (SSE chunks) counted so far this generation.
     gen_tokens: usize,
+    /// Server-reported completion tokens for this generation, once the final
+    /// usage chunk has arrived.
+    gen_usage: Option<usize>,
     /// Stats of the most recent completed generation (shown under the reply).
     pub last_stats: Option<GenStats>,
     rx: Option<Receiver<ChatEvent>>,
@@ -1683,12 +1758,16 @@ impl Default for ChatState {
             status: "ready".into(),
             sending: false,
             scroll: 0,
+            view: Cell::new(None),
+            notice: None,
+            stopped: Vec::new(),
             system_prompt: String::new(),
             temp: None,
             top_p: None,
             gen_start: None,
             gen_model: String::new(),
             gen_tokens: 0,
+            gen_usage: None,
             last_stats: None,
             rx: None,
             input_focused: true,
@@ -1702,13 +1781,17 @@ impl ChatState {
     /// hung read may never deliver Done, so we don't wait on the worker: clear
     /// `sending`, drop the receiver, and finalize. The detached thread exits when
     /// its socket errors (bounded by the read timeout); its late events land on a
-    /// dropped receiver. The partial reply already streamed is kept.
+    /// dropped receiver. The partial reply already streamed is kept and marked
+    /// `[stopped]` in the transcript.
     pub fn request_abort(&mut self) {
         if self.sending {
             self.abort.store(true, Ordering::Relaxed);
             self.sending = false;
             self.rx = None;
             let _ = self.finalize_generation(); // aborted = incomplete, not logged
+            if self.messages.last().is_some_and(|m| m.role == "assistant") {
+                self.stopped.push(self.messages.len() - 1);
+            }
             self.status = "stopped".into();
         }
     }
@@ -1720,16 +1803,17 @@ impl ChatState {
     fn finalize_generation(&mut self) -> Option<(GenStats, f64)> {
         let mut recorded = None;
         if let Some(start) = self.gen_start.take() {
-            if self.gen_tokens > 0 {
+            let (count, exact) = match self.gen_usage {
+                Some(n) => (n, true),
+                None => (self.gen_tokens, false),
+            };
+            if count > 0 {
                 let secs = start.elapsed().as_secs_f64();
-                let tps = if secs > 0.0 {
-                    self.gen_tokens as f64 / secs
-                } else {
-                    0.0
-                };
+                let tps = if secs > 0.0 { count as f64 / secs } else { 0.0 };
                 let stats = GenStats {
-                    tokens: self.gen_tokens,
+                    tokens: count,
                     tps,
+                    exact,
                 };
                 self.last_stats = Some(stats);
                 recorded = Some((stats, secs));
@@ -1744,7 +1828,34 @@ impl ChatState {
                 self.messages.pop();
             }
         }
+        self.prune_stopped();
         recorded
+    }
+
+    /// Forget `[stopped]` marks whose message no longer exists.
+    fn prune_stopped(&mut self) {
+        let n = self.messages.len();
+        self.stopped.retain(|&i| i < n);
+    }
+
+    /// Move the transcript view by `delta` rows (positive = older), clamped to
+    /// the last measured extent so scrolling past the top doesn't accumulate.
+    fn scroll_by(&mut self, delta: i32) {
+        let max = self.view.get().map_or(u16::MAX, |v| v.max_scroll);
+        let next = (i32::from(self.scroll) + delta).clamp(0, i32::from(max));
+        self.scroll = next as u16;
+    }
+
+    /// Rows moved by PageUp/PageDown: one transcript viewport (at least 1).
+    fn page_rows(&self) -> i32 {
+        i32::from(self.view.get().map_or(1, |v| v.viewport).max(1))
+    }
+
+    /// Home: jump to the oldest text (no-op until the view has been measured).
+    fn scroll_to_top(&mut self) {
+        if let Some(v) = self.view.get() {
+            self.scroll = v.max_scroll;
+        }
     }
 
     /// Clear any displayed throughput + in-flight counters. Called when the
@@ -1753,6 +1864,7 @@ impl ChatState {
         self.last_stats = None;
         self.gen_start = None;
         self.gen_tokens = 0;
+        self.gen_usage = None;
     }
 
     pub fn focus_input(&mut self) {
@@ -2842,6 +2954,7 @@ mod tests {
         app.chat.last_stats = Some(GenStats {
             tokens: 42,
             tps: 99.0,
+            exact: true,
         });
         app.handle_chat_command("clear");
         assert!(
@@ -3019,6 +3132,116 @@ mod tests {
             .unwrap()
             .reasoning_content
             .is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn chat_msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn chat_typing_and_scrolling_work_while_streaming_but_enter_does_not_send() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![chat_msg("user", "hi"), chat_msg("assistant", "")];
+        app.chat.sending = true;
+        app.chat.view.set(Some(ChatView {
+            viewport: 10,
+            max_scroll: 30,
+        }));
+        for c in ['a', 'b', 'c'] {
+            app.handle_chat_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.chat.input, "abc", "typing is kept mid-stream");
+        app.handle_chat_key(key(KeyCode::Backspace));
+        app.handle_chat_key(key(KeyCode::Char('c')));
+        assert_eq!(app.chat.input, "abc");
+        app.handle_chat_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(app.chat.input, "abc\n", "Ctrl+O newline works mid-stream");
+        app.chat.input = "abc".into();
+
+        app.handle_chat_key(key(KeyCode::Up));
+        assert_eq!(app.chat.scroll, 1, "Up scrolls mid-stream");
+        app.handle_chat_key(key(KeyCode::PageUp));
+        assert_eq!(app.chat.scroll, 11);
+
+        app.handle_chat_key(key(KeyCode::Enter));
+        assert_eq!(app.chat.input, "abc", "Enter does not consume the input");
+        assert_eq!(app.chat.messages.len(), 2, "Enter does not send");
+        assert!(app.chat.sending);
+        assert!(app.chat.status.contains("Esc stops it"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_help_note_is_not_a_message() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![chat_msg("user", "hi"), chat_msg("assistant", "yo")];
+        app.handle_chat_command("help");
+        assert!(app
+            .chat
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("/regen")));
+        assert_eq!(app.chat.messages.len(), 2);
+        assert!(app.tail_is_redoable(), "regen/edit still see the real tail");
+        app.handle_chat_command("clear");
+        assert!(app.chat.notice.is_none(), "/clear dismisses the note");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn abort_marks_message_index_and_edit_prunes_it() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![chat_msg("user", "hi"), chat_msg("assistant", "part")];
+        app.chat.sending = true;
+        app.chat.request_abort();
+        assert_eq!(app.chat.stopped, vec![1]);
+        app.edit_last();
+        assert!(app.chat.stopped.is_empty(), "mark dropped with its reply");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn usage_chunk_gives_exact_tokens_else_chunk_count() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        for usage in [Some(5usize), None] {
+            app.chat.messages = vec![chat_msg("user", "hi"), chat_msg("assistant", "")];
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.chat.rx = Some(rx);
+            app.chat.sending = true;
+            app.chat.gen_start = Some(Instant::now());
+            app.chat.gen_tokens = 0;
+            app.chat.gen_usage = None;
+            tx.send(ChatEvent::Content("a".into())).unwrap();
+            tx.send(ChatEvent::Content("b".into())).unwrap();
+            if let Some(n) = usage {
+                tx.send(ChatEvent::Usage {
+                    completion_tokens: n,
+                })
+                .unwrap();
+            }
+            tx.send(ChatEvent::Done).unwrap();
+            app.drain_chat_events();
+            let stats = app.chat.last_stats.expect("stats recorded");
+            match usage {
+                Some(n) => {
+                    assert_eq!((stats.tokens, stats.exact, stats.unit()), (n, true, "tok"));
+                }
+                None => {
+                    assert_eq!((stats.tokens, stats.exact), (2, false));
+                    assert_eq!(stats.unit(), "chunks");
+                    assert_eq!(app.request_log[0].unit(), "chunks");
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }
