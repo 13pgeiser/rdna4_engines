@@ -3076,6 +3076,15 @@ fn init_qwen4_pp_gpus(
     }
     gpus.devices = ordered;
     gpus.mesh = admitted.mesh.clone();
+    // The mesh executor enqueues every band's work and every edge publish /
+    // receive on the device's own launch stream (never the legacy null
+    // stream); install it before any band allocation so loads and forwards
+    // share one ordered stream per device.
+    for (rank, gpu) in gpus.devices.iter_mut().enumerate() {
+        gpu.ensure_capture_stream().map_err(|error| {
+            format!("qwen4: topology.pp rank {rank} launch stream creation failed: {error}")
+        })?;
+    }
     Ok(gpus)
 }
 

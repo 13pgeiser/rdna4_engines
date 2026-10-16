@@ -1671,12 +1671,22 @@ impl Gpus {
         }
         for (owner, rank) in admitted.ranks.iter().enumerate() {
             let gpu = &self.devices[owner];
-            if rank.logical != owner
-                || rank.device_ordinal != gpu.device_id
-                || gpu.active_stream.is_none()
-                || rank.arch != gpu.arch
-            {
-                return Err("admitted physical rank or non-null launch stream mismatch".into());
+            if rank.logical != owner || rank.device_ordinal != gpu.device_id {
+                return Err(format!(
+                    "admitted rank {owner} (logical {}, device {}) is not devices[{owner}] (device {})",
+                    rank.logical, rank.device_ordinal, gpu.device_id
+                ));
+            }
+            if rank.arch != gpu.arch {
+                return Err(format!(
+                    "admitted rank {owner} arch {} does not match device arch {}",
+                    rank.arch, gpu.arch
+                ));
+            }
+            if gpu.active_stream.is_none() {
+                return Err(format!(
+                    "device of rank {owner} has no launch stream (mesh work never runs on the null stream)"
+                ));
             }
             if let Some(expected_pci) = &rank.pci_bus_id {
                 gpu.bind_thread().map_err(|e| e.to_string())?;
