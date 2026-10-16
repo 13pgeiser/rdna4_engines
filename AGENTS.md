@@ -855,16 +855,67 @@ Caveats that are part of the fixture, not trivia:
   and off for every other producer; `on`/`1` arms every MTP producer that
   supports it, `off`/`0` is the opt-out (env beats TOML beats default). It
   serves greedy and sampled requests, thinking on or off (Qwen4 and
-  Qwen3.5/3.x). On Qwen4 a pool hit (request-local pool, cleared and
-  reseeded from the full prompt every request, so earlier requests never
-  influence candidates) takes the window only when the head's own first draft
-  (row-0 argmax, before any sampled draw) equals the first candidate and the
-  takeover's decayed emitted tokens per window over its verify cost (the
-  measured mean, else the request's window-cost fit, not the static per-arch
-  row table) is at least the native chooser's expected rate (the
-  floor's cheapest candidate once the floor is measured);
-  otherwise the window is native (the batched route reuses that row-0 step).
-  A takeover verifies `[seed, candidates..]` on the same batched verify
+  Qwen3.5/3.x). On Qwen4 the proposal source is `MtpCopyContext`
+  (`hipfire_runtime::ngram_mod`), a request-local verbatim-copy
+  (prompt-lookup) matcher: one direct-mapped table per key length (32, 16, 8
+  and `n_match`, longest first), each hash → the position just past the key's
+  most recent occurrence in the request's history (prompt plus retained
+  output), the match checked token for token (a hash collision never
+  proposes), and the proposal copies `history[pos..]`. It is seeded from the
+  full prompt every request and its tables are never cleared (a slot from an
+  earlier request can never propose, so earlier requests never influence
+  candidates); there is no low-acceptance clear on Qwen4 (the old pool's
+  five-low-window clear wiped a request's seeded prompt, up to 200K tokens,
+  for the rest of the request), the take-length chooser backs off on measured
+  acceptance instead. On a CPU proxy of the agentic code-edit chain
+  (`release-0.4.3/ngram-copy-research`; proxy, not a hardware measurement)
+  conditional per-depth acceptance was 0.991-0.997 with these keys against
+  0.90-0.96 for the 5-token chain of the earlier pool. Each window with a
+  proposal (up to `n_max` tokens) takes a length `d` in `1..take_cap` chosen
+  from the request's own shadow-measured per-depth n-gram acceptance `a_j`
+  (the proposal is compared with the tokens the window committed, whichever
+  source ran it: on a greedy stream exactly the verify's acceptance, on a
+  sampled stream an unbiased point-mass estimate) and measured takeover costs:
+  the `d` maximizing `(1 + Σ_i Π_{j<=i} a_j)` over the takeover's window cost
+  (the request's measured mean for that candidate count, else the nearest
+  measured count moved by the fit's per-row slope, else the native window
+  cost model; a drafter's first takeover of a row count is observed unpriced
+  like the first native window of a depth), taken when at least the native
+  chooser's rate; otherwise the window is native. The head's own first draft
+  (row-0 argmax, before any sampled draw) must equal the first candidate only
+  until the copy source is established: a take of at least 4 candidates with
+  depth-1 acceptance at least 0.9 over at least 4 windows of evidence
+  (provisional constants) **and** the last shadow observation having accepted
+  its first candidate (`ngram_last_first_accepted`, so a divergence costs at
+  most one blind window) runs with no head row-0 step.
+  `take_cap = min(n_max, QWEN4_ROW_EXACT_VERIFY_ROWS - 1)` = 7: a verify
+  forward is row-exact against single-row decode (Q8 decode copy, K1
+  lane-union MoE, rows_x4 GEMV, k4 HC gate, QSA prologue, fused
+  router+shared) only up to 8 rows; 9 or more run prefill kernels, which
+  break greedy byte-identity. Raising the one constant raises the cap.
+  Admission sizes the verify rows and the GDN row capture for `take_cap + 1`
+  rows when the n-gram source arms (`native_mtp_proposal_drafts`, which the
+  loader passes to `native_mtp_device_bytes` / `native_mtp_request_bytes`),
+  and the drafter grows its row capture and verify scratch to the armed cap.
+  **A request the floor retired keeps the copy lane.** Retirement says native
+  drafting loses to AR, nothing about the copy source, whose acceptance the
+  shadow table measures independently (on R9700 at the agentic chain's
+  sampling, T1.0 thinking on, the floor retired every request during the
+  thinking prose and the answer's verbatim code copy ran as AR; smoke:
+  `release-0.4.3/agentchain/runs/smoke-r9700/def/res.json`). Only the floor's
+  AR calibration (and its probes) bars the pool; on a retired request the
+  comparator is AR itself (1.0 token per AR step) instead of the native rate.
+  A retired takeover first catches the head up (`catch_up_head`: the rows the
+  retired AR tokens owe are appended teacher-forced exactly as a forced
+  advance does), then confirms the first candidate with the head's row-0
+  probe unless the source is established, falling back to the retired AR step
+  on a mismatch, else runs the takeover with no head step. The floor keeps
+  pricing external windows after retirement (`external`, `external_depth`,
+  `external_blocked`) without un-retiring, counting probes or changing native
+  routing, and reports `external_blocked` alone, so the lane disarms only when
+  takeovers themselves cost at least AR per token. `stats.mtp_retired` stays
+  true and the `ngram_mod_*` counters count retired takeovers. A
+  takeover verifies `[seed, candidates..]` on the same batched verify
   executor as native MTP windows (interleaved one-row route under
   `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows,
   and appends exactly those rows to the head teacher-forced (token p, hidden
@@ -878,12 +929,18 @@ Caveats that are part of the fixture, not trivia:
   depth's own, `MTP_AGREEMENT_RELAX` (0.95) when below, so a depth rejected
   once is re-explored instead of staying frozen below its threshold, and an
   unreached depth is priced at the request's own deepest observed acceptance
-  (conditional acceptance is flat in depth past the first draft). Triple
-  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
+  (conditional acceptance is flat in depth past the first draft); the n-gram
+  table uses the same rule. Triple
+  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/1/63 on admitted Qwen4
   targets and 24/48/64 elsewhere (per-component overrides; Qwen4 `n_max`
-  capped at 63, the 64-row verify). The load log prints `qwen4 native MTP
-  n-gram: on|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1`
-  window events carry `source` (`ngram`/`mtp`) and `verify_route`.
+  capped at 63, the 64-row spec verify capacity; it is the proposal and
+  observation length, the take cap is `min(n_max, 7)`). The load log prints
+  `qwen4 native MTP n-gram: on|off (n_match=.. n_min=.. n_max=.. take_cap=..)`;
+  `HIPFIRE_MTP_TRACE=1` window events carry `source` (`ngram`/`mtp`) and
+  `verify_route`, plus `ngram_plan` (`emitted`, `available`, `take`,
+  `confirm`, `rate`, `native_rate`, `a1`, `plan_us`, `retired`) per window
+  with a proposal (retired plans included) and `ngram_confirm` (`position`,
+  `match`) wherever the row-0 confirmation ran.
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus

@@ -93,7 +93,7 @@
 //!   prompt is a "rewrite this passage" request with the passage's first
 //!   `COPY_PRIMED` tokens already in the assistant turn, so the pool proposes
 //!   the passage's continuation on the first window (the fixture is
-//!   pre-checked on the CPU against `MtpNgramContext` for the prompt). Hits
+//!   pre-checked on the CPU against `MtpCopyContext` for the prompt). Hits
 //!   are REQUIRED: `request_stats().ngram_mod_windows`, summed over the
 //!   trials, and the offered drafts must both be nonzero, in the arm and again
 //!   in the parent from `<arm>.stats.json`.
@@ -181,7 +181,7 @@ use hipfire_arch_qwen4::Qwen4KvBackend;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource, SourcePayload};
-use hipfire_runtime::ngram_mod::{MtpNgramContext, NgramModConfig};
+use hipfire_runtime::ngram_mod::{MtpCopyContext, NgramModConfig};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
 use hipfire_runtime::sampler::{sample_cpu, SamplerConfig};
 use hipfire_runtime::spec::{MtpDrafter, MtpRequestStats, SpecRequestConfig};
@@ -2337,7 +2337,7 @@ fn copy_fixture(loaded: &Loaded) -> Result<Vec<u32>, String> {
         return Err("the passage's own tokens do not occur in the rendered request".into());
     }
     prompt.extend_from_slice(&passage[..COPY_PRIMED]);
-    let mut pool = MtpNgramContext::new(qwen4_ngram_mod_config(NGRAM_TRIPLE)?)
+    let mut pool = MtpCopyContext::new(qwen4_ngram_mod_config(NGRAM_TRIPLE)?)
         .map_err(|e| e.to_string())?;
     pool.begin_request(&prompt);
     let seed = &passage[COPY_PRIMED..=COPY_PRIMED];

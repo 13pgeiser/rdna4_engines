@@ -4664,9 +4664,12 @@ pub fn mtp_own_prefill() -> bool {
 pub fn ngram_mod_triple() -> (usize, usize, usize) {
     ngram_mod_triple_with_defaults((24, 48, 64))
 }
-/// Arch-aware `(n_match, n_min, n_max)` triple. `5/3/3` is the approved
-/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; every other
-/// family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
+/// Arch-aware `(n_match, n_min, n_max)` triple. `5/1/63` is the arch-16
+/// (native Qwen4 MTP) default on gfx1151 and gfx1201: there `n_max` is the
+/// proposal and shadow-observation length, not the takeover cap (the drafter
+/// takes at most `min(n_max, row-exact verify rows - 1)` candidates, chosen
+/// per window from this request's own measured acceptance and costs); every
+/// other family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
 /// N_MIN,N_MAX}` override wins per component. Validation stays with the
 /// consumer.
 pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
@@ -4674,7 +4677,7 @@ pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usi
 }
 fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
     if ngram_mod_arch_admitted(model_arch, gpu_arch) {
-        (5, 3, 3)
+        (5, 1, 63)
     } else {
         (24, 48, 64)
     }
@@ -6305,8 +6308,8 @@ mod tests {
 
     #[test]
     fn ngram_mod_triple_defaults_per_arch_with_env_override() {
-        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 3, 3));
-        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 1, 63));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 1, 63));
         assert_eq!(ngram_mod_default_triple(16, "gfx1100"), (24, 48, 64));
         assert_eq!(ngram_mod_default_triple(5, "gfx1151"), (24, 48, 64));
 

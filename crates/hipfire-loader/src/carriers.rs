@@ -793,7 +793,7 @@ impl Carrier for Qwen4Carrier {
             ) {
                 Ok(config) => {
                     eprintln!(
-                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={})",
+                        "  qwen4 native MTP n-gram: {} (n_match={} n_min={} n_max={} take_cap={})",
                         if hipfire_config::mtp_ngram_enabled_for_arch(arch, &ctx.gpu.arch) {
                             "on"
                         } else {
@@ -801,7 +801,8 @@ impl Carrier for Qwen4Carrier {
                         },
                         config.n_match,
                         config.n_min,
-                        config.n_max
+                        config.n_max,
+                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(&config)
                     );
                     Some(config)
                 }
@@ -1201,27 +1202,28 @@ fn qwen4_placement_inputs(
             &gpu.arch,
             usize::from(routed_experts),
         );
-    let mtp_for = |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
-        if !mtp_kept {
-            return Ok(None);
-        }
-        let head = residency::language_head_dtype(weights)
-            .ok_or("qwen4: manifest has no language head")?;
-        let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(gpu, config)
-            .then_some(state_format.gdn);
-        Ok(Some(
-            hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
-                config,
-                context,
-                chunk_rows,
-                max_k,
-                head,
-                row_capture,
-                hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
-            )
-            .ok_or("qwen4: native MTP device bytes overflow")?,
-        ))
-    };
+    let mtp_for =
+        |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+            if !mtp_kept {
+                return Ok(None);
+            }
+            let head = residency::language_head_dtype(weights)
+                .ok_or("qwen4: manifest has no language head")?;
+            let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(gpu, config)
+                .then_some(state_format.gdn);
+            Ok(Some(
+                hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
+                    config,
+                    context,
+                    chunk_rows,
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &gpu.arch),
+                    head,
+                    row_capture,
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
+                )
+                .ok_or("qwen4: native MTP device bytes overflow")?,
+            ))
+        };
     // The gathered QSA prefill attention's workspace, committed as the
     // context is (none when the route is off: the reserve is then unchanged).
     // Bytes already committed by an earlier load in this process are out of
@@ -2479,7 +2481,7 @@ pub fn load_qwen4_rank(
                     config,
                     ctx.max_seq,
                     bundle.spec_chunk_rows().unwrap_or(1).max(1),
-                    max_k,
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch),
                     hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, config)
                         .then_some(state_format.gdn),
                     hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(ctx.gpu),

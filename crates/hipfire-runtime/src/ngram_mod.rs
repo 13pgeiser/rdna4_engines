@@ -20,6 +20,11 @@
 //! [`NgramModPool::draft_into`] lets the per-window proposal reuse one
 //! candidate buffer instead of allocating.
 //!
+//! [`MtpCopyContext`] is the Qwen4 copy lane's source: the same lifecycle,
+//! but proposals copy the history verbatim from the most recent earlier
+//! occurrence of the longest matching suffix key (prompt lookup) instead of
+//! chaining a next-token table.
+//!
 //! Pure host Rust. Existing [`crate::spec::PldMatcher`] / [`crate::spec::NgramCache`]
 //! are unchanged for DFlash and legacy standalone users.
 
@@ -381,6 +386,249 @@ impl MtpNgramContext {
     #[inline]
     pub fn history(&self) -> &[u32] {
         &self.history
+    }
+}
+
+/// Longer key lengths [`MtpCopyContext`] tries before `n_match`, longest first;
+/// only those longer than `n_match` are used.
+const COPY_KEY_LADDER: [usize; 3] = [32, 16, 8];
+
+/// Request-local verbatim-copy (prompt-lookup) proposal source: the Qwen4
+/// n-gram copy lane's pool.
+///
+/// Where [`NgramModPool`] re-keys every drafted token through a
+/// hash(`n_match` tokens) → next-token table (so a chain jumps to whichever
+/// occurrence of each short key was written last), this context copies the
+/// history verbatim from ONE earlier occurrence of the current suffix: one
+/// direct-mapped table per key length (`n_match` and the longer
+/// [`COPY_KEY_LADDER`] lengths), each mapping hash(key) → the position just
+/// past the key's most recent occurrence. A proposal tries the longest key
+/// first, checks the stored position against the history token for token
+/// (a hash collision never proposes), and copies `history[pos..]` up to the
+/// cap. On a committed copy-heavy proxy of the agentic code-edit chain
+/// (`release-0.4.3/ngram-copy-research`, 45K→209K-token prompts, answers
+/// that copy a pasted function) conditional per-depth acceptance was
+/// 0.991-0.997 with keys 32/16/8/4 against 0.90-0.96 for the 5-token chain:
+/// code repeats short keys constantly (`}\n    }`, `.map_err(..)?;`), and a
+/// chain re-keyed on them leaves the source being copied.
+///
+/// Same lifecycle and API as [`MtpNgramContext`]: the request's history is
+/// the prompt plus the emitter-retained tokens; candidates and rejected
+/// tails are never history. The tables are not cleared between requests:
+/// a slot holding a position from an earlier request can never propose,
+/// because a proposal needs `history[pos - n..pos]` to equal the key in
+/// THIS request's history, and every such position of this request was
+/// indexed after (so overwrote) anything an earlier request wrote to the
+/// slot. Candidates therefore depend on this request alone.
+pub struct MtpCopyContext {
+    config: NgramModConfig,
+    /// Key lengths, longest first; the last is `n_match`.
+    keys: Vec<usize>,
+    /// `HASH_MUL^(n - 1)` per key, for the rolling index pass.
+    mul_pows: Vec<u64>,
+    /// Slots per key table (a power of two).
+    slots: usize,
+    /// `64 - log2(slots)`: the index is the top bits of the mixed hash.
+    shift: u32,
+    /// `keys.len() * slots` positions; [`EMPTY`] when never written.
+    table: Vec<u32>,
+    /// `prompt ++ emitted`.
+    history: Vec<u32>,
+    /// Positions `< indexed_until` are in the tables.
+    indexed_until: usize,
+    /// Number of `emitted` tokens already appended to `history`.
+    emitted_len: usize,
+    /// Reusable proposal buffer; capacity reserved to `n_max` once in `new`.
+    candidate: Vec<u32>,
+    begun: bool,
+}
+
+impl MtpCopyContext {
+    /// Allocate the key tables (`config.capacity` slots in total, split
+    /// evenly and rounded down to a power of two per key) and the proposal
+    /// buffer. Validation matches [`NgramModPool::new`].
+    pub fn new(config: NgramModConfig) -> Result<Self, &'static str> {
+        if config.capacity == 0 || !config.capacity.is_power_of_two() {
+            return Err("ngram_mod capacity must be a non-zero power of two");
+        }
+        if config.n_match == 0 {
+            return Err("ngram_mod n_match must be >= 1");
+        }
+        if config.n_max == 0 {
+            return Err("ngram_mod n_max must be >= 1");
+        }
+        if config.n_min > config.n_max {
+            return Err("ngram_mod n_min must be <= n_max");
+        }
+        let mut keys: Vec<usize> = COPY_KEY_LADDER
+            .iter()
+            .copied()
+            .filter(|&n| n > config.n_match)
+            .collect();
+        keys.push(config.n_match);
+        let per_key = (config.capacity / keys.len()).max(1);
+        let slots = 1usize << per_key.ilog2();
+        let mul_pows = keys
+            .iter()
+            .map(|&n| HASH_MUL.wrapping_pow((n - 1) as u32))
+            .collect();
+        Ok(Self {
+            config,
+            shift: 64 - slots.trailing_zeros(),
+            table: vec![EMPTY; keys.len() * slots],
+            keys,
+            mul_pows,
+            slots,
+            history: Vec::new(),
+            indexed_until: 0,
+            emitted_len: 0,
+            candidate: Vec::with_capacity(config.n_max),
+            begun: false,
+        })
+    }
+
+    /// Config the context was built with.
+    #[inline]
+    pub fn config(&self) -> &NgramModConfig {
+        &self.config
+    }
+
+    /// Key lengths tried, longest first.
+    pub fn keys(&self) -> &[usize] {
+        &self.keys
+    }
+
+    /// Request boundary: restart the history from the FULL canonical
+    /// `prompt` and index every prompt position. The tables are reused
+    /// without clearing (see the type docs). Sets `begun`.
+    pub fn begin_request(&mut self, prompt: &[u32]) {
+        self.history.clear();
+        self.history.extend_from_slice(prompt);
+        self.indexed_until = 0;
+        self.emitted_len = 0;
+        self.candidate.clear();
+        self.index_new();
+        self.begun = true;
+    }
+
+    /// Whether [`begin_request`](Self::begin_request) ran for the live request.
+    #[inline]
+    pub fn is_begun(&self) -> bool {
+        self.begun
+    }
+
+    /// Append the not-yet-seen suffix of `emitted` (the emitter-retained
+    /// output stream, holding the first token/seed exactly once) and index
+    /// it. No-op before `begin_request`.
+    pub fn sync_emitted(&mut self, emitted: &[u32]) {
+        if !self.begun {
+            return;
+        }
+        debug_assert!(
+            emitted.len() >= self.emitted_len,
+            "MTP copy-lane emitted history must grow monotonically"
+        );
+        if emitted.len() <= self.emitted_len {
+            return;
+        }
+        self.history.extend_from_slice(&emitted[self.emitted_len..]);
+        self.emitted_len = emitted.len();
+        self.index_new();
+    }
+
+    /// [`sync_emitted`](Self::sync_emitted)`(emitted)`, then copy from the
+    /// most recent earlier occurrence of the longest matching suffix key:
+    /// `Some(candidates)` iff at least `n_min` tokens follow it (length
+    /// `<= min(n_max, caller_max)`, and never past the history end); a key
+    /// whose copy is too short falls through to the next shorter key. The
+    /// slice borrows the internal buffer. `None` before `begin_request`.
+    pub fn propose(&mut self, emitted: &[u32], caller_max: usize) -> Option<&[u32]> {
+        if !self.begun {
+            return None;
+        }
+        self.sync_emitted(emitted);
+        self.candidate.clear();
+        let limit = self.config.n_max.min(caller_max);
+        if limit == 0 || self.config.n_min > limit {
+            return None;
+        }
+        let end = self.history.len();
+        for (k, &n) in self.keys.iter().enumerate() {
+            if end < n {
+                continue;
+            }
+            let key = &self.history[end - n..];
+            let pos = self.table[k * self.slots + self.slot(hash_window(key))];
+            if pos == EMPTY {
+                continue;
+            }
+            let pos = pos as usize;
+            if pos >= end || pos < n || self.history[pos - n..pos] != *key {
+                continue;
+            }
+            let take = limit.min(end - pos);
+            if take == 0 || take < self.config.n_min {
+                continue;
+            }
+            self.candidate
+                .extend_from_slice(&self.history[pos..pos + take]);
+            return Some(&self.candidate);
+        }
+        None
+    }
+
+    /// Drop the request's history and set `begun = false` (allocations kept).
+    pub fn reset_request(&mut self) {
+        self.history.clear();
+        self.indexed_until = 0;
+        self.emitted_len = 0;
+        self.candidate.clear();
+        self.begun = false;
+    }
+
+    /// Canonical request history (`prompt ++ emitted`).
+    #[inline]
+    pub fn history(&self) -> &[u32] {
+        &self.history
+    }
+
+    /// Table index of a key hash: the top bits of a multiplicative mix, so
+    /// every token bit reaches the index.
+    #[inline]
+    fn slot(&self, hash: u64) -> usize {
+        ((hash ^ (hash >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    /// Index every position `j` in `indexed_until..history.len()`: key
+    /// `history[j - n..j]` → `j` (the token at `j` follows it), for each key
+    /// length, with one rolling hash per key.
+    fn index_new(&mut self) {
+        let end = self.history.len();
+        for (k, &n) in self.keys.iter().enumerate() {
+            let start = self.indexed_until.max(n);
+            if start >= end {
+                continue;
+            }
+            let base = k * self.slots;
+            let mut hash = hash_window(&self.history[start - n..start]);
+            let mut j = start;
+            loop {
+                let slot = ((hash ^ (hash >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift)
+                    as usize;
+                self.table[base + slot] = j as u32;
+                j += 1;
+                if j >= end {
+                    break;
+                }
+                hash = roll_hash(
+                    hash,
+                    self.history[j - 1 - n],
+                    self.history[j - 1],
+                    self.mul_pows[k],
+                );
+            }
+        }
+        self.indexed_until = end;
     }
 }
 
@@ -920,5 +1168,164 @@ mod tests {
         }
         empty.begin_request(&[1]);
         assert_eq!(empty.pool.low_accept_streak, 0);
+    }
+
+    // ---- MtpCopyContext ---------------------------------------------------
+
+    fn copy_cfg(n_match: usize, n_min: usize, n_max: usize) -> NgramModConfig {
+        small_cfg(1 << 16, n_match, n_min, n_max)
+    }
+
+    #[test]
+    fn copy_context_keys_and_invalid_config() {
+        assert!(MtpCopyContext::new(small_cfg(3, 2, 1, 4)).is_err());
+        assert!(MtpCopyContext::new(small_cfg(16, 0, 1, 4)).is_err());
+        assert!(MtpCopyContext::new(small_cfg(16, 2, 5, 4)).is_err());
+        let ctx = MtpCopyContext::new(copy_cfg(4, 1, 63)).unwrap();
+        assert_eq!(ctx.keys(), &[32, 16, 8, 4]);
+        assert_eq!(ctx.slots, (1 << 16) / 4);
+        assert_eq!(
+            MtpCopyContext::new(copy_cfg(5, 1, 63)).unwrap().keys(),
+            &[32, 16, 8, 5]
+        );
+        assert_eq!(
+            MtpCopyContext::new(copy_cfg(16, 1, 63)).unwrap().keys(),
+            &[32, 16]
+        );
+        assert_eq!(
+            MtpCopyContext::new(copy_cfg(40, 1, 63)).unwrap().keys(),
+            &[40]
+        );
+        // Three keys: per-key slots round down to a power of two.
+        assert_eq!(
+            MtpCopyContext::new(copy_cfg(12, 1, 63)).unwrap().slots,
+            1 << 14
+        );
+    }
+
+    #[test]
+    fn copy_context_copies_one_occurrence_verbatim() {
+        // `7 8 9` occurs twice with different continuations. With the
+        // 8-token key `2..=9` the copy follows the first occurrence (the
+        // source being copied); a chain re-keyed on `7 8 9` would jump.
+        let mut prompt: Vec<u32> = (1..=16).collect();
+        prompt.extend_from_slice(&[50, 51, 52, 53, 54, 7, 8, 9, 90, 91, 92]);
+        let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 8)).unwrap();
+        ctx.begin_request(&prompt);
+        let emitted: Vec<u32> = (1..=9).collect();
+        assert_eq!(
+            ctx.propose(&emitted, 8).unwrap(),
+            &[10, 11, 12, 13, 14, 15, 16, 50]
+        );
+        // Only the 3-token key matches: its most recent occurrence.
+        let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 8)).unwrap();
+        ctx.begin_request(&prompt);
+        assert_eq!(
+            ctx.propose(&[99, 7, 8, 9], 8).unwrap(),
+            &[90, 91, 92, 99, 7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn copy_context_caps_and_never_runs_past_the_history() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 2, 6)).unwrap();
+        let prompt: Vec<u32> = (100..110).collect();
+        ctx.begin_request(&prompt);
+        assert_eq!(
+            ctx.propose(&[100, 101], 6).unwrap(),
+            &[102, 103, 104, 105, 106, 107]
+        );
+        assert_eq!(ctx.propose(&[100, 101], 3).unwrap(), &[102, 103, 104]);
+        // caller_max below n_min: no proposal.
+        assert!(ctx.propose(&[100, 101], 1).is_none());
+        // Unknown suffix: no proposal.
+        assert!(ctx.propose(&[100, 101, 7], 6).is_none());
+        // The copy stops at the history end: `108 109` last continued with
+        // the emitted `108 109` itself.
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 1, 6)).unwrap();
+        ctx.begin_request(&prompt);
+        assert_eq!(ctx.propose(&[108, 109], 6).unwrap(), &[108, 109]);
+        // A copy shorter than n_min falls through and finds nothing.
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 3, 6)).unwrap();
+        ctx.begin_request(&prompt);
+        assert!(ctx.propose(&[108, 109], 6).is_none());
+    }
+
+    #[test]
+    fn copy_context_learns_only_retained_tokens() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 1, 4)).unwrap();
+        ctx.begin_request(&[1, 2, 3]);
+        let first = ctx.propose(&[1, 2], 4).unwrap().to_vec();
+        assert_eq!(first, &[3, 1, 2]);
+        // Proposing again does not learn the candidates.
+        assert_eq!(ctx.propose(&[1, 2], 4).unwrap(), first.as_slice());
+        assert_eq!(ctx.history(), &[1, 2, 3, 1, 2]);
+        ctx.sync_emitted(&[1, 2]);
+        assert_eq!(ctx.history(), &[1, 2, 3, 1, 2]);
+        ctx.sync_emitted(&[1, 2, 9]);
+        assert_eq!(ctx.history(), &[1, 2, 3, 1, 2, 9]);
+        // `1 2` was last continued with 9.
+        assert_eq!(ctx.propose(&[1, 2, 9, 1, 2], 4).unwrap(), &[9, 1, 2]);
+    }
+
+    #[test]
+    fn copy_context_requests_are_isolated_without_clearing() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 1, 4)).unwrap();
+        let prompt_a: Vec<u32> = (1..=10).collect();
+        let prompt_b: Vec<u32> = (200..210).collect();
+        ctx.begin_request(&prompt_a);
+        assert_eq!(ctx.propose(&[1, 2], 4).unwrap(), &[3, 4, 5, 6]);
+        ctx.begin_request(&prompt_b);
+        assert!(
+            ctx.propose(&[1, 2], 4).is_none(),
+            "A's positions never propose in B"
+        );
+        assert_eq!(
+            ctx.propose(&[1, 2, 200, 201], 4).unwrap(),
+            &[202, 203, 204, 205]
+        );
+        // Same request: identical proposals whatever ran before.
+        let mut fresh = MtpCopyContext::new(copy_cfg(2, 1, 4)).unwrap();
+        for emitted in [&[200u32, 201][..], &[205, 206], &[209, 200], &[3, 4]] {
+            ctx.reset_request();
+            ctx.begin_request(&prompt_b);
+            fresh.reset_request();
+            fresh.begin_request(&prompt_b);
+            assert_eq!(ctx.propose(emitted, 4), fresh.propose(emitted, 4));
+        }
+        // A short request after a long one: A's slot for `3 4` points past
+        // this history's end and never proposes.
+        ctx.begin_request(&[3]);
+        assert!(ctx.propose(&[4], 4).is_none());
+    }
+
+    #[test]
+    fn copy_context_candidate_buffer_is_not_reallocated() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(2, 1, 4)).unwrap();
+        let ptr = ctx.candidate.as_ptr();
+        let prompt: Vec<u32> = (100..110).collect();
+        for _ in 0..3 {
+            ctx.begin_request(&prompt);
+            for caller_max in [4usize, 3, 2, 1, 4] {
+                let _ = ctx.propose(&[100, 101], caller_max);
+                assert_eq!(ctx.candidate.as_ptr(), ptr);
+            }
+            ctx.reset_request();
+        }
+    }
+
+    #[test]
+    fn copy_context_rolling_index_matches_direct_hash() {
+        let mut ctx = MtpCopyContext::new(copy_cfg(3, 1, 8)).unwrap();
+        let prompt: Vec<u32> = (0..200u32).map(|i| (i * 7919) % 101).collect();
+        ctx.begin_request(&prompt);
+        for (k, &n) in ctx.keys.clone().iter().enumerate() {
+            for j in n..prompt.len() {
+                let pos = ctx.table[k * ctx.slots + ctx.slot(hash_window(&prompt[j - n..j]))];
+                // The rolling pass wrote this slot at `j` (or later, by a
+                // later occurrence or a colliding key).
+                assert!(pos != EMPTY && pos as usize >= j, "key {n} at {j}: {pos}");
+            }
+        }
     }
 }
