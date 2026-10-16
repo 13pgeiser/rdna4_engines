@@ -10,9 +10,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 namespace rad {
 
@@ -113,21 +115,37 @@ int Engine::lora_start() {
 }
 
 int Engine::lora_load(const std::string& name, const std::string& dir, std::string* err) {
-    std::lock_guard<std::mutex> lk(lora_mu_);
+    std::unique_lock<std::mutex> lk(lora_mu_);
     if (!cfg_.lora.enabled()) { *err = "the engine was started without adapters"; return RAD_E_STATE; }
     if (name.empty()) { *err = "an adapter needs a name"; return RAD_E_INVAL; }
     int slot = -1;
     bool cooling = false;
-    const uint64_t now = lora_epoch_.load(std::memory_order_acquire);
-    for (size_t i = 0; i < lora_slots_.size(); ++i) {
-        const LoraSlotState& x = lora_slots_[i];
-        if (x.uid != 0 && x.name == name) {
-            *err = "an adapter named '" + name + "' is already loaded";
-            return RAD_E_INVAL;
+    /* A SLOT FREED A MOMENT AGO IS WAITED FOR HERE, not handed back as a retry. It is reusable once
+     * the step loop has gone round three times (a pass issued ahead may still read it), and the
+     * loop goes round idle or busy, so that is milliseconds -- an unload followed at once by a load
+     * (a hot swap) would otherwise fail almost every time under traffic. The lock is let go while
+     * waiting; the step loop's counter is an atomic and needs none of it. */
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        slot = -1;
+        cooling = false;
+        const uint64_t now = lora_epoch_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < lora_slots_.size(); ++i) {
+            const LoraSlotState& x = lora_slots_[i];
+            if (x.uid != 0 && x.name == name) {
+                *err = "an adapter named '" + name + "' is already loaded";
+                return RAD_E_INVAL;
+            }
+            if (x.uid != 0 || slot >= 0) continue;
+            if (x.used && now < x.freed_at + 3) { cooling = true; continue; }
+            slot = (int)i;
         }
-        if (x.uid != 0 || slot >= 0) continue;
-        if (x.used && now < x.freed_at + 3) { cooling = true; continue; }
-        slot = (int)i;
+        if (slot >= 0 || !cooling || stopping_.load(std::memory_order_acquire) ||
+            std::chrono::steady_clock::now() >= give_up)
+            break;
+        lk.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        lk.lock();
     }
     if (slot < 0) {
         *err = cooling ? std::string("the free slot was unloaded a moment ago and a step on the card "
