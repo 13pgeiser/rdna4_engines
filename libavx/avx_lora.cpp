@@ -105,6 +105,7 @@ AVX_KERNEL(lora_shrink) {
         return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *SL = &a->t[2], *LA = &a->t[3], *T = &a->t[4];
     const RadTensor* XS = rad_arg_in(a, 1);
+    if (XS && XS->dtype == RAD_DT_INVALID) XS = nullptr;     /* absent, as libref */
     const int64_t K = p_int(a, "K", 0), R = p_int(a, "R", 0), S = p_int(a, "S", 0);
     if (K <= 0 || R <= 0 || S <= 0) return RAD_E_SHAPE;
     const int64_t M = band_rows(numel(T) / R, p_int(a, "M", 0));
@@ -115,7 +116,7 @@ AVX_KERNEL(lora_shrink) {
     if (T->dtype != RAD_F32) return RAD_E_DTYPE;
     const Scales SA = make_scales(XS, M, K);
     const int64_t gp = p_int(a, "group", 0);
-    if (gp > 0 && SA.p && SA.group != gp) return RAD_E_SHAPE;
+    if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
 
     const Mat mx = as_mat(X, K), mt = as_mat(T, R);
     const Pool3 pa = pool3(LA, R, K);

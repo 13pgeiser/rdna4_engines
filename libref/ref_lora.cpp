@@ -67,6 +67,7 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
         return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *SL = &a->t[2], *LA = &a->t[3], *T = &a->t[4];
     const RadTensor* XS = t_in(a, 1);
+    if (XS && XS->dtype == RAD_DT_INVALID) XS = nullptr;     /* absent: null data or no dtype */
     const int64_t K = p_int(a, "K", 0), R = p_int(a, "R", 0), S = p_int(a, "S", 0);
     if (K <= 0 || R <= 0 || S <= 0) return RAD_E_SHAPE;
     const int64_t M = band_rows(numel(T) / R, p_int(a, "M", 0));
@@ -76,13 +77,15 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
     if (coded_act(X->dtype) && !XS) return RAD_E_INVAL;     /* a code without its scale */
     if (T->dtype != RAD_F32) return RAD_E_DTYPE;
 
-    /* gemm_nt_q's reading of the scale stream, and its `group` cross-check: the stream states the
-     * group, and a parameter that disagrees with it is a caller describing other bytes. Absent
-     * the stream the parameter says nothing -- a bf16 activation has no scale whatever `group`
-     * holds. */
+    /* gemm_nt_q's reading of the scale stream, and a `group` cross-check: the stream states the
+     * group, and a parameter whose GRID disagrees with it is a caller describing other bytes. The
+     * grid -- groups along K -- and not the number, because a K no wider than one group has one
+     * group whatever `group` says (a 64-wide row under 128), and from two groups up one power of
+     * two gives each count. Absent the stream the parameter says nothing: a bf16 activation has no
+     * scale whatever `group` holds. */
     const Scales SA = make_scales(XS, M, K, false);
     const int64_t gp = p_int(a, "group", 0);
-    if (gp > 0 && SA.p && SA.group != gp) return RAD_E_SHAPE;
+    if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;
 
     const Mat mx = as_mat(X, K), mt = as_mat(T, R);
     const Pool3 pa = pool3(LA, R, K);

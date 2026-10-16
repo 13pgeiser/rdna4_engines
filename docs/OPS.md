@@ -639,8 +639,9 @@ not read or write its `y` row at all — so a base row stays bit for bit what th
   `a`/`a_scale` are the GEMM's own first two operands, and `x(m, k)` is the value `gemm_nt_q` uses
   for that element: the code times its group's scale, read through the same scale-stream rule
   (`[rows, groups]` or `[rows]`, the group derived from the stream), or a `bf16`/`f16`/`f32`
-  element as it stands. An `fp8_e4m3`/`fp8_e5m2`/`i8` `a` without `a_scale` is refused. `group`
-  is a cross-check on the stream and 0 means none; `dtype` is `a`'s tensor dtype name
+  element as it stands. An `fp8_e4m3`/`fp8_e5m2`/`i8` `a` without `a_scale` (null data) is refused.
+  `group` is a cross-check on the stream's grid -- `ceil(K / group)` groups along K -- and 0 means
+  none; `dtype` is `a`'s tensor dtype name
   (`rad_dtype_name`: `bf16`, `f16`, `f32`, `fp8_e4m3`, `i8`, ...), not a combined quant string.
   `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
 - `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
