@@ -1165,8 +1165,36 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
-                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
+                // Resolve once, before the weight-host envelope, slot caps and
+                // every pp gate below read the request.
+                let mut resolved_msg = msg.clone();
+                let load_pp = match hipfire_config::topology::resolve_load_pp(&mut resolved_msg) {
+                    Ok(pp) => pp,
+                    Err(refusal) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &refusal,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let msg = resolved_msg;
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg)
+                {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        &refusal,
+                        "validation",
+                        false,
+                        false,
+                    );
                     let _ = stdout.flush();
                     continue;
                 }
@@ -1425,6 +1453,7 @@ fn main() {
                                 "kv_backend_legacy": slot_kv_diag.legacy,
                                 "kv_backend_warning": slot_kv_diag.warning,
                                 "kv_mode": slot_params.kv_mode_resolved,
+                                "pp": 1,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1944,11 +1973,7 @@ fn main() {
                 // Gpus + *_multi paths and refuses VL / DFlash / CASK /
                 // PFlash at load time. v1 supports Qwen3.5 dense + MoE
                 // only — see load_model_pp for the arch_id check.
-                let pp = msg
-                    .get("params")
-                    .and_then(|p| p.get("pp"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1) as usize;
+                let pp = load_pp;
                 // Expert-parallel degree (EP, task #26). tp>1 shards routed
                 // experts across ranks via load_model_ep. Mutually exclusive
                 // with pp; v1 refuses DFlash. See docs/plans/daemon-ep-wiring.md.
@@ -2513,12 +2538,13 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                m.pp,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -2537,12 +2563,13 @@ fn main() {
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                m.pp,
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
@@ -5185,6 +5212,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn load_pp_resolves_config_fallback_before_weight_host_refusal() {
+        let mut msg = serde_json::json!({"type": "load", "params": {"tp": 1}});
+        assert_eq!(
+            hipfire_config::topology::resolve_load_pp_with(&mut msg, |_| Ok(2)),
+            Ok(2)
+        );
+        assert!(super::weight_host_tenant::load_refusal(true, &msg)
+            .is_some_and(|refusal| refusal.contains("tp/pp > 1")));
+    }
+
     #[test]
     fn admitted_load_failure_names_missing_model_only_when_unload_first() {
         // Unload-first (single-device/pp, incl. Qwen4): prior already retired.

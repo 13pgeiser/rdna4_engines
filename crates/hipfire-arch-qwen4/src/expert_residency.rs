@@ -1078,7 +1078,9 @@ pub fn band_census_native_mtp(
 /// (the head dtype comes from the manifest's language head).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeMtpCensusInputs {
-    /// Draft window K (the request sizes `K.clamp(1, 10) + 1` rows).
+    /// Draft window K the request sizes (`native_mtp_window_rows` rows). The
+    /// Single load passes `native_mtp_proposal_drafts` (n-gram takeover
+    /// width); a PP load has no n-gram pool or copy lane, so passes its K.
     pub max_k: usize,
     /// The GDN storage format of the verify-row capture where the route
     /// captures rows (`mtp_spec::native_mtp_row_capture`), else `None`.
@@ -1127,7 +1129,7 @@ impl NativeMtpCensus {
 /// The native MTP reserve of one pipeline band (`Single` = the whole model).
 ///
 /// Every band charges the row capture of its OWN GDN layers
-/// (`Qwen4State::row_capture_bytes_scoped`, `K.clamp(1, 10) + 1` rows): each
+/// (`Qwen4State::row_capture_bytes_scoped`, `native_mtp_window_rows` rows): each
 /// band arms capture before its target snapshot. The output band, which owns
 /// the head and the request buffers, additionally charges
 /// `Qwen4MtpGpu::device_bytes` and `native_mtp_request_bytes` WITHOUT capture
@@ -1161,7 +1163,7 @@ pub fn native_mtp_census_scope(
         Some(gdn) => crate::state::Qwen4State::row_capture_bytes_scoped(
             config,
             gdn,
-            mtp.max_k.clamp(1, 10) + 1,
+            crate::mtp_spec::native_mtp_window_rows(mtp.max_k),
             gdn_layers,
         )
         .and_then(|bytes| u64::try_from(bytes).ok())

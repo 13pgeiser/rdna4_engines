@@ -8238,6 +8238,15 @@ pub fn native_mtp_device_bytes(
         .checked_add(u64::try_from(scratch).ok()?.max(request))
 }
 
+/// Rows a native MTP request sizes for windows of up to `max_k` drafts (pass
+/// [`native_mtp_proposal_drafts`], which counts n-gram takeovers): the seed
+/// row plus `max_k` clamped to the widest verify forward
+/// (`QWEN4_SPEC_VERIFY_ROWS - 1` drafts). The verify hidden rows and the GDN
+/// row capture of every band are sized by it.
+pub(crate) fn native_mtp_window_rows(max_k: usize) -> usize {
+    max_k.clamp(1, QWEN4_SPEC_VERIFY_ROWS - 1) + 1
+}
+
 /// Device bytes the first speculative request of a native MTP load of
 /// `max_seq` tokens allocates once and keeps (after the head attached): the
 /// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
@@ -8253,7 +8262,7 @@ pub fn native_mtp_request_bytes(
     row_capture: Option<crate::GdnStateFormat>,
     batched_fill: bool,
 ) -> Option<u64> {
-    let rows = max_k.clamp(1, QWEN4_SPEC_VERIFY_ROWS - 1) + 1;
+    let rows = native_mtp_window_rows(max_k);
     let hidden_row = config
         .hc_count
         .checked_mul(config.hidden_size)?
