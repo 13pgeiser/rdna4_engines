@@ -30,6 +30,9 @@ const MQ_I4_MOE_GEMV_IMAGES: [&[u8]; 2] = [
     kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
 ];
 
+/// Explicit arguments supplied through HIP's kernelParams launch path.
+const MQ_I4_MOE_GEMV_KERNARG_COUNT: usize = 17;
+
 /// K1 symbols in bucket order: `[codec][kind]`, codec 0 = W3 (`MQ3I4`),
 /// 1 = MQ4 (`Mq4Sym`), kind 0 = gate/up (R256), 1 = down (R128).
 pub const MQ_I4_MOE_GEMV_SYMBOLS: [[&str; 2]; 2] = [
@@ -376,7 +379,9 @@ impl Gpu {
                 y_stride as u32,
             );
             let nexp = SLAB_EXPERTS as u32;
-            let mut params = [
+            // Metadata lists reserved@92 as argument 17, not implicit struct padding.
+            let reserved = 0u32;
+            let mut params: [*mut c_void; MQ_I4_MOE_GEMV_KERNARG_COUNT] = [
                 &wp as *const _ as *mut c_void,
                 &ids as *const _ as *mut c_void,
                 &offs as *const _ as *mut c_void,
@@ -393,6 +398,7 @@ impl Gpu {
                 &xs as *const _ as *mut c_void,
                 &ys as *const _ as *mut c_void,
                 &nexp as *const _ as *mut c_void,
+                &reserved as *const _ as *mut c_void,
             ];
             let (grid_m, block) = if wide {
                 (mv.div_ceil(8), 256)
@@ -525,5 +531,60 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use peacemaker_ir::{envelope::Source, inst::Arch};
+    use peacemaker_lift::bundle::SourceCodec;
+
+    #[test]
+    fn k1_kernel_params_match_embedded_metadata() {
+        let mut mismatches = Vec::new();
+        let mut checked = 0;
+        for (arch, bytes) in [Arch::Gfx1151, Arch::Gfx1201]
+            .into_iter()
+            .zip(MQ_I4_MOE_GEMV_IMAGES)
+        {
+            let (_, images) = Source::read(bytes, arch).expect("embedded K1 metadata must parse");
+            for symbol in MQ_I4_MOE_GEMV_SYMBOLS
+                .iter()
+                .flatten()
+                .chain(MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten())
+            {
+                let image = images
+                    .iter()
+                    .find(|image| image.name == *symbol)
+                    .unwrap_or_else(|| panic!("{arch:?}: missing K1 symbol {symbol}"));
+                let metadata = &image.metadata.parsed;
+                assert_eq!(metadata.kernarg_segment_size, 96, "{arch:?}: {symbol}");
+                let reserved = metadata.args.last().expect("K1 arguments");
+                assert_eq!(
+                    (
+                        reserved.name.as_str(),
+                        reserved.offset,
+                        reserved.size,
+                        reserved.value_kind.as_str()
+                    ),
+                    ("reserved", 92, 4, "by_value"),
+                    "{arch:?}: {symbol}"
+                );
+                let explicit = metadata
+                    .args
+                    .iter()
+                    .filter(|arg| !arg.value_kind.starts_with("hidden_"))
+                    .count();
+                if explicit != MQ_I4_MOE_GEMV_KERNARG_COUNT {
+                    mismatches.push(format!(
+                        "{arch:?}: {symbol}: kernelParams={MQ_I4_MOE_GEMV_KERNARG_COUNT}, declared={explicit}"
+                    ));
+                }
+                checked += 1;
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+        println!("checked {checked} embedded K1 entries against kernelParams");
     }
 }

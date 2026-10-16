@@ -16339,7 +16339,7 @@ impl Gpu {
             [row_tiles, slot_tiles, 1],
             [32, 1, 1],
             0,
-            params; ep, tp, sp, xp, yp, m_val, k_val, xrd_val, mt_val, xsr_val
+            params; ep, tp, sp, xp, yp, m_val, k_val, xrd_val, mt_val, xsr_val, n_experts_val
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -51340,6 +51340,163 @@ mod route_selector_tests {
         assert_ne!(
             crate::code_object::CodeObjectId::of(nt1),
             crate::code_object::CodeObjectId::of(kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201)
+        );
+    }
+}
+
+#[cfg(test)]
+mod mq2_gfx1030_moe_abi_tests {
+    #[test]
+    fn grouped_mmq_params_and_blob_match_hip_declaration() {
+        // This probe is JIT-only: inspect the declaration passed to hipcc,
+        // not an unrelated architecture's precompiled kernel metadata.
+        let hip = super::kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MMQ_GFX1030_SRC;
+        let hip = hip
+            .lines()
+            .map(|line| line.split("//").next().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let declaration = hip
+            .split("void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(")
+            .nth(1)
+            .expect("HIP entry declaration");
+        let declared = declaration
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .filter(|arg| !arg.trim().is_empty())
+            .count();
+        let source = include_str!("gemm.rs");
+        let method = source
+            .split("pub fn gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(")
+            .nth(1)
+            .unwrap();
+        let params = method
+            .split("let mut params:")
+            .nth(1)
+            .unwrap()
+            .split("vec![")
+            .nth(1)
+            .unwrap()
+            .split("];")
+            .next()
+            .unwrap();
+        assert_eq!(
+            params
+                .lines()
+                .filter(|line| line.contains("c_void"))
+                .count(),
+            declared,
+            "actual kernelParams initializer"
+        );
+        let call = method
+            .split("let result = launch_params_blob!(")
+            .nth(1)
+            .unwrap()
+            .split(");")
+            .next()
+            .unwrap();
+        let values = call
+            .split("params;")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .filter(|value| !value.trim().is_empty())
+            .count();
+        assert_eq!(
+            values, declared,
+            "actual launch_params_blob captured values"
+        );
+    }
+
+    fn check_live_gemma_launcher(method: &str, hip: &str, symbol: &str) {
+        let hip = hip
+            .lines()
+            .map(|line| line.split("//").next().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let declaration = hip
+            .split(&format!("void {symbol}("))
+            .nth(1)
+            .expect("HIP entry declaration");
+        let declared = declaration
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .filter(|arg| !arg.trim().is_empty())
+            .count();
+        let source = include_str!("gemm.rs");
+        let body = source.split(&format!("pub fn {method}(")).nth(1).unwrap();
+        let params = body
+            .split("let mut params:")
+            .nth(1)
+            .unwrap()
+            .split("vec![")
+            .nth(1)
+            .unwrap()
+            .split("];")
+            .next()
+            .unwrap();
+        assert_eq!(
+            params
+                .lines()
+                .filter(|line| line.contains("c_void"))
+                .count(),
+            declared,
+            "{method}: actual kernelParams"
+        );
+        let blob = body
+            .split("let mut b = hip_bridge::KernargBlob::new();")
+            .nth(1)
+            .unwrap()
+            .split("b\n")
+            .next()
+            .unwrap();
+        assert_eq!(
+            blob.matches("b.push_").count(),
+            declared,
+            "{method}: captured blob"
+        );
+    }
+
+    #[test]
+    fn live_mq4_gate_up_params_match_hip_declarations() {
+        for (hip, symbol) in [
+            (
+                super::kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+                "HIPFIRE_MOE_GATE_UP_KERNEL",
+            ),
+            (
+                super::kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+            ),
+        ] {
+            if symbol == "HIPFIRE_MOE_GATE_UP_KERNEL" {
+                assert!(hip.contains(
+                    "#define HIPFIRE_MOE_GATE_UP_KERNEL gemv_hfq4g256_moe_gate_up_k8_indexed"
+                ));
+            }
+            check_live_gemma_launcher("gemv_mq4g256_moe_gate_up_k8_indexed", hip, symbol);
+        }
+    }
+
+    #[test]
+    fn live_q8_gate_up_params_match_hip_declaration() {
+        check_live_gemma_launcher(
+            "gemv_q8_0_moe_gate_up_k8_indexed",
+            super::kernels::GEMV_Q8_0_MOE_GATE_UP_K8_INDEXED_SRC,
+            "gemv_q8_0_moe_gate_up_k8_indexed",
+        );
+    }
+
+    #[test]
+    fn live_q8_down_params_match_hip_declaration() {
+        check_live_gemma_launcher(
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+            super::kernels::GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
         );
     }
 }

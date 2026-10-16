@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **K1 slab GEMV launches supply every declared kernel argument.** The normal HIP `kernelParams` path now passes the zero `reserved@92` argument after `n_experts`, matching the 17 explicit arguments in the narrow and wide gfx1151/gfx1201 PeaceMaker images and preventing a host-side out-of-bounds pointer read. A GPU-free regression test checks every selectable embedded entry's metadata. The companion launcher audit also restores the missing expert-count argument in the gfx1030 MQ2-Lloyd grouped MMQ probe's blob argument list (CPU-verified only). Kernel images and the existing K1 96-byte blob path are unchanged.
 - **hipfire-tui: Models-tab pulls, serve status, Chat scrolling and profile apply work as a new user expects.**
   - **Pull:** the Models tab runs `hipfire pull <tag> --yes` with stdin closed, so the CLI's line prompt no longer hangs the pull at 0 % and swallows keys. `c` cancels a pull (the child is killed and reaped), quitting while one runs asks y/n first, and no `hipfire pull` outlives the TUI. `p` on an entry with PLE rows or draft sidecars opens a chooser that passes `--ple q4|q8` / `--no-draft`.
   - **Serve status:** `/health` is polled every 2 s on every tab (450 ms timeout), so Chat and Logs no longer report `HTTP not ready` for a live serve. Chat Enter queues the prompt until the serve is online and sends it then (Esc cancels); it starts `hipfire serve -d` only once the first check says the serve is down and no serve process exists.
