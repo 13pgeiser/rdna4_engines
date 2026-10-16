@@ -1146,13 +1146,13 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(pad(area, 1, 0));
     let registry_label = registry_label(app);
-    // Whole parts only: at 80 columns a long active tag drops `aliases`
-    // instead of cutting the registry label mid-date.
+    // Whole parts only, most useful first: at 80 columns `aliases` drops out
+    // instead of the registry label being cut mid-date.
     let summary = fit_segments(
         &[
             format!("active: {}", app.active_model),
             format!(
-                "{} downloaded / {} available",
+                "{} of {} downloaded",
                 app.registry.downloaded_count(),
                 app.registry.models.len()
             ),
@@ -1204,7 +1204,9 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     const SIZE_W: usize = 9;
     const VRAM_W: usize = 7;
     const COL_GAPS: usize = 4;
-    const NOTES_MIN: usize = 30;
+    // Notes is the most expendable column: at 80 columns the full tag
+    // (`qwen3.8:flash-next-mq3-xts`) matters more than the description.
+    const NOTES_MIN: usize = 14;
     let inner_w = chunks[1].width.saturating_sub(2) as usize;
     let longest_tag = visible_items
         .iter()
@@ -1235,11 +1237,13 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     expanded,
                 } => {
                     let marker = if *expanded { "v" } else { ">" };
-                    // The action hint belongs to the selected group only.
+                    // The action hint belongs to the selected group only, and
+                    // stays short enough for the 80-column Notes cell (Enter
+                    // toggles too; the footer says so).
                     let hint = match (selected, *expanded) {
                         (false, _) => "",
-                        (true, false) => "Enter/Right to expand",
-                        (true, true) => "Enter/Left to collapse",
+                        (true, false) => "\u{2192} expand",
+                        (true, true) => "\u{2190} collapse",
                     };
                     Row::new([
                         format!("{marker} {name}"),
@@ -3731,7 +3735,7 @@ mod render_tests {
                 "{w}x{h}: Have is local/remote only"
             );
             assert_eq!(
-                text.matches("Enter/Right to expand").count(),
+                text.matches("\u{2192} expand").count(),
                 1,
                 "{w}x{h}: only the selected group carries the action hint"
             );
