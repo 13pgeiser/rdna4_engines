@@ -841,6 +841,23 @@ fn searched(bases: &[PathBuf], format: PleFormat) -> String {
         .join(" and ")
 }
 
+/// Resolve existing PLE rows for validation tools, without deriving missing q4.
+/// Oracle, parity and replay gates share this entrypoint and attachment policy.
+pub fn attach_validation_ple_rows(
+    hfq: &mut HfqFile,
+    model_path: &Path,
+    request: PleFormatRequest,
+    gpu_arch: &str,
+) -> Result<PleRowsChoice, String> {
+    resolve_and_attach_ple_rows(
+        hfq,
+        model_path,
+        request,
+        gpu_arch,
+        ResolvePolicy { derive_missing_q4: false, progress: None },
+    )
+}
+
 /// Pick the PLE rows source for a Qwen4 model and bind it.
 ///
 /// Base kinds: **monolithic** (the shard tensors are in the index) and
@@ -2350,6 +2367,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Q8_0") && err.contains("Q4LM"), "{err}");
+    }
+
+    #[test]
+    fn validation_split_q4_policy_refuses_without_deriving() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("validation-base.hfqm");
+        let sha = q8_rows_sha(2);
+        write_split(&base, &sha);
+        let q8 = sidecar_of(&base, PleFormat::Q8);
+        let q4 = sidecar_of(&base, PleFormat::Q4);
+        write_bound_sidecar(&q8, &base, RowEncoding::Q8F16, &sha, 2);
+        let mut hfq = HfqFile::open(&base).unwrap();
+        let error =
+            attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201")
+                .unwrap_err();
+        assert!(!q4.exists(), "validation must never derive a missing q4 table");
+        assert!(error.contains(q4.to_str().unwrap()));
+        assert!(hfq.ple_rows().is_none());
+        write_bound_sidecar(&q4, &base, RowEncoding::Q4Lm, &sha, 2);
+        let choice =
+            attach_validation_ple_rows(&mut hfq, &base, PleFormatRequest::Q4, "gfx1201")
+                .unwrap();
+        assert_eq!(
+            choice,
+            PleRowsChoice {
+                format: PleFormat::Q4,
+                origin: PleRowsOrigin::Sidecar(q4),
+                derived: false,
+                note: None,
+            }
+        );
+        assert!(hfq.ple_rows().is_some());
+        let mut replay = HfqFile::open(&base).unwrap();
+        let replay_choice = resolve_and_attach_ple_rows(
+            &mut replay,
+            &base,
+            PleFormatRequest::Q4,
+            "gfx1201",
+            ResolvePolicy { derive_missing_q4: false, progress: None },
+        )
+        .unwrap();
+        assert_eq!(choice, replay_choice);
     }
 
     #[test]

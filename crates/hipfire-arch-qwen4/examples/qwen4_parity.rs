@@ -5,6 +5,8 @@
 //! Run the generated Qwen4 operator oracle on the production HIP path,
 //! execute the production HFQM carrier on the fixed teacher-forced corpus, or
 //! exercise real-model state/MTP rollback plus compact arena fault scenarios.
+//! Split bases resolve existing PLE sidecars using `HIPFIRE_PLE_FORMAT`.
+//! Like the replay gate, this tool never derives missing q4 rows.
 //!
 //! Fixture usage:
 //!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
@@ -3857,6 +3859,8 @@ fn run_quality_candidate(
     let mut hfq = HfqFile::open(model_path)
         .map_err(|error| format!("open HFQM {}: {error}", model_path.display()))?;
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(&mut hfq, model_path, hipfire_config::memory::ple_format(), &gpu.arch)
+    .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
@@ -3938,7 +3942,7 @@ fn run_quality_candidate(
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let placements = placements;
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_ple_rows(
         config.clone(),
         &manifest.identity.recipe,
         transaction,
@@ -3946,8 +3950,10 @@ fn run_quality_candidate(
         &mut gpu,
         2048,
         metadata,
+        receipt.ple_rows,
         hipfire_arch_qwen4::Qwen4StateFormat::F32,
         backend,
+        None,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));

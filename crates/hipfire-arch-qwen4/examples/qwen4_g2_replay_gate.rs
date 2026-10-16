@@ -53,7 +53,7 @@ use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
-use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, ResolvePolicy};
+use hipfire_runtime::ple_sidecar::attach_validation_ple_rows;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::replay::{ReplayObservation, ReplayState, ShadowBodyRoute};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -227,15 +227,11 @@ fn load_bundle(
         HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
     // Never derives a missing q4 PLE table: derive it with
     // `hipfire ple derive` (or a serve load) first.
-    let choice = resolve_and_attach_ple_rows(
+    let choice = attach_validation_ple_rows(
         &mut hfq,
         path,
         hipfire_config::memory::ple_format(),
         &gpu.arch,
-        ResolvePolicy {
-            derive_missing_q4: false,
-            progress: None,
-        },
     )
     .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
     eprintln!("qwen4_g2_replay_gate: ple rows: {}", choice.format.name());

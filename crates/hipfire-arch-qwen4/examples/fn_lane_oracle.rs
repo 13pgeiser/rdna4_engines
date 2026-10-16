@@ -84,6 +84,9 @@
 //! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
 //! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
 //! rest host-mapped and borrowed from the resident source bytes.
+//!
+//! Split bases resolve existing PLE sidecars using `HIPFIRE_PLE_FORMAT`.
+//! Like the replay gate, this tool never derives missing q4 rows.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
@@ -2443,6 +2446,8 @@ fn load(
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
     let mut gpu = Gpu::init().map_err(e)?;
+    hipfire_runtime::ple_sidecar::attach_validation_ple_rows(&mut hfq, path, hipfire_config::memory::ple_format(), &gpu.arch)
+    .map_err(|error| format!("qwen4 PLE rows: {error}"))?;
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
     let receipt = admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)).map_err(e)?;
@@ -2523,7 +2528,7 @@ fn load(
         &receipt.config,
     )?;
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-    let mut bundle = Qwen4Bundle::assemble_with_metadata(
+    let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &receipt.manifest.identity.recipe,
         transaction,
@@ -2531,8 +2536,10 @@ fn load(
         &mut gpu,
         max_seq,
         receipt.ple,
+        receipt.ple_rows,
         state_format,
         backend,
+        None,
     )
     .map_err(e)?;
     bundle.attach_forward(&mut gpu, max_seq, scratch_mode).map_err(e)?;
