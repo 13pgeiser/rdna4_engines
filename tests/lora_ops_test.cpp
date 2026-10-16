@@ -1,4 +1,4 @@
-/* lora_test.cpp -- lora_shrink and lora_expand in libref and libavx, over one case matrix.
+/* lora_ops_test.cpp -- lora_shrink and lora_expand in libref and libavx, over one case matrix.
  *
  * The matrix and the checks are tests/r4d_emu/lora_cases.h's, the same ones the r4d emulator test
  * holds libr4d's kernels to: M in {1, 3, 17, 64, 130}, R in {16, 32, 48}, S = 4, K and N in
