@@ -30,10 +30,11 @@ pub const MAX_QUESTION_TOKENS: usize = 32_000;
 pub enum QuestionKind {
     Choice {
         keys: Vec<String>,
-        descriptions: Vec<String>,
+        /// `None` when the criteria value is JSON `null`.
+        descriptions: Vec<Option<String>>,
     },
     Score {
-        levels: Vec<String>,
+        levels: Vec<Option<String>>,
     },
     Noul {
         true_desc: Option<String>,
@@ -65,10 +66,13 @@ pub fn render_state(v: &Value) -> String {
     }
 }
 
-fn desc_string(v: &Value) -> String {
+/// A criteria value as an optional description: JSON `null` is "no
+/// description" (never the literal text `null`).
+fn desc_string(v: &Value) -> Option<String> {
     match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
     }
 }
 
@@ -133,13 +137,16 @@ pub fn parse_questions(v: &Value) -> Result<Vec<Question>, String> {
                         format!("{name}.criteria must be an object {{true, false}}")
                     })?;
                     for (k, val) in obj {
-                        let s = val
-                            .as_str()
-                            .ok_or_else(|| format!("{name}.criteria.{k} must be a string"))?
-                            .to_string();
+                        let s = match val {
+                            Value::Null => None,
+                            Value::String(s) => Some(s.clone()),
+                            _ => {
+                                return Err(format!("{name}.criteria.{k} must be a string or null"))
+                            }
+                        };
                         match k.as_str() {
-                            "true" => t = Some(s),
-                            "false" => f = Some(s),
+                            "true" => t = s,
+                            "false" => f = s,
                             _ => return Err(format!("{name}.criteria keys must be true/false")),
                         }
                     }
@@ -288,9 +295,24 @@ pub fn labels_for(
 /// The question block (instructions, labelled options, answer line). Plain
 /// mode prefixes the state block; session mode sends it as its own turn.
 pub fn build_question_text(q: &Question, labels: &[String]) -> String {
-    let descs: Vec<String> = match &q.kind {
-        QuestionKind::Choice { descriptions, .. } => descriptions.clone(),
-        QuestionKind::Score { levels } => levels.clone(),
+    // One line per option: `{code}. {text}`. Choice text is always the
+    // criteria key, followed by `: {description}` only when one is present.
+    // Score has no key (the code is the level), so an absent level prints the
+    // code again; noul falls back to `yes` / `no`.
+    let texts: Vec<String> = match &q.kind {
+        QuestionKind::Choice { keys, descriptions } => keys
+            .iter()
+            .zip(descriptions)
+            .map(|(k, d)| match d {
+                Some(d) => format!("{k}: {d}"),
+                None => k.clone(),
+            })
+            .collect(),
+        QuestionKind::Score { levels } => levels
+            .iter()
+            .zip(labels)
+            .map(|(d, label)| d.clone().unwrap_or_else(|| label.clone()))
+            .collect(),
         QuestionKind::Noul {
             true_desc,
             false_desc,
@@ -300,8 +322,8 @@ pub fn build_question_text(q: &Question, labels: &[String]) -> String {
         ],
     };
     let mut s = format!("Question: {}\nOptions:\n", q.instructions);
-    for (label, desc) in labels.iter().zip(descs.iter()) {
-        s.push_str(&format!("{label}. {desc}\n"));
+    for (label, text) in labels.iter().zip(texts.iter()) {
+        s.push_str(&format!("{label}. {text}\n"));
     }
     s.push_str("\nAnswer with the option code only.");
     s
@@ -654,7 +676,7 @@ mod tests {
                 assert_eq!(keys, &vec!["billing".to_string(), "shipping".to_string()]);
                 assert_eq!(
                     descriptions,
-                    &vec!["money".to_string(), "parcels".to_string()]
+                    &vec![Some("money".to_string()), Some("parcels".to_string())]
                 );
             }
             _ => panic!("wrong kind"),
@@ -758,7 +780,14 @@ mod tests {
         match &r.questions[1].kind {
             QuestionKind::Choice { keys, descriptions } => {
                 assert_eq!(keys, &vec!["shipping", "billing", "general"]);
-                assert_eq!(descriptions, &vec!["x", "y", "z"]);
+                assert_eq!(
+                    descriptions,
+                    &vec![
+                        Some("x".to_string()),
+                        Some("y".to_string()),
+                        Some("z".to_string())
+                    ]
+                );
             }
             other => panic!("wrong kind {other:?}"),
         }
@@ -823,7 +852,7 @@ mod tests {
             name: "s".into(),
             instructions: "i".into(),
             kind: QuestionKind::Score {
-                levels: vec!["a".into(), "b".into(), "c".into()],
+                levels: vec![Some("a".into()), Some("b".into()), Some("c".into())],
             },
         };
         assert_eq!(labels_for(&score, all).unwrap(), vec!["0", "1", "2"]);
@@ -844,7 +873,7 @@ mod tests {
             name: "s".into(),
             instructions: "i".into(),
             kind: QuestionKind::Score {
-                levels: vec!["a".into(), "b".into()],
+                levels: vec![Some("a".into()), Some("b".into())],
             },
         };
         assert!(labels_for(&score, |s: &str| s != "1").is_err());
@@ -866,11 +895,11 @@ mod tests {
             instructions: "Which queue?".into(),
             kind: QuestionKind::Choice {
                 keys: vec!["billing".into(), "shipping".into()],
-                descriptions: vec!["money".into(), "parcels".into()],
+                descriptions: vec![Some("money".into()), Some("parcels".into())],
             },
         };
         let t = build_user_text("the state", &q, &["A".into(), "B".into()]);
-        assert_eq!(t, "State:\nthe state\n\nQuestion: Which queue?\nOptions:\nA. money\nB. parcels\n\nAnswer with the option code only.");
+        assert_eq!(t, "State:\nthe state\n\nQuestion: Which queue?\nOptions:\nA. billing: money\nB. shipping: parcels\n\nAnswer with the option code only.");
         let n = Question {
             name: "n".into(),
             instructions: "Angry?".into(),
@@ -881,6 +910,74 @@ mod tests {
         };
         let t = build_user_text("s", &n, &["Yes".into(), "No".into()]);
         assert!(t.ends_with("Options:\nYes. shouting\nNo. no\n\nAnswer with the option code only."));
+    }
+
+    #[test]
+    fn choice_null_description_renders_key_only_never_literal_null() {
+        let q = parse_questions(&json!({"questions": {"q": {
+            "type": "choice", "instructions": "Pick one",
+            "criteria": {"a": null, "b": "desc"}}}}))
+        .unwrap()
+        .remove(0);
+        let labels = vec!["A".to_string(), "B".to_string()];
+        let t = build_question_text(&q, &labels);
+        assert_eq!(
+            t,
+            "Question: Pick one\nOptions:\nA. a\nB. b: desc\n\nAnswer with the option code only."
+        );
+        assert!(!t.contains("null"));
+        // Readout codes are unchanged by the key/description text.
+        assert_eq!(labels_for(&q, |_: &str| true).unwrap(), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn choice_all_null_and_non_string_descriptions() {
+        let q = parse_questions(&json!({"questions": {"q": {
+            "type": "choice", "instructions": "i",
+            "criteria": {"x": null, "y": null, "z": 5}}}}))
+        .unwrap()
+        .remove(0);
+        let labels: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+        assert!(build_question_text(&q, &labels).contains("Options:\nA. x\nB. y\nC. z: 5\n"));
+    }
+
+    #[test]
+    fn score_null_level_prints_its_code_never_literal_null() {
+        let q = parse_questions(&json!({"questions": {"q": {
+            "type": "score", "instructions": "i",
+            "criteria": [null, "mid", "high"]}}}))
+        .unwrap()
+        .remove(0);
+        let labels: Vec<String> = ["0", "1", "2"].iter().map(|s| s.to_string()).collect();
+        let t = build_question_text(&q, &labels);
+        assert!(t.contains("Options:\n0. 0\n1. mid\n2. high\n"));
+        assert!(!t.contains("null"));
+    }
+
+    #[test]
+    fn noul_null_absent_and_present_descriptions() {
+        let q = parse_questions(&json!({"questions": {"q": {
+            "type": "noul", "instructions": "i",
+            "criteria": {"true": null, "false": "calm"}}}}))
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            q.kind,
+            QuestionKind::Noul {
+                true_desc: None,
+                false_desc: Some("calm".into())
+            }
+        );
+        let labels = vec!["Yes".to_string(), "No".to_string()];
+        let t = build_question_text(&q, &labels);
+        assert!(t.contains("Options:\nYes. yes\nNo. calm\n"));
+        assert!(!t.contains("null"));
+        let bad = err_of(json!({"state": "s", "questions": {"q": {
+            "type": "noul", "instructions": "i", "criteria": {"true": 3}}}}));
+        assert!(
+            bad.contains("q.criteria.true must be a string or null"),
+            "{bad}"
+        );
     }
 
     #[test]
@@ -901,7 +998,7 @@ mod tests {
             instructions: "i".into(),
             kind: QuestionKind::Choice {
                 keys: keys.iter().map(|s| s.to_string()).collect(),
-                descriptions: keys.iter().map(|s| s.to_string()).collect(),
+                descriptions: keys.iter().map(|_| None).collect(),
             },
         }
     }
@@ -949,7 +1046,12 @@ mod tests {
             name: "s".into(),
             instructions: "i".into(),
             kind: QuestionKind::Score {
-                levels: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                levels: vec![
+                    Some("a".into()),
+                    Some("b".into()),
+                    Some("c".into()),
+                    Some("d".into()),
+                ],
             },
         };
         // Jev synth score row: probs [0, .05, .89, .06], confidence .89.
@@ -1003,7 +1105,7 @@ mod tests {
             instructions: "i".into(),
             kind: QuestionKind::Choice {
                 keys: vec!["A".into()],
-                descriptions: vec!["only".into()],
+                descriptions: vec![Some("only".into())],
             },
         };
         assemble_answer(&q, &[0.0], 1.0);
@@ -1142,7 +1244,7 @@ mod tests {
             name: "s".into(),
             instructions: "i".into(),
             kind: QuestionKind::Score {
-                levels: vec!["a".into(), "b".into(), "c".into()],
+                levels: vec![Some("a".into()), Some("b".into()), Some("c".into())],
             },
         };
         let z = [0.0f32, 1.0, 3.0];
@@ -1166,7 +1268,7 @@ mod tests {
             name: "s".into(),
             instructions: "i".into(),
             kind: QuestionKind::Score {
-                levels: vec!["x".into(), "y".into()],
+                levels: vec![Some("x".into()), Some("y".into())],
             },
         };
         let n = Question {
