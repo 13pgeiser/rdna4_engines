@@ -52,6 +52,8 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+#[cfg(target_os = "linux")]
+mod doctor;
 mod emu;
 mod kernel_pack;
 mod npu_trunk;
@@ -166,6 +168,9 @@ pub(crate) enum Commands {
     Ple(ple::PleArgs),
     /// Write a keyed NPU trunk calibration from offline measurement inputs.
     CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
+    /// Check this machine for the Strix Halo NPU trunk route and measure it (--npu).
+    #[cfg(target_os = "linux")]
+    Doctor(doctor::DoctorArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1005,6 +1010,8 @@ fn run() -> Result<()> {
         Some(Commands::Pull(args)) => pull_command(&paths, args),
         Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
         Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
+        #[cfg(target_os = "linux")]
+        Some(Commands::Doctor(args)) => doctor::doctor_command(&paths, args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
@@ -1046,6 +1053,28 @@ fn run() -> Result<()> {
             crate::serve::serve_command(&paths, args)
         }
     }
+}
+
+/// Persist one global user override and return what `hipfire config set` prints.
+/// `doctor --npu --apply` shares this so both write the same way.
+pub(crate) fn set_global_config(paths: &Paths, key: &str, value: &str) -> Result<String> {
+    let mut loaded = load_global(&paths.config)?;
+    loaded.layer.set_cli(key, value)?;
+    write_global_toml(&paths.config, &loaded.layer)?;
+    let canonical = canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
+    let value = loaded
+        .layer
+        .get(&canonical)
+        .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
+    let mut line = format!("{canonical} = {value}");
+    if loaded.format == ConfigFormat::LegacyJson {
+        line.push_str(&format!(
+            "\nmigrated active configuration to {}; preserved {} as a rollback copy",
+            paths.config.config_toml.display(),
+            paths.config.config_json.display()
+        ));
+    }
+    Ok(line)
 }
 
 fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
@@ -1173,22 +1202,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             Ok(())
         }
         ConfigAction::Set { key, value } => {
-            let mut loaded = load_global(&paths.config)?;
-            loaded.layer.set_cli(&key, &value)?;
-            write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
-            let value = loaded
-                .layer
-                .get(&canonical)
-                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
-            println!("{canonical} = {value}");
-            if loaded.format == ConfigFormat::LegacyJson {
-                println!(
-                    "migrated active configuration to {}; preserved {} as a rollback copy",
-                    paths.config.config_toml.display(),
-                    paths.config.config_json.display()
-                );
-            }
+            println!("{}", set_global_config(paths, &key, &value)?);
             Ok(())
         }
         ConfigAction::Reset { key } => {
