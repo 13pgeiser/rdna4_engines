@@ -20,6 +20,12 @@
 #include <string>
 #include <vector>
 
+/* sqrt(n_embd) rounded to bf16: the reference's embedding module multiplies the looked-up rows by
+ * `embed_scale.to(bf16)`, 73.5 at 5376 and not 73.32. */
+static double embed_scale(int64_t n) {
+    return rad_bf16_to_f32(rad_f32_to_bf16((float)std::sqrt((double)n)));
+}
+
 namespace gemma4_bf16 {
 
 using namespace rad::arch;
@@ -828,7 +834,7 @@ int Gemma4Head::declare(RadBuilder* b, Names& nm, const RadModelMeta* meta, cons
                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", n_trunk),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", std::sqrt((double)n_trunk))),
+                               RAD_F64("mult", embed_scale(n_trunk))),
                     RAD_WEIGHTS(w_tok)),
                   {}, {b_e});
     if (g.world > 1)
@@ -1264,12 +1270,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The embedding is scaled by sqrt(n_embd) at the lookup, not in the table (as in llama.cpp's
      * build_inp_embd and HF's ScaledWordEmbedding), so the plain table stays tied to the head.
-     * Without it the token signal in the residual stream would be ~73x too small. */
+     * Without it the token signal in the residual stream would be ~73x too small. The scale is
+     * sqrt(n_embd) rounded to bf16, as the reference multiplies by it (embed_scale: 73.5
+     * at 5376, not 73.32). The first norm hides the difference but the residual stream does not,
+     * and the DFlash drafter was trained on the reference's hidden states. */
     m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n_embd", g.n_embd),
                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
                                RAD_INT("vocab_offset", g.vocab_off),
-                               RAD_F64("mult", std::sqrt((double)g.n_embd))),
+                               RAD_F64("mult", embed_scale(g.n_embd))),
                     RAD_WEIGHTS(m.w_tok)),
                    {}, {m.b_x});
     if (g.world > 1)

@@ -5502,10 +5502,11 @@ TEST(gemma4_final_norm_softcap_and_vocab) {
     CHECK(find_map(b, "output.weight") != nullptr);
 
     /* The embedding is scaled by sqrt(n_embd) at lookup (as the reference's build_inp_embd and
-     * HF's ScaledWordEmbedding do), not baked into the table, so the table stays tied to the head. */
+     * HF's ScaledWordEmbedding do), not baked into the table, so the table stays tied to the head.
+     * HF multiplies by `embed_scale.to(bf16)`, so sqrt(5376) = 73.32 is 73.5. */
     const RecOp* el = find_op(b, "embed_lookup", 0);
     CHECK(el != nullptr);
-    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+    CHECK_NEAR(pflt(el, "mult"), 73.5, 1e-9);
 }
 
 TEST(gemma4_every_op_declares_the_buffers_it_touches) {
@@ -5806,11 +5807,12 @@ TEST(gemma4_assistant_is_a_serial_head_with_no_cache_of_its_own) {
     REQUIRE(mpre != nullptr);
     CHECK_EQ(mpre->src[0], std::string("draft.pre_projection.weight"));
 
-    /* The entry embeds through the trunk's table with the trunk's scale. */
+    /* The entry embeds through the trunk's table with the trunk's scale, sqrt(5376) rounded to
+     * bf16 as the reference's embedding module holds it. */
     const RecOp* el = find_op(b, "embed_lookup", 1);
     REQUIRE(el != nullptr);
     CHECK_EQ(pint(el, "n_embd"), 5376);
-    CHECK_NEAR(pflt(el, "mult"), std::sqrt(5376.0), 1e-9);
+    CHECK_NEAR(pflt(el, "mult"), 73.5, 1e-9);
     CHECK(el->w.size() == 1 && find_op(b, "embed_lookup", 0)->w == el->w);
 
     for (const auto& o : b.ops)
@@ -9017,13 +9019,13 @@ struct ArchCases {
             lfm2_bf16::step, 0, {}, 0x1775b188dc4a5120ull);
         add("gemma4_bf16", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x0cbeb3ccf57a622cull);
+            gemma4_bf16::step, 0, {}, 0xafc23087c634a537ull);
         add("gemma4_bf16, w4a8", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(1, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            gemma4_bf16::step, 0, {}, 0x0fbef815d409efd1ull);
+            gemma4_bf16::step, 0, {}, 0x719fa07788f8b98aull);
         add("gemma4_bf16, w4a8, two ranks", [this, sc, g4w4](RadBuilder* b) {
                 g4w4(b); auto c = sc(2, 0); return gemma4_bf16::declare(b, &g4, &c); },
-            nullptr, 0, {}, 0x3d3d4c65aeefe59aull);
+            nullptr, 0, {}, 0x93b174ab52cc0d31ull);
         add("gemma4", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 0); return gemma4::declare(b, &g4m, &c); },
             gemma4::step, 0, {}, 0x0f227f5853b6488cull);
