@@ -63,8 +63,12 @@ pub const HOTSET_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET";
 pub const SIDECAR_KIND: &str = "hipfire.qwen4.expert_hotset";
 /// `version` of the sidecar schema this module reads.
 pub const SIDECAR_VERSION: u64 = 1;
-/// The only GPU architecture the hotset runs on.
+/// The GPU architecture the default (sibling sidecar) hotset runs on.
 pub const HOTSET_ARCH: &str = "gfx1201";
+/// Architecture that runs the hotset only from an explicit
+/// [`HOTSET_ENV`] sidecar path (opt-in; the sibling sidecar is not applied
+/// there by default). The MQ4 tier kernels carry no arch guard.
+pub const HOTSET_OPT_IN_ARCH: &str = "gfx1100";
 /// Log prefix of every hotset line.
 pub const LOG_PREFIX: &str = "  qwen4 expert hot set: ";
 
@@ -204,9 +208,11 @@ impl fmt::Display for HotsetSkip {
         match self {
             Self::Disabled => write!(f, "{HOTSET_ENV}=0"),
             Self::Missing { .. } => f.write_str("sidecar not found"),
-            Self::NotGfx1201(arch) => {
-                write!(f, "gpu is {arch}; the hotset runs on {HOTSET_ARCH} only")
-            }
+            Self::NotGfx1201(arch) => write!(
+                f,
+                "gpu is {arch}; the default hotset runs on {HOTSET_ARCH} only \
+                 ({HOTSET_OPT_IN_ARCH} needs an explicit {HOTSET_ENV} path)"
+            ),
             Self::UnifiedMemory => {
                 f.write_str("unified-memory/use_ranges loading does not use the hotset")
             }
@@ -260,7 +266,8 @@ pub fn decide_environment(
             explicit: policy.is_explicit(),
         });
     }
-    if env.gpu_arch != HOTSET_ARCH {
+    let opted_in = env.gpu_arch == HOTSET_OPT_IN_ARCH && policy.is_explicit();
+    if env.gpu_arch != HOTSET_ARCH && !opted_in {
         return Err(HotsetSkip::NotGfx1201(env.gpu_arch.to_owned()));
     }
     if env.unified_memory {
@@ -1010,7 +1017,11 @@ mod tests {
             Err(HotsetSkip::Missing { explicit: false })
         );
         assert_eq!(
-            decide(&HotsetPolicy::Explicit(PathBuf::from("/x/h.json")), false, &good_env()),
+            decide(
+                &HotsetPolicy::Explicit(PathBuf::from("/x/h.json")),
+                false,
+                &good_env()
+            ),
             Err(HotsetSkip::Missing { explicit: true })
         );
         let mut env = good_env();
@@ -1018,6 +1029,18 @@ mod tests {
         assert_eq!(
             decide(&policy, true, &env),
             Err(HotsetSkip::NotGfx1201("gfx1100".to_owned()))
+        );
+        // gfx1100 is opt-in: an explicit sidecar path applies there.
+        let explicit = HotsetPolicy::Explicit(PathBuf::from("/x/h.json"));
+        assert_eq!(
+            decide(&explicit, true, &env),
+            Ok(PathBuf::from("/x/h.json"))
+        );
+        // Any other non-gfx1201 arch is refused even with an explicit path.
+        env.gpu_arch = "gfx1151";
+        assert_eq!(
+            decide(&explicit, true, &env),
+            Err(HotsetSkip::NotGfx1201("gfx1151".to_owned()))
         );
         let mut env = good_env();
         env.unified_memory = true;
@@ -1136,7 +1159,8 @@ mod tests {
         assert_eq!(
             HotsetSkip::NotGfx1201("gfx1100".to_owned()).log_line(path).unwrap(),
             "  qwen4 expert hot set: /m/q.mq4-xts.expert-hotset present, not applied (gpu is \
-             gfx1100; the hotset runs on gfx1201 only); whole-layer placement"
+             gfx1100; the default hotset runs on gfx1201 only (gfx1100 needs an explicit \
+             HIPFIRE_QWEN4_EXPERT_HOTSET path)); whole-layer placement"
         );
         for skip in [
             HotsetSkip::UnifiedMemory,
