@@ -1199,17 +1199,8 @@ impl RemoteSource {
             .http_status_as_error(false)
             .build()
             .into();
-        let authorization = env::var_os("HF_TOKEN")
-            .and_then(|value| {
-                let value = value.to_string_lossy().into_owned();
-                (!value.is_empty()).then(|| format!("Bearer {value}"))
-            })
-            .or_else(|| {
-                env::var_os("HUGGING_FACE_HUB_TOKEN").and_then(|value| {
-                    let value = value.to_string_lossy().into_owned();
-                    (!value.is_empty()).then(|| format!("Bearer {value}"))
-                })
-            });
+        let authorization = hipfire_config::http_auth::hf_authorization()
+            .map_err(|error| Qwen4Error::Invalid(error.to_string()))?;
         Ok(Self {
             spec,
             base_url,
@@ -4534,6 +4525,25 @@ mod tests {
         assert!(parse_remote_spec("weights/model.safetensors")
             .expect("local path is not remote")
             .is_none());
+    }
+
+    /// The only test that builds a `RemoteSource`, so it may own `HF_TOKEN`.
+    #[test]
+    fn remote_source_rejects_malformed_hf_token_naming_the_variable() {
+        let previous = env::var_os("HF_TOKEN");
+        env::set_var("HF_TOKEN", "hf_bad\ntoken");
+        let spec = parse_remote_spec("hf://owner/repo@0123456789abcdef0123456789abcdef01234567")
+            .expect("parse valid remote spec")
+            .expect("remote spec");
+        let result = RemoteSource::new(spec);
+        match previous {
+            Some(value) => env::set_var("HF_TOKEN", value),
+            None => env::remove_var("HF_TOKEN"),
+        }
+        let message = result.expect_err("newline in token must be refused").to_string();
+        assert!(message.contains("environment variable HF_TOKEN"), "{message}");
+        assert!(message.contains("a newline at character 7"), "{message}");
+        assert!(!message.contains("bad"), "{message}");
     }
 
     #[test]

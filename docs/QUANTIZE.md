@@ -352,7 +352,9 @@ thin `hipfire quantize` wrapper does not expose it. Source: `crates/hipfire-quan
   response's reported revision must equal the pinned one and the source identity
   is re-checked before publication. The endpoint is `HIPFIRE_HF_BASE`, else
   `HF_ENDPOINT`, else `https://huggingface.co`; a bearer token is taken from
-  `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN`.
+  `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN` (an empty variable counts as unset).
+  A token holding a space, newline, quote or non-ASCII character is refused
+  before any request, with an error naming the variable.
 - **Production admission** is the pinned checkpoint: exactly 131 safetensors
   shards and 1,658 source tensors (1,655 BF16 + 3 I64); the 333 vision-tower tensors
   are not written, so the output has 1,325 entries.

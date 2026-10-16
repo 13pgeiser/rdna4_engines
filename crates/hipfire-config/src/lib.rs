@@ -14,6 +14,7 @@ pub mod emu;
 pub mod emu_budget;
 pub mod emu_model;
 pub mod host_memory;
+pub mod http_auth;
 pub mod rocm;
 pub mod secret;
 

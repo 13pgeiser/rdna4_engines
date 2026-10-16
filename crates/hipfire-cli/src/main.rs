@@ -2035,6 +2035,10 @@ fn pull_with_sidecar_pins(
     hotset_pins: &[ExpertHotsetPin],
     grandfather_pins: &[GrandfatheredMonolithic],
 ) -> Result<Option<PathBuf>> {
+    // A malformed HF_TOKEN would otherwise surface only as the HTTP client's
+    // generic "failed to parse header value" after the registry work, or as a
+    // mere warning on an optional sidecar: refuse it before anything is fetched.
+    hipfire_config::http_auth::hf_authorization()?;
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -2303,11 +2307,8 @@ pub(crate) fn download_verified(
         .build()
         .into();
     let mut request = agent.get(url);
-    if let Some(token) = env::var_os("HF_TOKEN").or_else(|| env::var_os("HUGGING_FACE_HUB_TOKEN")) {
-        request = request.header(
-            "Authorization",
-            &format!("Bearer {}", token.to_string_lossy()),
-        );
+    if let Some(authorization) = hipfire_config::http_auth::hf_authorization()? {
+        request = request.header("Authorization", &authorization);
     }
     let mut response = request
         .call()
@@ -18463,6 +18464,48 @@ mod tests {
         assert!(!paths.models.join("test-model-head-q4k.hfq").exists());
         assert!(!paths.models.join("test-model-head-bf16.hfq").exists());
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// A malformed `HF_TOKEN` is refused before the registry is read or any
+    /// request is sent, with an error naming the variable (issue #655).
+    #[test]
+    fn pull_rejects_malformed_hf_token_before_any_request() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let paths = test_paths("pull-bad-hf-token");
+        // An unreachable endpoint: any attempted download would fail differently.
+        let _base = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:1");
+        for (value, what) in [
+            ("hf_secret\n", "a newline"),
+            ("hf_secret ", "a space"),
+            ("\"hf_secret\"", "a double quote"),
+            ("hf_s\u{e9}cret", "a non-ASCII character"),
+        ] {
+            let _token = EnvGuard::set("HF_TOKEN", value);
+            let error = pull_command(&paths, PullArgs::defaults("test-model"))
+                .expect_err("malformed token must be refused");
+            let text = format!("{error:#}");
+            assert!(text.contains("HF_TOKEN"), "{text}");
+            assert!(text.contains(what), "{text}");
+            assert!(!text.contains("secret"), "{text}");
+            assert!(!text.contains("download request failed"), "{text}");
+        }
+        assert!(!paths.models.exists(), "nothing is created before the check");
+    }
+
+    #[test]
+    fn download_verified_rejects_malformed_token_without_creating_files() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _token = EnvGuard::set("HF_TOKEN", "hf_bad token");
+        let dir = std::env::temp_dir().join(format!("hipfire-bad-token-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("model.mq4");
+        let error = download_verified("http://127.0.0.1:1/model.mq4", &destination, None, None, true)
+            .expect_err("malformed token must be refused");
+        let text = format!("{error:#}");
+        assert!(text.contains("environment variable HF_TOKEN"), "{text}");
+        assert!(text.contains("a space at character 7"), "{text}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
