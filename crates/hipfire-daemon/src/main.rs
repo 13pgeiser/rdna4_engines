@@ -84,6 +84,7 @@ mod emu_daemon;
 use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
+mod process_init;
 mod request_guards;
 mod slots;
 mod vision_ladder;
@@ -694,47 +695,6 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!("  Run `hipfire diag` for a full environment report.");
 }
 
-/// Install opt-in structured diagnostics on stderr. Stdout is reserved for the
-/// daemon's JSON-lines IPC protocol and must never receive tracing output.
-///
-/// `HIPFIRE_LOG` accepts an EnvFilter directive such as `info` or
-/// `hipfire_runtime=debug`; `RUST_LOG` is the fallback. Set
-/// `HIPFIRE_LOG_FORMAT=json` for machine-readable log events. With neither
-/// filter set, tracing remains off and the existing operator-facing stderr
-/// messages are unchanged.
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_env("HIPFIRE_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("off"));
-    // Ambient env on purpose: this runs before the CLI has sent the process
-    // config, and a developer_var read here would install the local fallback
-    // snapshot and make the real install_process_config fail.
-    let json = std::env::var("HIPFIRE_LOG_FORMAT")
-        .map(|value| value.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-
-    let result = if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .with_ansi(false)
-            .json()
-            .try_init()
-    } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .with_target(false)
-            .try_init()
-    };
-
-    if let Err(error) = result {
-        eprintln!("warning: failed to initialize structured logging: {error}");
-    }
-}
-
 /// Validate and install process policy, resolving `hardware.devices` against
 /// the KFD topology before any GPU runtime initializes. `claim` reserves each
 /// resolved card as part of that same step.
@@ -857,7 +817,7 @@ fn receive_startup_config(
 }
 
 fn main() {
-    init_tracing();
+    process_init::init();
     tracing::info!(pid = std::process::id(), "daemon starting");
 
     let args: Vec<String> = std::env::args().collect();
