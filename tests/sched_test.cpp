@@ -1121,6 +1121,52 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
     CHECK_EQ(ci[0], cslot * 4 + (p.e[0].conv_cursor % 4));
 }
 
+/* RadBatch::lora_slot: every row of a sequence carries its request's runtime LoRA slot, -1 for a
+ * base request, in the step's row order (decode rows first). */
+TEST(the_step_batch_carries_each_rows_adapter_slot) {
+    Fixture f;
+    f.build();
+    f.cfg.lora.max_loras = 2;
+    CHECK_OK(f.start());
+
+    auto r = f.request(100, 64);
+    r->lora_slot = 1;
+    r->lora_uid = 7;
+    CHECK(f.add(std::move(r)) != 0);
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK(b->lora_slot != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)100);
+    for (int64_t i = 0; i < b->n_tok; ++i) CHECK_EQ(b->lora_slot[i], 1);
+    f.commit_plain();
+
+    f.submit(64, 64);
+    b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK_EQ(b->n_tok, (int64_t)65);
+    CHECK_EQ(b->lora_slot[0], 1);                          /* the adapter request's decode row */
+    for (int64_t i = 1; i < 65; ++i) CHECK_EQ(b->lora_slot[i], -1);   /* the base prefill */
+}
+
+/* With no adapters served the field is null and the step slab is byte for byte what it was before
+ * the field existed: the slot array is the only thing adapters add to it. */
+TEST(no_adapters_no_slot_array) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    f.submit(32, 8);
+    const RadBatch* b = f.sch.step();
+    CHECK(b != nullptr);
+    CHECK(b->lora_slot == nullptr);
+
+    Config on = f.cfg;
+    on.lora.max_loras = 2;
+    const int64_t off_bytes = BatchBuilder::device_bytes(f.prog, f.cfg, f.kv.geom);
+    const int64_t on_bytes  = BatchBuilder::device_bytes(f.prog, on, f.kv.geom);
+    CHECK(off_bytes > 0);
+    CHECK_EQ(on_bytes - off_bytes, (f.cfg.max_tok * 4 + 255) / 256 * 256);
+}
+
 TEST(state_chunk_bounds_split_a_long_prefill_at_absolute_multiples) {
     DeriveInput in;
     StepPlan plan;

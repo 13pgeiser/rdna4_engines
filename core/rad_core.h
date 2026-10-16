@@ -349,7 +349,6 @@ public:
     std::vector<LoraIssueSite> lora_sites;
     std::vector<LoraPool>      lora_pools;
     std::vector<LoraScratch>   lora_t;
-    rad_buf                    lora_slot_buf = 0;   /* RAD_BUF_DERIVED "lora_slot", [max_tok] i32 */
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at

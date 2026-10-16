@@ -630,10 +630,11 @@ implementation reads `res` before it stores the product over it.
 
 The two halves of `y += scale ⊙ (B · (A · x))` at a trunk GEMM, issued by the core right after the
 GEMM in the GEMM's own row slice, with several adapters and no adapter mixed in one step. `slot` is
-an i32 per row naming its adapter's pool slot; **a row with `slot < 0 || slot >= S` is a base row
-and neither op touches it**: `lora_shrink` writes nothing into its `t` row, and `lora_expand` does
-not read or write its `y` row at all — so a base row stays bit for bit what the GEMM wrote, where
-`y + 0` would already have turned a -0 into +0.
+an i32 per row naming its adapter's pool slot -- the step batch's `RadBatch::lora_slot` from the
+GEMM's first row on; **a row with `slot < 0 || slot >= S` is a base row and neither op touches
+it**: `lora_shrink` writes nothing into its `t` row, and `lora_expand` does not read or write its
+`y` row at all — so a base row stays bit for bit what the GEMM wrote, where `y + 0` would already
+have turned a -0 into +0.
 
 - `lora_shrink`: `t[m, j] = Σ_k x(m, k) · lora_a[s, j, k]`, `s = slot[m]`, f32 accumulate.
   `a`/`a_scale` are the GEMM's own first two operands, and `x(m, k)` is the value `gemm_nt_q` uses

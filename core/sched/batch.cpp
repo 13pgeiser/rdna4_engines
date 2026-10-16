@@ -124,6 +124,9 @@ void BatchBuilder::carve(Set& s, char* h) {
      * moves a rotary position off the token index. */
     pair(&s.h_rope,  &s.d_rope,  mm_on_ ? 3 * T : 0);
     pair(&s.h_mmrow, &s.d_mmrow, mm_on_ ? T : 0);
+    /* Each row's adapter slot, only when the engine serves adapters: with none the slab and every
+     * offset in it are what they were before adapters existed. */
+    pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
     /* Host-only (derived metadata is copied into the planned arena), but carved on both sides to
      * keep device offsets equal to host offsets. */
     {
@@ -459,6 +462,7 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
               });
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
+    lora_on_ = cfg.lora.enabled();
     return RAD_OK;
 }
 
@@ -893,6 +897,12 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
             s.h_tok[k + j] = token_at(e, (int64_t)e.ctx_len + j + shift);
             s.h_pos[k + j] = e.ctx_len + j;
         }
+        /* Every row of a sequence runs with its request's adapter (RadBatch::lora_slot), fixed at
+         * admission; a placeholder row with no request is a base row. */
+        if (lora_on_) {
+            const int32_t ls = e.req ? e.req->lora_slot : -1;
+            for (int32_t j = 0; j < e.n_tokens; ++j) s.h_lora[k + j] = ls;
+        }
         /* Rotary position of each row at its own position (draft-head rows rotate at the index
          * they write, not the token they embed). Three planes of n_tok. */
         if (mm_on_) {
@@ -1098,6 +1108,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_mm_rows = n_mm;
         B.mm_rows = n_mm ? on_rank(base, b0, s.d_mmrow) : nullptr;
         B.mm_embd = n_mm ? mm_dev_[r] : nullptr;
+        B.lora_slot = lora_on_ ? on_rank(base, b0, s.d_lora) : nullptr;
         B.enc = 0;
         B.enc_n_patch = 0;
         B.enc_pixels = nullptr;

@@ -29,14 +29,13 @@ bool is_coded(uint32_t dt) {
 }
 
 rad_buf decl_persist(Builder& b, const std::string& name, uint32_t dtype, uint32_t rank,
-                     const int64_t* shape, int kind = RAD_BUF_PERSIST, const char* derive = nullptr) {
+                     const int64_t* shape) {
     RadBufDecl d{};
     d.dtype = dtype;
     d.rank = rank;
     for (uint32_t i = 0; i < rank; ++i) d.shape[i] = shape[i];
-    d.kind = kind;
+    d.kind = RAD_BUF_PERSIST;
     d.domain = RAD_DOMAIN_DEVICE;
-    d.derive = derive;
     return b.decl_buffer(name.c_str(), &d);
 }
 
@@ -128,16 +127,6 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         }
         t_by_r[x.R] = (int32_t)P.lora_t.size();
         P.lora_t.push_back(sc);
-    }
-
-    /* ---- the per-token slot, derived by the core each step (core/sched/derive.cpp) */
-    {
-        const int64_t sh[1] = { max_tok };
-        P.lora_slot_buf = decl_persist(b, "lora.slot", RAD_I32, 1, sh, RAD_BUF_DERIVED, "lora_slot");
-        if (!P.lora_slot_buf) {
-            RAD_ERR("lora: could not declare the per-token slot buffer");
-            return RAD_E_STATE;
-        }
     }
 
     /* ---- the two ops behind each targeted GEMM */

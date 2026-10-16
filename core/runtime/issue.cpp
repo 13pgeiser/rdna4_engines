@@ -477,9 +477,18 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_STATE,
                               fmt("LoRA site: the gemm wrote rows [%lld, %lld) of a %lld-token step",
                                   (long long)r0, (long long)(r0 + n), (long long)batch_->n_tok));
+    /* Each row's adapter is the step batch's (RadBatch::lora_slot), which the builder fills from
+     * every request's slot. It sits at one address per rank for the engine's life and is
+     * rewritten in stream order before each step's kernels, so the pointer this launch records is
+     * the one a replay of it reads. */
+    if (!batch_->lora_slot)
+        return abort_step_msg(h, RAD_E_STATE, "LoRA site: the step batch carries no per-row adapter "
+                                              "slot (RadBatch::lora_slot), so the engine was started "
+                                              "without adapters and should have declared no site");
     const LoraPool&    pool = program_->lora_pools[(size_t)s.pool];
     const rad_buf      t    = program_->lora_t[(size_t)s.t].lane[lane_ ? 1 : 0];
-    const RadOperand   slot = RAD_B_N(program_->lora_slot_buf, r0, n);
+    RadOperand         slot = RAD_P_T(batch_->lora_slot + r0, RAD_I32);
+    slot.rows = n;
     const RadOperand   tv   = RAD_B_N(t, 0, n);
     const RadOperand   sh[5] = { xa,
                                  s.opd_a_scale >= 0 && s.opd_a_scale < n_opd ? opd[s.opd_a_scale]
