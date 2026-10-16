@@ -733,6 +733,11 @@ token. The first decode token after load runs direct and the second captures
 - No automatic VRAM-weighted split.
 - PP decode is sequential across bands (no async multi-band pipeline / per-band
   graph capture as a documented product path).
+- PP Qwen3.5 decode (`generate_multi`) emits through the same
+  `QwenArSemanticProducer` as single-card AR: `<think>` spans stream as
+  `reasoning` events, only answer text as `token`, and `finish_reason` and
+  held tail text come from the shared finish. `stop` and tools are still
+  refused on PP upstream.
 - Experimental `HIPFIRE_PP_*` flags are **not** admissions and are not
   route-certified performance features.
 
