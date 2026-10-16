@@ -210,12 +210,19 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    // The quit-while-pulling confirmation is modal on every tab (and over the
+    // help overlay): y quits after cancelling the pull, n / Esc disarms, and
+    // every other key (including a second Ctrl+C or a global `q`) is swallowed.
+    if app.confirm_quit {
+        return app.handle_quit_confirm_key(key);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if app.chat.sending {
             app.chat.status = "generation in progress — press Esc to stop it".into();
             return false;
         }
-        return true;
+        return app.request_quit();
     }
 
     // The `?` help overlay is modal: while it is open, any key (other than the
@@ -263,7 +270,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     let chat_capturing = app.tab == app::Tab::Chat && app.chat.is_input_focused();
 
     match key.code {
-        KeyCode::Char('q') if !chat_capturing => return true,
+        KeyCode::Char('q') if !chat_capturing => return app.request_quit(),
         KeyCode::Esc => {
             // Esc only closes or cancels (a settings edit / enum preview, a chat
             // generation, the chat input focus); it never quits. With nothing to
@@ -548,5 +555,74 @@ mod tests {
         app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Restart);
         app.prev_tab();
         assert!(app.confirm_serve.is_none(), "BackTab disarms");
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn cancel_set(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn q_with_running_pull_asks_before_quitting() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
+
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q arms, not quits"
+        );
+        assert!(app.confirm_quit);
+        assert!(!cancel_set(&cancel));
+
+        // Modal: tab switching, a second q and Ctrl+C are all swallowed.
+        assert!(!handle_key(&mut app, k(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Home, "Tab is swallowed while armed");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(app.confirm_quit);
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('n'))), "n disarms");
+        assert!(!app.confirm_quit);
+        assert!(!cancel_set(&cancel), "n must not cancel the pull");
+        assert!(app.pull.is_some());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(handle_key(&mut app, k(KeyCode::Char('y'))), "y quits");
+        assert!(cancel_set(&cancel), "y cancels the pull before quitting");
+    }
+
+    #[test]
+    fn ctrl_c_with_running_pull_asks_before_quitting() {
+        let mut app = test_app();
+        app.tab = Tab::Models;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
+
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(app.confirm_quit);
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Esc)),
+            "Esc disarms, not quits"
+        );
+        assert!(!app.confirm_quit);
+        assert!(!cancel_set(&cancel));
+
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(handle_key(&mut app, k(KeyCode::Char('Y'))));
+        assert!(cancel_set(&cancel));
+    }
+
+    #[test]
+    fn quit_is_immediate_without_a_pull() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        assert!(handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(!app.confirm_quit);
+        assert!(handle_key(&mut app, ctrl_c()));
     }
 }

@@ -96,13 +96,13 @@ impl HipfirePaths {
     }
 }
 
+/// Serialises the tests that mutate process env (`HIPFIRE_CLI_BIN`, ...).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Serialises the tests that mutate HIPFIRE_CLI_BIN.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn native_cli_path_never_falls_back_to_a_real_build_under_test() {

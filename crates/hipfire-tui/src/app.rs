@@ -24,7 +24,7 @@ use crate::hipfire::{
     doctor::{self, DoctorReport},
     log_tail::{LogSnapshot, LogTailer},
     metrics::MetricsView,
-    model_actions::{self, PullEvent, RmOutcome},
+    model_actions::{self, PullEvent, PullHandle, RmOutcome},
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
     status::{start_background_serve, StatusState},
@@ -115,13 +115,17 @@ impl Tab {
 }
 
 /// In-flight model download. `percent`/`line` are refreshed each frame from the
-/// background pull worker's progress events.
+/// background pull worker's progress events. Dropping the job cancels the pull
+/// and reaps the child (see [`PullHandle`]).
 pub struct PullJob {
     pub tag: String,
-    rx: Receiver<PullEvent>,
+    pub handle: PullHandle,
     pub percent: Option<f64>,
     pub line: String,
 }
+
+/// How long a quit waits for the pull worker to kill and reap its child.
+const PULL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct App {
     pub paths: HipfirePaths,
@@ -178,6 +182,9 @@ pub struct App {
     /// Stop and restart are destructive (`R` force-reaps this install's serve
     /// daemons), so they wait for an explicit y; `s` start stays immediate.
     pub confirm_serve: Option<ServeAction>,
+    /// A y/n "quit and cancel the running pull?" confirmation is armed. Modal on
+    /// every tab; only ever armed while `pull` is `Some`.
+    pub confirm_quit: bool,
     /// Text staged by Chat `/copy` for the event loop to emit to the terminal
     /// clipboard (OSC52) after the next render; cleared once emitted.
     pub pending_clipboard: Option<String>,
@@ -242,6 +249,7 @@ impl App {
             confirm_delete: None,
             confirm_reset_all: false,
             confirm_serve: None,
+            confirm_quit: false,
             pending_clipboard: None,
             request_log: Vec::new(),
             doctor_cmd: None,
@@ -270,38 +278,96 @@ impl App {
             self.toast_info("a pull is already running");
             return;
         }
-        let rx = model_actions::pull(tag.clone());
+        let handle = model_actions::pull(tag.clone(), Vec::new());
         self.toast_info(format!("pulling {tag}\u{2026}"));
         self.pull = Some(PullJob {
             tag,
-            rx,
+            handle,
             percent: None,
             line: String::new(),
         });
     }
 
+    /// Ask the running pull to stop (Models tab `c`). The worker kills and reaps
+    /// the child and answers with `PullEvent::Cancelled`, which `drain_pull`
+    /// turns into the "pull cancelled" toast.
+    fn cancel_pull(&mut self) {
+        match &self.pull {
+            Some(job) => job.handle.cancel(),
+            None => self.toast_info("no pull running"),
+        }
+    }
+
+    /// Cancel the running pull (if any) and wait, bounded, for its worker to
+    /// kill and reap the child.
+    fn shutdown_pull(&mut self) {
+        if let Some(mut job) = self.pull.take() {
+            job.handle.shutdown(PULL_SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    /// A global quit was requested (`q` / Ctrl-C). Returns true when the app may
+    /// quit right now; while a pull is running it instead arms the y/n quit
+    /// confirm and returns false.
+    pub fn request_quit(&mut self) -> bool {
+        if self.pull.is_some() {
+            self.confirm_quit = true;
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Route a key to the armed quit confirm: `y`/`Y` cancels the pull, waits for
+    /// the child to be reaped and returns true (quit); `n`/`N`/Esc disarms; every
+    /// other key is swallowed (the prompt is modal on every tab).
+    pub fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.confirm_quit = false;
+                self.shutdown_pull();
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.confirm_quit = false;
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Consume pull progress/result events (called each frame). On completion it
     /// reloads the registry so the new local model appears.
     pub fn drain_pull(&mut self) {
-        let mut finished: Option<Result<String, String>> = None;
+        enum Finished {
+            Done(String),
+            Failed(String),
+            Cancelled,
+        }
+        let mut finished: Option<Finished> = None;
         if let Some(job) = &mut self.pull {
             loop {
-                match job.rx.try_recv() {
+                match job.handle.rx.try_recv() {
                     Ok(PullEvent::Progress { percent, line }) => {
                         job.percent = percent;
                         job.line = line;
                     }
                     Ok(PullEvent::Done) => {
-                        finished = Some(Ok(job.tag.clone()));
+                        finished = Some(Finished::Done(job.tag.clone()));
                         break;
                     }
                     Ok(PullEvent::Failed(err)) => {
-                        finished = Some(Err(format!("pull {}: {err}", job.tag)));
+                        finished = Some(Finished::Failed(format!("pull {}: {err}", job.tag)));
+                        break;
+                    }
+                    Ok(PullEvent::Cancelled) => {
+                        finished = Some(Finished::Cancelled);
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        finished = Some(Err(format!("pull {}: worker exited", job.tag)));
+                        finished =
+                            Some(Finished::Failed(format!("pull {}: worker exited", job.tag)));
                         break;
                     }
                 }
@@ -310,12 +376,17 @@ impl App {
         if let Some(result) = finished {
             self.pull = None;
             match result {
-                Ok(tag) => {
+                Finished::Done(tag) => {
                     self.toast_info(format!("pulled {tag}"));
                     self.reload(); // surface the new local model
                 }
-                Err(msg) => self.toast_error(msg),
+                Finished::Failed(msg) => self.toast_error(msg),
+                Finished::Cancelled => self.toast_info("pull cancelled"),
             }
+        }
+        // The quit confirm is only meaningful while a pull is running.
+        if self.pull.is_none() {
+            self.confirm_quit = false;
         }
     }
 
@@ -456,14 +527,17 @@ impl App {
     }
 
     /// Test seam: inject an in-flight pull without spawning a real process.
+    /// Returns the pull's cancel flag so tests can observe a cancel request.
     #[cfg(test)]
-    pub fn inject_pull(&mut self, tag: String, rx: Receiver<PullEvent>) {
+    pub fn inject_pull(&mut self, tag: String, rx: Receiver<PullEvent>) -> Arc<AtomicBool> {
+        let (handle, cancel) = PullHandle::detached(rx);
         self.pull = Some(PullJob {
             tag,
-            rx,
+            handle,
             percent: None,
             line: String::new(),
         });
+        cancel
     }
 
     /// Persist the current session UI state (active tab + expanded Models
@@ -673,6 +747,7 @@ impl App {
                 Some((_, true)) => self.toast_info("already downloaded"),
                 None => self.toast_info("select a model row to pull"),
             },
+            KeyCode::Char('c') => self.cancel_pull(),
             KeyCode::Char('d') => self.request_delete(),
             _ => {}
         }
@@ -2746,6 +2821,47 @@ mod tests {
             .expect("pull stays active during progress");
         assert_eq!(job.percent, Some(42.0));
         assert_eq!(job.line, "[bar] 42.0% 8 MB/s");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn c_key_cancels_running_pull_and_cancelled_event_clears_it() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Models;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = app.inject_pull("qwen3.5:9b".into(), rx);
+        app.handle_tab_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(cancel.load(Ordering::SeqCst), "c sets the cancel flag");
+        assert!(app.pull.is_some(), "the job stays until the worker answers");
+        tx.send(PullEvent::Cancelled).unwrap();
+        app.drain_pull();
+        assert!(app.pull.is_none());
+        let toast = app.toast.as_ref().expect("cancel toast");
+        assert_eq!(toast.text, "pull cancelled");
+        assert_eq!(toast.level, ToastLevel::Info, "cancel is not an error");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn c_key_without_pull_says_so() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Models;
+        app.handle_tab_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app.toast.as_ref().unwrap().text, "no pull running");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quit_confirm_disarms_when_the_pull_finishes() {
+        let (mut app, dir) = test_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.inject_pull("qwen3.5:9b".into(), rx);
+        assert!(!app.request_quit());
+        assert!(app.confirm_quit);
+        tx.send(PullEvent::Failed("boom".into())).unwrap();
+        app.drain_pull();
+        assert!(!app.confirm_quit, "no pull left to confirm about");
+        assert!(app.request_quit(), "idle quit is immediate");
         let _ = std::fs::remove_dir_all(dir);
     }
 

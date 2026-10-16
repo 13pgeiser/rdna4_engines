@@ -205,6 +205,12 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Separator between footer segments.
 const FOOTER_SEP: &str = " · ";
 
+/// The quit-while-pulling y/n prompt (shown while `confirm_quit` is armed).
+fn quit_confirm_prompt(app: &App) -> String {
+    let tag = app.pull.as_ref().map_or("", |job| job.tag.as_str());
+    format!("A pull of {tag} is running. Quit and cancel it?  y / n")
+}
+
 /// What the footer shows for the current tab/state: an ordered list of whole
 /// segments, highest priority first. [`fit_segments`] drops the ones that do not
 /// fit the footer width (never cutting one mid-word), so list order IS priority
@@ -215,6 +221,9 @@ const FOOTER_SEP: &str = " · ";
 fn footer_segments(app: &App) -> Vec<String> {
     fn segs(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+    if app.confirm_quit {
+        return vec![quit_confirm_prompt(app)];
     }
     match app.tab {
         Tab::Home => segs(&["? help", "r refresh", "Tab/Shift+Tab switch", "q quit"]),
@@ -269,6 +278,17 @@ fn footer_segments(app: &App) -> Vec<String> {
         Tab::Models => {
             if app.confirm_delete.is_some() {
                 segs(&["Delete this model?", "y confirm", "n / Esc cancel"])
+            } else if app.pull.is_some() {
+                segs(&[
+                    "c cancel pull",
+                    "Up/Down select",
+                    "Enter open/expand",
+                    "d delete",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
                 segs(&[
                     "Up/Down select",
@@ -397,6 +417,22 @@ fn footer_text(app: &App, width: u16) -> (String, Option<String>) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // An armed quit confirm outranks everything (it is modal on every tab and
+    // must stay visible even while a toast is live).
+    if app.confirm_quit {
+        frame.render_widget(
+            Paragraph::new(quit_confirm_prompt(app))
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .fg(YELLOW)
+                        .bg(BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            area,
+        );
+        return;
+    }
     // An armed serve stop/restart confirm owns the whole footer (wrapped over
     // both rows) and outranks any toast, so the prompt cannot be hidden.
     if let (Tab::Dashboard, Some(action)) = (app.tab, app.confirm_serve) {
@@ -408,7 +444,6 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-
     // A live toast takes over the footer line entirely (colored by severity);
     // otherwise show the per-tab hints + the last persistent status line.
     if let Some(toast) = &app.toast {
@@ -1243,7 +1278,9 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
         );
     } else if let Some(job) = &app.pull {
         let ratio = job.percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
-        let label = if job.line.is_empty() {
+        let label = if job.handle.cancel_requested() {
+            "cancelling\u{2026}".to_string()
+        } else if job.line.is_empty() {
             format!("pulling {}\u{2026}", job.tag)
         } else {
             job.line.clone()
@@ -1253,7 +1290,7 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(" Pulling {} ", job.tag)),
+                        .title(format!(" Pulling {} · c cancel ", job.tag)),
                 )
                 .gauge_style(Style::default().fg(GREEN).bg(PANEL_2))
                 .ratio(ratio)
@@ -2715,6 +2752,33 @@ mod render_tests {
         });
         assert!(text.contains("Pulling"), "gauge title shows the model");
         assert!(text.contains("37"), "percent in the gauge label");
+    }
+
+    #[test]
+    fn models_footer_offers_cancel_while_pulling() {
+        let text = render_with(|app| {
+            app.tab = Tab::Models;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.inject_pull("qwen3.5:9b".into(), rx);
+        });
+        assert!(text.contains("c cancel"), "footer/gauge advertise c cancel");
+    }
+
+    #[test]
+    fn quit_confirm_prompt_is_visible_on_every_tab() {
+        for tab in [Tab::Home, Tab::Chat, Tab::Models, Tab::Logs] {
+            let text = render_with(|app| {
+                app.tab = tab;
+                let (_tx, rx) = std::sync::mpsc::channel();
+                app.inject_pull("qwen3.5:9b".into(), rx);
+                app.toast_info("a toast that must not hide the prompt");
+                assert!(!app.request_quit());
+            });
+            assert!(
+                text.contains("A pull of qwen3.5:9b is running. Quit and cancel it?"),
+                "prompt missing on {tab:?}"
+            );
+        }
     }
 
     #[test]
