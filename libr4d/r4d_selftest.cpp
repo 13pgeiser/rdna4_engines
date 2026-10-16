@@ -353,6 +353,7 @@ static void cross_check(const Plugin& pl) {
     /* The libr4d orderings the integer priority has to preserve. */
     int p_ts = -1, p_os = -1, p_dec = -1, p_pre = -1, p_m16 = -1, p_m64 = -1, p_bt = -1;
     int p_g2dec = -1, p_g2pre = -1, p_g2win = -1;
+    int p_lsc = -1, p_lsw = -1, p_lsq = -1, p_lec = -1, p_let = -1;
     for (int k = 0; k < nk; ++k) {
         const RadKernelInfo* r = pl.kernel_at(k);
         if (!std::strcmp(r->name, "ar_twoshot_4rank_exact")) p_ts = r->priority;
@@ -365,6 +366,11 @@ static void cross_check(const Plugin& pl) {
         if (!std::strcmp(r->name, "attn_decode_h256_gqa2_fp8kv"))  p_g2dec = r->priority;
         if (!std::strcmp(r->name, "attn_prefill_h256_gqa2_fp8kv")) p_g2pre = r->priority;
         if (!std::strcmp(r->name, "attn_window_h256_gqa2_fp8kv"))  p_g2win = r->priority;
+        if (!std::strcmp(r->name, "lora_shrink_scalar")) p_lsc = r->priority;
+        if (!std::strcmp(r->name, "lora_shrink_wmma"))   p_lsw = r->priority;
+        if (!std::strcmp(r->name, "lora_shrink_wmma_q")) p_lsq = r->priority;
+        if (!std::strcmp(r->name, "lora_expand_scalar")) p_lec = r->priority;
+        if (!std::strcmp(r->name, "lora_expand_tiled"))  p_let = r->priority;
     }
     ok("two-shot all-reduce outranks one-shot (libr4d row order)", p_ts > p_os && p_ts > 0);
     ok("paged decode outranks paged prefill in the shared band", p_dec > p_pre && p_dec > 0);
@@ -373,6 +379,8 @@ static void cross_check(const Plugin& pl) {
        p_bt > p_m64 && p_bt < p_m16);
     ok("the h256/gqa2 legs outrank the windowed kernel in both their bands",
        p_g2win > 0 && p_g2dec > p_g2win && p_g2pre > p_g2win);
+    ok("the tiled LoRA rows outrank the scalar rows they shadow (at every M)",
+       p_lsc > 0 && p_lec > 0 && p_lsw > p_lsc && p_lsq > p_lsc && p_let > p_lec);
     std::printf("\n");
 }
 
@@ -12464,150 +12472,567 @@ static void ngram_ahead_case(const Plugin& pl) {
     ok("ngram_ids_i32 ahead: the ids ahead are the ones the next step computes", ahd1 == ids2);
 }
 
-/* ---- RUNTIME LoRA: lora_shrink then lora_expand, against an f64 host sum and libref's bytes.
+/* ---- RUNTIME LoRA: a lora_shrink row then a lora_expand row, as the engine issues them, against an
+ * f64 host sum and libref's bytes.
  *
- * Both rows in one case, because expand reads the `t` shrink wrote -- the order the engine issues
- * them in. Slots mix -1, 0..3 and 4 (= S): a base row keeps the 0xFF fill of `t` and every byte of
- * `y` (a -0 included), and the column slices' neighbours are untouched. Adapter rows: shrink
- * within (K + 2) 2^-24 sum|terms| of the f64 sum (an f32 dot's worst case in any order); expand
- * exactly the bytes of libref's f32 order (j ascending, sum then scale then add, one RTNE) over
- * the `t` the device wrote. `a` bf16 or E4M3 with a scale every 128 columns; `y` bf16 and f32;
- * M = 1 (decode), 17 and 130 (prefill-like), K = 1000 (a partial scale group). */
+ * Both halves in one case, because expand reads the `t` shrink wrote. A base row (slot -1, S,
+ * -5) keeps the 0xFF fill of `t` and every byte of `y` (a -0 included), and the column slices'
+ * neighbours are untouched. Adapter rows: shrink within (K + 2) 2^-24 sum|terms| of the f64 sum
+ * (an f32 dot's worst case in any order); expand exactly the bytes of libref's f32 order (j
+ * ascending, sum then scale then add, one RTNE) over the `t` the device wrote. The v1 pair runs
+ * its four small shapes and two real ones; the tiled pairs run the real shapes -- M 1 / 8 / 2048,
+ * K 2048 / 5120 / 6144 / 17408, N 2560 / 12288 / 17408, R 16 / 48 / 64 / 192 -- with slots in
+ * runs the way a prefill chunk holds several requests and base rows, plus:
+ *
+ *   * BATCH INVARIANCE ON THE CARD: rows computed alone (M = 1) and inside batches of 8, 37 and
+ *     2048 with other slots and base rows around them give the same t and y bits. This is the
+ *     check the emulator cannot make -- that the WMMA unit's answer for a row does not depend on
+ *     the tile position it lands in or on the rows beside it.
+ *   * A LAUNCH OF BASE ROWS ONLY touches no byte of t or y. */
+struct LoraProb {
+    int M = 0, K = 0, N = 0, R = 0, S = 4;
+    bool fp8 = false;
+    uint32_t ydt = RAD_BF16;
+    int lda = 0, lds = 0, ldy = 0, yoff = 3, group = 128;
+    std::vector<uint8_t> a, y0;
+    std::vector<float> as, sc;
+    std::vector<int32_t> slot;
+    std::vector<uint16_t> la, lb;
+};
+
+static size_t lora_ey(uint32_t ydt) { return ydt == RAD_F32 ? 4 : 2; }
+
+/* The contract's x(m, k): a code times its group's scale (one f32 product), or the bf16 value. */
+static float lora_x(const LoraProb& P, int m, int k) {
+    const size_t ai = (size_t)m * P.lda + k;
+    if (P.fp8) return rad_fp8e4m3_to_f32(P.a[ai]) * P.as[(size_t)m * P.lds + k / P.group];
+    uint16_t b;
+    std::memcpy(&b, &P.a[2 * ai], 2);
+    return rad_bf16_to_f32(b);
+}
+
+static float lora_ld_y(uint32_t ydt, const uint8_t* p) {
+    if (ydt == RAD_F32) { float v; std::memcpy(&v, p, 4); return v; }
+    uint16_t b;
+    std::memcpy(&b, p, 2);
+    return ydt == RAD_F16 ? rad_f16_to_f32(b) : rad_bf16_to_f32(b);
+}
+
+/* The slots of a prefill chunk: runs of 1..400 rows, each a request on some adapter or none
+ * (-1, S, -5 are three spellings of a base row). Short M cycles a fixed pattern instead. */
+static std::vector<int32_t> lora_slots(int M, int S, uint32_t seed) {
+    static const int32_t kCyc[] = { -1, 0, 1, 2, 3, 4, 2, -5, 1 };
+    std::vector<int32_t> v((size_t)M);
+    if (M <= 130) {
+        for (int m = 0; m < M; ++m) {
+            const int32_t s = kCyc[(m * 7 + 2) % 9];
+            v[(size_t)m] = (s >= 0 && s < 4 && s >= S) ? s % S : (s == 4 ? S : s);
+        }
+        return v;
+    }
+    uint32_t st = seed;
+    auto nx = [&]() { st = st * 1664525u + 1013904223u; return st >> 8; };
+    for (int m = 0; m < M;) {
+        const int len = 1 + (int)(nx() % 400);
+        const int k = (int)(nx() % (uint32_t)(S + 3));
+        const int32_t s = k < S ? k : (k == S ? -1 : (k == S + 1 ? S : -5));
+        for (int i = 0; i < len && m < M; ++i, ++m) v[(size_t)m] = s;
+    }
+    return v;
+}
+
+static LoraProb lora_make(int M, int K, int N, int R, bool fp8, uint32_t ydt, uint32_t seed,
+                          const std::vector<int32_t>* slots = nullptr) {
+    LoraProb P;
+    P.M = M; P.K = K; P.N = N; P.R = R; P.fp8 = fp8; P.ydt = ydt;
+    const int groups = (K + P.group - 1) / P.group;
+    P.lda = K + 8; P.lds = groups + 4; P.ldy = N + 6;
+    uint32_t st = seed;
+    auto rnd = [&]() {                           /* uniform in [-1, 1) */
+        st = st * 1664525u + 1013904223u;
+        return (float)((int32_t)(st >> 8) - (1 << 23)) / (float)(1 << 23);
+    };
+    const size_t ea = fp8 ? 1 : 2, ey = lora_ey(ydt);
+    P.a.resize((size_t)M * P.lda * ea);
+    for (size_t i = 0; i < (size_t)M * P.lda; ++i) {
+        if (fp8) P.a[i] = rad_f32_to_fp8e4m3(8.0f * rnd());
+        else { const uint16_t b = rad_f32_to_bf16(2.0f * rnd()); std::memcpy(&P.a[2 * i], &b, 2); }
+    }
+    P.as.resize((size_t)M * P.lds);
+    for (float& v : P.as) v = 0.01f + 0.02f * (rnd() + 1.0f);
+    P.slot = slots ? *slots : lora_slots(M, P.S, seed ^ 0x9e3779b9u);
+    P.la.resize((size_t)P.S * R * K);
+    P.lb.resize((size_t)P.S * N * R);
+    for (uint16_t& v : P.la) v = rad_f32_to_bf16(0.1f * rnd());
+    for (uint16_t& v : P.lb) v = rad_f32_to_bf16(0.1f * rnd());
+    P.sc.resize((size_t)P.S * N);
+    for (float& v : P.sc) v = 1.0f + 0.5f * rnd();
+    P.y0.resize((size_t)M * P.ldy * ey);
+    for (size_t i = 0; i < (size_t)M * P.ldy; ++i) {
+        const float v = i % 3 == 0 ? -0.0f : rnd();
+        if (ydt == RAD_F32) {
+            std::memcpy(&P.y0[4 * i], &v, 4);
+        } else {
+            const uint16_t b = ydt == RAD_F16 ? rad_f32_to_f16(v) : rad_f32_to_bf16(v);
+            std::memcpy(&P.y0[2 * i], &b, 2);
+        }
+    }
+    return P;
+}
+
+/* Row m of `src` into row `dst` of `P`: x, its scales, its slot and its y (same K / N / dtypes). */
+static void lora_copy_row(LoraProb& P, int dst, const LoraProb& src, int m) {
+    const size_t ea = P.fp8 ? 1 : 2, ey = lora_ey(P.ydt);
+    std::memcpy(&P.a[(size_t)dst * P.lda * ea], &src.a[(size_t)m * src.lda * ea], (size_t)P.lda * ea);
+    std::memcpy(&P.as[(size_t)dst * P.lds], &src.as[(size_t)m * src.lds], (size_t)P.lds * 4);
+    std::memcpy(&P.y0[(size_t)dst * P.ldy * ey], &src.y0[(size_t)m * src.ldy * ey],
+                (size_t)P.ldy * ey);
+    P.slot[(size_t)dst] = src.slot[(size_t)m];
+}
+
+/* Every row of [0, n) through f, on the host's cores: the f64 sums at M = 2048 are billions. */
+template <class F>
+static void lora_par(int64_t n, F&& f) {
+    const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < nt; ++i)
+        th.emplace_back([&, i]() { for (int64_t r = i; r < n; r += nt) f(r); });
+    for (auto& t : th) t.join();
+}
+
+/* Shrink then expand on the device over P; t ([M, R], 0xFF-filled first) and y come back. */
+static bool lora_run(const RadKernelInfo* rs, const RadKernelInfo* re, const LoraProb& P,
+                     std::vector<float>* t, std::vector<uint8_t>* y, int* rc1, int* rc2) {
+    const int M = P.M, K = P.K, N = P.N, R = P.R, S = P.S;
+    const int groups = (K + P.group - 1) / P.group;
+    const size_t ey = lora_ey(P.ydt);
+    void* d_a = dalloc(P.a.size());
+    void* d_as = dalloc(P.as.size() * 4);
+    void* d_sl = dalloc(P.slot.size() * 4);
+    void* d_la = dalloc(P.la.size() * 2);
+    void* d_lb = dalloc(P.lb.size() * 2);
+    void* d_sc = dalloc(P.sc.size() * 4);
+    void* d_t = dalloc((size_t)M * R * 4);
+    void* d_y = dalloc(P.y0.size());
+    if (!d_a || !d_as || !d_sl || !d_la || !d_lb || !d_sc || !d_t || !d_y) return false;
+    st_memcpy(d_a, P.a.data(), P.a.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_as, P.as.data(), P.as.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_sl, P.slot.data(), P.slot.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_la, P.la.data(), P.la.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_lb, P.lb.data(), P.lb.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_sc, P.sc.data(), P.sc.size() * 4, hipMemcpyHostToDevice);
+    st_memset(d_t, 0xFF, (size_t)M * R * 4);            /* a base row keeps this */
+    st_memcpy(d_y, P.y0.data(), P.y0.size(), hipMemcpyHostToDevice);
+
+    /* `a` columns [0, K) of [M, lda]; its scale [M, groups] of [M, lds]; `y` columns [yoff, +N). */
+    RadTensor ta = T(d_a, P.fp8 ? RAD_F8E4M3 : RAD_BF16, { M, K });
+    ta.stride[0] = P.lda;
+    RadTensor tsc = T(P.fp8 ? d_as : nullptr, RAD_F32, { M, groups });
+    tsc.stride[0] = P.lds;
+    RadTensor ty = T((uint8_t*)d_y + (size_t)P.yoff * ey, P.ydt, { M, N });
+    ty.stride[0] = P.ldy;
+    std::vector<RadTensor> t1 = { ta, tsc, T(d_sl, RAD_I32, { M }), T(d_la, RAD_BF16, { S, R, K }),
+                                  T(d_t, RAD_F32, { M, R }) };
+    std::vector<RadParam> p1 = { PI("M", M), PI("K", K), PI("R", R), PI("S", S),
+                                 PI("group", P.fp8 ? P.group : 0),
+                                 PS("dtype", P.fp8 ? "fp8_e4m3" : "bf16") };
+    std::vector<RadTensor> t2 = { T(d_t, RAD_F32, { M, R }), T(d_sl, RAD_I32, { M }),
+                                  T(d_lb, RAD_BF16, { S, N, R }), T(d_sc, RAD_F32, { S, N }), ty };
+    std::vector<RadParam> p2 = { PI("M", M), PI("N", N), PI("R", R), PI("S", S),
+                                 PS("dtype", rad_dtype_name(P.ydt)) };
+    RadArgs a1, a2;
+    std::memset(&a1, 0, sizeof(a1)); std::memset(&a2, 0, sizeof(a2));
+    a1.t = t1.data(); a1.n_t = (int)t1.size(); a1.p = p1.data(); a1.n_p = (int)p1.size();
+    a2.t = t2.data(); a2.n_t = (int)t2.size(); a2.p = p2.data(); a2.n_p = (int)p2.size();
+    a1.world_size = a2.world_size = 1;
+    if (rs->scratch) {
+        const int64_t need = rs->scratch(&a1);
+        if (need > 0) { a1.scratch = dalloc((size_t)need); a1.scratch_bytes = need; }
+    }
+    *rc1 = rs->launch(&a1, nullptr);
+    *rc2 = re->launch(&a2, nullptr);
+    st_stream_sync(nullptr);
+    t->resize((size_t)M * R);
+    st_memcpy(t->data(), d_t, t->size() * 4, hipMemcpyDeviceToHost);
+    y->resize(P.y0.size());
+    st_memcpy(y->data(), d_y, y->size(), hipMemcpyDeviceToHost);
+    dfree_all();
+    return true;
+}
+
+static void lora_pair_case(const Plugin& pl, const char* sname, const char* ename,
+                           const LoraProb& P) {
+    const RadKernelInfo* rs = find(pl, sname);
+    const RadKernelInfo* re = find(pl, ename);
+    const std::string what = fmt("%s + %s M %d R %d K %d N %d %s / %s y", sname, ename, P.M, P.R,
+                                 P.K, P.N, P.fp8 ? "e4m3+scale" : "bf16", rad_dtype_name(P.ydt));
+    if (!rs || !re) { ok(what.c_str(), false, "row absent"); return; }
+    std::vector<float> t;
+    std::vector<uint8_t> y;
+    int rc1 = 0, rc2 = 0;
+    if (!lora_run(rs, re, P, &t, &y, &rc1, &rc2)) { ok(what.c_str(), false, "hipMalloc"); return; }
+    const int R = P.R, K = P.K, N = P.N, S = P.S;
+    const size_t ey = lora_ey(P.ydt);
+    std::vector<int64_t> bb((size_t)P.M, 0), bt((size_t)P.M, 0), byy((size_t)P.M, 0);
+    std::vector<double> worst((size_t)P.M, 0.0);
+    lora_par(P.M, [&](int64_t mi) {
+        const int m = (int)mi;
+        const int32_t s = P.slot[(size_t)m];
+        const bool base = s < 0 || s >= S;
+        for (int j = 0; j < R; ++j) {
+            const float v = t[(size_t)m * R + j];
+            uint32_t bits; std::memcpy(&bits, &v, 4);
+            if (base) { bb[(size_t)m] += bits != 0xFFFFFFFFu; continue; }
+            double sum = 0, mag = 0;
+            for (int k = 0; k < K; ++k) {
+                const double term = (double)lora_x(P, m, k) *
+                                    rad_bf16_to_f32(P.la[((size_t)s * R + j) * K + k]);
+                sum += term; mag += std::fabs(term);
+            }
+            const double tol = (K + 2) * std::ldexp(1.0, -24) * mag + 1e-30;
+            worst[(size_t)m] = std::max(worst[(size_t)m], std::fabs(v - sum) / tol);
+            bt[(size_t)m] += !(std::fabs(v - sum) <= tol);
+        }
+        for (int c = 0; c < P.ldy; ++c) {
+            const size_t i = (size_t)m * P.ldy + c;
+            const int n = c - P.yoff;
+            if (base || n < 0 || n >= N) {
+                bb[(size_t)m] += std::memcmp(&y[i * ey], &P.y0[i * ey], ey) != 0;
+                continue;
+            }
+            float acc = 0.0f;                    /* libref's order over the device's t */
+            for (int j = 0; j < R; ++j)
+                acc += t[(size_t)m * R + j] * rad_bf16_to_f32(P.lb[((size_t)s * N + n) * R + j]);
+            const float d = P.sc[(size_t)s * N + n] * acc;
+            const float w = lora_ld_y(P.ydt, &P.y0[i * ey]) + d;
+            uint8_t want[4];
+            if (P.ydt == RAD_F32) {
+                std::memcpy(want, &w, 4);
+            } else {
+                const uint16_t b = P.ydt == RAD_F16 ? rad_f32_to_f16(w) : rad_f32_to_bf16(w);
+                std::memcpy(want, &b, 2);
+            }
+            byy[(size_t)m] += std::memcmp(&y[i * ey], want, ey) != 0;
+        }
+    });
+    int64_t bad_base = 0, bad_t = 0, bad_y = 0;
+    double w = 0;
+    for (int m = 0; m < P.M; ++m) {
+        bad_base += bb[(size_t)m]; bad_t += bt[(size_t)m]; bad_y += byy[(size_t)m];
+        w = std::max(w, worst[(size_t)m]);
+    }
+    ok(what.c_str(), rc1 == RAD_OK && rc2 == RAD_OK && !bad_base && !bad_t && !bad_y,
+       fmt("rc %d/%d, %lld base-row bytes touched, %lld t outside the bound (worst %.3f), "
+           "%lld y not libref's bytes", rc1, rc2, (long long)bad_base, (long long)bad_t, w,
+           (long long)bad_y));
+}
+
+/* BATCH INVARIANCE ON THE CARD. For each of `n_tgt` target rows of a batch (several slots, at
+ * tile starts, ends and middles), the same row alone -- its x, scales, slot and y, the same pools
+ * -- must come back with the same t and y bits. */
+static void lora_invariance_case(const Plugin& pl, const char* sname, const char* ename, int K,
+                                 int N, int R, bool fp8, uint32_t ydt) {
+    const RadKernelInfo* rs = find(pl, sname);
+    const RadKernelInfo* re = find(pl, ename);
+    if (!rs || !re) { ok(fmt("%s batch invariance", sname).c_str(), false, "row absent"); return; }
+    const size_t ey = lora_ey(ydt);
+    for (int M : { 8, 37, 2048 }) {
+        const LoraProb B = lora_make(M, K, N, R, fp8, ydt, 0x51ed270bu + (uint32_t)M);
+        std::vector<float> tb;
+        std::vector<uint8_t> yb;
+        int r1 = 0, r2 = 0;
+        if (!lora_run(rs, re, B, &tb, &yb, &r1, &r2) || r1 || r2) {
+            ok(fmt("%s batch invariance M %d", sname, M).c_str(), false,
+               fmt("rc %d/%d", r1, r2));
+            continue;
+        }
+        int64_t diff_t = 0, diff_y = 0, rows = 0;
+        const int cand[] = { 0, 1, 7, 15, 16, 17, 31, 32, 33, M / 2, M - 2, M - 1 };
+        for (int p : cand) {
+            if (p < 0 || p >= M) continue;
+            const int32_t s = B.slot[(size_t)p];
+            if (s < 0 || s >= B.S) continue;
+            LoraProb O = lora_make(1, K, N, R, fp8, ydt, 7u, &B.slot);
+            O.M = 1;
+            O.slot.assign(1, s);
+            O.la = B.la; O.lb = B.lb; O.sc = B.sc;
+            O.a.resize((size_t)O.lda * (fp8 ? 1 : 2));
+            O.as.resize((size_t)O.lds);
+            O.y0.resize((size_t)O.ldy * ey);
+            lora_copy_row(O, 0, B, p);
+            std::vector<float> to;
+            std::vector<uint8_t> yo;
+            if (!lora_run(rs, re, O, &to, &yo, &r1, &r2) || r1 || r2) { ++diff_t; continue; }
+            diff_t += std::memcmp(&to[0], &tb[(size_t)p * R], (size_t)R * 4) != 0;
+            diff_y += std::memcmp(&yo[0], &yb[(size_t)p * B.ldy * ey], (size_t)B.ldy * ey) != 0;
+            ++rows;
+        }
+        ok(fmt("%s + %s batch invariance: K %d R %d N %d %s, %lld rows alone vs in M %d",
+               sname, ename, K, R, N, fp8 ? "e4m3" : "bf16", (long long)rows, M).c_str(),
+           rows > 0 && !diff_t && !diff_y,
+           fmt("%lld t rows and %lld y rows differ from their M=1 bits", (long long)diff_t,
+               (long long)diff_y));
+    }
+}
+
+/* A chunk of base rows only: nothing is read past the slots, nothing is written. */
+static void lora_base_case(const Plugin& pl, const char* sname, const char* ename) {
+    const RadKernelInfo* rs = find(pl, sname);
+    const RadKernelInfo* re = find(pl, ename);
+    if (!rs || !re) { ok("lora base-only launch", false, "row absent"); return; }
+    std::vector<int32_t> slots(2048);
+    for (size_t i = 0; i < slots.size(); ++i) slots[i] = i % 3 == 0 ? -1 : (i % 3 == 1 ? 4 : -5);
+    const LoraProb P = lora_make(2048, 2048, 2560, 48, false, RAD_BF16, 99u, &slots);
+    std::vector<float> t;
+    std::vector<uint8_t> y;
+    int r1 = 0, r2 = 0;
+    const bool ran = lora_run(rs, re, P, &t, &y, &r1, &r2);
+    int64_t bad = 0;
+    for (float v : t) { uint32_t b; std::memcpy(&b, &v, 4); bad += b != 0xFFFFFFFFu; }
+    ok(fmt("%s + %s: M 2048 base rows only, t and y untouched", sname, ename).c_str(),
+       ran && !r1 && !r2 && !bad && y == P.y0,
+       fmt("rc %d/%d, %lld t words written, y %s", r1, r2, (long long)bad,
+           y == P.y0 ? "untouched" : "CHANGED"));
+}
+
 static void lora_case(const Plugin& pl) {
-    if (!(sel("lora_shrink_scalar") || sel("lora_expand_scalar"))) return;
-    const RadKernelInfo* rs = find(pl, "lora_shrink_scalar");
-    const RadKernelInfo* re = find(pl, "lora_expand_scalar");
-    if (!rs || !re) { ok("lora rows", false, "row absent"); return; }
-    static const int32_t kSlot[] = { -1, 0, 1, 2, 3, 4, 2, -5, 1 };
-    const int S = 4;
-    struct Shape { int M, R, K, N; bool fp8, f32y; };
-    const Shape shapes[] = { { 1, 16, 1000, 640, false, false }, { 17, 48, 1000, 300, true, false },
-                             { 130, 32, 256, 1000, true, true }, { 130, 16, 64, 64, false, true } };
-    for (const Shape& sh : shapes) {
-        const int M = sh.M, R = sh.R, K = sh.K, N = sh.N, group = 128;
-        const int groups = (K + group - 1) / group, lda = K + 8, lds = groups + 4, ldy = N + 6;
-        const size_t ea = sh.fp8 ? 1 : 2, ey = sh.f32y ? 4 : 2;
+    const bool sc_s = sel("lora_shrink_scalar"), sc_e = sel("lora_expand_scalar");
+    const bool tw = sel("lora_shrink_wmma"), tq = sel("lora_shrink_wmma_q");
+    const bool te = sel("lora_expand_tiled");
+    if (sc_s || sc_e) {
+        const char *s = "lora_shrink_scalar", *e = "lora_expand_scalar";
+        lora_pair_case(pl, s, e, lora_make(1, 1000, 640, 16, false, RAD_BF16, 0x2545f491u));
+        lora_pair_case(pl, s, e, lora_make(17, 1000, 300, 48, true, RAD_BF16, 0x2545f492u));
+        lora_pair_case(pl, s, e, lora_make(130, 256, 1000, 32, true, RAD_F32, 0x2545f493u));
+        lora_pair_case(pl, s, e, lora_make(130, 64, 64, 16, false, RAD_F32, 0x2545f494u));
+        lora_pair_case(pl, s, e, lora_make(8, 2048, 2560, 48, false, RAD_BF16, 0x2545f495u));
+        lora_pair_case(pl, s, e, lora_make(300, 6144, 2048, 16, true, RAD_F16, 0x2545f496u));
+    }
+    if (tw || te) {
+        const char *s = "lora_shrink_wmma", *e = "lora_expand_tiled";
+        lora_pair_case(pl, s, e, lora_make(1, 2048, 2560, 48, false, RAD_BF16, 0x1001u));
+        lora_pair_case(pl, s, e, lora_make(8, 2048, 12288, 32, false, RAD_BF16, 0x1002u));
+        lora_pair_case(pl, s, e, lora_make(8, 6144, 2048, 16, false, RAD_BF16, 0x1003u));
+        lora_pair_case(pl, s, e, lora_make(2048, 2048, 2560, 48, false, RAD_BF16, 0x1004u));
+        lora_pair_case(pl, s, e, lora_make(2048, 6144, 2048, 16, false, RAD_F32, 0x1005u));
+        lora_pair_case(pl, s, e, lora_make(2048, 2048, 17408, 64, false, RAD_BF16, 0x1006u));
+        lora_pair_case(pl, s, e, lora_make(37, 17408, 2560, 16, false, RAD_BF16, 0x1007u));
+        lora_pair_case(pl, s, e, lora_make(3, 2048, 384, 192, false, RAD_F16, 0x1008u));
+        lora_pair_case(pl, s, e, lora_make(130, 1000, 64, 16, false, RAD_BF16, 0x1009u));
+        lora_invariance_case(pl, s, e, 2048, 2560, 48, false, RAD_BF16);
+        lora_invariance_case(pl, s, e, 6144, 2048, 16, false, RAD_F32);
+        lora_base_case(pl, s, e);
+    }
+    if (tq || te) {
+        const char *s = "lora_shrink_wmma_q", *e = "lora_expand_tiled";
+        lora_pair_case(pl, s, e, lora_make(1, 5120, 2560, 48, true, RAD_BF16, 0x2001u));
+        lora_pair_case(pl, s, e, lora_make(8, 5120, 17408, 64, true, RAD_BF16, 0x2002u));
+        lora_pair_case(pl, s, e, lora_make(2048, 5120, 17408, 64, true, RAD_BF16, 0x2003u));
+        lora_pair_case(pl, s, e, lora_make(2048, 6144, 2048, 16, true, RAD_F16, 0x2004u));
+        lora_pair_case(pl, s, e, lora_make(17, 1000, 300, 48, true, RAD_F32, 0x2005u));
+        lora_invariance_case(pl, s, e, 5120, 1024, 64, true, RAD_BF16);
+    }
+}
+
+/* ---- --perflora M K N R S PATTERN [iters]: every lora_shrink row, then every lora_expand row,
+ * at one shape, warm (or cold with --cold). The pattern lays the slots out:
+ *
+ *   base   every row a base row -- what a base request pays for the adapter ops being there
+ *   one    every row adapter 0 -- one request, or a prefill chunk of one
+ *   half   even rows adapter 0, odd rows base -- base and adapter requests interleaved
+ *   mix    row m on adapter m % S -- every adapter in every tile, the most passes a tile has
+ *   runs   contiguous runs of ceil(M / S) rows a slot -- a chunk holding S requests
+ *
+ * `a` is bf16, or E4M3 with a scale every 128 when R4D_PERFLORA_A=fp8_e4m3; `y` bf16, or the
+ * dtype R4D_PERFLORA_Y names (f16, f32). Rows that do not serve the dtype say so. Each shrink row's
+ * t is compared with the first row's (max |diff| over max |t|), and each expand row's y bytes with
+ * the first's over the same t -- equal bytes is the claim the tiled expand makes. The GB/s column
+ * is the bytes the op cannot avoid (each active adapter's pool once, x or y once) over the time. */
+static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t R, int64_t S,
+                      const char* pat, int iters) {
+    if (M < 1 || K < 1 || N < 1 || R < 1 || S < 1 || iters < 1) {
+        std::printf("--perflora: M K N R S must be >= 1\n");
+        return;
+    }
+    const char* ae = std::getenv("R4D_PERFLORA_A");
+    const char* ye = std::getenv("R4D_PERFLORA_Y");
+    const bool fp8 = ae && !std::strcmp(ae, "fp8_e4m3");
+    const uint32_t ydt = ye && !std::strcmp(ye, "f32") ? RAD_F32
+                       : (ye && !std::strcmp(ye, "f16") ? RAD_F16 : RAD_BF16);
+    std::vector<int32_t> slot((size_t)M);
+    const int64_t run = (M + S - 1) / S;
+    for (int64_t m = 0; m < M; ++m) {
+        int32_t s;
+        if (!std::strcmp(pat, "base"))      s = -1;
+        else if (!std::strcmp(pat, "one"))  s = 0;
+        else if (!std::strcmp(pat, "half")) s = (m & 1) ? -1 : 0;
+        else if (!std::strcmp(pat, "mix"))  s = (int32_t)(m % S);
+        else if (!std::strcmp(pat, "runs")) s = (int32_t)(m / run);
+        else { std::printf("--perflora: PATTERN is base, one, half, mix or runs\n"); return; }
+        slot[(size_t)m] = s;
+    }
+    std::vector<bool> used((size_t)S, false);
+    int64_t act_rows = 0;
+    for (int32_t s : slot) if (s >= 0 && s < S) { used[(size_t)s] = true; ++act_rows; }
+    int64_t n_act = 0;
+    for (bool u : used) n_act += u;
+
+    const int64_t group = 128, groups = (K + group - 1) / group;
+    const size_t ea = fp8 ? 1 : 2, ey = lora_ey(ydt);
+    void* d_a = dalloc((size_t)(M * K) * ea);
+    void* d_as = dalloc((size_t)(M * groups) * 4);
+    void* d_sl = dalloc((size_t)M * 4);
+    void* d_la = dalloc((size_t)(S * R * K) * 2);
+    void* d_lb = dalloc((size_t)(S * N * R) * 2);
+    void* d_sc = dalloc((size_t)(S * N) * 4);
+    void* d_t = dalloc((size_t)(M * R) * 4);
+    void* d_y = dalloc((size_t)(M * N) * ey);
+    void* d_y0 = dalloc((size_t)(M * N) * ey);
+    if (!d_a || !d_as || !d_sl || !d_la || !d_lb || !d_sc || !d_t || !d_y || !d_y0) {
+        std::printf("--perflora: hipMalloc failed\n");
+        return;
+    }
+    {
         uint32_t st = 0x2545f491u;
-        auto rnd = [&]() {                       /* uniform in [-1, 1) */
+        auto rnd = [&]() {
             st = st * 1664525u + 1013904223u;
             return (float)((int32_t)(st >> 8) - (1 << 23)) / (float)(1 << 23);
         };
-        std::vector<uint8_t> a((size_t)M * lda * ea);
-        for (size_t i = 0; i < (size_t)M * lda; ++i) {
-            if (sh.fp8) a[i] = rad_f32_to_fp8e4m3(8.0f * rnd());
+        std::vector<uint8_t> a((size_t)(M * K) * ea);
+        for (size_t i = 0; i < (size_t)(M * K); ++i) {
+            if (fp8) a[i] = rad_f32_to_fp8e4m3(8.0f * rnd());
             else { const uint16_t b = rad_f32_to_bf16(2.0f * rnd()); std::memcpy(&a[2 * i], &b, 2); }
         }
-        std::vector<float> as((size_t)M * lds);
+        st_memcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
+        std::vector<float> as((size_t)(M * groups));
         for (float& v : as) v = 0.01f + 0.02f * (rnd() + 1.0f);
-        std::vector<int32_t> slot((size_t)M);
-        for (int m = 0; m < M; ++m) slot[(size_t)m] = kSlot[(m * 7 + 2) % 9];
-        std::vector<uint16_t> la((size_t)S * R * K), lb((size_t)S * N * R);
+        st_memcpy(d_as, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_sl, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
+        std::vector<uint16_t> la((size_t)(S * R * K)), lb((size_t)(S * N * R));
         for (uint16_t& v : la) v = rad_f32_to_bf16(0.1f * rnd());
         for (uint16_t& v : lb) v = rad_f32_to_bf16(0.1f * rnd());
-        std::vector<float> sc((size_t)S * N);
-        for (float& v : sc) v = 1.0f + 0.5f * rnd();
-        std::vector<uint8_t> y0((size_t)M * ldy * ey);
-        for (size_t i = 0; i < (size_t)M * ldy; ++i) {
-            const float v = i % 3 == 0 ? -0.0f : rnd();
-            if (sh.f32y) std::memcpy(&y0[4 * i], &v, 4);
-            else { const uint16_t b = rad_f32_to_bf16(v); std::memcpy(&y0[2 * i], &b, 2); }
-        }
-
-        void* d_a = dalloc(a.size());   st_memcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
-        void* d_as = dalloc(as.size() * 4);
-        st_memcpy(d_as, as.data(), as.size() * 4, hipMemcpyHostToDevice);
-        void* d_sl = dalloc(slot.size() * 4);
-        st_memcpy(d_sl, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
-        void* d_la = dalloc(la.size() * 2);
         st_memcpy(d_la, la.data(), la.size() * 2, hipMemcpyHostToDevice);
-        void* d_lb = dalloc(lb.size() * 2);
         st_memcpy(d_lb, lb.data(), lb.size() * 2, hipMemcpyHostToDevice);
-        void* d_sc = dalloc(sc.size() * 4);
+        std::vector<float> sc((size_t)(S * N));
+        for (float& v : sc) v = 1.0f + 0.5f * rnd();
         st_memcpy(d_sc, sc.data(), sc.size() * 4, hipMemcpyHostToDevice);
-        void* d_t = dalloc((size_t)M * R * 4);
-        st_memset(d_t, 0xFF, (size_t)M * R * 4);            /* a base row keeps this */
-        void* d_y = dalloc(y0.size());  st_memcpy(d_y, y0.data(), y0.size(), hipMemcpyHostToDevice);
-
-        /* `a` columns [0, K) of [M, lda]; its scale [M, groups] of [M, lds]; `y` columns [3, 3+N). */
-        RadTensor ta = T(d_a, sh.fp8 ? RAD_F8E4M3 : RAD_BF16, { M, K });
-        ta.stride[0] = lda;
-        RadTensor ts = T(sh.fp8 ? d_as : nullptr, RAD_F32, { M, groups });
-        ts.stride[0] = lds;
-        RadTensor ty = T((uint8_t*)d_y + 3 * ey, sh.f32y ? RAD_F32 : RAD_BF16, { M, N });
-        ty.stride[0] = ldy;
-        std::vector<RadTensor> t1 = { ta, ts, T(d_sl, RAD_I32, { M }), T(d_la, RAD_BF16, { S, R, K }),
-                                      T(d_t, RAD_F32, { M, R }) };
-        std::vector<RadParam> p1 = { PI("M", M), PI("K", K), PI("R", R), PI("S", S),
-                                     PI("group", sh.fp8 ? group : 0),
-                                     PS("dtype", sh.fp8 ? "fp8_e4m3" : "bf16") };
-        std::vector<RadTensor> t2 = { T(d_t, RAD_F32, { M, R }), T(d_sl, RAD_I32, { M }),
-                                      T(d_lb, RAD_BF16, { S, N, R }), T(d_sc, RAD_F32, { S, N }), ty };
-        std::vector<RadParam> p2 = { PI("M", M), PI("N", N), PI("R", R), PI("S", S),
-                                     PS("dtype", sh.f32y ? "f32" : "bf16") };
-        RadArgs a1, a2;
-        std::memset(&a1, 0, sizeof(a1)); std::memset(&a2, 0, sizeof(a2));
-        a1.t = t1.data(); a1.n_t = (int)t1.size(); a1.p = p1.data(); a1.n_p = (int)p1.size();
-        a2.t = t2.data(); a2.n_t = (int)t2.size(); a2.p = p2.data(); a2.n_p = (int)p2.size();
-        const int rc1 = rs->launch(&a1, nullptr);
-        const int rc2 = re->launch(&a2, nullptr);
-        st_stream_sync(nullptr);
-        std::vector<float> t((size_t)M * R);
-        st_memcpy(t.data(), d_t, t.size() * 4, hipMemcpyDeviceToHost);
-        std::vector<uint8_t> y(y0.size());
-        st_memcpy(y.data(), d_y, y.size(), hipMemcpyDeviceToHost);
-
-        int64_t bad_base = 0, bad_t = 0, bad_y = 0;
-        double worst = 0;
-        for (int m = 0; m < M; ++m) {
-            const int32_t s = slot[(size_t)m];
-            const bool base = s < 0 || s >= S;
-            for (int j = 0; j < R; ++j) {
-                const float v = t[(size_t)m * R + j];
-                uint32_t bits; std::memcpy(&bits, &v, 4);
-                if (base) { bad_base += bits != 0xFFFFFFFFu; continue; }
-                double sum = 0, mag = 0;
-                for (int k = 0; k < K; ++k) {
-                    const size_t ai = (size_t)m * lda + k;
-                    float x;
-                    if (sh.fp8) x = rad_fp8e4m3_to_f32(a[ai]) * as[(size_t)m * lds + k / group];
-                    else { uint16_t b; std::memcpy(&b, &a[2 * ai], 2); x = rad_bf16_to_f32(b); }
-                    const double term = (double)x * rad_bf16_to_f32(la[((size_t)s * R + j) * K + k]);
-                    sum += term; mag += std::fabs(term);
-                }
-                const double tol = (K + 2) * std::ldexp(1.0, -24) * mag + 1e-30;
-                worst = std::max(worst, std::fabs(v - sum) / tol);
-                bad_t += !(std::fabs(v - sum) <= tol);
-            }
-            for (int c = 0; c < ldy; ++c) {
-                const size_t i = (size_t)m * ldy + c;
-                const int n = c - 3;
-                if (base || n < 0 || n >= N) {
-                    bad_base += std::memcmp(&y[i * ey], &y0[i * ey], ey) != 0;
-                    continue;
-                }
-                float acc = 0.0f;                  /* libref's order over the device's t */
-                for (int j = 0; j < R; ++j)
-                    acc += t[(size_t)m * R + j] * rad_bf16_to_f32(lb[((size_t)s * N + n) * R + j]);
-                const float d = sc[(size_t)s * N + n] * acc;
-                uint8_t want[4];
-                if (sh.f32y) {
-                    float yv; std::memcpy(&yv, &y0[4 * i], 4);
-                    const float w = yv + d; std::memcpy(want, &w, 4);
-                } else {
-                    uint16_t yb; std::memcpy(&yb, &y0[2 * i], 2);
-                    const uint16_t w = rad_f32_to_bf16(rad_bf16_to_f32(yb) + d);
-                    std::memcpy(want, &w, 2);
-                }
-                bad_y += std::memcmp(&y[i * ey], want, ey) != 0;
+        std::vector<uint8_t> y((size_t)(M * N) * ey);
+        for (size_t i = 0; i < (size_t)(M * N); ++i) {
+            const float v = rnd();
+            if (ydt == RAD_F32) std::memcpy(&y[4 * i], &v, 4);
+            else {
+                const uint16_t b = ydt == RAD_F16 ? rad_f32_to_f16(v) : rad_f32_to_bf16(v);
+                std::memcpy(&y[2 * i], &b, 2);
             }
         }
-        ok(fmt("lora M %d R %d K %d N %d %s / %s y", M, R, K, N, sh.fp8 ? "e4m3+scale" : "bf16",
-               sh.f32y ? "f32" : "bf16").c_str(),
-           rc1 == RAD_OK && rc2 == RAD_OK && !bad_base && !bad_t && !bad_y,
-           fmt("rc %d/%d, %lld base-row bytes touched, %lld t outside the bound (worst %.3f), "
-               "%lld y not libref's bytes", rc1, rc2, (long long)bad_base, (long long)bad_t, worst,
-               (long long)bad_y));
-        dfree_all();
+        st_memcpy(d_y0, y.data(), y.size(), hipMemcpyHostToDevice);
+    }
+
+    std::printf("\nruntime LoRA  M=%lld K=%lld N=%lld R=%lld S=%lld  pattern %s: %lld adapter rows, "
+                "%lld adapter(s) active  a %s, y %s, %d iters%s\n", (long long)M, (long long)K,
+                (long long)N, (long long)R, (long long)S, pat, (long long)act_rows,
+                (long long)n_act, fp8 ? "fp8_e4m3/128" : "bf16", rad_dtype_name(ydt), iters,
+                g_cold > 0 ? ", cold" : ", warm");
+    const double sh_bytes = (double)n_act * R * K * 2 + (double)act_rows * K * ea;
+    const double ex_bytes = (double)n_act * N * R * 2 + (double)act_rows * (N * 2.0 * ey + R * 4.0);
+
+    std::vector<RadTensor> t1 = { T(d_a, fp8 ? RAD_F8E4M3 : RAD_BF16, { M, K }),
+                                  T(fp8 ? d_as : nullptr, RAD_F32, { M, groups }),
+                                  T(d_sl, RAD_I32, { M }), T(d_la, RAD_BF16, { S, R, K }),
+                                  T(d_t, RAD_F32, { M, R }) };
+    std::vector<RadParam> p1 = { PI("M", M), PI("K", K), PI("R", R), PI("S", S),
+                                 PI("group", fp8 ? group : 0),
+                                 PS("dtype", fp8 ? "fp8_e4m3" : "bf16") };
+    std::vector<RadTensor> t2 = { T(d_t, RAD_F32, { M, R }), T(d_sl, RAD_I32, { M }),
+                                  T(d_lb, RAD_BF16, { S, N, R }), T(d_sc, RAD_F32, { S, N }),
+                                  T(d_y, ydt, { M, N }) };
+    std::vector<RadParam> p2 = { PI("M", M), PI("N", N), PI("R", R), PI("S", S),
+                                 PS("dtype", rad_dtype_name(ydt)) };
+
+    /* A row whose band names other dtypes is skipped by name: lora_shrink_wmma_q shares the
+     * tiled entry point, and timing it on a bf16 `a` would print the bf16 row twice. */
+    auto takes = [](const RadKernelInfo* r, const char* dt) {
+        for (int c = 0; c < r->n_constraints; ++c) {
+            const RadConstraint& q = r->constraints[c];
+            if (q.op != RAD_C_IN || std::strcmp(q.key, "dtype") || !q.sval) continue;
+            const std::string set = std::string(" ") + q.sval + " ";
+            return set.find(std::string(" ") + dt + " ") != std::string::npos;
+        }
+        return true;
+    };
+
+    /* lora_shrink: every row, each one's t against the first's. */
+    std::vector<float> t_first, t_cur((size_t)(M * R));
+    std::printf("  lora_shrink rows (%.2f MB the op must read):\n", sh_bytes / 1e6);
+    for (int k = 0; k < pl.kernel_count(); ++k) {
+        const RadKernelInfo* r = pl.kernel_at(k);
+        if (!r->op || std::strcmp(r->op, "lora_shrink") || !r->launch) continue;
+        if (!takes(r, fp8 ? "fp8_e4m3" : "bf16")) {
+            std::printf("    %-22s (its band does not take this `a`)\n", r->name);
+            continue;
+        }
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = t1.data(); a.n_t = (int)t1.size(); a.p = p1.data(); a.n_p = (int)p1.size();
+        a.world_size = 1;
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        st_memset(d_t, 0, (size_t)(M * R) * 4);
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("    %-22s rc=%d (not served at this dtype / shape)\n", r->name, rc);
+            continue;
+        }
+        st_memcpy(t_cur.data(), d_t, t_cur.size() * 4, hipMemcpyDeviceToHost);
+        double dmax = 0, tmax = 0;
+        if (t_first.empty()) t_first = t_cur;
+        for (size_t i = 0; i < t_cur.size(); ++i) {
+            if (slot[i / (size_t)R] < 0 || slot[i / (size_t)R] >= S) continue;
+            dmax = std::max(dmax, (double)std::fabs(t_cur[i] - t_first[i]));
+            tmax = std::max(tmax, (double)std::fabs(t_first[i]));
+        }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("    %-22s %9.2f us  %8.1f GB/s   t vs first row: max|diff|/max|t| %.2e\n",
+                    r->name, us, sh_bytes / (us * 1e3), tmax > 0 ? dmax / tmax : 0.0);
+    }
+    if (t_first.empty()) { std::printf("  no lora_shrink row served\n"); return; }
+    st_memcpy(d_t, t_first.data(), t_first.size() * 4, hipMemcpyHostToDevice);
+
+    /* lora_expand: every row over the first shrink row's t, each one's y bytes against the first. */
+    std::vector<uint8_t> y_first, y_cur((size_t)(M * N) * ey);
+    std::printf("  lora_expand rows (%.2f MB the op must move):\n", ex_bytes / 1e6);
+    for (int k = 0; k < pl.kernel_count(); ++k) {
+        const RadKernelInfo* r = pl.kernel_at(k);
+        if (!r->op || std::strcmp(r->op, "lora_expand") || !r->launch) continue;
+        if (!takes(r, rad_dtype_name(ydt))) {
+            std::printf("    %-22s (its band does not take this `y`)\n", r->name);
+            continue;
+        }
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = t2.data(); a.n_t = (int)t2.size(); a.p = p2.data(); a.n_p = (int)p2.size();
+        a.world_size = 1;
+        if (r->scratch) {
+            const int64_t need = r->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        st_memcpy(d_y, d_y0, (size_t)(M * N) * ey, hipMemcpyDeviceToDevice);
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("    %-22s rc=%d (not served at this dtype / shape)\n", r->name, rc);
+            continue;
+        }
+        st_memcpy(y_cur.data(), d_y, y_cur.size(), hipMemcpyDeviceToHost);
+        if (y_first.empty()) y_first = y_cur;
+        int64_t diff = 0;
+        for (size_t i = 0; i < y_cur.size(); i += ey)
+            diff += std::memcmp(&y_cur[i], &y_first[i], ey) != 0;
+        /* Timed on a y that keeps accumulating: the cost of an add does not depend on y. */
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("    %-22s %9.2f us  %8.1f GB/s   y vs first row: %lld element(s) differ\n",
+                    r->name, us, ex_bytes / (us * 1e3), (long long)diff);
     }
 }
 
@@ -14643,6 +15068,12 @@ static void usage(void) {
                 "             default), every form compared with the first; `distinct` weight\n"
                 "             planes back the table, and fewer than the experts is a cache-resident\n"
                 "             floor rather than the real traffic.\n"
+                "  --perflora M K N R S PATTERN [iters]:  every lora_shrink row, then every\n"
+                "             lora_expand row, at one shape; PATTERN lays the slots out: base, one,\n"
+                "             half (even rows adapter 0, odd base), mix (row m on m %% S) or runs\n"
+                "             (S contiguous runs). R4D_PERFLORA_A=fp8_e4m3 for a coded `a` (scale\n"
+                "             every 128), R4D_PERFLORA_Y=f16|f32 for `y`. Each row's t and y are\n"
+                "             compared with the first row's; --cold applies.\n"
                 "  --perfqsa CTX [M] [iters]:  the QSA indexer at a real context length. It is\n"
                 "             the only decode op that grows with context, and at 200K it is\n"
                 "             about a third of the step. M is 1 + n_spec.\n"
@@ -14668,6 +15099,9 @@ int main(int argc, char** argv) {
     int moe_it = 20;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
     int m16_it = 20;
+    long long lo_m = 0, lo_k = 0, lo_n = 0, lo_r = 0, lo_s = 0;
+    const char* lo_pat = nullptr;
+    int lo_it = 200;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) {
             if (i + 5 >= argc) { usage(); return 2; }
@@ -14730,6 +15164,16 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) m16_e = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) m16_k = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) m16_d = std::strtoll(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perflora")) {
+            /* The runtime-LoRA pair at one shape and slot layout, every row of each op. */
+            if (i + 6 >= argc) { usage(); return 2; }
+            lo_m = std::strtoll(argv[++i], nullptr, 0);
+            lo_k = std::strtoll(argv[++i], nullptr, 0);
+            lo_n = std::strtoll(argv[++i], nullptr, 0);
+            lo_r = std::strtoll(argv[++i], nullptr, 0);
+            lo_s = std::strtoll(argv[++i], nullptr, 0);
+            lo_pat = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lo_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -14766,6 +15210,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("gated residual read timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (lo_pat) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        lora_perf(pl, lo_m, lo_k, lo_n, lo_r, lo_s, lo_pat, lo_it);
+        dfree_all();
+#else
+        skip("runtime LoRA timing", "built without HIP");
 #endif
         return 0;
     }
