@@ -235,6 +235,7 @@ static const Flag g_flags[] = {
     "                                    agreement, over the positions and tokens DIR was recorded at" },
     { "--kld-corpus",         "FILE",   "JSONL, one {\"prompt\", \"score_from\"?, \"source\"?} a line; --kld-record only" },
     { "--kld-out",            "FILE",   "the --kld-ref report as JSON, and every position's numbers in FILE.rows" },
+    { "--kld-lora",           "NAME",   "run --kld-record / --kld-ref through the --lora adapter NAME" },
 
     { "--debug-graph",        nullptr,  "print the entire declared graph and exit-quality detail" },
     { "--debug-selection",    nullptr,  "print the selection table" },
@@ -780,6 +781,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--kld-ref"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_ref = v; }
         else if (S("--kld-corpus"))            { if (!(v = need(i))) return RAD_E_INVAL; c->kld_corpus = v; }
         else if (S("--kld-out"))               { if (!(v = need(i))) return RAD_E_INVAL; c->kld_out = v; }
+        else if (S("--kld-lora"))              { if (!(v = need(i))) return RAD_E_INVAL; c->kld_lora = v; }
         else if (S("--debug-graph"))           { c->debug_graph = true; c->debug_selection = true; }
         else if (S("--debug-selection"))       c->debug_selection = true;
         else if (S("--debug-placement"))       c->debug_placement = true;
@@ -1033,6 +1035,7 @@ const ShowRow kShow[] = {
     { "--kld-ref",            [](const Config& c) { return or_none(c.kld_ref, "none"); } },
     { "--kld-corpus",         [](const Config& c) { return or_none(c.kld_corpus, "none"); } },
     { "--kld-out",            [](const Config& c) { return or_none(c.kld_out, "none"); } },
+    { "--kld-lora",           [](const Config& c) { return or_none(c.kld_lora, "none (the base)"); } },
     { "--debug-graph",        [](const Config& c) { return onoff(c.debug_graph); } },
     { "--debug-selection",    [](const Config& c) { return onoff(c.debug_selection); } },
     { "--debug-placement",    [](const Config& c) { return onoff(c.debug_placement); } },

@@ -97,6 +97,20 @@ int Engine::run_kld() {
         if (too_long) return RAD_E_FULL;
     }
 
+    /* --kld-lora: every document runs through one runtime LoRA adapter, held for the whole run --
+     * how an adapter is scored against a reference recorded from its merged or HF counterpart. */
+    int32_t  lora_slot = -1;
+    uint64_t lora_uid = 0;
+    std::shared_ptr<void> lora_hold;
+    if (!cfg_.kld_lora.empty() &&
+        lora_acquire(cfg_.kld_lora, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
+        RAD_ERR("kld: --kld-lora '%s' is not a loaded adapter (--lora NAME=PATH)", cfg_.kld_lora.c_str());
+        return RAD_E_NOTFOUND;
+    }
+    if (lora_slot >= 0)
+        RAD_INFO("kld: scoring through the runtime LoRA adapter '%s' (slot %d)", cfg_.kld_lora.c_str(),
+                 lora_slot);
+
     /* Submit every document under one hold of the queue, so batching depends only on the corpus
      * and the flags and a rerun batches identically. */
     std::vector<std::unique_ptr<server::Sink>> sinks(n);
@@ -110,6 +124,8 @@ int Engine::run_kld() {
         r->ignore_eos = true;
         r->sp.temp    = 0.0f;
         r->score      = true;
+        r->lora_slot  = lora_slot;
+        r->lora_uid   = lora_uid;
         r->sink       = sinks[d].get();
         sinks[d]->id  = r->id;
         reqs[d] = std::move(r);

@@ -816,6 +816,7 @@ struct Config {
      * of the two. */
     std::string kld_record;             /* --kld-record DIR */
     std::string kld_ref;                /* --kld-ref DIR */
+    std::string kld_lora;               /* --kld-lora NAME: score through this --lora adapter */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }
