@@ -15,6 +15,11 @@
 //! writes (`emit::assembly`, the module combiners, `profile`) are the
 //! accepted set; any other directive is an error.
 //!
+//! The one `.text` directive pair beyond the kernels is the module's end guard,
+//! `emit::CODE_END_TAIL` (`.p2alignl 7, 3214868480` then `.fill 96, 4, 3214868480`, LLVM's
+//! gfx10+ AMDHSA `s_code_end` padding): accepted once, after the last kernel, nothing may follow it
+//! in `.text`, and it is optional in the source (the typed [`link_encoded`] paths never add it).
+//!
 //! gfx942 (CDNA3, wave64) has no text front end here: its kernels are typed
 //! (`crate::cdna`), encoded by `peacemaker_cdna`, and linked through
 //! [`link_encoded`] / [`link_encoded_versioned`] as code object v5 or v6 with
@@ -63,6 +68,11 @@ struct Kernel<'a> {
     descriptor: Option<Vec<(&'a str, &'a str)>>,
 }
 
+/// Progress through the module's end-of-text guard (`emit::CODE_END_TAIL`): `.p2alignl 7, 3214868480`
+/// then `.fill 96, 4, 3214868480`, once, after the last kernel. Nothing may follow it in `.text`.
+#[derive(Clone, Copy, PartialEq)]
+enum CodeEnd { None, Aligned, Filled }
+
 /// Strip a `;` comment.
 fn code(line: &str) -> &str { line.split_once(';').map_or(line, |(c, _)| c).trim() }
 
@@ -77,6 +87,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
     let mut pending_align: Option<u32> = None;
     // Label → (kernel, word index).
     let mut labels: HashMap<&str, (usize, usize)> = HashMap::new();
+    let mut code_end = CodeEnd::None;
     let mut metadata: Option<String> = None;
     let mut lines = source.lines();
     while let Some(raw) = lines.next() {
@@ -99,6 +110,19 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
                 let symbol = rest.strip_suffix(",@function").ok_or_else(|| format!("unsupported {line}"))?;
                 attributes.entry(symbol).or_default()[2] = true;
             }
+            ".p2alignl" => {
+                if section != Section::Text || kernels.is_empty() || pending_align.is_some() || code_end != CodeEnd::None || rest != "7, 3214868480" {
+                    return Err(format!("unsupported {line}: the only accepted form is the single end-of-text guard `.p2alignl 7, 3214868480` after the last kernel"))
+                }
+                code_end = CodeEnd::Aligned;
+            }
+            ".fill" => {
+                if section != Section::Text || code_end != CodeEnd::Aligned || rest != "96, 4, 3214868480" {
+                    return Err(format!("unsupported {line}: the only accepted form is `.fill 96, 4, 3214868480` directly after the end-of-text `.p2alignl`"))
+                }
+                code_end = CodeEnd::Filled;
+            }
+            ".p2align" if code_end != CodeEnd::None => return Err(format!("{line}: no kernel may follow the end-of-text guard")),
             ".p2align" => {
                 let expected = match section { Section::Text => "8", Section::Rodata => "6", Section::None => "" };
                 if rest != expected { return Err(format!("unsupported {line} in this section")) }
@@ -138,6 +162,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
             _ if line.ends_with(':') && !line.contains(char::is_whitespace) => {
                 let name = &line[..line.len() - 1];
                 if section != Section::Text { return Err(format!("label {name} outside .text")) }
+                if code_end != CodeEnd::None { return Err(format!("label {name} follows the end-of-text guard")) }
                 if !name.starts_with(".L") {
                     if attributes.get(name) != Some(&[true; 3]) { return Err(format!("kernel {name} must be .protected, .globl and .type @function")) }
                     if pending_align.take() != Some(8) { return Err(format!("kernel {name} must follow .p2align 8")) }
@@ -149,7 +174,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
             }
             _ if head.starts_with('.') => return Err(format!("unsupported directive {line}")),
             _ => {
-                if section != Section::Text || pending_align.is_some() { return Err(format!("instruction outside a kernel: {line}")) }
+                if section != Section::Text || pending_align.is_some() || code_end != CodeEnd::None { return Err(format!("instruction outside a kernel: {line}")) }
                 let kernel = kernels.last_mut().ok_or_else(|| format!("instruction before any kernel: {line}"))?;
                 if (head == "s_branch" || head.starts_with("s_cbranch_")) && rest.starts_with(".L") {
                     kernel.branches.push((kernel.words.len(), head, rest));
@@ -161,6 +186,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
         }
     }
     if !target || !version { return Err("missing .amdgcn_target or .amdhsa_code_object_version".into()) }
+    if code_end == CodeEnd::Aligned { return Err("the end-of-text `.p2alignl` is not followed by its `.fill`".into()) }
     let metadata = metadata::msgpack(&metadata.ok_or("missing .amdgpu_metadata")?)?;
     let mut linked = Vec::with_capacity(kernels.len());
     let mut branch = Vec::with_capacity(1);
@@ -183,7 +209,7 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
         let descriptor = descriptor::encode(arch, kernel.symbol, directives, end, code_bytes)?;
         linked.push(elf::Kernel { symbol: kernel.symbol.to_owned(), code: kernel.words.iter().flat_map(|w| w.to_le_bytes()).collect(), descriptor });
     }
-    elf::link(arch, 6, &linked, &metadata)
+    elf::link(arch, 6, &linked, &metadata, code_end == CodeEnd::Filled)
 }
 
 /// One kernel whose code is already encoded: the typed encoder's words (not text) plus
@@ -233,7 +259,7 @@ pub fn link_encoded_versioned(kernels: &[EncodedKernel<'_>], metadata_yaml: &str
         let descriptor = descriptor::encode(arch, kernel.symbol, &directives, &end, code_bytes)?;
         linked.push(elf::Kernel { symbol: kernel.symbol.to_owned(), code: kernel.words.iter().flat_map(|w| w.to_le_bytes()).collect(), descriptor });
     }
-    elf::link(arch, code_object_version, &linked, &metadata)
+    elf::link(arch, code_object_version, &linked, &metadata, false)
 }
 
 /// Uncompressed `__CLANG_OFFLOAD_BUNDLE__` of an empty host entry and the

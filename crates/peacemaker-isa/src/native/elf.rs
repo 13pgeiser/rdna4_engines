@@ -45,6 +45,11 @@ const DYN: u64 = 16;
 const DYNAMIC_ENTRIES: u64 = 7;
 const KERNEL_ALIGN: u64 = 256;
 const S_NOP_0: u32 = 0xbf80_0000;
+/// `s_code_end`: the end-of-text guard's alignment fill and body (LLVM `EmitCodeEnd`).
+const S_CODE_END: u32 = 0xbf9f_0000;
+/// gfx11/gfx12 instruction cache line, the guard's alignment, and its dword count (3 cache lines).
+const CODE_END_ALIGN: u64 = 128;
+const CODE_END_DWORDS: usize = 96;
 /// `.comment`: the native writer's identity. It is deliberately not the ROCm linker's
 /// `Linker: AMD LLD ...` string, which would claim a tool that never ran.
 pub(crate) const NATIVE_COMMENT: &str = concat!("hipfire peacemaker native-emit ", env!("CARGO_PKG_VERSION"));
@@ -110,7 +115,10 @@ fn shstr(name: &str) -> u32 {
 /// Link `kernels` and the metadata blob into the code object `ld.lld -shared` writes, at
 /// `code_object_version` 5 or 6 (the two differ only in `EI_ABIVERSION`; version 5 is gfx942-only,
 /// as the RDNA kernels are all version 6).
-pub(crate) fn link(arch: Arch, code_object_version: u32, kernels: &[Kernel], metadata: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// `code_end` appends LLVM's gfx11/gfx12 end-of-module guard to `.text` after the last kernel: aligned to
+/// 128 bytes with `s_code_end`, then 96 `s_code_end` dwords. Kernel symbol sizes and descriptors never include it.
+pub(crate) fn link(arch: Arch, code_object_version: u32, kernels: &[Kernel], metadata: &[u8], code_end: bool) -> Result<Vec<u8>, String> {
     let abi = abi_version(code_object_version)?;
     if code_object_version == 5 && !arch.wave64() { return Err(format!("code object version 5 is emitted for gfx942 only, not {}", arch.name())) }
     if kernels.is_empty() { return Err("a code object needs at least one kernel".into()) }
@@ -122,6 +130,12 @@ pub(crate) fn link(arch: Arch, code_object_version: u32, kernels: &[Kernel], met
         while text.len() as u64 % KERNEL_ALIGN != 0 { text.extend(S_NOP_0.to_le_bytes()) }
         entries.push(text.len() as u64);
         text.extend(&k.code);
+    }
+    if code_end {
+        if arch.wave64() { return Err(format!("{}: the s_code_end guard is the gfx11/gfx12 form", arch.name())) }
+        text.reserve((align(text.len() as u64, CODE_END_ALIGN) - text.len() as u64) as usize + 4 * CODE_END_DWORDS);
+        while text.len() as u64 % CODE_END_ALIGN != 0 { text.extend(S_CODE_END.to_le_bytes()) }
+        for _ in 0..CODE_END_DWORDS { text.extend(S_CODE_END.to_le_bytes()) }
     }
     // .note: one NT_AMDGPU_METADATA, owner "AMDGPU".
     let mut note = Out::default();
@@ -307,8 +321,8 @@ mod tests {
     fn one_kernel() -> Vec<Kernel> { vec![Kernel { symbol: "k".into(), code: vec![0, 0, 0x81, 0xbf], descriptor: [0; KD_SIZE] }] }
     #[test]
     fn gfx942_header_carries_the_abi_version_and_default_target_features() {
-        let v5 = link(Arch::Gfx942, 5, &one_kernel(), &[0x80]).unwrap();
-        let v6 = link(Arch::Gfx942, 6, &one_kernel(), &[0x80]).unwrap();
+        let v5 = link(Arch::Gfx942, 5, &one_kernel(), &[0x80], false).unwrap();
+        let v6 = link(Arch::Gfx942, 6, &one_kernel(), &[0x80], false).unwrap();
         for (elf, abi) in [(&v5, 3), (&v6, 4)] {
             assert_eq!(&elf[..9], &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0x40, abi]);
             assert_eq!(u32::from_le_bytes(elf[48..52].try_into().unwrap()), 0x54c);
@@ -319,10 +333,61 @@ mod tests {
     }
     #[test]
     fn rdna_header_is_unchanged_and_version_five_is_gfx942_only() {
-        let rdna = link(Arch::Gfx1100, 6, &one_kernel(), &[0x80]).unwrap();
+        let rdna = link(Arch::Gfx1100, 6, &one_kernel(), &[0x80], false).unwrap();
         assert_eq!(rdna[8], 4);
         assert_eq!(u32::from_le_bytes(rdna[48..52].try_into().unwrap()), 0x41);
-        assert!(link(Arch::Gfx1100, 5, &one_kernel(), &[0x80]).is_err());
-        assert!(link(Arch::Gfx942, 4, &one_kernel(), &[0x80]).is_err());
+        assert!(link(Arch::Gfx1100, 5, &one_kernel(), &[0x80], false).is_err());
+        assert!(link(Arch::Gfx942, 4, &one_kernel(), &[0x80], false).is_err());
+    }
+    fn u64_at(b: &[u8], at: usize) -> usize { u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize }
+    /// Section header `index` of the object: (offset, size).
+    fn section(elf: &[u8], index: usize) -> (usize, usize) {
+        let header = u64_at(elf, 40) + 64 * index;
+        (u64_at(elf, header + 24), u64_at(elf, header + 32))
+    }
+    /// The `.text` bytes (section 7) and the sizes of the kernel symbols (`.symtab`, section 11, after `_DYNAMIC`).
+    fn text_and_symbol_sizes(elf: &[u8], kernels: usize) -> (Vec<u8>, Vec<usize>) {
+        let (offset, size) = section(elf, 7);
+        let (symtab, _) = section(elf, 11);
+        let sizes = (0..kernels).map(|k| u64_at(elf, symtab + 24 * (2 + 2 * k) + 16)).collect();
+        (elf[offset..offset + size].to_vec(), sizes)
+    }
+    fn kernel_of(dwords: usize) -> Kernel { Kernel { symbol: "k".into(), code: [0, 0, 0x81, 0xbf].repeat(dwords), descriptor: [0; KD_SIZE] } }
+    fn code_end_dwords(bytes: &[u8]) -> bool { bytes.chunks(4).all(|w| w == S_CODE_END.to_le_bytes()) }
+    #[test]
+    fn code_end_guard_aligns_to_128_then_adds_96_dwords_and_keeps_the_kernel_size() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            // One dword of code: the 4 bytes pad to 128 with s_code_end, then 384 more guard bytes.
+            let kernel = kernel_of(1);
+            let (bare, bare_sizes) = text_and_symbol_sizes(&link(arch, 6, &[kernel_of(1)], &[0x80], false).unwrap(), 1);
+            let (text, sizes) = text_and_symbol_sizes(&link(arch, 6, &[kernel], &[0x80], true).unwrap(), 1);
+            assert_eq!(bare.len(), 4);
+            assert_eq!(text.len(), 128 + 384);
+            assert_eq!(text[..4], bare[..]);
+            assert!(code_end_dwords(&text[4..]));
+            assert_eq!((sizes, bare_sizes), (vec![4], vec![4]));
+        }
+    }
+    #[test]
+    fn code_end_guard_adds_no_alignment_fill_when_the_text_already_ends_on_128() {
+        let code_bytes = 128;
+        let (text, sizes) = text_and_symbol_sizes(&link(Arch::Gfx1201, 6, &[kernel_of(code_bytes / 4)], &[0x80], true).unwrap(), 1);
+        assert_eq!(text.len(), code_bytes + 384);
+        assert_eq!(text[..code_bytes], [0, 0, 0x81, 0xbf].repeat(code_bytes / 4)[..]);
+        assert!(code_end_dwords(&text[code_bytes..]));
+        assert_eq!(sizes, vec![code_bytes]);
+    }
+    #[test]
+    fn code_end_guard_follows_the_last_kernel_only_and_is_gfx11_gfx12_only() {
+        let mut second = kernel_of(2);
+        second.symbol = "k2".into();
+        let elf = link(Arch::Gfx1100, 6, &[kernel_of(1), second], &[0x80], true).unwrap();
+        let (text, sizes) = text_and_symbol_sizes(&elf, 2);
+        // k at 0 (4 bytes), s_nop 0 to 256, k2 (8 bytes), s_code_end to 384, then 384 guard bytes.
+        assert_eq!(text.len(), 256 + 128 + 384);
+        assert!(text[4..256].chunks(4).all(|w| w == S_NOP_0.to_le_bytes()));
+        assert!(code_end_dwords(&text[256 + 8..]));
+        assert_eq!(sizes, vec![4, 8]);
+        assert!(link(Arch::Gfx942, 6, &one_kernel(), &[0x80], true).is_err());
     }
 }

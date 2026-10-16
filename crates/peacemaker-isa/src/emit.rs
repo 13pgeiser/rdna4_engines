@@ -25,7 +25,19 @@ fn scalar_high_water(text: &str) -> u16 {
  high
 }
 
+/// LLVM's gfx10+ AMDHSA end-of-module guard (`AMDGPUTargetAsmStreamer::EmitCodeEnd`, identical for gfx11
+/// and gfx12: 128-byte cache line, 3 lines of prefetch slack): the final `.text` is aligned to 128 bytes
+/// with `s_code_end` (0xbf9f0000 = 3214868480), then 96 more `s_code_end` dwords. It follows the last
+/// `.text` content of the module and changes no kernel symbol size or descriptor. Every kernel's source
+/// ends with it after `.end_amdgpu_metadata`; the module combiners keep the first kernel's metadata
+/// remainder (`amdhsa.target` through this guard) only, so a module carries it exactly once.
+pub const CODE_END_TAIL: &str = ".text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n";
+
 pub fn assembly(spec:&KernelSpec,regs:&RegPlan,program:&Program)->Result<String,String> {
+ let mut s=kernel_assembly(spec,regs,program)?;s.push_str(CODE_END_TAIL);Ok(s)
+}
+
+fn kernel_assembly(spec:&KernelSpec,regs:&RegPlan,program:&Program)->Result<String,String> {
  spec.kernargs.validate()?;if spec.arch!=program.arch {return Err("program architecture differs from kernel spec".into())}if !spec.wave32 {return Err("builder requires wave32".into())}
  let arch=spec.arch;let symbol=&spec.symbol;let nv=regs.next_free_vgpr();let ns=program.instructions.iter().map(|i|scalar_high_water(&i.text)).max().unwrap_or(0).max(regs.next_free_sgpr());
  // Kernels using VCC reserve it and include its two SGPRs in metadata,
