@@ -1,36 +1,45 @@
 radiance
 Copyright 2026 Deadcode and the radiance contributors
 
-Written by Deadcode, with contributions from tcclaviger (the N-rank all-reduce kernels), ggz14 (the
-MXFP4 GEMM, the A-tiled MXFP4 prefill GEMM and the GDN kernels' overflow guards), slydlake (the
-MXFP4 decode and prefill GEMMs, the MXFP4 linear and the DFlash2 drafter's MXFP4 linears, stop
-strings after the reasoning block, and the draft refill on a prefix hit), goodman-b (four-rank
-tensor parallelism for Qwen3.8-Flash-Next, the four-rank collectives ending the link hold
-themselves, their selftest cases and the TP4 lever map), keptn42 (the four-rank all-reduce served in
-place, the fused four-rank writes, the n-gram table in RAM, the four-class expert split, the Grafana
-dashboard, the routed GEMM's decode loads and run search, the gated residual's prefill read form and
-row groups, the fused router launch, the adaptive draft window, the MoE prefill forms, the sorted
-operand's decode kernel, two K blocks a pass for up to 80 routed rows, --prefill-span, the towers'
-lookup tables counted once, and for Gemma 4 its assistant head as a drafter that reads the trunk's
-cache, bf16 checkpoints, the fused w4a8 decode step, the vision tower and window snapshots that let
-a prefix hit resume), mechkbfan (the token embedding in the pinned host pool), Code000 (the n-gram
-gather on the card and the MTP head's history-pass skip), baKon (three-rank tensor parallelism,
-serving any world size from the shipped container, the request log, an uneven world's per-rank KV
-and weights split, --rope-scaling, the model entry's context length, root and capabilities, /props,
-the three-rank two-shot all-reduce and tiered-int8 wire, the diagnosis of the three-rank lossy-wire
-crash, cardclock.py, --busy-prefill-chunk, curl, jq and a CA bundle in the image with hfget.sh under
-its busybox, rad-export, and --prefill-interleave), hazyumps (static YaRN for
-the Qwen rotary paths), malic (ParoQuant: its MXFP4, int5 and int4 checkpoints imported and served,
-the Givens rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and
-4-bit asymmetric GEMMs), Perire (Gemma 4 26B-A4B with z-lab's DFlash drafter: its plugin, its
-kernels in libr4d -- the windowed paged attention, pair_argmax, the fused sandwich joins and
-expert_scale -- and the host emulator that tests them, the prefill split into two slices with their
-all-reduces beside the compute, and the vocabulary-sharded draft head), redxherring (--model taking
-a Hugging Face repo id), Smellyyyy (the idea behind --prefill-interleave), gearwave00001 (/v1/messages as Claude
-Code sends it), devmilan (the NVFP4 and FP8 compressed-tensors imports), sfjes (Gemma 4 31B dense:
-its plugin, its two attention classes and their kernels, and prefix reuse that leaves a windowed
-group alone) and zivius (LiquidAI's LFM2 and LFM2-VL and d1's /v1/systemone, after the design of
-their Codeberg PR 50, and Qwen3-ASR with /v1/audio/transcriptions and /v1/realtime).
+Written by Deadcode, with contributions from:
+
+- tcclaviger: the N-rank all-reduce kernels
+- ggz14: the MXFP4 GEMM, the A-tiled MXFP4 prefill GEMM and the GDN kernels' overflow guards
+- slydlake: the MXFP4 decode and prefill GEMMs, the MXFP4 linear and the DFlash2 drafter's MXFP4
+  linears, stop strings after the reasoning block, and the draft refill on a prefix hit
+- goodman-b: four-rank tensor parallelism for Qwen3.8-Flash-Next, the four-rank collectives ending
+  the link hold themselves, their selftest cases and the TP4 lever map
+- keptn42: the four-rank all-reduce served in place, the fused four-rank writes, the n-gram table in
+  RAM, the four-class expert split, the Grafana dashboard, the routed GEMM's decode loads and run
+  search, the gated residual's prefill read form and row groups, the fused router launch, the
+  adaptive draft window, the MoE prefill forms, the sorted operand's decode kernel, two K blocks a
+  pass for up to 80 routed rows, --prefill-span, the towers' lookup tables counted once, and for
+  Gemma 4 its assistant head as a drafter that reads the trunk's cache, bf16 checkpoints, the fused
+  w4a8 decode step, the vision tower and window snapshots that let a prefix hit resume
+- mechkbfan: the token embedding in the pinned host pool
+- Code000: the n-gram gather on the card and the MTP head's history-pass skip
+- baKon: three-rank tensor parallelism, serving any world size from the shipped container, the
+  request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
+  context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
+  wire, the diagnosis of the three-rank lossy-wire crash, cardclock.py, --busy-prefill-chunk, curl,
+  jq and a CA bundle in the image with hfget.sh under its busybox, rad-export, and
+  --prefill-interleave
+- hazyumps: static YaRN for the Qwen rotary paths
+- malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
+  rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit
+  asymmetric GEMMs
+- Perire: Gemma 4 26B-A4B with z-lab's DFlash drafter -- its plugin, its kernels in libr4d (the
+  windowed paged attention, pair_argmax, the fused sandwich joins and expert_scale) and the host
+  emulator that tests them, the prefill split into two slices with their all-reduces beside the
+  compute, and the vocabulary-sharded draft head
+- redxherring: --model taking a Hugging Face repo id
+- Smellyyyy: the idea behind --prefill-interleave
+- gearwave00001: /v1/messages as Claude Code sends it
+- devmilan: the NVFP4 and FP8 compressed-tensors imports
+- sfjes: Gemma 4 31B dense -- its plugin, its two attention classes and their kernels, and prefix
+  reuse that leaves a windowed group alone
+- zivius: LiquidAI's LFM2 and LFM2-VL and d1's /v1/systemone, after the design of their Codeberg
+  PR 50, and Qwen3-ASR with /v1/audio/transcriptions and /v1/realtime
 
 This product includes software from the following projects, each under the MIT License. The
 license text is in the file named beside each.
