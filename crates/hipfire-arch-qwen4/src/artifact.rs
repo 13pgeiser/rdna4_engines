@@ -325,14 +325,16 @@ pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
 /// every other architecture keeps the `ExpertSlabKernelsUnavailable` refusal.
 pub const SLAB_ROUTE_GFX1151_RECEIPTS_LANDED: bool = true;
 
-/// The gfx1151 E8P-I4 receipts switch, defined once in
-/// [`rdna_compute::slab_admission`] and re-exported here: `false` until the Halo G1 receipts
-/// of `e8p_i4_moe_gemv_pm_gfx1151` and `qwen4_moe_iu4_sym_e8p_pm_gfx1151` are in `rcpt/`.
-/// While `false`, gfx1151 serves MQ4 and W3 only: [`rdna_compute::qwen4_slab_codec_admitted`]
-/// refuses E8P there, so [`crate::expert_arena::ExpertArenaPlan::check_executable`] (and with
-/// it [`expert_slab_plan`]) refuses an E8P artifact on gfx1151 with the arena `ArchRefused`
-/// error. Flipping it is the one-line admission change; it does not affect
-/// [`slab_route_admitted`] (MQ4 is already served) or any other architecture.
+/// The gfx1151 E8P-I4 admission switch, defined once in
+/// [`rdna_compute::slab_admission`] and re-exported here: `true`. The Halo G1 receipts named
+/// there are pre-rc5 history for `e8p_i4_moe_gemv_pm_gfx1151` and
+/// `qwen4_moe_iu4_sym_e8p_pm_gfx1151`; the current rc5 bounded images (96-byte K1, 64-byte K2)
+/// are not claimed GPU qualified by this constant.
+/// [`rdna_compute::qwen4_slab_codec_admitted`] reads it for gfx1151 E8P, so
+/// [`crate::expert_arena::ExpertArenaPlan::check_executable`] (and with it
+/// [`expert_slab_plan`]) admits MQ4 + E8P layers on gfx1151; `false` would refuse them with
+/// the arena `ArchRefused` error. It does not affect [`slab_route_admitted`] (MQ4 is served
+/// either way) or any other architecture.
 pub use rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;
 
 /// Whether the sealed expert-slab route may load on GPU architecture `arch`:
@@ -388,7 +390,7 @@ fn expert_slab_plan(
         });
     }
     // The arena plan names every expert's codec; the architecture's admitted codecs (gfx1100 MQ4 + E8P,
-    // gfx1151 MQ4 + W3 [+ E8P once SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED], gfx1201 MQ4 + W3 + E8P)
+    // gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 + W3 + E8P)
     // and one cold codec per layer refuse the rest.
     let plan = crate::expert_arena::ExpertArenaPlan::from_table(&table)
         .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: expert slab arenas: {error}")))?;
@@ -2467,7 +2469,7 @@ mod tests {
     }
 
     /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P,
-    /// gfx1151 MQ4 + W3 (+ E8P once SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 + W3 + E8P,
+    /// gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 + W3 + E8P,
     /// W2 nowhere, one cold codec per layer (layers may differ), and every other architecture
     /// (or none) keeps the unchanged fail-closed refusal.
     #[test]
@@ -2558,9 +2560,9 @@ mod tests {
         assert_eq!(plan.layers()[0].cold_codec("gfx1201"), Ok(CODEC_W3));
         assert_eq!(plan.layers()[1].cold_codec("gfx1201"), Ok(CODEC_E8P));
         assert!(expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100")).is_err());
-        // gfx1151 admits MQ4 + W3 only until its E8P receipts land
-        // (SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED): E8P is an arena arch refusal there, and so is
-        // a W3 + E8P layer (the arch refusal, or the two-cold-codecs refusal once landed).
+        // gfx1151 admits MQ4 + E8P exactly when SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED (else an
+        // arena arch refusal); a W3 + E8P layer is refused either way (the arch refusal, or the
+        // two-cold-codecs refusal when admitted).
         let e8p_on_gfx1151 = expert_slab_plan(&slab_metadata(), &headers(E8pI4), Some("gfx1151"));
         assert_eq!(e8p_on_gfx1151.is_ok(), SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED);
         if !SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED {

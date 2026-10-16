@@ -708,7 +708,7 @@ mod qwen4_route_tests {
         assert_rejected(&dtypes);
     }
 
-    /// The sealed slab route admits gfx1201 MQ4 / W3 / E8P, gfx1151 MQ4 / W3 (and E8P once
+    /// The sealed slab route admits gfx1201 MQ4 / W3 / E8P, gfx1151 MQ4 / W3 / E8P (E8P via
     /// `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`) and gfx1100 MQ4 / E8P; every other arch, a
     /// crossed pair and W2 (everywhere) refuse, and a declared cold codec must be the one the
     /// dtypes name. Both states of the gfx1151 E8P switch are pure-decided.

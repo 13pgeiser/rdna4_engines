@@ -550,8 +550,8 @@ impl Gpu {
 
     /// Load the sealed slab's kernels (call before graph capture) for a layer whose cold bucket
     /// is codec `cold_codec`: `0` = no cold bucket (an MQ4-only layer, any arch), gfx1201
-    /// 1 = W3 or 3 = E8P, gfx1100 3 = E8P, gfx1151 1 = W3 (and 3 = E8P once the matrix admits it); every
-    /// other value (W2 / codec 2 everywhere, W3 on gfx1100, E8P on gfx1151 until admitted, unknown codecs)
+    /// 1 = W3 or 3 = E8P, gfx1100 3 = E8P, gfx1151 1 = W3 or 3 = E8P (E8P via the receipts switch); every
+    /// other value (W2 / codec 2 everywhere, W3 on gfx1100, E8P on gfx1151 with the switch unset, unknown codecs)
     /// is refused by the shared admission matrix before
     /// anything loads. Loads the planner and,
     /// on gfx1201, the cold (if any) and MQ4 K1 symbols (the historical W3 preload, unchanged);
@@ -1862,7 +1862,7 @@ mod tests {
         // Runtime selection = metadata AND the shared admission matrix (what
         // `Gpu::ensure_qwen4_slab_kernels` and `Gpu::mq_i4_moe_gemv_slab` consult): a tabled entry
         // is served by the very same table object exactly when admitted, and no other
-        // (arch, codec) pair is served. Every tabled entry except gfx1151 E8P is admitted today;
+        // (arch, codec) pair is served. Every tabled entry except gfx1151 E8P is admitted whenever its codec matrix says so;
         // gfx1151 E8P has its K1 table (inventory) but follows the matrix alone.
         for (arch, codec) in available {
             let admitted = crate::qwen4_slab_codec_admitted(arch, codec);

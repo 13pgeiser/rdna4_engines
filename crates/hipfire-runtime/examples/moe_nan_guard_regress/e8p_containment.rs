@@ -3,15 +3,15 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! `e8p_nan_containment`: the expert-slab E8P (and, on gfx1100, hot MQ4) K1/K2 consumers of the
-//! MoE non-finite router guard, old rc4b images vs the new guarded images, on gfx1201 and gfx1100.
+//! MoE non-finite router guard, old unguarded images vs the new guarded images, on gfx1201, gfx1100 and gfx1151.
 //!
 //! A child module of `moe_nan_guard_regress.rs` (it reuses that driver's `Ctx`, old-image loader,
 //! fixtures, router runners and comparators). It runs ONLY on an arch whose slab matrix admits
-//! E8P (gfx1201, gfx1100); there is no skip on those arches.
+//! E8P (gfx1201, gfx1100, gfx1151); there is no skip on those arches.
 //!
 //! # What is proved
 //!
-//! 1. **Finite old == new, bitwise.** The rc4b image (88-byte K1 / 60-byte K2 kernarg) and the new
+//! 1. **Finite old == new, bitwise.** The old image (rc4b, or the pre-rc5 gfx1151 image; 88-byte K1 / 60-byte K2 kernarg) and the new
 //!    guarded production launcher (96-byte K1 / 64-byte K2 kernarg) run on the same valid finite
 //!    inputs and the same routing: E8P K1 gate/up + down at 1/3/8 lanes, E8P K2 gate/up + down at
 //!    7 and 33 prefill rows (gate output feeds the down A4 sidecar through the real producers);
@@ -31,7 +31,7 @@
 //!    exactly canary and the rest bitwise unchanged. The declared count is the full table extent,
 //!    never the number of active experts.
 //! 4. **Router producer + consumer chain.** All-NaN, +Inf and -Inf router rows (the real router
-//!    kernels, incl. the fast one on gfx1201) fail closed: every id -1, every weight +0, the typed
+//!    kernels, incl. the fast one on gfx1201 and gfx1151) fail closed: every id -1, every weight +0, the typed
 //!    fault word names `(layer, global row)` exactly (single failing row) or one failing row
 //!    (several); finite rows are bitwise the pinned beta router's. The router's device tensors
 //!    feed the production planner + K1 (decode) and the slab scatter + A4 producers + K2
@@ -52,6 +52,14 @@
 //! rc4b images: `e8p_i4_moe_gemv_pm_<arch>.hxaco`, `qwen4_moe_iu4_sym_e8p_pm_<arch>.hxaco`
 //! (+ gfx1100 `mq_i4_moe_gemv_mq4only_pm_gfx1100.hxaco`, `qwen4_moe_iu4_sym_pm_gfx1100.hxaco`);
 //! pinned beta sources `moe_router_softmax_top10_f32.hip` (+ `_fast.hip` on gfx1201).
+//!
+//! gfx1151 has no rc4b image at the pinned beta ref (its E8P kernels first exist in the pre-rc5
+//! gfx1151 port, commit `11411610b`, whose images are the unguarded 88-byte K1 / 60-byte K2 ABI:
+//! `e8p_i4_moe_gemv_pm_gfx1151.hxaco` sha256 `4cd87a1e…`, `qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco`
+//! sha256 `4312e5bc…`); those two files, taken from that commit, are the gfx1151 old baseline in
+//! `--old-dir` (the current tree's same-named files are the new bounded images and are NOT the
+//! baseline). gfx1151 compares E8P only: there is no old gfx1151 MQ4 K2 image, so no hot-MQ4
+//! phase there (the hot MQ4 K1 is compared against beta's image by `pm_k1_case`).
 
 use super::*;
 use hipfire_runtime::e8p_i4_reference as e8p;
@@ -576,8 +584,9 @@ fn k2_old_stem(arch: &str, codec: u8) -> R<&'static str> {
     match (arch, codec) {
         ("gfx1201", SLAB_CODEC_E8P) => Ok("qwen4_moe_iu4_sym_e8p_pm_gfx1201"),
         ("gfx1100", SLAB_CODEC_E8P) => Ok("qwen4_moe_iu4_sym_e8p_pm_gfx1100"),
+        ("gfx1151", SLAB_CODEC_E8P) => Ok("qwen4_moe_iu4_sym_e8p_pm_gfx1151"),
         ("gfx1100", SLAB_CODEC_MQ4) => Ok("qwen4_moe_iu4_sym_pm_gfx1100"),
-        _ => Err(format!("no rc4b K2 image for codec {codec} on {arch}")),
+        _ => Err(format!("no old K2 image for codec {codec} on {arch}")),
     }
 }
 
@@ -1606,7 +1615,7 @@ fn out_paths(cx: &Ctx) -> (PathBuf, PathBuf) {
 pub(super) fn run(cx: &mut Ctx) -> R<Outcome> {
     if !rdna_compute::qwen4_slab_codec_admitted(&cx.arch, SLAB_CODEC_E8P) {
         return Ok(Outcome::Skip(format!(
-            "{CASE_NAME}: the slab matrix serves E8P on gfx1201 and gfx1100 only, device is {}",
+            "{CASE_NAME}: the slab matrix serves E8P on gfx1201, gfx1100 and gfx1151 only, device is {}",
             cx.arch
         )));
     }
@@ -1622,7 +1631,7 @@ pub(super) fn run(cx: &mut Ctx) -> R<Outcome> {
     }
     if cx.old_dir.is_none() {
         return Err(format!(
-            "{CASE_NAME}: needs --old-dir: the rc4b E8P/MQ4 images are not tracked at the pinned beta ref"
+            "{CASE_NAME}: needs --old-dir: the rc4b E8P/MQ4 images are not tracked at the pinned beta ref (gfx1151: the pre-rc5 images of commit 11411610b)"
         ));
     }
     let mut rep = Report::default();
@@ -1696,7 +1705,7 @@ fn finish(cx: &mut Ctx, rep: Report, body: R<()>) -> R<Outcome> {
         "phases": phases,
         "old_images": images,
         "old_sources": sources,
-        "old_sources_note": "every old source this case compiles: only moe_router_softmax_top10_f32.hip (run_router_old always passes fast=false, also against the fast router's new output on gfx1201); moe_router_softmax_top10_f32_fast.hip and the old planner are never loaded",
+        "old_sources_note": "every old source this case compiles: only moe_router_softmax_top10_f32.hip (run_router_old always passes fast=false, also against the fast router's new output on gfx1201 and gfx1151); moe_router_softmax_top10_f32_fast.hip and the old planner are never loaded",
         "counters": c.to_json(),
         "output": {
             "file": f32_path.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -1761,6 +1770,30 @@ mod tests {
             for d in blob[words_end..].chunks_exact(2) {
                 assert!(e8p::writer_guard(u16::from_le_bytes([d[0], d[1]])).is_ok());
             }
+        }
+    }
+
+    /// Every arch whose slab matrix serves E8P has an old K2 baseline stem named after its own
+    /// arch (the K1 old image is named after the arch's cold K1 module), and only gfx1100 has the
+    /// hot-MQ4 old K2; no other arch or codec invents one.
+    #[test]
+    fn old_baseline_images_are_arch_keyed_and_cover_every_e8p_arch() {
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let stem = k2_old_stem(arch, SLAB_CODEC_E8P).unwrap();
+            assert_eq!(stem, format!("qwen4_moe_iu4_sym_e8p_pm_{arch}"));
+            let k1 = slab_moe::slab_cold_k1_metadata(arch, SLAB_CODEC_E8P).unwrap();
+            assert!(k1.k1.module.ends_with(arch), "{arch}: {}", k1.k1.module);
+        }
+        assert_eq!(k2_old_stem("gfx1100", SLAB_CODEC_MQ4), Ok("qwen4_moe_iu4_sym_pm_gfx1100"));
+        for arch in ["gfx1201", "gfx1151"] {
+            assert!(k2_old_stem(arch, SLAB_CODEC_MQ4).is_err(), "{arch}");
+        }
+        for arch in ["gfx942", "gfx1200", "gfx1101", "gfx1150", ""] {
+            assert!(k2_old_stem(arch, SLAB_CODEC_E8P).is_err(), "{arch:?}");
+        }
+        // Resource model: only gfx1100 adds the hot-MQ4 phase.
+        for (arch, phases) in [("gfx1201", 1), ("gfx1151", 1), ("gfx1100", 2)] {
+            assert_eq!(resource_model(arch, 1)["phases"].as_array().unwrap().len(), phases, "{arch}");
         }
     }
 

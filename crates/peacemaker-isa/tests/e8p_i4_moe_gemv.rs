@@ -791,6 +791,123 @@ fn n_experts_guard_cpu_model_rejects_minus_one_min_n_and_n_plus_one_and_passes_n
     }
 }
 
+/// One CPU launch of the grid `[M, U]` (one slot per expert descriptor `u`, slot `u` reading `xs[u]`): a workgroup
+/// `(row, u)` is dropped when the emitted `n_experts` compare `guard` fires on `ids[u]`, otherwise it stores the
+/// `kernel_row` model word to `y[u][row]`. A passing id indexes the weight table with `get(..).expect(..)`, so a
+/// dereference past the `n`-entry table is a test failure, not a silent read.
+#[allow(clippy::too_many_arguments)]
+fn cpu_guarded_launch(
+    guard: &str,
+    n: u32,
+    ids: &[u32],
+    table: &[(Vec<u8>, Vec<u16>)],
+    xs: &[Vec<f32>],
+    four_chain: bool,
+    k: usize,
+    m: usize,
+) -> Vec<Vec<u32>> {
+    assert_eq!(table.len(), n as usize, "the table has exactly n_experts entries");
+    let mut y = vec![vec![0xa5a5_a5a5u32; m]; ids.len()];
+    for (u, &id) in ids.iter().enumerate() {
+        for row in 0..m {
+            if scalar_compare(guard, id, n) {
+                continue;
+            }
+            let (plane, scales) = table
+                .get(id as usize)
+                .expect("a passing expert id must index the n-entry table");
+            y[u][row] =
+                kernel_row(four_chain, k, plane, scales, row, &xs[u..u + 1])[0].to_bits();
+        }
+    }
+    y
+}
+
+/// CPU NaN-containment fixture on every K1 arch (gfx1201, gfx1100, gfx1151), no emulator: the router's fail-closed
+/// output for a non-finite row is expert id `-1` with weight `+0`, and the activation rows of the failed lanes
+/// may be NaN. Launching the grid with the emitted guard compare over the ids `[n-1, -1, i32::MIN, n, n+1, 0]`
+/// (slots 1..=4 carry all-NaN activations): every invalid-id slot keeps its sentinel (no store, no table
+/// dereference), the two valid slots (`n-1` and `0`) are finite and bit-equal to the launch that never saw the
+/// invalid descriptors, and the same valid expert fed a NaN row does produce NaN (the fixture has teeth: the
+/// guard, not the data, is what keeps the NaN out).
+#[test]
+fn n_experts_nan_containment_cpu_fixture_on_every_arch() {
+    for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
+        for spec in e8p_i4_moe_gemv::module_specs(arch) {
+            let e = e8p_i4_moe_gemv::emit(spec).unwrap();
+            let symbol = spec.symbol();
+            let lines = insns(&e.s_text);
+            let guard = *lines
+                .iter()
+                .find(|l| **l == "s_cmp_ge_u32 s34, s4")
+                .unwrap_or_else(|| panic!("{symbol}: n_experts compare"));
+            let four_chain = spec.kind.chains() == 4;
+            let (k, m, groups) = (256usize, 2usize, 2usize);
+            let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ u64::from(arch as u8 as u32 + 1));
+            let n = 5u32;
+            let table: Vec<(Vec<u8>, Vec<u16>)> = (0..n)
+                .map(|_| {
+                    let words: Vec<u16> = (0..m * k / 8)
+                        .map(|_| {
+                            ((rng.next() & 0xff)
+                                | ((rng.next() & 0x7f) << 8)
+                                | ((rng.next() & 1) << 15)) as u16
+                        })
+                        .collect();
+                    let scales: Vec<u16> = (0..m * groups)
+                        .map(|_| 0x0400 + rng.below(0x7bff - 0x0400 + 1) as u16)
+                        .collect();
+                    (words.iter().flat_map(|w| w.to_le_bytes()).collect(), scales)
+                })
+                .collect();
+            let finite = |rng: &mut Rng| -> Vec<f32> { (0..k).map(|_| rng.f32()).collect() };
+            let nan_row = vec![f32::NAN; k];
+            let (x_hi, x_lo) = (finite(&mut rng), finite(&mut rng));
+            let ids = [n - 1, u32::MAX, i32::MIN as u32, n, n + 1, 0];
+            let xs = [
+                x_hi.clone(),
+                nan_row.clone(),
+                nan_row.clone(),
+                nan_row.clone(),
+                nan_row.clone(),
+                x_lo.clone(),
+            ];
+            let y = cpu_guarded_launch(guard, n, &ids, &table, &xs, four_chain, k, m);
+            for u in [1usize, 2, 3, 4] {
+                assert!(
+                    y[u].iter().all(|&w| w == 0xa5a5_a5a5),
+                    "{symbol}: id {:#x} stored through the guard",
+                    ids[u]
+                );
+            }
+            let baseline = cpu_guarded_launch(
+                guard,
+                n,
+                &[n - 1, 0],
+                &table,
+                &[x_hi.clone(), x_lo.clone()],
+                four_chain,
+                k,
+                m,
+            );
+            for (u, b) in [(0usize, 0usize), (5, 1)] {
+                assert_eq!(y[u], baseline[b], "{symbol}: valid slot {u} changed by the invalid ones");
+                assert!(
+                    y[u].iter().all(|&w| f32::from_bits(w).is_finite() && w != 0xa5a5_a5a5),
+                    "{symbol}: valid slot {u} not a finite written word"
+                );
+            }
+            // Teeth: the unguarded model on a valid expert with a NaN row yields NaN.
+            let (plane, scales) = &table[(n - 1) as usize];
+            let poisoned = kernel_row(four_chain, k, plane, scales, 0, &[nan_row])[0];
+            assert!(poisoned.is_nan(), "{symbol}: a NaN activation must poison an unguarded row");
+            // n_experts == 0: the whole grid is dropped.
+            let none = cpu_guarded_launch(guard, 0, &[0, 1, u32::MAX], &[], &xs[..3], four_chain, k, m);
+            assert!(none.iter().flatten().all(|&w| w == 0xa5a5_a5a5), "{symbol}: n = 0 stored");
+        }
+    }
+}
+
 /// Resources: wave32, one wave per workgroup, no scratch/spills/private/dynamic LDS, exactly the
 /// 1,536-byte static table stage (the K-E1 stage size), one workgroup barrier that publishes it.
 #[test]

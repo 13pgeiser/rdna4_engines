@@ -48092,7 +48092,7 @@ pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2>
 /// The sealed-slab NT1 K2 table of slab codec `codec` on `arch` the route SERVES:
 /// [`slab_k2_metadata`] (gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), gfx1151 E8P (3)) restricted to
 /// what [`crate::qwen4_slab_codec_admitted`] admits. `None` for everything else and for every codec
-/// the matrix refuses (W2 / codec 2 never, gfx1100 W3 never, gfx1151 E8P until admitted): a table
+/// the matrix refuses (W2 / codec 2 never, gfx1100 W3 never, gfx1151 E8P while its switch is false): a table
 /// entry is not permission.
 pub(crate) fn slab_k2_entry(arch: &str, codec: u8) -> Option<&'static SlabK2> {
     if !crate::qwen4_slab_codec_admitted(arch, codec) {

@@ -12,19 +12,17 @@
 //! | arch    | MQ4 (0) | W3 (1) | W2 (2) | E8P (3)                                  |
 //! |---------|---------|--------|--------|------------------------------------------|
 //! | gfx1201 | yes     | yes    | no     | yes                                      |
-//! | gfx1151 | yes     | yes    | no     | [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] (no today) |
+//! | gfx1151 | yes     | yes    | no     | yes ([`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`]) |
 //! | gfx1100 | yes     | no     | no     | yes                                      |
 //! | other   | no      | no     | no     | no                                       |
 //!
 //! gfx1100 serves MQ4-only layers (no cold bucket) and MQ4 + E8P layers; W3 is
-//! refused there (no gfx1100 W3 kernels). gfx1151 serves MQ4-only layers and
-//! MQ4 + W3 layers; its E8P kernels (`e8p_i4_moe_gemv_pm_gfx1151`,
-//! `qwen4_moe_iu4_sym_e8p_pm_gfx1151`) are the gfx1100 arm re-emitted for gfx1151 and
-//! are selectable, but E8P stays refused there until the one receipts constant
-//! [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] flips to `true`; that single flip is the whole
-//! admission change (every arena, dispatch and launch check goes through
-//! [`qwen4_slab_codec_admitted`]). Matching is by exact architecture name, so near
-//! misses are refused.
+//! refused there (no gfx1100 W3 kernels). gfx1151 serves MQ4-only, MQ4 + W3 and
+//! MQ4 + E8P layers; its E8P kernels (`e8p_i4_moe_gemv_pm_gfx1151`,
+//! `qwen4_moe_iu4_sym_e8p_pm_gfx1151`) are the gfx1100 arm re-emitted for gfx1151, admitted
+//! through the one receipts constant [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] (every
+//! arena, dispatch and launch check goes through [`qwen4_slab_codec_admitted`]). Matching is
+//! by exact architecture name, so near misses are refused.
 //!
 //! Cold codec `0` (MQ4) means NO cold bucket on every architecture, gfx1151
 //! included. The "no cold kernel preload" promise for such a layer is scoped to
@@ -46,13 +44,22 @@ pub const SLAB_CODEC_W3: u8 = 1;
 /// Codec id of an E8P-I4 expert.
 pub const SLAB_CODEC_E8P: u8 = 3;
 
-/// Whether the gfx1151 E8P-I4 (codec 3) slab kernels have their receipts: the K1/K2 byte
-/// oracles (G1, synthetic and real layer) bit-identical to the K-E0 CPU twin on the Halo card
-/// (exact gfx1151) and the frozen-bytes proof of both gfx1151 E8P images against the gfx1100
-/// arm. `false` until those receipts are in `rcpt/`. The ONE switch of E8P admission on
-/// gfx1151: [`qwen4_slab_codec_admitted`] reads it, and so does every consumer of the matrix
-/// (expert arenas, dispatch selection, K1/K2 tables). gfx1100 and gfx1201 E8P never read it.
-pub const SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED: bool = false;
+/// Admission switch for the gfx1151 E8P-I4 (codec 3) slab kernels. Historical receipts (pre-rc5,
+/// recorded against the superseded unbounded 88-byte K1 / 60-byte K2 images and NOT
+/// qualification of the current images): K1/K2 byte oracles bit-identical to the K-E0 CPU twin
+/// on the Halo card (exact gfx1151, BDF `0000:c0:00.0`), 0 mismatches each: K1
+/// `e8p_i4_moe_gemv_pm_gfx1151` (old image `4cd87a1e…`) G1 on synthetic plus real mq2-xts
+/// (d3d536c0) L0/L47 samples (`k1-g1.json`, sha256 `219201db…`) and the synthetic oracle
+/// (`k1-synthetic.json`, `6c1d6a82…`); K2 `qwen4_moe_iu4_sym_e8p_pm_gfx1151` (old image
+/// `4312e5bc…`) G1 with device epilogue probes, 72 scenario runs (`k2-g1.json`, `8aa54ff2…`).
+/// The current images are the same gfx1100 arm re-emitted at the rc5 bounded ABI (96-byte K1
+/// with `n_experts@88`, 64-byte K2 with `n_experts@60`); this constant being `true` does not
+/// claim they are GPU qualified: fresh Halo gates on the current images are recorded
+/// separately.
+/// The ONE switch of E8P admission on gfx1151: [`qwen4_slab_codec_admitted`] reads it, and so
+/// does every consumer of the matrix (expert arenas, dispatch selection, K1/K2 tables).
+/// gfx1100 and gfx1201 E8P never read it.
+pub const SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED: bool = true;
 
 /// Whether the sealed expert-slab route serves `codec` on GPU architecture
 /// `arch`. Exact architecture names only: no family prefix match. gfx1151 E8P follows
@@ -267,7 +274,7 @@ mod tests {
             assert!(qwen4_slab_layer_cold_codec(arch, &[mq4]).is_err(), "{arch}");
             assert!(qwen4_slab_layer_cold_codec(arch, &[]).is_err(), "{arch}");
         }
-        // gfx1151 with the E8P receipts not landed (today) serves MQ4 and W3: uniform MQ4 has no
+        // gfx1151 with the E8P receipts not landed (`false`, the refused state) serves MQ4 and W3: uniform MQ4 has no
         // cold bucket, W3 is the cold codec whether uniform or mixed with MQ4, and E8P is
         // refused in every position.
         assert_eq!(qwen4_slab_layer_cold_codec_with("gfx1151", &[mq4, mq4], false), Ok(mq4));
@@ -378,9 +385,8 @@ mod tests {
         }
     }
 
-    /// The receipts constant is the single gfx1151 E8P admission switch (`false` today, so E8P
-    /// is refused on gfx1151): the public matrix and layer decision read exactly it, whichever
-    /// way it is set, and it moves no other cell.
+    /// The receipts constant is the single gfx1151 E8P admission switch: the public matrix and
+    /// layer decision read exactly it, whichever way it is set, and it moves no other cell.
     #[test]
     fn gfx1151_e8p_admission_is_the_one_receipts_constant() {
         let landed = SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;

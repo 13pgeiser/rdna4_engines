@@ -54,8 +54,8 @@
 //! `--budget-s N` (total, default 600), `--case-timeout-s N` (default 150),
 //! `--out-dir DIR` (default `.`: where `e8p_nan_containment` publishes its JSON and f32le files).
 //!
-//! `e8p_nan_containment` (gfx1201 + gfx1100, sibling module `moe_nan_guard_regress/e8p_containment.rs`)
-//! compares the rc4b E8P (and gfx1100 hot MQ4) K1/K2 images against the new guarded launchers and
+//! `e8p_nan_containment` (gfx1201 + gfx1100 + gfx1151, sibling module `moe_nan_guard_regress/e8p_containment.rs`)
+//! compares the old E8P (rc4b; pre-rc5 on gfx1151) (and gfx1100 hot MQ4) K1/K2 images against the new guarded launchers and
 //! needs a flat `--old-dir` holding those `.hxaco` images and the pinned beta router sources.
 //!
 //! Memory (every case but `e8p_nan_containment`): about 150 MiB of device memory per child (16 real

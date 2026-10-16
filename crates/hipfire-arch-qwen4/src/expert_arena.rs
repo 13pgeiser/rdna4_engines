@@ -157,7 +157,7 @@ pub enum ExpertArenaError {
     /// The expert's format has no kernels on any architecture (MQ2-I4).
     UnsupportedFormat(ExpertFormat),
     /// The expert's codec has no sealed-route kernels on `arch` (gfx1100 serves
-    /// MQ4 + E8P, gfx1151 MQ4 + W3 (+ E8P once `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`), gfx1201
+    /// MQ4 + E8P, gfx1151 MQ4 + W3 + E8P (E8P via `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`), gfx1201
     /// MQ4 + W3 + E8P, everything else nothing).
     ArchRefused { format: ExpertFormat, arch: String },
     /// One layer holds two different cold codecs (W3 and E8P); the route has
@@ -438,8 +438,8 @@ mod tests {
         );
     }
 
-    /// The matrix keyed by (arch, cold codec): gfx1100 MQ4 + E8P, gfx1151 MQ4 + W3 (+ E8P once
-    /// its receipts landed), gfx1201 MQ4 + W3 + E8P, W2 nowhere; a layer's cold codec is one codec.
+    /// The matrix keyed by (arch, cold codec): gfx1100 MQ4 + E8P, gfx1151 MQ4 + W3 (+ E8P when
+    /// its receipts switch is set), gfx1201 MQ4 + W3 + E8P, W2 nowhere; a layer's cold codec is one codec.
     #[test]
     fn check_executable_is_keyed_by_arch_and_cold_codec() {
         let plan = |formats: &[ExpertFormat]| ExpertArenaPlan {
@@ -468,7 +468,7 @@ mod tests {
                 arch: "gfx1100".into()
             })
         );
-        // gfx1151 serves W3 next to MQ4 but, until its E8P receipts land, no E8P: an arch refusal.
+        // gfx1151 serves W3 next to MQ4 in both switch states; E8P only with the switch set.
         assert_eq!(w3.check_executable_with("gfx1151", false), Ok(()));
         assert_eq!(w3.check_executable_with("gfx1151", true), Ok(()));
         assert_eq!(

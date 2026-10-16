@@ -8,8 +8,8 @@ K4's serving route admits E8P-I4 cold experts and an MQ4 hot set on exact
 gfx1100, not the standalone W2 port described below. W2 is refused on every
 architecture and its gfx1100 kernels are not registered for serving. The
 codec-generic two-bucket route also admits W3 or E8P cold experts with an
-MQ4 hot set on gfx1201 (not both cold codecs within one layer), and W3 with
-an MQ4 hot set on gfx1151 (E8P refused there). gfx1100 W3
+MQ4 hot set on gfx1201 (not both cold codecs within one layer), and W3 or
+E8P with an MQ4 hot set on gfx1151 (E8P via its own Halo receipts). gfx1100 W3
 remains refused. The kernel instruction bytes and ABI of the existing gfx1201
 W3/MQ4 objects and the aggregate MQ4 routes are unchanged; the landed images
 are the guarded containers of current beta's code-end baseline
