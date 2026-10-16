@@ -3586,7 +3586,8 @@ pub fn generate_dflash(
     // Qwen DFlash/spec: terminal ToolCalls are held by generate_spec; the
     // producer-authorized visible channel + router finish drive release,
     // finish_reason, and cache store. Length without decoded EOT never
-    // releases calls or stores cache. Other arches keep whole-output extract.
+    // releases calls, but a complete call-less body stores. Other arches
+    // keep whole-output extract.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let qwen_semantic_v2 = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.caps().semantic_contract_version == Some(2))
@@ -3661,7 +3662,7 @@ pub fn generate_dflash(
             );
         let semantic_stop = run.semantic_stop.is_some();
         // A ctx-exhausted mid-loop break is a length stop even when the token
-        // budget is unspent: same `length` + no-store path as the cap below.
+        // budget is unspent; a complete call-less body is still splice-safe.
         let hit_length_cap = run.ctx_exhausted
             || qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
         // Prefer producer-visible channel; fall back to finish Token events.
@@ -4430,7 +4431,7 @@ pub fn generate_spec(
     // Set when the mid-loop `position + block_size >= ctx_capacity` break
     // fires: the draft's context-indexed structures cannot host another
     // full block, so the epilogue must report a length stop
-    // (`finish_reason=length`, no cache store) rather than a natural stop.
+    // (`finish_reason=length`) rather than a natural stop.
     let mut ctx_exhausted = false;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
@@ -7069,8 +7070,8 @@ pub fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_m
 }
 
 /// Speculative wire terminal after `Qwen35Emit::finish` + length/EOT known.
-/// Length without decoded EOT never releases calls or stores cache; malformed
-/// is error XOR done; decoded EOT on the final budget token beats length.
+/// Length without decoded EOT never releases calls, but stores a complete
+/// call-less body; malformed is error XOR done. Final-budget EOT beats length.
 #[derive(Debug, Clone)]
 pub enum QwenDflashWireTerminal {
     Malformed {
@@ -7140,11 +7141,20 @@ pub fn qwen_dflash_wire_terminal(
         };
     }
     if hit_length_cap {
+        // Hidden calls cannot be described by the call-less client echo.
+        // Truncated tool bodies also remain unstored.
+        let call_in_body = !finish_summary_held_tool_calls(finish).is_empty() || finish.tool_calls > 0;
+        let store_cache = finish.finish_reason != "truncated_tool_call" && !call_in_body;
         return QwenDflashWireTerminal::Done {
             finish_reason: "length",
             release_tool_calls: false,
-            store_cache: false,
-            fingerprint_text: String::new(),
+            store_cache,
+            // An unstored turn carries no fingerprint (nothing may key on it).
+            fingerprint_text: if store_cache {
+                normalize_asst_turn_for_fingerprint(visible_for_cache)
+            } else {
+                String::new()
+            },
             wire_tool_calls: Vec::new(),
         };
     }
@@ -9212,12 +9222,23 @@ mod qwen_history_chain_tests {
     /// route's cache-action seam into the shared `qwen_cached_turn_entry`.
     /// Returns what the client observed on the wire.
     fn produce_turn(route: Route, tok: &Tokenizer, cache: &mut AsstTurnCache, step: &Gen) -> Wire {
+        let mut ids = emitted_body(step.body);
+        ids.push(step.end);
+        produce_turn_ids(route, tok, cache, step, &ids, false)
+    }
+
+    fn produce_turn_ids(
+        route: Route,
+        tok: &Tokenizer,
+        cache: &mut AsstTurnCache,
+        step: &Gen,
+        ids: &[u32],
+        length: bool,
+    ) -> Wire {
         use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
         use hipfire_runtime::prompt_frame::{AssistantPrefix, ThinkMode};
         use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 
-        let mut ids = emitted_body(step.body);
-        ids.push(step.end);
         let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
         let mut insert = |fp: u64, seq: Vec<u32>| {
             cache.insert(fp, qwen_cached_turn_entry(tok, seq, true));
@@ -9266,7 +9287,7 @@ mod qwen_history_chain_tests {
                 } else {
                     super::qwen_dflash_visible_from_finish(&finish)
                 };
-                let terminal = qwen_dflash_wire_terminal(&finish, false, false, &visible, false);
+                let terminal = qwen_dflash_wire_terminal(&finish, length, false, &visible, false);
                 let stored = qwen_dflash_apply_cache_action(
                     &mut insert,
                     &qwen_dflash_cache_action(&terminal),
@@ -9274,7 +9295,7 @@ mod qwen_history_chain_tests {
                 );
                 assert!(
                     stored.is_some(),
-                    "Mtp: a completed stop must store {:?}",
+                    "Mtp: a safe terminal must store {:?}",
                     step.body
                 );
             }
@@ -9282,7 +9303,7 @@ mod qwen_history_chain_tests {
                 let mut producer = crate::ar::QwenArSemanticProducer::new("p", true);
                 let (mut sink, mut conversation, mut streamed, mut seq_pos) =
                     (Vec::new(), Vec::new(), Vec::new(), 0usize);
-                for &id in &ids {
+                for &id in ids {
                     let mut bytes = Vec::new();
                     tok.decode_token_bytes_into(id, &mut bytes);
                     let stopped = producer
@@ -9299,10 +9320,16 @@ mod qwen_history_chain_tests {
                         break;
                     }
                 }
-                let (finish, visible) = producer.finish(&mut sink, false).expect("finish");
+                let (finish, visible) = producer.finish(&mut sink, length).expect("finish");
                 assert_eq!(
-                    finish.cause == QwenArTerminalCause::OpenThink,
-                    step.open_think,
+                    finish.cause,
+                    if length {
+                        QwenArTerminalCause::LengthCap
+                    } else if step.open_think {
+                        QwenArTerminalCause::OpenThink
+                    } else {
+                        QwenArTerminalCause::DecodedEot
+                    },
                     "AR terminal cause"
                 );
                 let stored = qwen_ar_apply_cache_action(
@@ -9312,7 +9339,7 @@ mod qwen_history_chain_tests {
                 );
                 assert!(
                     stored.is_some(),
-                    "Ar: a completed stop must store {:?}",
+                    "Ar: a safe terminal must store {:?}",
                     step.body
                 );
                 for line in String::from_utf8(sink).unwrap().lines() {
@@ -9470,6 +9497,146 @@ mod qwen_history_chain_tests {
         }
     }
 
+    fn run_length_chain(step: &Gen) {
+        let tok = tokenizer();
+        // Prose stays noncanonical byte IDs; think markers are actual special
+        // IDs, like the R2 failure, rather than byte-spelled marker text.
+        let mut body = Vec::new();
+        let mut rest = step.body.as_bytes();
+        while !rest.is_empty() {
+            if let Some(tail) = rest.strip_prefix(b"<think>") {
+                body.push(2);
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix(b"</think>") {
+                body.push(3);
+                rest = tail;
+            } else {
+                body.push(BYTE_BASE + u32::from(rest[0]));
+                rest = &rest[1..];
+            }
+        }
+        let frame = JinjaChatFrame {
+            tokenizer: &tok,
+            template: THINK_HISTORY,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let mut route_prompts = Vec::new();
+        for route in [Route::Mtp, Route::Ar] {
+            let mut cache = AsstTurnCache::new_from_env();
+            let mut history = vec![msg(Role::System, "be helpful")];
+            let mut committed = Vec::new();
+            let mut prompts = Vec::new();
+            for turn in 0..=3 {
+                history.push(msg(Role::User, &format!("question {turn}")));
+                let cold = tok.encode(&frame.render_messages(&history, None, None).unwrap());
+                let prompt = qwen_jinja_cached_history_tokens(
+                    &frame,
+                    &mut cache,
+                    &cold,
+                    &history,
+                    None,
+                    hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                    match route {
+                        Route::Mtp => "dflash",
+                        Route::Ar => "qwen4-ar",
+                    },
+                    Some(&committed),
+                )
+                .unwrap();
+                if turn > 0 {
+                    assert!(
+                        prompt.len() > committed.len(),
+                        "{route:?} turn {turn}: strict append"
+                    );
+                    assert_eq!(
+                        prompt
+                            .iter()
+                            .zip(&committed)
+                            .take_while(|(a, b)| a == b)
+                            .count(),
+                        committed.len(),
+                        "{route:?} turn {turn}: full prefix reuse, zero old rows re-prefilled"
+                    );
+                }
+                if turn == 2 {
+                    assert!(
+                        !cold.starts_with(&committed),
+                        "fixture must diverge without splicing"
+                    );
+                    // Every history turn gets the template-owned EOT. No
+                    // synthetic think close may appear before that marker.
+                    let mut trailer = vec![IM_END];
+                    trailer.extend(tok.encode("\n"));
+                    assert!(prompt[committed.len()..].starts_with(&trailer));
+                    assert!(contains(&prompt, &body), "special IDs replay verbatim");
+                }
+                prompts.push(prompt.clone());
+                if turn == 3 {
+                    break;
+                }
+                let (wire, generated) = if turn == 1 {
+                    (
+                        produce_turn_ids(route, &tok, &mut cache, step, &body, true),
+                        body.clone(),
+                    )
+                } else {
+                    let normal = &SCRIPT[3];
+                    let wire = produce_turn(route, &tok, &mut cache, normal);
+                    let mut generated = emitted_body(normal.body);
+                    generated.push(IM_END);
+                    generated.extend(tok.encode("\n"));
+                    (wire, generated)
+                };
+                committed = prompt;
+                committed.extend(generated);
+                let mut assistant = msg(Role::Assistant, &wire.content);
+                assistant.reasoning_content = Some(wire.reasoning);
+                let cached =
+                    qwen_jinja_lookup_turn(&mut cache, &assistant, &[]).expect("stored turn");
+                if turn == 1 {
+                    assert_eq!(
+                        cached.content.unwrap().token_ids,
+                        body,
+                        "length body stays exact"
+                    );
+                }
+                history.push(assistant);
+            }
+            route_prompts.push(prompts);
+        }
+        assert_eq!(
+            route_prompts[0], route_prompts[1],
+            "MTP and AR prompts stay identical"
+        );
+    }
+
+    #[test]
+    fn length_inside_open_think_chain_reuses_full_prefix_on_mtp_and_ar() {
+        run_length_chain(&Gen {
+            body: "still he thinking",
+            end: 0, // Unused: length emits no terminator.
+            open_think: true,
+            reasoning: "still he thinking",
+            content: "",
+        });
+    }
+
+    #[test]
+    fn length_with_literal_think_special_ids_chain_reuses_full_prefix_on_mtp_and_ar() {
+        run_length_chain(&Gen {
+            body: "plan he\n</think>\n\nquote <think>inner he</think>\n\nanswer he",
+            end: 0,
+            open_think: false,
+            reasoning: "plan he\ninner he",
+            content: "quote answer he",
+        });
+    }
+
     #[test]
     fn cached_turn_entry_reasoning_identity_ignores_trailing_terminators() {
         let tok = tokenizer();
@@ -9501,7 +9668,7 @@ mod qwen_history_chain_tests {
     }
 
     #[test]
-    fn open_think_stores_only_when_completed_without_a_call() {
+    fn open_think_and_length_store_only_without_a_call() {
         use hipfire_runtime::emit_text::ToolOutputRouter;
         let ar_store = |cause| {
             crate::ar::qwen_ar_finish_route(ToolOutputRouter::new(), cause, &mut String::new())
@@ -9510,7 +9677,7 @@ mod qwen_history_chain_tests {
         };
         assert!(ar_store(QwenArTerminalCause::OpenThink));
         assert!(ar_store(QwenArTerminalCause::DecodedEot));
-        assert!(!ar_store(QwenArTerminalCause::LengthCap));
+        assert!(ar_store(QwenArTerminalCause::LengthCap));
         assert!(!ar_store(QwenArTerminalCause::StopSequence));
 
         let open = |tool_calls: usize| FinishSummary {
@@ -9528,12 +9695,21 @@ mod qwen_history_chain_tests {
                 _ => false,
             };
         assert!(spec_store(&open(0), false, false));
-        assert!(!spec_store(&open(0), true, false), "length");
+        assert!(spec_store(&open(0), true, false), "length");
         assert!(!spec_store(&open(0), false, true), "grammar fail-closed");
         assert!(
             !spec_store(&open(1), false, false),
             "a completed call in the body"
         );
+        assert!(
+            !spec_store(&open(1), true, false),
+            "length with a hidden completed call"
+        );
+        let truncated = FinishSummary {
+            finish_reason: "truncated_tool_call",
+            ..FinishSummary::default()
+        };
+        assert!(!spec_store(&truncated, true, false), "truncated length body");
     }
 }
 #[cfg(test)]

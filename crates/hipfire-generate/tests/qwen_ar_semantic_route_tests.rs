@@ -276,17 +276,29 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         let fin = fin.expect("finish");
         assert_eq!(fin.finish_reason, "length");
         assert!(fin.wire_tool_calls.is_empty());
-        assert!(!fin.store_cache, "every length terminal is cache-unsafe");
+        assert!(!fin.store_cache, "completed hidden call is cache-unsafe");
         assert!(!out.contains("\"type\":\"tool_calls\""));
     }
 
     #[test]
-    fn length_cap_prose_only_no_cache() {
-        let (_, _, fin, _, _, _) = drive_ar_semantic_path(&["just prose"], false, true);
+    fn length_cap_prose_only_stores_cache() {
+        let (_, visible, fin, _, _, _) = drive_ar_semantic_path(&["just prose"], false, true);
         let fin = fin.expect("finish");
         assert_eq!(fin.finish_reason, "length");
         assert!(fin.wire_tool_calls.is_empty());
-        assert!(!fin.store_cache);
+        assert!(fin.store_cache);
+        // The production cache action really mutates the sink.
+        let action = qwen_ar_cache_action(&fin, &visible);
+        let mut sink = HashMap::new();
+        let fp = qwen_ar_apply_cache_action(
+            |k, v| {
+                sink.insert(k, v);
+            },
+            &action,
+            vec![4, 5],
+        )
+        .expect("length body stores");
+        assert_eq!(sink[&fp], vec![4, 5]);
     }
 
     #[test]
@@ -303,12 +315,35 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     }
 
     #[test]
-    fn length_cap_partial_opener_no_calls_no_cache() {
+    fn length_cap_partial_opener_flushes_prose_and_stores_cache() {
+        // A held marker prefix flushes as ordinary prose, so the body is
+        // call-less and cache-safe.
         let (_, _, fin, _, _, _) = drive_ar_semantic_path(&["hi<tool_"], false, true);
         let fin = fin.expect("length");
         assert_eq!(fin.finish_reason, "length");
         assert!(fin.wire_tool_calls.is_empty());
+        assert!(fin.store_cache);
+    }
+
+    #[test]
+    fn length_cap_open_think_with_hidden_completed_call_no_cache() {
+        // A call completed before the unclosed think is hidden by length; the
+        // call-less fingerprint would not describe that body.
+        let (out, _, fin, stopped, _, _) = drive_ar_semantic_path(
+            &[
+                r#"pre<tool_call>{"name":"read","arguments":{"path":"/x"}}</tool_call>"#,
+                "<think>secret",
+            ],
+            false,
+            true,
+        );
+        assert!(!stopped);
+        let fin = fin.expect("length");
+        assert_eq!(fin.cause, QwenArTerminalCause::LengthCap);
+        assert_eq!(fin.finish_reason, "length");
+        assert!(fin.wire_tool_calls.is_empty());
         assert!(!fin.store_cache);
+        assert!(!out.contains("\"type\":\"tool_calls\""));
     }
 
     #[test]
@@ -477,7 +512,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         let fin = fin.unwrap();
         assert_eq!(fin.finish_reason, "length");
         assert!(fin.wire_tool_calls.is_empty());
-        assert!(!fin.store_cache);
+        assert!(fin.store_cache, "call-less length body stores");
     }
 
     #[test]
@@ -659,7 +694,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
                 assert!(
                     visible.contains(prose) && visible.contains(prefix),
                     "natural EOS must flush proper prefix as prose via finish: \
-                     marker={marker:?} prefix={prefix:?} visible={visible:?} out={out:?}"
+                         marker={marker:?} prefix={prefix:?} visible={visible:?} out={out:?}"
                 );
 
                 // Length finalization (`hit_length_cap = true`) — distinct terminal cause.
@@ -672,11 +707,11 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
                 );
                 assert_eq!(fin_len.cause, QwenArTerminalCause::LengthCap);
                 assert_eq!(fin_len.finish_reason, "length");
-                assert!(!fin_len.store_cache);
+                assert!(fin_len.store_cache, "call-less length flush stores");
                 assert!(
                     visible_len.contains(prose) && visible_len.contains(prefix),
                     "length finish must also flush proper prefix prose: \
-                     marker={marker:?} prefix={prefix:?} visible={visible_len:?} out={out_len:?}"
+                         marker={marker:?} prefix={prefix:?} visible={visible_len:?} out={out_len:?}"
                 );
             }
 
@@ -869,7 +904,8 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(out.contains("\"type\":\"done\""));
         assert!(out.contains("\"finish_reason\":\"tool_calls\""));
         assert!(out.contains("\"name\":\"read\""));
-        // Pure length without EOT would suppress the same complete call.
+        // Pure length without EOT would suppress the same complete call, and
+        // the call-less fingerprint would not describe that body: no store.
         let (out_len, _, fin_len, _, _, _) = drive_ar_semantic_path(
             &[r#"pre<tool_call>{"name":"read","arguments":{"path":"/x"}}</tool_call>"#],
             false,
@@ -905,7 +941,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     #[test]
     fn open_think_at_length_cap_is_length_with_reasoning_not_error() {
         // max_tokens spent mid-reasoning: every reasoning byte streams, the turn
-        // ends with done/finish_reason=length, and nothing is cached.
+        // ends with done/finish_reason=length, and the call-less body is cached.
         let (out, visible, fin, stopped, _, _) =
             drive_ar_semantic_path(&["step one, ", "step two"], true, true);
         assert!(!stopped);
@@ -913,7 +949,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert_eq!(fin.cause, QwenArTerminalCause::LengthCap);
         assert_eq!(fin.finish_reason, "length");
         assert!(fin.wire_tool_calls.is_empty());
-        assert!(!fin.store_cache);
+        assert!(fin.store_cache, "call-less open-think length body stores");
         assert!(visible.is_empty(), "no answer text: {visible:?}");
         let events = parse_jsonl(&out);
         let reasoning: String = events
@@ -1165,19 +1201,47 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert_eq!(sink.len(), 1);
         assert_eq!(sink[&fp], vec![1, 2, 3]);
 
+        // Length without a completed hidden call stores verbatim.
         let (_, _, fin_len, _, _, _) = drive_ar_semantic_path(&["Hello world"], false, true);
         let fin_len = fin_len.expect("length");
         let action_len = qwen_ar_cache_action(&fin_len, "Hello world");
-        assert!(!action_len.store);
-        assert!(qwen_ar_apply_cache_action(
+        assert!(action_len.store);
+        let fp_len = qwen_ar_apply_cache_action(
             |k, v| {
                 sink.insert(k, v);
             },
             &action_len,
             vec![9],
         )
+        .expect("length body stores");
+        assert_eq!(fp_len, fp, "terminal kind does not change the content key");
+        assert_eq!(
+            sink.len(),
+            1,
+            "the same content key replaces its prior body"
+        );
+        assert_eq!(sink[&fp_len], vec![9]);
+
+        // A completed call hidden by length is not described by the call-less
+        // fingerprint: no sink mutation.
+        let (_, visible_hidden, fin_hidden, _, _, _) = drive_ar_semantic_path(
+            &[r#"hi<tool_call>{"name":"read","arguments":{"path":"/x"}}</tool_call>"#],
+            false,
+            true,
+        );
+        let fin_hidden = fin_hidden.expect("length");
+        let action_hidden = qwen_ar_cache_action(&fin_hidden, &visible_hidden);
+        assert!(!action_hidden.store);
+        assert!(qwen_ar_apply_cache_action(
+            |k, v| {
+                sink.insert(k, v);
+            },
+            &action_hidden,
+            vec![7],
+        )
         .is_none());
-        assert_eq!(sink.len(), 1, "length must not mutate sink");
+        assert_eq!(sink.len(), 1, "hidden-call length must not mutate sink");
+        assert_eq!(sink[&fp_len], vec![9]);
     }
 
     #[test]

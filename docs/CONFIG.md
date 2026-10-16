@@ -942,9 +942,14 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
 
-Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
+Qwen AR, MTP and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
-producer reasoning text when the turn thought). On the next turn, Jinja history
+producer reasoning text when the turn thought). A `length` terminal with a complete
+call-less body (open-think length included) is stored the same way, under the same
+content/tool fingerprint and producer reasoning; the template's per-turn `im_end`
+framing is kept and no synthetic think close is inserted. Truncated or malformed
+tool output, suppressed hidden completed calls (they cannot be described in the
+echo key), stop-sequence, abort and fail-closed terminals are never stored. On the next turn, Jinja history
 replay splices that span through the model's trained template framing so the
 LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
 hits; edited or mismatched history falls back to a plain retokenized render

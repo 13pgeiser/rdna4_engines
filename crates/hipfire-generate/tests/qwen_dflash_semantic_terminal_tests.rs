@@ -569,10 +569,13 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     #[test]
     fn open_think_at_length_cap_is_length_done_not_error() {
         // Budget spent mid-reasoning on the spec path: the reasoning already
-        // streamed, and the terminal is done/length (no calls, no cache), not
-        // the fail-closed open-think error.
-        let (stream, fin, _raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
-        assert!(stream.iter().any(|e| matches!(e, ClientEvent::Reasoning(_))));
+        // streamed, and the terminal is done/length (no calls) that STORES the
+        // call-less emitted body verbatim in the cache — no synthetic think
+        // close or end-of-turn is inserted — not the fail-closed open-think error.
+        let (stream, fin, raw) = drive_qwen_emit("still thinking", AssistantPrefix::OpenThink);
+        assert!(stream
+            .iter()
+            .any(|e| matches!(e, ClientEvent::Reasoning(_))));
         assert!(fin.open_think);
         let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "", false);
         match &term {
@@ -585,14 +588,82 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
             } => {
                 assert_eq!(*finish_reason, "length");
                 assert!(!*release_tool_calls);
-                assert!(!*store_cache);
+                assert!(
+                    *store_cache,
+                    "call-less open-think length stores its emitted body"
+                );
                 assert!(wire_tool_calls.is_empty());
             }
             other => panic!("expected length Done, got {other:?}"),
         }
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
+        assert!(action.store);
+        assert!(action.tool_calls.is_empty());
+        // Apply the action to a sink: the verbatim generated body inserts, with
+        // no synthetic `</think>` close or `<|im_end|>` (id 1) appended.
+        let tok = test_tokenizer();
+        let body = tok.encode("still thinking");
+        assert_eq!(raw, body, "emitter streamed exactly the generated body");
+        assert!(!raw.contains(&1), "no synthetic end of turn in the body");
+        let mut sink: Vec<(u64, Vec<u32>)> = Vec::new();
+        let fp = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
+            |f, seq| sink.push((f, seq)),
+            &action,
+            raw.clone(),
+        );
+        assert_eq!(sink.len(), 1, "length open-think body is inserted");
+        let (stored_fp, stored_seq) = &sink[0];
+        assert_eq!(fp, Some(*stored_fp));
+        assert_eq!(
+            *stored_fp,
+            hipfire_generate::common::asst_turn_fingerprint(
+                &action.fingerprint_text,
+                &action.tool_calls
+            )
+        );
+        assert_eq!(*stored_seq, body, "stored verbatim: no synthetic close/EOT");
+
+        // A completed call hidden in the open-think body cannot be described by
+        // the call-less fingerprint: length stays uncached with no calls released.
+        let hidden = FinishSummary {
+            events: vec![ClientEvent::ToolCalls(vec![ToolCall {
+                id: None,
+                name: "t".into(),
+                arguments: serde_json::json!({}),
+                rendered_body: None,
+            }])],
+            finish_reason: "open_think",
+            tool_calls: 1,
+            visible_text: String::new(),
+            decoded_eot: false,
+            open_think: true,
+        };
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&hidden, true, false, "", false);
+        match &term {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
+                finish_reason,
+                release_tool_calls,
+                store_cache,
+                wire_tool_calls,
+                ..
+            } => {
+                assert_eq!(*finish_reason, "length");
+                assert!(!*release_tool_calls);
+                assert!(
+                    !*store_cache,
+                    "hidden completed call at length stays uncached"
+                );
+                assert!(wire_tool_calls.is_empty());
+            }
+            other => panic!("expected length Done, got {other:?}"),
+        }
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
         // A grammar violation still fails closed at the same boundary.
         let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, true, "", false);
-        assert!(matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }));
+        assert!(matches!(
+            term,
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }
+        ));
     }
 
     #[test]
@@ -1232,9 +1303,13 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     #[test]
     fn decoded_eot_beats_length_cap_helper() {
         let fin = summary_stop("hi");
-        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, false, false));
+        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(
+            8, 8, false, false
+        ));
         // Emitter semantic stop at cap is also not length (independent of EOT).
-        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, false, true));
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(
+            8, 8, false, true
+        ));
         let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "hi", false);
         match &term {
             hipfire_generate::qwen::QwenDflashWireTerminal::Done {
@@ -1244,18 +1319,24 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
                 ..
             } => {
                 assert_eq!(*finish_reason, "length");
-                assert!(!*store_cache);
+                assert!(
+                    *store_cache,
+                    "call-less plain length stores its emitted body"
+                );
                 assert!(!*release_tool_calls);
             }
             other => panic!("{other:?}"),
         }
-        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, true, false));
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(
+            8, 8, true, false
+        ));
         let tok = test_tokenizer();
         let mut ids = tok.encode("hi");
         ids.push(1);
         let (_s, fin_eot, _) = drive_qwen_ids(&ids, AssistantPrefix::Plain);
         assert!(fin_eot.decoded_eot);
-        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin_eot, false, false, "hi", false);
+        let term =
+            hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin_eot, false, false, "hi", false);
         assert!(matches!(
             term,
             hipfire_generate::qwen::QwenDflashWireTerminal::Done {

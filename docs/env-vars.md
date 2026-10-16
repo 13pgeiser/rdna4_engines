@@ -310,6 +310,14 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_QWEN4_CACHE_QUALITY_OUT` | unset | Oracle/diagnostic only. Absolute path of a JSONL file that `hipfire_arch_qwen4::cache_quality::cache_quality_event` appends to (one compact JSON line per event, flushed per line; the variable is read once; unset or empty disables capture, a relative path warns and disables it). It is the opt-in production ID capture sink consumed by `quality_driver.py`; no daemon or generate code path calls it in this tree. |
 | `HIPFIRE_CQ_SESSION_BUDGET_BYTES` | unset: unbounded | Oracle only: `u64` byte budget of the `SessionCache` the `qwen4_parity --mode cache-quality` hit-vs-cold logits oracle builds (reference parity of the session cache; also honours `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Not read by the daemon. |
 
+Assistant-turn token splicing also stores complete call-less `length` bodies,
+including open `<think>` spans, keyed by the unchanged content/tool fingerprint
+and producer reasoning text. Echoing `content` and `reasoning_content` replays
+the emitted IDs without a synthetic `</think>`; the history template still
+appends its per-turn `<|im_end|>`. Truncated/malformed tool output, suppressed
+hidden calls, stop-sequence, abort and fail-closed terminals remain unstored.
+See [Prompt / assistant-turn cache](CONFIG.md#prompt--assistant-turn-cache).
+
 ### Embedding (arch 17)
 
 | Variable | Default / sense | Notes |

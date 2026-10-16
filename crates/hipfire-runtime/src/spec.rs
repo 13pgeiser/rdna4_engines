@@ -1591,7 +1591,9 @@ pub struct FinishSummary {
     pub decoded_eot: bool,
     /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
     /// a reasoning-only `stop` with no tool calls. Qwen may cache a completed
-    /// whole-body turn; length, truncation and fail-closed exits stay unstored.
+    /// whole-body turn; truncation and fail-closed exits stay unstored. A
+    /// length terminal is classified by the wrapper (the AR route stores a
+    /// call-less length body verbatim; see `qwen_ar_finish_route`).
     pub open_think: bool,
 }
 

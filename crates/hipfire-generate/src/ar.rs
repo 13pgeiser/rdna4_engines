@@ -227,16 +227,19 @@ pub fn qwen_ar_think_budget_step(
     }
 }
 
-/// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
-/// or primes asst_turn_cache. Decoded EOT on the final budget token still
-/// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
+/// Finish the AR router. Length-cap (without EOT) never exposes tool_calls,
+/// but a successful call-less length body (prose or open-think) IS cached: the
+/// generated tokens are stored verbatim so the next turn splices the exact wire
+/// IDs. Decoded EOT on the final budget token still classifies as
+/// stop/tool_calls. Unclosed/malformed without length → Err.
 /// A stop sequence keeps calls completed before it, drops a call it cut off,
 /// and never primes asst_turn_cache (the KV holds the trimmed stop text).
 /// Open think → `stop` with the reasoning only and no tool calls. A completed
 /// open-think stop IS cached: the whole generated body is stored verbatim
 /// beside its router reasoning text (`qwen_cached_turn_entry`), so history
-/// replays the unclosed span as one body. It stays uncached when the tool
-/// router fails or finished a call the stop would discard.
+/// replays the unclosed span as one body. Length and open-think stay uncached
+/// when the tool router fails or finished a call the terminal would discard
+/// (a call-less fingerprint would not describe that body).
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
     cause: QwenArTerminalCause,
@@ -249,9 +252,9 @@ pub fn qwen_ar_finish_route(
     match router.finish() {
         Err(err) => {
             if length_unsafe || stop_sequence || open_think {
-                // Any pure-length terminal is unsafe: no calls, no cache. A
-                // stop sequence that cut a call short leaves no call either,
-                // and neither does a turn that ended inside `<think>`.
+                // A truncated router (error) at length leaves no call and no
+                // cache. A stop sequence that cut a call short leaves no call
+                // either, and neither does a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
                     finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
@@ -278,12 +281,13 @@ pub fn qwen_ar_finish_route(
                 }
             }
             if length_unsafe {
-                // Length is never a tool-safe or cache-safe terminal —
-                // prose-only, complete hidden call, or trailing flush alike.
+                // Length never releases a call, but a call-less successful
+                // body (prose or open-think) is cache-safe. A completed hidden
+                // call would not be described by the call-less fingerprint.
                 Ok(QwenArRouteFinish {
                     finish_reason: "length",
                     wire_tool_calls: Vec::new(),
-                    store_cache: false,
+                    store_cache: finished_calls.is_empty(),
                     trailing_visible,
                     cause,
                 })
@@ -2303,8 +2307,9 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // fingerprint / trailer trim / value contract (`qwen_cached_turn_entry`) the
     // MTP route stores, so the next turn of EITHER route splices these exact
     // IDs instead of re-encoding the decoded text. `finish.store_cache` already
-    // excludes length-capped, stop-sequence and malformed terminals (and an
-    // open-think stop that holds a completed call); a client abort returned above.
+    // excludes stop-sequence and malformed terminals, truncated tool routers,
+    // and completed calls hidden by length/open-think; length-capped call-less
+    // bodies store. A client abort returned above.
     let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
     if cache_action.store {
         let tok = m.tokenizer.as_ref().unwrap();
@@ -5787,7 +5792,7 @@ pub fn generate(
         // Length-cap never exposes executable calls; malformed without
         // length fails closed (error, no tool_calls, no asst_turn_cache).
         // Decoded EOT on the final budget token beats length.
-        // Open think → reasoning-only stop (no calls, no cache) via finish().
+        // Open think → reasoning-only stop (no calls) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
         let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
@@ -5862,8 +5867,9 @@ pub fn generate(
         // the model wrote into KV instead of re-encoding via
         // `tokenizer.encode(msg.content)` (BPE non-bijective).
         //
-        // Suppressed on malformed / length-partial turns and on client Abort
-        // (effects.store_cache == false). A completed open-think stop stores.
+        // Suppressed on malformed / truncated-tool / hidden-call turns and on
+        // client Abort (effects.store_cache == false). Call-less length and
+        // completed open-think bodies store.
         let mut cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
         cache_action.store = effects.store_cache && cache_action.store;
         if cache_action.store {
