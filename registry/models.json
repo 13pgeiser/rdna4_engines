@@ -1316,7 +1316,7 @@
       "file": "qwen3.8-flash-next-base.mq2-xts",
       "size_gb": 46.9,
       "min_vram_gb": 48,
-      "desc": "Qwen3.8-Flash-Next MQ2 XTS for 7900 XTX (gfx1100) and R9700 (gfx1201): the 6,306 hot routed experts keep their MQ4 XTS bytes; the other 18,270 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set; the 108 linear-attention input projections use 4-bit QT44 encoding instead of 6-bit MQ6 (Qwen4 HFQM, arch 16). Split base (46.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 76.0 GB with the q4 rows or 101.3 GB with the q8 rows. Needs hipfire at or after @@MQ2_LAND@@.",
+      "desc": "Qwen3.8-Flash-Next MQ2 XTS for 7900 XTX (gfx1100) and R9700 (gfx1201): the 6,306 hot routed experts keep their MQ4 XTS bytes; the other 18,270 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set; the 108 linear-attention input projections use 4-bit QT44 encoding instead of 6-bit MQ6 (Qwen4 HFQM, arch 16). Split base (46.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 76.0 GB with the q4 rows or 101.3 GB with the q8 rows. Needs hipfire at or after ea2abd111.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1337,7 +1337,7 @@
       "file": "qwen3.8-flash-next-base.mq2-xts-4500",
       "size_gb": 44.5,
       "min_vram_gb": 48,
-      "desc": "Qwen3.8-Flash-Next MQ2 XTS 4500 for 7900 XTX (gfx1100) and R9700 (gfx1201): the 4,500 hot routed experts keep their MQ4 XTS bytes; the other 20,076 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set; the 108 linear-attention input projections use 4-bit QT44 encoding instead of 6-bit MQ6 (Qwen4 HFQM, arch 16). Split base (44.5 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 73.7 GB with the q4 rows or 98.9 GB with the q8 rows. Needs hipfire at or after @@MQ2_LAND@@.",
+      "desc": "Qwen3.8-Flash-Next MQ2 XTS 4500 for 7900 XTX (gfx1100) and R9700 (gfx1201): the 4,500 hot routed experts keep their MQ4 XTS bytes; the other 20,076 trunk routed experts are E8P 2-bit, solved on a chat-mix calibration set; the 108 linear-attention input projections use 4-bit QT44 encoding instead of 6-bit MQ6 (Qwen4 HFQM, arch 16). Split base (44.5 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB) or exact .ple-q8 (54.4 GB), so the download is about 73.7 GB with the q4 rows or 98.9 GB with the q8 rows. Needs hipfire at or after ea2abd111.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
