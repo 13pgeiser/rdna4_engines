@@ -1506,6 +1506,44 @@ const QWEN36_27B_GFX1201_B1S_SYMBOLS: &[&str] = &[
     "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s",
 ];
 
+/// No-AWQ plain rotate producers of the 27B route, planned only for the
+/// families whose projection weights lack a sidecar (`Qwen36PlainRotate`).
+/// Decode and batched fallback launch `fused_rmsnorm_mq_rotate`,
+/// `fused_silu_mul_mq_rotate` and the 48-head `gated_norm_mq_rotate_k6144`
+/// (`gemv.rs`); gfx1201 prefill launches the non-slab `_i4_gfx12` producers
+/// (`awq == None` never selects a slab twin; the gated norm also has its
+/// `_xbf16` GDN-plane twin). `mq_rotate_x` is already in the AR closure.
+const QWEN36_27B_GFX1201_PLAIN_RMSNORM_HIP: &[RouteHip] = &[
+    ("fused_rmsnorm_mq_rotate", &["fused_rmsnorm_mq_rotate"]),
+    ("fused_rmsnorm_mq_rotate_i4_gfx12_v2", &["fused_rmsnorm_mq_rotate_i4_gfx12_v2"]),
+];
+const QWEN36_27B_GFX1201_PLAIN_SILU_HIP: &[RouteHip] = &[
+    ("fused_silu_mul_mq_rotate", &["fused_silu_mul_mq_rotate"]),
+    ("fused_silu_mul_mq_rotate_i4_gfx12", &["fused_silu_mul_mq_rotate_i4_gfx12"]),
+];
+const QWEN36_27B_GFX1201_PLAIN_GATED_NORM_HIP: &[RouteHip] = &[
+    ("gated_norm_mq_rotate_k6144_gfx1201", &["gated_norm_mq_rotate_k6144_gfx1201"]),
+    ("gated_norm_mq_rotate_i4_gfx12_v2", &["gated_norm_mq_rotate_i4_gfx12_v2"]),
+    ("gated_norm_mq_rotate_i4_gfx12_v2_xbf16", &["gated_norm_mq_rotate_i4_gfx12_v2_xbf16"]),
+];
+const QWEN36_27B_GFX1201_PLAIN_ROTATE_HIP: &[RouteHip] = &[("mq_rotate_x_i4_gfx12", &["mq_rotate_x_i4_gfx12"])];
+
+/// The non-slab `_b1` GEMM symbols that read the plain producers' records
+/// (`gemm.rs` `g12_iu4_b1_image`): residual add/set and the fused GDN input
+/// projection, plus the F1-lite gate/up + SwiGLU entry (planned whenever an
+/// RMSNorm producer is plain; see `route_entries`).
+const QWEN36_27B_GFX1201_B1_SYMBOLS: &[&str] = &[
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
+];
+const QWEN36_27B_GFX1201_B1_SILU_SYMBOLS: &[&str] = &[
+    "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1",
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1",
+    "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1",
+];
+
 /// Header-selected kernel closure for one resolved load. Refuses (never
 /// returns a partial plan) when the model, arch, policy axes, spec route or
 /// feature flags are outside a closed route.
@@ -1557,6 +1595,41 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
                 }
             } else {
                 hip.push(QWEN36_27B_GFX1201_XBATCH_HIP);
+            }
+            // No-AWQ projections: the AWQ closure above is kept whole and the
+            // plain producer families their sidecar-less weights launch are
+            // appended. Slab producer twins need an AWQ scale, so a plain
+            // producer writes token-order A4 records and its GEMM consumers are
+            // the `_b1` symbols of the non-slab bundle.
+            let plain = qwen36_27b_plain_rotate(input);
+            if plain.rmsnorm {
+                hip.push(QWEN36_27B_GFX1201_PLAIN_RMSNORM_HIP);
+            }
+            if plain.silu {
+                hip.push(QWEN36_27B_GFX1201_PLAIN_SILU_HIP);
+            }
+            if plain.gated_norm {
+                hip.push(QWEN36_27B_GFX1201_PLAIN_GATED_NORM_HIP);
+            }
+            if plain.rotate {
+                hip.push(QWEN36_27B_GFX1201_PLAIN_ROTATE_HIP);
+            }
+            if plain.any() {
+                embedded.push(PlannedKernel::Embedded {
+                    module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
+                    image: crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+                    radiowave_json: None,
+                    // F1-lite gate/up + SwiGLU (a layer with a plain RMSNorm
+                    // producer and an AWQ down scale) reads the non-slab
+                    // `gate_up_silu` symbol; planned whenever any RMSNorm
+                    // producer is plain, since the families are aggregated
+                    // across layers.
+                    symbols: if plain.rmsnorm {
+                        QWEN36_27B_GFX1201_B1_SILU_SYMBOLS
+                    } else {
+                        QWEN36_27B_GFX1201_B1_SYMBOLS
+                    },
+                });
             }
             (hip, embedded)
         }
@@ -1701,6 +1774,18 @@ fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regis
         }
         all.push(entry(arch, "gemv_mq4g256v2_xbatch", &["gemv_mq4g256v2_xbatch"],
             kernels::GEMV_MQ4G256V2_XBATCH_SRC.into(), extra_flags));
+        // No-AWQ plain rotate producers (`QWEN36_27B_GFX1201_PLAIN_*`): the
+        // launchers' own sources for the modules neither inventory carries.
+        all.push(entry(arch, "fused_rmsnorm_mq_rotate_i4_gfx12_v2", &["fused_rmsnorm_mq_rotate_i4_gfx12_v2"],
+            kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC.into(), extra_flags));
+        all.push(entry(arch, "fused_silu_mul_mq_rotate_i4_gfx12", &["fused_silu_mul_mq_rotate_i4_gfx12"],
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC.into(), extra_flags));
+        all.push(entry(arch, "gated_norm_mq_rotate_k6144_gfx1201", &["gated_norm_mq_rotate_k6144_gfx1201"],
+            kernels::gated_norm_mq_rotate_k6144_gfx1201_src().into(), extra_flags));
+        all.push(entry(arch, "gated_norm_mq_rotate_i4_gfx12_v2_xbf16", &["gated_norm_mq_rotate_i4_gfx12_v2_xbf16"],
+            kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_XBF16_SRC.into(), extra_flags));
+        all.push(entry(arch, "mq_rotate_x_i4_gfx12", &["mq_rotate_x_i4_gfx12"],
+            kernels::MQ_ROTATE_X_I4_GFX12_SRC.into(), extra_flags));
     }
     Ok(all)
 }
@@ -1777,6 +1862,48 @@ fn qwen36_27b_route(input: &RouteKernelInput<'_>) -> Result<Option<bool>, Regist
         KernelSpecRoute::NativeMtp if !mtp_head => refuse("native MTP needs the MQ4G256 sidecar head tensors"),
         KernelSpecRoute::NativeMtp => Ok(Some(true)),
         _ => Ok(Some(false)),
+    }
+}
+
+/// Which plain (no-AWQ) rotate producer families a 27B load needs on top of
+/// the AWQ closure. Each flag is set when a projection weight the family
+/// feeds is present in the header without its `<stem>.awq_scale.weight`
+/// sidecar; weights the model does not have never set it.
+#[derive(Clone, Copy)]
+struct Qwen36PlainRotate {
+    /// RMSNorm producers: DeltaNet `in_proj_qkv`, attention `q_proj`, `mlp.gate_proj`.
+    rmsnorm: bool,
+    /// SwiGLU producer: `mlp.down_proj`.
+    silu: bool,
+    /// Gated-norm producer: `linear_attn.out_proj`.
+    gated_norm: bool,
+    /// Standalone rotate producer: `self_attn.o_proj`.
+    rotate: bool,
+}
+
+impl Qwen36PlainRotate {
+    fn any(self) -> bool {
+        self.rmsnorm || self.silu || self.gated_norm || self.rotate
+    }
+}
+
+fn qwen36_27b_plain_rotate(input: &RouteKernelInput<'_>) -> Qwen36PlainRotate {
+    let awq_stems: std::collections::HashSet<&str> =
+        input.tensors.iter().filter_map(|t| t.name.strip_suffix(".awq_scale.weight")).collect();
+    let lacks_sidecar = |stems: &[&str]| {
+        input
+            .tensors
+            .iter()
+            .filter(|t| t.name.starts_with("model.language_model.layers."))
+            .filter_map(|t| t.name.strip_suffix(".weight"))
+            .filter(|stem| stems.iter().any(|s| stem.ends_with(*s)))
+            .any(|stem| !awq_stems.contains(stem))
+    };
+    Qwen36PlainRotate {
+        rmsnorm: lacks_sidecar(&[".linear_attn.in_proj_qkv", ".self_attn.q_proj", ".mlp.gate_proj"]),
+        silu: lacks_sidecar(&[".mlp.down_proj"]),
+        gated_norm: lacks_sidecar(&[".linear_attn.out_proj"]),
+        rotate: lacks_sidecar(&[".self_attn.o_proj"]),
     }
 }
 

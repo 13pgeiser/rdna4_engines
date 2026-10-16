@@ -129,16 +129,20 @@ fn manifest(plan: &RouteKernelPlan) -> BTreeMap<String, (String, String, Value, 
     out
 }
 
-/// The frozen A3 manifests and observed identities are the hipcc closure:
-/// the `kernel.pm_decode=false` opt-out. The default (twins on) closure is
-/// derived from it exactly in [`pm_decode_twins_replace_their_hip_route_entries`].
-fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
-    let trunk = header(G0, "header-27b.json");
+/// The 27B plan for the canonical header minus the tensors `keep_tensor`
+/// rejects (every `*.awq_scale.weight` sidecar for a no-AWQ load) plus the MTP head.
+fn plan_27b(
+    spec: KernelSpecRoute,
+    pm_decode: bool,
+    keep_tensor: impl Fn(&str) -> bool,
+) -> RouteKernelPlan {
+    let mut trunk = header(G0, "header-27b.json");
+    trunk.tensors.retain(|(name, _, _)| keep_tensor(name));
     let head = header(A3, "header-27b-mtp.json");
     let tensors = metas(&[&trunk, &head]);
     let mut flags = builtin_flags("gfx1201");
-    flags.pm_decode = false;
-    let plan = plan(&Load {
+    flags.pm_decode = pm_decode;
+    plan(&Load {
         arch: "gfx1201",
         model_arch: trunk.arch_id,
         tensors: &tensors,
@@ -147,8 +151,14 @@ fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
         spec,
         flags: &flags,
     })
-    .unwrap();
-    (fixture(A3, "27b-xts-gfx1201.a3.json"), plan)
+    .unwrap()
+}
+
+/// The frozen A3 manifests and observed identities are the hipcc closure:
+/// the `kernel.pm_decode=false` opt-out. The default (twins on) closure is
+/// derived from it exactly in [`pm_decode_twins_replace_their_hip_route_entries`].
+fn route_27b(spec: KernelSpecRoute) -> (Value, RouteKernelPlan) {
+    (fixture(A3, "27b-xts-gfx1201.a3.json"), plan_27b(spec, false, |_| true))
 }
 
 fn route_key(spec: KernelSpecRoute) -> &'static str {
@@ -217,6 +227,163 @@ fn ar_plan_carries_no_native_mtp_head_or_unrelated_model_recipe() {
     for module in mtp.keys() {
         for foreign in ["qwen4", "deepseek4", "gemma4", "glimmer", "minimax", "qsa_", "ddtree", "dspark", "_gfx1151", "eagle"] {
             assert!(!module.contains(foreign), "unrelated recipe {module}");
+        }
+    }
+}
+
+/// A no-AWQ 27B load (the canonical header minus every `*.awq_scale.weight`
+/// sidecar) launches the plain rotate producers: RMSNorm, SwiGLU and gated
+/// norm rotation, the standalone rotate, the gfx1201 non-slab IU4 prefill
+/// producers (`awq == None` never selects the slab twins) and the non-slab
+/// `_b1` GEMMs that read them. The AWQ-only closure planned none of them.
+#[test]
+fn no_awq_27b_plan_closes_the_plain_rotate_producers() {
+    const PLAIN: [(&str, &str); 12] = [
+        ("fused_rmsnorm_mq_rotate", "fused_rmsnorm_mq_rotate"),
+        ("fused_rmsnorm_mq_rotate_i4_gfx12_v2", "fused_rmsnorm_mq_rotate_i4_gfx12_v2"),
+        ("fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate"),
+        ("fused_silu_mul_mq_rotate_i4_gfx12", "fused_silu_mul_mq_rotate_i4_gfx12"),
+        ("gated_norm_mq_rotate_k6144_gfx1201", "gated_norm_mq_rotate_k6144_gfx1201"),
+        ("gated_norm_mq_rotate_i4_gfx12_v2", "gated_norm_mq_rotate_i4_gfx12_v2"),
+        ("gated_norm_mq_rotate_i4_gfx12_v2_xbf16", "gated_norm_mq_rotate_i4_gfx12_v2_xbf16"),
+        ("mq_rotate_x", "mq_rotate_x"),
+        ("mq_rotate_x_i4_gfx12", "mq_rotate_x_i4_gfx12"),
+        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"),
+        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1"),
+        ("gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1", "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1"),
+    ];
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        for pm_decode in [false, true] {
+            let plan = plan_27b(spec, pm_decode, |name| !name.ends_with(".awq_scale.weight"));
+            let got = manifest(&plan);
+            for (module, symbol) in PLAIN {
+                let (_, _, _, _, symbols) = got
+                    .get(module)
+                    .unwrap_or_else(|| panic!("{spec:?} pm_decode={pm_decode}: no-AWQ plan lacks module {module}"));
+                assert!(
+                    symbols.contains(symbol),
+                    "{spec:?} pm_decode={pm_decode}: no-AWQ plan lacks {module}:{symbol}"
+                );
+            }
+        }
+    }
+}
+
+/// Plain-only modules of the 27B route by producer family; `mq_rotate_x` is
+/// already in the AWQ closure and not listed.
+const PLAIN_FAMILIES: [(&str, &[&str]); 4] = [
+    ("rmsnorm", &["fused_rmsnorm_mq_rotate", "fused_rmsnorm_mq_rotate_i4_gfx12_v2"]),
+    ("silu", &["fused_silu_mul_mq_rotate", "fused_silu_mul_mq_rotate_i4_gfx12"]),
+    (
+        "gated_norm",
+        &[
+            "gated_norm_mq_rotate_k6144_gfx1201",
+            "gated_norm_mq_rotate_i4_gfx12_v2",
+            "gated_norm_mq_rotate_i4_gfx12_v2_xbf16",
+        ],
+    ),
+    ("rotate", &["mq_rotate_x_i4_gfx12"]),
+];
+const PLAIN_B1: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1";
+const PLAIN_B1_SILU_SYMBOL: &str = "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1";
+
+type Manifest = BTreeMap<String, (String, String, Value, Value, BTreeSet<String>)>;
+
+/// The plan manifest with the sidecars of the given weight stems
+/// (e.g. `.mlp.down_proj`) removed from the canonical AWQ header.
+fn manifest_without_sidecars(spec: KernelSpecRoute, pm_decode: bool, stems: &[&str]) -> Manifest {
+    let dropped: Vec<String> = stems.iter().map(|s| format!("{s}.awq_scale.weight")).collect();
+    manifest(&plan_27b(spec, pm_decode, |name| !dropped.iter().any(|d| name.ends_with(d.as_str()))))
+}
+
+/// The AWQ closure is untouched: the full-sidecar plan plans no plain-only
+/// module (its exact module/image identity is the frozen-manifest test), and
+/// dropping sidecars of weights that feed no plain producer changes nothing.
+#[test]
+fn awq_27b_plan_is_unchanged_by_the_plain_closure() {
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        for pm_decode in [false, true] {
+            let awq = manifest_without_sidecars(spec, pm_decode, &[]);
+            for (family, modules) in PLAIN_FAMILIES {
+                for module in modules {
+                    assert!(!awq.contains_key(*module), "{spec:?} pm_decode={pm_decode}: AWQ plan carries {family} module {module}");
+                }
+            }
+            assert!(!awq.contains_key(PLAIN_B1), "{spec:?} pm_decode={pm_decode}: AWQ plan carries the non-slab _b1 bundle");
+            let unrelated = manifest_without_sidecars(
+                spec,
+                pm_decode,
+                &[".self_attn.k_proj", ".self_attn.v_proj", ".linear_attn.in_proj_a", ".linear_attn.in_proj_b", ".mlp.up_proj"],
+            );
+            assert_eq!(awq, unrelated, "{spec:?} pm_decode={pm_decode}: sidecars no producer reads changed the plan");
+        }
+    }
+}
+
+/// Each producer family is planned exactly when a weight it feeds lacks its
+/// sidecar; the non-slab `_b1` bundle rides with any plain family, and its
+/// F1-lite gate/up SwiGLU symbol whenever the RMSNorm producer is plain.
+#[test]
+fn partial_sidecars_plan_only_their_plain_families() {
+    let cases: [(&[&str], &[&str]); 5] = [
+        (&[".mlp.down_proj"], &["silu"]),
+        (&[".linear_attn.out_proj"], &["gated_norm"]),
+        (&[".self_attn.o_proj"], &["rotate"]),
+        (&[".self_attn.q_proj"], &["rmsnorm"]),
+        (&[".linear_attn.in_proj_qkv"], &["rmsnorm"]),
+    ];
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        for pm_decode in [false, true] {
+            for (stems, want) in cases {
+                let got = manifest_without_sidecars(spec, pm_decode, stems);
+                for (family, modules) in PLAIN_FAMILIES {
+                    for module in modules {
+                        assert_eq!(
+                            got.contains_key(*module),
+                            want.contains(&family),
+                            "{spec:?} pm_decode={pm_decode} without {stems:?}: module {module} ({family})"
+                        );
+                    }
+                }
+                let (_, _, _, _, symbols) = got
+                    .get(PLAIN_B1)
+                    .unwrap_or_else(|| panic!("{spec:?} pm_decode={pm_decode} without {stems:?}: no _b1 bundle"));
+                assert!(symbols.contains("gemm_mq4g256v2_residual_mmq_iu4_full_add_b1"));
+                assert_eq!(
+                    symbols.contains(PLAIN_B1_SILU_SYMBOL),
+                    want.contains(&"rmsnorm"),
+                    "{spec:?} pm_decode={pm_decode} without {stems:?}: F1-lite _b1 symbol"
+                );
+            }
+        }
+    }
+}
+
+/// Families aggregate across layers: layer 0 lacks only its gate sidecar
+/// (plain RMSNorm producer, AWQ down) while layer 1 lacks only its down
+/// sidecar. Layer 0 still needs the F1-lite `_b1` gate/up SwiGLU symbol even
+/// though the model also has a plain SwiGLU family.
+#[test]
+fn cross_layer_partial_sidecars_keep_the_f1lite_b1_symbol() {
+    const GATE0: &str = "model.language_model.layers.0.mlp.gate_proj.awq_scale.weight";
+    const DOWN1: &str = "model.language_model.layers.1.mlp.down_proj.awq_scale.weight";
+    for spec in [KernelSpecRoute::Ar, KernelSpecRoute::NativeMtp] {
+        for pm_decode in [false, true] {
+            let got = manifest(&plan_27b(spec, pm_decode, |name| name != GATE0 && name != DOWN1));
+            for (family, modules) in PLAIN_FAMILIES {
+                for module in modules {
+                    assert_eq!(
+                        got.contains_key(*module),
+                        matches!(family, "rmsnorm" | "silu"),
+                        "{spec:?} pm_decode={pm_decode}: module {module} ({family})"
+                    );
+                }
+            }
+            let (_, _, _, _, symbols) = &got[PLAIN_B1];
+            assert!(
+                symbols.contains(PLAIN_B1_SILU_SYMBOL),
+                "{spec:?} pm_decode={pm_decode}: layer 0 needs the F1-lite _b1 symbol"
+            );
         }
     }
 }
