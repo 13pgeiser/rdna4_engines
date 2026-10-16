@@ -3195,6 +3195,17 @@ static const RadConstraint cLoraExpand[] = {
     C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
     C_IN("dtype", "bf16 f16 f32"),
 };
+/* The tiled rows (r4d_lora_bf16.hip, V2). Shrink is two rows because a constraint on an absent
+ * parameter does not hold: a bf16 activation has no `group`, and a coded one is the WMMA's only
+ * when its group is whole 32-wide steps (the scale is applied a step at a time). Anything else --
+ * f16, f32, a coded activation with another group or none declared -- is the scalar row's. */
+static const RadConstraint cLoraShrinkWmma[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLoraShrinkWmmaQ[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
+    C_IN("dtype", "fp8_e4m3 fp8_e5m2 i8"), C_GE("group", 32), C_DIV("group", 32),
+};
 
 /* ---- the routed mixture of experts ----------------------------------------------------------
  *
@@ -6310,7 +6321,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 
 /* Runtime LoRA, v1: scalar f32, correct first (r4d_lora_bf16.hip). NO opd_shape: libref describes
  * both ops, so rad-kbench draws the same operands for this row as for the oracle -- `slot` in
- * [0, S], S itself a base row. NOT CONCURRENT: see rad_kernel_concurrent below. */
+ * [0, S], S itself a base row. NOT CONCURRENT: see rad_kernel_concurrent below. Below the tiled
+ * rows, which serve the same ops for every dtype but f16/f32 activations (R4D_PRIO_LORA_TILED). */
 { "lora_shrink_scalar", "lora_shrink", "gemm",
   "t = x A[slot]^T per row, base rows untouched: one block a row, one wave a column, the k of a "
   "lane in order and a fixed xor butterfly across the wave",
@@ -6318,7 +6330,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "honoured",
   "bf16 / f16 / f32 a, or fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; "
   "i32 slot; f32 t",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_SCALAR,
   ROW(cLoraShrink), NOTUNE,
   nullptr, nullptr, r4d_rad_lora_shrink },
 { "lora_expand_scalar", "lora_expand", "gemm",
@@ -6326,9 +6338,39 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "output, j in order",
   "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured",
   "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
-  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_SCALAR,
   ROW(cLoraExpand), NOTUNE,
   nullptr, nullptr, r4d_rad_lora_expand },
+/* Runtime LoRA, v2: the tiled rows. The grid is row TILES, a tile of base rows leaves on one
+ * ballot, and a mixed tile runs one pass per distinct slot; shrink's summation order is fixed by K
+ * and R (sh_plan), expand's bytes are v1's. The shrink split keeps its partials in the op's
+ * scratch (the hook sizes it for the band) and its arrival counters in a block keyed on `t`. */
+{ "lora_shrink_wmma", "lora_shrink", "gemm",
+  "t = x A[slot]^T per row, base rows untouched: WMMA bf16 over 16-row x 16-j tiles, K in 32-wide "
+  "steps over 4 waves and a K split fixed by K and R, one pass a distinct slot of a tile",
+  "any M and K, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of a and t honoured, "
+  "16-byte loads where the rows are aligned",
+  "bf16 a; bf16 lora_a; i32 slot; f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraShrinkWmma), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_shrink_wmma, r4d_rad_lora_shrink_wmma_scratch },
+{ "lora_shrink_wmma_q", "lora_shrink", "gemm",
+  "lora_shrink_wmma over fp8 / i8 codes: each code is exact in bf16, and each 32-wide step's "
+  "partial is scaled by its group's f32 scale",
+  "any M and K, a scale group that is a multiple of 32 (or one group across K), 1 <= R <= 65536, "
+  "1 <= S <= 2^20; strides of a, a_scale and t honoured",
+  "fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; i32 slot; f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraShrinkWmmaQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_shrink_wmma, r4d_rad_lora_shrink_wmma_scratch },
+{ "lora_expand_tiled", "lora_expand", "gemm",
+  "y += scale * (t B[slot]^T) per row, base rows neither read nor written: 32-row x 128-column "
+  "tiles, B[slot]'s slab staged in LDS once a tile, v1's j-ascending order a output",
+  "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured",
+  "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraExpand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_expand_tiled },
 { "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
   "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
   "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "

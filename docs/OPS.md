@@ -654,7 +654,10 @@ tensor's. The pools are ordinary inputs and not weights: the engine owns them as
 and copies an adapter into a slot between steps, so a recorded pass replays the same pointers and
 reads whatever adapters the slots hold. A row's result does not depend on `M` or on any other row
 (no split of a reduction that moves with the batch), which is what lets a request's bytes be the
-same alone and in a mixed batch. Implementations: libref, libavx, libr4d (scalar f32 rows).
+same alone and in a mixed batch. Implementations: libref, libavx, libr4d (scalar f32 rows, and
+tiled rows over row tiles that outrank them: a WMMA shrink whose summation order is fixed by `K`
+and `R`, and an expand that stages `lora_b[s]` in LDS for a tile of rows and computes libref's
+bytes).
 
 ## Attention
 

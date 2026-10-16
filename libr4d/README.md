@@ -59,7 +59,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `dflash_conv_t2_g16_bf16` | the drafter's causal conv, two taps, 16 groups |
 | `dflash_select_bf16` | the drafter's candidate selector: edge scores and the greedy path walk |
 | `dequant_w4_bf16` | unpacks a 4-bit fragment-ordered weight back to bf16 |
-| `lora_shrink` / `lora_expand` | runtime LoRA's two halves beside a trunk GEMM, each row's adapter read from a per-row slot on the device (base rows untouched): `t = x A[slot]^T` one block a row, `y += scale ⊙ (t B[slot]^T)` one thread an output; scalar f32, a row's bytes independent of M |
+| `lora_shrink` / `lora_expand` | runtime LoRA's two halves beside a trunk GEMM, each row's adapter read from a per-row slot on the device (base rows untouched). Tiled rows (preferred): `t = x A[slot]^T` WMMA bf16 over 16-row x 16-j tiles with a K split fixed by K and R (`lora_shrink_wmma`, `lora_shrink_wmma_q` for fp8/i8 codes), `y += scale ⊙ (t B[slot]^T)` over 32-row x 128-column tiles with B[slot] staged in LDS, libref's bytes (`lora_expand_tiled`); a tile of base rows leaves on one ballot, a mixed tile runs one pass a slot. Scalar v1 rows (`_scalar`): one block a row / one thread an output, and the f16/f32-activation shrink. A row's bytes are independent of M in every row |
 | `quant_act_i8` / `quant_act_i8_asum` | per-row int8 activation quantiser, in the r4d GEMMs' fragment byte order; the `_asum` form also emits the per-group row sums the asymmetric GEMMs need |
 | `had_quant_act_i8` | the same with a block Walsh-Hadamard rotation first, which is what makes one scale per row viable |
 | `rmsnorm_had_quant_i8` | residual add, RMS norm, rotate and quantise in one kernel |

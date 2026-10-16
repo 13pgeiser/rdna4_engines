@@ -68,6 +68,13 @@ enum {
      * one. */
     R4D_PRIO_LOGITS_FP8     = 60,
 
+    /* Runtime LoRA: the tiled rows serve a subset of the scalar rows' dtypes at every M, so they
+     * must outrank them to be reached; the scalar rows keep f16 / f32 activations (no exact WMMA)
+     * and a coded activation whose scale group is not whole 32-wide steps, and stay reachable by
+     * name. The choice never depends on M -- a row's bytes would then depend on its batch. */
+    R4D_PRIO_LORA_TILED   = 60,
+    R4D_PRIO_LORA_SCALAR  = 50,
+
     /* Exactly one candidate row per (op, geometry). The value carries no ordering; it leaves a
      * user's override plugin room above and below. */
     R4D_PRIO_ONLY         = 50,
@@ -128,9 +135,14 @@ int     r4d_rad_norm_add_norm_bf16      (const RadArgs*, RadStream);
 int     r4d_rad_norm_add_norm_route_bf16(const RadArgs*, RadStream);
 int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
 int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
-/* Runtime LoRA's two halves, each row's adapter named by its slot (r4d_lora_bf16.hip). */
+/* Runtime LoRA's two halves, each row's adapter named by its slot (r4d_lora_bf16.hip): the v1
+ * scalar rows, and the tiled rows -- WMMA shrink over row tiles with a K split fixed by K and R
+ * (its partials in the op's scratch), and an expand that stages B[s] in LDS for a tile of rows. */
 int     r4d_rad_lora_shrink             (const RadArgs*, RadStream);
 int     r4d_rad_lora_expand             (const RadArgs*, RadStream);
+int     r4d_rad_lora_shrink_wmma        (const RadArgs*, RadStream);
+int64_t r4d_rad_lora_shrink_wmma_scratch(const RadArgs*);
+int     r4d_rad_lora_expand_tiled       (const RadArgs*, RadStream);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
 int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);
