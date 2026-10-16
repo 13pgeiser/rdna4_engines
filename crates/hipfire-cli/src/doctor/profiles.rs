@@ -21,7 +21,8 @@ pub(crate) struct Profile {
     pub npu_fw: &'static str,
     /// Header index sha256 of the pinned model artifact.
     pub model_index_sha256: &'static str,
-    /// Kernel sets (`pack:<tag>@<commit12>` / `jit:<commit12>`) validated on this host.
+    /// Kernel sets validated on this host: `pack:<tag>@<commit12>` / `jit:<commit12>` match exactly; a bare
+    /// `pack:<tag>` matches that release pack at any commit ([`kernel_set_listed`]).
     pub kernels: &'static [&'static str],
 }
 
@@ -34,9 +35,21 @@ pub(crate) const PROFILES: &[Profile] = &[Profile {
     amdxdna: "in-tree",
     npu_fw: "1.1.2.65",
     model_index_sha256: "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",
-    // Filled from the Halo P0 smoke of doctor --npu; see docs/npu/npu-trunk.md.
-    kernels: &[],
+    // The Halo P0 `doctor --npu` run (j1356) validated this row; pinned to the v0.4.3 release pack by tag, since the
+    // release commit cannot name its own hash.
+    kernels: &["pack:v0.4.3"],
 }];
+
+/// Whether `found` is one of the `listed` kernel sets. A listed `pack:<tag>` (no `@`) matches `pack:<tag>@<any
+/// commit>`; every other entry matches only itself.
+fn kernel_set_listed(listed: &[&str], found: &str) -> bool {
+    listed.iter().any(|&entry| {
+        entry == found
+            || (entry.starts_with("pack:")
+                && !entry.contains('@')
+                && found.split_once('@').is_some_and(|(tag, _)| tag == entry))
+    })
+}
 
 /// The tier decision for one host.
 #[derive(Debug, PartialEq)]
@@ -68,7 +81,7 @@ fn differences(profile: &Profile, host: &Host, model_sha: Option<&str>) -> Vec<P
         profile.model_index_sha256,
         model_sha.unwrap_or("unknown"),
     );
-    if !profile.kernels.contains(&host.kernels.as_str()) {
+    if !kernel_set_listed(profile.kernels, &host.kernels) {
         let reference = if profile.kernels.is_empty() {
             "none validated yet".to_owned()
         } else {
@@ -222,13 +235,40 @@ mod tests {
     }
 
     #[test]
-    fn first_row_has_no_validated_kernel_set_until_filled() {
+    fn a_tag_entry_matches_that_release_pack_at_any_commit_only() {
+        let listed = ["pack:v0.4.3"];
+        assert!(kernel_set_listed(&listed, "pack:v0.4.3@0123456789ab"));
+        assert!(kernel_set_listed(&listed, "pack:v0.4.3@fedcba987654"));
+        for other in [
+            "pack:v0.4.2@0123456789ab",
+            "pack:v0.4.30@0123456789ab",
+            "pack:v0.4.3.1@0123456789ab",
+            "jit:0123456789ab",
+            "unknown",
+        ] {
+            assert!(!kernel_set_listed(&listed, other), "{other}");
+        }
+        // Exact entries (with a commit, or jit) still match only themselves.
+        assert!(kernel_set_listed(&[KERNEL_SET], KERNEL_SET));
+        assert!(!kernel_set_listed(
+            &[KERNEL_SET],
+            "pack:v0.4.3@ffffffffffff"
+        ));
+        assert!(!kernel_set_listed(
+            &["jit:ffffffffffff"],
+            "jit:000000000000"
+        ));
+    }
+
+    #[test]
+    fn hipx_row_is_reference_on_the_v0_4_3_release_pack_only() {
         let first = &PROFILES[0];
         assert_eq!(first.id, "hipx");
         assert_eq!(first.kernel, "7.3.0-rc7-perfopt+");
         assert_eq!(first.npu_fw, "1.1.2.65");
         assert_eq!(first.model_index_sha256.len(), 64);
-        let host = Host {
+        assert_eq!(first.kernels, ["pack:v0.4.3"]);
+        let host = |kernels: &str| Host {
             kernel: first.kernel.into(),
             iommu: Iommu {
                 gpu: first.iommu_gpu.into(),
@@ -236,11 +276,27 @@ mod tests {
             },
             amdxdna: first.amdxdna.into(),
             npu_fw: first.npu_fw.into(),
-            kernels: "jit:abcdefabcdef".into(),
+            kernels: kernels.into(),
             ..Host::default()
         };
-        let assessment = assess(PROFILES, false, &host, Some(first.model_index_sha256));
-        assert_eq!(assessment.tier, Tier::CompatibleUnvalidated);
-        assert_eq!(fields(&assessment), ["kernels"]);
+        let reference = assess(
+            PROFILES,
+            false,
+            &host("pack:v0.4.3@0123456789ab"),
+            Some(first.model_index_sha256),
+        );
+        assert_eq!(reference.tier, Tier::Reference);
+        assert_eq!(reference.profile, Some("hipx"));
+        for other in ["pack:v0.4.4@0123456789ab", "jit:abcdefabcdef"] {
+            let assessment = assess(
+                PROFILES,
+                false,
+                &host(other),
+                Some(first.model_index_sha256),
+            );
+            assert_eq!(assessment.tier, Tier::CompatibleUnvalidated, "{other}");
+            assert_eq!(fields(&assessment), ["kernels"]);
+            assert_eq!(assessment.diff[0].reference, "pack:v0.4.3");
+        }
     }
 }
