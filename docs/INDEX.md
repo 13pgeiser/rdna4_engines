@@ -76,6 +76,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Registry models, VRAM, sampling, sidecars | [`docs/MODELS.md`](MODELS.md) | shipped / ref-pinned | Registry presence ≠ runtime admission. |
 | Serve HTTP API | [`docs/SERVE.md`](SERVE.md) | shipped / ref-pinned | |
 | Chat UX and daemon attach behavior | [`docs/CHAT.md`](CHAT.md) | shipped / ref-pinned | |
+| Open field faults (known issues) and what to capture | [`docs/KNOWN-ISSUES.md`](KNOWN-ISSUES.md) | measured | Dated observations with host versions; root causes unresolved unless stated. Not a default, workaround or admission. |
 | Crate layout and request lifecycle (overview) | [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) | shipped / ref-pinned | Runtime source wins on conflict. |
 | Architecture id table | [`docs/architecture-ids.md`](architecture-ids.md) | shipped / ref-pinned | |
 | Quantization formats and math | [`docs/QUANTIZATION.md`](QUANTIZATION.md) | shipped / ref-pinned | |
@@ -144,6 +145,7 @@ Every current top-level page, exactly once.
 | [`MODELS.md`](MODELS.md) | shipped / ref-pinned | Models. |
 | [`SERVE.md`](SERVE.md) | shipped / ref-pinned | Serve API. |
 | [`CHAT.md`](CHAT.md) | shipped / ref-pinned | Chat. |
+| [`KNOWN-ISSUES.md`](KNOWN-ISSUES.md) | measured | Open field faults and what to capture. |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | shipped / ref-pinned | Architecture overview. |
 | [`architecture-ids.md`](architecture-ids.md) | shipped / ref-pinned | Arch id table. |
 | [`QUANTIZATION.md`](QUANTIZATION.md) | shipped / ref-pinned | Quant design. |
