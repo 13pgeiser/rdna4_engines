@@ -1531,6 +1531,15 @@
       "min_vram_gb": 16,
       "desc": "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
+    "decider:4b": {
+      "repo": "hipfire-models/decider-4b",
+      "file": "decider-4b.mq4",
+      "size_gb": 2.6,
+      "min_vram_gb": 4.1,
+      "default_kv_mode": "q8",
+      "desc": "Decision judge for POST /v1/systemone, Qwen3.5-4B base, MQ4",
+      "quant_recipe": "mq4g256v2-symmetric-uncalibrated"
+    },
     "carnice:9b": {
       "repo": "hipfire-models/carnice-9b",
       "file": "carnice-9b.mq4",
@@ -1953,6 +1962,7 @@
     "qwen3.8:draft": "qwen3.8:27b-draft-mq4",
     "qwen3": "qwen3:8b",
     "carnice": "carnice:9b",
+    "decider": "decider:4b",
     "qwopus": "qwopus:9b",
     "deepseek4": "deepseek-v4-flash",
     "deepseek-v4": "deepseek-v4-flash",

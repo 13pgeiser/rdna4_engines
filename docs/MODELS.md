@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-10-13 against `registry/models.json` (90 tags, 82 aliases) on the 0.4.2 beta line.
+**Last checked:** 2026-10-16 against `registry/models.json` (91 tags, 83 aliases) on the 0.4.2 beta line.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 
@@ -229,6 +229,7 @@ Flash-Next expert-hotset **fetching** is likewise pinned in the client, not decl
 | `carnice:9b-mq6` | `carnice-9b.mq6` | 7.3 | 8 | Hermes MQ6 |
 | `carnice:27b` | `carnice-27b.mq4` | 15.0 | 16 | Hermes 27B |
 | `carnice:27b-mq6` | `carnice-27b.mq6` | 21.4 | 24 | Hermes 27B MQ6 |
+| `decider:4b` | `decider-4b.mq4` | 2.6 | 4.1 | registry `default_kv_mode` q8 (`auto` still applies); dense Qwen3.5-4B decision judge for `POST /v1/systemone` (upstream Mapika/decider-4b, Apache-2.0); symmetric MQ4G256V2, uncalibrated — no calibration profile ships with the tag |
 | `qwopus:4b` | `qwopus-4b.mq4` | 2.6 | 4 | Qwopus3.5 v3 |
 | `qwopus:4b-mq6` | `qwopus-4b.mq6` | 3.8 | 5 | |
 | `qwopus:9b` | `qwopus-9b.mq4` | 5.3 | 6 | |
@@ -375,6 +376,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `muse-glimmer:latest` / `muse-glimmer:quality` / `muse-glimmer:30b` | `muse-glimmer` |
 | `qwen3` | `qwen3:8b` |
 | `carnice` | `carnice:9b` |
+| `decider` | `decider:4b` |
 | `qwopus` | `qwopus:9b` |
 | `qwopus:{4b,9b,27b}-{mq4,hf4}` | matching primary `qwopus:{4b,9b,27b}` tag |
 | `deepseek4` / `deepseek-v4` / `deepseek-v4-flash-0731` / `ds4` (also `:0731`) | `deepseek-v4-flash` |

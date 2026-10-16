@@ -262,7 +262,7 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus / decider finetunes)
 #   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
@@ -291,6 +291,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 16
     if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
+    # Decider-4B = dense Qwen3.5-4B finetune used as a /v1/systemone judge
+    # (Mapika/decider-4b, Apache-2.0). The architecture is unchanged dense
+    # qwen3_5 (5); it has no A3B variant, so there is no "a3b" split here.
+    if family == "decider":
+        return 5
 
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)

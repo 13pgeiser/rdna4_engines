@@ -181,8 +181,8 @@ not current product baselines.
 
 ## Models
 
-The bundled registry (`registry/v1.json`) contains 90 curated entries
-(models, quant variants and draft sidecars) and 82 aliases. Run
+The bundled registry (`registry/v1.json`) contains 91 curated entries
+(models, quant variants and draft sidecars) and 83 aliases. Run
 `hipfire list -r` for the live list.
 
 | Family | Pull tags |
