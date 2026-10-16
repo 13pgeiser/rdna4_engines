@@ -828,7 +828,7 @@ A request that begins with the route on `gpu` takes the same path as a tripped f
 npu-trunk: rows=<n> route=gpu (diagnostic)
 ```
 
-`hipfire-daemon --version` prints `hipfire-daemon <version> <commit>` (the full build commit) and exits. It answers before any tracing, config or GPU work, so it is GPU-free. `hipfire doctor --npu` reads it to name the kernel set (`jit:<commit12>`) when the install holds no kernel-pack manifest.
+`hipfire-daemon --version` prints `hipfire-daemon <version> <commit>` (the full build commit) and exits. It answers before any config, protocol or GPU work, so it is GPU-free. `hipfire doctor --npu` reads it to name the kernel set (`jit:<commit12>`) when the install holds no kernel-pack manifest.
 
 ### Installing and testing auto on a Strix Halo host (maintainer hardware gate)
 
