@@ -167,6 +167,7 @@ fn run_mtp(
             reused > 0,
             &|| false,
         )
+        .and_then(|outcome| outcome.into_first_token())
         .expect("MTP prefill");
     let digests = state_digests(bundle, gpu, SessionRoute::Mtp, tokens.len());
     bundle.session_commit();
@@ -197,7 +198,11 @@ const HOSTMEM_LOCK: &str = "hostmem-flashnext.lock";
 /// `/proc/<pid>/stat` fields after the command: 1 = ppid, 19 = starttime.
 fn proc_stat(pid: u32, index: usize) -> Option<u64> {
     let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    raw.get(raw.rfind(')')? + 2..)?.split_whitespace().nth(index)?.parse().ok()
+    raw.get(raw.rfind(')')? + 2..)?
+        .split_whitespace()
+        .nth(index)?
+        .parse()
+        .ok()
 }
 
 /// Granted flocks on files named [`HOSTMEM_LOCK`] that `pids` hold, read from
@@ -207,18 +212,27 @@ fn hostmem_lock_holders(pids: impl Iterator<Item = u32>) -> Vec<(u32, String)> {
     let locks = std::fs::read_to_string("/proc/locks").unwrap_or_default();
     let mut held = Vec::new();
     for pid in pids {
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
         for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else { continue };
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
             if target.file_name().and_then(|n| n.to_str()) != Some(HOSTMEM_LOCK) {
                 continue;
             }
-            let Ok(meta) = std::fs::metadata(&target) else { continue };
+            let Ok(meta) = std::fs::metadata(&target) else {
+                continue;
+            };
             let inode = format!(":{}", meta.ino());
             for line in locks.lines() {
                 let f: Vec<&str> = line.split_whitespace().collect();
-                if f.len() >= 6 && !f.contains(&"->") && f[1] == "FLOCK"
-                    && f[4] == pid.to_string() && f[5].ends_with(&inode)
+                if f.len() >= 6
+                    && !f.contains(&"->")
+                    && f[1] == "FLOCK"
+                    && f[4] == pid.to_string()
+                    && f[5].ends_with(&inode)
                     && !held.iter().any(|(p, _): &(u32, String)| *p == pid)
                 {
                     held.push((pid, f[3].to_string()));
@@ -251,13 +265,19 @@ fn hold_refusal(
         return Some("no fabric hold (FABRIC_JOB unset)".into());
     };
     let Some(depth) = chain.iter().position(|&pid| pid == wrapper) else {
-        return Some(format!("fabric wrapper {wrapper} is not an ancestor of this process"));
+        return Some(format!(
+            "fabric wrapper {wrapper} is not an ancestor of this process"
+        ));
     };
     if start_of(wrapper) != Some(start) {
-        return Some(format!("fabric wrapper {wrapper} is gone (stale FABRIC_JOB)"));
+        return Some(format!(
+            "fabric wrapper {wrapper} is gone (stale FABRIC_JOB)"
+        ));
     }
     if !holds_lock(&chain[..=depth]) {
-        return Some(format!("fabric job {marker} does not hold {HOSTMEM_LOCK} (no --hostmem-lock)"));
+        return Some(format!(
+            "fabric job {marker} does not hold {HOSTMEM_LOCK} (no --hostmem-lock)"
+        ));
     }
     None
 }
@@ -268,17 +288,26 @@ fn require_fabric_hold() {
     let args: Vec<String> = std::env::args().collect();
     let threads_one = std::env::var("RUST_TEST_THREADS").is_ok_and(|v| v == "1")
         || args.iter().any(|a| a == "--test-threads=1")
-        || args.windows(2).any(|w| w[0] == "--test-threads" && w[1] == "1");
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--test-threads" && w[1] == "1");
     let mut chain = vec![std::process::id()];
     while let Some(ppid) = proc_stat(*chain.last().unwrap(), 1).filter(|&p| p > 1) {
         chain.push(ppid as u32);
     }
     let marker = std::env::var("FABRIC_JOB").unwrap_or_default();
-    let refusal = hold_refusal(threads_one, &marker, &chain, |pid| proc_stat(pid, 19), |pids| {
-        !hostmem_lock_holders(pids.iter().copied()).is_empty()
-    });
+    let refusal = hold_refusal(
+        threads_one,
+        &marker,
+        &chain,
+        |pid| proc_stat(pid, 19),
+        |pids| !hostmem_lock_holders(pids.iter().copied()).is_empty(),
+    );
     if let Some(why) = refusal {
-        let all = std::fs::read_dir("/proc").into_iter().flatten().flatten()
+        let all = std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
             .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok());
         panic!(
             "refusing to load Flash-Next: {why}. {HOSTMEM_LOCK} holders (pid, mode): {:?}. Run \
@@ -294,13 +323,23 @@ fn fabric_hold_guard_refuses_loads_outside_a_hold() {
     let chain = [30, 20, 10];
     let start = |pid| (pid == 20).then_some(77);
     let refusal = |threads, marker: &str, holds: bool| {
-        hold_refusal(threads, marker, &chain, start, |pids: &[u32]| holds && pids.contains(&20))
+        hold_refusal(threads, marker, &chain, start, |pids: &[u32]| {
+            holds && pids.contains(&20)
+        })
     };
-    assert!(refusal(false, "20:77:B", true).unwrap().contains("--test-threads=1"));
-    assert!(refusal(true, "", true).unwrap().contains("FABRIC_JOB unset"));
-    assert!(refusal(true, "40:77:B", true).unwrap().contains("not an ancestor"));
+    assert!(refusal(false, "20:77:B", true)
+        .unwrap()
+        .contains("--test-threads=1"));
+    assert!(refusal(true, "", true)
+        .unwrap()
+        .contains("FABRIC_JOB unset"));
+    assert!(refusal(true, "40:77:B", true)
+        .unwrap()
+        .contains("not an ancestor"));
     assert!(refusal(true, "20:78:B", true).unwrap().contains("stale"));
-    assert!(refusal(true, "20:77:B", false).unwrap().contains("--hostmem-lock"));
+    assert!(refusal(true, "20:77:B", false)
+        .unwrap()
+        .contains("--hostmem-lock"));
     assert_eq!(refusal(true, "20:77:B", true), None);
 }
 
@@ -624,7 +663,10 @@ fn tail_snapshot_restore_matches_split_cold_on_flash_next() {
     // The gap from the restored tail (200) is under the test minimum
     // (256): B's own tail split is skipped, so B has no boundary after the
     // restore.
-    assert_eq!(SessionState::lineage_boundary(&bundle, &b, tail, b.len()), None);
+    assert_eq!(
+        SessionState::lineage_boundary(&bundle, &b, tail, b.len()),
+        None
+    );
 
     assert_eq!(bundle.session_plan(&a, SessionRoute::Ar), 0);
     run(&mut bundle, &mut gpu, &logits, &a, 0);
@@ -875,6 +917,7 @@ fn retired_turn_commits_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         let seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("MTP prefill");
         let mut emitted = vec![seed];
         for i in 0..owed {
@@ -930,6 +973,7 @@ fn retired_turn_commits_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the retired turn");
         bundle.session_commit();
 
@@ -937,6 +981,7 @@ fn retired_turn_commits_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         let reference_seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("reference MTP prefill");
         assert_eq!(reference_seed, seed, "owed {owed}: cold seed");
         assert!(
@@ -968,6 +1013,7 @@ fn retired_turn_commits_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the reference turn");
         bundle.session_commit();
 
@@ -1033,6 +1079,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
     MtpDrafter::configure_request(&mut drafter, cfg);
     let seed = drafter
         .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+        .and_then(|outcome| outcome.into_first_token())
         .expect("MTP prefill");
     let mut stream = vec![seed];
     for i in 0..4 {
@@ -1048,6 +1095,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
         MtpDrafter::configure_request(&mut drafter, cfg);
         let cold_seed = drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
+            .and_then(|outcome| outcome.into_first_token())
             .expect("MTP prefill");
         assert_eq!(cold_seed, seed, "n {n}: cold seed");
         let window = drafter
@@ -1089,12 +1137,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
             .expect("terminal flush"),
             "n {n}: the drafter advances the flush itself"
         );
-        let history: Vec<u32> = a
-            .iter()
-            .chain(&[seed])
-            .chain(consumed)
-            .copied()
-            .collect();
+        let history: Vec<u32> = a.iter().chain(&[seed]).chain(consumed).copied().collect();
         assert_eq!(
             SessionState::live_position(&bundle, SessionRoute::Mtp),
             Some(history.len()),
@@ -1118,6 +1161,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the repaired turn");
         bundle.session_commit();
 
@@ -1126,7 +1170,9 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
         drafter
             .mtp_prefill(&mut gpu, &mut bundle, &a, &a, 0, false, &never)
             .expect("reference MTP prefill");
-        let forced: Vec<u32> = std::iter::once(seed).chain(consumed.iter().copied()).collect();
+        let forced: Vec<u32> = std::iter::once(seed)
+            .chain(consumed.iter().copied())
+            .collect();
         assert!(
             MtpDrafter::mtp_forced_advance(
                 &mut drafter,
@@ -1151,6 +1197,7 @@ fn terminal_stop_inside_window_repairs_live_on_flash_next() {
                 true,
                 &never,
             )
+            .and_then(|outcome| outcome.into_first_token())
             .expect("live prefill after the reference turn");
         bundle.session_commit();
 

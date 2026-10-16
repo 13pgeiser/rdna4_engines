@@ -141,8 +141,7 @@ const SEASONS_IDS: [u32; 25] = [
 ];
 
 /// The committed copy-heavy prompt (`benchmarks/prompts/code_edit_rewrite_copy.txt`).
-const COPY_PROMPT: &[u8] =
-    include_bytes!("../../../benchmarks/prompts/code_edit_rewrite_copy.txt");
+const COPY_PROMPT: &[u8] = include_bytes!("../../../benchmarks/prompts/code_edit_rewrite_copy.txt");
 const COPY_PROMPT_SHA256: &str = "5f223a71ca57719c256968a15031f78483459ac22fb649690e3f9077b211e79d";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -366,7 +365,8 @@ fn ngram_window_check(arm: Arm, case: Case, stderr: &str) -> WindowCounts {
         assert!(
             w.ngram > 0,
             "{} arm took no n-gram window on the copy-heavy case ({} mtp windows)",
-            arm.name, w.mtp
+            arm.name,
+            w.mtp
         );
     }
     w
@@ -387,13 +387,17 @@ fn slab_payload_bytes(
     hfq: &HfqFile,
     entry: &hipfire_runtime::weight_manifest::WeightEntry,
 ) -> Option<u64> {
-    if entry.name.ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX) {
+    if entry
+        .name
+        .ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX)
+    {
         return match entry.logical_shape.as_slice() {
             [bytes] => Some(*bytes as u64),
             _ => None,
         };
     }
-    hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+    hfq.tensor_data(&entry.name)
+        .map(|(_, bytes)| bytes.len() as u64)
 }
 
 #[test]
@@ -557,7 +561,8 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
     )
     .expect("arm identity json");
     assert_eq!(
-        recorded["config"], expected,
+        recorded["config"],
+        expected,
         "{} arm ran under a different identity than the parent expects (logs in {})",
         arm.name,
         dir.display()
@@ -723,7 +728,10 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             .map(|device| device.arch.as_str())
             .collect::<Vec<_>>();
         if residency::keeps_host_memory_out_of_reclaim(hipfire_arch_qwen4::ARCH_ID, &archs) {
-            hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
+            hip_bridge::keep_host_memory_out_of_reclaim(&format!(
+                "Qwen4 model on {}",
+                archs.join(",")
+            ));
         }
     }
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
@@ -759,15 +767,14 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     let placement = if use_ranges {
         explicit
     } else {
-        let (non_expert, per_layer) = residency::resident_split(&weights, |entry| {
-            slab_payload_bytes(&hfq, entry)
-        })?;
-        let experts = residency::routed_expert_bytes(&weights, |entry| {
-            slab_payload_bytes(&hfq, entry)
-        })?;
+        let (non_expert, per_layer) =
+            residency::resident_split(&weights, |entry| slab_payload_bytes(&hfq, entry))?;
+        let experts =
+            residency::routed_expert_bytes(&weights, |entry| slab_payload_bytes(&hfq, entry))?;
         let (free, _) = gpu.hip.get_vram_info().map_err(|e| e.to_string())?;
         let free = free as u64;
-        let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, MAX_SEQ);
+        let chunk =
+            hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, MAX_SEQ);
         let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
             backend,
             gpu.is_uma(),
@@ -813,21 +820,29 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             gather,
         )?;
         match residency::resolve_expert_vram_layers(explicit, || {
-            Ok(residency::fits_fully_resident(free, non_expert, experts, reserve))
+            Ok(residency::fits_fully_resident(
+                free, non_expert, experts, reserve,
+            ))
         })? {
             Some(residency::ExpertVramLayers::Auto) => {
-                let required = non_expert.checked_add(reserve)
+                let required = non_expert
+                    .checked_add(reserve)
                     .ok_or("qwen4: non-expert weights plus reserve overflow")?;
                 if free < required {
-                    return Err("qwen4: not enough free VRAM for non-expert weights plus auto reserve".into());
+                    return Err(
+                        "qwen4: not enough free VRAM for non-expert weights plus auto reserve"
+                            .into(),
+                    );
                 }
-                Some(residency::ExpertVramLayers::Layers(residency::auto_vram_layers(
-                    free,
-                    non_expert,
-                    per_layer,
-                    receipt.config.num_hidden_layers,
-                    reserve,
-                )))
+                Some(residency::ExpertVramLayers::Layers(
+                    residency::auto_vram_layers(
+                        free,
+                        non_expert,
+                        per_layer,
+                        receipt.config.num_hidden_layers,
+                        reserve,
+                    ),
+                ))
             }
             placement => placement,
         }
@@ -846,16 +861,17 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         residency::place_routed_experts(&mut weights, layers);
         vram_layers = layers.min(receipt.config.num_hidden_layers);
     }
-    let host_bytes = residency::host_mapped_bytes(&weights, |entry| {
-        slab_payload_bytes(&hfq, entry)
-    })?;
+    let host_bytes =
+        residency::host_mapped_bytes(&weights, |entry| slab_payload_bytes(&hfq, entry))?;
     residency::check_host_ram(
         host_bytes,
         rdna_compute::kv_slots::mem_available_bytes(),
         residency::ttm_pool_estimate(),
     )?;
     residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
-    eprintln!("qwen4 expert placement: {vram_layers} resident layers, {host_bytes} host-mapped bytes");
+    eprintln!(
+        "qwen4 expert placement: {vram_layers} resident layers, {host_bytes} host-mapped bytes"
+    );
     if use_ranges {
         hfq.drop_mmap();
     }
@@ -963,8 +979,9 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
                 ..SpecRequestConfig::default()
             });
         }
-        let mut seed =
-            drafter.mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?;
+        let mut seed = drafter
+            .mtp_prefill(&mut gpu, &mut bundle, &tokens, &tokens, 0, false, &|| false)?
+            .into_first_token()?;
         ids.push(seed);
         let eos = bundle.config.eos_token_id;
         let mut windows: Vec<serde_json::Value> = Vec::new();

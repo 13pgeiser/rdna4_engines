@@ -307,7 +307,8 @@ const COPY_AR_SALT: u64 = 0xC0A11;
 /// and the assistant turn already holds the passage's first `COPY_PRIMED`
 /// tokens, so the last five context tokens before the first window's seed
 /// (the passage's token `COPY_PRIMED`, when sampled) occur in the prompt.
-const COPY_INSTRUCTION: &str = "Rewrite the following passage, keeping its wording wherever you can.\n\n";
+const COPY_INSTRUCTION: &str =
+    "Rewrite the following passage, keeping its wording wherever you can.\n\n";
 const COPY_PASSAGE: &str = "The old lighthouse keeper climbed the spiral stairs every evening to light the great lamp, and every morning he polished the brass until it shone like gold.";
 const COPY_PRIMED: usize = 8;
 
@@ -561,8 +562,9 @@ fn id_config(arm: &str, identity: &Value, pen: &Penalties, fixture: Fixture) -> 
 fn check_config(ids_path: &Path, expected: &serde_json::Value) -> Result<(), String> {
     let config_path = ids_path.with_extension("config.json");
     let recorded: serde_json::Value = match fs::read(&config_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{}: {e}", config_path.display()))?,
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", config_path.display()))?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
                 "{} exists but {} does not: its config is unknown; remove it or use another {OUT_ENV}",
@@ -804,8 +806,8 @@ fn sampled_mtp_matches_ar_distribution_on_flash_next() {
     let ar = &samples[0];
     for (arm, mtp) in ARMS.iter().zip(&samples).skip(1) {
         compare_to_reference(arm, "ar", ar, mtp, &mut report, &mut failures);
-        let evidence = read_json(&dir.join(format!("{arm}.evidence.json")))
-            .unwrap_or_else(|e| panic!("{e}"));
+        let evidence =
+            read_json(&dir.join(format!("{arm}.evidence.json"))).unwrap_or_else(|e| panic!("{e}"));
         short_arm_coverage(arm, &evidence, &mut report, &mut coverage);
     }
     eprint!("{report}");
@@ -889,7 +891,10 @@ fn load(model: &Path) -> Result<Loaded, String> {
         // A slab layer arena is one span of the container, not an index
         // tensor: it declares its byte size as its logical shape.
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-            if entry.name.ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX) {
+            if entry
+                .name
+                .ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX)
+            {
                 return match entry.logical_shape.as_slice() {
                     [bytes] => Some(*bytes as u64),
                     _ => None,
@@ -937,9 +942,7 @@ fn load(model: &Path) -> Result<Loaded, String> {
                 receipt.config.num_key_value_heads,
                 context.tokens,
             )
-            .map(|bytes| {
-                (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64)
-            })
+            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
             .ok_or("qwen4: QSA gather scratch size overflows")
         })
         .transpose()?;
@@ -953,7 +956,9 @@ fn load(model: &Path) -> Result<Loaded, String> {
             gather,
         )?;
         let placement = residency::resolve_expert_vram_layers(explicit, || {
-            Ok(residency::fits_fully_resident(free, non_expert, experts, reserve))
+            Ok(residency::fits_fully_resident(
+                free, non_expert, experts, reserve,
+            ))
         })?;
         if let Some(policy) = placement {
             let vram_layers = match policy {
@@ -1162,15 +1167,17 @@ impl Loaded {
     ) -> Result<MtpRun, String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
-        let mut seed_token = drafter.mtp_prefill(
-            &mut self.gpu,
-            &mut self.bundle,
-            prompt,
-            prompt,
-            0,
-            false,
-            &|| false,
-        )?;
+        let mut seed_token = drafter
+            .mtp_prefill(
+                &mut self.gpu,
+                &mut self.bundle,
+                prompt,
+                prompt,
+                0,
+                false,
+                &|| false,
+            )?
+            .into_first_token()?;
         let mut ids = vec![seed_token];
         let (mut drafted, mut accepted) = (0, 0);
         let mut windows = Vec::new();
@@ -1371,7 +1378,14 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         for trial in 0..trials {
             let seed = trial_seed(0x5EC, trial);
             let result = run(&mut loaded, seed)?;
-            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            evidence.observe(
+                trial,
+                seed,
+                &result,
+                &loaded.tokenizer,
+                budget,
+                LATE_MARGINALS[0],
+            );
             samples.push(result.ids);
         }
         // Only a forced floor-off route replays byte for byte; the adaptive
@@ -1567,12 +1581,7 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
     require_arm_env(arm, "naive")?;
     let pen = Penalties::from_env()?;
     let fixture = Fixture::from_env()?;
-    let config = id_config(
-        arm,
-        &own_identity(model, dir, &CONTROL_ENV)?,
-        &pen,
-        fixture,
-    );
+    let config = id_config(arm, &own_identity(model, dir, &CONTROL_ENV)?, &pen, fixture);
     let ids_path = dir.join(format!("{arm}.identity.json"));
     if ids_path.exists() {
         check_config(&ids_path, &config)?;
@@ -1996,9 +2005,7 @@ fn analyze_windows(windows: &[WindowRec], probe_budget: usize, late_from: usize)
         coverage.probes_before_retirement = before + usize::from(is_native_window(&windows[at]));
         coverage.post_retirement_ar = windows[at + 1..]
             .iter()
-            .filter(|window| {
-                is_ar_window(window) && window.before.retired && window.after.retired
-            })
+            .filter(|window| is_ar_window(window) && window.before.retired && window.after.retired)
             .map(|window| window.index)
             .collect();
         coverage.full = coverage.calibration_ok
@@ -2158,7 +2165,13 @@ impl Evidence {
     }
 
     /// `<stem>.evidence.json` and the decoded sample text `<stem>.text.txt`.
-    fn write(&self, dir: &Path, stem: &str, probe_budget: usize, late_from: usize) -> Result<(), String> {
+    fn write(
+        &self,
+        dir: &Path,
+        stem: &str,
+        probe_budget: usize,
+        late_from: usize,
+    ) -> Result<(), String> {
         write_json(
             &dir.join(format!("{stem}.evidence.json")),
             &self.to_json(probe_budget, late_from),
@@ -2172,7 +2185,12 @@ impl Evidence {
 /// must never touch the floor; the adaptive arm must start every request
 /// with the calibration window. Four tokens do NOT exercise retirement; the
 /// late case does.
-fn short_arm_coverage(arm: &str, evidence: &Value, report: &mut String, coverage: &mut Vec<String>) {
+fn short_arm_coverage(
+    arm: &str,
+    evidence: &Value,
+    report: &mut String,
+    coverage: &mut Vec<String>,
+) {
     let count = |key: &str| evidence[key].as_u64().unwrap_or(0) as usize;
     let (trials, ar, retired, calibrated, no_window) = (
         count("trials"),
@@ -2261,7 +2279,16 @@ fn compare_to_reference(
     failures: &mut Vec<String>,
 ) {
     let marginals: Vec<usize> = (0..TOKENS).collect();
-    compare_positions(arm, reference, ar, mtp, &marginals, &[(0, 1)], report, failures);
+    compare_positions(
+        arm,
+        reference,
+        ar,
+        mtp,
+        &marginals,
+        &[(0, 1)],
+        report,
+        failures,
+    );
 }
 
 /// An n-gram arm's recorded config (the `ar` arm uses [`dist_config`]):
@@ -2324,7 +2351,11 @@ fn copy_long_config(
     // Validate the same pool config as the child, without loading a GPU.
     qwen4_ngram_mod_config(triple)?;
     let mut config = config_base(
-        "copy-long-distribution", arm, &settings.pen, Fixture::Prose, identity,
+        "copy-long-distribution",
+        arm,
+        &settings.pen,
+        Fixture::Prose,
+        identity,
     );
     config["fixture"] = json!("copy-long");
     config["instruction"] = json!(COPY_LONG_INSTRUCTION);
@@ -2370,7 +2401,10 @@ fn check_copy_long_shard(
     let arch = receipt["gpu"]["arch"]
         .as_str()
         .ok_or_else(|| format!("{}: missing GPU arch receipt", path.display()))?;
-    check_config(&path, &copy_long_config(arm, identity, settings, arch, range)?)
+    check_config(
+        &path,
+        &copy_long_config(arm, identity, settings, arch, range)?,
+    )
 }
 
 fn ensure_copy_long_shards(
@@ -2388,7 +2422,12 @@ fn ensure_copy_long_shards(
     for gap in shard_gaps(&shards, trials)? {
         eprintln!("{arm}: running missing shard {}..{}", gap.0, gap.1);
         spawn_arm(
-            COPY_LONG_ARM_TEST, arm, "leviathan", model, dir, Some(gap),
+            COPY_LONG_ARM_TEST,
+            arm,
+            "leviathan",
+            model,
+            dir,
+            Some(gap),
             &format!("{arm}.{}-{}", gap.0, gap.1),
         )?;
     }
@@ -2404,7 +2443,10 @@ fn ensure_copy_long_shards(
 
 fn copy_long_coverage(arm: &str, parts: &[Value], report: &mut String) -> Vec<String> {
     let total = |key: &str| -> usize {
-        parts.iter().map(|part| part[key].as_u64().expect("long-copy stats count") as usize).sum()
+        parts
+            .iter()
+            .map(|part| part[key].as_u64().expect("long-copy stats count") as usize)
+            .sum()
     };
     let windows = total("ngram_mod_windows");
     let wide = total("takeover_verified_ge5");
@@ -2431,11 +2473,20 @@ fn compare_copy_long(
     report: &mut String,
     failures: &mut Vec<String>,
 ) {
-    let positions = COPY_LONG_MARGINALS.iter().map(|&first| (first, None))
-        .chain(COPY_LONG_JOINTS.iter().map(|&(first, second)| (first, Some(second))));
+    let positions = COPY_LONG_MARGINALS
+        .iter()
+        .map(|&first| (first, None))
+        .chain(
+            COPY_LONG_JOINTS
+                .iter()
+                .map(|&(first, second)| (first, Some(second))),
+        );
     for (first, second) in positions {
         let cells = |samples: &[Vec<u32>]| -> Vec<(u32, Option<u32>)> {
-            samples.iter().map(|ids| (ids[first], second.map(|index| ids[index]))).collect()
+            samples
+                .iter()
+                .map(|ids| (ids[first], second.map(|index| ids[index])))
+                .collect()
         };
         let (stat, df, p) = homogeneity(&cells(ar), &cells(mtp));
         let label = second.map_or_else(
@@ -2444,7 +2495,8 @@ fn compare_copy_long(
         );
         let line = format!(
             "{arm} vs copy_long_ar, {label}: chi2={stat:.2} df={df} p={p:.6} (n={}+{})\n",
-            ar.len(), mtp.len(),
+            ar.len(),
+            mtp.len(),
         );
         if !(p > ALPHA) {
             failures.push(line.clone());
@@ -2468,7 +2520,11 @@ fn copy_long_compared_arms() -> Result<Vec<&'static str>, String> {
         return Ok(COPY_LONG_ARMS[1..].to_vec());
     };
     let mut arms = Vec::new();
-    for name in raw.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+    for name in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
         let arm = COPY_LONG_ARMS[1..]
             .iter()
             .copied()
@@ -2508,24 +2564,35 @@ fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
         let mut parts = Vec::new();
         for range in shards {
             let path = late_file(&dir, arm, range, "ids.json");
-            let ids: Vec<Vec<u32>> = serde_json::from_value(
-                read_json(&path).unwrap_or_else(|e| panic!("{e}")),
-            ).expect("long-copy shard ids");
-            assert_eq!(ids.len(), range.1 - range.0, "{arm}: shard {range:?} trials");
-            assert!(ids.iter().all(|ids| ids.len() == COPY_LONG_TOKENS),
-                "{arm}: shard {range:?} generated length");
+            let ids: Vec<Vec<u32>> =
+                serde_json::from_value(read_json(&path).unwrap_or_else(|e| panic!("{e}")))
+                    .expect("long-copy shard ids");
+            assert_eq!(
+                ids.len(),
+                range.1 - range.0,
+                "{arm}: shard {range:?} trials"
+            );
+            assert!(
+                ids.iter().all(|ids| ids.len() == COPY_LONG_TOKENS),
+                "{arm}: shard {range:?} generated length"
+            );
             all.extend(ids);
             if arm != COPY_LONG_ARMS[0] {
                 let part = read_json(&late_file(&dir, arm, range, "stats.json"))
                     .unwrap_or_else(|e| panic!("{e}"));
-                assert_eq!(part["trials"].as_u64(), Some((range.1 - range.0) as u64),
-                    "{arm}: shard {range:?} stats trials");
+                assert_eq!(
+                    part["trials"].as_u64(),
+                    Some((range.1 - range.0) as u64),
+                    "{arm}: shard {range:?} stats trials"
+                );
                 // Require the corresponding per-window evidence, not IDs alone.
                 let evidence = read_json(&late_file(&dir, arm, range, "evidence.json"))
                     .unwrap_or_else(|e| panic!("{e}"));
                 assert_eq!(evidence["trials"], part["trials"], "{arm}: evidence trials");
-                assert_eq!(evidence["ngram_windows"], part["ngram_mod_windows"],
-                    "{arm}: evidence n-gram windows");
+                assert_eq!(
+                    evidence["ngram_windows"], part["ngram_mod_windows"],
+                    "{arm}: evidence n-gram windows"
+                );
                 parts.push(part);
             }
         }
@@ -2540,14 +2607,21 @@ fn sampled_mtp_copy_long_matches_ar_distribution_on_flash_next() {
     let mut coverage = Vec::new();
     for arm in &compared {
         compare_copy_long(
-            arm, &samples[COPY_LONG_ARMS[0]], &samples[arm], &mut report, &mut failures,
+            arm,
+            &samples[COPY_LONG_ARMS[0]],
+            &samples[arm],
+            &mut report,
+            &mut failures,
         );
         coverage.extend(copy_long_coverage(arm, &stats[arm], &mut report));
     }
     eprint!("{report}");
     fs::write(dir.join("copy-long-report.txt"), &report).expect("long-copy report");
-    assert!(failures.is_empty() && coverage.is_empty(), "{}",
-        failure_message(&dir, &failures, &coverage));
+    assert!(
+        failures.is_empty() && coverage.is_empty(),
+        "{}",
+        failure_message(&dir, &failures, &coverage)
+    );
 }
 
 #[test]
@@ -2589,7 +2663,15 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
             let arch = receipt_arch(&ids_path).unwrap_or_else(|e| panic!("{e}"));
             let copy_lane =
                 hipfire_config::mtp_ngram_copy_enabled_for_arch(hipfire_arch_qwen4::ARCH_ID, &arch);
-            ngram_config(name, spec, &identity, sampling, &settings.pen, trials, copy_lane)
+            ngram_config(
+                name,
+                spec,
+                &identity,
+                sampling,
+                &settings.pen,
+                trials,
+                copy_lane,
+            )
         };
         check_config(&ids_path, &expected).unwrap_or_else(|e| panic!("{e}"));
         let ids: Vec<Vec<u32>> =
@@ -2639,9 +2721,13 @@ fn sampled_mtp_ngram_matches_ar_distribution_on_flash_next() {
         // window). An adaptive copy arm spends its first window on the
         // floor's calibration token, so its hits are reported, not required.
         if arm.copy && arm_route(arm.name).is_some() && (windows == 0 || drafts == 0) {
-            coverage.push(format!("{line}  the copied-span fixture produced no n-gram hits\n"));
+            coverage.push(format!(
+                "{line}  the copied-span fixture produced no n-gram hits\n"
+            ));
         } else if !arm.copy && native == 0 {
-            coverage.push(format!("{line}  no native MTP window ran on the prose prompt\n"));
+            coverage.push(format!(
+                "{line}  no native MTP window ran on the prose prompt\n"
+            ));
         }
         report.push_str(&line);
         let evidence = read_json(&dir.join(format!("{}.evidence.json", arm.name)))
@@ -2763,7 +2849,9 @@ impl CopyLongStats {
                 .after
                 .ngram_windows
                 .checked_sub(window.before.ngram_windows)
-                .ok_or_else(|| format!("trial {trial}: ngram_mod_windows went backwards in a window"))?;
+                .ok_or_else(|| {
+                    format!("trial {trial}: ngram_mod_windows went backwards in a window")
+                })?;
             match moved {
                 0 => {}
                 1 => {
@@ -2938,7 +3026,14 @@ fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> 
                 return Err(format!("trial {trial}: the n-gram pool was not armed"));
             }
             stats.observe(trial, seed, &result)?;
-            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            evidence.observe(
+                trial,
+                seed,
+                &result,
+                &loaded.tokenizer,
+                budget,
+                LATE_MARGINALS[0],
+            );
             if replays && trial < REPLAYS {
                 samples.push(result.ids.clone());
                 firsts.push((trial, seed, result));
@@ -2983,7 +3078,10 @@ fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> 
             stats.mtp_windows,
             stats.takeover_verified_ge5
         );
-        write_json(&late_file(dir, arm, range, "stats.json"), &stats.to_json(range))?;
+        write_json(
+            &late_file(dir, arm, range, "stats.json"),
+            &stats.to_json(range),
+        )?;
         evidence.write(
             dir,
             &format!("{arm}.{}-{}", range.0, range.1),
@@ -3142,7 +3240,8 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
                     .mtp_request(&mut drafter, &prompt, cfg, TOKENS)
                     .map(|result| (result, seed))
             };
-            let (mut windows, mut drafts, mut accepted, mut native) = (0usize, 0usize, 0usize, 0usize);
+            let (mut windows, mut drafts, mut accepted, mut native) =
+                (0usize, 0usize, 0usize, 0usize);
             let mut first_stats: Vec<MtpRequestStats> = Vec::new();
             for trial in 0..trials {
                 let (result, seed) = run(&mut loaded, trial)?;
@@ -3157,7 +3256,14 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
                 if trial < REPLAYS {
                     first_stats.push(stats);
                 }
-                evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+                evidence.observe(
+                    trial,
+                    seed,
+                    &result,
+                    &loaded.tokenizer,
+                    budget,
+                    LATE_MARGINALS[0],
+                );
                 samples.push(result.ids);
             }
             // Only a forced floor-off route replays byte for byte; the
@@ -3599,7 +3705,11 @@ fn sampled_mtp_adaptive_late_matches_ar_distribution_on_flash_next() {
                     .unwrap_or_else(|e| panic!("{e}")),
             )
             .expect("shard ids json");
-            assert_eq!(part.len(), range.1 - range.0, "{arm} shard {range:?} trial count");
+            assert_eq!(
+                part.len(),
+                range.1 - range.0,
+                "{arm} shard {range:?} trial count"
+            );
             assert!(
                 part.iter().all(|ids| ids.len() == tokens),
                 "{arm} shard {range:?} id count"
@@ -3742,7 +3852,14 @@ fn run_late_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let seed = trial_seed(salt, trial);
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             let result = loaded.mtp_request(&mut drafter, &prompt, cfg, tokens)?;
-            evidence.observe(trial, seed, &result, &loaded.tokenizer, budget, LATE_MARGINALS[0]);
+            evidence.observe(
+                trial,
+                seed,
+                &result,
+                &loaded.tokenizer,
+                budget,
+                LATE_MARGINALS[0],
+            );
             samples.push(result.ids);
             progress(trial);
         }
@@ -3920,7 +4037,13 @@ mod coverage_logic {
         assert_eq!(find("batched", FLOOR_ENV), Some(Some("0")));
         assert_eq!(find("batched", INCREMENTAL_ENV), Some(Some("0")));
         assert_eq!(find("copy_interleaved", INCREMENTAL_ENV), Some(Some("1")));
-        for arm in ["ar", "adaptive", "ngram_adaptive", LATE_ADAPTIVE_ARM, LATE_PILOT_ARM] {
+        for arm in [
+            "ar",
+            "adaptive",
+            "ngram_adaptive",
+            LATE_ADAPTIVE_ARM,
+            LATE_PILOT_ARM,
+        ] {
             assert_eq!(find(arm, FLOOR_ENV), Some(None), "{arm}");
             assert_eq!(find(arm, INCREMENTAL_ENV), Some(None), "{arm}");
         }
@@ -4092,7 +4215,10 @@ fn run_think_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             (Some(logits), None) => {
                 let seed = trial_seed(THINK_AR_SALT, n);
                 let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
-                (loaded.ar_ids(logits, &prompt, &cfg, seed as u32, tokens)?, seed)
+                (
+                    loaded.ar_ids(logits, &prompt, &cfg, seed as u32, tokens)?,
+                    seed,
+                )
             }
             (None, Some(drafter)) => {
                 let seed = trial_seed(THINK_MTP_SALT, n);

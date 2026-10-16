@@ -104,7 +104,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn file_sha256(path: &Path) -> R<String> {
-    let mut file = std::fs::File::open(path).map_err(|x| format!("open {}: {x}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|x| format!("open {}: {x}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 8 << 20];
     loop {
@@ -215,7 +216,11 @@ fn usize_list(value: &str) -> R<BTreeSet<usize>> {
     value
         .split(',')
         .filter(|part| !part.trim().is_empty())
-        .map(|part| part.trim().parse::<usize>().map_err(|x| format!("bad number {part:?}: {x}")))
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .map_err(|x| format!("bad number {part:?}: {x}"))
+        })
         .collect()
 }
 
@@ -256,10 +261,18 @@ fn parse_args() -> R<Args> {
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             "--arm" => arm = Some(value("--arm")?),
             "--state-steps" => state_steps = usize_list(&value("--state-steps")?)?,
-            "--save-logits-steps" => save_logits_steps = usize_list(&value("--save-logits-steps")?)?,
-            "--moe-dump-positions" => moe_dump_positions = usize_list(&value("--moe-dump-positions")?)?,
-            "--perturb-rank" => perturb_rank = Some(value("--perturb-rank")?.parse::<usize>().map_err(e)?),
-            "--perturb-step" => perturb_step = Some(value("--perturb-step")?.parse::<usize>().map_err(e)?),
+            "--save-logits-steps" => {
+                save_logits_steps = usize_list(&value("--save-logits-steps")?)?
+            }
+            "--moe-dump-positions" => {
+                moe_dump_positions = usize_list(&value("--moe-dump-positions")?)?
+            }
+            "--perturb-rank" => {
+                perturb_rank = Some(value("--perturb-rank")?.parse::<usize>().map_err(e)?)
+            }
+            "--perturb-step" => {
+                perturb_step = Some(value("--perturb-step")?.parse::<usize>().map_err(e)?)
+            }
             "--kv-mode" => kv_mode = Some(value("--kv-mode")?),
             "--state-quant" => state_quant = Some(value("--state-quant")?),
             "--skip-model-hash" => skip_model_hash = true,
@@ -287,7 +300,11 @@ fn parse_args() -> R<Args> {
                 std::process::exit(0);
             }
             "--truncate-prompt-tokens" => {
-                truncate_prompt_tokens = Some(value("--truncate-prompt-tokens")?.parse::<usize>().map_err(e)?)
+                truncate_prompt_tokens = Some(
+                    value("--truncate-prompt-tokens")?
+                        .parse::<usize>()
+                        .map_err(e)?,
+                )
             }
             "--spec" => match value("--spec")?.as_str() {
                 "mtp" => spec_mtp = true,
@@ -306,7 +323,9 @@ fn parse_args() -> R<Args> {
                     other => return Err(format!("--ngram takes on, off or auto, got {other:?}")),
                 }
             }
-            "--state-every" => state_every = value("--state-every")?.parse::<usize>().map_err(e)?.max(1),
+            "--state-every" => {
+                state_every = value("--state-every")?.parse::<usize>().map_err(e)?.max(1)
+            }
             "--chunk-dump" => chunk_dump = Some(value("--chunk-dump")?),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -379,7 +398,10 @@ fn load_prompt(
         let text = std::str::from_utf8(&bytes).map_err(|x| format!("{path}: {x}"))?;
         let ids = text
             .split_whitespace()
-            .map(|word| word.parse::<u32>().map_err(|x| format!("{path}: bad id {word:?}: {x}")))
+            .map(|word| {
+                word.parse::<u32>()
+                    .map_err(|x| format!("{path}: bad id {word:?}: {x}"))
+            })
             .collect::<R<Vec<u32>>>()?;
         (ids, "ids")
     } else {
@@ -439,7 +461,9 @@ fn perturb_state(bundle: &mut Qwen4Bundle, gpu: &mut Gpu) -> R<Value> {
         bytes[4 * index + 2] ^= 0x40;
     }
     let after = bytes[4 * index..4 * index + 4].to_vec();
-    gpu.hip.memcpy_htod(&layer.recurrent.buf, &bytes).map_err(e)?;
+    gpu.hip
+        .memcpy_htod(&layer.recurrent.buf, &bytes)
+        .map_err(e)?;
     gpu.hip.device_synchronize().map_err(e)?;
     Ok(json!({
         "tensor": "gdn[0].recurrent",
@@ -719,9 +743,9 @@ fn mtp_prompt(
     }
     speculator.configure_request(request);
     let first = match pp.as_deref_mut() {
-        Some(gpus) => {
-            pp_drafter(speculator)?.pp_mtp_prefill(gpus, bundle, ids, ids, 0, false, &|| false)?
-        }
+        Some(gpus) => pp_drafter(speculator)?
+            .pp_mtp_prefill(gpus, bundle, ids, ids, 0, false, &|| false)?
+            .into_first_token()?,
         None => match speculator.prefill(gpu, bundle, ids, ids, 0, false, None, &|| false)? {
             PrefillOutcome::Ready { first_token } => first_token,
             PrefillOutcome::Aborted => return Err("MTP prefill aborted".into()),
@@ -816,7 +840,8 @@ fn mtp_prompt(
 
 fn run() -> R<()> {
     let args = parse_args()?;
-    std::fs::create_dir_all(&args.out).map_err(|x| format!("create {}: {x}", args.out.display()))?;
+    std::fs::create_dir_all(&args.out)
+        .map_err(|x| format!("create {}: {x}", args.out.display()))?;
     if let Some(layers) = args.chunk_dump.as_deref() {
         // Chunk-row dumps (`hipfire_arch_qwen4::chunk_dump`): the arm's prefill chunks of the
         // selected layers are digested under `<out>/chunk-dump/`; `fn-ep/oracle/compare.py
@@ -828,7 +853,10 @@ fn run() -> R<()> {
                 args.out.join("chunk-dump"),
             );
             if layers != "default" {
-                std::env::set_var(hipfire_arch_qwen4::chunk_dump::CHUNK_DUMP_LAYERS_ENV, layers);
+                std::env::set_var(
+                    hipfire_arch_qwen4::chunk_dump::CHUNK_DUMP_LAYERS_ENV,
+                    layers,
+                );
             }
         }
     }
@@ -1098,8 +1126,11 @@ fn run() -> R<()> {
         });
     }
     let write_meta = |meta: &Value| -> R<()> {
-        std::fs::write(args.out.join("meta.json"), serde_json::to_vec_pretty(meta).map_err(e)?)
-            .map_err(e)
+        std::fs::write(
+            args.out.join("meta.json"),
+            serde_json::to_vec_pretty(meta).map_err(e)?,
+        )
+        .map_err(e)
     };
     write_meta(&meta)?;
 
@@ -1294,7 +1325,10 @@ fn run() -> R<()> {
                 }
             }
             if step % 32 == 0 && step > 0 {
-                eprintln!("[fn_ep_oracle] prompt {prompt_index}: step {step}/{}", args.tokens);
+                eprintln!(
+                    "[fn_ep_oracle] prompt {prompt_index}: step {step}/{}",
+                    args.tokens
+                );
             }
         }
         steps_run.push(completed);

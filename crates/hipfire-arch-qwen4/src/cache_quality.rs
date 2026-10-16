@@ -368,7 +368,14 @@ fn cq_parse_arm(value: &Value, ctx: &str) -> Result<CqArm, String> {
     let object = cq_obj(
         value,
         ctx,
-        &["name", "kind", "cache_mode", "expect", "expect_start", "label"],
+        &[
+            "name",
+            "kind",
+            "cache_mode",
+            "expect",
+            "expect_start",
+            "label",
+        ],
     )?;
     let name = cq_name(object, "name", ctx)?;
     let ctx = format!("{ctx} arm {name:?}");
@@ -447,7 +454,9 @@ fn cq_parse_arm(value: &Value, ctx: &str) -> Result<CqArm, String> {
                 label,
             })
         }
-        other => Err(format!("{ctx}: unknown kind {other:?} (expected hit or cold)")),
+        other => Err(format!(
+            "{ctx}: unknown kind {other:?} (expected hit or cold)"
+        )),
     }
 }
 
@@ -511,7 +520,10 @@ fn cq_parse_case(
     if arms.is_empty() {
         return Err(format!("{ctx}: needs at least one arm"));
     }
-    let colds = arms.iter().filter(|arm| arm.kind == CqArmKind::Cold).count();
+    let colds = arms
+        .iter()
+        .filter(|arm| arm.kind == CqArmKind::Cold)
+        .count();
     if colds > 1 {
         return Err(format!(
             "{ctx}: {colds} cold arms (the comparison reference must be unique)"
@@ -534,8 +546,8 @@ fn cq_parse_case(
 /// Lengths and file contents are checked by [`cq_resolve_streams`] and
 /// [`cq_validate_cases`].
 fn cq_parse_fixture(text: &str) -> Result<CqFixture, String> {
-    let root: Value =
-        serde_json::from_str(text).map_err(|error| format!("fixture is not valid JSON: {error}"))?;
+    let root: Value = serde_json::from_str(text)
+        .map_err(|error| format!("fixture is not valid JSON: {error}"))?;
     let top = cq_obj(
         &root,
         "fixture",
@@ -761,7 +773,9 @@ fn cq_validate_cases(
         for (i, turn) in case.turns.iter().enumerate() {
             let ctx = format!("case {:?} turn {i}", case.name);
             let len = len_of(&ctx, &turn.stream)?;
-            if !(0 < turn.prompt_end && turn.prompt_end <= turn.consumed_end && turn.consumed_end <= len)
+            if !(0 < turn.prompt_end
+                && turn.prompt_end <= turn.consumed_end
+                && turn.consumed_end <= len)
             {
                 return Err(format!(
                     "{ctx}: needs 0 < prompt_end ({}) <= consumed_end ({}) <= stream {:?} length ({len})",
@@ -827,7 +841,10 @@ fn cq_logsumexp(row: &[f32]) -> f64 {
     if !max.is_finite() {
         return max;
     }
-    let sum: f64 = row.iter().map(|&value| (f64::from(value) - max).exp()).sum();
+    let sum: f64 = row
+        .iter()
+        .map(|&value| (f64::from(value) - max).exp())
+        .sum();
     max + sum.ln()
 }
 
@@ -1124,10 +1141,7 @@ struct CqArmRun {
     sidecar: CqSidecarInfo,
 }
 
-fn cq_stream<'a>(
-    streams: &'a BTreeMap<String, Vec<u32>>,
-    name: &str,
-) -> Result<&'a [u32], String> {
+fn cq_stream<'a>(streams: &'a BTreeMap<String, Vec<u32>>, name: &str) -> Result<&'a [u32], String> {
     streams
         .get(name)
         .map(Vec::as_slice)
@@ -1411,15 +1425,17 @@ fn cq_prefill(
             let drafter = drafter
                 .as_mut()
                 .ok_or("native MTP drafter is not allocated")?;
-            let seed = drafter.mtp_prefill(
-                gpu,
-                &mut rig.bundle,
-                prompt,
-                &prompt[start..],
-                start,
-                start > 0,
-                &|| false,
-            )?;
+            let seed = drafter
+                .mtp_prefill(
+                    gpu,
+                    &mut rig.bundle,
+                    prompt,
+                    &prompt[start..],
+                    start,
+                    start > 0,
+                    &|| false,
+                )?
+                .into_first_token()?;
             Ok(Some(seed))
         }
     }
@@ -1464,12 +1480,19 @@ fn cq_expect_positions(
 ) -> Result<(), String> {
     let target = rig.bundle.state.position;
     if target != expected {
-        return Err(format!("{what}: target position {target}, expected {expected}"));
+        return Err(format!(
+            "{what}: target position {target}, expected {expected}"
+        ));
     }
     if mode == CqMode::NativeMtp {
-        let head = rig.bundle.mtp_position().map_err(|error| error.to_string())?;
+        let head = rig
+            .bundle
+            .mtp_position()
+            .map_err(|error| error.to_string())?;
         if head != expected {
-            return Err(format!("{what}: MTP head position {head}, expected {expected}"));
+            return Err(format!(
+                "{what}: MTP head position {head}, expected {expected}"
+            ));
         }
     }
     Ok(())
@@ -1521,7 +1544,9 @@ pub(crate) fn cq_state_families(
     position: usize,
 ) -> Result<BTreeMap<String, CqFamily>, String> {
     let SnapshotParts { meta, layout } = SessionState::snapshot_parts(bundle, route, position)?;
-    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
     let mut families = BTreeMap::new();
     families.insert("part.0".to_string(), cq_family_of(&meta));
     let ranges = layout
@@ -1549,7 +1574,9 @@ pub(crate) fn cq_state_families(
 /// Digest of the native drafter's pending target-hidden row.
 fn cq_pending_family(gpu: &mut Gpu, drafter: &Qwen4MtpDrafter) -> Result<CqFamily, String> {
     let hidden = drafter.pending_hidden_for_parity()?;
-    gpu.hip.device_synchronize().map_err(|error| error.to_string())?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())?;
     let mut bytes = vec![0u8; hidden.byte_size()];
     gpu.hip
         .memcpy_dtoh(&mut bytes, &hidden.buf)
@@ -1887,7 +1914,10 @@ fn cq_run_case(
         eprintln!("cache-quality: case {} arm {}", case.name, arm.name);
         let run = cq_run_arm(gpu, rig, fixture, streams, case, arm, path, host);
         if let Err(error) = &run {
-            eprintln!("cache-quality: case {} arm {} failed: {error}", case.name, arm.name);
+            eprintln!(
+                "cache-quality: case {} arm {} failed: {error}",
+                case.name, arm.name
+            );
         }
         runs.push(run);
     }
@@ -1940,7 +1970,11 @@ fn cq_run_case(
         });
         arm_values.push(cq_arm_json(arm, run, expectation));
         if let (Some(found), Some(cold_index)) = (comparison.as_ref(), cold_index) {
-            comparisons.push(cq_comparison_json(&arm.name, &case.arms[cold_index].name, found));
+            comparisons.push(cq_comparison_json(
+                &arm.name,
+                &case.arms[cold_index].name,
+                found,
+            ));
         }
     }
     let value = json!({
@@ -2050,8 +2084,15 @@ pub fn run_prefix_cache_quality(
         let mut cases = Vec::new();
         let mut failures = Vec::new();
         for case in &fixture.cases {
-            let (value, case_failures) =
-                cq_run_case(&mut gpu, rig, &fixture, &streams, case, &sidecar_base, &mut host);
+            let (value, case_failures) = cq_run_case(
+                &mut gpu,
+                rig,
+                &fixture,
+                &streams,
+                case,
+                &sidecar_base,
+                &mut host,
+            );
             cases.push(value);
             failures.extend(case_failures);
         }
@@ -2090,9 +2131,7 @@ pub fn run_prefix_cache_quality(
             (report, failures)
         }
         (Err(error), Ok(())) => return Err(error),
-        (Err(error), Err(unload)) => {
-            return Err(format!("{error}; unload also failed: {unload}"))
-        }
+        (Err(error), Err(unload)) => return Err(format!("{error}; unload also failed: {unload}")),
     };
     let passed = failures.is_empty();
     report.insert("passed".into(), json!(passed));
@@ -2123,7 +2162,9 @@ mod tests {
     }
 
     fn fake_synth(salt: u64, len: usize) -> Vec<u32> {
-        (0..len).map(|i| (salt as u32) * 100_000 + i as u32).collect()
+        (0..len)
+            .map(|i| (salt as u32) * 100_000 + i as u32)
+            .collect()
     }
 
     fn fixture_json(sha: &str) -> Value {
@@ -2428,7 +2469,10 @@ mod tests {
         assert!(parse_err(&value).contains("share_len"));
 
         let mut value = valid();
-        value["streams"]["branch"].as_object_mut().unwrap().remove("share_len");
+        value["streams"]["branch"]
+            .as_object_mut()
+            .unwrap()
+            .remove("share_len");
         assert!(parse_err(&value).contains("together"));
 
         let mut value = valid();
@@ -2440,8 +2484,8 @@ mod tests {
     fn id_files_must_be_u32_multiples() {
         let bytes = vec![1u8, 2, 3, 4, 5];
         let fixture = parse(&fixture_json(&cq_sha256_hex(&bytes))).unwrap();
-        let error = cq_resolve_streams(&fixture, &|_| Ok(bytes.clone()), &fake_synth)
-            .expect_err("5 bytes");
+        let error =
+            cq_resolve_streams(&fixture, &|_| Ok(bytes.clone()), &fake_synth).expect_err("5 bytes");
         assert!(error.contains("multiple of 4"), "{error}");
     }
 
@@ -2452,7 +2496,9 @@ mod tests {
         assert_eq!(a, cq_synth_tokens(vocab, eos, 17, 4096));
         assert_ne!(a, cq_synth_tokens(vocab, eos, 18, 4096));
         assert_eq!(a.len(), 4096);
-        assert!(a.iter().all(|&t| (10..vocab as u32).contains(&t) && t != eos));
+        assert!(a
+            .iter()
+            .all(|&t| (10..vocab as u32).contains(&t) && t != eos));
         // A longer request extends the shorter one (same LCG walk).
         assert_eq!(a[..100], cq_synth_tokens(vocab, eos, 17, 100)[..]);
         // The EOS id is skipped, not remapped: forcing it out of a tiny span
@@ -2523,7 +2569,11 @@ mod tests {
         assert!((compared.kl_arm_cold - backward).abs() < 1e-6);
         // Both rows peak at index 0 (P is a three-way tie, first index wins).
         assert!(compared.top1_equal);
-        assert!(!cq_compare_rows(&[1.0, 2.0, 0.0], &[2.0, 1.0, 0.0]).unwrap().top1_equal);
+        assert!(
+            !cq_compare_rows(&[1.0, 2.0, 0.0], &[2.0, 1.0, 0.0])
+                .unwrap()
+                .top1_equal
+        );
         assert!((compared.max_abs_diff - f64::from(std::f32::consts::LN_2)).abs() < 1e-12);
     }
 
@@ -2558,9 +2608,15 @@ mod tests {
         assert!(cq_bitwise_reasons(None, 0, "cold", true, true).is_empty());
         assert_eq!(cq_bitwise_reasons(None, 0, "cold", false, true).len(), 1);
         assert_eq!(cq_bitwise_reasons(None, 0, "cold", true, false).len(), 1);
-        assert_eq!(cq_bitwise_reasons(Some(8192), 4096, "session", true, true).len(), 1);
+        assert_eq!(
+            cq_bitwise_reasons(Some(8192), 4096, "session", true, true).len(),
+            1
+        );
         // expect_start > 0 with a cold source: right start, wrong source.
-        assert_eq!(cq_bitwise_reasons(Some(8192), 8192, "cold", true, true).len(), 1);
+        assert_eq!(
+            cq_bitwise_reasons(Some(8192), 8192, "cold", true, true).len(),
+            1
+        );
         // expect_start == 0 may be cold.
         assert!(cq_bitwise_reasons(Some(0), 0, "cold", true, true).is_empty());
     }

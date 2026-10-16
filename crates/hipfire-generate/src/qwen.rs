@@ -4405,10 +4405,10 @@ pub fn generate_spec(
         resume_from,
         &|| check_abort(&id_for_abort),
     );
-    let first_token = match prefill_outcome {
-        Ok(PrefillOutcome::Ready { first_token }) => first_token,
-        Ok(PrefillOutcome::Aborted) => {
-            // Fail-closed cancel: reset+sync first; terminal follows attestation.
+    let first_token = match classify_spec_prefill(prefill_outcome) {
+        Ok(first_token) => first_token,
+        Err(terminal) => {
+            // Fail-closed: reset+sync first; the terminal follows attestation.
             let ep = spec_rollback_live(
                 &mut m.seq_pos,
                 &mut m.conversation_tokens,
@@ -4420,23 +4420,7 @@ pub fn generate_spec(
                 slot,
                 spec.as_mut(),
             );
-            emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
-            return None;
-        }
-        Err(e) => {
-            let msg = format!("prefill: {}", e);
-            let ep = spec_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec.as_mut(),
-            );
-            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
+            emit_spec_prefill_terminal(stdout, id, &terminal, &ep);
             return None;
         }
     };
@@ -10788,6 +10772,42 @@ fn qwen4_pp_mtp_parts<'a>(
     Ok((drafter, bundle))
 }
 
+/// How a spec prefill that did not produce a seed ends the request.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpecPrefillTerminal {
+    /// The client aborted mid-prefill: a cancel, never a validation error.
+    Cancelled,
+    /// A real prefill failure: the fail-closed `validation` error.
+    Failed(String),
+}
+
+/// Split a `Speculator::prefill` result into the seed or the request's terminal.
+pub fn classify_spec_prefill(
+    outcome: Result<PrefillOutcome, String>,
+) -> Result<u32, SpecPrefillTerminal> {
+    match outcome {
+        Ok(PrefillOutcome::Ready { first_token }) => Ok(first_token),
+        Ok(PrefillOutcome::Aborted) => Err(SpecPrefillTerminal::Cancelled),
+        Err(e) => Err(SpecPrefillTerminal::Failed(format!("prefill: {e}"))),
+    }
+}
+
+/// Emit the terminal of a spec prefill that ended without a seed, after the
+/// rollback epilogue ran.
+pub fn emit_spec_prefill_terminal(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    terminal: &SpecPrefillTerminal,
+    epilogue: &RollbackEpilogue,
+) {
+    match terminal {
+        SpecPrefillTerminal::Cancelled => emit_spec_cancel_after_rollback(stdout, id, 0, epilogue),
+        SpecPrefillTerminal::Failed(msg) => {
+            emit_fail_closed_error(stdout, Some(id), msg, "validation", false, epilogue)
+        }
+    }
+}
+
 /// [`production_fail_closed_rollback_live`] for the spec loop: the mesh form
 /// (all-band reset plus the drafter's) on a pipeline-parallel Qwen4 model, the
 /// single-GPU form otherwise.
@@ -10861,17 +10881,15 @@ fn spec_prefill(
     } else {
         (prompt_tokens, 0)
     };
-    drafter
-        .pp_mtp_prefill(
-            gpus,
-            bundle,
-            prompt_tokens,
-            fill_tokens,
-            start_pos,
-            cache_hit,
-            abort,
-        )
-        .map(|first_token| PrefillOutcome::Ready { first_token })
+    drafter.pp_mtp_prefill(
+        gpus,
+        bundle,
+        prompt_tokens,
+        fill_tokens,
+        start_pos,
+        cache_hit,
+        abort,
+    )
 }
 
 /// `Speculator::step` of the spec loop, on the mesh for a pipeline-parallel
