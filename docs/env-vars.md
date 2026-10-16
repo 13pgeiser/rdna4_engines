@@ -333,6 +333,18 @@ Lineage-derived pool snapshots use a separate `/session-exact` domain, so
 they do not alias cold-exact reference snapshots. Cache tracing labels a
 parked-main restore `source=live`; `prior` and `lcp` still describe the
 immediately preceding request, which may be the side conversation.
+
+For Flash-Next/Qwen4 pipeline parallelism, `memory.session_cache_bytes` is an
+independent opportunistic device-cache budget **per band**, not a mesh-wide
+reservation. Captures retain the same free-memory/context-growth guards as
+Single. Every band captures its own state at the root's common prefill
+boundaries; only client-committed, all-band snapshots are reusable. Aggregate
+records hold pins on every local piece, are scoped to placement and mesh/load
+epoch, and a missing piece makes the whole record a cold miss. The bounded
+aggregate index retains at most 64 records. Resident-only lineage/tail snapshots
+do not enter that index because their row streams depend on mutable live state.
+Disk-tier caching, `HIPFIRE_QWEN4_TURN_SNAPSHOTS=1`, and MTP sessions remain
+refused under PP; Single and EP session behavior is unchanged.
 ### Embedding (arch 17)
 
 | Variable | Default / sense | Notes |
