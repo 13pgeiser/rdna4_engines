@@ -1613,6 +1613,12 @@ pub(crate) fn qwen4_expert_table_entries(
     Ok(entries)
 }
 
+/// `expert` is outside the layer's `qwen4.expert_keep` row; dense layers
+/// (`ids == None`) have no absent experts.
+fn expert_pruned(ids: Option<&[u16]>, expert: usize) -> bool {
+    ids.is_some_and(|ids| u16::try_from(expert).is_ok_and(|e| ids.binary_search(&e).is_err()))
+}
+
 fn pruned_expert_entries(
     layout: &Qwen4ExpertTableLayout<'_>,
     local: Qwen4PeerExpertSource,
@@ -2525,9 +2531,6 @@ impl Qwen4MoeLayerRuntime {
                 let entry = view
                     .entry(eid)
                     .ok_or_else(|| invalid("missing tier expert entry"))?;
-                if entry.gate_up_len == 0 && entry.down_len == 0 {
-                    continue;
-                }
                 if entry.format != crate::expert_slabs::ExpertFormat::Mq4Xts {
                     return Err(invalid("aggregate expert tiers require MQ4 entries"));
                 }
@@ -2633,7 +2636,7 @@ impl Qwen4MoeLayerRuntime {
         let mut experts = Vec::with_capacity(config.num_experts);
         let mut metadata = Vec::with_capacity(config.num_experts);
         for (expert, entry) in table_entries.iter().enumerate() {
-            let absent = entry.gate_up_ptr == 0 && entry.down_ptr == 0;
+            let absent = expert_pruned(kept_ids, expert) && entry.gate_up_ptr == 0 && entry.down_ptr == 0;
             let tier_gate = matches!(entry.origin, Qwen4ExpertOrigin::Tier).then(|| {
                 foreign_packed_source(entry.gate_up_ptr, gate_up_expert_bytes, gate_up_dtype)
             });
@@ -3007,7 +3010,8 @@ impl Qwen4MoeLayerRuntime {
         for (expert, (entry, format)) in plan.experts.iter().zip(&formats).enumerate() {
             let (gate_up_dtype, down_dtype) = dtypes_of(*format)?;
             let (gate_up_bytes, down_bytes) = (format.gate_up_bytes(), format.down_bytes());
-            let absent = entry.gate_up_offset == entry.down_offset;
+            let absent = expert_pruned(config.kept_expert_ids(layer_label, false), expert)
+                && entry.gate_up_offset == entry.down_offset;
             if !absent && (entry.gate_up_offset + gate_up_bytes != entry.down_offset
                 || entry.down_offset + down_bytes > plan.bytes)
             {

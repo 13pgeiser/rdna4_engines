@@ -196,17 +196,21 @@ fn run(args: Args) -> Result<(), String> {
     if let (Some(root), Some(keep)) = (&keep_json, &keep) {
         apply_keep_tiers(root, keep, &mut formats).map_err(|e| e.to_string())?;
     }
-    for item in 0..formats.len() {
-        let (layer, expert) = (item / geometry.experts, item % geometry.experts);
-        if keep.as_ref().is_some_and(|k| !k.is_kept(layer, expert)) { continue }
-        let records = match formats[item] {
-            ExpertFormat::Mq3I4 => args.records_w3.as_ref(),
-            ExpertFormat::Mq2I4 => args.records_w2.as_ref(),
-            // E8P records are one pair of per-layer files, verified by the provider at open.
-            ExpertFormat::E8pI4 | ExpertFormat::Mq4Xts => continue,
-        }.ok_or_else(|| format!("missing records directory for L{layer}/E{expert}"))?;
-        let path = records.join(format!("L{layer}/E{expert}.npz"));
-        if !path.is_file() { return Err(format!("missing record {}", path.display())) }
+    // Pruned packs only: a dense run keeps its former error timing and never
+    // stats the full 48 x 512 record grid up front.
+    if let Some(k) = keep.as_ref() {
+        for item in 0..formats.len() {
+            let (layer, expert) = (item / geometry.experts, item % geometry.experts);
+            if !k.is_kept(layer, expert) { continue }
+            let records = match formats[item] {
+                ExpertFormat::Mq3I4 => args.records_w3.as_ref(),
+                ExpertFormat::Mq2I4 => args.records_w2.as_ref(),
+                // E8P records are one pair of per-layer files, verified by the provider at open.
+                ExpertFormat::E8pI4 | ExpertFormat::Mq4Xts => continue,
+            }.ok_or_else(|| format!("missing records directory for L{layer}/E{expert}"))?;
+            let path = records.join(format!("L{layer}/E{expert}.npz"));
+            if !path.is_file() { return Err(format!("missing record {}", path.display())) }
+        }
     }
     let w3 = provider(
         args.records_w3.clone(),

@@ -222,15 +222,20 @@ pub(super) fn stage_buffer_bytes(arena_bytes: impl IntoIterator<Item = usize>) -
 /// A layer's per-expert pointer table moved from the layer's arena to
 /// `stage_base`: every entry must lie inside `[arena_base, arena_base +
 /// arena_bytes)`; the result is the little-endian device pointer table.
+/// `kept` is the layer's `qwen4.expert_keep` row (`None` for dense artifacts):
+/// a zero entry is accepted only for an expert outside that row.
 pub(super) fn rebase_stage_entries(
     entries: &[usize],
     arena_base: usize,
     arena_bytes: usize,
     stage_base: usize,
+    kept: Option<&[u16]>,
 ) -> Result<Vec<u8>, String> {
     let mut table = Vec::with_capacity(entries.len() * std::mem::size_of::<u64>());
     for (expert, &entry) in entries.iter().enumerate() {
-        if entry == 0 {
+        if entry == 0
+            && kept.is_some_and(|ids| u16::try_from(expert).is_ok_and(|e| ids.binary_search(&e).is_err()))
+        {
             table.extend_from_slice(&0usize.to_ne_bytes());
             continue;
         }
@@ -380,11 +385,13 @@ impl Qwen4ExpertStage {
                     &runtime.expert_gate_up_entries,
                     &runtime.expert_down_entries,
                 ] {
+                    let kept = config.kept_expert_ids(layer, false);
                     let table = rebase_stage_entries(
                         entries,
                         slab.arena_base,
                         slab.arena_bytes,
                         stage_base,
+                        kept,
                     )
                     .map_err(|reason| {
                         invalid(format!("layer {layer} slab stage table: {reason}"))
@@ -762,7 +769,7 @@ mod tests {
     fn rebase_moves_every_entry_by_the_same_delta() {
         let (arena, stage) = (0x7000_0000usize, 0x2_0000_0000usize);
         let entries = [arena, arena + 1280, arena + 99_999];
-        let table = rebase_stage_entries(&entries, arena, 100_000, stage).unwrap();
+        let table = rebase_stage_entries(&entries, arena, 100_000, stage, None).unwrap();
         let decoded: Vec<usize> = table
             .chunks_exact(8)
             .map(|chunk| usize::from_ne_bytes(chunk.try_into().unwrap()))
@@ -774,11 +781,28 @@ mod tests {
     fn rebase_refuses_entries_outside_the_arena_after_an_arena_swap() {
         let (arena, stage) = (0x7000_0000usize, 0x2_0000_0000usize);
         // Below the base, at the end, and a table of a different (swapped) arena.
-        assert!(rebase_stage_entries(&[arena - 8], arena, 100_000, stage).is_err());
-        assert!(rebase_stage_entries(&[arena + 100_000], arena, 100_000, stage).is_err());
+        assert!(rebase_stage_entries(&[arena - 8], arena, 100_000, stage, None).is_err());
+        assert!(rebase_stage_entries(&[arena + 100_000], arena, 100_000, stage, None).is_err());
         let other_arena = 0x9000_0000usize;
-        assert!(rebase_stage_entries(&[other_arena + 16], arena, 100_000, stage).is_err());
-        assert!(rebase_stage_entries(&[arena, usize::MAX], arena, 100_000, usize::MAX - 8).is_err());
+        assert!(rebase_stage_entries(&[other_arena + 16], arena, 100_000, stage, None).is_err());
+        assert!(rebase_stage_entries(&[arena, usize::MAX], arena, 100_000, usize::MAX - 8, None).is_err());
+    }
+
+    #[test]
+    fn rebase_rejects_dense_null_and_preserves_pruned_absent_null() {
+        let (arena, stage) = (0x7000_0000usize, 0x2_0000_0000usize);
+        // Dense (no keep row): a null entry is an error, as before pruning existed.
+        assert!(rebase_stage_entries(&[arena, 0], arena, 100_000, stage, None).is_err());
+        // Pruned: expert 1 is outside the keep row, so its null entry stays null.
+        let kept = [0u16, 2];
+        let table = rebase_stage_entries(&[arena, 0, arena + 8], arena, 100_000, stage, Some(&kept)).unwrap();
+        let decoded: Vec<usize> = table
+            .chunks_exact(8)
+            .map(|chunk| usize::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(decoded, vec![stage, 0, stage + 8]);
+        // A null entry for a kept expert is still an error.
+        assert!(rebase_stage_entries(&[arena, 0, arena + 8], arena, 100_000, stage, Some(&[0, 1, 2])).is_err());
     }
 
     #[test]

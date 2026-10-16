@@ -1043,6 +1043,13 @@ impl Qwen4Config {
         if let Some(keep) = &self.expert_keep {
             expect(keep.n_experts(), self.num_experts, "expert_keep.n_experts")?;
             expect(keep.n_layers(), self.num_hidden_layers, "expert_keep.layers")?;
+            // The masked router kernel is compiled for exactly 512 experts and top-10.
+            if self.num_experts != 512 || self.num_experts_per_tok != 10 {
+                return Err(format!(
+                    "qwen4: expert_keep requires num_experts=512 and num_experts_per_tok=10 (got {} and {})",
+                    self.num_experts, self.num_experts_per_tok
+                ));
+            }
             if !self.norm_topk_prob {
                 return Err("qwen4: expert_keep requires norm_topk_prob=true".into());
             }
@@ -2746,6 +2753,17 @@ mod tests {
         metadata[crate::EXPERT_KEEP_METADATA_KEY] =
             crate::ExpertKeep::new(512, vec![(0..16).collect(); 47], None, 10).unwrap().to_metadata_value();
         assert!(Qwen4Config::from_nested_value(&metadata).unwrap_err().contains("expert_keep.layers"));
+    }
+
+    #[test]
+    fn expert_keep_requires_fixed_e512_top10_geometry() {
+        let mut metadata = synthetic();
+        let keep = crate::ExpertKeep::new(4, vec![vec![0, 1, 2]; 2], None, 2).unwrap();
+        metadata[crate::EXPERT_KEEP_METADATA_KEY] = keep.to_metadata_value();
+        let error = dev(&metadata).unwrap_err();
+        assert!(error.contains("num_experts=512"), "{error}");
+        // Without keep metadata the same synthetic geometry stays admitted.
+        dev(&synthetic()).expect("dense synthetic is unaffected");
     }
 
     /// The AR-only profile is derived, never parsed: Flash-Next converts (the
