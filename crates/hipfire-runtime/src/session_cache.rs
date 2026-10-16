@@ -363,7 +363,7 @@ fn saturating_total(bytes: impl IntoIterator<Item = u64>) -> u64 {
 /// Whether `need` more device bytes, with `growth` more for the live state,
 /// leave the guard's headroom free in the pool the device allocates from
 /// (`Gpu::device_mem_info`: VRAM, a unified-memory APU's carve-out, or its GTT
-/// clamped to `MemAvailable` minus `CmaFree` plus TTM's page pool); `None`
+/// clamped to `MemAvailable` minus the CMA region plus TTM's page pool); `None`
 /// when the free-memory query itself fails. A caller allocates only right
 /// after `Some(true)`.
 fn memory_fits(gpu: &mut Gpu, need: u64, growth: u64) -> Option<bool> {
@@ -383,7 +383,7 @@ fn memory_fits(gpu: &mut Gpu, need: u64, growth: u64) -> Option<bool> {
 }
 
 /// Whether the disk tier's host bounce buffer of `bytes` may be allocated now:
-/// host `MemAvailable` (less `CmaFree`, no TTM credit: pageable memory is not
+/// host `MemAvailable` (less the CMA region, no TTM credit: pageable memory is not
 /// GTT) must hold it plus the headroom and, on unified memory where the live
 /// state's `growth` comes out of the same RAM, that reserve. An unreadable
 /// `MemAvailable` refuses.

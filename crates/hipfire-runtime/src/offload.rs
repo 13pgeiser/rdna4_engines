@@ -725,7 +725,7 @@ fn read_u64(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// `MemAvailable - CmaFree` in bytes, read now
+/// `MemAvailable - CMA` in bytes, read now
 /// ([`rdna_compute::uma_memory::mem_available_bytes`]). `None` when unreadable
 /// (admission then refuses rather than assuming room).
 pub fn mem_available_bytes() -> Option<u64> {
@@ -825,7 +825,7 @@ pub fn gtt_budget() -> Option<GttBudget> {
 
 /// Refuse before any allocation when the pinned weights would not leave
 /// [`HOST_RAM_HEADROOM_BYTES`] of the host RAM they can take: `mem_available`
-/// (`MemAvailable - CmaFree`, [`mem_available_bytes`]; free CMA pages serve
+/// (`MemAvailable - CMA`, [`mem_available_bytes`]; CMA pageblocks serve
 /// only movable allocations) plus `ttm_pool_bytes`, the estimate of freed GTT
 /// pages parked in TTM's page pool ([`ttm_pool_estimate`]). Pinned pages
 /// cannot be reclaimed, so over-committing them starves the rest of the host.
@@ -847,7 +847,7 @@ pub fn check_host_ram(
     if available.saturating_add(ttm_pool_bytes) < needed {
         return Err(format!(
             "host-placed weights need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
-             MemAvailable - CmaFree is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
+             MemAvailable - CMA is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
              memory or keep more weights in VRAM (memory.moe_expert_budget / \
              memory.gpu_layer_budget)",
             host_bytes as f64 / GIB_F,
@@ -889,7 +889,7 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
     Ok(())
 }
 
-/// Both host-tier admissions, read now: `MemAvailable - CmaFree` + TTM's page pool, then
+/// Both host-tier admissions, read now: `MemAvailable - CMA` + TTM's page pool, then
 /// GTT's cap. This is the one call a loader makes before allocating anything
 /// host-mapped.
 pub fn admit_host_placement(host_bytes: u64) -> Result<(), String> {
@@ -1176,7 +1176,7 @@ mod tests {
         let empty = ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, 16_108_144);
         let error = check_host_ram(host, available, empty.unwrap()).unwrap_err();
         assert!(
-            error.contains("MemAvailable - CmaFree is 45.8 GiB (plus 0.0 GiB"),
+            error.contains("MemAvailable - CMA is 45.8 GiB (plus 0.0 GiB"),
             "{error}"
         );
         // A pool smaller than the 4.3 GiB gap still refuses.

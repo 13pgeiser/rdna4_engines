@@ -57,8 +57,8 @@ fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
     hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
-/// `MemAvailable - CmaFree` the automatic prewarm of the PLE hot-row pack leaves at
-/// ready (`memory.ple_hot_store_bytes = auto`: budget = `MemAvailable - CmaFree` - this,
+/// `MemAvailable - CMA` the automatic prewarm of the PLE hot-row pack leaves at
+/// ready (`memory.ple_hot_store_bytes = auto`: budget = `MemAvailable - CMA` - this,
 /// capped at the pack). The pack's pages are clean page cache, counted in
 /// `MemAvailable` and dropped (never swapped) under pressure; the reserve
 /// covers what a request allocates without first reclaiming prewarmed pages.
@@ -189,7 +189,7 @@ fn start_ple_hot_store(
 }
 
 /// Bytes of the PLE hot-row pack to prewarm now that the model is ready: an
-/// explicit `memory.ple_hot_store_bytes`, or (`auto`) `MemAvailable - CmaFree` minus
+/// explicit `memory.ple_hot_store_bytes`, or (`auto`) `MemAvailable - CMA` minus
 /// [`PLE_HOT_PREWARM_RESERVE_BYTES`]; the store caps it at the pack's size.
 fn ple_hot_prewarm_budget() -> (u64, Option<u64>) {
     let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
@@ -208,7 +208,7 @@ fn ple_prewarm_off_reason(available: Option<u64>, explicit_zero: bool) -> String
         "memory.ple_prewarm_bytes = 0".to_string()
     } else {
         format!(
-            "MemAvailable - CmaFree {} MiB leaves no headroom over the {} MiB reserve",
+            "MemAvailable - CMA {} MiB leaves no headroom over the {} MiB reserve",
             available.map_or(0, |bytes| bytes / (1 << 20)),
             PLE_PREWARM_RESERVE_BYTES / (1 << 20)
         )
@@ -227,7 +227,7 @@ const PLE_PREWARM_RESERVE_BYTES: u64 = 8 << 30;
 
 /// Bytes of the q4 PLE table to prewarm now that the model is ready: an
 /// explicit `memory.ple_prewarm_bytes`, or (`auto`) [`PLE_PREWARM_AUTO_BYTES`]
-/// capped at `MemAvailable - CmaFree` minus [`PLE_PREWARM_RESERVE_BYTES`]; the
+/// capped at `MemAvailable - CMA` minus [`PLE_PREWARM_RESERVE_BYTES`]; the
 /// prewarm caps it at the table's data.  The flag is whether the budget was
 /// set to zero.
 fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
@@ -237,7 +237,7 @@ fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
     (budget, available, explicit_zero)
 }
 
-/// [`ple_prewarm_budget`] for a given request and `MemAvailable - CmaFree`.
+/// [`ple_prewarm_budget`] for a given request and `MemAvailable - CMA`.
 fn ple_prewarm_budget_for(
     request: hipfire_config::memory::PleHotStoreBudget,
     available: Option<u64>,
@@ -271,7 +271,7 @@ const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
 /// Bytes of a rank-ordered q4 PLE table to read while the model loads: the
 /// `requested` `memory.ple_load_fill_bytes` (`auto` = [`PLE_LOAD_FILL_AUTO_BYTES`])
 /// capped at an explicit `memory.ple_prewarm_bytes`, at the table, and at the
-/// host RAM available now (`MemAvailable - CmaFree` plus TTM's page pool, which the
+/// host RAM available now (`MemAvailable - CMA` plus TTM's page pool, which the
 /// weights' GTT allocations take first) minus the weights still to load into
 /// host RAM minus [`PLE_PREWARM_RESERVE_BYTES`] (0 when unknown).
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -2173,7 +2173,7 @@ pub fn load_qwen4_rank(
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
         eprintln!(
                 "  qwen4 routed experts: layers 0..{} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
-                 (MemAvailable - CmaFree {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
+                 (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 vram_layers.min(config.num_hidden_layers),
                 gib(host_bytes),
                 gib(mem_available.unwrap_or(0)),
@@ -2597,7 +2597,7 @@ pub fn load_qwen4_rank(
             );
         } else {
             eprintln!(
-                "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable - CmaFree {} MiB)",
+                "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable - CMA {} MiB)",
                 budget.min(store.data_bytes()) / MIB,
                 store.data_bytes() / MIB,
                 available.map_or(0, |bytes| bytes / MIB),
@@ -2612,7 +2612,7 @@ pub fn load_qwen4_rank(
         let (budget, available) = ple_hot_prewarm;
         store.set_prewarm_budget(budget);
         eprintln!(
-            "  qwen4 ple hot store: prewarm budget {} MiB of a {} MiB pack (MemAvailable - CmaFree {} MiB)",
+            "  qwen4 ple hot store: prewarm budget {} MiB of a {} MiB pack (MemAvailable - CMA {} MiB)",
             budget.min(store.data_bytes()) / MIB,
             store.data_bytes() / MIB,
             available.map_or(0, |bytes| bytes / MIB),
@@ -2642,7 +2642,7 @@ pub fn load_qwen4_rank(
                 Ok(prewarm) => {
                     prewarm.set_budget(budget);
                     eprintln!(
-                            "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable - CmaFree {} MiB)",
+                            "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable - CMA {} MiB)",
                             budget.min(*data_bytes) / MIB,
                             data_bytes / MIB,
                             available.map_or(0, |bytes| bytes / MIB),

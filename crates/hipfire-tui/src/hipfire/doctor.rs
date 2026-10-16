@@ -175,6 +175,15 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
         }
     };
     checks.push(check("live GPU probe", gpu_ok, gpu_detail));
+    // Kexec HandOver scratch (CMA pageblocks the GPU cannot use). Older CLIs do
+    // not report it, so an absent key adds no check; `warn` shows as not ok.
+    if let Some(status) = v["kho_scratch"]["status"].as_str() {
+        checks.push(check(
+            "KHO scratch",
+            status == "pass",
+            v["kho_scratch"]["detail"].as_str().unwrap_or(status),
+        ));
+    }
 
     DoctorReport {
         checks,
@@ -208,6 +217,23 @@ mod tests {
         assert!(by("GPU (PCI)"));
         assert!(by("local models"));
         assert!(by("live GPU probe"));
+    }
+
+    #[test]
+    fn parse_diag_kho_scratch_warn_and_absent() {
+        let warn = r#"{"kho_scratch": {"name": "kho_scratch", "status": "warn",
+            "scratch_bytes": 14193524736, "detail": "KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it"}}"#;
+        let r = parse_diag_json(warn);
+        let kho = r.checks.iter().find(|c| c.name == "KHO scratch").unwrap();
+        assert!(!kho.ok);
+        assert!(kho.detail.contains("kho=off"), "{}", kho.detail);
+        let pass = r#"{"kho_scratch": {"status": "pass", "detail": "none"}}"#;
+        assert!(parse_diag_json(pass)
+            .checks
+            .iter()
+            .any(|c| c.name == "KHO scratch" && c.ok));
+        let absent = parse_diag_json(r#"{"platform": "linux"}"#);
+        assert!(absent.checks.iter().all(|c| c.name != "KHO scratch"));
     }
 
     #[test]

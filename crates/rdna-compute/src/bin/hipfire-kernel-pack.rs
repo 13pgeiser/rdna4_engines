@@ -25,7 +25,10 @@ fn worker_count(cores: usize, available_bytes: Option<u64>, override_jobs: Optio
 fn host_jobs() -> Result<usize, String> {
     let cores = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
     let memory = std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|text| available_memory(&text));
+        .and_then(|text| {
+            let zoneinfo = rdna_compute::uma_memory::read_zoneinfo();
+            available_memory(&text, zoneinfo.as_deref())
+        });
     let override_jobs = hipfire_config::developer_var("HIPFIRE_PACK_JOBS").ok();
     worker_count(cores, memory, override_jobs.as_deref())
 }
@@ -186,8 +189,8 @@ mod tests {
 
     #[test]
     fn parses_available_not_unused_memory() {
-        assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n"), Some(2 * BYTES_PER_JOB));
-        assert_eq!(available_memory("MemFree: 100 kB\n"), None);
-        assert_eq!(available_memory("MemAvailable: invalid kB\n"), None);
+        assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n", None), Some(2 * BYTES_PER_JOB));
+        assert_eq!(available_memory("MemFree: 100 kB\n", None), None);
+        assert_eq!(available_memory("MemAvailable: invalid kB\n", None), None);
     }
 }

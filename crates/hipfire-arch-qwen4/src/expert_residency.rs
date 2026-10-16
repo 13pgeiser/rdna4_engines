@@ -1020,7 +1020,7 @@ pub fn ep_fit_report(
 
 /// Refuse before any allocation when the pinned experts would not leave
 /// [`HOST_RAM_HEADROOM_BYTES`] of the host RAM they can take: `mem_available`
-/// (`MemAvailable - CmaFree`; free CMA pages serve only movable allocations)
+/// (`MemAvailable - CMA`; CMA pageblocks serve only movable allocations)
 /// plus `ttm_pool_bytes`, the estimate of freed GTT pages parked in TTM's
 /// page pool ([`ttm_pool_estimate`]). Pinned pages cannot be reclaimed, so
 /// over-committing them starves the rest of the host.
@@ -1042,7 +1042,7 @@ pub fn check_host_ram(
     if available.saturating_add(ttm_pool_bytes) < needed {
         return Err(format!(
             "routed experts need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
-             MemAvailable - CmaFree is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
+             MemAvailable - CMA is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
              memory or keep more expert layers in VRAM ({EXPERT_VRAM_LAYERS_ENV})",
             host_bytes as f64 / GIB,
             HOST_RAM_HEADROOM_BYTES as f64 / GIB,
@@ -2179,7 +2179,7 @@ mod tests {
         let empty = ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, 16_108_144);
         let error = check_host_ram(host, available, empty.unwrap()).unwrap_err();
         assert!(
-            error.contains("MemAvailable - CmaFree is 45.8 GiB (plus 0.0 GiB"),
+            error.contains("MemAvailable - CMA is 45.8 GiB (plus 0.0 GiB"),
             "{error}"
         );
         // A pool smaller than the 4.3 GiB gap still refuses.

@@ -3172,6 +3172,32 @@ fn finish_route_kernels(
     Ok(())
 }
 
+/// The load-time KHO scratch warning line: only on a unified-memory GPU, and
+/// only at [`rdna_compute::uma_memory::KHO_WARN_BYTES`] or more.
+fn kho_scratch_load_warning(uma: bool, scratch: Option<u64>) -> Option<String> {
+    if !uma {
+        return None;
+    }
+    rdna_compute::uma_memory::kho_scratch_warning(scratch?).map(|text| format!("  warning: {text}"))
+}
+
+/// Print [`kho_scratch_load_warning`] at most once per process (every load
+/// path of the daemon and `hipfire serve` goes through
+/// [`load_admitted_with_gemma4_drafter`]).
+fn warn_kho_scratch_once(uma: bool) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if !uma {
+        return;
+    }
+    WARNED.call_once(|| {
+        if let Some(line) =
+            kho_scratch_load_warning(uma, rdna_compute::uma_memory::kho_scratch_bytes())
+        {
+            eprintln!("{line}");
+        }
+    });
+}
+
 /// Consume an already-admitted source: the retained [`SourceAdmission`] handle
 /// plus its resolved carrier. Destructive work — VMM readiness, carrier load
 /// with its allocations and collectives — begins here, only after admission has
@@ -3212,6 +3238,7 @@ pub fn load_admitted_with_gemma4_drafter(
     let carrier =
         carrier.ok_or_else(|| "single/pp admission must resolve a carrier".to_string())?;
     ensure_vmm_ready_for_load(gpu)?;
+    warn_kho_scratch_once(gpu.is_uma());
     let rec_sampling = match &source {
         ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
         _ => None,
@@ -5558,6 +5585,24 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+    }
+}
+
+#[cfg(test)]
+mod kho_scratch_warning_tests {
+    use super::kho_scratch_load_warning;
+
+    #[test]
+    fn kho_load_warning_is_uma_only_and_needs_one_gib() {
+        let hipx = Some(13_536u64 << 20);
+        assert_eq!(
+            kho_scratch_load_warning(true, hipx).as_deref(),
+            Some("  warning: KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it")
+        );
+        assert_eq!(kho_scratch_load_warning(false, hipx), None);
+        assert_eq!(kho_scratch_load_warning(true, None), None);
+        assert_eq!(kho_scratch_load_warning(true, Some((1 << 30) - 1)), None);
+        assert!(kho_scratch_load_warning(true, Some(1 << 30)).is_some());
     }
 }
 

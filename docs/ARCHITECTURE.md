@@ -707,7 +707,7 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   APU's GTT or carve-out) and yield to context growth. A capture is skipped,
   or older snapshots are evicted, unless free device memory
   (`Gpu::device_mem_info`: `hipMemGetInfo`, on a GTT-backed APU clamped to
-  `MemAvailable` minus `CmaFree` plus TTM's page pool) still holds the live
+  `MemAvailable` minus the CMA region plus TTM's page pool) still holds the live
   state's growth through the prompt in flight plus headroom: on a
   unified-memory APU `clamp(MemTotal / 16, 2 GiB, 8 GiB)`, on a discrete GPU
   256 MiB; every allocation path, disk staging included, keeps it.

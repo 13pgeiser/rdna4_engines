@@ -114,7 +114,7 @@ Stable/default-on and safety controls:
 | `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set (the built-in calibration is the normal path and applies on any Halo kernel/firmware/GPU PCI address, keyed by arch/build/model/epilogue/route; under `auto` each request picks its NPU family subset and pair plan from GPU/NPU rate scales learned live in this process, see [live rate scales](npu/npu-trunk.md#live-rate-scales-auto)); any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
 | `fusions.npu_trunk_calibration` | `""` | Empty resolves to `<hipfire home>/npu-trunk/calibration.json`; alias `npu_trunk_calibration`, env `HIPFIRE_QWEN4_NPU_TRUNK_CAL` (a non-empty path replaces the default). A calibration is `schema_version` 4 JSON that rejects unknown fields. A file at the path wins; only a **missing** file uses the compiled-in measured Halo calibration (stock route, or the overlay route of the load's trunk overlay), so an unreadable or invalid file is an error and never falls back to the built-in. A calibration file is an optional strict override and passes a strict key check (arch, GPU PCI address, NPU firmware, build, kernel release, model-index hash, epilogue, trunk route); `auto` treats a mismatch as GPU-only and never recalibrates. No file is required: the built-in calibration binds on the hard key fields only (arch, build, model-index hash, epilogue, trunk route) and applies on any Halo kernel, NPU firmware and GPU PCI address at margin 0.0; when those differ from the record the load logs one `npu-trunk: built-in Halo calibration (measured on kernel <k>, NPU firmware <fw>, GPU <bdf>) applies by arch/model/route; this host ...` line. Live rate scales correct its speed for the host (see [NPU trunk](npu/npu-trunk.md#live-rate-scales-auto)). Armed logs include `cal_source=file\|builtin`. No calibration/index I/O when effectively off. See [NPU trunk](npu/npu-trunk.md). |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
-| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host available-memory headroom check (`MemAvailable` minus `CmaFree`); the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
+| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host available-memory headroom check (`MemAvailable` minus the CMA region); the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
 The following default-off keys are experimental kernel-route overrides. They
 are typed booleans, process-scoped, and visible in `hipfire config list` with
@@ -557,17 +557,24 @@ provisioning, prefill rungs, the session cache) reads `Gpu::device_mem_info`
 A discrete GPU, or an APU whose device pool is its BIOS carve-out, gets
 `hipMemGetInfo` unchanged. An APU that allocates from GTT (device pool larger
 than `mem_info_vram_total`, e.g. Strix Halo with a 1 GiB carve-out and a
-120 GiB `ttm.pages_limit`) gets `min(hipMemGetInfo free, MemAvailable - CmaFree
+120 GiB `ttm.pages_limit`) gets `min(hipMemGetInfo free, MemAvailable - CMA
 + TTM page-pool estimate)`: `hipMemGetInfo` there is TTM's cap minus live GTT
 and ignores host RAM pressure, while freed GTT pages parked in TTM's pool are
 outside `MemAvailable` but are what the next GTT allocation takes first.
-`CmaFree` (free pages of CMA pageblocks, which `MemAvailable` counts but which
-serve only movable allocations, never pinned GTT or kernel memory) is
-subtracted, saturating at 0, even when `CmaTotal` is 0; a missing `CmaFree`
-counts as 0. The TTM pool addition is unchanged. Every host-RAM sizing site
+The CMA region (the larger of `CmaFree` and the CMA pageblocks, `CmaTotal` or
+the sum of `/proc/zoneinfo` `cma` lines; `MemAvailable` counts both free pages
+and page cache in them, but they serve only movable allocations, never pinned
+GTT or kernel memory) is subtracted, saturating at 0, even when `CmaTotal` is
+0: kernels with Kexec HandOver (KHO) enabled by default release its scratch
+memory (~13 GiB on a 128 GB Strix Halo) as CMA pageblocks outside any
+registered CMA area. A missing `CmaFree`/`CmaTotal` counts as 0, unreadable
+zoneinfo falls back to `CmaTotal`. Loading on a unified-memory GPU prints
+`KHO scratch reserves N GiB unusable by the GPU; boot with kho=off to reclaim
+it` once when the scratch is at least 1 GiB, and `hipfire diag` reports it
+as a warning. The TTM pool addition is unchanged. Every host-RAM sizing site
 (the OOM guard, host-mapped expert and offload placement, the PLE prewarm,
 hot-row and load-fill budgets, the JIT worker count) reads the same
-`MemAvailable - CmaFree` figure through `rdna_compute::uma_memory`
+`MemAvailable - CMA` figure through `rdna_compute::uma_memory`
 (`meminfo_available_bytes`, `mem_available_bytes`, `host_total_bytes` for
 `MemTotal`). An unreadable `MemAvailable` fails the query (callers refuse
 rather than size blind).
@@ -850,16 +857,17 @@ Compat env: `HIPFIRE_OOM_GUARD`. Used by `kv_slots::preflight_alloc`, the
 
 Two checks exist; only one is gated:
 
-- **Host available-memory headroom** (`MemAvailable` minus `CmaFree`) — gated
+- **Host available-memory headroom** (`MemAvailable` minus the CMA region) — gated
   by `memory.oom_guard`. Default
   `auto` turns it **on** for unified-memory APU arches (`gfx1035` / `gfx1036` /
   `gfx1103` / `gfx1150`–`gfx1152`: GPU allocations come from system RAM, so an
   overshoot is a desktop-killing OOM), **off** for discrete GPUs (overshoot is
   a failed `hipMalloc`), and for GPU-less processes by host swap state (no
   swap → on). Explicit `true`/`false` force either way; `auto` logs its
-  decision once. `CmaFree` is subtracted because free CMA pages serve only
-  movable allocations, not pinned GTT or kernel memory. In a unified-memory
-  process the room it checks is `MemAvailable - CmaFree` plus TTM's page-pool
+  decision once. The CMA region (larger of `CmaFree` and the CMA pageblocks,
+  `CmaTotal` or `/proc/zoneinfo` `cma`) is subtracted because only movable
+  allocations can use it, not pinned GTT or kernel memory. In a unified-memory
+  process the room it checks is `MemAvailable - CMA` plus TTM's page-pool
   estimate (freed GTT pages the next GTT allocation takes first; this
   addition is unchanged).
 - **R9700 deployment-target VRAM budget** (32 GiB class ceiling in
@@ -928,10 +936,10 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget (a ceiling, not a reservation) of the Qwen4 and Gemma 4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus, on Qwen4, live continuation of the previous turn; Gemma 4 resumes a follow-up turn from the previous prompt rounded down to the prefill width, byte-identical to a cold prefill; `0` = off, cold prefill every turn). Snapshots take free device memory only while the context does not need it: they are skipped or evicted before VMM context growth would run short. Free device memory keeps a headroom for that growth and the allocation in flight: on a unified-memory APU `clamp(MemTotal / 16, 2 GiB, 8 GiB)` (2 GiB on a 32 GiB host, 8 GiB from 128 GiB; was a fixed 1 GiB), on a discrete GPU 256 MiB; every allocation path, disk staging included, applies it. Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.session_cache_disk_bytes` | `0` | int 0–64 TiB; byte budget of the session cache's disk tier (one budget for the whole `memory.session_cache_dir`, every model and build). Snapshots evicted from memory, and every snapshot at model unload, are written there and restored on demand, surviving daemon restarts of the same build; LRU over leaves, other builds' files evicted first. `0` = off. Env: `HIPFIRE_SESSION_CACHE_DISK_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.session_cache_dir` | `""` | Directory of the session cache's disk tier; empty = `$HIPFIRE_HOME/session-cache`. One process uses it at a time (a second one runs without the disk tier). Env: `HIPFIRE_SESSION_CACHE_DIR`. |
-| `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus `CmaFree` minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus the CMA region minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, a load never derives it: a missing file is refused naming both searched locations (the model path as given, then its canonical symlink target), `hipfire pull <tag> --ple q4` and `hipfire ple derive --format q4 <model>` (derives it from the local Q8 rows, about 1 minute, progress on stderr). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
-| `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus `CmaFree`, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
 
 Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -1059,7 +1067,7 @@ With the q4 sidecar and no hot-row pack attached, the sidecar's data is
 read into the page cache after the model is ready, while no request runs
 (a rank-ordered table hottest tier first); `memory.ple_prewarm_bytes` (env
 `HIPFIRE_PLE_PREWARM_BYTES`) sets the budget: `auto` (default) = 15 GiB,
-capped at `MemAvailable` minus `CmaFree` minus 8 GiB at ready and at the
+capped at `MemAvailable` minus the CMA region minus 8 GiB at ready and at the
 sidecar's data bytes, `0` = off, an integer = that many bytes. A rank-ordered table's
 hottest prefix is already read during the load, throttled, by
 `memory.ple_load_fill_bytes` (env `HIPFIRE_PLE_LOAD_FILL_BYTES`, `auto` =
@@ -1461,9 +1469,9 @@ uses ambient variables in engine hot paths.
 | `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
 | `session_cache_bytes` | `memory.session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | 8589934592 (8 GiB; `0` off) |
-| `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − `CmaFree` − 4 GiB of the hot-row pack) |
+| `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − CMA region − 4 GiB of the hot-row pack) |
 | `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
-| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − `CmaFree` − 8 GiB; `0` off) |
+| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − CMA region − 8 GiB; `0` off) |
 | `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
 | `session_cache_disk_bytes` | `memory.session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | 0 (off) |
 | `session_cache_dir` | `memory.session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | `$HIPFIRE_HOME/session-cache` |

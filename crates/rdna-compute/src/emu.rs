@@ -267,7 +267,7 @@ impl Gpu {
     }
 
     /// Preflight a managed host allocation against the ledger (shared-host /
-    /// GTT room). Call ALONGSIDE the real host checks (`MemAvailable - CmaFree`,
+    /// GTT room). Call ALONGSIDE the real host checks (`MemAvailable - CMA`,
     /// TTM, GTT cap), never instead of them. Off: `Ok`. A refusal is a normal
     /// out-of-memory (`hipErrorOutOfMemory`). Zero bytes hold no capacity.
     pub fn emu_check_host_allocation(&self, bytes: u64, gtt_backed: bool) -> HipResult<()> {

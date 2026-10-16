@@ -42,10 +42,10 @@ pub fn parse_job_override(name: &str, value: Option<&str>) -> Result<Option<usiz
     }).transpose()
 }
 
-/// `MemAvailable - CmaFree` from `/proc/meminfo` text; the shared rule in
-/// [`crate::uma_memory::meminfo_available_bytes`].
-pub fn available_memory(text: &str) -> Option<u64> {
-    crate::uma_memory::meminfo_available_bytes(text)
+/// `MemAvailable - CMA` from `/proc/meminfo` (and `/proc/zoneinfo`) text; the
+/// shared rule in [`crate::uma_memory::meminfo_available_bytes`].
+pub fn available_memory(text: &str, zoneinfo: Option<&str>) -> Option<u64> {
+    crate::uma_memory::meminfo_available_bytes(text, zoneinfo)
 }
 
 fn memory_remaining(limit: &str, current: &str) -> Option<u64> {
@@ -172,9 +172,15 @@ mod tests {
         assert_eq!(memory_remaining("1024", "4096"), Some(0));
         assert_eq!(memory_remaining("invalid", "0"), None);
         assert_eq!(memory_remaining("4096", "invalid"), None);
-        assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n"), Some(2 * BYTES_PER_JOB));
-        assert_eq!(available_memory("MemFree: 100 kB\n"), None);
+        assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n", None), Some(2 * BYTES_PER_JOB));
+        assert_eq!(available_memory("MemFree: 100 kB\n", None), None);
         let cma = "MemAvailable: 3145728 kB\nCmaFree: 1048576 kB\n";
-        assert_eq!(available_memory(cma), Some(2 << 30));
+        assert_eq!(available_memory(cma, None), Some(2 << 30));
+        // CMA pageblocks outside any registered area (KHO scratch): zoneinfo
+        // `cma` pages (262144 x 4 KiB = 1 GiB) beat a smaller CmaFree.
+        let zoneinfo = "Node 0, zone   Normal\n        cma      262144\n      nr_free_cma  1\n";
+        assert_eq!(available_memory(cma, Some(zoneinfo)), Some(2 << 30));
+        let cma = "MemAvailable: 3145728 kB\nCmaFree: 4096 kB\n";
+        assert_eq!(available_memory(cma, Some(zoneinfo)), Some(2 << 30));
     }
 }

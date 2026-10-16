@@ -474,8 +474,8 @@ pub(crate) fn open_direct(path: &Path) -> io::Result<File> {
     }
 }
 
-/// `/proc/meminfo` `MemAvailable - CmaFree` in bytes (page cache counts as
-/// available, so a prewarmed pack does not lower it; free CMA pages do not
+/// `/proc/meminfo` `MemAvailable - CMA` in bytes (page cache counts as
+/// available, so a prewarmed pack does not lower it; CMA pageblocks do not
 /// serve pinned allocations).
 pub fn mem_available_bytes() -> Option<u64> {
     rdna_compute::uma_memory::mem_available_bytes()
@@ -1670,7 +1670,7 @@ impl HotRowStore {
         eprintln!(
             "{TAG}: prewarm complete: {:.2} GiB of {:.2} GiB (hottest first; {:.2} GiB of it read \
              during load) in {:.1} s, then tier 0 re-touched ({:.2} GiB, {:.1} s); {:.2} GB/s \
-             reading, {:.1} s paused for requests, MemAvailable - CmaFree {:.1} GiB",
+             reading, {:.1} s paused for requests, MemAvailable - CMA {:.1} GiB",
             gib(budget),
             gib(self.data_bytes),
             gib(skipped),

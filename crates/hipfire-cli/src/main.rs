@@ -6594,9 +6594,10 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// Host memory available for sweep sizing. Linux nets `CmaFree` out of
-/// `MemAvailable` (`rdna_compute::uma_memory`): the CMA pool is counted as
-/// available but is unusable for the unmovable allocations a model load makes.
+/// Host memory available for sweep sizing. Linux nets the CMA region out of
+/// `MemAvailable` (`rdna_compute::uma_memory`): CMA pageblocks (including KHO
+/// scratch) are counted as available but are unusable for the unmovable
+/// allocations a model load makes.
 /// Other platforms keep the raw host snapshot.
 #[cfg(target_os = "linux")]
 fn sweep_available_bytes() -> Option<u64> {
@@ -8812,6 +8813,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "config_overrides": config_overrides,
         "warnings": loaded_registry.warnings,
         "host_memory": hipfire_config::host_memory(),
+        "kho_scratch": kho_scratch_check(kho_scratch_probe()),
     });
     #[cfg(windows)]
     {
@@ -8886,6 +8888,11 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             loaded_config.format
         );
         println!("daemon:        {}", daemon.as_deref().unwrap_or("missing"));
+        println!(
+            "KHO scratch:   {} ({})",
+            report["kho_scratch"]["status"].as_str().unwrap_or("pass"),
+            report["kho_scratch"]["detail"].as_str().unwrap_or("")
+        );
         if let Some(live) = report.get("live_gpu").filter(|value| !value.is_null()) {
             println!(
                 "HIP GPU:       {} (HIP {})",
@@ -8931,6 +8938,40 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Live KHO scratch bytes (`rdna_compute::uma_memory`); `None` off Linux.
+#[cfg(target_os = "linux")]
+fn kho_scratch_probe() -> Option<u64> {
+    rdna_compute::uma_memory::kho_scratch_bytes()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kho_scratch_probe() -> Option<u64> {
+    None
+}
+
+/// `hipfire diag` host-memory check for Kexec HandOver scratch: `pass` when
+/// there is none (or it is under the warning threshold), `warn` (never a
+/// failure) with the shared warning text at 1 GiB or more. `scratch_bytes` is
+/// the CMA pageblock total outside any registered CMA area.
+fn kho_scratch_check(scratch_bytes: Option<u64>) -> serde_json::Value {
+    let bytes = scratch_bytes.unwrap_or(0);
+    let warning = rdna_compute::uma_memory::kho_scratch_warning(bytes);
+    let detail = match (&warning, bytes) {
+        (Some(text), _) => text.clone(),
+        (None, 0) => "none".to_owned(),
+        (None, bytes) => format!(
+            "{:.1} MiB of CMA pageblocks outside any CMA area (below the warning threshold)",
+            bytes as f64 / (1024.0 * 1024.0)
+        ),
+    };
+    serde_json::json!({
+        "name": "kho_scratch",
+        "status": if warning.is_some() { "warn" } else { "pass" },
+        "scratch_bytes": bytes,
+        "detail": detail,
+    })
 }
 
 /// Provenance of every figure in the diag DXGI section. These are budgets as
@@ -9894,6 +9935,23 @@ mod tests {
         );
         assert_eq!(listed[1]["amd"], false);
         assert_eq!(listed[1]["vendor_label"], "non-AMD");
+    }
+
+    #[test]
+    fn kho_scratch_check_passes_when_none_and_warns_from_one_gib() {
+        for none in [None, Some(0), Some(512 << 20)] {
+            let check = kho_scratch_check(none);
+            assert_eq!(check["name"], "kho_scratch");
+            assert_eq!(check["status"], "pass");
+        }
+        assert_eq!(kho_scratch_check(None)["scratch_bytes"], 0);
+        let warn = kho_scratch_check(Some(13_536 << 20));
+        assert_eq!(warn["status"], "warn");
+        assert_eq!(warn["scratch_bytes"], 13_536u64 << 20);
+        assert_eq!(
+            warn["detail"],
+            "KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it"
+        );
     }
 
     #[test]

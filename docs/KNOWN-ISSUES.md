@@ -123,3 +123,36 @@ the HIP 7.16 / ROCr 1.21 build above):
   and [`amd_loader_context.cpp` 243-266](https://github.com/ROCm/rocm-systems/blob/18f797bd457c75d8ffb3ea95212825b9f2939389/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/amd_loader_context.cpp#L243-L266):
   why the code check reads `hsa_amd_pointer_info` host aliases and not the
   loader's host shadow.
+
+## Strix Halo on Ubuntu 26.04-class kernels: ~13 GiB of KHO scratch unusable by the GPU
+
+**State:** understood; mitigated in hipfire (subtracted from host sizing, warned
+about), fixed only by a kernel boot parameter.
+
+**Symptom.** On a 128 GB Strix Halo running a kernel with Kexec HandOver (KHO)
+enabled by default (Ubuntu 26.04's 7.0 generic kernel:
+`CONFIG_KEXEC_HANDOVER=y` and `CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y`),
+`/proc/meminfo` shows `CmaTotal: 0 kB` yet a `CmaFree` of ~13 GiB right after
+boot, and `MemAvailable` reports that memory as available. KHO reserves
+"scratch" memory at boot and releases it to the allocator as `MIGRATE_CMA`
+pageblocks without counting it in `CmaTotal`. Only movable allocations can use
+those pages; pinned GTT, `hipHostMalloc` and kernel allocations cannot, and
+page cache that fills them still counts in `MemAvailable`. Sizing from
+`MemAvailable` therefore over-reports by the whole region (measured:
+13,536 MiB = 760 + 8,476 + 4,300 MiB of scratch, equal to the sum of the
+per-zone `cma` lines in `/proc/zoneinfo`).
+
+**What hipfire does.** Host sizing subtracts the whole CMA region, the larger
+of `CmaFree` and the CMA pageblocks (`CmaTotal` or the `/proc/zoneinfo` `cma`
+sum, which includes KHO scratch). A model load on a unified-memory GPU prints
+`KHO scratch reserves N GiB unusable by the GPU; boot with kho=off to reclaim
+it` once per process when the scratch is at least 1 GiB, and `hipfire diag`
+reports it as a `kho_scratch` warning.
+
+**Fix.** Boot with `kho=off` to return the memory to the system, or shrink the
+reservation with the `kho_scratch=` kernel parameter.
+
+**Not affected.** Fedora and openSUSE Tumbleweed kernels ship KHO with the
+default-enable option off. Hosts where KHO fails to reserve its low-memory
+scratch log `KHO: Failed to reserve ... disabling kexec handover` at boot and
+have no scratch.
