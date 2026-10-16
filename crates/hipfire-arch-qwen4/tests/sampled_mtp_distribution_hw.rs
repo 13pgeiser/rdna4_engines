@@ -484,6 +484,20 @@ impl Fixture {
     }
 }
 
+/// Per-window draft budget of `Loaded::mtp_request_with_budget`, before the
+/// remaining-token clamp.
+#[derive(Clone, Copy)]
+enum DraftBudget {
+    /// A fixed budget: every arm but the long-copy ones passes `MTP_K`.
+    Fixed(usize),
+    /// The drafter's proposal capacity read at every window, after the
+    /// request armed the n-gram source, as the product spec loop does
+    /// (`mtp_draft_k(proposal_capacity(), max_emit)`). Read before
+    /// `configure_request` it would be the previous request's (a fresh
+    /// drafter's first request would run at `max_k`).
+    ProposalCapacity,
+}
+
 /// One request's decode: IDs, window totals, final request stats and the
 /// per-window records of `Loaded::mtp_request`.
 struct MtpRun {
@@ -1131,19 +1145,20 @@ impl Loaded {
         cfg: SpecRequestConfig,
         tokens: usize,
     ) -> Result<MtpRun, String> {
-        self.mtp_request_with_budget(drafter, prompt, cfg, tokens, MTP_K)
+        self.mtp_request_with_budget(drafter, prompt, cfg, tokens, DraftBudget::Fixed(MTP_K))
     }
 
     /// [`mtp_request`](Self::mtp_request) with the per-window draft budget
     /// passed to `mtp_step` (before the remaining-token clamp) given: the
-    /// long-copy arms pass the n-gram take cap's width, every other arm `MTP_K`.
+    /// long-copy arms pass [`DraftBudget::ProposalCapacity`] (the n-gram take
+    /// cap's width once armed), every other arm `MTP_K`.
     fn mtp_request_with_budget(
         &mut self,
         drafter: &mut Qwen4MtpDrafter,
         prompt: &[u32],
         cfg: SpecRequestConfig,
         tokens: usize,
-        draft_budget: usize,
+        draft_budget: DraftBudget,
     ) -> Result<MtpRun, String> {
         let eos = self.bundle.config.eos_token_id;
         drafter.configure_request(cfg);
@@ -1161,7 +1176,11 @@ impl Loaded {
         let mut windows = Vec::new();
         while ids.len() < tokens && seed_token != eos {
             let position = self.bundle.state.position;
-            let k = draft_budget.min(tokens - ids.len());
+            let budget = match draft_budget {
+                DraftBudget::Fixed(budget) => budget,
+                DraftBudget::ProposalCapacity => MtpDrafter::proposal_capacity(drafter),
+            };
+            let k = budget.min(tokens - ids.len());
             let before = StatsSnap::of(&drafter.request_stats());
             let started = Counters::now();
             let window = drafter.mtp_step(
@@ -2904,8 +2923,13 @@ fn run_copy_long_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> 
         let mut firsts: Vec<(usize, u64, MtpRun)> = Vec::new();
         let run = |loaded: &mut Loaded, drafter: &mut Qwen4MtpDrafter, seed: u64| {
             let cfg = spec_request_ngram(temp, top_p, top_k, min_p, seed, &pen);
-            let draft_budget = MtpDrafter::proposal_capacity(drafter);
-            loaded.mtp_request_with_budget(drafter, &prompt, cfg, COPY_LONG_TOKENS, draft_budget)
+            loaded.mtp_request_with_budget(
+                drafter,
+                &prompt,
+                cfg,
+                COPY_LONG_TOKENS,
+                DraftBudget::ProposalCapacity,
+            )
         };
         for trial in start..end {
             let seed = trial_seed(salt, trial);
