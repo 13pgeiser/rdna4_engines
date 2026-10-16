@@ -4550,6 +4550,13 @@ pub const MQ_I4_MOE_GEMV_PM_GFX1201_SHA256: &str =
 /// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco`).
 pub const MQ_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
     "443f03cf0eed10bf1d6b34dd61ecb22c72fe00d5c72c4de3c9405374aeee9633";
+/// K1-C1 builder module of gfx1151 (`peacemaker-isa emit --kernel mq_i4_moe_gemv_c1 --arch
+/// gfx1151`): the one-lane (AR, `lanes == 1`) rows8 schedule of the K1 arithmetic, both codecs in
+/// one launch per projection, no union plan. Module `mq_i4_moe_gemv_c1_pm_gfx1151`, symbols
+/// `mq_i4_moe_gemv_c1_r256_gate_up` and `mq_i4_moe_gemv_c1_r128_down`, 80-byte bounded
+/// kernarg ABI (`n_experts@72`, zero `reserved@76`).
+pub const MQ_I4_MOE_GEMV_C1_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/mq_i4_moe_gemv_c1_pm_gfx1151.hxaco");
 /// Certified builder module of the MQ3-I4 NT1 entries on gfx1151
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1151`): module
 /// `qwen4_moe_iu4_sym_w3_pm_gfx1151`, the gfx1201 module's four symbols with `gfx1151` in

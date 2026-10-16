@@ -111,6 +111,86 @@ pub const MQ_I4_A4_GFX1100_SYMBOL: &str = "mq_i4_a4_r128_k640_gfx1100";
 
 /// Module key and symbol of the gfx1100 slab tile mask (module = symbol).
 pub const EP_TILE_MASK_GFX1100_MODULE: &str = "ep_tile_mask_pm_gfx1100";
+/// Module key of the embedded K1-C1 certified builder image (gfx1151 only).
+const MQ_I4_MOE_GEMV_C1_MODULE: &str = "mq_i4_moe_gemv_c1_pm_gfx1151";
+
+/// K1-C1 symbols: `[kind]`, 0 = gate/up (R256), 1 = down (R128). Each serves both codecs.
+pub const MQ_I4_MOE_GEMV_C1_SYMBOLS: [&str; 2] = ["mq_i4_moe_gemv_c1_r256_gate_up", "mq_i4_moe_gemv_c1_r128_down"];
+/// Bytes of the K1-C1 kernarg blob (frozen ABI: `n_experts@72`, zero `reserved@76`).
+pub const MQ_I4_MOE_GEMV_C1_KERNARG_BYTES: usize = 80;
+/// Explicit arguments supplied through HIP's kernelParams launch path for K1-C1:
+/// the 12 original arguments, `n_experts` and `reserved` (listed by the metadata as argument 14).
+const MQ_I4_MOE_GEMV_C1_KERNARG_COUNT: usize = 14;
+/// Output rows per K1-C1 workgroup (one wave32 each).
+pub const MQ_I4_MOE_GEMV_C1_ROWS_PER_WG: usize = 8;
+/// Threads per K1-C1 workgroup.
+pub const MQ_I4_MOE_GEMV_C1_BLOCK: u32 = 256;
+
+/// Whether the K1-C1 kernels (and K1-Cn), which carry only the MQ4 and W3 (`MQ3I4`)
+/// arithmetic, serve a layer whose cold bucket is codec `cold_codec`: `0` (an MQ4-only layer)
+/// or `1` (W3). Every other cold codec keeps the K1 bucket entries.
+pub const fn k1_rows8_cold_codec(cold_codec: u8) -> bool {
+    matches!(cold_codec, 0 | 1)
+}
+
+/// Launch geometry and kernarg scalars of one K1-C1 projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlabC1Launch {
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub m: u32,
+    pub k: u32,
+    pub x_row_div: u32,
+    pub y_slot_stride: u32,
+}
+
+/// The K1-C1 launch of the gate/up (`down == false`) or down projection: grid
+/// `[M / 8, 10, 1]`, block `[256, 1, 1]`.
+pub const fn slab_c1_launch(down: bool) -> SlabC1Launch {
+    let (m, k, x_row_div, y_slot_stride) = if down {
+        (SLAB_DOWN_M, SLAB_DOWN_K, 1, SLAB_DOWN_M)
+    } else {
+        (SLAB_GATE_UP_M, SLAB_GATE_UP_K, SLAB_TOP_K, SLAB_GATE_UP_M / 2)
+    };
+    SlabC1Launch {
+        grid: [(m / MQ_I4_MOE_GEMV_C1_ROWS_PER_WG) as u32, SLAB_TOP_K as u32, 1],
+        block: [MQ_I4_MOE_GEMV_C1_BLOCK, 1, 1],
+        m: m as u32,
+        k: k as u32,
+        x_row_div: x_row_div as u32,
+        y_slot_stride: y_slot_stride as u32,
+    }
+}
+
+/// The 80-byte K1-C1 kernarg blob in ABI order: six pointers (expert weight table, `topk`,
+/// codec table, X, Y0, Y1), then `M`, `K`, `uniform_codec`, `x_row_div`, `x_row_stride` (= `K`),
+/// `y_slot_stride`, `n_experts@72` (the extent of the weight pointer table) and a zero `reserved@76`.
+#[allow(clippy::too_many_arguments)]
+fn slab_c1_kernarg(
+    weight_ptrs: *mut c_void,
+    topk: *mut c_void,
+    codec_table: *mut c_void,
+    x: *mut c_void,
+    y0: *mut c_void,
+    y1: *mut c_void,
+    uniform_codec: i32,
+    n_experts: u32,
+    geo: &SlabC1Launch,
+) -> hip_bridge::KernargBlob {
+    let mut b = hip_bridge::KernargBlob::with_capacity(MQ_I4_MOE_GEMV_C1_KERNARG_BYTES);
+    for ptr in [weight_ptrs, topk, codec_table, x, y0, y1] {
+        b.push_ptr(ptr);
+    }
+    b.push_u32(geo.m);
+    b.push_u32(geo.k);
+    b.push_i32(uniform_codec);
+    b.push_u32(geo.x_row_div);
+    b.push_u32(geo.k);
+    b.push_u32(geo.y_slot_stride);
+    b.push_u32(n_experts);
+    b.push_u32(0);
+    b
+}
 const PLAN_SYMBOL: &str = "qwen4_slab_union_plan";
 /// Planner module keys: the shared one (gfx1201 and gfx1151: the historical key) and gfx1100's own.
 const PLAN_MODULE_SHARED: &str = "qwen4_slab_union_plan";
@@ -475,6 +555,11 @@ impl Gpu {
                 self.ensure_embedded_kernel(arch.mq4_k1.module, arch.mq4_k1.image, symbol)?;
             }
         }
+        if self.slab_k1_c1() && k1_rows8_cold_codec(cold_codec) {
+            for symbol in MQ_I4_MOE_GEMV_C1_SYMBOLS {
+                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_C1_MODULE, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, symbol)?;
+            }
+        }
         Ok(())
     }
 
@@ -780,6 +865,119 @@ impl Gpu {
             })?;
         }
         Ok(())
+    }
+
+    /// Whether the slab decode uses the K1-C1 kernels at `lanes == 1`: exact gfx1151 and
+    /// `HIPFIRE_QWEN4_SLAB_K1_C1` not `0` (default on). The environment is read once per process.
+    pub fn slab_k1_c1(&self) -> bool {
+        static ENABLED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SLAB_K1_C1", true));
+        self.arch == "gfx1151" && *ENABLED
+    }
+
+    /// K1-C1: one projection of the one-lane (`lanes == 1`, AR decode) slab decode in ONE launch
+    /// for both codecs, straight from `topk` (no union plan, no union scratch). Bitwise the K1
+    /// result of [`Gpu::mq_i4_moe_gemv_slab`] at `lanes == 1` over the plan of the same `topk`.
+    ///
+    /// Operand shapes are the `lanes == 1` shapes of [`Gpu::mq_i4_moe_gemv_slab`]: `topk` holds the
+    /// layer's `[10]` i32 routed ids, gate/up `xrot` `[2560]` F32 and `y0`/`y1` `[10, 640]` F32,
+    /// down `xrot` `[10, 640]` F32, `y0` `[10, 2560]` F32 unweighted, `y1` `None`.
+    /// [`SlabBuckets::Uniform`] names the one codec (0 = W3, 1 = MQ4: the K1 bucket index);
+    /// [`SlabBuckets::Table`] is the `[512]` u8 codec table. The layer's cold codec must be `0` or
+    /// `1` ([`k1_rows8_cold_codec`]); a W3 bucket needs `1`. gfx1151 only: any other device errors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mq_i4_moe_gemv_slab_c1(
+        &mut self,
+        down: bool,
+        buckets: SlabBuckets<'_>,
+        weight_ptrs: &GpuTensor,
+        topk: &GpuTensor,
+        xrot: &GpuTensor,
+        y0: &GpuTensor,
+        y1: Option<&GpuTensor>,
+        cold_codec: u8,
+    ) -> HipResult<()> {
+        if self.arch != "gfx1151" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("mq_i4_moe_gemv_slab_c1: the K1-C1 kernels are gfx1151-only, got {}", self.arch),
+            ));
+        }
+        if !k1_rows8_cold_codec(cold_codec) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("mq_i4_moe_gemv_slab_c1: K1-C1 serves MQ4/W3 layers only, got cold codec {cold_codec}"),
+            ));
+        }
+        let geo = slab_c1_launch(down);
+        let slots = SLAB_TOP_K;
+        if down == y1.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab_c1: gate/up needs the up output, down has none",
+            ));
+        }
+        let x_src_rows = if down { slots } else { 1 };
+        if weight_ptrs.buf.size() < SLAB_EXPERTS * 8
+            || topk.buf.size() < slots * 4
+            || xrot.buf.size() < x_src_rows * geo.k as usize * 4
+            || y0.buf.size() < slots * geo.y_slot_stride as usize * 4
+            || y1.is_some_and(|y| y.buf.size() < slots * geo.y_slot_stride as usize * 4)
+        {
+            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab_c1: operand smaller than the launch extent"));
+        }
+        let (codec_ptr, uniform) = match buckets {
+            // K1 bucket 0 = W3 = codec 1, bucket 1 = MQ4 = codec 0.
+            SlabBuckets::Uniform(0) if cold_codec == 0 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "mq_i4_moe_gemv_slab_c1: the cold bucket launches but cold_codec is 0 (no cold codec)",
+                ))
+            }
+            SlabBuckets::Uniform(bucket) if bucket < 2 => (std::ptr::null_mut::<c_void>(), 1 - bucket as i32),
+            SlabBuckets::Uniform(_) => {
+                return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab_c1: bucket must be 0 or 1"))
+            }
+            SlabBuckets::Table(table) => {
+                if table.buf.size() < SLAB_EXPERTS {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "mq_i4_moe_gemv_slab_c1: codec table holds fewer than 512 bytes",
+                    ));
+                }
+                (table.buf.as_ptr(), -1)
+            }
+        };
+        let nexp = SLAB_EXPERTS as u32;
+        self.bind_thread()?;
+        let func = MQ_I4_MOE_GEMV_C1_SYMBOLS[down as usize];
+        self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_C1_MODULE, kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, func)?;
+        let wp = weight_ptrs.buf.as_ptr();
+        let tp = topk.buf.as_ptr();
+        let xp = xrot.buf.as_ptr();
+        let y0p = y0.buf.as_ptr();
+        let y1p = y1.map_or(std::ptr::null_mut::<c_void>(), |y| y.buf.as_ptr());
+        let (mv, kv, dv, xs, ys) = (geo.m, geo.k, geo.x_row_div, geo.k, geo.y_slot_stride);
+        let reserved = 0u32;
+        let mut params: [*mut c_void; MQ_I4_MOE_GEMV_C1_KERNARG_COUNT] = [
+            &wp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &codec_ptr as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &y0p as *const _ as *mut c_void,
+            &y1p as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &uniform as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+            &xs as *const _ as *mut c_void,
+            &ys as *const _ as *mut c_void,
+            &nexp as *const _ as *mut c_void,
+            &reserved as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(func, geo.grid, geo.block, 0, &mut params, || {
+            slab_c1_kernarg(wp, tp, codec_ptr, xp, y0p, y1p, uniform, nexp, &geo)
+        })
     }
 
     /// Split the grouped tile ids `tile_ids` (`tiles` words) by codec with the
@@ -1612,5 +1810,83 @@ mod tests {
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
         println!("checked {checked} embedded K1 entries against kernelParams");
+    }
+
+    /// The embedded K1-C1 metadata matches the 80-byte ABI and the launcher's kernelParams count.
+    #[test]
+    fn c1_kernel_params_match_embedded_metadata() {
+        let (_, images) = Source::read(kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151, Arch::Gfx1151)
+            .expect("embedded K1-C1 metadata must parse");
+        let mut mismatches = Vec::new();
+        for symbol in MQ_I4_MOE_GEMV_C1_SYMBOLS {
+            let image = images
+                .iter()
+                .find(|image| image.name == symbol)
+                .unwrap_or_else(|| panic!("missing K1-C1 symbol {symbol}"));
+            let metadata = &image.metadata.parsed;
+            assert_eq!(
+                metadata.kernarg_segment_size as usize, MQ_I4_MOE_GEMV_C1_KERNARG_BYTES,
+                "{symbol}"
+            );
+            let find = |name: &str| {
+                metadata
+                    .args
+                    .iter()
+                    .find(|arg| arg.name == name)
+                    .map(|arg| (arg.offset, arg.size, arg.value_kind.as_str()))
+            };
+            assert_eq!(find("n_experts"), Some((72, 4, "by_value")), "{symbol}");
+            let last = metadata.args.last().expect("K1-C1 arguments");
+            assert_eq!(
+                (last.name.as_str(), last.offset, last.size, last.value_kind.as_str()),
+                ("reserved", 76, 4, "by_value"),
+                "{symbol}"
+            );
+            let explicit = metadata
+                .args
+                .iter()
+                .filter(|arg| !arg.value_kind.starts_with("hidden_"))
+                .count();
+            if explicit != MQ_I4_MOE_GEMV_C1_KERNARG_COUNT {
+                mismatches.push(format!(
+                    "{symbol}: kernelParams={MQ_I4_MOE_GEMV_C1_KERNARG_COUNT}, declared={explicit}"
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// K1-C1 / K1-Cn serve MQ4-only and W3 layers only; E8P, W2 and unknown cold codecs keep K1.
+    #[test]
+    fn rows8_kernels_serve_mq4_only_and_w3_layers() {
+        assert!(k1_rows8_cold_codec(0) && k1_rows8_cold_codec(1));
+        assert!(!k1_rows8_cold_codec(2) && !k1_rows8_cold_codec(3) && !k1_rows8_cold_codec(4));
+    }
+
+    /// The K1-C1 kernarg is the frozen 80-byte ABI: six pointers, then `M`, `K`,
+    /// `uniform_codec`, `x_row_div`, `x_row_stride`, `y_slot_stride`, `n_experts`, zero `reserved`.
+    #[test]
+    fn c1_kernarg_is_the_frozen_80_byte_abi() {
+        for (down, n_experts) in [(false, 512u32), (true, 1234)] {
+            let geo = slab_c1_launch(down);
+            let ptr = |n: usize| (0x1000 * n) as *mut c_void;
+            let blob = slab_c1_kernarg(ptr(1), ptr(2), ptr(3), ptr(4), ptr(5), ptr(6), -1, n_experts, &geo);
+            let bytes = blob.as_bytes();
+            assert_eq!(bytes.len(), MQ_I4_MOE_GEMV_C1_KERNARG_BYTES);
+            for n in 1..=6usize {
+                let off = 8 * (n - 1);
+                assert_eq!(u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()), (0x1000 * n) as u64);
+            }
+            let word = |off: usize| u32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap());
+            assert_eq!(word(48), geo.m);
+            assert_eq!(word(52), geo.k);
+            assert_eq!(word(56), u32::MAX, "uniform_codec -1 = table");
+            assert_eq!(word(60), geo.x_row_div);
+            assert_eq!(word(64), geo.k, "x_row_stride = K");
+            assert_eq!(word(68), geo.y_slot_stride);
+            assert_eq!(word(72), n_experts, "n_experts@72");
+            assert_eq!(word(76), 0, "reserved@76");
+            assert_eq!(geo.m as usize % MQ_I4_MOE_GEMV_C1_ROWS_PER_WG, 0);
+        }
     }
 }

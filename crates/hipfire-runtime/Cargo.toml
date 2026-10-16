@@ -233,6 +233,11 @@ required-features = ["lab"]
 name = "gfx1100_intrinsic_keys_observe"
 required-features = ["lab"]
 
+# K1-C1 (gfx1151 one-lane slab decode GEMV) GPU byte-exactness + timing oracle against the incumbent
+# K1 route (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_c1_oracle"
+required-features = ["lab"]
 [[example]]
 name = "coherence_probe"
 required-features = []

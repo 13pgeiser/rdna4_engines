@@ -136,6 +136,11 @@ const PM_GFX1151: &[Pm] = &[
         &["spec_accept_ordered_u32_pm_gfx1151"],
     ),
     ("mq_i4_moe_gemv_pm_gfx1151", kernels::MQ_I4_MOE_GEMV_PM_GFX1151, MQ_I4_MOE_SYMBOLS),
+    (
+        "mq_i4_moe_gemv_c1_pm_gfx1151",
+        kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
+        &rdna_compute::slab_moe::MQ_I4_MOE_GEMV_C1_SYMBOLS,
+    ),
 ];
 
 const PM_GFX1201: &[Pm] = &[

@@ -27,7 +27,9 @@
 use super::layer_ops::hip;
 use crate::families::moe::MoeDtypes;
 use crate::types::DispatchError;
-use rdna_compute::slab_moe::{SlabBuckets, SLAB_EXPERTS, SLAB_NARROW_MAX_LANES, SLAB_TOP_K};
+use rdna_compute::slab_moe::{
+    k1_rows8_cold_codec, SlabBuckets, SLAB_EXPERTS, SLAB_NARROW_MAX_LANES, SLAB_TOP_K,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Lanes of one unchanged narrow K1 launch; wider admitted calls either select
@@ -155,6 +157,10 @@ fn topk_group(topk: &GpuTensor, first: usize, n: usize) -> GpuTensor {
 /// Otherwise consecutive <=8-lane groups retain S1's exact fallback, with a
 /// separate union plan immediately before each launch. The scratch then holds
 /// only the last group's plan on return (see [`k1_down`]).
+///
+/// One lane of an MQ4 or W3 layer on gfx1151 (unless `HIPFIRE_QWEN4_SLAB_K1_C1=0`) takes K1-C1
+/// instead: one launch for both codecs straight from `topk`, no union plan (bitwise the K1 result).
+/// E8P layers keep the K1 bucket entries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_gate_up(
     gpu: &mut Gpu,
@@ -167,6 +173,18 @@ pub(crate) fn k1_gate_up(
     lanes: usize,
 ) -> Result<(), DispatchError> {
     k1_check_lanes(gpu, "k1_gate_up", lanes)?;
+    if lanes == 1 && gpu.slab_k1_c1() && k1_rows8_cold_codec(layer.cold_codec) {
+        return hip(gpu.mq_i4_moe_gemv_slab_c1(
+            false,
+            layer.buckets,
+            gate_up_ptrs,
+            topk,
+            xr,
+            gate_out,
+            Some(up_out),
+            layer.cold_codec,
+        ));
+    }
     if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
         hip(gpu.qwen4_slab_union_plan(topk, layer.buckets, lanes))?;
         return hip(gpu.mq_i4_moe_gemv_slab(
@@ -206,7 +224,8 @@ pub(crate) fn k1_gate_up(
 /// K1 down of `lanes` lanes (up to the shared per-architecture exact cap): `xrot`
 /// `[lanes * 10, 640]` F32, `y0` `[lanes * 10, 2560]` F32 unweighted.
 ///
-/// Narrow and opted-in C16/C32 calls use the union gate/up planned.
+/// Narrow and opted-in C16/C32 calls use the union gate/up planned (K1-C1 at one lane reads
+/// `topk` instead and needs no union).
 /// Otherwise a wider call runs 8-lane groups like [`k1_gate_up`]; the union
 /// scratch holds only the last gate/up group's plan (the SwiGLU stage sits
 /// between the two calls), so each group re-plans its own `topk` ids
@@ -223,6 +242,9 @@ pub(crate) fn k1_down(
     lanes: usize,
 ) -> Result<(), DispatchError> {
     k1_check_lanes(gpu, "k1_down", lanes)?;
+    if lanes == 1 && gpu.slab_k1_c1() && k1_rows8_cold_codec(layer.cold_codec) {
+        return hip(gpu.mq_i4_moe_gemv_slab_c1(true, layer.buckets, down_ptrs, topk, xrot, y0, None, layer.cold_codec));
+    }
     if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes, layer.cold_codec) {
         return hip(gpu.mq_i4_moe_gemv_slab(
             true,
@@ -315,6 +337,33 @@ mod tests {
         // Codec bytes of the per-layer table: 1 = W3 -> bucket 0, 0 = MQ4 -> bucket 1.
         assert_eq!(gpu::slab_bucket_of_codec(1), Codec::Mq3I4.order_index());
         assert_eq!(gpu::slab_bucket_of_codec(0), Codec::Mq4Sym.order_index());
+    }
+
+    /// The K1-C1 launcher's constants: its two symbols, grid `[M / 8, 10, 1]`, block
+    /// `[256, 1, 1]`, the 80-byte bounded kernarg (`n_experts@72`, zero `reserved@76`),
+    /// and the shapes it shares with K1.
+    #[test]
+    fn c1_launcher_contract() {
+        assert_eq!(
+            gpu::MQ_I4_MOE_GEMV_C1_SYMBOLS,
+            ["mq_i4_moe_gemv_c1_r256_gate_up", "mq_i4_moe_gemv_c1_r128_down"]
+        );
+        assert_eq!(gpu::MQ_I4_MOE_GEMV_C1_KERNARG_BYTES, 80);
+        assert_eq!((gpu::MQ_I4_MOE_GEMV_C1_ROWS_PER_WG, gpu::MQ_I4_MOE_GEMV_C1_BLOCK), (8, 256));
+        let gate = gpu::slab_c1_launch(false);
+        assert_eq!(gate.grid, [1280 / 8, 10, 1]);
+        assert_eq!(gate.block, [256, 1, 1]);
+        assert_eq!(
+            (gate.m as usize, gate.k as usize, gate.x_row_div as usize, gate.y_slot_stride as usize),
+            (k1::GATE_UP_M, k1::GATE_UP_K, k1::TOP_K, k1::GATE_UP_M / 2)
+        );
+        let down = gpu::slab_c1_launch(true);
+        assert_eq!(down.grid, [2560 / 8, 10, 1]);
+        assert_eq!(down.block, [256, 1, 1]);
+        assert_eq!(
+            (down.m as usize, down.k as usize, down.x_row_div as usize, down.y_slot_stride as usize),
+            (k1::DOWN_M, k1::DOWN_K, 1, k1::DOWN_M)
+        );
     }
 
     /// The planner's fixed-capacity layout is `6 S + 2` words per call.

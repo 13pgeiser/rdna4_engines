@@ -298,6 +298,24 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
             assert_eq!(st.v[0][0],0x8180_1234,"{arch:?}");
         }
     }
+    // K1-C1's SADDR global loads: `global_load_b128` / `_b64` read 4 / 2 dwords at `saddr + voffset` (+ imm offset) per lane.
+    #[test] fn global_saddr_loads_b64_and_b128_fill_their_registers() {
+        let bytes:Vec<u8>=(0..32).map(|n|0x40+n).collect();
+        for arch in [Arch::Gfx1100,Arch::Gfx1201] {
+            let mut st=state();st.s[8]=0x1000;st.s[9]=0;st.v[2][0]=4;
+            let mut mem=Memory::default();mem.map("m".into(),0x1000,bytes.clone()).unwrap();
+            let run=|st:&mut State,mem:&mut Memory,name:&str,dst:Operand,imm:u16|{
+                let mut ops=vec![dst,reg(Kind::V,2,1),reg(Kind::S,8,2)];if imm!=0 {ops.push(Operand::Imm(ImmField::VmemOffset(imm.into())));}
+                execute(name,&insn_on(arch,name,ops),st,mem,&mut [])};
+            run(&mut st,&mut mem,"global_load_b128",reg(Kind::V,4,4),0).unwrap();
+            assert_eq!([st.v[4][0],st.v[5][0],st.v[6][0],st.v[7][0]],[0x4746_4544,0x4b4a_4948,0x4f4e_4d4c,0x5352_5150],"{arch:?}");
+            run(&mut st,&mut mem,"global_load_b64",reg(Kind::V,8,2),8).unwrap();
+            assert_eq!([st.v[8][0],st.v[9][0],st.v[10][0]],[0x4f4e_4d4c,0x5352_5150,0],"{arch:?}");
+            // An unmapped read is a hard error, not a silent zero.
+            st.v[2][0]=0x1000;
+            assert!(run(&mut st,&mut mem,"global_load_b128",reg(Kind::V,4,4),0).is_err(),"{arch:?}");
+        }
+    }
     // Stores: b8/b16 write exactly their size, d16_hi stores bits [31:16], b96/b128 write whole dwords.
     #[test] fn flat_stores_write_exact_sizes_and_the_high_half() {
         for arch in [Arch::Gfx1100,Arch::Gfx1201] {

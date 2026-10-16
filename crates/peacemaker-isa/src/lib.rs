@@ -77,6 +77,7 @@ pub mod kernels {
     pub mod qwen4_shared_gu_gfx11;
     pub mod spec_accept_pm;
     pub mod spec_sampling_rows_pm;
+    pub mod mq_i4_moe_gemv_c1;
     /// gfx942 (CDNA3) kernels built with `crate::cdna::builder`.
     pub mod cdna {
         pub mod fp8_act_producer;

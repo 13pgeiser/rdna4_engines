@@ -4641,8 +4641,8 @@ fn decode_down_stage(
         let rot_batch = slice_moe_f32_view(p.rot_batch, 0, routed_slots);
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         if route.is_some_and(MoeRouteCapability::is_slab) {
-            // Over the union this call's gate/up planned (same stream, no
-            // other slab launch between the two stages).
+            // One lane of an MQ4/W3 layer runs K1-C1 straight from `topk`; otherwise over the union
+            // this call's gate/up planned (same stream, no other slab launch between the two).
             let layer = slab_route::layer(
                 &gpu.arch,
                 p.route_policy.as_ref(),
