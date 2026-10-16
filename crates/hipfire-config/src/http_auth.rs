@@ -72,6 +72,13 @@ pub fn validate_bearer_token(token: &str) -> std::result::Result<(), BearerToken
     Ok(())
 }
 
+/// Names a character that cannot appear in a header credential, by kind or code
+/// point ("a space", "a non-ASCII character (U+00E9)"). Never the character
+/// itself for printable text. `ch` must not be `=`.
+pub(crate) fn describe_char(ch: char) -> String {
+    describe_invalid(ch, false).0
+}
+
 fn describe_invalid(ch: char, after_padding: bool) -> (String, &'static str) {
     const WHITESPACE: &str =
         "remove stray spaces and line breaks, such as one copied along with the token";

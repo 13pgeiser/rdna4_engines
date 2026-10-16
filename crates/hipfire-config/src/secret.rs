@@ -34,8 +34,8 @@ impl BearerToken {
     ///
     /// The file must be UTF-8. Trailing whitespace (the usual final newline) is
     /// trimmed; the remainder must be at least [`MIN_BEARER_TOKEN_BYTES`] bytes
-    /// and contain no whitespace or control characters, so it is always a valid
-    /// single-line header value.
+    /// and contain only printable ASCII characters (no whitespace, control or
+    /// non-ASCII characters), so it is always a valid single-line header value.
     ///
     /// On Unix the file must be a regular file that grants nothing to group or
     /// other (`mode & 0o077 == 0`); the mode is checked on the same opened
@@ -74,7 +74,8 @@ impl BearerToken {
     /// Builds a token from an in-memory value, for callers that receive it
     /// other than from a key file (a remote session, a command-line prompt, a
     /// test). It applies the same rules as [`BearerToken::load`] — at least
-    /// [`MIN_BEARER_TOKEN_BYTES`] bytes, no whitespace or control characters —
+    /// [`MIN_BEARER_TOKEN_BYTES`] bytes, printable ASCII only (no whitespace,
+    /// control or non-ASCII characters) —
     /// but never trims: a value with surrounding whitespace is rejected, not
     /// silently altered. Errors never echo the value.
     pub fn new(value: impl Into<String>) -> Result<Self> {
@@ -90,7 +91,10 @@ impl BearerToken {
 
     fn from_bytes(path: &Path, bytes: Vec<u8>) -> Result<Self> {
         let Ok(mut text) = String::from_utf8(bytes) else {
-            return Err(invalid(format!("{} is not valid UTF-8", path.display())));
+            return Err(invalid(format!(
+                "{} is not valid UTF-8; a bearer token must be printable ASCII",
+                path.display()
+            )));
         };
         let len = text.trim_end().len();
         text.truncate(len);
@@ -145,21 +149,31 @@ fn invalid(message: String) -> ConfigError {
 }
 
 /// Why `token` is unacceptable, phrased to follow "the token" / "a token that";
-/// `None` when it is a valid single-line value of at least
-/// [`MIN_BEARER_TOKEN_BYTES`] bytes. Never includes the token.
+/// `None` when it is a valid single-line printable-ASCII value of at least
+/// [`MIN_BEARER_TOKEN_BYTES`] bytes (ASCII, so bytes equal characters). Never
+/// includes the token: an offending character is named by kind or code point.
 fn problem(token: &str) -> Option<String> {
     if token.is_empty() {
-        Some("is empty".to_owned())
-    } else if token.len() < MIN_BEARER_TOKEN_BYTES {
-        Some(format!(
+        return Some("is empty".to_owned());
+    }
+    if let Some((index, ch)) = token
+        .chars()
+        .enumerate()
+        .find(|(_, c)| !c.is_ascii() || c.is_whitespace() || c.is_control())
+    {
+        return Some(format!(
+            "contains {} at character {}; it must be a single line of printable ASCII \
+             characters because it is sent as an HTTP header value",
+            crate::http_auth::describe_char(ch),
+            index + 1
+        ));
+    }
+    (token.len() < MIN_BEARER_TOKEN_BYTES).then(|| {
+        format!(
             "is {} bytes; at least {MIN_BEARER_TOKEN_BYTES} are required",
             token.len()
-        ))
-    } else if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        Some("contains whitespace or control characters; it must be a single line".to_owned())
-    } else {
-        None
-    }
+        )
+    })
 }
 
 #[cfg(unix)]
@@ -242,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_exactly_the_minimum_length_and_utf8() {
+    fn accepts_exactly_the_minimum_length() {
         let min = "a".repeat(MIN_BEARER_TOKEN_BYTES);
         let dir = Dir::new();
         assert_eq!(
@@ -251,13 +265,14 @@ mod tests {
                 .as_str(),
             min
         );
-        // 16 two-byte characters = 32 bytes: length is counted in bytes.
-        let utf8 = "é".repeat(16);
+        // Printable ASCII punctuation is fine; only whitespace, control and
+        // non-ASCII characters are refused.
+        let punct = "!#$%&'()*+,-./:;<=>?@[]^_`{|}~0123456789".to_owned();
         assert_eq!(
-            BearerToken::load(&dir.file(utf8.as_bytes()))
+            BearerToken::load(&dir.file(punct.as_bytes()))
                 .unwrap()
                 .as_str(),
-            utf8
+            punct
         );
     }
 
@@ -291,15 +306,48 @@ mod tests {
 
     #[test]
     fn rejects_interior_whitespace_and_control_characters() {
-        for body in [
-            format!("{TOKEN}\n{TOKEN}"),
-            format!("{TOKEN} {TOKEN}"),
-            format!("{TOKEN}\0{TOKEN}"),
-            format!("\n{TOKEN}"),
+        for (body, expect) in [
+            (format!("{TOKEN}\n{TOKEN}"), "a newline at character 37"),
+            (format!("{TOKEN} {TOKEN}"), "a space at character 37"),
+            (format!("{TOKEN}\0{TOKEN}"), "a control character (U+0000)"),
+            (format!("\n{TOKEN}"), "a newline at character 1"),
         ] {
             let message = load_err(body.as_bytes());
-            assert!(message.contains("whitespace or control"), "{message}");
+            assert!(message.contains(expect), "{message}");
+            assert!(message.contains("serve.api_key_file"), "{message}");
+            assert!(
+                message.contains("single line of printable ASCII"),
+                "{message}"
+            );
             assert!(!message.contains(TOKEN), "{message}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_ascii_naming_the_file_without_echoing_it() {
+        let dir = Dir::new();
+        for (body, expect) in [
+            // 16 two-byte characters = 32 bytes: long enough, still refused.
+            (
+                "\u{e9}".repeat(16),
+                "a non-ASCII character (U+00E9) at character 1",
+            ),
+            (
+                format!("{TOKEN}\u{1F511}"),
+                "a non-ASCII character (U+1F511) at character 37",
+            ),
+            (
+                format!("{}\u{e9}{}", &TOKEN[..10], &TOKEN[10..]),
+                "at character 11",
+            ),
+        ] {
+            let path = dir.file(body.as_bytes());
+            let message = BearerToken::load(&path).unwrap_err().to_string();
+            assert!(message.contains(expect), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(message.contains("serve.api_key_file"), "{message}");
+            assert!(!message.contains(TOKEN), "{message}");
+            assert!(!message.contains('\u{e9}'), "{message}");
         }
     }
 
@@ -347,17 +395,29 @@ mod tests {
         for (value, expect) in [
             (String::new(), "is empty"),
             (short.to_owned(), "31 bytes"),
-            (format!("{TOKEN}\n"), "whitespace or control"),
-            (format!(" {TOKEN}"), "whitespace or control"),
-            (format!("{TOKEN} {TOKEN}"), "whitespace or control"),
-            (format!("{TOKEN}\0"), "whitespace or control"),
+            (format!("{TOKEN}\n"), "a newline at character 37"),
+            (format!(" {TOKEN}"), "a space at character 1"),
+            (format!("{TOKEN} {TOKEN}"), "a space at character 37"),
+            (
+                format!("{TOKEN}\0"),
+                "a control character (U+0000) at character 37",
+            ),
+            (
+                format!("{TOKEN}\u{e9}"),
+                "a non-ASCII character (U+00E9) at character 37",
+            ),
+            (
+                "\u{e9}".repeat(16),
+                "a non-ASCII character (U+00E9) at character 1",
+            ),
         ] {
             let message = BearerToken::new(value).unwrap_err().to_string();
             assert!(message.contains(expect), "{message}");
             assert!(!message.contains(TOKEN), "{message}");
             assert!(!message.contains(short), "{message}");
         }
-        assert!(BearerToken::new("é".repeat(16)).is_ok());
+        // The in-memory rule is the file rule: non-ASCII is refused whatever the length.
+        assert!(BearerToken::new("\u{e9}".repeat(32)).is_err());
     }
 
     #[test]

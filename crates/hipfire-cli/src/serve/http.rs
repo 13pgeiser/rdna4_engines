@@ -2509,8 +2509,8 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn bearer_headers_require_one_matching_utf8_credential() {
-        let text = "é".repeat(32);
+    fn bearer_headers_require_one_matching_ascii_credential() {
+        let text = "k3y!".repeat(8);
         let key = BearerToken::new(text.clone()).unwrap();
         let mut headers = hyper::HeaderMap::new();
         assert!(!bearer_authorized(&headers, &key));

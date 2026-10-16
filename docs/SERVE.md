@@ -32,7 +32,10 @@ the path is stored in configuration. Local CLI/TUI clients read the configured
 file automatically. Native Windows does not generate a key for you: create the
 file yourself.
 
-The UTF-8 file must contain at least 32 bytes after trimming trailing whitespace.
+The file must contain at least 32 bytes of printable ASCII after trimming trailing
+whitespace; a space, line break, control character or non-ASCII character inside the
+key is refused at startup with an error naming the file and the character position
+(the key is sent as an HTTP header value).
 On Unix, group/other permissions are refused: use `chmod 600`. Windows ACLs are
 not checked yet; restrict access to the account running serve yourself.
 For example, create a private random token and persist its **path**, not its contents:
@@ -147,7 +150,7 @@ environment variable.
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
 | `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
-| `--api-key-file <absolute-path>` | Protected UTF-8 bearer file; overrides `serve.api_key_file` for this process |
+| `--api-key-file <absolute-path>` | Protected printable-ASCII bearer file; overrides `serve.api_key_file` for this process |
 | `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
 | `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |
