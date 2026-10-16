@@ -1590,7 +1590,8 @@ pub struct FinishSummary {
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
     /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
-    /// a reasoning-only `stop` with no tool calls and no cache store.
+    /// a reasoning-only `stop` with no tool calls. Qwen may cache a completed
+    /// whole-body turn; length, truncation and fail-closed exits stay unstored.
     pub open_think: bool,
 }
 

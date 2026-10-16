@@ -12,6 +12,7 @@ Per-architecture generation bodies lifted out of `crates/hipfire-daemon/src/main
 - Modules are family-partitioned so each has one owning agent — families depend on `common` and never on each other.
 - `src/lib.rs` and `Cargo.toml` are scaffold-owned and belong to no agent; do not claim them for a family change.
 - Qwen4 prompt reuse in `qwen.rs` goes only through the session cache: `generate_dflash` (native MTP) and `generate_qwen4_ar` ask the bundle's `session_plan` for the start (longest of the live state and a cold-exact snapshot) and call `session_commit_live` with the consumed history at a committed terminal. `HIPFIRE_QWEN_PROMPT_CACHE` gates only the non-Qwen4 conversation plans there; `ar.rs` and the Qwen3.5 path are unchanged.
+- Qwen assistant-turn splicing keys normalized content and tool calls together with the producer's router-emitted reasoning text. Echoed nonempty `reasoning_content` selects an exact turn; missing/empty reasoning uses the content/tool index only when exactly one cached turn matches. Safe completed open-think terminals store the same whole-body content slot and text-only reasoning marker as closed thinking turns, so history does not synthesize a close inside their generated tokens. Length, truncated and fail-closed turns remain unstored.
 
 ## Crate map
 

@@ -2482,7 +2482,7 @@ pub fn plan_prompt_cache(
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
             asst_turn_cache
-                .get(&fp)
+                .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
                 .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
@@ -2589,7 +2589,10 @@ pub fn plan_from_rendered(
 }
 
 /// Qwen jinja cache-lookup turn synthesis: fingerprint the message's normalized
-/// content (+ tool identity) and forward the stored producer reasoning so rich
+/// content (+ tool identity), select the cached turn by the echoed
+/// `reasoning_content` (exact when nonempty; with none, only a unique turn for
+/// the fingerprint hits — think-only turns share an empty-content fingerprint),
+/// and forward the stored producer reasoning so rich
 /// `reasoning_content` history satisfies the splice text check. Primer rule: a
 /// whole-envelope turn (reasoning present) replays verbatim — the template
 /// re-emits every marker around its slots, so prepending would duplicate the
@@ -2607,7 +2610,7 @@ pub fn qwen_jinja_lookup_turn(
 ) -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-    cache.get(&fp).and_then(|turn| {
+    cache.get_for_reasoning(&fp, msg.reasoning_content.as_deref()).and_then(|turn| {
         turn.content.as_ref().map(|c| {
             let mut v = if turn.reasoning.is_some() {
                 Vec::new()
@@ -7054,15 +7057,22 @@ pub fn qwen_dflash_wire_terminal(
         };
     }
     // The model ended the turn inside `<think>`: the reasoning already
-    // streamed and the turn stops with no answer. No calls and no cache — the
-    // KV holds an unclosed think span that no rendered history reproduces.
-    // Same as AR's `QwenArTerminalCause::OpenThink`.
+    // streamed and the turn stops with no answer and no calls on the wire.
+    // The completed stop IS cacheable: the whole generated body is stored
+    // verbatim in the content slot beside the router's reasoning text (the
+    // shared `qwen_cached_turn_entry` contract), so history replays the
+    // unclosed span as one body and never synthesizes a `</think>` inside it.
+    // Visible prose before the span (if any) is the fingerprint text. A
+    // completed call in the body is not described by that call-less
+    // fingerprint, so such a turn stays uncached (as in
+    // `qwen_ar_finish_route`). Same as AR's `QwenArTerminalCause::OpenThink`.
     if finish.open_think {
+        let call_in_body = !finish_summary_held_tool_calls(finish).is_empty() || finish.tool_calls > 0;
         return QwenDflashWireTerminal::Done {
             finish_reason: "stop",
             release_tool_calls: false,
-            store_cache: false,
-            fingerprint_text: String::new(),
+            store_cache: !call_in_body,
+            fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
             wire_tool_calls: Vec::new(),
         };
     }
@@ -7128,14 +7138,28 @@ where
 /// body verbatim plus, when the turn thought, the producer reasoning text.
 /// The jinja lookup ([`qwen_jinja_lookup_turn`]) replays it identically for
 /// either producer, so both routes splice byte-identical history.
+///
+/// The reasoning text is the router's SSE `reasoning` channel, which the client
+/// echoes as `reasoning_content`; the EOS filter hides end-of-turn markers from
+/// that channel. A body that kept a trailing terminator (`<|endoftext|>`, or an
+/// `<|im_end|>` the trailer trim did not remove) must therefore not leak its
+/// marker text into the reasoning identity. The stored body stays verbatim.
 pub fn qwen_cached_turn_entry(
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     seq: Vec<u32>,
     started_in_think: bool,
 ) -> hipfire_runtime::prompt_frame::CachedAssistantTurn {
+    let terminators = [
+        tokenizer.special_token_id("<|im_end|>"),
+        tokenizer.special_token_id("<|endoftext|>"),
+    ];
+    let mut producer_end = seq.len();
+    while producer_end > 0 && terminators.contains(&Some(seq[producer_end - 1])) {
+        producer_end -= 1;
+    }
     let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
         tokenizer,
-        &seq,
+        &seq[..producer_end],
         started_in_think,
     )
     .map(|text| hipfire_runtime::prompt_frame::CachedAssistantBody {
@@ -8352,6 +8376,7 @@ mod qwen_history_chain_tests {
             r#""<|reserved_0|>": 4"#.to_string(),
             r#""<|reserved_1|>": 5"#.to_string(),
             r#""<|reserved_2|>": 6"#.to_string(),
+            r#""<|endoftext|>": 7"#.to_string(),
             r#""he": 50"#.to_string(),
         ];
         for b in 0u32..=255 {
@@ -8368,7 +8393,8 @@ mod qwen_history_chain_tests {
                     {{"id": 3, "content": "</think>", "special": true}},
                     {{"id": 4, "content": "<|reserved_0|>", "special": true}},
                     {{"id": 5, "content": "<|reserved_1|>", "special": true}},
-                    {{"id": 6, "content": "<|reserved_2|>", "special": true}}
+                    {{"id": 6, "content": "<|reserved_2|>", "special": true}},
+                    {{"id": 7, "content": "<|endoftext|>", "special": true}}
                 ]}}"#,
             entries.join(", ")
         );
@@ -8754,6 +8780,342 @@ mod qwen_history_chain_tests {
                 "edited {label}: the stale emitted body must not be replayed"
             );
         }
+    }
+
+    // ── Reasoning-keyed history: think-only / empty-content turns ─────────
+    //
+    // Several turns of one chat can share a content/tool fingerprint (every
+    // think-only turn has empty content). The cache therefore keys each turn
+    // by (fingerprint, producer reasoning); a client that echoes
+    // `reasoning_content` selects its own turn exactly, and one that does not
+    // hits only when exactly one cached turn matches.
+
+    /// Qwen3.8-shaped history template: every assistant turn replays
+    /// `<think>\n{reasoning|trim}\n</think>\n\n{content}`, and the generation
+    /// prompt opens `<think>` (every turn generates after a primed `<think>\n`).
+    const THINK_HISTORY: &str = "{% for m in messages %}{% if m.role == 'assistant' %}{% set rc = '' %}{% if m.reasoning_content is string %}{% set rc = m.reasoning_content %}{% endif %}{% set rc = rc|trim %}<|im_start|>assistant\n<think>\n{{ rc }}\n</think>\n\n{{ m.content }}<|im_end|>\n{% else %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+
+    const EOS: u32 = 7;
+
+    /// One scripted model turn: the text generated after the primed
+    /// `<think>\n` (emitted byte by byte, so `he` stays unmerged and a
+    /// re-encode is observably different), the token that ends it, and what the
+    /// router must show the client.
+    struct Gen {
+        body: &'static str,
+        end: u32,
+        open_think: bool,
+        reasoning: &'static str,
+        content: &'static str,
+    }
+
+    /// Closed-think empty-content turns (0, 1, 4), an open-think turn ended by
+    /// `<|im_end|>` (2) and by `<|endoftext|>` (5), and normal think + answer
+    /// turns (3, 6).
+    const SCRIPT: [Gen; 7] = [
+        Gen { body: "plan he one\n</think>\n\n", end: IM_END, open_think: false, reasoning: "plan he one\n", content: "" },
+        Gen { body: "plan he two\n</think>\n\n", end: IM_END, open_think: false, reasoning: "plan he two\n", content: "" },
+        Gen { body: "still he thinking", end: IM_END, open_think: true, reasoning: "still he thinking", content: "" },
+        Gen { body: "think he\n</think>\n\nthe answer he gave", end: IM_END, open_think: false, reasoning: "think he\n", content: "the answer he gave" },
+        Gen { body: "plan he four\n</think>\n\n", end: IM_END, open_think: false, reasoning: "plan he four\n", content: "" },
+        Gen { body: "he trails off", end: EOS, open_think: true, reasoning: "he trails off", content: "" },
+        Gen { body: "weigh he\n</think>\n\nhe finished", end: IM_END, open_think: false, reasoning: "weigh he\n", content: "he finished" },
+    ];
+
+    struct Wire {
+        reasoning: String,
+        content: String,
+    }
+
+    fn contains(hay: &[u32], needle: &[u32]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Generate one scripted turn through the route's real producer (the AR
+    /// semantic producer, or the native-MTP `Qwen35Emit`), classify the
+    /// terminal through the route's real finish seam, and store it through the
+    /// route's cache-action seam into the shared `qwen_cached_turn_entry`.
+    /// Returns what the client observed on the wire.
+    fn produce_turn(route: Route, tok: &Tokenizer, cache: &mut AsstTurnCache, step: &Gen) -> Wire {
+        use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
+        use hipfire_runtime::prompt_frame::{AssistantPrefix, ThinkMode};
+        use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
+
+        let mut ids = emitted_body(step.body);
+        ids.push(step.end);
+        let nl: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let mut insert = |fp: u64, seq: Vec<u32>| {
+            cache.insert(fp, qwen_cached_turn_entry(tok, seq, true));
+        };
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        match route {
+            Route::Mtp => {
+                let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+                    tokenizer: tok,
+                    eos: EOS,
+                    im_end: Some(IM_END),
+                    tools: None,
+                    enable_grammar: false,
+                    stop: Vec::new(),
+                    max_think: 0,
+                    max_tokens: 4096,
+                    assistant_prefix: AssistantPrefix::OpenThink,
+                    think_mode: ThinkMode::NonThink,
+                    decoded_vocab: None,
+                });
+                let mut route_event = |ev: &ClientEvent| match ev {
+                    ClientEvent::Token(t) => content.push_str(t),
+                    ClientEvent::Reasoning(t) => reasoning.push_str(t),
+                    _ => {}
+                };
+                for (i, &id) in ids.iter().enumerate() {
+                    let outcome = if i == 0 { emit.begin(id) } else { emit.observe(id) };
+                    outcome.events.iter().for_each(&mut route_event);
+                    if outcome.stop.is_some() {
+                        break;
+                    }
+                }
+                let streamed = emit.streamed_tokens().to_vec();
+                let finish = emit.finish();
+                finish.events.iter().for_each(&mut route_event);
+                assert_eq!(finish.open_think, step.open_think, "spec emitter open_think");
+                let visible = if !finish.visible_text.is_empty() {
+                    finish.visible_text.clone()
+                } else {
+                    super::qwen_dflash_visible_from_finish(&finish)
+                };
+                let terminal = qwen_dflash_wire_terminal(&finish, false, false, &visible, false);
+                let stored = qwen_dflash_apply_cache_action(
+                    &mut insert,
+                    &qwen_dflash_cache_action(&terminal),
+                    qwen_dflash_cache_seq(&streamed, Some(IM_END), &nl),
+                );
+                assert!(stored.is_some(), "Mtp: a completed stop must store {:?}", step.body);
+            }
+            Route::Ar => {
+                let mut producer = crate::ar::QwenArSemanticProducer::new("p", true);
+                let (mut sink, mut conversation, mut streamed, mut seq_pos) =
+                    (Vec::new(), Vec::new(), Vec::new(), 0usize);
+                for &id in &ids {
+                    let mut bytes = Vec::new();
+                    tok.decode_token_bytes_into(id, &mut bytes);
+                    let stopped = producer
+                        .commit_and_observe(
+                            &mut sink,
+                            &mut conversation,
+                            &mut streamed,
+                            &mut seq_pos,
+                            id,
+                            &bytes,
+                        )
+                        .expect("classify");
+                    if stopped || id == EOS || tok.is_terminator(id) {
+                        break;
+                    }
+                }
+                let (finish, visible) = producer.finish(&mut sink, false).expect("finish");
+                assert_eq!(
+                    finish.cause == QwenArTerminalCause::OpenThink,
+                    step.open_think,
+                    "AR terminal cause"
+                );
+                let stored = qwen_ar_apply_cache_action(
+                    &mut insert,
+                    &qwen_ar_cache_action(&finish, &visible),
+                    qwen_dflash_cache_seq(&streamed, Some(IM_END), &nl),
+                );
+                assert!(stored.is_some(), "Ar: a completed stop must store {:?}", step.body);
+                for line in String::from_utf8(sink).unwrap().lines() {
+                    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                    match event["type"].as_str() {
+                        Some("token") => content.push_str(event["text"].as_str().unwrap()),
+                        Some("reasoning") => reasoning.push_str(event["text"].as_str().unwrap()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(reasoning, step.reasoning, "{route:?}: router reasoning for {:?}", step.body);
+        assert_eq!(content, step.content, "{route:?}: router content for {:?}", step.body);
+        Wire { reasoning, content }
+    }
+
+    /// Run the scripted chat on one route. `echo` sends the router-produced
+    /// `reasoning_content` back (a rich client); otherwise only the content.
+    /// Returns each turn's prompt IDs.
+    fn run_think_chain(route: Route, tok: &Tokenizer, echo: bool) -> Vec<Vec<u32>> {
+        let frame = JinjaChatFrame {
+            tokenizer: tok,
+            template: THINK_HISTORY,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let label = match route {
+            Route::Mtp => "dflash",
+            Route::Ar => "qwen4-ar",
+        };
+        let bodies: Vec<Vec<u32>> = SCRIPT.iter().map(|g| emitted_body(g.body)).collect();
+        let nl = tok.encode("\n");
+        let render = |cache: &mut AsstTurnCache, history: &[Message]| {
+            let cold = tok.encode(&frame.render_messages(history, None, None).unwrap());
+            qwen_jinja_cached_history_tokens(
+                &frame,
+                cache,
+                &cold,
+                history,
+                None,
+                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                label,
+                None,
+            )
+            .unwrap()
+        };
+        let mut cache = AsstTurnCache::new_from_env();
+        let mut history = vec![msg(Role::System, "be helpful")];
+        let mut prompts: Vec<Vec<u32>> = Vec::new();
+        let mut contents: Vec<String> = Vec::new();
+        let mut consumed: Vec<u32> = Vec::new();
+        for (turn, step) in SCRIPT.iter().enumerate() {
+            history.push(msg(Role::User, &format!("question {turn}")));
+            let prompt = render(&mut cache, &history);
+            if echo {
+                // Every turn: the new prompt extends everything the producer
+                // consumed last turn, so the KV prefix is reused in full, and
+                // every earlier turn replays its own emitted IDs.
+                if turn > 0 {
+                    assert!(
+                        prompt.len() > consumed.len() && prompt.starts_with(&consumed),
+                        "{route:?} turn {turn}: prompt must start with the consumed conversation"
+                    );
+                }
+                for (k, body) in bodies[..turn].iter().enumerate() {
+                    assert!(
+                        contains(&prompt, body),
+                        "{route:?} turn {turn}: earlier turn {k} must splice its own emitted IDs"
+                    );
+                }
+            } else {
+                // No echoed reasoning: a turn hits only when it is the sole
+                // cached turn with its content; an ambiguous one is a plain
+                // miss. Never another turn's tokens.
+                for k in 0..turn {
+                    let sharing = contents[..turn].iter().filter(|c| **c == contents[k]).count();
+                    assert_eq!(
+                        contains(&prompt, &bodies[k]),
+                        sharing == 1,
+                        "{route:?} turn {turn}: earlier turn {k} (shares its content with {sharing} turn(s))"
+                    );
+                }
+            }
+            let wire = produce_turn(route, tok, &mut cache, step);
+            consumed = prompt.clone();
+            consumed.extend_from_slice(&bodies[turn]);
+            // The EOS terminator token is route-dependent (the trailer and
+            // template `<|im_end|>` differ), so only an `<|im_end|>` turn also
+            // consumes its terminator and ChatML newline.
+            if step.end == IM_END {
+                consumed.push(IM_END);
+                consumed.extend_from_slice(&nl);
+            }
+            let mut assistant = msg(Role::Assistant, &wire.content);
+            if echo {
+                assistant.reasoning_content = Some(wire.reasoning.clone());
+            }
+            contents.push(wire.content);
+            history.push(assistant);
+            prompts.push(prompt);
+        }
+        if echo {
+            // Edited echoed reasoning is exact-key: it must not splice the
+            // stale emitted body, and untouched turns still hit.
+            history.push(msg(Role::User, "question final"));
+            history[4].reasoning_content = Some("edited reasoning".into());
+            let edited = render(&mut cache, &history);
+            for (k, body) in bodies.iter().enumerate() {
+                assert_eq!(
+                    contains(&edited, body),
+                    k != 1,
+                    "{route:?} edited-turn render: turn {k}"
+                );
+            }
+        }
+        prompts
+    }
+
+    #[test]
+    fn think_only_chain_with_echoed_reasoning_hits_every_turn_on_mtp_and_ar() {
+        let tok = tokenizer();
+        let mtp = run_think_chain(Route::Mtp, &tok, true);
+        let ar = run_think_chain(Route::Ar, &tok, true);
+        assert_eq!(mtp.len(), SCRIPT.len());
+        assert!(SCRIPT.len() >= 4);
+        for (turn, (m, a)) in mtp.iter().zip(&ar).enumerate() {
+            assert_eq!(m, a, "turn {turn}: MTP and AR prompts must be byte-identical");
+        }
+    }
+
+    #[test]
+    fn think_only_chain_without_echo_never_splices_another_turns_tokens() {
+        let tok = tokenizer();
+        for route in [Route::Mtp, Route::Ar] {
+            run_think_chain(route, &tok, false);
+        }
+    }
+
+    #[test]
+    fn cached_turn_entry_reasoning_identity_ignores_trailing_terminators() {
+        let tok = tokenizer();
+        for (text, reasoning) in [
+            ("plan he\n</think>\n\nanswer", "plan he\n"),
+            ("still he thinking", "still he thinking"),
+        ] {
+            let body = emitted_body(text);
+            let bare = qwen_cached_turn_entry(&tok, body.clone(), true);
+            assert_eq!(bare.reasoning.as_ref().map(|r| r.text.as_str()), Some(reasoning));
+            for end in [IM_END, EOS] {
+                let mut seq = body.clone();
+                seq.push(end);
+                let entry = qwen_cached_turn_entry(&tok, seq.clone(), true);
+                assert_eq!(entry.reasoning, bare.reasoning, "terminator {end} must not enter the identity");
+                assert_eq!(entry.content.expect("content").token_ids, seq, "body stays verbatim");
+            }
+        }
+    }
+
+    #[test]
+    fn open_think_stores_only_when_completed_without_a_call() {
+        use hipfire_runtime::emit_text::ToolOutputRouter;
+        let ar_store = |cause| {
+            crate::ar::qwen_ar_finish_route(ToolOutputRouter::new(), cause, &mut String::new())
+                .expect("finish")
+                .store_cache
+        };
+        assert!(ar_store(QwenArTerminalCause::OpenThink));
+        assert!(ar_store(QwenArTerminalCause::DecodedEot));
+        assert!(!ar_store(QwenArTerminalCause::LengthCap));
+        assert!(!ar_store(QwenArTerminalCause::StopSequence));
+
+        let open = |tool_calls: usize| FinishSummary {
+            finish_reason: "open_think",
+            open_think: true,
+            decoded_eot: true,
+            tool_calls,
+            ..FinishSummary::default()
+        };
+        let spec_store = |finish: &FinishSummary, length: bool, grammar: bool| {
+            match qwen_dflash_wire_terminal(finish, length, grammar, "", false) {
+                super::QwenDflashWireTerminal::Done { store_cache, .. } => store_cache,
+                _ => false,
+            }
+        };
+        assert!(spec_store(&open(0), false, false));
+        assert!(!spec_store(&open(0), true, false), "length");
+        assert!(!spec_store(&open(0), false, true), "grammar fail-closed");
+        assert!(!spec_store(&open(1), false, false), "a completed call in the body");
     }
 }
 #[cfg(test)]

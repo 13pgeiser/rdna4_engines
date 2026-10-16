@@ -608,10 +608,39 @@ impl Eviction {
 // ─── AsstTurnCache ────────────────────────────────────────────────────
 
 /// Per-turn token cache for V4F prefix-cache stability.
+///
+/// Entries are keyed by the content/tool-call fingerprint PLUS the producer
+/// reasoning identity (`entry.reasoning.text`, missing and empty being the same
+/// identity). Two turns that normalize to the same content fingerprint (e.g.
+/// distinct think-only turns with empty content) therefore coexist instead of
+/// overwriting each other. `by_content` indexes the identities present for each
+/// content fingerprint so the reasoning-less fallback is an O(1) uniqueness
+/// check rather than a scan.
 pub struct AsstTurnCache {
     cap: Option<usize>,
-    map: std::collections::HashMap<u64, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
-    order: std::collections::VecDeque<u64>,
+    map: std::collections::HashMap<AsstTurnKey, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
+    order: std::collections::VecDeque<AsstTurnKey>,
+    by_content: std::collections::HashMap<u64, Vec<AsstTurnKey>>,
+}
+
+/// Cache slot identity: content/tools fingerprint + fingerprint of NONEMPTY
+/// producer reasoning (`None` for missing/empty).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AsstTurnKey {
+    fp: u64,
+    reasoning: Option<u64>,
+}
+
+impl AsstTurnKey {
+    fn new(fp: u64, reasoning: Option<&str>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let reasoning = reasoning.filter(|r| !r.is_empty()).map(|r| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            r.hash(&mut h);
+            h.finish()
+        });
+        Self { fp, reasoning }
+    }
 }
 
 impl AsstTurnCache {
@@ -630,56 +659,100 @@ impl AsstTurnCache {
                     .unwrap_or(32),
             )
         };
+        Self::with_cap(cap)
+    }
+
+    fn with_cap(cap: Option<usize>) -> Self {
         Self {
             cap,
             map: std::collections::HashMap::new(),
             order: std::collections::VecDeque::new(),
+            by_content: std::collections::HashMap::new(),
         }
     }
 
-    pub fn touch_mru(&mut self, fp: u64) {
-        if let Some(pos) = self.order.iter().position(|k| *k == fp) {
+    fn touch_mru(&mut self, key: AsstTurnKey) {
+        if let Some(pos) = self.order.iter().position(|k| *k == key) {
             self.order.remove(pos);
         }
-        self.order.push_back(fp);
+        self.order.push_back(key);
     }
 
+    /// True when any reasoning identity is cached for this content fingerprint.
     pub fn contains_key(&self, fp: &u64) -> bool {
-        self.map.contains_key(fp)
+        self.by_content.contains_key(fp)
     }
 
+    /// Reasoning-less lookup: hits only when exactly one identity is cached
+    /// for `fp`. See [`Self::get_for_reasoning`].
     pub fn get(&mut self, fp: &u64) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
-        if self.map.contains_key(fp) {
-            self.touch_mru(*fp);
-            self.map.get(fp)
-        } else {
-            None
-        }
+        self.get_for_reasoning(fp, None)
+    }
+
+    /// Nonempty `reasoning` selects exactly that producer-reasoning identity.
+    /// `None`/empty hits only when exactly ONE identity is cached for `fp`
+    /// (ambiguity → miss). A hit refreshes MRU order.
+    pub fn get_for_reasoning(
+        &mut self,
+        fp: &u64,
+        reasoning: Option<&str>,
+    ) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+        let wanted = reasoning.filter(|r| !r.is_empty());
+        let key = match wanted {
+            Some(r) => {
+                let key = AsstTurnKey::new(*fp, Some(r));
+                // Guard the 64-bit reasoning hash with the stored text.
+                let exact = self
+                    .map
+                    .get(&key)
+                    .and_then(|t| t.reasoning.as_ref())
+                    .is_some_and(|b| b.text == r);
+                if !exact {
+                    return None;
+                }
+                key
+            }
+            None => match self.by_content.get(fp).map(Vec::as_slice) {
+                Some([only]) => *only,
+                _ => return None,
+            },
+        };
+        self.touch_mru(key);
+        self.map.get(&key)
     }
 
     pub fn insert(&mut self, fp: u64, turn: hipfire_runtime::prompt_frame::CachedAssistantTurn) {
-        if self.map.contains_key(&fp) {
-            self.map.insert(fp, turn);
-            self.touch_mru(fp);
+        let key = AsstTurnKey::new(fp, turn.reasoning.as_ref().map(|b| b.text.as_str()));
+        if self.map.contains_key(&key) {
+            self.map.insert(key, turn);
+            self.touch_mru(key);
             return;
         }
         if let Some(c) = self.cap {
             while self.order.len() >= c {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
+                    if let Some(keys) = self.by_content.get_mut(&old.fp) {
+                        keys.retain(|k| *k != old);
+                        if keys.is_empty() {
+                            self.by_content.remove(&old.fp);
+                        }
+                    }
                 } else {
                     break;
                 }
             }
         }
-        self.map.insert(fp, turn);
-        self.order.push_back(fp);
+        self.map.insert(key, turn);
+        self.order.push_back(key);
+        self.by_content.entry(fp).or_default().push(key);
     }
 
     /// Drop all cached assistant-turn token sequences (authoritative cold reset).
     pub fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.by_content.clear();
     }
 
     /// Read-only emptiness probe for test/snapshot surfaces.
@@ -5485,6 +5558,120 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+    }
+}
+
+#[cfg(test)]
+mod asst_turn_cache_tests {
+    use super::AsstTurnCache;
+    use hipfire_runtime::prompt_frame::{CachedAssistantBody, CachedAssistantTurn};
+
+    fn turn(reasoning: Option<&str>, marker: u32) -> CachedAssistantTurn {
+        CachedAssistantTurn {
+            reasoning: reasoning.map(|text| CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: text.to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![marker],
+                text: String::new(),
+            }),
+        }
+    }
+
+    fn marker(t: Option<&CachedAssistantTurn>) -> Option<u32> {
+        t.and_then(|t| t.content.as_ref()).map(|c| c.token_ids[0])
+    }
+
+    #[test]
+    fn distinct_reasoning_turns_with_same_content_fp_coexist() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("alpha"))), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("beta"))), Some(2));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("gamma"))), None);
+    }
+
+    #[test]
+    fn empty_content_turns_with_different_reasoning_coexist_and_missing_equals_empty() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(0, turn(Some("think one"), 1));
+        c.insert(0, turn(Some("think two"), 2));
+        // Absent and empty reasoning are the same identity: replace, not coexist.
+        c.insert(9, turn(None, 3));
+        c.insert(9, turn(Some(""), 4));
+        assert_eq!(marker(c.get_for_reasoning(&0, Some("think one"))), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&0, Some("think two"))), Some(2));
+        assert_eq!(marker(c.get_for_reasoning(&9, None)), Some(4));
+        assert_eq!(marker(c.get_for_reasoning(&9, Some(""))), Some(4));
+    }
+
+    #[test]
+    fn absent_or_empty_reasoning_misses_when_content_fp_is_ambiguous() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get_for_reasoning(&7, None)), None);
+        assert_eq!(marker(c.get_for_reasoning(&7, Some(""))), None);
+        assert_eq!(marker(c.get(&7)), None);
+    }
+
+    #[test]
+    fn unique_identity_serves_absent_or_empty_reasoning_fallback() {
+        let mut c = AsstTurnCache::with_cap(Some(8));
+        c.insert(7, turn(Some("alpha"), 1));
+        assert_eq!(marker(c.get_for_reasoning(&7, None)), Some(1));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some(""))), Some(1));
+        assert_eq!(marker(c.get(&7)), Some(1));
+        // Nonempty reasoning is exact: no fallback to the unique entry.
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("other"))), None);
+    }
+
+    #[test]
+    fn eviction_removes_ambiguity_and_clear_drops_all_indices() {
+        let mut c = AsstTurnCache::with_cap(Some(2));
+        c.insert(7, turn(Some("alpha"), 1));
+        c.insert(7, turn(Some("beta"), 2));
+        assert_eq!(marker(c.get(&7)), None);
+        // Third distinct entry evicts the LRU ("alpha"), leaving "beta" unique.
+        c.insert(8, turn(None, 3));
+        assert_eq!(marker(c.get_for_reasoning(&7, Some("alpha"))), None);
+        assert_eq!(marker(c.get(&7)), Some(2));
+        assert!(c.contains_key(&7));
+        // Evicting the last identity of a content fp removes it entirely.
+        c.insert(10, turn(None, 4));
+        c.insert(11, turn(None, 5));
+        assert!(!c.contains_key(&7));
+        assert_eq!(marker(c.get(&7)), None);
+        c.clear();
+        assert!(c.is_empty());
+        assert!(!c.contains_key(&11));
+        assert_eq!(marker(c.get(&11)), None);
+        // Cache remains usable and unambiguous after clear.
+        c.insert(7, turn(Some("gamma"), 6));
+        assert_eq!(marker(c.get(&7)), Some(6));
+    }
+
+    #[test]
+    fn replacement_keeps_slot_and_refreshes_mru_under_cap() {
+        let mut c = AsstTurnCache::with_cap(Some(2));
+        c.insert(1, turn(Some("a"), 1));
+        c.insert(2, turn(Some("b"), 2));
+        // Replace oldest: no growth, becomes MRU, new body served.
+        c.insert(1, turn(Some("a"), 10));
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
+        // Next insert evicts fp 2 (now LRU), not the refreshed fp 1.
+        c.insert(3, turn(Some("c"), 3));
+        assert_eq!(marker(c.get_for_reasoning(&2, Some("b"))), None);
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
+        assert_eq!(marker(c.get_for_reasoning(&3, Some("c"))), Some(3));
+        // A lookup hit also refreshes MRU: touch 1, then insert evicts 3.
+        let _ = c.get_for_reasoning(&1, Some("a"));
+        c.insert(4, turn(Some("d"), 4));
+        assert_eq!(marker(c.get_for_reasoning(&3, Some("c"))), None);
+        assert_eq!(marker(c.get_for_reasoning(&1, Some("a"))), Some(10));
     }
 }
 

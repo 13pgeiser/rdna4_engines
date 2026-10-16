@@ -1742,7 +1742,8 @@ pub fn build_cached_history_jinja_with(
             // Observed: a 4-turn coding session hit the key on turn 2 yet fell back to the
             // plain render, and the retokenized reasoning diverged 74 tokens into the
             // assistant turn (`lcp=173` against `prior_len=371`), collapsing the cache.
-            // `reasoning` still needs the check below because it is NOT part of the key.
+            // Keep the reasoning check below as defense in depth: callers may use
+            // a reasoning-aware key or the unambiguous content-only recovery path.
         } else {
             // Tool turn: counts must match
             if turn.tools.len() != m.tool_calls.len() {

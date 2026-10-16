@@ -689,10 +689,11 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
                 "completed marker must be suppressed: marker={marker:?} visible={visible:?}"
             );
             if *marker == "<think>" {
-                // Open think after prose → reasoning-only stop (no cache).
+                // Open think after prose → reasoning-only stop; the completed
+                // stop stores its whole body (no call in it).
                 assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
                 assert_eq!(fin.finish_reason, "stop");
-                assert!(!fin.store_cache);
+                assert!(fin.store_cache);
             } else if *marker == "</think>" {
                 // Orphan closer drops closer, keeps prose; not a stop marker.
                 assert!(!stopped);
@@ -755,8 +756,10 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(visible.is_empty(), "no answer text: {visible:?}");
         assert_reasoning_only_stop(&out, &HA13_REASONING_TAIL.concat());
 
-        // The KV holds an unclosed think span: never cached.
-        assert!(!fin.store_cache);
+        // A completed open-think stop stores its whole generated body: the
+        // reasoning identity is carried by `qwen_cached_turn_entry`, not by
+        // refusing the cache.
+        assert!(fin.store_cache);
         let action = qwen_ar_cache_action(&fin, &visible);
         let mut sink = HashMap::new();
         assert!(qwen_ar_apply_cache_action(
@@ -766,8 +769,8 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
             &action,
             vec![1],
         )
-        .is_none());
-        assert!(sink.is_empty());
+        .is_some());
+        assert_eq!(sink.len(), 1);
 
         // The same EOS on the final budget token still beats length.
         let (out, _, fin, _, _, _) = drive_ar_semantic_path(&chunks, true, true);
@@ -784,7 +787,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(!stopped);
         let fin = fin.expect("open think finishes Ok");
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
-        assert!(!fin.store_cache);
+        assert!(fin.store_cache);
         assert!(visible.is_empty());
         assert_reasoning_only_stop(&out, "still thinking");
     }
@@ -796,7 +799,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert!(stopped);
         let fin = fin.expect("open think");
         assert_eq!(fin.cause, QwenArTerminalCause::OpenThink);
-        assert!(!fin.store_cache);
+        assert!(fin.store_cache);
         assert!(!visible.contains("secret"));
         let content: String = parse_jsonl(&out)
             .iter()

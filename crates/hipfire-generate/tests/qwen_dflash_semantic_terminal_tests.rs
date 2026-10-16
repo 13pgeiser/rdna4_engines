@@ -494,7 +494,7 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
     }
 
     /// Reasoning-only `stop`: every reasoning byte streamed, no answer, no
-    /// call, no cache, and one `done` as the last event — no error.
+    /// call, and one `done` as the last event — no error. The whole body is cached.
     fn assert_spec_reasoning_only_stop(
         label: &str,
         stream: &[ClientEvent],
@@ -516,12 +516,12 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
             } => {
                 assert_eq!(*finish_reason, "stop", "{label}");
                 assert!(!*release_tool_calls, "{label}");
-                assert!(!*store_cache, "{label}: an unclosed think span is never cached");
+                assert!(*store_cache, "{label}: a completed open-think stop stores its whole body");
                 assert!(wire_tool_calls.is_empty(), "{label}");
             }
             other => panic!("{label}: expected stop Done, got {other:?}"),
         }
-        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
+        assert!(hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
 
         let _guard = begin_terminal_test("req-ot", 21);
         let wire = render_spec_turn("req-ot", stream, fin, &term);

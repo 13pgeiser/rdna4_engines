@@ -154,7 +154,8 @@ pub enum QwenArTerminalCause {
     StopSequence,
     /// The turn ended inside `<think>` without running out of budget (decoded
     /// EOT, or a natural stop, inside the span). A graceful `stop`: the
-    /// reasoning already streamed, no answer, no tool calls and no cache.
+    /// reasoning already streamed, no answer and no tool calls. Completed
+    /// whole-body turns may be cached alongside their producer reasoning text.
     OpenThink,
 }
 
@@ -231,9 +232,11 @@ pub fn qwen_ar_think_budget_step(
 /// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
 /// A stop sequence keeps calls completed before it, drops a call it cut off,
 /// and never primes asst_turn_cache (the KV holds the trimmed stop text).
-/// Open think → `stop` with the reasoning only: no tool calls and no cache,
-/// because the KV holds an unclosed `<think>` span that no rendered history
-/// reproduces.
+/// Open think → `stop` with the reasoning only and no tool calls. A completed
+/// open-think stop IS cached: the whole generated body is stored verbatim
+/// beside its router reasoning text (`qwen_cached_turn_entry`), so history
+/// replays the unclosed span as one body. It stays uncached when the tool
+/// router fails or finished a call the stop would discard.
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
     cause: QwenArTerminalCause,
@@ -274,14 +277,25 @@ pub fn qwen_ar_finish_route(
                     }
                 }
             }
-            if length_unsafe || open_think {
+            if length_unsafe {
                 // Length is never a tool-safe or cache-safe terminal —
                 // prose-only, complete hidden call, or trailing flush alike.
-                // Neither is a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
-                    finish_reason: if length_unsafe { "length" } else { "stop" },
+                    finish_reason: "length",
                     wire_tool_calls: Vec::new(),
                     store_cache: false,
+                    trailing_visible,
+                    cause,
+                })
+            } else if open_think {
+                // A turn that ended inside `<think>` stops with its reasoning
+                // only: no calls on the wire. Its whole body is cache-safe
+                // unless a completed call sits in that body, which a
+                // call-less fingerprint would not describe.
+                Ok(QwenArRouteFinish {
+                    finish_reason: "stop",
+                    wire_tool_calls: Vec::new(),
+                    store_cache: finished_calls.is_empty(),
                     trailing_visible,
                     cause,
                 })
@@ -2289,8 +2303,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // fingerprint / trailer trim / value contract (`qwen_cached_turn_entry`) the
     // MTP route stores, so the next turn of EITHER route splices these exact
     // IDs instead of re-encoding the decoded text. `finish.store_cache` already
-    // excludes length-capped, stop-sequence, malformed and open-think
-    // terminals; a client abort returned above.
+    // excludes length-capped, stop-sequence and malformed terminals (and an
+    // open-think stop that holds a completed call); a client abort returned above.
     let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
     if cache_action.store {
         let tok = m.tokenizer.as_ref().unwrap();
@@ -3900,9 +3914,12 @@ pub fn generate(
                     let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
                     // flat token vector, so project the content slot out of the per-channel
-                    // cache value. Qwen turns are content-only, so nothing is dropped.
+                    // cache value. Qwen turns are content-only, so nothing is dropped. The
+                    // echoed `reasoning_content` selects the exact producer turn when several
+                    // turns share this content/tool fingerprint (e.g. think-only turns); with no
+                    // echo only a unique identity hits.
                     let hit = cache_ref
-                        .get(&fp)
+                        .get_for_reasoning(&fp, msg.reasoning_content.as_deref())
                         .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
                     if trace_cache {
                         eprintln!(
@@ -5845,8 +5862,8 @@ pub fn generate(
         // the model wrote into KV instead of re-encoding via
         // `tokenizer.encode(msg.content)` (BPE non-bijective).
         //
-        // Suppressed on malformed / length-partial / open-think turns and
-        // on client Abort (effects.store_cache == false).
+        // Suppressed on malformed / length-partial turns and on client Abort
+        // (effects.store_cache == false). A completed open-think stop stores.
         let mut cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
         cache_action.store = effects.store_cache && cache_action.store;
         if cache_action.store {
