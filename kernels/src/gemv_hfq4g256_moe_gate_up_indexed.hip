@@ -80,7 +80,7 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const float* __restrict__ x,                         // [K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int mi = M >> 1;
 #if HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE
@@ -116,6 +116,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const unsigned int expert_id_v = __builtin_amdgcn_raw_buffer_load_b32(
         topk_rsrc, (unsigned int)krank * 4u, 0, 0);
     const int expert_id = __builtin_amdgcn_readfirstlane(expert_id_v);
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            y_gate[krank * mi + row] = 0.0f;
+            y_up[krank * mi + row] = 0.0f;
+        }
+        return;
+    }
     const auto expert_ptrs_rsrc = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<unsigned long long*>(expert_ptrs),
         0, 0xffffffffu, 0x31004000u);
@@ -130,6 +137,13 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptr);
 #else
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            y_gate[krank * mi + row] = 0.0f;
+            y_up[krank * mi + row] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 #endif

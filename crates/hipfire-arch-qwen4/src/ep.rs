@@ -33,7 +33,7 @@ use hipfire_runtime::serve_contract::{
     TemplateIdentity, TokenizerIdentity,
 };
 use hipfire_runtime::session_cache::{SessionCache, SessionRoute};
-use rdna_compute::moe::Qwen4EpOwnerTables;
+use rdna_compute::moe::{Qwen4EpOwnerTables, QWEN4_EP_OWNER_EXPERTS};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -43,7 +43,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {
@@ -213,7 +215,10 @@ fn worker_main<P: 'static>(
 ) -> Result<(), String> {
     let index = rank - 1;
     if !baton.wait(index) {
-        let _ = ready.send((rank, Err("not loaded: an earlier rank failed to load".to_string())));
+        let _ = ready.send((
+            rank,
+            Err("not loaded: an earlier rank failed to load".to_string()),
+        ));
         return Ok(());
     }
     let mut peer = match catch_unwind(AssertUnwindSafe(|| init(rank))) {
@@ -241,9 +246,7 @@ fn worker_main<P: 'static>(
         match catch_unwind(AssertUnwindSafe(|| job.run(rank, &mut peer))) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => shared.fail(rank, &error),
-            Err(payload) => {
-                shared.fail(rank, &format!("panicked: {}", panic_message(&*payload)))
-            }
+            Err(payload) => shared.fail(rank, &format!("panicked: {}", panic_message(&*payload))),
         }
         latch.count_down();
     }
@@ -366,8 +369,10 @@ impl<P: 'static> PeerPool<P> {
             });
             if sent.is_err() {
                 latch.count_down();
-                self.shared
-                    .fail(index + 1, "worker thread is gone (it exited or panicked earlier)");
+                self.shared.fail(
+                    index + 1,
+                    "worker thread is gone (it exited or panicked earlier)",
+                );
             }
         }
         let local_result = local.map(|local| match catch_unwind(AssertUnwindSafe(local)) {
@@ -785,7 +790,12 @@ impl Qwen4EpRowGatherHook {
                 tables,
                 slot_owner: Mutex::new(plan.slot_owner),
             })
-            .map_err(|_| format!("qwen4 EP rank {}: balanced owners are already installed", self.rank))
+            .map_err(|_| {
+                format!(
+                    "qwen4 EP rank {}: balanced owners are already installed",
+                    self.rank
+                )
+            })
     }
 }
 
@@ -839,11 +849,16 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 gpu,
                 self.rank,
                 buffer,
-                EpSlotOwners::ExpertModulo(topk_indices),
+                EpSlotOwners::ExpertModulo(topk_indices, QWEN4_EP_OWNER_EXPERTS),
                 slots,
             ),
         };
-        result.map_err(|error| format!("qwen4 EP row gather layer {layer_idx} rank {}: {error}", self.rank))
+        result.map_err(|error| {
+            format!(
+                "qwen4 EP row gather layer {layer_idx} rank {}: {error}",
+                self.rank
+            )
+        })
     }
 
     fn assigns_owners(&self, layer_idx: u16) -> bool {
@@ -897,7 +912,10 @@ mod gather_hook_tests {
             note_gather_buffer(&last, 1, buffer).unwrap();
         }
         let error = note_gather_buffer(&last, 1, 0).unwrap_err();
-        assert!(error.contains("buffer 0") && error.contains("rank 1"), "{error}");
+        assert!(
+            error.contains("buffer 0") && error.contains("rank 1"),
+            "{error}"
+        );
         // The same buffer twice in a row is refused wherever it occurs.
         assert!(note_gather_buffer(&last, 1, 2).is_ok());
         assert!(note_gather_buffer(&last, 1, 2).is_err());
@@ -918,8 +936,14 @@ mod gather_hook_tests {
         // than the trunk to prove the head range is excluded by the guard.
         let by_layer = [None, Some(tables), None, Some(tables), Some(tables)];
         let trunk_layers = 4;
-        assert_eq!(balanced_layer_tables(&by_layer, 1, trunk_layers), Some(&tables));
-        assert_eq!(balanced_layer_tables(&by_layer, 3, trunk_layers), Some(&tables));
+        assert_eq!(
+            balanced_layer_tables(&by_layer, 1, trunk_layers),
+            Some(&tables)
+        );
+        assert_eq!(
+            balanced_layer_tables(&by_layer, 3, trunk_layers),
+            Some(&tables)
+        );
         assert_eq!(balanced_layer_tables(&by_layer, 0, trunk_layers), None);
         assert_eq!(balanced_layer_tables(&by_layer, 2, trunk_layers), None);
         // The MTP head's layer indices start at the trunk layer count.
@@ -1016,7 +1040,14 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
         tiles: usize,
     ) -> Result<(), String> {
         self.tile
-            .exchange(gpu, self.rank, &self.owner_table, tile_ids, y_down_grouped, tiles)
+            .exchange(
+                gpu,
+                self.rank,
+                &self.owner_table,
+                tile_ids,
+                y_down_grouped,
+                tiles,
+            )
             .map_err(|error| error.to_string())
     }
 }
@@ -1081,12 +1112,13 @@ impl Qwen4EpMesh {
     /// Drain every rank, stop the workers (each frees its own bundle on its
     /// thread) and release rank 0's gather events. Always attempts every step.
     pub(crate) fn close(self, gpu: &mut Gpu) -> Result<(), String> {
-        let Self { pool, gather, tile, .. } = self;
+        let Self {
+            pool, gather, tile, ..
+        } = self;
         let mut first: Option<String> = None;
-        let drained = pool.run_all_forced(
-            || sync_device(gpu),
-            &|_, peer: &mut Qwen4EpPeer| sync_device(&mut peer.gpu),
-        );
+        let drained = pool.run_all_forced(|| sync_device(gpu), &|_, peer: &mut Qwen4EpPeer| {
+            sync_device(&mut peer.gpu)
+        });
         if let Err(error) = drained {
             first.get_or_insert(error);
         }
@@ -1133,7 +1165,9 @@ impl Qwen4Bundle {
     ) -> Result<R, String> {
         let ranks = self.ranks();
         if rank >= ranks {
-            return Err(format!("qwen4 EP rank {rank} out of range (ranks = {ranks})"));
+            return Err(format!(
+                "qwen4 EP rank {rank} out of range (ranks = {ranks})"
+            ));
         }
         if rank == 0 {
             let mesh = self.ep.take();
@@ -1246,7 +1280,8 @@ impl Qwen4Bundle {
                                 Err(error)
                             }
                         }
-                    }) as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
+                    })
+                        as Box<dyn FnOnce(usize) -> Result<Qwen4EpPeer, String> + Send>
                 })
                 .collect();
         let pool = PeerPool::spawn(inits, Qwen4EpPeer::teardown).map_err(ep_err)?;
@@ -1289,10 +1324,9 @@ impl Qwen4Bundle {
         {
             let me = &*self;
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || register(0, me, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| register(rank, &peer.bundle, &mut peer.gpu),
-            )?;
+            pool.run_all(|| register(0, me, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                register(rank, &peer.bundle, &mut peer.gpu)
+            })?;
         }
         let gather = lock(&builder)
             .take()
@@ -1317,10 +1351,9 @@ impl Qwen4Bundle {
         // P2P is enabled below) with one transport.
         let capacities = {
             let me = &*self;
-            pool.run_all(
-                || Ok(tile_capacity(me)),
-                &|_, peer: &mut Qwen4EpPeer| Ok(tile_capacity(&peer.bundle)),
-            )
+            pool.run_all(|| Ok(tile_capacity(me)), &|_, peer: &mut Qwen4EpPeer| {
+                Ok(tile_capacity(&peer.bundle))
+            })
         };
         let capacities = match capacities {
             Ok(capacities) => capacities,
@@ -1358,7 +1391,9 @@ impl Qwen4Bundle {
                 let gpu0 = &mut *gpu;
                 pool.run_all(
                     || register_tile(0, me, gpu0),
-                    &|rank, peer: &mut Qwen4EpPeer| register_tile(rank, &peer.bundle, &mut peer.gpu),
+                    &|rank, peer: &mut Qwen4EpPeer| {
+                        register_tile(rank, &peer.bundle, &mut peer.gpu)
+                    },
                 )
             };
             if let Err(error) = registered {
@@ -1400,14 +1435,11 @@ impl Qwen4Bundle {
         };
         let enabled = {
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || enable(0, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| {
-                    peer.gather = Some(gather.clone());
-                    peer.tile = tile.clone();
-                    enable(rank, &mut peer.gpu)
-                },
-            )
+            pool.run_all(|| enable(0, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                peer.gather = Some(gather.clone());
+                peer.tile = tile.clone();
+                enable(rank, &mut peer.gpu)
+            })
         };
         if let Err(error) = enabled {
             return Err(release_rank0(gpu, error));
@@ -1416,10 +1448,9 @@ impl Qwen4Bundle {
         // 4. Compact expert sources of every rank.
         let sources = {
             let me = &*self;
-            pool.run_all(
-                || rank_sources(me),
-                &|_, peer: &mut Qwen4EpPeer| rank_sources(&peer.bundle),
-            )
+            pool.run_all(|| rank_sources(me), &|_, peer: &mut Qwen4EpPeer| {
+                rank_sources(&peer.bundle)
+            })
         };
         let sources: Vec<Vec<Qwen4PeerExpertSource>> = match sources {
             Ok(sources) => sources,
@@ -1461,10 +1492,9 @@ impl Qwen4Bundle {
         let attached = {
             let me = &mut *self;
             let gpu0 = &mut *gpu;
-            pool.run_all(
-                || attach(0, me, gpu0),
-                &|rank, peer: &mut Qwen4EpPeer| attach(rank, &mut peer.bundle, &mut peer.gpu),
-            )
+            pool.run_all(|| attach(0, me, gpu0), &|rank, peer: &mut Qwen4EpPeer| {
+                attach(rank, &mut peer.bundle, &mut peer.gpu)
+            })
         };
         if let Err(error) = attached {
             return Err(release_rank0(gpu, error));
@@ -1478,10 +1508,9 @@ impl Qwen4Bundle {
         if let Some(tile) = tile.as_ref() {
             let verdicts = {
                 let me = &*self;
-                pool.run_all(
-                    || Ok(tile_verdicts(me)),
-                    &|_, peer: &mut Qwen4EpPeer| Ok(tile_verdicts(&peer.bundle)),
-                )
+                pool.run_all(|| Ok(tile_verdicts(me)), &|_, peer: &mut Qwen4EpPeer| {
+                    Ok(tile_verdicts(&peer.bundle))
+                })
             };
             let verdicts = match verdicts {
                 Ok(verdicts) => verdicts,
@@ -1512,10 +1541,9 @@ impl Qwen4Bundle {
                 };
                 let installed = {
                     let me = &mut *self;
-                    pool.run_all(
-                        || install(0, me),
-                        &|rank, peer: &mut Qwen4EpPeer| install(rank, &mut peer.bundle),
-                    )
+                    pool.run_all(|| install(0, me), &|rank, peer: &mut Qwen4EpPeer| {
+                        install(rank, &mut peer.bundle)
+                    })
                 };
                 if let Err(error) = installed {
                     return Err(release_rank0(gpu, error));
@@ -1580,10 +1608,7 @@ impl Qwen4Bundle {
         let Some(mesh) = self.ep.take() else {
             return local(self);
         };
-        let result = mesh.run(
-            || local(&mut *self).map_err(|error| error.to_string()),
-            job,
-        );
+        let result = mesh.run(|| local(&mut *self).map_err(|error| error.to_string()), job);
         self.ep = Some(mesh);
         result
             .and_then(|values| agree(what, values))
@@ -2022,10 +2047,9 @@ mod tests {
         let tokens = vec![3u32, 5, 7];
         let sum = |t: &[u32]| t.iter().sum::<u32>() as i64;
         let out = pool
-            .run_all(
-                || Ok(sum(&tokens)),
-                &|_, peer: &mut Fake| Ok(sum(&tokens) + peer.rank as i64),
-            )
+            .run_all(|| Ok(sum(&tokens)), &|_, peer: &mut Fake| {
+                Ok(sum(&tokens) + peer.rank as i64)
+            })
             .expect("run");
         assert_eq!(out, vec![15, 16, 17]);
     }
@@ -2039,21 +2063,26 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
         let error = pool
-            .run_all(
-                || Ok(()),
-                &|rank, _: &mut Fake| {
-                    if rank == 2 {
-                        Err("boom".to_string())
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
+            .run_all(|| Ok(()), &|rank, _: &mut Fake| {
+                if rank == 2 {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            })
             .expect_err("rank 2 fails");
-        assert!(error.contains("rank 2") && error.contains("boom"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("boom"),
+            "{error}"
+        );
         assert!(aborts.load(Ordering::SeqCst) >= 1);
-        let again = pool.run_all(|| Ok(()), &|_, _: &mut Fake| Ok(())).expect_err("poisoned");
-        assert!(again.contains("poisoned") && again.contains("boom"), "{again}");
+        let again = pool
+            .run_all(|| Ok(()), &|_, _: &mut Fake| Ok(()))
+            .expect_err("poisoned");
+        assert!(
+            again.contains("poisoned") && again.contains("boom"),
+            "{again}"
+        );
         assert!(pool.poisoned().is_some());
         // A forced run (teardown drain) still reaches the workers.
         pool.run_all_forced(|| Ok(()), &|_, _: &mut Fake| Ok(()))
@@ -2086,24 +2115,27 @@ mod tests {
                 },
             )
             .expect_err("fails");
-        assert!(error.contains("rank 0") && error.contains("rank0 failed"), "{error}");
+        assert!(
+            error.contains("rank 0") && error.contains("rank0 failed"),
+            "{error}"
+        );
     }
 
     #[test]
     fn peer_panic_becomes_an_error_and_the_worker_survives_for_teardown() {
         let pool = pool(2);
         let error = pool
-            .run_all(
-                || Ok(()),
-                &|rank, _: &mut Fake| {
-                    if rank == 1 {
-                        panic!("kernel exploded");
-                    }
-                    Ok(())
-                },
-            )
+            .run_all(|| Ok(()), &|rank, _: &mut Fake| {
+                if rank == 1 {
+                    panic!("kernel exploded");
+                }
+                Ok(())
+            })
             .expect_err("panic is an error");
-        assert!(error.contains("rank 1") && error.contains("kernel exploded"), "{error}");
+        assert!(
+            error.contains("rank 1") && error.contains("kernel exploded"),
+            "{error}"
+        );
         pool.run_all_forced(|| Ok(()), &|_, _: &mut Fake| Ok(()))
             .expect("workers still answer");
         pool.close().expect("close");
@@ -2132,7 +2164,9 @@ mod tests {
     #[test]
     fn run_rank_targets_one_peer() {
         let pool = pool(3);
-        let value = pool.run_rank(2, &|rank, peer: &mut Fake| Ok((rank, peer.value))).expect("run");
+        let value = pool
+            .run_rank(2, &|rank, peer: &mut Fake| Ok((rank, peer.value)))
+            .expect("run");
         assert_eq!(value, (2, 20));
         assert!(pool.run_rank(0, &|_, _: &mut Fake| Ok(())).is_err());
         assert!(pool.run_rank(4, &|_, _: &mut Fake| Ok(())).is_err());
@@ -2151,7 +2185,10 @@ mod tests {
             Box::new(|rank| Ok(Fake { rank, value: 0 })),
         ];
         let error = PeerPool::spawn(inits, count).err().expect("spawn fails");
-        assert!(error.contains("rank 2") && error.contains("load failed"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("load failed"),
+            "{error}"
+        );
         // Rank 1 built and is torn down; rank 3 never loads after rank 2 failed.
         assert_eq!(TORN_DOWN.load(Ordering::SeqCst), 1);
     }
@@ -2165,7 +2202,11 @@ mod tests {
                 let order = order.clone();
                 let active = active.clone();
                 Box::new(move |rank: usize| {
-                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0, "two loads overlapped");
+                    assert_eq!(
+                        active.fetch_add(1, Ordering::SeqCst),
+                        0,
+                        "two loads overlapped"
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(10 * (5 - rank as u64)));
                     lock(&order).push(rank);
                     active.fetch_sub(1, Ordering::SeqCst);
@@ -2195,7 +2236,10 @@ mod tests {
             })
             .collect();
         let error = PeerPool::spawn(inits, teardown_ok).err().expect("fails");
-        assert!(error.contains("rank 2") && error.contains("out of host memory"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("out of host memory"),
+            "{error}"
+        );
         assert_eq!(loaded.load(Ordering::SeqCst), 2, "rank 3 must not load");
     }
 
@@ -2216,7 +2260,10 @@ mod tests {
             .collect();
         let pool = PeerPool::spawn(inits, bad).expect("spawn");
         let error = pool.close().expect_err("teardown error surfaces");
-        assert!(error.contains("rank 2") && error.contains("free failed"), "{error}");
+        assert!(
+            error.contains("rank 2") && error.contains("free failed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2225,9 +2272,7 @@ mod tests {
         assert_eq!(agree("unit", vec![(), ()]).unwrap(), ());
         let error = agree("token", vec![7u32, 7, 9, 7]).unwrap_err();
         assert!(
-            error.contains("token")
-                && error.contains("rank 0 = 7")
-                && error.contains("rank 2 = 9"),
+            error.contains("token") && error.contains("rank 0 = 7") && error.contains("rank 2 = 9"),
             "{error}"
         );
         assert!(agree::<u32>("none", Vec::new()).is_err());
@@ -2265,21 +2310,34 @@ mod tile_verdict_tests {
     fn agreement_needs_every_rank_identical_and_complete() {
         for ranks in [2usize, 4] {
             let all = vec![Some(vec![true; 40]); ranks];
-            assert_eq!(agreed_tile_verdicts(&all).map(Vec::len), Some(40), "{ranks}");
+            assert_eq!(
+                agreed_tile_verdicts(&all).map(Vec::len),
+                Some(40),
+                "{ranks}"
+            );
             // One rank that did not admit the lever refuses it for all.
             for absent in 0..ranks {
                 let mut mixed = all.clone();
                 mixed[absent] = None;
-                assert!(agreed_tile_verdicts(&mixed).is_none(), "{ranks} absent {absent}");
+                assert!(
+                    agreed_tile_verdicts(&mixed).is_none(),
+                    "{ranks} absent {absent}"
+                );
             }
             // One rank with one asymmetric layer, or a different layer count, refuses.
             for odd in 0..ranks {
                 let mut asymmetric = all.clone();
                 asymmetric[odd].as_mut().unwrap()[7] = false;
-                assert!(agreed_tile_verdicts(&asymmetric).is_none(), "{ranks} asym {odd}");
+                assert!(
+                    agreed_tile_verdicts(&asymmetric).is_none(),
+                    "{ranks} asym {odd}"
+                );
                 let mut shorter = all.clone();
                 shorter[odd].as_mut().unwrap().pop();
-                assert!(agreed_tile_verdicts(&shorter).is_none(), "{ranks} short {odd}");
+                assert!(
+                    agreed_tile_verdicts(&shorter).is_none(),
+                    "{ranks} short {odd}"
+                );
             }
         }
         assert!(agreed_tile_verdicts(&[]).is_none());

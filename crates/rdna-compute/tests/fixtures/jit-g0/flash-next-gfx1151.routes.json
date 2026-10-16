@@ -514,7 +514,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+      "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
       "symbols": [
         "moe_router_softmax_top10_f32_fast"
       ],
@@ -986,7 +986,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "1ed557aa3d9f40769ffa519c855c966e2427e6d7d6891f28b320f550172119d3",
+      "sha256": "a2bf86ef70fbc7b9092c88ca3c3aa9a63b9cba8deb839980509e1ca393f088c2",
       "symbols": [
         "qwen4_moe_sym_check_gfx1151"
       ],
@@ -1037,7 +1037,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "d36c19d027c49dd1a1a95053628f4ca11e25944f07cce0518f7505eb976f9758",
+      "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",

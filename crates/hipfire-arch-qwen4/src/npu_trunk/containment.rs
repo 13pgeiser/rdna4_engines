@@ -10,6 +10,17 @@ pub(crate) enum FaultClass {
 }
 
 impl FaultClass {
+    /// The class of a pair executor error, by variant (never by message text). Every `HipError` is a GPU error, including a
+    /// `rdna_compute::router_fault::RouterFault` (non-finite MoE router row), which `Gpu::take_device_wait_error` returns as
+    /// `HipError` code 0 and which therefore fails the request with its original error and is never rerun.
+    pub(crate) fn of(error: &crate::gpu_forward::Qwen4GpuForwardError) -> Self {
+        if matches!(error, crate::gpu_forward::Qwen4GpuForwardError::Hip(_)) {
+            Self::GpuHip
+        } else {
+            Self::NpuRuntime
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NpuRuntime => "NPU runtime",
@@ -316,6 +327,54 @@ mod tests {
             reference.request(&request, 0).unwrap()
         );
         assert_eq!(faulted.npu_pairs_attempted, 1);
+    }
+
+    #[test]
+    fn router_fault_is_a_gpu_request_failure_never_rerun() {
+        use crate::gpu_forward::Qwen4GpuForwardError;
+        use rdna_compute::router_fault::RouterFault;
+        // The production path: the fault word's RouterFault -> `to_hip_error` (code 0, as `take_device_wait_error` returns it)
+        // -> `?` into the forward error -> `FaultClass::of` (what `NpuForward::contain_fault` classifies with).
+        let fault = RouterFault::decode(3, RouterFault::encode(17, 1234)).expect("decodes");
+        let error = Qwen4GpuForwardError::from(fault.to_hip_error());
+        assert!(matches!(&error, Qwen4GpuForwardError::Hip(_)));
+        assert_eq!(FaultClass::of(&error), FaultClass::GpuHip);
+        // The layer/row message survives the conversion.
+        let message = error.to_string();
+        assert!(
+            message.contains("GPU 3")
+                && message.contains("layer 17")
+                && message.contains("row 1234"),
+            "{message}"
+        );
+        // A non-Hip error (the NPU runtime's relay/validation failures) stays an NPU runtime fault.
+        assert_eq!(
+            FaultClass::of(&Qwen4GpuForwardError::Dispatch("npu relay".to_string())),
+            FaultClass::NpuRuntime
+        );
+        // Latch semantics for that class: the route latches, but the request is never marked for a GPU-only rerun, so
+        // `rerun_after_fault` runs it once and returns the router error unchanged.
+        let mut latch = FaultLatch::default();
+        assert!(latch.trip(FaultClass::of(&error), &error.to_string()));
+        assert!(latch.tripped() && !latch.take_request_fault());
+        let mut attempts = 0;
+        let result: Result<(), Qwen4GpuForwardError> = rerun_after_fault(
+            &mut latch,
+            10,
+            0,
+            |_, _| {
+                attempts += 1;
+                Err(Qwen4GpuForwardError::from(fault.to_hip_error()))
+            },
+            |latch| latch.take_request_fault(),
+            |_| panic!("a router fault is never replanned"),
+        );
+        assert_eq!(attempts, 1);
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("layer 17") && message.contains("row 1234"),
+            "{message}"
+        );
     }
 
     #[test]

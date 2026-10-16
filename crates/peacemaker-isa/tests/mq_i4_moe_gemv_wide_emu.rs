@@ -232,14 +232,17 @@ fn kernarg(
     xrs: usize,
     ys: usize,
 ) -> Vec<u8> {
-    let mut a = Vec::with_capacity(88);
+    let mut a = Vec::with_capacity(96);
     for p in ptrs {
         a.extend(p.to_le_bytes());
     }
     for v in [m, k, u, c, xdiv, xsrc, xrs, ys] {
         a.extend((v as u32).to_le_bytes());
     }
-    assert_eq!(a.len(), 88);
+    // `n_experts@88`: the extent of the weight table, above every expert id of every route; `reserved@92` is zero.
+    a.extend((N_EXPERTS as u32).to_le_bytes());
+    a.extend(0u32.to_le_bytes());
+    assert_eq!(a.len(), 96);
     a
 }
 
@@ -351,7 +354,7 @@ fn run_case(rig: &Rig, codec: Codec, kind: Kind, wide: Cap, case: &Case) -> usiz
         .unwrap();
     mem.map("ref_slots".into(), REF_SLOTS, vec![0; 4 * 16])
         .unwrap();
-    mem.map("kernarg".into(), KERNARG, vec![0; 88]).unwrap();
+    mem.map("kernarg".into(), KERNARG, vec![0; 96]).unwrap();
 
     let xsrc = if kind == Kind::GateUp { c } else { 10 * c };
     let (y1w, y1r) = if kind == Kind::GateUp {

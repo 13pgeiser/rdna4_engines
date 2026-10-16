@@ -32,17 +32,17 @@ use hipfire_runtime::spec::{
     MtpSpeculator, MtpWindow, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch, SpecStep,
     SpecTarget, Speculator,
 };
-use smallvec::SmallVec;
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
 };
 use rdna_compute::profile::{unix_micros, Span, SpanProfiler};
-use rdna_compute::{Gpu, GpuTensor};
 use rdna_compute::spec_sampling_cpu_ar::{
     spec_cpu_ar_alloc_f32, spec_cpu_ar_alloc_u32, SpecCpuArPolicy, SpecDistRows, SPEC_CPU_AR_CAP,
     SPEC_CPU_AR_EOS_NONE,
 };
+use rdna_compute::{Gpu, GpuTensor};
+use smallvec::SmallVec;
 use std::time::Instant;
 
 /// `HIPFIRE_MTP_FLOOR_TRACE=1`: one `QWEN4_FLOOR_TRACE` JSON line per AR
@@ -489,7 +489,9 @@ impl Qwen4Bundle {
             .max_chunk;
         self.begin_npu_trunk_request(gpu)
             .map_err(|error| error.to_string())?;
-        let plan_end = self.session_lineage_after(start_pos).map_or(end_pos, |p| p.min(end_pos));
+        let plan_end = self
+            .session_lineage_after(start_pos)
+            .map_or(end_pos, |p| p.min(end_pos));
         if let Some(forward) = &mut self.execution {
             forward
                 .plan_npu_trunk_request(gpu, plan_end - start_pos, start_pos)
@@ -502,23 +504,27 @@ impl Qwen4Bundle {
                 self.reset_recurrent(gpu)?;
                 return Ok(SpecAdvance::Aborted);
             }
-            self.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
-            let planned=self.npu_trunk_planned();
+            self.poll_npu_trunk(gpu)
+                .map_err(|error| error.to_string())?;
+            let planned = self.npu_trunk_planned();
             let rows = self.prefill_schedule_rows(start_pos + offset, end_pos, max_chunk);
-            let end=offset+rows;
+            let end = offset + rows;
             // A planned pair group (rows above one chunk) runs through the pair
             // executor inside the forward, in every NPU mode.
-            let covered=planned && rows>max_chunk;
+            let covered = planned && rows > max_chunk;
             self.set_ple_lookahead(&tokens[end..]);
-            if covered && end<tokens.len() {
-                self.spec_prefill_rows_without_pick(gpu,&tokens[offset..end],false)
-                    .map_err(|error|error.to_string())?;
+            if covered && end < tokens.len() {
+                self.spec_prefill_rows_without_pick(gpu, &tokens[offset..end], false)
+                    .map_err(|error| error.to_string())?;
             } else {
-                last_argmax=Some(self.spec_prefill_rows(gpu,&tokens[offset..end],false)
-                    .map_err(|error|error.to_string())?);
+                last_argmax = Some(
+                    self.spec_prefill_rows(gpu, &tokens[offset..end], false)
+                        .map_err(|error| error.to_string())?,
+                );
             }
             if self.session_next_boundary() == Some(start_pos + end) {
-                self.spec_advance_session_boundary(gpu, start_pos + end).map_err(|e|e.to_string())?;
+                self.spec_advance_session_boundary(gpu, start_pos + end)
+                    .map_err(|e| e.to_string())?;
             }
             offset = end;
         }
@@ -756,7 +762,13 @@ impl SpecTarget for Qwen4Bundle {
         remaining_new_tokens: usize,
         max_draft_rows: usize,
     ) {
-        Qwen4Bundle::map_ahead_for_decode(self, gpu, position, remaining_new_tokens, max_draft_rows);
+        Qwen4Bundle::map_ahead_for_decode(
+            self,
+            gpu,
+            position,
+            remaining_new_tokens,
+            max_draft_rows,
+        );
     }
 }
 
@@ -999,7 +1011,8 @@ pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FloorRoute {    /// Ordinary target-only token, no head work (after sticky retirement).
+pub(crate) enum FloorRoute {
+    /// Ordinary target-only token, no head work (after sticky retirement).
     Ar,
     /// Ordinary target-only token timed for the floor, head kept synced (an
     /// AR probe of a would-be retirement).
@@ -1446,8 +1459,12 @@ impl MtpFloor {
     /// the unmeasured neighbours of [`Self::cap_cost`].  Ties keep the
     /// earlier (shallower) option.
     fn best_candidate(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
-        let mut best = (self.interleaved.1 > 0.0)
-            .then(|| (FloorRoute::Interleaved, self.interleaved.0 / self.interleaved.1));
+        let mut best = (self.interleaved.1 > 0.0).then(|| {
+            (
+                FloorRoute::Interleaved,
+                self.interleaved.0 / self.interleaved.1,
+            )
+        });
         for cap in 1..self.caps.len().min(max_depth.saturating_add(1)) {
             let Some(cost) = self.cap_cost(agreement, cap) else {
                 continue;
@@ -1552,7 +1569,12 @@ impl MtpFloor {
             let decay = self.decay;
             let emitted = window.emitted as f32;
             decay_add(&mut self.combined, us, emitted, decay);
-            decay_add(&mut self.slow, us, emitted, decay.max(MTP_FLOOR_RETIRE_DECAY));
+            decay_add(
+                &mut self.slow,
+                us,
+                emitted,
+                decay.max(MTP_FLOOR_RETIRE_DECAY),
+            );
             match route {
                 NativeWindow::Interleaved => decay_add(&mut self.interleaved, us, emitted, decay),
                 NativeWindow::Batched => {
@@ -1600,7 +1622,12 @@ impl MtpFloor {
                 let decay = self.decay;
                 if self.calibrated {
                     decay_add(&mut self.combined, wall_us, emitted as f32, decay);
-                    decay_add(&mut self.slow, wall_us, emitted as f32, decay.max(MTP_FLOOR_RETIRE_DECAY));
+                    decay_add(
+                        &mut self.slow,
+                        wall_us,
+                        emitted as f32,
+                        decay.max(MTP_FLOOR_RETIRE_DECAY),
+                    );
                 }
                 if emitted > 0 {
                     decay_add(&mut self.external, wall_us, emitted as f32, decay);
@@ -1671,8 +1698,12 @@ impl MtpFloor {
     /// cap priced by [`Self::cap_cost`].  Ties keep the earlier (shallower)
     /// option.
     fn best_native(&self, agreement: &Agreement, max_depth: usize) -> Option<(FloorRoute, f32)> {
-        let mut best = (self.interleaved.1 > 0.0)
-            .then(|| (FloorRoute::Interleaved, self.interleaved.0 / self.interleaved.1));
+        let mut best = (self.interleaved.1 > 0.0).then(|| {
+            (
+                FloorRoute::Interleaved,
+                self.interleaved.0 / self.interleaved.1,
+            )
+        });
         for cap in 1..self.caps.len().min(max_depth.saturating_add(1)) {
             if self.caps[cap].windows <= 0.0 {
                 continue;
@@ -1852,8 +1883,19 @@ impl MtpFloor {
                 options.push(',');
             }
             let stats = self.caps[cap];
-            let per = |x: f32| if stats.windows > 0.0 { x / stats.windows } else { 0.0 };
-            let mean_drafted: f32 = stats.drafted.iter().enumerate().map(|(d, &w)| d as f32 * w).sum();
+            let per = |x: f32| {
+                if stats.windows > 0.0 {
+                    x / stats.windows
+                } else {
+                    0.0
+                }
+            };
+            let mean_drafted: f32 = stats
+                .drafted
+                .iter()
+                .enumerate()
+                .map(|(d, &w)| d as f32 * w)
+                .sum();
             options.push_str(&format!(
                 "{{\"route\":\"cap{cap}\",\"modeled\":{},\"win_us\":{:.1},\"emit\":{:.3},\"drafted\":{:.2},\"us_per_tok\":{cost:.1}}}",
                 stats.windows <= 0.0,
@@ -2292,8 +2334,7 @@ fn mtp_sampled_picks_enabled() -> bool {
 
 /// Exact supported architecture with the resident device sampler available.
 fn mtp_device_sampler_supported(gpu: &Gpu) -> bool {
-    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
-        && gpu.spec_cpu_ar_device_supported()
+    (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && gpu.spec_cpu_ar_device_supported()
 }
 
 /// Device-accept eligibility that needs no `Gpu`: Leviathan (not naive), no
@@ -2565,7 +2606,10 @@ impl DeviceAccept {
             }
         };
         let mut it = tensors.into_iter();
-        let mut next = || it.next().expect("nine device accept buffers allocated above");
+        let mut next = || {
+            it.next()
+                .expect("nine device accept buffers allocated above")
+        };
         let target = SpecDistRows {
             counts: next(),
             ids: next(),
@@ -2770,14 +2814,16 @@ impl DeviceAccept {
                 })?;
                 staging.state = StageState::Fenced;
                 gpu.memcpy_dtoh_auto(&mut staging.result, &self.result.buf)
-                    .map_err(|error| {
-                        format!("Qwen4 sampled MTP device accept result: {error}")
-                    })?;
+                    .map_err(|error| format!("Qwen4 sampled MTP device accept result: {error}"))?;
             }
         }
         // The result wait ordered every queued copy, the kernel and the
         // readback itself: nothing is left to drain.
         staging.state = StageState::Idle;
+        // The target rows this accept consumed came from the router producers; a
+        // non-finite router row recorded its (layer, row) in the device fault word.
+        gpu.take_device_wait_error()
+            .map_err(|error| format!("Qwen4 sampled MTP device accept: {error}"))?;
         let bytes = &staging.result;
         Ok([
             u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
@@ -2797,7 +2843,10 @@ impl SampledVerify {
         k >= 1
             && self.draws_drafts()
             && self.device_eligible
-            && self.device.as_ref().is_some_and(|device| k <= device.capacity)
+            && self
+                .device
+                .as_ref()
+                .is_some_and(|device| k <= device.capacity)
     }
 
     /// This window's per-row greedy picks are unused: the device route
@@ -3840,8 +3889,7 @@ impl Qwen4MtpDrafter {
         {
             return base;
         }
-        let acceptance =
-            self.stats.ngram_mod_accepted as f32 / self.stats.ngram_mod_drafts as f32;
+        let acceptance = self.stats.ngram_mod_accepted as f32 / self.stats.ngram_mod_drafts as f32;
         if acceptance < 0.95 {
             return base;
         }
@@ -4019,7 +4067,9 @@ impl Qwen4MtpDrafter {
                 }
             }
             gpu.copy_d2d(row_hidden, pending, pending.byte_size())
-                .map_err(|error| format!("Qwen4 MTP AR calibration pending hidden copy: {error}"))?;
+                .map_err(|error| {
+                    format!("Qwen4 MTP AR calibration pending hidden copy: {error}")
+                })?;
             // Drain the calibration's head work so the first probe window
             // does not bill it.
             gpu.hip
@@ -4028,10 +4078,17 @@ impl Qwen4MtpDrafter {
             // Only rank 0's clocks price the floor; a replica rank's floor is
             // never consulted.
             if !self.follower {
-                let event = if self.floor.calibrated { "ar_probe" } else { "calibration" };
+                let event = if self.floor.calibrated {
+                    "ar_probe"
+                } else {
+                    "calibration"
+                };
                 self.floor.observe_calibration(us, &self.agreement);
                 if floor_trace_enabled() {
-                    eprintln!("{}", self.floor.trace_line(&self.agreement, event, us, 1, 0));
+                    eprintln!(
+                        "{}",
+                        self.floor.trace_line(&self.agreement, event, us, 1, 0)
+                    );
                 }
             }
             self.stats.mtp_windows += 1;
@@ -4244,10 +4301,9 @@ impl Qwen4MtpDrafter {
         bundle
             .spec_forward_rows_resident(gpu, replay, true)
             .map_err(|error| format!("Qwen4 terminal repair replay: {error}"))?;
-        let fill = self
-            .append_scratch
-            .as_mut()
-            .filter(|fill| replay.len() >= 2 && replay.len() <= fill.rows() && mtp_batched_fill_enabled());
+        let fill = self.append_scratch.as_mut().filter(|fill| {
+            replay.len() >= 2 && replay.len() <= fill.rows() && mtp_batched_fill_enabled()
+        });
         match fill {
             Some(fill) => bundle
                 .mtp_append_rows(
@@ -4350,8 +4406,13 @@ impl Qwen4MtpDrafter {
             return;
         };
         let priced_us = if pending.first_use { f32::NAN } else { us };
-        self.floor
-            .observe_window(pending.route, pending.window, priced_us, pending.k, &self.agreement);
+        self.floor.observe_window(
+            pending.route,
+            pending.window,
+            priced_us,
+            pending.k,
+            &self.agreement,
+        );
         if floor_trace_enabled() {
             let event = match pending.route {
                 NativeWindow::Interleaved => "native_interleaved",
@@ -4793,7 +4854,9 @@ impl Qwen4MtpDrafter {
         let policy = bundle
             .mtp_draft_request_state()
             .map_err(|error| error.to_string())?;
-        let ticket = bundle.mtp_snapshot(gpu).map_err(|error| error.to_string())?;
+        let ticket = bundle
+            .mtp_snapshot(gpu)
+            .map_err(|error| error.to_string())?;
         let drafted = bundle.mtp_forward_token(gpu, seed, Some(pending), position, true);
         let restored = bundle.mtp_restore(gpu, ticket);
         let policy_restored = bundle.set_mtp_draft_request_state(policy);
@@ -4825,10 +4888,20 @@ impl Qwen4MtpDrafter {
         // The floor prices the takeover over its whole window: from the
         // native window whose row-0 step confirmed it, to the drained head
         // fill after commit.
-        let wall_start = probe.as_ref().map_or_else(Instant::now, |probe| probe.start);
+        let wall_start = probe
+            .as_ref()
+            .map_or_else(Instant::now, |probe| probe.start);
         let candidates = std::mem::take(&mut self.ngram_candidates);
-        let window =
-            self.takeover_window(gpu, target, position, seed, emitted, &candidates, eos, probe);
+        let window = self.takeover_window(
+            gpu,
+            target,
+            position,
+            seed,
+            emitted,
+            &candidates,
+            eos,
+            probe,
+        );
         self.ngram_candidates = candidates;
         let window = window?;
         let wall_us = if self.floor_enabled && !Self::floor_forced() {
@@ -4897,9 +4970,9 @@ impl Qwen4MtpDrafter {
         let window_start = probe.map_or_else(Instant::now, |probe| probe.start);
         let mut accepted_drafts = 0usize;
         let mut emitted_len = 0usize;
-        let mut snapshot = match Self::bundle(target).and_then(|bundle| {
-            bundle.mtp_snapshot(gpu).map_err(|error| error.to_string())
-        }) {
+        let mut snapshot = match Self::bundle(target)
+            .and_then(|bundle| bundle.mtp_snapshot(gpu).map_err(|error| error.to_string()))
+        {
             Ok(ticket) => Some(ticket),
             Err(error) => {
                 self.takeover_block = block;
@@ -4974,10 +5047,9 @@ impl Qwen4MtpDrafter {
             // The kept rows' captured hiddens are spec hidden rows
             // `0..consumed` (the verify's, or the replay's).
             timers.mark(gpu, "head_fill");
-            let fill = self
-                .append_scratch
-                .as_mut()
-                .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
+            let fill = self.append_scratch.as_mut().filter(|fill| {
+                consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled()
+            });
             match fill {
                 Some(fill) => bundle
                     .mtp_append_rows(
@@ -5311,50 +5383,93 @@ pub(crate) fn mtp_prefill_chunk(
     reuse_trunk_ids: bool,
     abort: &dyn Fn() -> bool,
 ) -> Result<Option<u32>, String> {
-    let max_chunk=bundle.spec_chunk_rows().unwrap_or(1).max(1);
-    let paired=bundle.npu_trunk_planned() && chunk.len()>max_chunk;
+    let max_chunk = bundle.spec_chunk_rows().unwrap_or(1).max(1);
+    let paired = bundle.npu_trunk_planned() && chunk.len() > max_chunk;
     // The pair's banks and its interior snapshot row: the target forward runs
     // them through the pair executor, and the head appends follow the same
     // banks and cut.
-    let shape=if paired {
-        Some(bundle.npu_trunk_pair_shape(pos,chunk.len(),max_chunk).filter(|shape|shape.total()==chunk.len())
-            .ok_or_else(||"Qwen4 npu-trunk: scheduled pair group has no matching plan".to_string())?)
-    } else {None};
-    let pick=mtp_prefill_target(bundle,gpu,chunk,needs_pick)?;
-    if let Some(shape)=&shape {
+    let shape = if paired {
+        Some(
+            bundle
+                .npu_trunk_pair_shape(pos, chunk.len(), max_chunk)
+                .filter(|shape| shape.total() == chunk.len())
+                .ok_or_else(|| {
+                    "Qwen4 npu-trunk: scheduled pair group has no matching plan".to_string()
+                })?,
+        )
+    } else {
+        None
+    };
+    let pick = mtp_prefill_target(bundle, gpu, chunk, needs_pick)?;
+    if let Some(shape) = &shape {
         // The target captured both banks together, but head append boundaries,
         // prompt-id uploads and pending rows remain those of the sequential run.
         for piece in shape.pieces() {
-            let tokens=&chunk[piece.clone()];
-            mtp_append_prefill_chunk(bundle,gpu,tokens,pos+piece.start,piece.start,
-                pending,append_scratch.as_deref_mut(),false,abort)?;
-            if piece.end<chunk.len() {
-                bundle.publish_pair_session_boundary(gpu, pos + piece.end).map_err(|e| e.to_string())?;
+            let tokens = &chunk[piece.clone()];
+            mtp_append_prefill_chunk(
+                bundle,
+                gpu,
+                tokens,
+                pos + piece.start,
+                piece.start,
+                pending,
+                append_scratch.as_deref_mut(),
+                false,
+                abort,
+            )?;
+            if piece.end < chunk.len() {
+                bundle
+                    .publish_pair_session_boundary(gpu, pos + piece.end)
+                    .map_err(|e| e.to_string())?;
             }
         }
     } else {
-        mtp_append_prefill_chunk(bundle,gpu,chunk,pos,0,pending,append_scratch,
-            reuse_trunk_ids,abort)?;
+        mtp_append_prefill_chunk(
+            bundle,
+            gpu,
+            chunk,
+            pos,
+            0,
+            pending,
+            append_scratch,
+            reuse_trunk_ids,
+            abort,
+        )?;
     }
     Ok(pick)
 }
 
 fn mtp_prefill_target(
-    bundle: &mut Qwen4Bundle, gpu: &mut Gpu, chunk: &[u32], needs_pick: bool,
-) -> Result<Option<u32>,String> {
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    chunk: &[u32],
+    needs_pick: bool,
+) -> Result<Option<u32>, String> {
     if needs_pick {
-        bundle.spec_prefill_rows(gpu,chunk,true).map(Some).map_err(|e|e.to_string())
+        bundle
+            .spec_prefill_rows(gpu, chunk, true)
+            .map(Some)
+            .map_err(|e| e.to_string())
     } else {
-        bundle.spec_prefill_rows_silent(gpu,chunk).map(|_|None).map_err(|e|e.to_string())
+        bundle
+            .spec_prefill_rows_silent(gpu, chunk)
+            .map(|_| None)
+            .map_err(|e| e.to_string())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn mtp_append_prefill_chunk(
-    bundle: &mut Qwen4Bundle, gpu: &mut Gpu, chunk: &[u32], pos: usize,
-    hidden_row0: usize, pending: &GpuTensor, append_scratch: Option<&mut MtpAppendScratch>,
-    reuse_trunk_ids: bool, abort: &dyn Fn()->bool,
-) -> Result<(),String> {
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    chunk: &[u32],
+    pos: usize,
+    hidden_row0: usize,
+    pending: &GpuTensor,
+    append_scratch: Option<&mut MtpAppendScratch>,
+    reuse_trunk_ids: bool,
+    abort: &dyn Fn() -> bool,
+) -> Result<(), String> {
     // The head's batched rows route: the incumbent batched fill
     // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
     // fill (exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET` on unless `0`), which uses
@@ -5408,7 +5523,7 @@ fn mtp_append_prefill_chunk(
                 // one). Under DET a lone row takes the rows route below
                 // instead, through the same kernels as every other row.
                 bundle
-                    .copy_spec_hidden_row_to(gpu, hidden_row0+off, pending)
+                    .copy_spec_hidden_row_to(gpu, hidden_row0 + off, pending)
                     .map_err(|error| error.to_string())?;
                 bundle
                     .mtp_append_token(gpu, chunk[off], Some(pending), position)
@@ -5429,7 +5544,7 @@ fn mtp_append_prefill_chunk(
                         MtpFillContext::PromptFill,
                         scratch,
                         &chunk[off..off + n],
-                        hidden_row0+off,
+                        hidden_row0 + off,
                         prefill_trunk_ids_row(reuse_trunk_ids, off),
                         prompt_ids.as_ref(),
                         position,
@@ -5441,7 +5556,7 @@ fn mtp_append_prefill_chunk(
         // The per-row loop leaves `pending` on the chunk's last row: the
         // next draft step's row-0 hidden.
         bundle
-            .copy_spec_hidden_row_to(gpu, hidden_row0+chunk.len()-1, pending)
+            .copy_spec_hidden_row_to(gpu, hidden_row0 + chunk.len() - 1, pending)
             .map_err(|error| error.to_string())?;
     } else {
         for (index, &token) in chunk.iter().enumerate() {
@@ -5453,7 +5568,7 @@ fn mtp_append_prefill_chunk(
                 .checked_add(index)
                 .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
             bundle
-                .copy_spec_hidden_row_to(gpu, hidden_row0+index, pending)
+                .copy_spec_hidden_row_to(gpu, hidden_row0 + index, pending)
                 .map_err(|error| error.to_string())?;
             bundle
                 .mtp_append_token(gpu, token, Some(pending), position)
@@ -5641,7 +5756,6 @@ impl Qwen4MtpDrafter {
             Some((30.3, 14.8))
         } else {
             None
-
         }
     }
 
@@ -5926,8 +6040,7 @@ impl Qwen4MtpDrafter {
             self.ngram_candidates
                 .extend_from_slice(&plan.ngram_candidates);
         }
-        let (hit, k, trace, floor_active) =
-            (plan.ngram_hit, plan.k, plan.trace, plan.floor_active);
+        let (hit, k, trace, floor_active) = (plan.ngram_hit, plan.k, plan.trace, plan.floor_active);
         // The window before this one stays repairable only until now.
         self.release_retained(target);
         if plan.route == WindowRoute::ArRetired {
@@ -5957,9 +6070,7 @@ impl Qwen4MtpDrafter {
         self.ensure_resources(gpu, target)?;
         let depth = match plan.route {
             WindowRoute::Native { depth } => depth,
-            WindowRoute::ArCalibrate => {
-                return self.mtp_ar_step(gpu, target, position, seed, true)
-            }
+            WindowRoute::ArCalibrate => return self.mtp_ar_step(gpu, target, position, seed, true),
             WindowRoute::ArRetired | WindowRoute::ArRouted => {
                 return self.mtp_ar_step(gpu, target, position, seed, false)
             }
@@ -6012,7 +6123,13 @@ impl Qwen4MtpDrafter {
             let window = window?;
             self.observe_agreement(&window);
             let stats = WindowStats::of(&window, 0);
-            self.finish_floor_window(!floor_active, NativeWindow::Interleaved, stats, k, window_start);
+            self.finish_floor_window(
+                !floor_active,
+                NativeWindow::Interleaved,
+                stats,
+                k,
+                window_start,
+            );
             return Ok(window);
         }
         // History picks the route and the most drafts; the drafts' own
@@ -6200,9 +6317,10 @@ impl Qwen4MtpDrafter {
                 .expect("MTP snapshot remains active until transaction commit");
             // The whole captured hidden and the verify's PLE rows from row 0.
             let verify_hidden = {
-                let hidden = picks.spec_hidden.as_ref().ok_or_else(|| {
-                    "Qwen4 native MTP spec hidden is not allocated".to_string()
-                })?;
+                let hidden = picks
+                    .spec_hidden
+                    .as_ref()
+                    .ok_or_else(|| "Qwen4 native MTP spec hidden is not allocated".to_string())?;
                 hidden.sub_offset(0, hidden.numel())
             };
             let ple_normed = picks
@@ -6387,10 +6505,14 @@ impl Qwen4MtpDrafter {
             }
             // A chunk ends at the session cache's next snapshot boundary when
             // one lies inside the natural chunk, else at the natural chunk end.
-            Self::bundle(target)?.poll_npu_trunk(gpu).map_err(|error| error.to_string())?;
-            let rows=Self::bundle(target)?.prefill_schedule_rows(pos,prompt_tokens.len(),chunk_rows);
-            let natural=pos.checked_add(rows)
-                .ok_or_else(||"Qwen4 native MTP prefill position overflow".to_string())?;
+            Self::bundle(target)?
+                .poll_npu_trunk(gpu)
+                .map_err(|error| error.to_string())?;
+            let rows =
+                Self::bundle(target)?.prefill_schedule_rows(pos, prompt_tokens.len(), chunk_rows);
+            let natural = pos
+                .checked_add(rows)
+                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
             let end = natural;
             if end <= pos || end > natural {
                 return Err(format!(
@@ -6402,9 +6524,11 @@ impl Qwen4MtpDrafter {
             // Only the prompt's last chunk's pick is read (the seed): an
             // earlier chunk still captures its full wide hidden for the head
             // but skips the final hyper, LM head, argmax and readback.
-            let needs_pick=if chunk.len()>chunk_rows {
-                end==prompt_tokens.len()
-            } else {mtp_prefill_chunk_needs_pick(end,prompt_tokens.len(),skip_intermediate_pick)};
+            let needs_pick = if chunk.len() > chunk_rows {
+                end == prompt_tokens.len()
+            } else {
+                mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick)
+            };
             let pick = mtp_prefill_chunk(
                 Self::bundle(target)?,
                 gpu,
@@ -6515,19 +6639,39 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // An NPU fault latches the route off; the request then reruns from the re-planned session start with the exact
         // GPU-only schedule (`mtp_prefill_from` restores or resets target, head and draft policy before its first row).
         let prompt_len = prompt_tokens.len();
-        let mut run = MtpPrefillRun { drafter: self, target, restart: 0 };
+        let mut run = MtpPrefillRun {
+            drafter: self,
+            target,
+            restart: 0,
+        };
         crate::npu_trunk::containment::rerun_after_fault(
             &mut run,
             prompt_len,
             start_pos,
             |run, start| {
-                let hit = if start == start_pos { cache_hit } else { start > 0 };
-                run.drafter.mtp_prefill_from(gpu, &mut *run.target, prompt_tokens, start, hit, abort)
+                let hit = if start == start_pos {
+                    cache_hit
+                } else {
+                    start > 0
+                };
+                run.drafter.mtp_prefill_from(
+                    gpu,
+                    &mut *run.target,
+                    prompt_tokens,
+                    start,
+                    hit,
+                    abort,
+                )
             },
             |run| {
-                let Ok(bundle) = Qwen4MtpDrafter::bundle(&mut *run.target) else { return false; };
-                if !bundle.take_npu_trunk_fault() { return false; }
-                run.restart = bundle.session_plan_capped(prompt_tokens, SessionRoute::Mtp, prompt_len);
+                let Ok(bundle) = Qwen4MtpDrafter::bundle(&mut *run.target) else {
+                    return false;
+                };
+                if !bundle.take_npu_trunk_fault() {
+                    return false;
+                }
+                run.restart =
+                    bundle.session_plan_capped(prompt_tokens, SessionRoute::Mtp, prompt_len);
                 true
             },
             |run| run.restart,
@@ -7046,7 +7190,9 @@ pub fn native_mtp_device_bytes(
     )?;
     let (resident, scratch) =
         crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
-    u64::try_from(resident).ok()?.checked_add(u64::try_from(scratch).ok()?.max(request))
+    u64::try_from(resident)
+        .ok()?
+        .checked_add(u64::try_from(scratch).ok()?.max(request))
 }
 
 /// Device bytes the first speculative request of a native MTP load of
@@ -7070,8 +7216,9 @@ pub fn native_mtp_request_bytes(
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
     let verify_rows = crate::bundle::spec_hidden_capacity_rows(
-        rows.max(max_seq.min(chunk_rows)),chunk_rows,
-        crate::npu_trunk::NpuTrunkMode::from_env().ok()==Some(crate::npu_trunk::NpuTrunkMode::On),
+        rows.max(max_seq.min(chunk_rows)),
+        chunk_rows,
+        crate::npu_trunk::NpuTrunkMode::from_env().ok() == Some(crate::npu_trunk::NpuTrunkMode::On),
     )?;
     let capture = match row_capture {
         Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
@@ -7230,7 +7377,12 @@ mod tests {
         // Every pass covers the chunk exactly once, in order.
         for batched in [true, false] {
             for rows in [1usize, 2, 7, 1023, 1024, 1025, 4097] {
-                assert_eq!(prompt_fill_passes(rows, batched, 1024).iter().sum::<usize>(), rows);
+                assert_eq!(
+                    prompt_fill_passes(rows, batched, 1024)
+                        .iter()
+                        .sum::<usize>(),
+                    rows
+                );
             }
         }
     }
@@ -7694,7 +7846,11 @@ mod tests {
             assert_eq!(owners, start + step.emit.len(), "k={k}");
             // The terminal pending-seed flush writes exactly that one row to
             // both owners and meets the host cursor.
-            assert_eq!(native_commit_position(owners, 1).unwrap(), owners + 1, "k={k}");
+            assert_eq!(
+                native_commit_position(owners, 1).unwrap(),
+                owners + 1,
+                "k={k}"
+            );
             if k == 1 {
                 assert_eq!(owners, 1258);
                 assert_eq!(native_commit_position(owners, 1).unwrap(), 1259);
@@ -7719,7 +7875,10 @@ mod tests {
         let plan = plan_of(&mut drafter, 3, None);
         assert_eq!(plan.route, WindowRoute::ArRetired);
         assert!(plan.floor_active && !plan.ngram_hit);
-        assert!(drafter.ngram_candidates.is_empty(), "the pool was never asked");
+        assert!(
+            drafter.ngram_candidates.is_empty(),
+            "the pool was never asked"
+        );
         assert_eq!(drafter.ngram_yield, (20.0, 5.0));
 
         // The request's first window calibrates AR before any pool hit.
@@ -7821,7 +7980,11 @@ mod tests {
         drafter.push_replay(ReplayOp::Reset);
         assert_eq!(
             drafter.pending_replay(),
-            &[ReplayOp::Reset, ReplayOp::Configure(cfg(1)), ReplayOp::Reset]
+            &[
+                ReplayOp::Reset,
+                ReplayOp::Configure(cfg(1)),
+                ReplayOp::Reset
+            ]
         );
         // A later configure supersedes the earlier one.
         MtpDrafter::configure_request(&mut drafter, cfg(2));
@@ -7879,10 +8042,7 @@ mod tests {
         assert!(!replica.floor.retired);
         // Both count the window (stats are rank-local bookkeeping).
         assert_eq!(leader.stats.mtp_windows, replica.stats.mtp_windows);
-        assert_eq!(
-            window_key(Ok(window.clone())),
-            Ok((vec![1, 2], 1, 1))
-        );
+        assert_eq!(window_key(Ok(window.clone())), Ok((vec![1, 2], 1, 1)));
     }
 
     #[test]
@@ -7893,7 +8053,11 @@ mod tests {
             accepted,
             drafts_generated,
         };
-        assert_eq!(drafter.batched_depth(3), 3, "the prior drafts the full depth");
+        assert_eq!(
+            drafter.batched_depth(3),
+            3,
+            "the prior drafts the full depth"
+        );
         // One depth-3 rejection drops that depth below its threshold.
         drafter.observe_agreement(&window(2, 3));
         assert_eq!(drafter.batched_depth(3), 2, "the rejected depth is dropped");
@@ -7950,13 +8114,9 @@ mod tests {
             let mut combined = (0.0, 0.0);
             for route in [NativeWindow::Interleaved, NativeWindow::Batched] {
                 for _ in 0..2 {
-                    drafter.floor.observe_native(
-                        route,
-                        &window(1, 1),
-                        40.0,
-                        3,
-                        &drafter.agreement,
-                    );
+                    drafter
+                        .floor
+                        .observe_native(route, &window(1, 1), 40.0, 3, &drafter.agreement);
                     combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
                 }
             }
@@ -7965,12 +8125,11 @@ mod tests {
                 drafter.floor.interleaved,
                 (40.0 * decay + 40.0, 2.0 * decay + 2.0)
             );
-            assert_eq!(
-                drafter.floor.batched[1],
-                (40.0 * decay + 40.0, decay + 1.0)
-            );
+            assert_eq!(drafter.floor.batched[1], (40.0 * decay + 40.0, decay + 1.0));
             for _ in 0..2 {
-                assert!(!drafter.floor.observe_external(2, 40.0, 1, &drafter.agreement));
+                assert!(!drafter
+                    .floor
+                    .observe_external(2, 40.0, 1, &drafter.agreement));
                 combined = (combined.0 * decay + 40.0, combined.1 * decay + 2.0);
             }
             assert_eq!(drafter.floor.combined, combined);
@@ -8031,16 +8190,33 @@ mod tests {
 
     /// `n` batched windows routed at and drafting `depth`, every draft
     /// accepted, `us` each.
-    fn batched_windows(floor: &mut MtpFloor, agreement: &Agreement, depth: usize, us: f32, n: usize) {
+    fn batched_windows(
+        floor: &mut MtpFloor,
+        agreement: &Agreement,
+        depth: usize,
+        us: f32,
+        n: usize,
+    ) {
         for _ in 0..n {
-            floor.observe_native(NativeWindow::Batched, &window(depth, depth), us, 7, agreement);
+            floor.observe_native(
+                NativeWindow::Batched,
+                &window(depth, depth),
+                us,
+                7,
+                agreement,
+            );
         }
     }
 
     /// `n` batched windows that drafted `depth` tokens but realized three
     /// committed tokens in 60 us (20 us per token), whatever the agreement
     /// predicts.
-    fn batched_windows_realized(floor: &mut MtpFloor, agreement: &Agreement, depth: usize, n: usize) {
+    fn batched_windows_realized(
+        floor: &mut MtpFloor,
+        agreement: &Agreement,
+        depth: usize,
+        n: usize,
+    ) {
         for _ in 0..n {
             floor.observe_native(NativeWindow::Batched, &window(2, depth), 60.0, 7, agreement);
         }
@@ -8331,14 +8507,21 @@ mod tests {
         let good = agreement(1.8, 2.0);
         let mut floor = MtpFloor::new();
         floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
-        assert_eq!(floor.combined, (0.0, 0.0), "uncalibrated windows are not priced");
+        assert_eq!(
+            floor.combined,
+            (0.0, 0.0),
+            "uncalibrated windows are not priced"
+        );
         floor.observe_calibration(30.0, &good);
         floor.observe_native(NativeWindow::Batched, &window(2, 2), 75.0, 3, &good);
         assert_eq!(floor.combined, (75.0, 3.0));
         floor.observe_native(NativeWindow::Interleaved, &window(1, 1), 40.0, 3, &good);
         assert_eq!(
             floor.combined,
-            (75.0 * MTP_AGREEMENT_DECAY + 40.0, 3.0 * MTP_AGREEMENT_DECAY + 2.0)
+            (
+                75.0 * MTP_AGREEMENT_DECAY + 40.0,
+                3.0 * MTP_AGREEMENT_DECAY + 2.0
+            )
         );
         let before = floor.combined;
         floor.observe_native(NativeWindow::Batched, &window(1, 1), f32::NAN, 3, &good);
@@ -8346,7 +8529,10 @@ mod tests {
         floor.observe_external(4, 40.0, 4, &good);
         assert_eq!(
             floor.combined,
-            (before.0 * MTP_AGREEMENT_DECAY + 40.0, before.1 * MTP_AGREEMENT_DECAY + 4.0)
+            (
+                before.0 * MTP_AGREEMENT_DECAY + 40.0,
+                before.1 * MTP_AGREEMENT_DECAY + 4.0
+            )
         );
         assert_eq!(MtpFloor::new().combined, (0.0, 0.0));
     }
@@ -8446,7 +8632,10 @@ mod tests {
         }
         let caps = floor.caps[3];
         let window_us = caps.us / caps.windows;
-        let (one, three) = (caps.drafted[1] / caps.windows, caps.drafted[3] / caps.windows);
+        let (one, three) = (
+            caps.drafted[1] / caps.windows,
+            caps.drafted[3] / caps.windows,
+        );
         assert!((one - 1.0 / 3.0).abs() < 0.05 && (three - 2.0 / 3.0).abs() < 0.05);
         // At 0.8 agreement a window drafting d emits 1 + 0.8 + ... + 0.8^d.
         let e = |d: i32| (0..=d).map(|i| 0.8f32.powi(i)).sum::<f32>();
@@ -8462,7 +8651,9 @@ mod tests {
         assert!((cost(2) - down).abs() < 1.0, "{} vs {down}", cost(2));
         assert_eq!(floor.cap_cost(&good, 1), None);
         assert_eq!(floor.cap_cost(&good, 5), None);
-        assert!(floor.trace_line(&good, "t", 1.0, 1, 3).contains("\"route\":\"cap4\",\"modeled\":true"));
+        assert!(floor
+            .trace_line(&good, "t", 1.0, 1, 3)
+            .contains("\"route\":\"cap4\",\"modeled\":true"));
         // The row is the request's own: windows drafting 2 and 3 rows at the
         // R9700's 12.4 ms per row fit it within a few percent.
         for _ in 0..20 {
@@ -8536,7 +8727,11 @@ mod tests {
             .with_decay(decay)
             .with_retire_evidence(MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS);
         let mut draws = Draws(seed.max(1));
-        let mut run = ChooserRun { depths: Vec::with_capacity(windows), tokens: 0.0, us: 0.0 };
+        let mut run = ChooserRun {
+            depths: Vec::with_capacity(windows),
+            tokens: 0.0,
+            us: 0.0,
+        };
         while run.depths.len() < windows {
             if forced.is_none() && floor.needs_ar_sample() {
                 floor.observe_calibration(ar_us, &agreement);
@@ -8560,12 +8755,24 @@ mod tests {
                 FloorRoute::Interleaved => {
                     let accepted = (0..k).take_while(|_| draws.next() < p).count();
                     let us = ar_us * (accepted + 1) as f32;
-                    (0, (accepted + 1).min(k), accepted, us, NativeWindow::Interleaved)
+                    (
+                        0,
+                        (accepted + 1).min(k),
+                        accepted,
+                        us,
+                        NativeWindow::Interleaved,
+                    )
                 }
                 FloorRoute::Batched(cap) => {
                     let drafted = cap.min(kept.max(1));
                     let accepted = (0..drafted).take_while(|_| draws.next() < p).count();
-                    (cap, drafted, accepted, window_us[drafted], NativeWindow::Batched)
+                    (
+                        cap,
+                        drafted,
+                        accepted,
+                        window_us[drafted],
+                        NativeWindow::Batched,
+                    )
                 }
             };
             observe_agreement(&mut agreement, &window(accepted, drafts), decay);
@@ -8599,13 +8806,15 @@ mod tests {
 
     /// Halo gfx1151 Flash-Next mq4-xts window medians by drafted depth
     /// (fnrw-halo forced K=5/7 and adaptive traces) and its AR step.
-    const HALO_WINDOW_US: [f32; 8] =
-        [0.0, 38_500.0, 44_500.0, 51_700.0, 59_800.0, 67_000.0, 85_000.0, 92_600.0];
+    const HALO_WINDOW_US: [f32; 8] = [
+        0.0, 38_500.0, 44_500.0, 51_700.0, 59_800.0, 67_000.0, 85_000.0, 92_600.0,
+    ];
     const HALO_AR_US: f32 = 28_450.0;
     /// R9700 gfx1201: 48.7 ms at one draft plus 12.4 ms per extra row
     /// (fnrw-r9700 `DEPTH-RECORDS.md`), and its AR step.
-    const R9700_WINDOW_US: [f32; 8] =
-        [0.0, 48_700.0, 61_100.0, 73_500.0, 85_900.0, 98_300.0, 110_700.0, 123_100.0];
+    const R9700_WINDOW_US: [f32; 8] = [
+        0.0, 48_700.0, 61_100.0, 73_500.0, 85_900.0, 98_300.0, 110_700.0, 123_100.0,
+    ];
     const R9700_AR_US: f32 = 28_600.0;
 
     /// Sixteen seeded 60-window requests of one stream through
@@ -8622,7 +8831,9 @@ mod tests {
 
     impl ChooserScenario {
         fn best_depth(&self) -> usize {
-            (1..8).max_by(|&a, &b| self.forced[a].total_cmp(&self.forced[b])).expect("depths")
+            (1..8)
+                .max_by(|&a, &b| self.forced[a].total_cmp(&self.forced[b]))
+                .expect("depths")
         }
 
         /// Share of the late native windows (retired AR tokens excluded)
@@ -8650,7 +8861,11 @@ mod tests {
                 .sum::<f32>()
                 / seeds.clone().count() as f32
         };
-        let mut scenario = ChooserScenario { rate: mean(None), forced: [0.0; 8], late: [0; 9] };
+        let mut scenario = ChooserScenario {
+            rate: mean(None),
+            forced: [0.0; 8],
+            late: [0; 9],
+        };
         for depth in 1..8 {
             scenario.forced[depth] = mean(Some(depth));
         }
@@ -8671,7 +8886,12 @@ mod tests {
     #[test]
     fn chooser_climbs_out_of_a_pruned_slow_start() {
         let code = |w: usize| if w < 4 { (0.3, 2) } else { (0.93, 7) };
-        let s = chooser_scenario(HALO_WINDOW_US, HALO_AR_US, MTP_AGREEMENT_DECAY_GFX1151, code);
+        let s = chooser_scenario(
+            HALO_WINDOW_US,
+            HALO_AR_US,
+            MTP_AGREEMENT_DECAY_GFX1151,
+            code,
+        );
         assert_eq!(s.best_depth(), 5, "{s:?}");
         assert!(s.late_share(|d| d == 5) >= 0.7, "{s:?}");
         // One-row probes past the optimum stay a small share of windows.
@@ -8687,17 +8907,32 @@ mod tests {
     /// acceptance (0.72) on either card the chooser stays at 2-3.
     #[test]
     fn chooser_stays_shallow_where_deeper_rows_lose() {
-        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.8, 7));
+        let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
+            (0.8, 7)
+        });
         assert!(matches!(r9700.best_depth(), 2 | 3), "{r9700:?}");
         assert!(r9700.forced[5] < 0.94 * r9700.forced[3], "{r9700:?}");
-        assert!(r9700.late_share(|d| (5..8).contains(&d)) <= 0.1, "{r9700:?}");
+        assert!(
+            r9700.late_share(|d| (5..8).contains(&d)) <= 0.1,
+            "{r9700:?}"
+        );
         // The calibration token and three table-depth probe windows are in
         // the chooser's rate, not in the fixed depths'.
-        assert!(r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()], "{r9700:?}");
+        assert!(
+            r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()],
+            "{r9700:?}"
+        );
         let prose = |w: usize| if w < 4 { (0.3, 2) } else { (0.72, 7) };
         for s in [
-            chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.72, 7)),
-            chooser_scenario(HALO_WINDOW_US, HALO_AR_US, MTP_AGREEMENT_DECAY_GFX1151, prose),
+            chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
+                (0.72, 7)
+            }),
+            chooser_scenario(
+                HALO_WINDOW_US,
+                HALO_AR_US,
+                MTP_AGREEMENT_DECAY_GFX1151,
+                prose,
+            ),
         ] {
             assert!(matches!(s.best_depth(), 2 | 3), "{s:?}");
             assert!(s.late_share(|d| (1..=3).contains(&d)) >= 0.85, "{s:?}");
@@ -8717,21 +8952,41 @@ mod tests {
     fn chooser_prices_the_margin_prune_into_the_cap() {
         let mixed = |w: usize| {
             let h = (w as u32).wrapping_mul(2_654_435_761) >> 24;
-            if h % 100 < 55 { (0.92, 7) } else { (0.45, 1) }
+            if h % 100 < 55 {
+                (0.92, 7)
+            } else {
+                (0.45, 1)
+            }
         };
-        let halo = chooser_scenario(HALO_WINDOW_US, HALO_AR_US, MTP_AGREEMENT_DECAY_GFX1151, mixed);
+        let halo = chooser_scenario(
+            HALO_WINDOW_US,
+            HALO_AR_US,
+            MTP_AGREEMENT_DECAY_GFX1151,
+            mixed,
+        );
         assert!(halo.best_depth() >= 3, "{halo:?}");
-        assert!(halo.rate >= 0.95 * halo.forced[halo.best_depth()], "{halo:?}");
-        assert!(halo.late_share(|d| d + 1 >= halo.best_depth() && d <= halo.best_depth() + 1) >= 0.7, "{halo:?}");
+        assert!(
+            halo.rate >= 0.95 * halo.forced[halo.best_depth()],
+            "{halo:?}"
+        );
+        assert!(
+            halo.late_share(|d| d + 1 >= halo.best_depth() && d <= halo.best_depth() + 1) >= 0.7,
+            "{halo:?}"
+        );
         let r9700 = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, mixed);
-        assert!(r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()], "{r9700:?}");
+        assert!(
+            r9700.rate >= 0.93 * r9700.forced[r9700.best_depth()],
+            "{r9700:?}"
+        );
     }
 
     /// The same rule finds depth where a dearer row still pays: R9700 row
     /// prices at code acceptance.
     #[test]
     fn chooser_goes_deep_on_r9700_costs_when_acceptance_pays() {
-        let s = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| (0.93, 7));
+        let s = chooser_scenario(R9700_WINDOW_US, R9700_AR_US, MTP_AGREEMENT_DECAY, |_| {
+            (0.93, 7)
+        });
         assert!(s.best_depth() >= 4, "{s:?}");
         assert!(s.late_share(|d| d >= 4 && d < 8) >= 0.6, "{s:?}");
         assert!(s.rate >= 0.95 * s.forced[s.best_depth()], "{s:?}");
@@ -9052,8 +9307,18 @@ mod tests {
         MtpDrafter::configure_request(&mut drafter, SpecRequestConfig::default());
         drafter.floor.observe_calibration(30_000.0, &good);
         for depth in [3, 5] {
-            drafter.floor_observe_native(false, NativeWindow::Batched, &window(depth, depth), 75_000.0, 7);
-            assert_eq!(drafter.floor.batched[depth], (75_000.0, 1.0), "depth {depth}");
+            drafter.floor_observe_native(
+                false,
+                NativeWindow::Batched,
+                &window(depth, depth),
+                75_000.0,
+                7,
+            );
+            assert_eq!(
+                drafter.floor.batched[depth],
+                (75_000.0, 1.0),
+                "depth {depth}"
+            );
         }
     }
 
@@ -9318,7 +9583,10 @@ mod tests {
             .collect();
         target.push(dev_dist(&dev_peaked(6), dev_spec(None)));
         let accepted_drafts: Vec<u32> = tops.iter().map(|&top| top as u32).collect();
-        let qs: Vec<SparseDist> = accepted_drafts.iter().map(|&token| dev_point(token)).collect();
+        let qs: Vec<SparseDist> = accepted_drafts
+            .iter()
+            .map(|&token| dev_point(token))
+            .collect();
         for seed in 0..32 {
             let verdict = dev_check_window(&target, &qs, &accepted_drafts, DEV_NO_EOS, seed);
             assert_eq!(verdict.accepted, 3);
@@ -9403,7 +9671,10 @@ mod tests {
             let (verdict, decoded) = dev_check_step(&p, &q, 4, DEV_NO_EOS, seed);
             assert_eq!(verdict, DraftVerdict::Accept);
             assert_eq!(decoded.consumed, 1);
-            assert!(!decoded.hit_eos, "a kernel-only stop is not the request EOS");
+            assert!(
+                !decoded.hit_eos,
+                "a kernel-only stop is not the request EOS"
+            );
         }
     }
 
@@ -9416,7 +9687,10 @@ mod tests {
             let (verdict, decoded) = dev_check_step(&p, &q, 2, 4, seed);
             assert_eq!(verdict, DraftVerdict::Reject(4));
             assert_eq!(decoded.consumed, 2);
-            assert!(decoded.hit_eos, "the residual replacement is the request EOS");
+            assert!(
+                decoded.hit_eos,
+                "the residual replacement is the request EOS"
+            );
             let (_, decoded) = dev_check_step(&p, &q, 2, DEV_NO_EOS, seed);
             assert_eq!(decoded.consumed, 2);
             assert!(!decoded.hit_eos);
@@ -9452,7 +9726,13 @@ mod tests {
                 let want = p.sample(host_rng.next_f32());
                 let mut tape = [0.0f32; 1];
                 fill_uniform_tape(&base, &mut tape);
-                let words = dev_simulate_accept(std::slice::from_ref(&p), &[], &[], &tape, SPEC_CPU_AR_EOS_NONE);
+                let words = dev_simulate_accept(
+                    std::slice::from_ref(&p),
+                    &[],
+                    &[],
+                    &tape,
+                    SPEC_CPU_AR_EOS_NONE,
+                );
                 let verdict = decode_device_verdict(&[], words, SPEC_CPU_AR_EOS_NONE).unwrap();
                 assert_eq!(verdict.terminal, Some(want));
                 assert_eq!(verdict.consumed, 1);
@@ -9468,13 +9748,25 @@ mod tests {
     fn device_verdict_decoding_rejects_impossible_words() {
         let drafts = [5u32, 6, 7];
         let reject = decode_device_verdict(&drafts, [1, 4], DEV_NO_EOS).unwrap();
-        assert_eq!((reject.accepted, reject.consumed, reject.terminal), (1, 3, Some(4)));
+        assert_eq!(
+            (reject.accepted, reject.consumed, reject.terminal),
+            (1, 3, Some(4))
+        );
         let bonus = decode_device_verdict(&drafts, [3, 4], DEV_NO_EOS).unwrap();
-        assert_eq!((bonus.accepted, bonus.consumed, bonus.terminal), (3, 4, Some(4)));
+        assert_eq!(
+            (bonus.accepted, bonus.consumed, bonus.terminal),
+            (3, 4, Some(4))
+        );
         let stop = decode_device_verdict(&drafts, [2, SPEC_CPU_AR_EOS_NONE], 6).unwrap();
-        assert_eq!((stop.accepted, stop.consumed, stop.terminal, stop.hit_eos), (2, 2, None, true));
+        assert_eq!(
+            (stop.accepted, stop.consumed, stop.terminal, stop.hit_eos),
+            (2, 2, None, true)
+        );
         let result = device_accept_result(&drafts, &stop);
-        assert_eq!((result.committed.as_slice(), result.accepted, result.hit_eos), (&[5u32, 6][..], 2, true));
+        assert_eq!(
+            (result.committed.as_slice(), result.accepted, result.hit_eos),
+            (&[5u32, 6][..], 2, true)
+        );
         assert!(decode_device_verdict(&drafts, [4, 1], DEV_NO_EOS).is_err());
         assert!(decode_device_verdict(&drafts, [0, SPEC_CPU_AR_EOS_NONE], DEV_NO_EOS).is_err());
     }
@@ -9497,19 +9789,62 @@ mod tests {
     fn device_accept_eligibility_is_neutral_leviathan_only() {
         let spec = SampleSpec::cpu_ar(0.7, 0.9, None, 0.0);
         assert!(device_accept_eligible(false, 0, false, true, &spec));
-        assert!(!device_accept_eligible(true, 0, false, true, &spec), "naive");
-        assert!(!device_accept_eligible(false, 64, false, true, &spec), "history window");
-        assert!(!device_accept_eligible(false, 0, true, true, &spec), "gpu penalty rows");
-        assert!(!device_accept_eligible(false, 0, false, false, &spec), "blocked tokens");
+        assert!(
+            !device_accept_eligible(true, 0, false, true, &spec),
+            "naive"
+        );
+        assert!(
+            !device_accept_eligible(false, 64, false, true, &spec),
+            "history window"
+        );
+        assert!(
+            !device_accept_eligible(false, 0, true, true, &spec),
+            "gpu penalty rows"
+        );
+        assert!(
+            !device_accept_eligible(false, 0, false, false, &spec),
+            "blocked tokens"
+        );
         for temperature in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let bad = SampleSpec { temperature, ..spec };
-            assert!(!device_accept_eligible(false, 0, false, true, &bad), "{temperature}");
+            let bad = SampleSpec {
+                temperature,
+                ..spec
+            };
+            assert!(
+                !device_accept_eligible(false, 0, false, true, &bad),
+                "{temperature}"
+            );
         }
         let wide = SampleSpec::cpu_ar(0.7, 0.9, Some(0), 0.0);
         assert!(device_accept_eligible(false, 0, false, true, &wide));
-        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { pool: 65, cap: 65, ..spec }));
-        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { cap: 0, ..spec }));
-        assert!(!device_accept_eligible(false, 0, false, true, &SampleSpec { cap: spec.pool + 1, ..spec }));
+        assert!(!device_accept_eligible(
+            false,
+            0,
+            false,
+            true,
+            &SampleSpec {
+                pool: 65,
+                cap: 65,
+                ..spec
+            }
+        ));
+        assert!(!device_accept_eligible(
+            false,
+            0,
+            false,
+            true,
+            &SampleSpec { cap: 0, ..spec }
+        ));
+        assert!(!device_accept_eligible(
+            false,
+            0,
+            false,
+            true,
+            &SampleSpec {
+                cap: spec.pool + 1,
+                ..spec
+            }
+        ));
     }
 
     #[test]

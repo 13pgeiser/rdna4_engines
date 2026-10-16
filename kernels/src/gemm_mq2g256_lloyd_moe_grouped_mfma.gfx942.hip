@@ -21,7 +21,8 @@ void gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
     const int* __restrict__ sorted_slot_index,
     const half_t* __restrict__ X_src,
     float* __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int lane = threadIdx.x;
     const int n_lane = lane & 15;
@@ -32,7 +33,7 @@ void gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
     if (row_start >= M || slot_start >= m_total) return;
 
     const int expert_id = expert_tile_ids[blockIdx.y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     const int my_row = row_start + n_lane;
     const int safe_row = my_row < M ? my_row : M - 1;

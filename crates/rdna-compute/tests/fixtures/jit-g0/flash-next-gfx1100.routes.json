@@ -287,7 +287,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "98d58c8aaf5ce7efbc7fac58eedd80427a95187f59ceda9c580f7d7619110a52",
+      "sha256": "2f4fff61535fae7babee6f9cfa6b5d4cdfe5563b520eea4850c60af2725501c0",
       "symbols": [
         "gemm_mq4g128v2_moe_grouped_wmma_gfx1151_bf16out"
       ],
@@ -331,7 +331,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "61f00e9594d7eb98b78b6d1f9a6f2b5e396e5ff1df356e13c72a395836d62240",
+      "sha256": "f82dccca09b94abe72efbfe6c4b15213be67d53f501fdd4ada28c1b4a0d71add",
       "symbols": [
         "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
       ],
@@ -643,7 +643,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+      "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
       "symbols": [
         "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
         "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -944,7 +944,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+      "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
       "symbols": [
         "moe_combine_order_top10",
         "moe_down_combine_grouped_top10_bf16in"
@@ -999,7 +999,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+      "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
       "symbols": [
         "moe_down_combine_top10_batched"
       ],
@@ -1096,7 +1096,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+      "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
       "symbols": [
         "moe_router_softmax_top10_f32"
       ],

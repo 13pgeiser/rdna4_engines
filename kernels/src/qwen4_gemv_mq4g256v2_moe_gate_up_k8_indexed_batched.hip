@@ -105,7 +105,7 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
     const float* __restrict__ x,                         // [N × K]
     float* __restrict__ y_gate,                          // [N × K_TOP × MI]
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -115,6 +115,15 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
 
     // Per-token slices into routing + input.
     const int expert_id = topk_indices[bid * K_TOP + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            const int mi_inv = M >> 1;
+            const long long base_inv = (long long)bid * K_TOP * mi_inv + (long long)krank * mi_inv;
+            if (row < mi_inv) y_gate[base_inv + row] = 0.0f;
+            else              y_up[base_inv + (row - mi_inv)] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x_row = x + (long long)bid * K;
@@ -261,7 +270,7 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batche
     const float* __restrict__ x,                         // [N × 2560]
     float* __restrict__ y_gate,                          // [N × K_TOP × MI]
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
-    int M, int K_TOP
+    int M, int K_TOP, int n_experts
 ) {
     __shared__ __align__(16) float xs[2560];
     const int krank = blockIdx.y;
@@ -273,6 +282,15 @@ extern "C" __global__ void gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batche
     if (row >= M) return;
     const int tid = threadIdx.x & 31;
     const int expert_id = topk_indices[bid * K_TOP + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            const int mi_inv = M >> 1;
+            const long long base_inv = (long long)bid * K_TOP * mi_inv + (long long)krank * mi_inv;
+            if (row < mi_inv) y_gate[base_inv + row] = 0.0f;
+            else              y_up[base_inv + (row - mi_inv)] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ row_ptr =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]) + (long long)row * 10 * 136;
     float acc = mq4v2_gate_up_row10(row_ptr, xs, tid);

@@ -78,8 +78,7 @@ use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
 
 const MQ3GL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256gl_moe_down_indexed.hip");
-const MQ3L_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
+const MQ3L_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
 const GL_FN: &str = "gemv_mq3g256gl_moe_down_residual_scaled_k8_indexed";
 const L_FN: &str = "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed";
@@ -229,7 +228,11 @@ fn build_mq3gl(m: usize, k: usize, codes: &[u8], scales: &[f32]) -> Vec<u8> {
                 out[obase + 3 * c + 1] = b[1];
                 out[obase + 3 * c + 2] = b[2];
             }
-            put_half(&mut out, idx_bytes + (row * gpr + g) * 2, scales[row * gpr + g]);
+            put_half(
+                &mut out,
+                idx_bytes + (row * gpr + g) * 2,
+                scales[row * gpr + g],
+            );
         }
     }
     out
@@ -317,9 +320,7 @@ fn decode_row_l(blob: &[u8], k: usize, row: usize, out: &mut [f32]) {
 fn packing_self_test() {
     let mut worst = 0usize;
     for pattern in 0..64u64 {
-        let codes: Vec<u8> = (0..8)
-            .map(|j| (mix(pattern * 977 + j) & 7) as u8)
-            .collect();
+        let codes: Vec<u8> = (0..8).map(|j| (mix(pattern * 977 + j) & 7) as u8).collect();
         let packed = pack_chunk(&codes);
         for j in 0..8 {
             let back = code_from_chunk(&packed, j);
@@ -402,9 +403,7 @@ fn build_case(
     // Routing: DUPLICATE experts at ranks 0/2 and 1/7 (self-contention on one
     // blob), distinct weights, two of them negative.
     let base_ids: [i32; 8] = [3, 7, 3, 11, 19, 0, 25, 7];
-    let topk_idx: Vec<i32> = (0..k_top)
-        .map(|t| base_ids[t % 8] % n_exp as i32)
-        .collect();
+    let topk_idx: Vec<i32> = (0..k_top).map(|t| base_ids[t % 8] % n_exp as i32).collect();
     let base_w: [f32; 8] = [0.31, -0.17, 0.44, 0.09, 0.22, 0.63, -0.05, 0.28];
     let topk_w: Vec<f32> = (0..k_top).map(|t| base_w[t % 8]).collect();
 
@@ -448,19 +447,28 @@ fn build_case(
     }
     let gl_ptr_t = gpu
         .upload_raw(
-            &gl_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+            &gl_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_exp],
         )
         .unwrap();
     let l_ptr_t = gpu
         .upload_raw(
-            &l_ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+            &l_ptrs
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[n_exp],
         )
         .unwrap();
     let idx_t = gpu
         .upload_raw(
-            &topk_idx.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
+            &topk_idx
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
             &[k_top],
         )
         .unwrap();
@@ -480,6 +488,7 @@ fn build_case(
     }
     bg.push_i32(m as i32);
     bg.push_i32(k as i32);
+    bg.push_i32((gl_ptr_t.buf.size() / 8) as i32);
     let gl_args = bg.into_vec();
 
     let mut bl = KernargBlob::new();
@@ -490,6 +499,7 @@ fn build_case(
     bl.push_ptr(y.buf.as_ptr() as *const _);
     bl.push_i32(m as i32);
     bl.push_i32(k as i32);
+    bl.push_i32((l_ptr_t.buf.size() / 8) as i32);
     let l_args = bl.into_vec();
 
     keep.push(gl_ptr_t);
@@ -500,7 +510,11 @@ fn build_case(
 
     println!(
         "  case {label}: M={m} K={k} gpr={gpr} k_top={k_top} n_exp={n_exp} scales={}",
-        if pow2 { "pow2 (cross-format exact)" } else { "arbitrary fp16" }
+        if pow2 {
+            "pow2 (cross-format exact)"
+        } else {
+            "arbitrary fp16"
+        }
     );
     println!(
         "    quad-loop iters={} tail groups={}   topk_idx={:?}  (dupes exercise atomic self-contention)",
@@ -703,7 +717,12 @@ fn main() {
     let mut l_args = a.l_args.clone();
     let got_gl = run_once(&mut gpu, &a, GL_FN, &mut gl_args);
     let got_l = run_once(&mut gpu, &a, L_FN, &mut l_args);
-    all_pass &= report("A MQ3GL vs CPU", &compare(&got_gl, &want_gl), &got_gl, &want_gl);
+    all_pass &= report(
+        "A MQ3GL vs CPU",
+        &compare(&got_gl, &want_gl),
+        &got_gl,
+        &want_gl,
+    );
     all_pass &= report("A MQ3L  vs CPU", &compare(&got_l, &want_l), &got_l, &want_l);
 
     // Atomic-order non-determinism band: k_top blocks atomicAdd into the same
@@ -720,7 +739,9 @@ fn main() {
     let mag = want_gl.iter().map(|v| v.abs()).sum::<f64>() / want_gl.len() as f64;
     println!(
         "    {:<22} atomic reorder band over 5 identical launches = {:.3e} ({:.2e} of mean|y|)",
-        "A MQ3GL", band, band / mag
+        "A MQ3GL",
+        band,
+        band / mag
     );
 
     // Seed pass-through: y(seed) - y(0) must reproduce the seed exactly, i.e.
@@ -764,7 +785,12 @@ fn main() {
         &bgot_gl,
         &bwant_gl,
     );
-    all_pass &= report("B MQ3L  vs CPU", &compare(&bgot_l, &bwant_l), &bgot_l, &bwant_l);
+    all_pass &= report(
+        "B MQ3L  vs CPU",
+        &compare(&bgot_l, &bwant_l),
+        &bgot_l,
+        &bwant_l,
+    );
     let cross: Vec<f64> = bgot_l.iter().map(|v| *v as f64).collect();
     all_pass &= report(
         "B MQ3GL vs MQ3L",
@@ -788,8 +814,13 @@ fn main() {
     );
 
     // ── timing (case A only: the production down shape) ────────────────────
-    println!("\n== timing (case A: M={} K={} k_top={}) ==", a.m, a.k, a.k_top);
-    println!("   first pass of any (kernel × shape) cell is JIT-contaminated — a warmup burst runs");
+    println!(
+        "\n== timing (case A: M={} K={} k_top={}) ==",
+        a.m, a.k, a.k_top
+    );
+    println!(
+        "   first pass of any (kernel × shape) cell is JIT-contaminated — a warmup burst runs"
+    );
     println!("   first and is discarded; reported numbers are from the bursts after it.");
     let warm = 32usize;
     let per = 100usize;

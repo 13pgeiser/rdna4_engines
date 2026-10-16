@@ -142,8 +142,7 @@ fn build_mq3l(m: usize, k: usize, seed: u64) -> Vec<u8> {
         for g in 0..gpr {
             let off = (row * gpr + g) * GROUP_BYTES;
             // per-group scale ~0.004..0.008 (same spirit as the MQ2 bench)
-            let s =
-                0.004f32 + ((mix(seed ^ ((row as u64) << 20) ^ g as u64) % 4000) as f32) * 1e-6;
+            let s = 0.004f32 + ((mix(seed ^ ((row as u64) << 20) ^ g as u64) % 4000) as f32) * 1e-6;
             for (e, &c) in CB8.iter().enumerate() {
                 let h = half_bits(c * s);
                 out[off + 2 * e] = (h & 0xff) as u8;
@@ -213,7 +212,10 @@ impl Case {
         let ptrs: Vec<u64> = expert_t.iter().map(|t| t.buf.as_ptr() as u64).collect();
         let ptr_t = gpu
             .upload_raw(
-                &ptrs.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>(),
+                &ptrs
+                    .iter()
+                    .flat_map(|p| p.to_le_bytes())
+                    .collect::<Vec<u8>>(),
                 &[n_exp],
             )
             .expect("upload ptr table");
@@ -266,6 +268,7 @@ impl Case {
         bb.push_i32(m as i32);
         bb.push_i32(k as i32);
         bb.push_i32(k_top as i32);
+        bb.push_i32((ptr_t.buf.size() / 8) as i32);
         let blob_batched = bb.into_vec();
 
         // N single-token blobs: same kernel, pointers pre-offset per token so
@@ -281,6 +284,7 @@ impl Case {
                 s.push_ptr(dev_off(&y_u, b * stride * 4));
                 s.push_i32(m as i32);
                 s.push_i32(k as i32);
+                s.push_i32((ptr_t.buf.size() / 8) as i32);
                 s.into_vec()
             })
             .collect();
@@ -346,7 +350,10 @@ impl Case {
             let base = row * row_bytes + g * GROUP_BYTES;
             let mut cb = [0.0f32; CB_ENTRIES];
             for (ei, c) in cb.iter_mut().enumerate() {
-                *c = half_to_f32(u16::from_le_bytes([raw[base + 2 * ei], raw[base + 2 * ei + 1]]));
+                *c = half_to_f32(u16::from_le_bytes([
+                    raw[base + 2 * ei],
+                    raw[base + 2 * ei + 1],
+                ]));
             }
             let idx = &raw[base + CB_BYTES..base + GROUP_BYTES];
             for w in 0..GROUP_WEIGHTS {
@@ -513,7 +520,9 @@ fn main() {
         GROUP_BYTES as f64 / GROUP_WEIGHTS as f64,
         GROUP_BYTES as f64 * 8.0 / GROUP_WEIGHTS as f64
     );
-    println!("NOTE: `_k4` = 4-accumulator ILP unroll, NOT k_top=4. K_TOP is a runtime arg (grid.y).");
+    println!(
+        "NOTE: `_k4` = 4-accumulator ILP unroll, NOT k_top=4. K_TOP is a runtime arg (grid.y)."
+    );
     println!("NOTE: a first-pass number is JIT-contaminated; every timing below is post-warmup.\n");
 
     gpu.ensure_kernel_public(BATCHED_MOD, BATCHED_SRC, BATCHED_FN)
@@ -688,7 +697,9 @@ fn main() {
 
     // ── C. tail-group coverage. K=2048 gives gpr=8 => quads=2, tail=0, so the
     //    kernel's three tail expansions are NEVER exercised on the a3b shape. ──
-    println!("=== C. tail-group coverage (M=256, k_top=2, N=3) - the a3b K=2048 shape has tail=0 ===");
+    println!(
+        "=== C. tail-group coverage (M=256, k_top=2, N=3) - the a3b K=2048 shape has tail=0 ==="
+    );
     for &kk in &[1280usize, 1536, 1792] {
         let gpr = kk / GROUP_WEIGHTS;
         let mut case = Case::new(&mut gpu, 256, kk, 2, 3, 8, 0x3311 + kk as u64);
@@ -730,7 +741,9 @@ fn main() {
     // ── D. timing ──
     println!("=== D. timing - batched_k4 (1 launch) vs N x single-token launches ===");
     println!("    warmup pass, then 7 timed iterations; MIN and MEDIAN reported.");
-    println!("    HIP-dispatch microbenchmark: TRIAGE ONLY, not a kernel verdict (see file header).");
+    println!(
+        "    HIP-dispatch microbenchmark: TRIAGE ONLY, not a kernel verdict (see file header)."
+    );
     println!(
         "    weight bytes/call = N x k_top x {} KiB (algorithmic; L2 reuse across repeated experts \
          is NOT subtracted)",

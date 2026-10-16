@@ -11,7 +11,8 @@
 // `slot_experts[s]`, which lives on rank `e % n_ranks`. This kernel, launched on
 // each rank, copies every row owned by ANOTHER rank from that owner's buffer
 // (peer-mapped VRAM) into the local buffer at the same row offset. Rows owned by
-// `self_rank`, and slots with a negative expert id, are never written.
+// `self_rank`, and slots whose expert id is outside `[0, n_experts)` (the router's
+// -1 marker for a non-finite row, or any corrupt id), are never written.
 //
 // Pure uint4 load/store: bit-exact for -0.0, NaN payloads and denormals (no
 // arithmetic, no float typing).
@@ -19,17 +20,18 @@
 // grid  = (ceil(n16 / blockDim.x), n_slots), block = (256, 1, 1)
 // src0..src7: row-buffer base of rank 0..7 (entries >= n_ranks may be null)
 // dst:        this rank's row-buffer base
+// n_experts:  expert ids are valid in `[0, n_experts)`; any other id owns nothing
 
 extern "C" __global__ void ep_gather_rows_by_owner(
     const int *__restrict__ slot_experts, const uint4 *src0, const uint4 *src1,
     const uint4 *src2, const uint4 *src3, const uint4 *src4, const uint4 *src5,
     const uint4 *src6, const uint4 *src7, uint4 *dst, int n_slots, int n_ranks,
-    int self_rank, int n16) {
+    int self_rank, int n16, int n_experts) {
     const int slot = (int)blockIdx.y;
     if (slot >= n_slots)
         return;
     const int e = slot_experts[slot];
-    if (e < 0)
+    if (e < 0 || e >= n_experts)
         return;
     const int owner = e % n_ranks;
     if (owner >= 8 || owner == self_rank)

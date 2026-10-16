@@ -29,7 +29,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
     const float* __restrict__ topk_weights,              // [k_top]
     const float* __restrict__ rot_batch,                 // [k_top × K] FWHT-rotated
     float*       __restrict__ x_residual,                // [M]
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -37,6 +37,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexe
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;
@@ -225,7 +226,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed(
     float* __restrict__ x_residual,
     int M,
     int K,
-    int k_top
+    int k_top, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -238,7 +239,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed(
     __shared__ float cb_lds[16];
 
     float combined = 0.0f;
-    if (rank0 < k_top) {
+    if (rank0 < k_top && (unsigned)topk_indices[rank0] < (unsigned)n_experts) {
         const int expert0 = topk_indices[rank0];
         const char* row0 =
             reinterpret_cast<const char*>(expert_ptrs[expert0])
@@ -247,7 +248,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed(
         const float dot0 = mq2_down_dot_k4(row0, x0, K, cb_lds);
         if (tid == 0) combined += topk_weights[rank0] * dot0;
     }
-    if (rank1 < k_top) {
+    if (rank1 < k_top && (unsigned)topk_indices[rank1] < (unsigned)n_experts) {
         const int expert1 = topk_indices[rank1];
         const char* row1 =
             reinterpret_cast<const char*>(expert_ptrs[expert1])
@@ -274,7 +275,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed(
     const float* __restrict__ rot_batch,
     float* __restrict__ x_residual,
     int M,
-    int K
+    int K, int n_experts
 ) {
     const int row0 = blockIdx.x * 2;
     if (row0 >= M) return;
@@ -284,6 +285,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;
@@ -414,13 +416,14 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed(
     const float* __restrict__ rot_batch,
     float* __restrict__ x_residual,
     int M,
-    int K
+    int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M || K != 2048) return;
     const int krank = blockIdx.y;
     const int tid = threadIdx.x;
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;

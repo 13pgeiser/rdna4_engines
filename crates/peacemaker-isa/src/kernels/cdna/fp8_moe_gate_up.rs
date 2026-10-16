@@ -13,18 +13,19 @@
 //! "Proposed qt55 native-FP8 grouped tile contract"; GFX942-FP8-FN-PLAN §3.3
 //! path C and §13.2.
 //!
-//! # ABI (kernargs, 68 bytes; [`KERNARG_OFFSETS`])
+//! # ABI (kernargs, 72 bytes; [`KERNARG_OFFSETS`])
 //!
 //! | offset | name | |
 //! |---|---|---|
 //! | 0 | `W` | qt=55 expert blocks: expert `e` at `W + e*expert_stride`, OCP e4m3fn codes `u8[R, K]` row-major, then BF16 `s_inv[R/128, K/128]` (a multiplier) at `+R*K` |
 //! | 8 | `expert_stride` | u64 (the PM metadata declares it as two by-value u32 halves, lo then hi: same bytes) |
-//! | 16 | `tile_desc` | `i32x4[n_tiles]` `{expert, row0, nrows, 0}`; `expert < 0` skips the tile |
+//! | 16 | `tile_desc` | `i32x4[n_tiles]` `{expert, row0, nrows, 0}`; `expert < 0` or `expert >= n_experts` skips the tile |
 //! | 24 | `sorted_rows` | `i32[n_sorted]`: flat slot or `-1` (padding) |
 //! | 32 | `X` | FNUZ e4m3 codes `u8[x_rows, K]` from the producer (`cvt_pk_fp8_f32((x/a)*0.5)`, canonical `+0`, never `0x80`) |
 //! | 40 | `x_scale` | `f32[x_rows]`: the producer's per-row power-of-two scale `a` |
 //! | 48 | `Y` | `f32[n_sorted, R]` output |
 //! | 56, 60, 64 | `R`, `K`, `x_row_div` | u32 |
+//! | 68 | `n_experts` | u32: experts in `W`; a tile whose `expert` is outside `[0, n_experts)` is skipped (fail closed, before `W + expert*expert_stride` is formed) |
 //!
 //! This is the tile interface of the BF16-MFMA baseline launcher
 //! (`gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip` in the gfx942-fp8 tree:
@@ -117,8 +118,8 @@ use peacemaker_cdna::enc::sop::{Sop1Op, Sop2Op, SopcOp, SoppOp};
 use peacemaker_cdna::enc::vop::{Vop1Op, Vop2Op, VopcOp};
 use peacemaker_cdna::enc::vop3::Vop3OnlyOp;
 use peacemaker_cdna::enc::vop3p::MaiOp;
-use peacemaker_cdna::operand::InlineFloat;
 use peacemaker_cdna::enc::vop3p::MfmaType;
+use peacemaker_cdna::operand::InlineFloat;
 use peacemaker_cdna::sim::mfma::{accumulate, AccumModel};
 use peacemaker_cdna::Src;
 
@@ -133,10 +134,10 @@ pub const COLS_PER_WG: u32 = 64;
 /// Sorted rows per M tile.
 pub const TILE_ROWS: u32 = 16;
 /// Kernarg byte offsets: W, expert_stride (lo, hi), tile_desc, sorted_rows,
-/// X, x_scale, Y, R, K, x_row_div.
-pub const KERNARG_OFFSETS: [u32; 11] = [0, 8, 12, 16, 24, 32, 40, 48, 56, 60, 64];
+/// X, x_scale, Y, R, K, x_row_div, n_experts.
+pub const KERNARG_OFFSETS: [u32; 12] = [0, 8, 12, 16, 24, 32, 40, 48, 56, 60, 64, 68];
 /// Kernarg segment bytes.
-pub const KERNARG_BYTES: u32 = 68;
+pub const KERNARG_BYTES: u32 = 72;
 /// Bytes of one staged activation row in LDS (128 codes + 16 pad).
 pub const LDS_ROW_BYTES: u32 = 144;
 /// Bytes of one 128-K activation buffer.
@@ -151,10 +152,14 @@ pub struct Shape {
 }
 
 /// The workgroup grid for `r` output columns and `n_tiles` tiles.
-pub fn grid(r: u32, n_tiles: u32) -> [u32; 3] { [r / COLS_PER_WG, n_tiles, 1] }
+pub fn grid(r: u32, n_tiles: u32) -> [u32; 3] {
+    [r / COLS_PER_WG, n_tiles, 1]
+}
 
 /// qt=55 expert block stride: `round_up(R*K + 2*ceil(R/128)*ceil(K/128), 256)`.
-pub fn expert_stride(r: usize, k: usize) -> usize { (r * k + 2 * r.div_ceil(128) * k.div_ceil(128)).div_ceil(256) * 256 }
+pub fn expert_stride(r: usize, k: usize) -> usize {
+    (r * k + 2 * r.div_ceil(128) * k.div_ceil(128)).div_ceil(256) * 256
+}
 
 fn reg(src: Src, i: u8) -> Src {
     match src {
@@ -183,18 +188,44 @@ struct Loop {
 /// the fixed order activation pair, weight pairs `t = 0..3`, scale.
 fn issue_loads(b: &mut Builder, l: &Loop) -> Result<(), String> {
     b.push(o::s1(Sop1Op::AndSaveexecB64, l.exec_save, l.m_stage))?;
-    b.push(o::global_load(FlatOp::LoadDwordx2, l.vx, l.v_xoff, Some(l.x_base), 0))?;
+    b.push(o::global_load(
+        FlatOp::LoadDwordx2,
+        l.vx,
+        l.v_xoff,
+        Some(l.x_base),
+        0,
+    ))?;
     b.push(o::s1(Sop1Op::MovB64, Src::ExecLo, l.exec_save))?;
     for t in 0..4u8 {
-        b.push(o::global_load(FlatOp::LoadDwordx2, reg(l.wr, 2 * t), l.v_woff, Some(l.w_base), 32 * i16::from(t)))?;
+        b.push(o::global_load(
+            FlatOp::LoadDwordx2,
+            reg(l.wr, 2 * t),
+            l.v_woff,
+            Some(l.w_base),
+            32 * i16::from(t),
+        ))?;
     }
-    b.push(o::global_load(FlatOp::LoadUshort, l.vswr, l.v_swoff, Some(l.w_base), 0))
+    b.push(o::global_load(
+        FlatOp::LoadUshort,
+        l.vswr,
+        l.v_swoff,
+        Some(l.w_base),
+        0,
+    ))
 }
 
 /// `dst = num / div` for `num < 2^21`, `1 <= div < 2^21`: `f32` estimate
 /// (within ±1 of the quotient for these ranges whatever the `v_rcp_f32`
 /// rounding), then one exact downward and one exact upward correction.
-fn udiv(b: &mut Builder, dst: Src, num: Src, sdiv: Src, v_rcp: Src, t: Src, t2: Src) -> Result<(), String> {
+fn udiv(
+    b: &mut Builder,
+    dst: Src,
+    num: Src,
+    sdiv: Src,
+    v_rcp: Src,
+    t: Src,
+    t2: Src,
+) -> Result<(), String> {
     b.push(o::v1(Vop1Op::CvtF32U32, t, num))?;
     b.push(o::v2(Vop2Op::MulF32, t, v_rcp, t))?;
     b.push(o::v1(Vop1Op::CvtU32F32, dst, t))?;
@@ -216,14 +247,18 @@ fn udiv(b: &mut Builder, dst: Src, num: Src, sdiv: Src, v_rcp: Src, t: Src, t2: 
 /// kernel arguments for the baseline grouped launcher: code is deliberately
 /// identical for all admitted shapes and does not specialize the K order.
 pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
-    if arch.cdna().is_none() { return Err(format!("{SYMBOL}: {} is not a CDNA target", arch.name())) }
+    if arch.cdna().is_none() {
+        return Err(format!("{SYMBOL}: {} is not a CDNA target", arch.name()));
+    }
     if shape.r == 0 || shape.r % COLS_PER_WG != 0 || shape.k == 0 || shape.k % 128 != 0 {
         return Err(format!("{SYMBOL}: R must be a positive multiple of 64 and K a positive multiple of 128: {shape:?}"));
     }
     let bytes = u64::from(shape.r) * u64::from(shape.k)
         + 2 * u64::from(shape.r.div_ceil(128)) * u64::from(shape.k / 128);
     if bytes > u64::from(u32::MAX) {
-        return Err(format!("{SYMBOL}: shape exceeds the 32-bit per-expert offset range: {shape:?}"));
+        return Err(format!(
+            "{SYMBOL}: shape exceeds the 32-bit per-expert offset range: {shape:?}"
+        ));
     }
     let mut b = Builder::new(arch, SYMBOL, WORKGROUP)?;
     let offsets = [
@@ -238,8 +273,13 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
         b.arg_u32("R")?,
         b.arg_u32("K")?,
         b.arg_u32("x_row_div")?,
+        b.arg_u32("n_experts")?,
     ];
-    if offsets != KERNARG_OFFSETS { return Err(format!("{SYMBOL}: kernarg offsets {offsets:?} differ from the ABI {KERNARG_OFFSETS:?}")) }
+    if offsets != KERNARG_OFFSETS {
+        return Err(format!(
+            "{SYMBOL}: kernarg offsets {offsets:?} differ from the ABI {KERNARG_OFFSETS:?}"
+        ));
+    }
     let wg_x = b.workgroup_id(0)?;
     let wg_y = b.workgroup_id(1)?;
     let tid = b.workitem_ids(1)?;
@@ -247,9 +287,20 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
 
     // ---- scalars
     let ka = b.sgprs(16, 4)?; // W, stride, tile_desc, sorted, X, x_scale, Y, R, K
-    let (s_w, s_stride_lo, s_stride_hi, s_td, s_sorted, s_x, s_xs, s_y, s_r, s_k) =
-        (ka, reg(ka, 2), reg(ka, 3), reg(ka, 4), reg(ka, 6), reg(ka, 8), reg(ka, 10), reg(ka, 12), reg(ka, 14), reg(ka, 15));
+    let (s_w, s_stride_lo, s_stride_hi, s_td, s_sorted, s_x, s_xs, s_y, s_r, s_k) = (
+        ka,
+        reg(ka, 2),
+        reg(ka, 3),
+        reg(ka, 4),
+        reg(ka, 6),
+        reg(ka, 8),
+        reg(ka, 10),
+        reg(ka, 12),
+        reg(ka, 14),
+        reg(ka, 15),
+    );
     let s_div = b.sgprs(1, 1)?;
+    let s_nexp = b.sgprs(1, 1)?;
     let td = b.sgprs(4, 4)?;
     let (s_expert, s_row0, s_nrows) = (td, reg(td, 1), reg(td, 2));
     let s_tda = b.sgprs(2, 2)?;
@@ -302,11 +353,18 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     let kernarg = b.kernarg_base();
     b.push(o::s_load(SmemOp::LoadDwordx16, ka, kernarg, 0))?;
     b.push(o::s_load(SmemOp::LoadDword, s_div, kernarg, 64))?;
+    b.push(o::s_load(SmemOp::LoadDword, s_nexp, kernarg, 68))?;
     b.push(o::s2(Sop2Op::LshlB32, s_t, wg_y, Src::Int(4)))?;
     b.push(o::s2(Sop2Op::AddU32, s_tda, s_td, s_t))?;
-    b.push(o::s2(Sop2Op::AddcU32, reg(s_tda, 1), reg(s_td, 1), Src::Int(0)))?;
+    b.push(o::s2(
+        Sop2Op::AddcU32,
+        reg(s_tda, 1),
+        reg(s_td, 1),
+        Src::Int(0),
+    ))?;
     b.push(o::s_load(SmemOp::LoadDwordx4, td, s_tda, 0))?;
-    b.push(o::sc(SopcOp::CmpLtI32, s_expert, Src::Int(0)))?;
+    // Fail closed: one unsigned compare skips the -1 sentinel and every id >= n_experts.
+    b.push(o::sc(SopcOp::CmpGeU32, s_expert, s_nexp))?;
     b.branch(SoppOp::CbranchScc1, "done")?;
 
     // Expert block base: W + expert * expert_stride (64-bit).
@@ -315,7 +373,12 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     b.push(o::s2(Sop2Op::MulI32, reg(s_t, 1), s_expert, s_stride_hi))?;
     b.push(o::s2(Sop2Op::AddU32, reg(s_wexp, 1), s_t, reg(s_t, 1)))?;
     b.push(o::s2(Sop2Op::AddU32, s_wexp, s_wexp, s_w))?;
-    b.push(o::s2(Sop2Op::AddcU32, reg(s_wexp, 1), reg(s_wexp, 1), reg(s_w, 1)))?;
+    b.push(o::s2(
+        Sop2Op::AddcU32,
+        reg(s_wexp, 1),
+        reg(s_wexp, 1),
+        reg(s_w, 1),
+    ))?;
 
     // Lane geometry: n = tid & 15, s = (tid & 63) >> 4, slot = tid >> 4, wave = tid >> 6.
     b.push(o::v2(Vop2Op::AndB32, vn, Src::Int(15), tid))?;
@@ -341,10 +404,22 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     b.push(o::v2(Vop2Op::AddU32, vt2, s_row0, vslot))?;
     b.push(o::v2(Vop2Op::LshlrevB32, vt2, Src::Int(2), vt2))?;
     b.push(o::s1(Sop1Op::AndSaveexecB64, exec_save, m_n))?;
-    b.push(o::global_load(FlatOp::LoadDword, v_flat_n, vt, Some(s_sorted), 0))?;
+    b.push(o::global_load(
+        FlatOp::LoadDword,
+        v_flat_n,
+        vt,
+        Some(s_sorted),
+        0,
+    ))?;
     b.push(o::s1(Sop1Op::MovB64, Src::ExecLo, exec_save))?;
     b.push(o::s1(Sop1Op::AndSaveexecB64, exec_save, m_slot))?;
-    b.push(o::global_load(FlatOp::LoadDword, v_flat_s, vt2, Some(s_sorted), 0))?;
+    b.push(o::global_load(
+        FlatOp::LoadDword,
+        v_flat_s,
+        vt2,
+        Some(s_sorted),
+        0,
+    ))?;
     b.push(o::s1(Sop1Op::MovB64, Src::ExecLo, exec_save))?;
 
     // X rows: flat / x_row_div where flat >= 0.
@@ -361,14 +436,27 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     b.push(o::s1(Sop1Op::AndSaveexecB64, exec_save, m_xn))?;
     b.push(o::global_load(FlatOp::LoadDword, v_a, vt, Some(s_xs), 0))?;
     b.push(o::s1(Sop1Op::MovB64, Src::ExecLo, exec_save))?;
-    b.push(o::v2(Vop2Op::MulF32, v_fa, Src::Float(InlineFloat::Four), v_a))?;
+    b.push(o::v2(
+        Vop2Op::MulF32,
+        v_fa,
+        Src::Float(InlineFloat::Four),
+        v_a,
+    ))?;
 
     // Global byte offsets of block 0.
     b.push(o::v3(Vop3OnlyOp::MulLoU32, vt, &[v_xrow_s, s_k]))?;
-    b.push(o::v3(Vop3OnlyOp::LshlAddU32, v_xoff, &[vn, Src::Int(3), vt]))?;
+    b.push(o::v3(
+        Vop3OnlyOp::LshlAddU32,
+        v_xoff,
+        &[vn, Src::Int(3), vt],
+    ))?;
     b.push(o::v2(Vop2Op::AddU32, vt, s_ob, vn))?;
     b.push(o::v3(Vop3OnlyOp::MulLoU32, vt, &[vt, s_k]))?;
-    b.push(o::v3(Vop3OnlyOp::LshlAddU32, v_woff, &[vs, Src::Int(3), vt]))?;
+    b.push(o::v3(
+        Vop3OnlyOp::LshlAddU32,
+        v_woff,
+        &[vs, Src::Int(3), vt],
+    ))?;
     // Scale offset: R*K + 2 * ((ob >> 7) * nkb).
     b.push(o::s2(Sop2Op::LshrB32, s_t, s_ob, Src::Int(7)))?;
     b.push(o::s2(Sop2Op::MulI32, s_t, s_t, s_nkb))?;
@@ -378,7 +466,12 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     b.push(o::v1(Vop1Op::MovB32, v_swoff, s_t))?;
 
     // LDS addresses: staging row slot bytes 8n; operand row n bytes 8s.
-    b.push(o::v2(Vop2Op::MulU32U24, vt3, Src::Lit(LDS_ROW_BYTES), vslot))?;
+    b.push(o::v2(
+        Vop2Op::MulU32U24,
+        vt3,
+        Src::Lit(LDS_ROW_BYTES),
+        vslot,
+    ))?;
     b.push(o::v3(Vop3OnlyOp::LshlAddU32, v_lw, &[vn, Src::Int(3), vt3]))?;
     b.push(o::v2(Vop2Op::MulU32U24, vt3, Src::Lit(LDS_ROW_BYTES), vn))?;
     b.push(o::v3(Vop3OnlyOp::LshlAddU32, v_lr, &[vs, Src::Int(3), vt3]))?;
@@ -388,13 +481,28 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     }
 
     // Accumulators, zero activation pair for rows that stage nothing, loop state.
-    for i in 0..4 { b.push(o::v1(Vop1Op::MovB32, reg(total, i), Src::Int(0)))? }
-    for i in 0..2 { b.push(o::v1(Vop1Op::MovB32, reg(vx, i), Src::Int(0)))? }
+    for i in 0..4 {
+        b.push(o::v1(Vop1Op::MovB32, reg(total, i), Src::Int(0)))?
+    }
+    for i in 0..2 {
+        b.push(o::v1(Vop1Op::MovB32, reg(vx, i), Src::Int(0)))?
+    }
     b.push(o::s1(Sop1Op::MovB32, s_kb, Src::Int(0)))?;
     b.push(o::s1(Sop1Op::MovB32, s_buf, Src::Int(0)))?;
     b.push(o::s1(Sop1Op::MovB32, s_c7f, Src::Lit(0x7f7f_7f7f)))?;
 
-    let lp = Loop { w_base: s_wexp, x_base: s_x, exec_save, m_stage: m_xs, vx, wr, vswr, v_xoff, v_woff, v_swoff };
+    let lp = Loop {
+        w_base: s_wexp,
+        x_base: s_x,
+        exec_save,
+        m_stage: m_xs,
+        vx,
+        wr,
+        vswr,
+        v_xoff,
+        v_woff,
+        v_swoff,
+    };
     issue_loads(&mut b, &lp)?;
 
     // ---- K loop, one 128-K block per iteration
@@ -415,7 +523,12 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     // Next block's loads (the last block reloads itself).
     b.push(o::s2(Sop2Op::AddU32, s_kb, s_kb, Src::Int(1)))?;
     b.push(o::sc(SopcOp::CmpLtU32, s_kb, s_nkb))?;
-    b.push(o::s2(Sop2Op::CselectB32, s_step, Src::Lit(128), Src::Int(0)))?;
+    b.push(o::s2(
+        Sop2Op::CselectB32,
+        s_step,
+        Src::Lit(128),
+        Src::Int(0),
+    ))?;
     b.push(o::s2(Sop2Op::CselectB32, s_step2, Src::Int(2), Src::Int(0)))?;
     b.push(o::v2(Vop2Op::AddU32, v_xoff, s_step, v_xoff))?;
     b.push(o::v2(Vop2Op::AddU32, v_woff, s_step, v_woff))?;
@@ -423,12 +536,27 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     issue_loads(&mut b, &lp)?;
     b.barrier()?;
     b.push(o::v2(Vop2Op::AddU32, v_addr, s_buf, v_lr))?;
-    for t in 0..4u8 { b.push(o::ds_read(DsOp::ReadB64, reg(vb, 2 * t), v_addr, 32 * u16::from(t)))? }
+    for t in 0..4u8 {
+        b.push(o::ds_read(
+            DsOp::ReadB64,
+            reg(vb, 2 * t),
+            v_addr,
+            32 * u16::from(t),
+        ))?
+    }
     for t in 0..4u8 {
         let c = if t == 0 { Src::Int(0) } else { p };
-        b.push(o::mfma(MaiOp::MfmaF32_16x16x32Fp8Fp8, p, reg(wa, 2 * t), reg(vb, 2 * t), c))?;
+        b.push(o::mfma(
+            MaiOp::MfmaF32_16x16x32Fp8Fp8,
+            p,
+            reg(wa, 2 * t),
+            reg(vb, 2 * t),
+            c,
+        ))?;
     }
-    for i in 0..4 { b.push(o::v2(Vop2Op::FmacF32, reg(total, i), reg(p, i), v_scale))? }
+    for i in 0..4 {
+        b.push(o::v2(Vop2Op::FmacF32, reg(total, i), reg(p, i), v_scale))?
+    }
     b.push(o::s2(Sop2Op::XorB32, s_buf, s_buf, Src::Lit(LDS_BUF_BYTES)))?;
     b.push(o::sc(SopcOp::CmpLtU32, s_kb, s_nkb))?;
     b.branch(SoppOp::CbranchScc1, "kloop")?;
@@ -436,7 +564,14 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     // ---- store Y[row0 + n, ob + 4s .. +4] for n < nrows
     // Padding is +0 even when a finite weight scale overflows the scale DAG.
     for i in 0..4 {
-        b.push(o::v2ci(Vop2Op::CndmaskB32, reg(total, i), None, Src::Int(0), reg(total, i), m_xn))?;
+        b.push(o::v2ci(
+            Vop2Op::CndmaskB32,
+            reg(total, i),
+            None,
+            Src::Int(0),
+            reg(total, i),
+            m_xn,
+        ))?;
     }
     b.push(o::v2(Vop2Op::AddU32, vt, s_row0, vn))?;
     b.push(o::v3(Vop3OnlyOp::MulLoU32, vt, &[vt, s_r]))?;
@@ -444,7 +579,13 @@ pub fn build(arch: Arch, shape: Shape) -> Result<Kernel, String> {
     b.push(o::v3(Vop3OnlyOp::LshlAddU32, vt, &[vs, Src::Int(2), vt]))?;
     b.push(o::v2(Vop2Op::LshlrevB32, vt, Src::Int(2), vt))?;
     b.push(o::s1(Sop1Op::AndSaveexecB64, exec_save, m_n))?;
-    b.push(o::global_store(FlatOp::StoreDwordx4, vt, total, Some(s_y), 0))?;
+    b.push(o::global_store(
+        FlatOp::StoreDwordx4,
+        vt,
+        total,
+        Some(s_y),
+        0,
+    ))?;
     b.label("done")?;
     b.finish()
 }
@@ -467,24 +608,40 @@ pub struct Problem<'a> {
     pub r: usize,
     pub k: usize,
     pub x_row_div: usize,
+    /// Experts in `w`; a tile whose expert is outside `[0, n_experts)` is skipped (nothing written), as in the kernel.
+    pub n_experts: usize,
 }
 
 /// OCP e4m3fn code as the FNUZ operand the kernel feeds the MFMA: `fn(b)/2`,
 /// with `0x80` (−0) → `+0` (the in-kernel remap). Decoded from the OCP
 /// definition (bias 7, subnormal `m·2^-9`), not from the FNUZ table.
 fn weight_operand(b: u8) -> Result<f32, String> {
-    if b & 0x7f == 0x7f { return Err(format!("weight code {b:#04x} is an OCP NaN")) }
-    if b == 0x80 { return Ok(0.0) }
+    if b & 0x7f == 0x7f {
+        return Err(format!("weight code {b:#04x} is an OCP NaN"));
+    }
+    if b == 0x80 {
+        return Ok(0.0);
+    }
     let (e, m) = (i32::from(b >> 3 & 15), f32::from(b & 7));
-    let mag = if e == 0 { m * 2f32.powi(-9) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) };
+    let mag = if e == 0 {
+        m * 2f32.powi(-9)
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 7)
+    };
     Ok(if b & 0x80 != 0 { -mag } else { mag } / 2.0)
 }
 
 /// FNUZ e4m3 activation code (bias 8, subnormal `m·2^-10`, `0x80` NaN).
 fn act_operand(b: u8) -> Result<f32, String> {
-    if b == 0x80 { return Err("activation code 0x80 is FNUZ NaN".into()) }
+    if b == 0x80 {
+        return Err("activation code 0x80 is FNUZ NaN".into());
+    }
     let (e, m) = (i32::from(b >> 3 & 15), f32::from(b & 7));
-    let mag = if e == 0 { m * 2f32.powi(-10) } else { (1.0 + m / 8.0) * 2f32.powi(e - 8) };
+    let mag = if e == 0 {
+        m * 2f32.powi(-10)
+    } else {
+        (1.0 + m / 8.0) * 2f32.powi(e - 8)
+    };
     Ok(if b & 0x80 != 0 { -mag } else { mag })
 }
 
@@ -493,37 +650,72 @@ fn act_operand(b: u8) -> Result<f32, String> {
 /// Validates the ABI contract of the module doc.
 pub fn reference(pb: &Problem, model: AccumModel, y: &mut [f32]) -> Result<(), String> {
     let (r, k) = (pb.r, pb.k);
-    if k == 0 || k % 128 != 0 { return Err(format!("K {k} is not a positive multiple of 128")) }
-    if r == 0 || r % 64 != 0 { return Err(format!("R {r} is not a positive multiple of 64")) }
+    if k == 0 || k % 128 != 0 {
+        return Err(format!("K {k} is not a positive multiple of 128"));
+    }
+    if r == 0 || r % 64 != 0 {
+        return Err(format!("R {r} is not a positive multiple of 64"));
+    }
     let nkb = k / 128;
     let block_bytes = r * k + 2 * r.div_ceil(128) * nkb;
     if pb.expert_stride % 8 != 0 || pb.expert_stride < block_bytes {
-        return Err(format!("expert_stride {} does not hold an R={r} K={k} qt=55 block", pb.expert_stride));
+        return Err(format!(
+            "expert_stride {} does not hold an R={r} K={k} qt=55 block",
+            pb.expert_stride
+        ));
     }
-    if pb.x_row_div == 0 || pb.x_row_div >= 1 << 21 { return Err(format!("x_row_div {} outside 1..2^21", pb.x_row_div)) }
-    if y.len() != pb.sorted_rows.len() * r { return Err(format!("Y has {} elements, expected {} x {r}", y.len(), pb.sorted_rows.len())) }
+    if pb.x_row_div == 0 || pb.x_row_div >= 1 << 21 {
+        return Err(format!("x_row_div {} outside 1..2^21", pb.x_row_div));
+    }
+    if y.len() != pb.sorted_rows.len() * r {
+        return Err(format!(
+            "Y has {} elements, expected {} x {r}",
+            y.len(),
+            pb.sorted_rows.len()
+        ));
+    }
     let x_rows = pb.x_scale.len();
-    if pb.x.len() != x_rows * k { return Err(format!("X has {} bytes, expected {x_rows} x {k}", pb.x.len())) }
+    if pb.x.len() != x_rows * k {
+        return Err(format!(
+            "X has {} bytes, expected {x_rows} x {k}",
+            pb.x.len()
+        ));
+    }
     for (i, &a) in pb.x_scale.iter().enumerate() {
-        if !a.is_finite() || a <= 0.0 || a.to_bits() & 0x007f_ffff != 0 { return Err(format!("x_scale[{i}] = {a} is not a finite power of two")) }
+        if !a.is_finite() || a <= 0.0 || a.to_bits() & 0x007f_ffff != 0 {
+            return Err(format!("x_scale[{i}] = {a} is not a finite power of two"));
+        }
     }
     // Operand tables (NaN codes → Err when used).
     let act: Vec<Result<f32, String>> = (0..=255u8).map(act_operand).collect();
     let wgt: Vec<Result<f32, String>> = (0..=255u8).map(weight_operand).collect();
     let (mut wa, mut xb) = ([0f32; 32], [0f32; 32]);
     for (tile, &[expert, row0, nrows, _]) in pb.tile_desc.iter().enumerate() {
-        if expert < 0 { continue }
-        if !(1..=16).contains(&nrows) || row0 < 0 { return Err(format!("tile {tile}: row0 {row0} nrows {nrows}")) }
+        if expert < 0 || expert as usize >= pb.n_experts {
+            continue;
+        }
+        if !(1..=16).contains(&nrows) || row0 < 0 {
+            return Err(format!("tile {tile}: row0 {row0} nrows {nrows}"));
+        }
         let base = expert as usize * pb.expert_stride;
-        let blk = pb.w.get(base..base + block_bytes).ok_or_else(|| format!("tile {tile}: expert {expert} outside W"))?;
+        let blk =
+            pb.w.get(base..base + block_bytes)
+                .ok_or_else(|| format!("tile {tile}: expert {expert} outside W"))?;
         let (codes, scales) = blk.split_at(r * k);
         for n in 0..nrows as usize {
             let i = row0 as usize + n;
-            let flat = *pb.sorted_rows.get(i).ok_or_else(|| format!("tile {tile}: sorted row {i} outside sorted_rows"))?;
+            let flat = *pb
+                .sorted_rows
+                .get(i)
+                .ok_or_else(|| format!("tile {tile}: sorted row {i} outside sorted_rows"))?;
             let (xrow, a) = if flat >= 0 {
-                if flat >= 1 << 21 { return Err(format!("sorted_rows[{i}] = {flat} >= 2^21")) }
+                if flat >= 1 << 21 {
+                    return Err(format!("sorted_rows[{i}] = {flat} >= 2^21"));
+                }
                 let xr = flat as usize / pb.x_row_div;
-                if xr >= x_rows { return Err(format!("sorted_rows[{i}] = {flat}: X row {xr} >= {x_rows}")) }
+                if xr >= x_rows {
+                    return Err(format!("sorted_rows[{i}] = {flat}: X row {xr} >= {x_rows}"));
+                }
                 (Some(&pb.x[xr * k..xr * k + k]), pb.x_scale[xr])
             } else if flat == -1 {
                 (None, 1.0)
@@ -539,15 +731,25 @@ pub fn reference(pb: &Problem, model: AccumModel, y: &mut [f32]) -> Result<(), S
                     for t in 0..4 {
                         let k0 = 128 * kb + 32 * t;
                         for j in 0..32 {
-                            xb[j] = match xrow { Some(x) => act[usize::from(x[k0 + j])].clone()?, None => 0.0 };
+                            xb[j] = match xrow {
+                                Some(x) => act[usize::from(x[k0 + j])].clone()?,
+                                None => 0.0,
+                            };
                             wa[j] = wgt[usize::from(wrow[k0 + j])].clone()?;
                         }
                         // Hardware A = weights, B = activations, k ascending.
                         partial = accumulate(model, MfmaType::Fp8, partial, &wa, &xb);
                     }
                     let si = (col / 128) * nkb + kb;
-                    let s_w = f32::from_bits(u32::from(u16::from_le_bytes([scales[2 * si], scales[2 * si + 1]])) << 16);
-                    if !s_w.is_finite() { return Err(format!("expert {expert} scale ({}, {kb}) is not finite", col / 128)) }
+                    let s_w = f32::from_bits(
+                        u32::from(u16::from_le_bytes([scales[2 * si], scales[2 * si + 1]])) << 16,
+                    );
+                    if !s_w.is_finite() {
+                        return Err(format!(
+                            "expert {expert} scale ({}, {kb}) is not finite",
+                            col / 128
+                        ));
+                    }
                     total = partial.mul_add(fa * s_w, total);
                 }
                 y[i * r + col] = if flat < 0 { 0.0 } else { total };

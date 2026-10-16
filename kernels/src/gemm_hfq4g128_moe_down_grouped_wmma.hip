@@ -27,14 +27,15 @@ extern "C" __global__ void gemm_hfq4g128_moe_down_grouped_wmma(
     const float* __restrict__ per_expert_scale,
     const _Float16* __restrict__ act,    // [slots, K]
     float* __restrict__ y,               // [m_total, M]
-    int M, int K
+    int M, int K,
+    int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
     const int tile = blockIdx.y;
     if (row_start >= M) return;
     const int expert = tile_ids[tile];
-    if (expert < 0) return;
+    if (expert < 0 || expert >= n_experts) return;
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptrs[expert]);
 
     const int lane = tid & 15;

@@ -39,17 +39,25 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_ranks(
     const int flat = c * 256 + t;
     for (int e = t; e < E; e += 256) partial[(size_t)e * C + c] = 0;
     const int n = min(256, L - c * 256);
-    const int my = t < n ? topk[flat] : -1;
+    // An id outside [0, E) (the router's -1 non-finite-row marker, or any
+    // corrupt id) is not routed: it joins no expert's rank/count, its rank
+    // cell is -1, and nothing is addressed by it.
+    const int raw = t < n ? topk[flat] : -1;
+    const int my = (raw >= 0 && raw < E) ? raw : -1;
     s_e[t] = my;
     __syncthreads();
     if (t < n) {
-        int r = 0;
-        for (int j = 0; j < t; ++j) r += s_e[j] == my;
-        rank[flat] = r;
-        if (r == 0) {
-            int cnt = 1;
-            for (int j = t + 1; j < n; ++j) cnt += s_e[j] == my;
-            partial[(size_t)my * C + c] = cnt;
+        if (my < 0) {
+            rank[flat] = -1;
+        } else {
+            int r = 0;
+            for (int j = 0; j < t; ++j) r += s_e[j] == my;
+            rank[flat] = r;
+            if (r == 0) {
+                int cnt = 1;
+                for (int j = t + 1; j < n; ++j) cnt += s_e[j] == my;
+                partial[(size_t)my * C + c] = cnt;
+            }
         }
     }
 }
@@ -91,9 +99,13 @@ extern "C" __global__ __launch_bounds__(256) void qwen4_moe_group_scatter(
     const int C = (L + 255) / 256;
     if (i < L) {
         const int e = topk[i];
-        const int pos = offsets[e] + chunk_prefix[(size_t)e * (C + 1) + i / 256] + rank[i];
-        sorted[pos] = i;
-        inverse[i] = pos;
+        if (e >= 0 && e < E) {
+            const int pos = offsets[e] + chunk_prefix[(size_t)e * (C + 1) + i / 256] + rank[i];
+            sorted[pos] = i;
+            inverse[i] = pos;
+        } else {
+            inverse[i] = -1;  // unrouted slot: no grouped row
+        }
     }
     if (i < Pmax) {
         const int used = offsets[E];

@@ -28,30 +28,31 @@ pub(crate) mod qt44_qt53_prefill;
 pub mod slab_moe_decode;
 pub mod slab_route;
 pub use moe_program::{MoeStage, SealedMoeOp};
-pub mod moe_dump;
 pub(crate) mod draft_head;
+pub mod moe_dump;
 pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
 pub mod sandwich;
-pub(crate) mod steps;
 pub mod step_graph;
+pub(crate) mod steps;
+pub use layer_ops::{
+    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
+    execute_final_hyper, execute_gated_delta_net, execute_gated_delta_net_arena,
+    execute_gated_delta_net_core_rows, execute_gated_delta_net_uncovered,
+    execute_grouped_depthwise, execute_grouped_depthwise_rows, execute_hyper_norm,
+    execute_hyper_read, execute_hyper_write, execute_indexed_attention,
+    execute_indexed_attention_arena, execute_indexed_attention_core_rows,
+    execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
+    project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
+    set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseFfnOp,
+    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GdnTrunkArenas,
+    GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
+    IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    QsaTrunkArenas,
+};
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
     StateClass, StepGraph, StepGraphError,
-};
-pub use layer_ops::{
-    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
-    execute_final_hyper, execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm,
-    execute_hyper_read, execute_hyper_write, execute_indexed_attention, execute_lm_head,
-    execute_project, project_weight, project_weights, qsa_projection_hook_installed,
-    reset_qsa_projection_slot, set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp,
-    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
-    execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
-    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
-    execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
-    CoreWindow,
 };
 pub use steps::{
     execute_steps, execute_validated_steps, execute_validated_steps_window,
@@ -250,7 +251,10 @@ fn select_grouped_route(
                 && formats.shared_selector == DType::BF16
                 && matches!(formats.shared_gate, DType::BF16 | DType::Q8_0)
                 && formats.shared_up == formats.shared_gate
-                && matches!(formats.shared_down, DType::BF16 | DType::Q8_0 | DType::MQ4G128V2)
+                && matches!(
+                    formats.shared_down,
+                    DType::BF16 | DType::Q8_0 | DType::MQ4G128V2
+                )
                 && [
                     dtypes.router,
                     shared.selector,
@@ -756,7 +760,13 @@ mod fp8_route_tests {
 
     #[test]
     fn gfx942_qt55_canonical_selects_fp8_route() {
-        let selected = select("gfx942", &fp8_dtypes(), Some(fp8_policy()), CANONICAL, false);
+        let selected = select(
+            "gfx942",
+            &fp8_dtypes(),
+            Some(fp8_policy()),
+            CANONICAL,
+            false,
+        );
         assert!(matches!(
             selected,
             Ok(Some(MoeRouteCapability::Fp8B128Grouped))
@@ -767,7 +777,13 @@ mod fp8_route_tests {
     fn non_gfx942_qt55_refuses() {
         for arch in ["gfx1151", "gfx1201", "gfx1100", "gfx1030", "gfx908"] {
             assert!(
-                is_fp8_refusal(select(arch, &fp8_dtypes(), Some(fp8_policy()), CANONICAL, false)),
+                is_fp8_refusal(select(
+                    arch,
+                    &fp8_dtypes(),
+                    Some(fp8_policy()),
+                    CANONICAL,
+                    false
+                )),
                 "{arch} must refuse qt55",
             );
         }
@@ -796,7 +812,9 @@ mod fp8_route_tests {
             reject_fp8_moe_unless_routed(&fp8_dtypes(), Some(MoeRouteCapability::Qt44Qt53Grouped))
                 .map(|()| None)
         ));
-        assert!(is_fp8_refusal(reject_fp8_b128(DType::FP8E4M3B128).map(|()| None)));
+        assert!(is_fp8_refusal(
+            reject_fp8_b128(DType::FP8E4M3B128).map(|()| None)
+        ));
         reject_fp8_b128(DType::MQ4G256).unwrap();
         // Generic resolution carries the refusal state, never a route.
         let ctx = DispatchCtx::for_test("gfx942");
@@ -838,14 +856,34 @@ mod fp8_route_tests {
         let refuses = |dtypes: &MoeDtypes<'_>, policy: MoeRoutePolicy, shape, sidecars| {
             is_fp8_refusal(select("gfx942", dtypes, Some(policy), shape, sidecars))
         };
-        assert!(refuses(&fp8_dtypes(), fp8_policy(), [513, 10, 2560, 640, 2560, 2560, 640], false));
-        assert!(refuses(&fp8_dtypes(), fp8_policy(), [512, 8, 2560, 640, 2560, 2560, 640], false));
-        assert!(refuses(&fp8_dtypes(), fp8_policy(), [512, 10, 2560, 640, 2560, 1, 640], false));
+        assert!(refuses(
+            &fp8_dtypes(),
+            fp8_policy(),
+            [513, 10, 2560, 640, 2560, 2560, 640],
+            false
+        ));
+        assert!(refuses(
+            &fp8_dtypes(),
+            fp8_policy(),
+            [512, 8, 2560, 640, 2560, 2560, 640],
+            false
+        ));
+        assert!(refuses(
+            &fp8_dtypes(),
+            fp8_policy(),
+            [512, 10, 2560, 640, 2560, 1, 640],
+            false
+        ));
         assert!(refuses(&fp8_dtypes(), fp8_policy(), CANONICAL, true));
 
         let mut widened = fp8_policy();
         widened.geometry.experts = 513;
-        assert!(refuses(&fp8_dtypes(), widened, [513, 10, 2560, 640, 2560, 2560, 640], false));
+        assert!(refuses(
+            &fp8_dtypes(),
+            widened,
+            [513, 10, 2560, 640, 2560, 2560, 640],
+            false
+        ));
 
         let mut q8_shared = fp8_policy();
         q8_shared.formats.shared_gate = DType::Q8_0;
@@ -2311,8 +2349,17 @@ fn dispatch_grouped_gemm(
     if let Some(tags) = expert_dtype_tags {
         if coalesced {
             return hip!(gpu.gemm_mixed_moe_grouped_wmma_coalesced(
-                ptrs, tags, tile_ids, sorted_slot_index, x, y,
-                m, k, x_row_div, m_total, rows,
+                ptrs,
+                tags,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
             ));
         }
         return hip!(gpu.gemm_mixed_moe_grouped_wmma(
@@ -3424,7 +3471,10 @@ fn decode_gate_side_stage(
                         (p.router.buf, p.router_logits, p.router.m),
                         (shared_expert_gate.buf, scalar_buf, shared_expert_gate.m),
                     ],
-                    [(shared_gate_w.buf, shared_gate), (shared_up_w.buf, shared_up)],
+                    [
+                        (shared_gate_w.buf, shared_gate),
+                        (shared_up_w.buf, shared_up)
+                    ],
                     shared_gate_w.m,
                     p.x_norm,
                     p.router.k,
@@ -3642,6 +3692,10 @@ fn decode_route_gpu_stage(
                 1,
                 p.norm_topk_prob,
                 p.recipe.bf16_round_trip(),
+                // Decode is one row; a captured or retained body bakes the launch's
+                // row base in, so a fault reports row 0 (the layer names the site).
+                p.layer_idx as usize,
+                0,
             ))?;
         } else if router_shared_fuse {
             let shared_x_rot = unsafe {
@@ -3691,7 +3745,9 @@ fn decode_route_gpu_stage(
             ))?;
         }
         // The grouped top-10 router stores its weights BF16-rounded itself.
-        if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
+        if p.recipe.bf16_round_trip()
+            && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
+        {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }
@@ -4898,6 +4954,7 @@ fn decode_combine_stage(
             target,
             p.hidden,
             1,
+            p.n_exp,
         ))?;
     } else {
         hip!(gpu.moe_down_combine_k8_batched(
@@ -5041,7 +5098,8 @@ fn prefill_gate_up_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).0,
+            coalesced_verify
+                && crate::families::moe::routed_host_mapped_projections(p.routed_experts).0,
         )?;
         // The explicit unscatter stage follows this grouped GEMM.
     } else {
@@ -5417,7 +5475,8 @@ fn prefill_down_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
-            coalesced_verify && crate::families::moe::routed_host_mapped_projections(p.routed_experts).1,
+            coalesced_verify
+                && crate::families::moe::routed_host_mapped_projections(p.routed_experts).1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {

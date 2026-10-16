@@ -245,7 +245,11 @@ pub(crate) fn kernarg_value_bytes<T: KernargValue>(v: &T) -> &[u8] {
 /// params-built kernargs and the captured blob are byte-identical.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_assert_params_match(params: &[*mut c_void], values: &[&[u8]]) {
-    assert_eq!(params.len(), values.len(), "kernarg count: params vs blob values");
+    assert_eq!(
+        params.len(),
+        values.len(),
+        "kernarg count: params vs blob values"
+    );
     for (i, (p, v)) in params.iter().zip(values).enumerate() {
         // SAFETY: each params entry points at a live local at least as large
         // as the matching blob value (both lists name the same locals).
@@ -294,20 +298,18 @@ pub(crate) fn recorded_launch_artifact(
             name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
                 module("gemv_hfq4g256_residual_scaled")
             }
-            "gemv_hfq4g256_moe_gate_up_k8_indexed" => {
-                module("gemv_hfq4g256_moe_gate_up_indexed")
+            "gemv_hfq4g256_moe_gate_up_k8_indexed" => module("gemv_hfq4g256_moe_gate_up_indexed"),
+            name if name.starts_with("gemv_hfq4g256_multirow_r") => {
+                module("gemv_hfq4g256_multirow_default")
+                    .or_else(|| module("gemv_hfq4g256_multirow_rdna3"))
             }
-            name if name.starts_with("gemv_hfq4g256_multirow_r") => module("gemv_hfq4g256_multirow_default")
-                .or_else(|| module("gemv_hfq4g256_multirow_rdna3")),
-            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => module("gemv_hfq4g256_residual_multirow_default")
-                .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3")),
+            name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => {
+                module("gemv_hfq4g256_residual_multirow_default")
+                    .or_else(|| module("gemv_hfq4g256_residual_multirow_rdna3"))
+            }
             _ => None,
         })
-        .or_else(|| {
-            func_name
-                .strip_suffix("_f32")
-                .and_then(module)
-        })
+        .or_else(|| func_name.strip_suffix("_f32").and_then(module))
         .cloned()
 }
 
@@ -478,7 +480,9 @@ pub(crate) fn qsa_extent_limit(
     owners
         .into_iter()
         .find_map(|(base, reserved, mapped)| {
-            ptr.checked_sub(base).filter(|&n| n < reserved).map(|n| (n, mapped))
+            ptr.checked_sub(base)
+                .filter(|&n| n < reserved)
+                .map(|n| (n, mapped))
         })
         .unwrap_or((0, allocation_bytes))
 }
@@ -493,8 +497,18 @@ pub(crate) fn qsa_extent_verdict(
 ) -> Result<usize, QsaExtentFailure> {
     match required_end {
         Some(end) if end <= limit_bytes => Ok(end),
-        Some(end) => Err(QsaExtentFailure { arena, limit_bytes, required_end: end, overflow: false }),
-        None => Err(QsaExtentFailure { arena, limit_bytes, required_end: usize::MAX, overflow: true }),
+        Some(end) => Err(QsaExtentFailure {
+            arena,
+            limit_bytes,
+            required_end: end,
+            overflow: false,
+        }),
+        None => Err(QsaExtentFailure {
+            arena,
+            limit_bytes,
+            required_end: usize::MAX,
+            overflow: true,
+        }),
     }
 }
 
@@ -576,7 +590,10 @@ impl GpuTensor {
     /// free it.
     pub fn prefix_as_f16(&self, len_elems: usize) -> GpuTensor {
         let byte_len = len_elems.checked_mul(2).expect("F16 view length overflow");
-        assert!(byte_len <= self.buf.size(), "F16 view exceeds accessible buffer prefix");
+        assert!(
+            byte_len <= self.buf.size(),
+            "F16 view exceeds accessible buffer prefix"
+        );
         GpuTensor {
             buf: unsafe { hip_bridge::DeviceBuffer::from_raw(self.buf.as_ptr(), byte_len) },
             shape: vec![len_elems],
@@ -730,10 +747,16 @@ fn validate_vmm_move_ranges(moves: &[VmmResourceMove]) -> Result<(), String> {
             ));
         }
         let old_end = mv.old_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
-            format!("VMM move {index}: old range 0x{:x}+{} overflows", mv.old_base, mv.reserved_bytes)
+            format!(
+                "VMM move {index}: old range 0x{:x}+{} overflows",
+                mv.old_base, mv.reserved_bytes
+            )
         })?;
         let new_end = mv.new_base.checked_add(mv.reserved_bytes).ok_or_else(|| {
-            format!("VMM move {index}: new range 0x{:x}+{} overflows", mv.new_base, mv.reserved_bytes)
+            format!(
+                "VMM move {index}: new range 0x{:x}+{} overflows",
+                mv.new_base, mv.reserved_bytes
+            )
         })?;
         old_ranges.push((mv.old_base, old_end));
         new_ranges.push((mv.new_base, new_end));
@@ -1300,6 +1323,10 @@ pub struct Gpu {
     /// device address. Read after each step by
     /// [`Gpu::take_device_wait_error`] and the `download_*` readers.
     device_wait: Option<crate::device_wait::DeviceWaitMapping>,
+    /// Host-mapped router non-finite fault word (`crate::router_fault`), allocated
+    /// at `Gpu` init and kept for the `Gpu`'s lifetime because captured graphs bake
+    /// in its device address. Folded into [`Gpu::take_device_wait_error`].
+    router_fault: Option<crate::router_fault::RouterFaultMapping>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
     /// Name of the most recently launched kernel on this `Gpu`'s stream.
@@ -1966,7 +1993,10 @@ impl Gpu {
         // Honor HIPFIRE_DEVICES for every direct entry point before the HIP
         // runtime initializes; a no-op when unset or already applied (daemon).
         match hipfire_config::devices::apply_entry_point_device_visibility() {
-            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved { devices, visibility })) => {
+            Ok(Some(hipfire_config::devices::DeviceSelection::Resolved {
+                devices,
+                visibility,
+            })) => {
                 eprintln!(
                     "[devices] HIPFIRE_DEVICES -> {} (ROCR_VISIBLE_DEVICES={} HIP_VISIBLE_DEVICES={})",
                     devices
@@ -1980,7 +2010,10 @@ impl Gpu {
             }
             Ok(_) => {}
             Err(error) => {
-                return Err(hip_bridge::HipError::new(0, &format!("HIPFIRE_DEVICES: {error}")));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("HIPFIRE_DEVICES: {error}"),
+                ));
             }
         }
         let hip = HipRuntime::load()?;
@@ -2144,6 +2177,7 @@ impl Gpu {
             orphan_vmm_arenas: Vec::new(),
             host_mapped: HashMap::new(),
             device_wait: None,
+            router_fault: None,
             active_stream: None,
             last_kernel: None,
             scratch: crate::scratch::ScratchState {
@@ -2294,6 +2328,7 @@ impl Gpu {
             {
                 gpu.ensure_device_wait_block()?;
             }
+            gpu.ensure_router_fault_word()?;
             Ok(gpu)
         })
     }
@@ -3394,77 +3429,80 @@ impl Gpu {
                 self.replay.rearm_after_layout_growth();
             }
         }
-        let result: HipResult<()> =
-            if record || observe || self.graphs.capture_mode || self.flags.force_blob_path {
-                let mut blob = blob_builder();
-                blob.pad_to(16);
-                if observe {
-                    self.replay
-                        .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
-                }
-                if record {
-                    let artifact = recorded_launch_artifact(&self.compiler, func_name);
-                    self.replay.record_hip_launch_typed_bound(
-                        &self.hip,
-                        func_name,
-                        artifact,
-                        grid,
-                        block,
-                        shared_mem,
-                        blob.as_bytes(),
-                        bindings.grid,
-                        bindings.kernargs,
-                        Some(&self.compiler),
-                        railgun_words,
-                    );
-                }
-                let func = &self.functions[func_name];
-                if self.graphs.capture_mode {
-                    self.graphs.capture_blobs.push(blob.into_vec());
-                    let buf = self.graphs.capture_blobs.last_mut().unwrap();
-                    // SAFETY: every caller's builder encodes the same argument
-                    // values supplied by `params`; graph-owned storage stays live
-                    // through graph instantiation and replay.
-                    unsafe {
-                        self.hip.launch_kernel_blob(
-                            func,
-                            grid,
-                            block,
-                            shared_mem,
-                            self.active_stream.as_ref(),
-                            buf.as_mut_slice(),
-                        )
-                    }
-                } else {
-                    let mut bytes = blob.into_vec();
-                    // SAFETY: HIP consumes the contiguous argument bytes during
-                    // this one-shot launch; `bytes` remains live across the call.
-                    unsafe {
-                        self.hip.launch_kernel_blob(
-                            func,
-                            grid,
-                            block,
-                            shared_mem,
-                            self.active_stream.as_ref(),
-                            bytes.as_mut_slice(),
-                        )
-                    }
-                }
-            } else {
-                let func = &self.functions[func_name];
-                // SAFETY: forwarded from the typed launch wrapper that assembled
-                // `params` for this kernel signature.
+        let result: HipResult<()> = if record
+            || observe
+            || self.graphs.capture_mode
+            || self.flags.force_blob_path
+        {
+            let mut blob = blob_builder();
+            blob.pad_to(16);
+            if observe {
+                self.replay
+                    .observe_g0_launch(func_name, grid, block, shared_mem, blob.as_bytes());
+            }
+            if record {
+                let artifact = recorded_launch_artifact(&self.compiler, func_name);
+                self.replay.record_hip_launch_typed_bound(
+                    &self.hip,
+                    func_name,
+                    artifact,
+                    grid,
+                    block,
+                    shared_mem,
+                    blob.as_bytes(),
+                    bindings.grid,
+                    bindings.kernargs,
+                    Some(&self.compiler),
+                    railgun_words,
+                );
+            }
+            let func = &self.functions[func_name];
+            if self.graphs.capture_mode {
+                self.graphs.capture_blobs.push(blob.into_vec());
+                let buf = self.graphs.capture_blobs.last_mut().unwrap();
+                // SAFETY: every caller's builder encodes the same argument
+                // values supplied by `params`; graph-owned storage stays live
+                // through graph instantiation and replay.
                 unsafe {
-                    self.hip.launch_kernel(
+                    self.hip.launch_kernel_blob(
                         func,
                         grid,
                         block,
                         shared_mem,
                         self.active_stream.as_ref(),
-                        params,
+                        buf.as_mut_slice(),
                     )
                 }
-            };
+            } else {
+                let mut bytes = blob.into_vec();
+                // SAFETY: HIP consumes the contiguous argument bytes during
+                // this one-shot launch; `bytes` remains live across the call.
+                unsafe {
+                    self.hip.launch_kernel_blob(
+                        func,
+                        grid,
+                        block,
+                        shared_mem,
+                        self.active_stream.as_ref(),
+                        bytes.as_mut_slice(),
+                    )
+                }
+            }
+        } else {
+            let func = &self.functions[func_name];
+            // SAFETY: forwarded from the typed launch wrapper that assembled
+            // `params` for this kernel signature.
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    grid,
+                    block,
+                    shared_mem,
+                    self.active_stream.as_ref(),
+                    params,
+                )
+            }
+        };
         if result.is_ok() {
             self.last_kernel = Some(func_name.to_string());
         }
@@ -3784,7 +3822,9 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        self.scratch.route_load.admit_unplanned(module_name, func_name)?;
+        self.scratch
+            .route_load
+            .admit_unplanned(module_name, func_name)?;
         if !self.modules.contains_key(module_name) {
             if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
                 // Developer-only route-closure audit, as `scratch::load_embedded_module`.
@@ -3800,12 +3840,21 @@ impl Gpu {
                 );
             }
             let module = self.hip.module_load_data(image.as_bytes())?;
-            crate::scratch::qsa_code_check_register(&self.arch, &module, module_name, image.as_bytes());
+            crate::scratch::qsa_code_check_register(
+                &self.arch,
+                &module,
+                module_name,
+                image.as_bytes(),
+            );
             self.compiler
                 .code_objects_mut()
                 .admit_module(
                     module_name,
-                    crate::code_object::CodeObjectArtifact::native_embedded(module_name, image, None),
+                    crate::code_object::CodeObjectArtifact::native_embedded(
+                        module_name,
+                        image,
+                        None,
+                    ),
                 )
                 .map_err(|reason| {
                     crate::scratch::qsa_code_check_unregister(&module);
@@ -3900,12 +3949,18 @@ impl Gpu {
     pub fn finish_route_kernel_load(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         use crate::scratch::RouteLoad;
-        if matches!(self.scratch.route_load, RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }) {
+        if matches!(
+            self.scratch.route_load,
+            RouteLoad::Idle | RouteLoad::Sealed | RouteLoad::Open { .. }
+        ) {
             return Ok(());
         }
         self.ensure_route_modules_preloaded()?;
         self.scratch.route_load = match std::mem::take(&mut self.scratch.route_load) {
-            RouteLoad::Prepared { open: Some(route) } => RouteLoad::Open { route, unplanned: 0 },
+            RouteLoad::Prepared { open: Some(route) } => RouteLoad::Open {
+                route,
+                unplanned: 0,
+            },
             _ => RouteLoad::Sealed,
         };
         Ok(())
@@ -3933,7 +3988,10 @@ impl Gpu {
     /// preload covers only the planned kernels.
     pub fn route_kernels_finished(&self) -> bool {
         // bind_thread: skip — pure state query.
-        matches!(self.scratch.route_load, crate::scratch::RouteLoad::Sealed | crate::scratch::RouteLoad::Open { .. })
+        matches!(
+            self.scratch.route_load,
+            crate::scratch::RouteLoad::Sealed | crate::scratch::RouteLoad::Open { .. }
+        )
     }
 
     /// True once a planned route is sealed: unplanned kernels are refused.
@@ -4099,16 +4157,17 @@ impl Gpu {
     fn map_qsa_gather_prefix(&mut self, workspace: &mut GpuTensor, bytes: usize) -> HipResult<()> {
         let mapped = self.vmm_mapped_bytes(workspace).unwrap_or(0);
         let granularity = self.vmm_granularity(workspace).unwrap_or(0);
-        let grow = crate::scratch::vmm_prefix_growth(mapped, workspace.byte_size(), granularity, bytes)
-            .ok_or_else(|| {
-                HipError::new(
-                    0,
-                    &format!(
+        let grow =
+            crate::scratch::vmm_prefix_growth(mapped, workspace.byte_size(), granularity, bytes)
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
                         "QSA gather workspace cannot map {bytes} bytes of a {}-byte reservation",
                         workspace.byte_size()
                     ),
-                )
-            })?;
+                    )
+                })?;
         if grow > 0 {
             self.grow_vmm_tensor(workspace, grow, &[])?;
         }
@@ -4641,7 +4700,10 @@ impl Gpu {
     /// iff `dflash_block == 8` (a batching serve) and `HIPFIRE_CB_VERIFY_FP8`
     /// is off. `Err` when both verify opt-ins are forced on (two different
     /// verify arithmetics).
-    pub fn iu4_verify_load_decision(flags: &crate::FeatureFlags, dflash_block: usize) -> Result<bool, String> {
+    pub fn iu4_verify_load_decision(
+        flags: &crate::FeatureFlags,
+        dflash_block: usize,
+    ) -> Result<bool, String> {
         // bind_thread: skip — pure flag decision, no HIP call or device state.
         match flags.cb_verify_iu4 {
             Some(true) if flags.cb_verify_fp8 => Err(
@@ -5012,25 +5074,38 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        let err = |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
+        let err =
+            |msg: String| hip_bridge::HipError::new(0, &format!("ensure_q8_0_f16_shadow: {msg}"));
         if self.arch != "gfx1151" {
-            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+            return Err(err(format!(
+                "requires exact gfx1151 (device is {})",
+                self.arch
+            )));
         }
         if weight.dtype != DType::Q8_0 {
             return Err(err(format!("needs a Q8_0 weight (got {:?})", weight.dtype)));
         }
         if m == 0 || k == 0 || k % 64 != 0 || (m as u128) * (k as u128) * 2 >= (1u128 << 31) {
-            return Err(err(format!("shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31")));
+            return Err(err(format!(
+                "shape M={m} K={k} needs M >= 1, K % 64 == 0 and M*K*2 < 2^31"
+            )));
         }
         let elems = m * k;
         let packed = elems / 32 * 34;
         if weight.buf.size() < packed {
-            return Err(err(format!("packed capacity {} is below M*K/32*34 = {packed} bytes", weight.buf.size())));
+            return Err(err(format!(
+                "packed capacity {} is below M*K/32*34 = {packed} bytes",
+                weight.buf.size()
+            )));
         }
         let key = weight.buf.as_ptr() as usize;
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             if shadow.buf.size() != elems * 2 {
-                return Err(err(format!("cached shadow is {} bytes, M*K*2 = {}", shadow.buf.size(), elems * 2)));
+                return Err(err(format!(
+                    "cached shadow is {} bytes, M*K*2 = {}",
+                    shadow.buf.size(),
+                    elems * 2
+                )));
             }
             return Ok(shadow.buf.as_ptr());
         }
@@ -5142,8 +5217,6 @@ impl Gpu {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slots_attn_crossover
     }
-
-
 
     // ── Tensor allocation ───────────────────────────────────────
 
@@ -5268,7 +5341,8 @@ impl Gpu {
             return Err(self.retain_failed_vmm_arena(arena, duplicate));
         }
         self.vmm_generation_counter += 1;
-        self.vmm_generations.insert(key, self.vmm_generation_counter);
+        self.vmm_generations
+            .insert(key, self.vmm_generation_counter);
         self.vmm_arenas.insert(key, arena);
         Ok(GpuTensor {
             buf,
@@ -5307,9 +5381,9 @@ impl Gpu {
         }
         // Producer streams may still be writing the source.
         self.hip.device_synchronize()?;
-        let reserve_bytes = logical.checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES).ok_or_else(|| {
-            HipError::new(0, "exportable weight size plus tail pad overflows")
-        })?;
+        let reserve_bytes = logical
+            .checked_add(EXPORT_WEIGHT_TAIL_PAD_BYTES)
+            .ok_or_else(|| HipError::new(0, "exportable weight size plus tail pad overflows"))?;
         let mut arena = VmmArena::reserve_exportable(&self.hip, self.device_id, reserve_bytes)?;
         let fd = match self.fill_exportable_weight_arena(&mut arena, &source.buf, logical) {
             Ok(fd) => fd,
@@ -5556,10 +5630,88 @@ impl Gpu {
     /// GPU that never launched a bounded wait.
     pub fn take_device_wait_error(&self) -> HipResult<()> {
         // bind_thread: skip — reads host memory only, touches no device state.
-        match self.take_device_wait_timeout() {
-            Some(timeout) => Err(timeout.to_hip_error()),
+        if let Some(timeout) = self.take_device_wait_timeout() {
+            return Err(timeout.to_hip_error());
+        }
+        self.take_router_fault_error()
+    }
+
+    /// Allocate this GPU's router fault word (`crate::router_fault`) if it does
+    /// not exist yet. `Gpu` init calls this, so the word exists before any graph
+    /// capture bakes its address into a router producer's kernargs.
+    pub fn ensure_router_fault_word(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.router_fault.is_some() {
+            return Ok(());
+        }
+        self.router_fault = Some(crate::router_fault::RouterFaultMapping::alloc(
+            &self.hip,
+            self.device_id,
+        )?);
+        Ok(())
+    }
+
+    /// Device address of the router fault word: the `fault` kernarg of every Qwen4
+    /// router producer. Null before [`Self::ensure_router_fault_word`] (producers
+    /// treat null as "do not record").
+    pub fn router_fault_ptr(&self) -> *mut c_void {
+        // bind_thread: skip — pure field read.
+        self.router_fault
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |mapping| mapping.device_ptr())
+    }
+
+    /// The router fault recorded since the last take, without clearing it.
+    pub fn peek_router_fault(&self) -> Option<crate::router_fault::RouterFault> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.router_fault
+            .as_ref()
+            .and_then(|mapping| mapping.peek(self.device_id))
+    }
+
+    /// The router fault (earliest row, then earliest layer) recorded since the
+    /// last take, clearing the record. Call after the step's work has completed.
+    pub fn take_router_fault(&self) -> Option<crate::router_fault::RouterFault> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        self.router_fault
+            .as_ref()
+            .and_then(|mapping| mapping.take(self.device_id))
+    }
+
+    /// [`Self::take_router_fault`] as the request-failing error, naming layer and row.
+    pub fn take_router_fault_error(&self) -> HipResult<()> {
+        // bind_thread: skip — reads host memory only, touches no device state.
+        match self.take_router_fault() {
+            Some(fault) => Err(fault.to_hip_error()),
             None => Ok(()),
         }
+    }
+
+    /// Drop a stale router fault. Request entry points call this once the device
+    /// is idle (never mid-pipeline: that would lose an earlier row's report).
+    pub fn clear_router_fault(&self) {
+        // bind_thread: skip — host memory only.
+        if let Some(mapping) = self.router_fault.as_ref() {
+            mapping.clear();
+        }
+    }
+
+    /// Global row of row 0 of the router launches encoded next: the arch sets the
+    /// prefill chunk's first token position before enqueuing it (0 for decode and
+    /// for lane steps) and dispatch passes it as the producer's `row_base`.
+    pub fn set_router_row_base(&self, row: usize) {
+        // bind_thread: skip — host-side value only.
+        if let Some(mapping) = self.router_fault.as_ref() {
+            mapping.set_row_base(row);
+        }
+    }
+
+    /// See [`Self::set_router_row_base`].
+    pub fn router_row_base(&self) -> usize {
+        // bind_thread: skip — host-side value only.
+        self.router_fault
+            .as_ref()
+            .map_or(0, |mapping| mapping.row_base())
     }
 
     /// Release every registered host-mapped allocation, mirroring
@@ -5718,18 +5870,34 @@ impl Gpu {
     /// Developer-only mapped extent check. Callers gate argument computation on
     /// `qwen4_qsa_extent_check`; no allocation, FFI or formatting on the off path.
     pub fn qsa_extent_check(
-        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — host metadata only, no device access.
         if self.flags.qwen4_qsa_extent_check {
-            self.qsa_extent_assert(arena, self.qsa_tensor_extent(t, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_tensor_extent(t, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
     pub(crate) fn qsa_extent_check_pooled(
-        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str, valid_blocks: usize,
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+        valid_blocks: usize,
     ) {
         // bind_thread: skip — host metadata only, no device access.
         if self.flags.qwen4_qsa_extent_check {
@@ -5740,8 +5908,14 @@ impl Gpu {
     }
 
     pub(crate) fn qsa_extent_post_launch_pooled(
-        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str, valid_blocks: usize,
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
+        valid_blocks: usize,
     ) {
         // bind_thread: skip — delegated to qsa_extent_sync when enabled.
         if self.flags.qwen4_qsa_extent_sync {
@@ -5769,29 +5943,51 @@ impl Gpu {
             buf.size(),
         );
         QsaExtent {
-            numel: buf.size(), elem_bytes: 1, mapped_bytes: limit,
+            numel: buf.size(),
+            elem_bytes: 1,
+            mapped_bytes: limit,
             required_end: qsa_required_end(bias, offset, len),
             valid_blocks: 0,
         }
     }
 
     pub(crate) fn qsa_extent_check_buffer(
-        &self, arena: &'static str, buf: &DeviceBuffer, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        buf: &DeviceBuffer,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — host metadata only, no device access.
         if self.flags.qwen4_qsa_extent_check {
-            self.qsa_extent_assert(arena, self.qsa_buffer_extent(buf, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_buffer_extent(buf, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
     pub(crate) fn qsa_extent_post_launch_buffer(
-        &self, arena: &'static str, buf: &DeviceBuffer, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        buf: &DeviceBuffer,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — delegated to qsa_extent_sync when enabled.
         if self.flags.qwen4_qsa_extent_sync {
-            self.qsa_extent_sync(arena, self.qsa_buffer_extent(buf, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_buffer_extent(buf, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
@@ -5810,9 +6006,14 @@ impl Gpu {
         ] {
             if let Some(buf) = slot.as_ref() {
                 let bytes = buf.size();
-                if let Some(bias) = address.checked_sub(buf.as_ptr() as usize).filter(|&n| n < bytes) {
+                if let Some(bias) = address
+                    .checked_sub(buf.as_ptr() as usize)
+                    .filter(|&n| n < bytes)
+                {
                     return QsaExtent {
-                        numel: bytes / elem_bytes, elem_bytes, mapped_bytes: bytes,
+                        numel: bytes / elem_bytes,
+                        elem_bytes,
+                        mapped_bytes: bytes,
                         required_end: qsa_required_end(bias, offset, len),
                         valid_blocks: 0,
                     };
@@ -5821,23 +6022,41 @@ impl Gpu {
         }
         // Unknown raw storage must fail closed, never silently bless an extent.
         QsaExtent {
-            numel: 0, elem_bytes: 1, mapped_bytes: 0,
+            numel: 0,
+            elem_bytes: 1,
+            mapped_bytes: 0,
             required_end: None,
             valid_blocks: 0,
         }
     }
 
     pub(crate) fn qsa_extent_check_ptr(
-        &self, arena: &'static str, ptr: *mut c_void, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        ptr: *mut c_void,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — host metadata only, no device access.
         if self.flags.qwen4_qsa_extent_check {
-            self.qsa_extent_assert(arena, self.qsa_scratch_extent(ptr, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_assert(
+                arena,
+                self.qsa_scratch_extent(ptr, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
-    fn qsa_extent_assert(&self, arena: &'static str, e: QsaExtent, d: QsaExtentDepth, site: &'static str) {
+    fn qsa_extent_assert(
+        &self,
+        arena: &'static str,
+        e: QsaExtent,
+        d: QsaExtentDepth,
+        site: &'static str,
+    ) {
         if let Err(f) = qsa_extent_verdict(arena, e.required_end, e.mapped_bytes) {
             eprintln!("qsa-extent-check FAIL arena={} numel={} elem_bytes={} mapped_bytes={} need_bytes={} overflow={} rows={} end_position={} block_count={} valid_blocks={} site={site}",
                 f.arena, e.numel, e.elem_bytes, f.limit_bytes, f.required_end, f.overflow, d.rows, d.end_position, d.block_count, e.valid_blocks);
@@ -5847,30 +6066,60 @@ impl Gpu {
 
     /// Mode 2 deliberately synchronizes the device after each checked launch.
     pub fn qsa_extent_post_launch(
-        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        t: &GpuTensor,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — delegated to qsa_extent_sync when enabled.
         if self.flags.qwen4_qsa_extent_sync {
-            self.qsa_extent_sync(arena, self.qsa_tensor_extent(t, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_tensor_extent(t, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
     pub(crate) fn qsa_extent_post_launch_ptr(
-        &self, arena: &'static str, ptr: *mut c_void, offset_bytes: usize,
-        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+        &self,
+        arena: &'static str,
+        ptr: *mut c_void,
+        offset_bytes: usize,
+        len_bytes: usize,
+        depth: QsaExtentDepth,
+        site: &'static str,
     ) {
         // bind_thread: skip — delegated to qsa_extent_sync when enabled.
         if self.flags.qwen4_qsa_extent_sync {
-            self.qsa_extent_sync(arena, self.qsa_scratch_extent(ptr, offset_bytes, len_bytes), depth, site);
+            self.qsa_extent_sync(
+                arena,
+                self.qsa_scratch_extent(ptr, offset_bytes, len_bytes),
+                depth,
+                site,
+            );
         }
     }
 
-    fn qsa_extent_sync(&self, arena: &'static str, e: QsaExtent, d: QsaExtentDepth, site: &'static str) {
+    fn qsa_extent_sync(
+        &self,
+        arena: &'static str,
+        e: QsaExtent,
+        d: QsaExtentDepth,
+        site: &'static str,
+    ) {
         let result = self.bind_thread().and_then(|()| {
             self.hip.device_synchronize()?;
             let code = self.hip.last_error();
-            if code == 0 { Ok(()) } else { Err(HipError::new(code, "hipGetLastError after QSA launch")) }
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipGetLastError after QSA launch"))
+            }
         });
         if let Err(err) = result {
             eprintln!("qsa-extent-check FAULT after site={site} arena={arena} numel={} elem_bytes={} mapped_bytes={} need_bytes={} rows={} end_position={} block_count={} valid_blocks={} error={err}",
@@ -6207,9 +6456,9 @@ impl Gpu {
         // call; they are never freed.
         let mut targets: Vec<DeviceBuffer> = Vec::with_capacity(forks.len());
         for fork in forks {
-            let mapped = self.vmm_mapped_bytes(fork).ok_or_else(|| {
-                HipError::new(0, "forked tensor is not a registered VMM owner")
-            })?;
+            let mapped = self
+                .vmm_mapped_bytes(fork)
+                .ok_or_else(|| HipError::new(0, "forked tensor is not a registered VMM owner"))?;
             targets.push(unsafe { DeviceBuffer::from_raw(fork.buf.as_ptr(), mapped) });
         }
         if let Some(slab) = prefix.slab.as_ref() {
@@ -7402,9 +7651,10 @@ impl Gpu {
     /// fills every row owned by another rank from that owner's buffer.
     ///
     /// For slot `s` in `0..n_slots`, `e = slot_experts[s]` (i32, device memory);
-    /// when `e >= 0` and `owner = e % n_ranks != self_rank`, row `s`
+    /// when `0 <= e < n_experts` and `owner = e % n_ranks != self_rank`, row `s`
     /// (`n16` uint4 = `n16 * 16` bytes) is copied from `src[owner]` to `dst` at
-    /// the same row offset. Owned rows and negative-id slots are never written.
+    /// the same row offset. Owned rows and slots whose id is outside
+    /// `[0, n_experts)` (negative marker or corrupt id) are never written.
     /// Pure uint4 load/store, so the copy is bit-exact for every bit pattern.
     ///
     /// `src[r]` is rank `r`'s row-buffer base as a device address (valid on this
@@ -7420,6 +7670,7 @@ impl Gpu {
         n_ranks: usize,
         self_rank: usize,
         n16: usize,
+        n_experts: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !(2..=8).contains(&n_ranks) || self_rank >= n_ranks {
@@ -7428,6 +7679,14 @@ impl Gpu {
                 "ep_gather_rows_by_owner: n_ranks must be 2..=8 and self_rank < n_ranks",
             ));
         }
+        if n_experts == 0 {
+            return Err(HipError::new(
+                0,
+                "ep_gather_rows_by_owner: n_experts must be non-zero",
+            ));
+        }
+        let mut experts_i32 = i32::try_from(n_experts)
+            .map_err(|_| HipError::new(0, "ep_gather_rows_by_owner: n_experts exceeds i32"))?;
         if n_slots == 0 || n16 == 0 {
             return Err(HipError::new(
                 0,
@@ -7464,7 +7723,7 @@ impl Gpu {
         let s6 = src[6] as *mut c_void;
         let s7 = src[7] as *mut c_void;
         let d = dst as *mut c_void;
-        let mut params: [*mut c_void; 14] = [
+        let mut params: [*mut c_void; 15] = [
             &ids as *const _ as *mut c_void,
             &s0 as *const _ as *mut c_void,
             &s1 as *const _ as *mut c_void,
@@ -7479,6 +7738,7 @@ impl Gpu {
             &mut ranks_i32 as *mut _ as *mut c_void,
             &mut self_i32 as *mut _ as *mut c_void,
             &mut n16_i32 as *mut _ as *mut c_void,
+            &mut experts_i32 as *mut _ as *mut c_void,
         ];
         let blob_builder = || {
             let mut blob = hip_bridge::KernargBlob::new();
@@ -7496,6 +7756,7 @@ impl Gpu {
             blob.push_i32(ranks_i32);
             blob.push_i32(self_i32);
             blob.push_i32(n16_i32);
+            blob.push_i32(experts_i32);
             blob
         };
         let grid_x = (n16 as u32).div_ceil(256);
@@ -8146,6 +8407,16 @@ impl Drop for Gpu {
                 }
             }
         }
+        if self.router_fault.is_some() {
+            // Queued router producers may still store into the fault word.
+            if let Err(err) = self.hip.device_synchronize() {
+                eprintln!("[rdna-compute] failed to synchronize the router fault word during Gpu drop: {err}");
+            } else if let Some(mapping) = self.router_fault.take() {
+                if let Err(err) = mapping.free(&self.hip) {
+                    eprintln!("[rdna-compute] failed to release the router fault word during Gpu drop: {err}");
+                }
+            }
+        }
     }
 }
 
@@ -8153,7 +8424,12 @@ impl Drop for Gpu {
 mod tests {
     const QSA_MIB: usize = 1 << 20;
 
-    fn qsa_verdict(bias: usize, offset: usize, len: usize, limit: usize) -> Result<usize, super::QsaExtentFailure> {
+    fn qsa_verdict(
+        bias: usize,
+        offset: usize,
+        len: usize,
+        limit: usize,
+    ) -> Result<usize, super::QsaExtentFailure> {
         super::qsa_extent_verdict("test", super::qsa_required_end(bias, offset, len), limit)
     }
 
@@ -8169,7 +8445,12 @@ mod tests {
         let failure = qsa_verdict(32, 16, 49, 96).unwrap_err();
         assert_eq!(
             failure,
-            super::QsaExtentFailure { arena: "test", limit_bytes: 96, required_end: 97, overflow: false }
+            super::QsaExtentFailure {
+                arena: "test",
+                limit_bytes: 96,
+                required_end: 97,
+                overflow: false
+            }
         );
     }
 
@@ -8177,16 +8458,27 @@ mod tests {
     fn qsa_extent_usize_overflow_is_rejected() {
         assert_eq!(super::qsa_required_end(usize::MAX, 1, 0), None);
         assert_eq!(super::qsa_required_end(0, usize::MAX, 1), None);
-        assert_eq!(super::qsa_required_end(1, usize::MAX - 2, 1), Some(usize::MAX));
+        assert_eq!(
+            super::qsa_required_end(1, usize::MAX - 2, 1),
+            Some(usize::MAX)
+        );
         // Even with an unbounded limit an overflowed end must not pass.
-        for (bias, offset, len) in [(usize::MAX, 1, 0), (0, usize::MAX, 1), (usize::MAX / 2 + 1, usize::MAX / 2 + 1, 0)] {
+        for (bias, offset, len) in [
+            (usize::MAX, 1, 0),
+            (0, usize::MAX, 1),
+            (usize::MAX / 2 + 1, usize::MAX / 2 + 1, 0),
+        ] {
             let failure = qsa_verdict(bias, offset, len, usize::MAX).unwrap_err();
             assert!(failure.overflow);
             assert_eq!(failure.required_end, usize::MAX);
             assert_eq!(failure.limit_bytes, usize::MAX);
         }
         // Unknown storage (required end `None`) fails closed.
-        assert!(super::qsa_extent_verdict("unknown", None, 0).unwrap_err().overflow);
+        assert!(
+            super::qsa_extent_verdict("unknown", None, 0)
+                .unwrap_err()
+                .overflow
+        );
     }
 
     #[test]
@@ -8198,14 +8490,20 @@ mod tests {
         // A view 1 MiB into the owner: bias 1 MiB, limit is the mapped prefix.
         let (bias, limit) = super::qsa_extent_limit(base + QSA_MIB, owners, 32 * QSA_MIB);
         assert_eq!((bias, limit), (QSA_MIB, mapped));
-        assert!(limit < 32 * QSA_MIB, "mapped prefix is smaller than the logical size");
+        assert!(
+            limit < 32 * QSA_MIB,
+            "mapped prefix is smaller than the logical size"
+        );
         // Logical size is within the view but past the mapped prefix: rejected.
         let failure = qsa_verdict(bias, 0, 3 * QSA_MIB + 1, limit).unwrap_err();
         assert_eq!(failure.limit_bytes, mapped);
         assert_eq!(failure.required_end, QSA_MIB + 3 * QSA_MIB + 1);
         assert_eq!(qsa_verdict(bias, 0, 3 * QSA_MIB, limit), Ok(mapped));
         // Outside every owner (and at the reserved end): allocation size.
-        assert_eq!(super::qsa_extent_limit(base + reserved, owners, 4096), (0, 4096));
+        assert_eq!(
+            super::qsa_extent_limit(base + reserved, owners, 4096),
+            (0, 4096)
+        );
         assert_eq!(super::qsa_extent_limit(0x2000, owners, 123), (0, 123));
         assert_eq!(super::qsa_extent_limit(base, [], 77), (0, 77));
     }
@@ -8289,15 +8587,19 @@ mod tests {
     fn kernarg_cross_check_rejects_params_order_mismatch() {
         let mut m = 3i32;
         let mut k = 4i32;
-        let params: Vec<*mut c_void> =
-            vec![&mut k as *mut _ as *mut c_void, &mut m as *mut _ as *mut c_void];
+        let params: Vec<*mut c_void> = vec![
+            &mut k as *mut _ as *mut c_void,
+            &mut m as *mut _ as *mut c_void,
+        ];
         super::debug_assert_params_match(
             &params,
-            &[super::kernarg_value_bytes(&m), super::kernarg_value_bytes(&k)],
+            &[
+                super::kernarg_value_bytes(&m),
+                super::kernarg_value_bytes(&k),
+            ],
         );
     }
 
-    use std::ffi::c_void;
     use super::gen_fwht_signs;
     use super::DType;
     use super::Gpu;
@@ -8306,6 +8608,7 @@ mod tests {
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
+    use std::ffi::c_void;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -8897,9 +9200,17 @@ mod tests {
         assert_eq!(alias(short, 3 * MIB), 3 * MIB);
         assert_eq!(alias(short, 3 * MIB - 1), 2 * MIB);
         assert_eq!(alias(std::iter::empty::<usize>(), MIB), 0);
-        assert_eq!(alias([0usize, 2 * MIB], 4 * MIB), 0, "zero-size granule ends the walk");
+        assert_eq!(
+            alias([0usize, 2 * MIB], 4 * MIB),
+            0,
+            "zero-size granule ends the walk"
+        );
         assert_eq!(alias([usize::MAX, 2], usize::MAX), usize::MAX);
-        assert_eq!(alias([usize::MAX, 2], usize::MAX - 1), 0, "overflowing sum ends the walk");
+        assert_eq!(
+            alias([usize::MAX, 2], usize::MAX - 1),
+            0,
+            "overflowing sum ends the walk"
+        );
     }
 
     /// FP8 rows are 516 B (512 payload + 4 scale), so a row straddles the 2 MiB
@@ -8918,12 +9229,18 @@ mod tests {
         let kv_alias = alias(granules, limit);
         assert_eq!(kv_alias, GRANULE);
         assert_eq!(valid - kv_alias, 388);
-        assert_eq!((valid - kv_alias) % ROW, ROW - (GRANULE - (GRANULE / ROW) * ROW));
+        assert_eq!(
+            (valid - kv_alias) % ROW,
+            ROW - (GRANULE - (GRANULE / ROW) * ROW)
+        );
         // Raw index with an in-place restored tail: writable_from four rows
         // short of valid falls inside granule 0, so nothing may alias.
         let writable_from = valid - 4 * ROW;
         assert!(writable_from < GRANULE);
-        assert_eq!(alias(granules, valid.min(writable_from).min(4 * GRANULE)), 0);
+        assert_eq!(
+            alias(granules, valid.min(writable_from).min(4 * GRANULE)),
+            0
+        );
         // granule_prefix_bytes caps the alias even when valid is larger.
         assert_eq!(alias(granules, valid.min(valid).min(GRANULE)), GRANULE);
         assert_eq!(alias(granules, 3 * GRANULE - 1), 2 * GRANULE);
@@ -8962,7 +9279,10 @@ mod tests {
             vmm_move(0x11_000, 0x91_000, 0x1000),
             vmm_move(0x20_000, 0xa0_000, 0x2000),
         ];
-        assert!(validate(&ok).is_ok(), "adjacent and disjoint ranges are fine");
+        assert!(
+            validate(&ok).is_ok(),
+            "adjacent and disjoint ranges are fine"
+        );
         assert!(validate(&[]).is_ok());
 
         let duplicate = [
@@ -8994,7 +9314,9 @@ mod tests {
             .contains("reserved_bytes is zero"));
         let mut bad_mapped = vmm_move(0x10_000, 0x90_000, 0x1000);
         bad_mapped.mapped_bytes = 0x1001;
-        assert!(validate(&[bad_mapped]).unwrap_err().contains("exceeds reserved"));
+        assert!(validate(&[bad_mapped])
+            .unwrap_err()
+            .contains("exceeds reserved"));
         assert!(validate(&[vmm_move(usize::MAX - 8, 0x90_000, 0x1000)])
             .unwrap_err()
             .contains("overflows"));
@@ -9017,7 +9339,9 @@ mod tests {
         let granularity = gpu
             .vmm_recommended_granularity()
             .expect("VMM granularity query");
-        let granule = (2usize << 20).max(granularity).next_multiple_of(granularity);
+        let granule = (2usize << 20)
+            .max(granularity)
+            .next_multiple_of(granularity);
         let mut src = unsafe { gpu.alloc_vmm_tensor(&[4 * granule], DType::Raw, 0, &access) }
             .expect("alloc VMM source");
         let mapped = gpu
@@ -9059,7 +9383,11 @@ mod tests {
         let mut forks = gpu.fork_vmm_prefixes(&set, &access).expect("fork prefix");
         assert_eq!(forks.len(), 1);
         let fork = forks.pop().unwrap();
-        assert_ne!(fork.buf.as_ptr(), src.buf.as_ptr(), "fork must use a fresh VA");
+        assert_ne!(
+            fork.buf.as_ptr(),
+            src.buf.as_ptr(),
+            "fork must use a fresh VA"
+        );
         assert_ne!(gpu.vmm_owner_generation(&fork), Some(src_generation));
         let fork_mapped = gpu.vmm_mapped_bytes(&fork).expect("fork mapped");
         assert_eq!(fork_mapped, 3 * granule);
@@ -9067,8 +9395,16 @@ mod tests {
         let src_ids = gpu.vmm_physical_granules(&src).expect("source granules");
         let fork_ids = gpu.vmm_physical_granules(&fork).expect("fork granules");
         assert_eq!(fork_ids.len(), 3);
-        assert_eq!(fork_ids[..2], src_ids[..2], "aliased granules share physical ids");
-        assert_eq!(fork_ids[..2], aliased[..], "set reports the aliased granules");
+        assert_eq!(
+            fork_ids[..2],
+            src_ids[..2],
+            "aliased granules share physical ids"
+        );
+        assert_eq!(
+            fork_ids[..2],
+            aliased[..],
+            "set reports the aliased granules"
+        );
         assert_ne!(fork_ids[2], src_ids[2], "the frontier granule is private");
         let mv = gpu.vmm_resource_move(&src, &fork).expect("resource move");
         assert_eq!(mv.old_base, src.buf.as_ptr() as usize);
@@ -9082,7 +9418,11 @@ mod tests {
         gpu.hip
             .memcpy_dtoh(&mut fork_bytes, &view(&fork, fork_mapped))
             .expect("read fork");
-        assert_eq!(fork_bytes[..valid], pattern[..valid], "fork prefix != source");
+        assert_eq!(
+            fork_bytes[..valid],
+            pattern[..valid],
+            "fork prefix != source"
+        );
         assert!(
             fork_bytes[valid..].iter().all(|byte| *byte == 0),
             "fork bytes past valid must be zero"
@@ -9685,10 +10025,16 @@ mod tests {
         let mib = 1usize << 20;
         assert_eq!(p, 64 * 1024);
         assert!(super::validate_weight_extents(p + g, 1, g).is_ok());
-        assert!(super::validate_weight_extents(p + g, g, g).is_ok(), "exact logical + pad");
+        assert!(
+            super::validate_weight_extents(p + g, g, g).is_ok(),
+            "exact logical + pad"
+        );
         assert!(super::validate_weight_extents(p + 2 * g, g + 1, g).is_ok());
         assert!(super::validate_weight_extents(64 * mib + p, 64 * mib, g).is_ok());
-        assert!(super::validate_weight_extents(2 * p + g, 1, g).is_ok(), "not exact ceil");
+        assert!(
+            super::validate_weight_extents(2 * p + g, 1, g).is_ok(),
+            "not exact ceil"
+        );
         assert!(super::validate_weight_extents(2 * mib, 1, 2 * mib).is_ok());
         assert!(super::validate_weight_extents(66 * mib, 64 * mib, 2 * mib).is_ok());
     }
@@ -9712,8 +10058,14 @@ mod tests {
         let mib = 1usize << 20;
         assert!(super::validate_weight_extents(p, 1, g).is_err());
         assert!(super::validate_weight_extents(p + g, g + 1, g).is_err());
-        assert!(super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(), "no tail");
-        assert!(super::validate_weight_extents(g, g + 1, g).is_err(), "logical beyond physical");
+        assert!(
+            super::validate_weight_extents(64 * mib, 64 * mib, g).is_err(),
+            "no tail"
+        );
+        assert!(
+            super::validate_weight_extents(g, g + 1, g).is_err(),
+            "logical beyond physical"
+        );
         assert!(super::validate_weight_extents(64 * mib, 64 * mib, 2 * mib).is_err());
     }
 
@@ -9724,7 +10076,9 @@ mod tests {
         let p = super::EXPORT_WEIGHT_TAIL_PAD_BYTES;
         assert!(super::validate_weight_extents(p + g + 1, 1, g).is_err());
         assert!(super::validate_weight_extents(p + g - 1, 1, g).is_err());
-        assert!(super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err());
+        assert!(
+            super::validate_weight_extents(3 * (2usize << 20) + 4096, 1, 2usize << 20).is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -9748,7 +10102,12 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn s2_read(gpu: &super::Gpu, buf: &hip_bridge::DeviceBuffer, off: usize, len: usize) -> Vec<u8> {
+    fn s2_read(
+        gpu: &super::Gpu,
+        buf: &hip_bridge::DeviceBuffer,
+        off: usize,
+        len: usize,
+    ) -> Vec<u8> {
         let mut out = vec![0u8; len];
         gpu.hip
             .memcpy_dtoh_at(&mut out, buf, off)
@@ -9766,7 +10125,12 @@ mod tests {
             let n = chunk.min(logical - off);
             let got = s2_read(gpu, &owner.buf, off, n);
             if let Some(i) = (0..n).find(|&i| got[i] != pattern[off + i]) {
-                panic!("byte {} differs: got {} want {}", off + i, got[i], pattern[off + i]);
+                panic!(
+                    "byte {} differs: got {} want {}",
+                    off + i,
+                    got[i],
+                    pattern[off + i]
+                );
             }
             off += n;
         }
@@ -9774,7 +10138,12 @@ mod tests {
 
     /// Padding in `[logical, physical)` reads back zero.
     #[cfg(target_os = "linux")]
-    fn s2_check_tail_zero(gpu: &super::Gpu, owner: &super::GpuTensor, logical: usize, physical: usize) {
+    fn s2_check_tail_zero(
+        gpu: &super::Gpu,
+        owner: &super::GpuTensor,
+        logical: usize,
+        physical: usize,
+    ) {
         let tail = physical - logical;
         if tail == 0 {
             return;
@@ -9808,7 +10177,11 @@ mod tests {
     /// Freeing a borrowed view of a registered owner is refused and leaves the
     /// registration (and the orphan table) untouched.
     #[cfg(target_os = "linux")]
-    fn s2_assert_borrowed_free_rejected(gpu: &mut super::Gpu, owner: &super::GpuTensor, logical: usize) {
+    fn s2_assert_borrowed_free_rejected(
+        gpu: &mut super::Gpu,
+        owner: &super::GpuTensor,
+        logical: usize,
+    ) {
         let key = owner.buf.as_ptr() as usize;
         let before = (gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len());
         let view = || super::GpuTensor {
@@ -9817,7 +10190,9 @@ mod tests {
             shape: vec![logical],
             dtype: super::DType::Raw,
         };
-        let err = gpu.free_tensor(view()).expect_err("borrowed free must fail");
+        let err = gpu
+            .free_tensor(view())
+            .expect_err("borrowed free must fail");
         assert!(err.to_string().contains("borrowed VMM view"), "{err}");
         let err = gpu
             .release_tensor_immediate(view())
@@ -9854,10 +10229,14 @@ mod tests {
         let logical = (3usize << 20) + 12_345;
         let mut pattern = s2_pattern(logical);
         pattern.extend_from_slice(&[0xa5; 256]);
-        let mut src = gpu.upload_raw(&pattern, &[pattern.len()]).expect("upload small source");
+        let mut src = gpu
+            .upload_raw(&pattern, &[pattern.len()])
+            .expect("upload small source");
         let view = src.sub_offset(0, logical);
         assert!(view.buf.is_borrowed());
-        let exp = gpu.create_exportable_weight_copy(&view).expect("export bounded small source");
+        let exp = gpu
+            .create_exportable_weight_copy(&view)
+            .expect("export bounded small source");
         drop(view);
         assert_eq!(exp.logical_bytes, logical);
         assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
@@ -9868,7 +10247,8 @@ mod tests {
         s2_assert_owner(gpu, &exp.owner, logical);
         s2_check_pattern(gpu, &exp.owner, logical);
         s2_check_tail_zero(gpu, &exp.owner, logical, exp.physical_bytes);
-        gpu.release_weight_source_immediate(&mut src).expect("release small source");
+        gpu.release_weight_source_immediate(&mut src)
+            .expect("release small source");
         let super::ExportedWeightAllocation { owner, fd, .. } = exp;
         gpu.free_tensor(owner).expect("free small owner");
         drop(fd);
@@ -9948,11 +10328,21 @@ mod tests {
         s2_small_nonaligned_case(&mut gpu);
 
         let logical = 64usize << 20;
-        let mut src = gpu.upload_raw(&s2_pattern(logical), &[logical]).expect("upload source");
-        let exp = gpu.create_exportable_weight_copy(&src).expect("create exportable copy");
+        let mut src = gpu
+            .upload_raw(&s2_pattern(logical), &[logical])
+            .expect("upload source");
+        let exp = gpu
+            .create_exportable_weight_copy(&src)
+            .expect("create exportable copy");
         assert_eq!(exp.logical_bytes, logical);
-        assert_eq!(exp.granularity, 4096, "weight arenas use the minimum granularity");
-        assert_eq!(exp.physical_bytes, logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
+        assert_eq!(
+            exp.granularity, 4096,
+            "weight arenas use the minimum granularity"
+        );
+        assert_eq!(
+            exp.physical_bytes,
+            logical + super::EXPORT_WEIGHT_TAIL_PAD_BYTES
+        );
         assert!(exp.physical_bytes - logical >= super::EXPORT_WEIGHT_TAIL_PAD_BYTES);
         eprintln!(
             "S2_EXPORTER pid={} logical={} physical={} granularity={} vram_used={}",
@@ -9982,7 +10372,8 @@ mod tests {
 
         // Old hipMalloc owner is physically released, not parked.
         let before = s2_vram_used();
-        gpu.release_weight_source_immediate(&mut src).expect("release old owner");
+        gpu.release_weight_source_immediate(&mut src)
+            .expect("release old owner");
         assert!(src.buf.is_borrowed() && src.buf.size() == 0 && src.shape == vec![0]);
         gpu.release_weight_source_immediate(&mut src)
             .expect_err("emptied source is not a hipMalloc owner");
@@ -10003,7 +10394,10 @@ mod tests {
         let raw = exp.fd.as_raw_fd();
         // SAFETY: F_GETFD on an FD this process owns.
         let flags = unsafe { fcntl(raw, S2_F_GETFD) };
-        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exported FD must be CLOEXEC");
+        assert!(
+            flags >= 0 && flags & S2_FD_CLOEXEC != 0,
+            "exported FD must be CLOEXEC"
+        );
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
         cmd.args([
             "--exact",
@@ -10028,7 +10422,10 @@ mod tests {
         assert!(status.success(), "importer failed: {status:?}");
         // SAFETY: as above; the child's pre_exec cannot change the parent's descriptor flags.
         let flags = unsafe { fcntl(raw, S2_F_GETFD) };
-        assert!(flags >= 0 && flags & S2_FD_CLOEXEC != 0, "exporter FD lost CLOEXEC");
+        assert!(
+            flags >= 0 && flags & S2_FD_CLOEXEC != 0,
+            "exporter FD lost CLOEXEC"
+        );
 
         let super::ExportedWeightAllocation { owner, fd, .. } = exp;
         assert_eq!((gpu.vmm_arenas.len(), gpu.orphan_vmm_arenas.len()), (1, 0));

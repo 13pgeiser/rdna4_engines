@@ -792,3 +792,7 @@ required-features = ["lab"]
 [[example]]
 name = "ep2_boundary_micro"
 required-features = ["lab"]
+
+[[example]]
+name = "moe_nan_guard_regress"
+required-features = ["lab"]

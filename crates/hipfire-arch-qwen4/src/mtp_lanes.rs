@@ -31,18 +31,17 @@
 //! [`LaneCostModel`] instead of wall clocks (see its docs).
 
 use crate::bundle::{BundleError, Qwen4Bundle};
+use crate::lane::Qwen4LaneStore;
 use crate::lane::{LabRoutes, LaneSpec, LaneSpecConfig, Qwen4LaneState};
 use crate::lane_exec::{LaneDraft, LaneRoute};
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuStateSnapshot};
 use crate::mtp_spec::{
     accept_native_greedy, batched_depth, draft_accept_estimate, draft_pairing,
-    finish_native_window, mtp_prefill_chunk,
-    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, observe_agreement, Agreement, DraftPairing, FloorRoute,
-    MtpFloor, NativeFinish, NativeWindow, DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR,
-    MTP_MAX_DEPTH, MTP_ROW_WORTH, WindowStats,
+    finish_native_window, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
+    mtp_reuse_prefill_ids_enabled, mtp_skip_intermediate_pick_enabled, observe_agreement,
+    Agreement, DraftPairing, FloorRoute, MtpFloor, NativeFinish, NativeWindow, WindowStats,
+    DRAFT_ACCEPT_MAX, MTP_AGREEMENT_DECAY, MTP_AGREEMENT_PRIOR, MTP_MAX_DEPTH, MTP_ROW_WORTH,
 };
-use crate::lane::Qwen4LaneStore;
 use crate::state::Qwen4StateSnapshot;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
@@ -332,7 +331,8 @@ impl LaneSpecPolicy {
         observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
         if self.floor_enabled {
             let stats = WindowStats::of(window, cap);
-            self.floor.observe_window(NativeWindow::Batched, stats, units, k, &self.agreement);
+            self.floor
+                .observe_window(NativeWindow::Batched, stats, units, k, &self.agreement);
         }
     }
 
@@ -344,7 +344,8 @@ impl LaneSpecPolicy {
         }
         observe_agreement(&mut self.agreement, window, MTP_AGREEMENT_DECAY);
         if self.floor_enabled {
-            self.floor.observe_native(NativeWindow::Interleaved, window, 1.0, k, &self.agreement);
+            self.floor
+                .observe_native(NativeWindow::Interleaved, window, 1.0, k, &self.agreement);
         }
     }
 }
@@ -382,7 +383,9 @@ pub(crate) struct PendingWindow {
 pub(crate) fn lane_call<R>(
     result: Result<Result<R, BundleError>, BundleError>,
 ) -> Result<R, String> {
-    result.and_then(|inner| inner).map_err(|error| error.to_string())
+    result
+        .and_then(|inner| inner)
+        .map_err(|error| error.to_string())
 }
 
 /// One lane's drafting state inside the step-synchronous loop.
@@ -520,9 +523,7 @@ pub(crate) fn draft_lanes(
                 pending_hidden,
                 ..
             } = spec;
-            let top1 = store
-                .draft_top1
-                .sub_offset(slot * slot_bytes, slot_bytes);
+            let top1 = store.draft_top1.sub_offset(slot * slot_bytes, slot_bytes);
             let hidden = (j == 0).then_some(&*pending_hidden);
             let (input, position) = (st.input, st.position + j);
             lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
@@ -534,6 +535,8 @@ pub(crate) fn draft_lanes(
         let bytes = active.len() * slot_bytes;
         gpu.hip
             .memcpy_dtoh(&mut store.draft_top1_host[..bytes], &store.draft_top1.buf)
+            .map_err(|e| format!("draft_step: draft download: {e}"))?;
+        gpu.take_device_wait_error()
             .map_err(|e| format!("draft_step: draft download: {e}"))?;
         for (slot, &d) in active.iter().enumerate() {
             let top = &store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
@@ -805,11 +808,8 @@ pub(crate) fn prefill_tile(
         ));
     }
     let end = start + tokens.len();
-    let needs_pick = mtp_prefill_chunk_needs_pick(
-        end,
-        host.prompt.len(),
-        mtp_skip_intermediate_pick_enabled(),
-    );
+    let needs_pick =
+        mtp_prefill_chunk_needs_pick(end, host.prompt.len(), mtp_skip_intermediate_pick_enabled());
     // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
     lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
@@ -886,7 +886,10 @@ mod tests {
         let model = LaneCostModel::new();
         let fit = fit_array(&model);
         for (got, want) in fit.iter().zip(COST_PRIOR_US) {
-            assert!((got - want).abs() < want * 1e-9, "{fit:?} vs {COST_PRIOR_US:?}");
+            assert!(
+                (got - want).abs() < want * 1e-9,
+                "{fit:?} vs {COST_PRIOR_US:?}"
+            );
         }
         // A window of d drafts costs 1 + (r d + G share) / (alpha(C) / C).
         let units = model.window_units(8, 3, 0.375);
@@ -921,7 +924,10 @@ mod tests {
             let err = (fit[i] / truth[i] - 1.0).abs();
             let prior_err = (COST_PRIOR_US[i] / truth[i] - 1.0).abs();
             assert!(err < 0.15, "param {i}: {fit:?} vs {truth:?}");
-            assert!(err < 0.6 * prior_err, "param {i} barely left the prior: {fit:?}");
+            assert!(
+                err < 0.6 * prior_err,
+                "param {i} barely left the prior: {fit:?}"
+            );
         }
         let wall_err = worst_wall_error(&model, truth, 400, 200);
         assert!(wall_err < 0.10, "held-out wall error {wall_err}");
@@ -940,7 +946,10 @@ mod tests {
         feed(&mut model, after, 400, 400);
         let to_after = worst_wall_error(&model, after, 800, 200);
         let to_before = worst_wall_error(&model, before, 800, 200);
-        assert!(to_after < 0.20, "wall error against the new truth {to_after}");
+        assert!(
+            to_after < 0.20,
+            "wall error against the new truth {to_after}"
+        );
         assert!(
             to_after < 0.5 * to_before,
             "fit still follows the old truth: {to_after} vs {to_before}"
@@ -1036,7 +1045,10 @@ mod tests {
             policy.observe_batched(&window(2, 1, 1), units, 1, 1);
         }
         assert!(!policy.retired());
-        assert_eq!(policy.route(1, LabRoutes::Floor), LaneRoute::Batched { k_max: 1 });
+        assert_eq!(
+            policy.route(1, LabRoutes::Floor),
+            LaneRoute::Batched { k_max: 1 }
+        );
     }
 
     #[test]

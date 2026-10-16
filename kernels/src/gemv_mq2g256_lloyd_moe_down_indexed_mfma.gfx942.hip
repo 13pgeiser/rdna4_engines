@@ -18,7 +18,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942(
     const float* __restrict__ rot_batch,
     float* __restrict__ x_residual,
     int M,
-    int K
+    int K, int n_experts
 ) {
     const int lane = threadIdx.x;
     const int n_lane = lane & 15;
@@ -27,6 +27,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942(
     if (row_start >= M) return;
     const int krank = blockIdx.y;
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;

@@ -5,7 +5,7 @@
 //! Wide twins of the K1 lane-union decode GEMV: the eight entries
 //! `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}_c{16,32}` (design `WideTwinGemvSol` §7.1/§7.3).
 //!
-//! The 88-byte kernarg ABI, the slot/X/Y addressing and every arithmetic step are the narrow entries'
+//! The 96-byte kernarg ABI (the narrow entries': 88 bytes plus `n_experts@88` and a zero `reserved@92`), the slot/X/Y addressing and every arithmetic step are the narrow entries'
 //! ([`super`]); only the schedule differs, so every `(slot, output row)` value stays bitwise the narrow
 //! (C1) entry's:
 //!
@@ -14,7 +14,8 @@
 //!    `8*wg_x + w` for the whole K traversal, across every slot of the expert (`n <= C`, `C = 16 | 32`):
 //!    one wave32 per output row, the lane arithmetic and reduction tree of the narrow entry unchanged.
 //!    A workgroup returns uniformly (before its first barrier) when its first row is `>= M`, its expert
-//!    index is `>= U`, `n == 0`, `n` exceeds the entry's capacity or `offsets[u+1] > 10*C`.
+//!    index is `>= U`, its expert id is `>= n_experts` (unsigned), `n == 0`, `n` exceeds the entry's capacity or
+//!    `offsets[u+1] > 10*C`.
 //!  * Per group (128 columns; `Mq4Sym` gate: 256) the wave loads and dequantizes its weights exactly once,
 //!    outside every slot loop (no weight-class load sits inside a tile or slot branch: the census test
 //!    asserts it, and the count is the same for C16 and C32). The expert's slots then run in tiles of eight:
@@ -55,6 +56,8 @@ const WAVE: u8 = 80;
 const ROWB: u8 = 81;
 const SSI: u8 = 82;
 const XSL: u8 = 83;
+/// `n_experts@88`: the extent of the `expert_weight_ptrs` table (the narrow entries' `SNEXP`, moved clear of `WAVE`).
+const SNEXP_W: u8 = 84;
 const SGPRS: u8 = 88;
 
 /// VGPR layout of a wide entry: the narrow [`Lay`] fields for the shared pieces (`xo` / `ya` are one lane
@@ -216,6 +219,13 @@ fn plan(arch: Arch, l: &WLay) -> Result<RegPlan, String> {
     ] {
         declare(&mut regs, name, RKind::S, base, len)?;
     }
+    declare(
+        &mut regs,
+        "kernel_arguments_n_experts",
+        RKind::S,
+        SNEXP_W,
+        1,
+    )?;
     let chains = u16::from(b.chains);
     for (name, base, len) in [
         ("thread_id", LANE, 1),
@@ -294,7 +304,9 @@ pub(super) fn emit(spec: Spec, net: Network) -> Result<Emitted, String> {
         .hidden("x_row_div", 72, 4, "by_value")
         .hidden("x_src_rows", 76, 4, "by_value")
         .hidden("x_row_stride", 80, 4, "by_value")
-        .hidden("y_slot_stride", 84, 4, "by_value");
+        .hidden("y_slot_stride", 84, 4, "by_value")
+        .hidden("n_experts", 88, 4, "by_value")
+        .hidden("reserved", 92, 4, "by_value");
     let kspec = KernelSpec {
         kernel_id: "mq_i4_moe_gemv".into(),
         variant: spec.tag(),
@@ -381,6 +393,7 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
     smem(b, XROT, 8, KARG, 0x20)?;
     smem(b, SU, 4, KARG, 0x40)?;
     smem(b, SXSTR, 2, KARG, 0x50)?;
+    smem(b, SNEXP_W, 1, KARG, 0x58)?;
     // LDS addresses, all functions of the work-item id alone and defined once (before the first branch):
     //   producer store: wave*pitch + lane*16 (`[slot=wave][half][lane][4 f32]`), consumer base: lane*16.
     valu(
@@ -488,6 +501,15 @@ fn prologue(b: &mut Builder, spec: Spec, l: &WLay) -> R {
         format!("s_cmp_gt_u32 s{OFF1}, s{TMP}"),
         &[],
         &[OFF1, TMP],
+    )?;
+    branch(b, &format!("s_cbranch_scc1 {exit}"))?;
+    // Expert id range check before the table index (the narrow entries' guard): an id at or past `n_experts`
+    // (unsigned, so a negative id too) exits without a load or a store.
+    sop(
+        b,
+        format!("s_cmp_ge_u32 s{EID}, s{SNEXP_W}"),
+        &[],
+        &[EID, SNEXP_W],
     )?;
     branch(b, &format!("s_cbranch_scc1 {exit}"))?;
     sop(b, format!("s_lshl_b32 s{TMP}, s{EID}, 3"), &[TMP], &[EID])?;

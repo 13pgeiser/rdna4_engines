@@ -335,7 +335,7 @@ fn row_case(
         .collect();
     let owner_of = |id: i32| -> Option<usize> {
         match kind {
-            RowKind::ByOwner => (id >= 0).then(|| id as usize % n),
+            RowKind::ByOwner => (id >= 0 && (id as usize) < EXPERTS).then(|| id as usize % n),
             RowKind::BySlotOwner => (id >= 0 && (id as usize) < n).then_some(id as usize),
         }
     };
@@ -369,6 +369,7 @@ fn row_case(
             n,
             self_rank,
             n16,
+            EXPERTS,
         ),
         RowKind::BySlotOwner => rig.gpu.ep_gather_rows_by_slot_owner(
             &id_tensor,
@@ -1864,7 +1865,7 @@ impl<'a> Env<'a> {
         self.guard("ep_gather_rows_by_owner", &p)?;
         ctx(
             self.gpu
-                .ep_gather_rows_by_owner(ids, src, dst, slots, ranks, self_rank, n16),
+                .ep_gather_rows_by_owner(ids, src, dst, slots, ranks, self_rank, n16, EXPERTS),
             "ep_gather_rows_by_owner",
         )
     }

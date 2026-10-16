@@ -26,7 +26,9 @@ extern "C" __global__ void moe_down_unscatter_k8(
     const int col = blockIdx.y * blockDim.x + threadIdx.x;
     if (slot >= total_slots || col >= dim) return;
 
+    // inverse_perm[slot] < 0: the slot's id was invalid (unrouted); no grouped
+    // row exists, so the canonical-order row is zero (never read from Y).
     const int grouped_slot = inverse_perm[slot];
     down_expanded[(long long)slot * dim + col] =
-        Y_down_grouped[(long long)grouped_slot * dim + col];
+        grouped_slot >= 0 ? Y_down_grouped[(long long)grouped_slot * dim + col] : 0.0f;
 }

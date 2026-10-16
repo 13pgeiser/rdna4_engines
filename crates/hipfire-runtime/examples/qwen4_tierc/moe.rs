@@ -293,7 +293,9 @@ fn router_logits(rng: &mut Rng, rows: usize) -> Vec<f32> {
                     row[i] = 3.0;
                 }
             }
-            2 => row.iter_mut().for_each(|v| *v = (rng.below(4) as f32) - 1.0),
+            2 => row
+                .iter_mut()
+                .for_each(|v| *v = (rng.below(4) as f32) - 1.0),
             _ => {}
         }
         out.extend(row);
@@ -313,7 +315,7 @@ fn run_router(
     let t_w = sentinel_f32(gpu, rows * K)?;
     // gfx942: `qwen4_router_fast_enabled` is false (gfx1151/gfx1201 only), so the
     // incumbent `moe_router_softmax_top10_f32` runs for every row count.
-    gpu.moe_router_softmax_top10_f32(&t_logits, &t_ids, &t_w, rows, normalize, round)
+    gpu.moe_router_softmax_top10_f32(&t_logits, &t_ids, &t_w, rows, normalize, round, 0, 0)
         .map_err(e)?;
     sync(gpu)?;
     let ids = down_i32(gpu, &t_ids)?;
@@ -350,9 +352,17 @@ fn router_case(gpu: &mut Gpu) -> Result<String, String> {
         }
         let tag = format!("rows={rows} norm=true round=1");
         results.push(exact_ints(&format!("{tag} ids"), &ids1, &want_ids));
-        results.push(exact_ints(&format!("{tag} ids vs rounded-input run"), &ids1, &ids_r));
+        results.push(exact_ints(
+            &format!("{tag} ids vs rounded-input run"),
+            &ids1,
+            &ids_r,
+        ));
         let want_w1: Vec<f32> = w_r.iter().map(|&v| bf16r(v)).collect();
-        results.push(exact_f32(&format!("{tag} w == bf16(round=0 w of rounded logits)"), &w1, &want_w1));
+        results.push(exact_f32(
+            &format!("{tag} w == bf16(round=0 w of rounded logits)"),
+            &w1,
+            &want_w1,
+        ));
     }
     all(results)
 }
@@ -388,7 +398,10 @@ fn check_scatter(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<String, Str
     let sorted = down_i32(gpu, &t_sorted)?;
     let tiles = down_i32(gpu, &t_tiles)?;
     let inverse = down_i32(gpu, &t_inv)?;
-    free_all(gpu, vec![t_topk, t_counts, t_offsets, t_sorted, t_tiles, t_inv])?;
+    free_all(
+        gpu,
+        vec![t_topk, t_counts, t_offsets, t_sorted, t_tiles, t_inv],
+    )?;
 
     // Intra-run order is atomic-arrival order: canonicalise each expert's live
     // run (ascending) before comparing the permutation; report how many runs the
@@ -398,7 +411,9 @@ fn check_scatter(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<String, Str
     for ex in 0..E {
         let (lo, n) = (lay.offsets[ex] as usize, lay.raw[ex]);
         if lo + n > canon.len() {
-            return Err(format!("{label}: reference run of expert {ex} outside sorted buffer"));
+            return Err(format!(
+                "{label}: reference run of expert {ex} outside sorted buffer"
+            ));
         }
         if !canon[lo..lo + n].windows(2).all(|w| w[0] <= w[1]) {
             unsorted_runs += 1;
@@ -431,9 +446,15 @@ fn check_scatter(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<String, Str
         exact_ints(&format!("{label} counts"), &counts, &lay.counts),
         exact_ints(&format!("{label} offsets"), &offsets, &lay.offsets),
         exact_ints(&format!("{label} tile_ids"), &tiles, &lay.tiles),
-        exact_ints(&format!("{label} sorted (per-run canonical, pads -1)"), &canon, &lay.sorted),
+        exact_ints(
+            &format!("{label} sorted (per-run canonical, pads -1)"),
+            &canon,
+            &lay.sorted,
+        ),
         inv_res,
-        Ok(format!("{label} runs not ascending on device: {unsorted_runs} (informational)")),
+        Ok(format!(
+            "{label} runs not ascending on device: {unsorted_runs} (informational)"
+        )),
     ])
 }
 
@@ -498,11 +519,18 @@ fn check_stable(gpu: &mut Gpu, label: &str, topk: &[i32]) -> Result<String, Stri
     let sorted = down_i32(gpu, &t_sorted)?;
     let tiles = down_i32(gpu, &t_tiles)?;
     let inverse = down_i32(gpu, &t_inv)?;
-    free_all(gpu, vec![t_topk, t_counts, t_offsets, t_sorted, t_tiles, t_inv])?;
+    free_all(
+        gpu,
+        vec![t_topk, t_counts, t_offsets, t_sorted, t_tiles, t_inv],
+    )?;
     all(vec![
         exact_ints(&format!("{label} counts"), &counts, &lay.counts),
         exact_ints(&format!("{label} offsets"), &offsets, &lay.offsets),
-        exact_ints(&format!("{label} sorted ((expert, flat_slot) order, pads/tail -1)"), &sorted, &lay.sorted),
+        exact_ints(
+            &format!("{label} sorted ((expert, flat_slot) order, pads/tail -1)"),
+            &sorted,
+            &lay.sorted,
+        ),
         exact_ints(&format!("{label} tile_ids"), &tiles, &lay.tiles),
         exact_ints(&format!("{label} inverse_perm"), &inverse, &lay.inverse),
     ])
@@ -604,7 +632,11 @@ fn unscatter_silu_case(gpu: &mut Gpu) -> Result<String, String> {
         // rt=1 on the raw input == BF16 round of the rt=0 result on the BF16-exact input
         // (same device expf, so no cross-implementation exp difference).
         let want_c: Vec<f32> = b.iter().map(|&v| bf16r(v)).collect();
-        results.push(exact_f32(&format!("{tag} rt=1 == bf16(rt=0 on bf16-exact input)"), &c, &want_c));
+        results.push(exact_f32(
+            &format!("{tag} rt=1 == bf16(rt=0 on bf16-exact input)"),
+            &c,
+            &want_c,
+        ));
     }
     all(results)
 }
@@ -643,7 +675,11 @@ fn rotate128_ref(a: &[f32], s1: &[f32], s2: &[f32]) -> Vec<f32> {
             for el in 0..4 {
                 let partner = old[tid ^ stride][el];
                 let mine = old[tid][el];
-                v[tid][el] = if tid & stride != 0 { partner - mine } else { mine + partner };
+                v[tid][el] = if tid & stride != 0 {
+                    partner - mine
+                } else {
+                    mine + partner
+                };
             }
         }
     }
@@ -663,8 +699,16 @@ fn unscatter_silu_rotate_case(gpu: &mut Gpu) -> Result<String, String> {
     gpu.ensure_mq_signs_128().map_err(e)?;
     let (s1, s2) = {
         let g: &Gpu = &*gpu;
-        let t1 = g.scratch.mq_signs1_128.as_ref().ok_or("mq_signs1_128 missing")?;
-        let t2 = g.scratch.mq_signs2_128.as_ref().ok_or("mq_signs2_128 missing")?;
+        let t1 = g
+            .scratch
+            .mq_signs1_128
+            .as_ref()
+            .ok_or("mq_signs1_128 missing")?;
+        let t2 = g
+            .scratch
+            .mq_signs2_128
+            .as_ref()
+            .ok_or("mq_signs2_128 missing")?;
         (down_f32(g, t1)?, down_f32(g, t2)?)
     };
     let mut results = Vec::new();
@@ -703,7 +747,12 @@ fn unscatter_silu_rotate_case(gpu: &mut Gpu) -> Result<String, String> {
                     want[base..base + 128].copy_from_slice(&r);
                 }
             }
-            results.push(close_f32(&format!("rows={rows} rt={}", rt as u8), &got, &want, F32_ACCUM));
+            results.push(close_f32(
+                &format!("rows={rows} rt={}", rt as u8),
+                &got,
+                &want,
+                F32_ACCUM,
+            ));
         }
         free_all(gpu, vec![t_sorted, t_y])?;
     }
@@ -743,7 +792,7 @@ fn combine_batched_case(gpu: &mut Gpu) -> Result<String, String> {
         let t_ids = ints(gpu, &topk)?;
         let t_w = up_f32(gpu, &w)?;
         let t_res = up_f32(gpu, &residual)?;
-        gpu.moe_down_combine_top10_batched(&t_exp, &t_ids, &t_w, &t_res, HIDDEN, rows)
+        gpu.moe_down_combine_top10_batched(&t_exp, &t_ids, &t_w, &t_res, HIDDEN, rows, E)
             .map_err(e)?;
         sync(gpu)?;
         let got = down_f32(gpu, &t_res)?;
@@ -791,6 +840,7 @@ fn combine_grouped_case(gpu: &mut Gpu) -> Result<String, String> {
             HIDDEN,
             lay.m_total_max,
             rows,
+            E,
         )
         .map_err(e)?;
         sync(gpu)?;
@@ -850,6 +900,7 @@ fn combine_grouped_bf16in_case(gpu: &mut Gpu) -> Result<String, String> {
                 lay.m_total_max,
                 rows,
                 initial_zero,
+                E,
             )
             .map_err(e)?;
             sync(gpu)?;
@@ -863,7 +914,11 @@ fn combine_grouped_bf16in_case(gpu: &mut Gpu) -> Result<String, String> {
                         let row = lay.inverse[t * K + r] as usize;
                         outs[r] = grouped[row * HIDDEN + col];
                     }
-                    let start = if initial_zero { 0.0 } else { residual[t * HIDDEN + col] };
+                    let start = if initial_zero {
+                        0.0
+                    } else {
+                        residual[t * HIDDEN + col]
+                    };
                     want[t * HIDDEN + col] = combine_ref(
                         start,
                         &topk[t * K..(t + 1) * K],
@@ -954,8 +1009,14 @@ fn argmax_case(gpu: &mut Gpu) -> Result<String, String> {
         sync(gpu)?;
         let got = down_i32(gpu, &t_idx)?;
         free_all(gpu, vec![t_logits, t_idx])?;
-        let want: Vec<i32> = (0..rows).map(|r| argmax_ref(&logits[r * VOCAB..(r + 1) * VOCAB])).collect();
-        results.push(exact_ints(&format!("rows={rows}"), &got[..rows.min(got.len())], &want));
+        let want: Vec<i32> = (0..rows)
+            .map(|r| argmax_ref(&logits[r * VOCAB..(r + 1) * VOCAB]))
+            .collect();
+        results.push(exact_ints(
+            &format!("rows={rows}"),
+            &got[..rows.min(got.len())],
+            &want,
+        ));
     }
     all(results)
 }
@@ -1005,16 +1066,28 @@ fn gemv_x4_case(gpu: &mut Gpu) -> Result<String, String> {
     let mut results = Vec::new();
     // (router 512, selector 1, shared gate 640, shared up 640); the Q8 shared recipe passes M = 0
     // for gate/up (`rows(m)` in the call site).
-    for (cfg, ms) in [("bf16-shared", [512usize, 1, 640, 640]), ("q8-shared", [512, 1, 0, 0])] {
+    for (cfg, ms) in [
+        ("bf16-shared", [512usize, 1, 640, 640]),
+        ("q8-shared", [512, 1, 0, 0]),
+    ] {
         let x = rng.vec(k, -1.0, 1.0);
         let ws: Vec<Vec<f32>> = ms
             .iter()
             .map(|&m| rng.vec_bf16_exact(m.max(1) * k, -0.05, 0.05))
             .collect();
         let t_x = up_f32(gpu, &x)?;
-        let t_w: Vec<GpuTensor> = ws.iter().map(|w| up_bf16(gpu, w)).collect::<Result<_, _>>()?;
-        let t_y: Vec<GpuTensor> = ms.iter().map(|&m| sentinel_f32(gpu, m.max(1))).collect::<Result<_, _>>()?;
-        let t_s: Vec<GpuTensor> = ms.iter().map(|&m| sentinel_f32(gpu, m.max(1))).collect::<Result<_, _>>()?;
+        let t_w: Vec<GpuTensor> = ws
+            .iter()
+            .map(|w| up_bf16(gpu, w))
+            .collect::<Result<_, _>>()?;
+        let t_y: Vec<GpuTensor> = ms
+            .iter()
+            .map(|&m| sentinel_f32(gpu, m.max(1)))
+            .collect::<Result<_, _>>()?;
+        let t_s: Vec<GpuTensor> = ms
+            .iter()
+            .map(|&m| sentinel_f32(gpu, m.max(1)))
+            .collect::<Result<_, _>>()?;
         gpu.gemv_bf16_xf32_x4(
             [
                 (&t_w[0], &t_y[0], ms[0]),
@@ -1028,7 +1101,8 @@ fn gemv_x4_case(gpu: &mut Gpu) -> Result<String, String> {
         .map_err(e)?;
         for i in 0..4 {
             if ms[i] > 0 {
-                gpu.gemv_bf16_xf32(&t_w[i], &t_x, &t_s[i], ms[i], k).map_err(e)?;
+                gpu.gemv_bf16_xf32(&t_w[i], &t_x, &t_s[i], ms[i], k)
+                    .map_err(e)?;
             }
         }
         sync(gpu)?;
@@ -1041,8 +1115,17 @@ fn gemv_x4_case(gpu: &mut Gpu) -> Result<String, String> {
             let want: Vec<f32> = (0..ms[i])
                 .map(|r| gemv_row_ref(&ws[i][r * k..(r + 1) * k], &x))
                 .collect();
-            results.push(exact_f32(&format!("{cfg} part{i} m={} == single-matrix launch", ms[i]), &got, &single));
-            results.push(close_f32(&format!("{cfg} part{i} m={} vs CPU mirror", ms[i]), &got, &want, F32_ACCUM));
+            results.push(exact_f32(
+                &format!("{cfg} part{i} m={} == single-matrix launch", ms[i]),
+                &got,
+                &single,
+            ));
+            results.push(close_f32(
+                &format!("{cfg} part{i} m={} vs CPU mirror", ms[i]),
+                &got,
+                &want,
+                F32_ACCUM,
+            ));
         }
         let mut all_t = vec![t_x];
         all_t.extend(t_w);
@@ -1097,8 +1180,16 @@ fn gemv_scaled_add_case(gpu: &mut Gpu) -> Result<String, String> {
                 })
                 .collect();
             let tag = format!("m={m} k={k} trial={trial}");
-            results.push(exact_f32(&format!("{tag} fused == gemv + bf16_scaled_add"), &fused, &pair));
-            results.push(exact_f32(&format!("{tag} fused == CPU epilogue of the device GEMV"), &fused, &want));
+            results.push(exact_f32(
+                &format!("{tag} fused == gemv + bf16_scaled_add"),
+                &fused,
+                &pair,
+            ));
+            results.push(exact_f32(
+                &format!("{tag} fused == CPU epilogue of the device GEMV"),
+                &fused,
+                &want,
+            ));
             free_all(gpu, vec![t_w, t_x, t_fused, t_pair, t_y, t_sc])?;
         }
     }
@@ -1123,7 +1214,12 @@ fn silu_mul_case(gpu: &mut Gpu) -> Result<String, String> {
         let got = down_f32(gpu, &t_o)?;
         free_all(gpu, vec![t_g, t_u, t_o])?;
         let want: Vec<f32> = g.iter().zip(&u).map(|(&a, &b)| silu_ref(a, b)).collect();
-        results.push(close_f32(&format!("rows={rows} n={n}"), &got, &want, F32_ACCUM));
+        results.push(close_f32(
+            &format!("rows={rows} n={n}"),
+            &got,
+            &want,
+            F32_ACCUM,
+        ));
     }
     all(results)
 }
@@ -1141,8 +1237,11 @@ fn shared_activation_case(gpu: &mut Gpu) -> Result<String, String> {
         let u_rt: Vec<f32> = u.iter().map(|&v| bf16r(v)).collect();
         let (t_g, t_u) = (up_f32(gpu, &g)?, up_f32(gpu, &u)?);
         let (t_grt, t_urt) = (up_f32(gpu, &g_rt)?, up_f32(gpu, &u_rt)?);
-        let (t_o_rt, t_o_shared, t_o_f32) =
-            (sentinel_f32(gpu, n)?, sentinel_f32(gpu, n)?, sentinel_f32(gpu, n)?);
+        let (t_o_rt, t_o_shared, t_o_f32) = (
+            sentinel_f32(gpu, n)?,
+            sentinel_f32(gpu, n)?,
+            sentinel_f32(gpu, n)?,
+        );
         let t_sel = up_f32(gpu, &sel)?;
         gpu.silu_mul_bf16_rt_f32(&t_g, &t_u, &t_o_rt).map_err(e)?;
         gpu.shared_expert_activation_bf16_f32(&t_g, &t_u, &t_o_shared, &t_sel, rows)
@@ -1153,17 +1252,45 @@ fn shared_activation_case(gpu: &mut Gpu) -> Result<String, String> {
         let o_shared = down_f32(gpu, &t_o_shared)?;
         let o_f32 = down_f32(gpu, &t_o_f32)?;
         let sel_got = down_f32(gpu, &t_sel)?;
-        free_all(gpu, vec![t_g, t_u, t_grt, t_urt, t_o_rt, t_o_shared, t_o_f32, t_sel])?;
+        free_all(
+            gpu,
+            vec![t_g, t_u, t_grt, t_urt, t_o_rt, t_o_shared, t_o_f32, t_sel],
+        )?;
         let tag = format!("rows={rows}");
         // Same device expf in all three launches: BF16 round of the F32 launch on BF16-exact
         // inputs is the BF16 recipe's result, bit for bit.
         let want_rt: Vec<f32> = o_f32.iter().map(|&v| bf16r(v)).collect();
-        results.push(exact_f32(&format!("{tag} silu_mul_bf16_rt == bf16(silu_mul_f32 of rounded inputs)"), &o_rt, &want_rt));
-        results.push(exact_f32(&format!("{tag} shared activation out == silu_mul_bf16_rt"), &o_shared, &o_rt));
-        let want_f32: Vec<f32> = g_rt.iter().zip(&u_rt).map(|(&a, &b)| silu_ref(a, b)).collect();
-        results.push(close_f32(&format!("{tag} silu_mul_f32 vs CPU"), &o_f32, &want_f32, F32_ACCUM));
-        let want_sel: Vec<f32> = sel.iter().map(|&s| 1.0f32 / (1.0f32 + (-bf16r(s)).exp())).collect();
-        results.push(close_f32(&format!("{tag} selector sigmoid(bf16(sel))"), &sel_got, &want_sel, F32_ACCUM));
+        results.push(exact_f32(
+            &format!("{tag} silu_mul_bf16_rt == bf16(silu_mul_f32 of rounded inputs)"),
+            &o_rt,
+            &want_rt,
+        ));
+        results.push(exact_f32(
+            &format!("{tag} shared activation out == silu_mul_bf16_rt"),
+            &o_shared,
+            &o_rt,
+        ));
+        let want_f32: Vec<f32> = g_rt
+            .iter()
+            .zip(&u_rt)
+            .map(|(&a, &b)| silu_ref(a, b))
+            .collect();
+        results.push(close_f32(
+            &format!("{tag} silu_mul_f32 vs CPU"),
+            &o_f32,
+            &want_f32,
+            F32_ACCUM,
+        ));
+        let want_sel: Vec<f32> = sel
+            .iter()
+            .map(|&s| 1.0f32 / (1.0f32 + (-bf16r(s)).exp()))
+            .collect();
+        results.push(close_f32(
+            &format!("{tag} selector sigmoid(bf16(sel))"),
+            &sel_got,
+            &want_sel,
+            F32_ACCUM,
+        ));
     }
     all(results)
 }
@@ -1204,7 +1331,11 @@ fn fwht_ref(a: &[f32], s1: &[f32], s2: &[f32], lanes: usize, scale: f32) -> Vec<
             for el in 0..4 {
                 let partner = old[tid ^ stride][el];
                 let mine = old[tid][el];
-                v[tid][el] = if tid & stride != 0 { partner - mine } else { mine + partner };
+                v[tid][el] = if tid & stride != 0 {
+                    partner - mine
+                } else {
+                    mine + partner
+                };
             }
         }
         stride <<= 1;
@@ -1221,8 +1352,19 @@ fn fwht_ref(a: &[f32], s1: &[f32], s2: &[f32], lanes: usize, scale: f32) -> Vec<
 
 /// Row-batched rotation of `rows` rows of width `k` in groups of `group` (zero-padded last
 /// group, only `k` values kept: `mq_rotate_x_128_v2`'s tail contract).
-fn rotate_rows_ref(x: &[f32], k: usize, rows: usize, group: usize, s1: &[f32], s2: &[f32]) -> Vec<f32> {
-    let (lanes, scale) = if group == 128 { (32, 0.0883883476f32) } else { (64, 0.0625f32) };
+fn rotate_rows_ref(
+    x: &[f32],
+    k: usize,
+    rows: usize,
+    group: usize,
+    s1: &[f32],
+    s2: &[f32],
+) -> Vec<f32> {
+    let (lanes, scale) = if group == 128 {
+        (32, 0.0883883476f32)
+    } else {
+        (64, 0.0625f32)
+    };
     let mut out = vec![0.0f32; rows * k];
     for r in 0..rows {
         for g in 0..k.div_ceil(group) {
@@ -1253,11 +1395,17 @@ fn mq_signs(gpu: &mut Gpu, g128: bool) -> Result<(Vec<f32>, Vec<f32>), String> {
     }
     let g: &Gpu = &*gpu;
     let (t1, t2) = if g128 {
-        (g.scratch.mq_signs1_128.as_ref(), g.scratch.mq_signs2_128.as_ref())
+        (
+            g.scratch.mq_signs1_128.as_ref(),
+            g.scratch.mq_signs2_128.as_ref(),
+        )
     } else {
         (g.scratch.mq_signs1.as_ref(), g.scratch.mq_signs2.as_ref())
     };
-    let (t1, t2) = (t1.ok_or("mq signs1 missing")?, t2.ok_or("mq signs2 missing")?);
+    let (t1, t2) = (
+        t1.ok_or("mq signs1 missing")?,
+        t2.ok_or("mq signs2 missing")?,
+    );
     Ok((down_f32(g, t1)?, down_f32(g, t2)?))
 }
 
@@ -1296,7 +1444,8 @@ fn rotate128_silu_case(gpu: &mut Gpu) -> Result<String, String> {
         let t_act = sentinel_f32(gpu, n)?;
         let t_pair = sentinel_f32(gpu, n)?;
         gpu.silu_mul_bf16_rt_f32(&t_g, &t_u, &t_act).map_err(e)?;
-        gpu.rotate_x_mq_128_v2(&t_act, &t_pair, k, rows).map_err(e)?;
+        gpu.rotate_x_mq_128_v2(&t_act, &t_pair, k, rows)
+            .map_err(e)?;
         for with_shared in [false, true] {
             let t_fused = sentinel_f32(gpu, n)?;
             let sg = rng.vec(MI, -4.0, 4.0);
@@ -1315,7 +1464,11 @@ fn rotate128_silu_case(gpu: &mut Gpu) -> Result<String, String> {
                 &t_fused,
                 k,
                 rows,
-                if with_shared { Some((&t_sg, &t_su, &t_so, &t_sel)) } else { None },
+                if with_shared {
+                    Some((&t_sg, &t_su, &t_so, &t_sel))
+                } else {
+                    None
+                },
             )
             .map_err(e)?;
             sync(gpu)?;
@@ -1323,7 +1476,11 @@ fn rotate128_silu_case(gpu: &mut Gpu) -> Result<String, String> {
             let pair = down_f32(gpu, &t_pair)?;
             let act = down_f32(gpu, &t_act)?;
             let tag = format!("rows={rows} shared={}", with_shared as u8);
-            results.push(exact_f32(&format!("{tag} fused == silu_mul_bf16_rt + rotate_x_mq_128_v2"), &fused, &pair));
+            results.push(exact_f32(
+                &format!("{tag} fused == silu_mul_bf16_rt + rotate_x_mq_128_v2"),
+                &fused,
+                &pair,
+            ));
             results.push(exact_f32(
                 &format!("{tag} fused == CPU FWHT128 of the device activation"),
                 &fused,
@@ -1363,7 +1520,11 @@ fn rotate256_case(gpu: &mut Gpu) -> Result<String, String> {
             gpu.rotate_x_mq_batched(&t_x, &t_b, k, rows).map_err(e)?;
             sync(gpu)?;
             let got = down_f32(gpu, &t_b)?;
-            results.push(exact_f32(&format!("rotate_x_mq_batched k={k} rows={rows}"), &got, &want));
+            results.push(exact_f32(
+                &format!("rotate_x_mq_batched k={k} rows={rows}"),
+                &got,
+                &want,
+            ));
             free_all(gpu, vec![t_x, t_b])?;
         }
         // Single-row entry (`rotate_x_mq`).
@@ -1484,7 +1645,15 @@ fn fp8_unscatter_silu_case(gpu: &mut Gpu) -> Result<String, String> {
     let mut results = Vec::new();
     for &rows in &FP8_ACT_ROWS {
         let slots = rows * K;
-        let topk = make_topk(&mut rng, rows, if rows < 16 { Spread::Uniform } else { Spread::Skewed });
+        let topk = make_topk(
+            &mut rng,
+            rows,
+            if rows < 16 {
+                Spread::Uniform
+            } else {
+                Spread::Skewed
+            },
+        );
         let lay = scatter_ref(&topk);
         // Grouped rows actually used (a multiple of 16); the rest of the layout is -1 tail.
         let n_sorted = lay.offsets[E] as usize;
@@ -1507,7 +1676,9 @@ fn fp8_unscatter_silu_case(gpu: &mut Gpu) -> Result<String, String> {
             // Padding rows carry arbitrary finite garbage: they must not reach the output.
             for (p, &flat) in sorted.iter().enumerate() {
                 if flat < 0 {
-                    v[p * 2 * MI..(p + 1) * 2 * MI].iter_mut().for_each(|x| *x = 7.0);
+                    v[p * 2 * MI..(p + 1) * 2 * MI]
+                        .iter_mut()
+                        .for_each(|x| *x = 7.0);
                 }
             }
             v
@@ -1529,10 +1700,15 @@ fn fp8_unscatter_silu_case(gpu: &mut Gpu) -> Result<String, String> {
                 continue;
             }
             for col in 0..MI {
-                want[flat as usize * MI + col] = fp8_swiglu_ref(y[p * 2 * MI + col], y[p * 2 * MI + MI + col]);
+                want[flat as usize * MI + col] =
+                    fp8_swiglu_ref(y[p * 2 * MI + col], y[p * 2 * MI + MI + col]);
             }
         }
-        results.push(exact_bits_report(&format!("rows={rows} G={n_sorted}"), &got, &want));
+        results.push(exact_bits_report(
+            &format!("rows={rows} G={n_sorted}"),
+            &got,
+            &want,
+        ));
     }
     all(results)
 }
@@ -1563,7 +1739,11 @@ fn fp8_shared_activation_case(gpu: &mut Gpu) -> Result<String, String> {
         let got_act = down_f32(gpu, &t_act)?;
         let got_sel = down_f32(gpu, &t_sel)?;
         free_all(gpu, vec![t_g, t_u, t_act, t_sel])?;
-        let want_act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| fp8_swiglu_ref(g, u)).collect();
+        let want_act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| fp8_swiglu_ref(g, u))
+            .collect();
         let want_sel: Vec<f32> = sel
             .iter()
             .map(|&s| {
@@ -1571,8 +1751,16 @@ fn fp8_shared_activation_case(gpu: &mut Gpu) -> Result<String, String> {
                 bf16r(1.0f32 / (1.0f32 + (-l).exp()))
             })
             .collect();
-        results.push(exact_bits_report(&format!("rows={rows} activation"), &got_act, &want_act));
-        results.push(exact_bits_report(&format!("rows={rows} selector (in place, once)"), &got_sel, &want_sel));
+        results.push(exact_bits_report(
+            &format!("rows={rows} activation"),
+            &got_act,
+            &want_act,
+        ));
+        results.push(exact_bits_report(
+            &format!("rows={rows} selector (in place, once)"),
+            &got_sel,
+            &want_sel,
+        ));
     }
     all(results)
 }

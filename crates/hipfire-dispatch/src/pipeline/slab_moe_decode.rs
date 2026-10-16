@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! K1 decode GEMV `mq_i4_moe_gemv` (gfx1201, gfx1151): mixed-codec F4 lane-union planner,
-//! frozen 88-byte kernarg ABI and the real per-bucket launch.
+//! frozen 96-byte kernarg ABI and the real per-bucket launch.
 //!
 //! The module is deliberately independent: it depends only on `std`,
 //! `hip-bridge` and `rdna-compute` (never on the loader, the sealed route
@@ -72,7 +72,7 @@ pub const DOWN_K: usize = 640;
 /// Threads per workgroup of every K1 decode kernel (one wave32).
 pub const WORKGROUP: u32 = 32;
 /// Size of the frozen F4 GEMV kernarg.
-pub const KERNARG_BYTES: usize = 88;
+pub const KERNARG_BYTES: usize = 96;
 const F32_BYTES: usize = 4;
 const U32_BYTES: usize = 4;
 const PTR_BYTES: usize = 8;
@@ -131,7 +131,10 @@ impl Codec {
         if gate == down {
             Ok(gate)
         } else {
-            Err(SlabMoeError::QtPairMismatch { gate_up_qt, down_qt })
+            Err(SlabMoeError::QtPairMismatch {
+                gate_up_qt,
+                down_qt,
+            })
         }
     }
 }
@@ -231,15 +234,30 @@ impl BucketKey {
     /// Fixed `(codec, profile)` order: all of a codec's profiles, codecs in
     /// [`Codec::ORDER`].
     pub const ORDER: [BucketKey; 4] = [
-        BucketKey { codec: Codec::Mq3I4, profile: Profile::R256 },
-        BucketKey { codec: Codec::Mq3I4, profile: Profile::R128 },
-        BucketKey { codec: Codec::Mq4Sym, profile: Profile::R256 },
-        BucketKey { codec: Codec::Mq4Sym, profile: Profile::R128 },
+        BucketKey {
+            codec: Codec::Mq3I4,
+            profile: Profile::R256,
+        },
+        BucketKey {
+            codec: Codec::Mq3I4,
+            profile: Profile::R128,
+        },
+        BucketKey {
+            codec: Codec::Mq4Sym,
+            profile: Profile::R256,
+        },
+        BucketKey {
+            codec: Codec::Mq4Sym,
+            profile: Profile::R128,
+        },
     ];
 
     /// Key of `codec` for the projection `kind`.
     pub const fn new(codec: Codec, kind: Kind) -> Self {
-        BucketKey { codec, profile: kind.profile() }
+        BucketKey {
+            codec,
+            profile: kind.profile(),
+        }
     }
 
     /// Projection this key computes (profile determines kind).
@@ -300,11 +318,18 @@ pub enum SlabMoeError {
     /// Profile does not belong to the kind.
     ProfileMismatch { kind: Kind, profile: Profile },
     /// Explicit `M`/`K` differ from the kind's frozen geometry.
-    Geometry { what: &'static str, got: usize, want: usize },
+    Geometry {
+        what: &'static str,
+        got: usize,
+        want: usize,
+    },
     /// Layout violates the union contract.
     Layout(&'static str),
     /// An operand is null, misaligned, too small or aliases another operand.
-    Operand { name: &'static str, reason: &'static str },
+    Operand {
+        name: &'static str,
+        reason: &'static str,
+    },
     /// Device is neither gfx1201 nor gfx1151.
     Arch(String),
     /// The launch cannot be issued in this execution mode.
@@ -316,19 +341,37 @@ impl fmt::Display for SlabMoeError {
         match self {
             Self::InvalidLaneCount { c } => write!(f, "lane count {c} not in 1..={MAX_LANES}"),
             Self::ExpertOutOfRange { lane, rank, id } => {
-                write!(f, "lane {lane} rank {rank}: expert id {id} not in 0..{MAX_EXPERTS}")
+                write!(
+                    f,
+                    "lane {lane} rank {rank}: expert id {id} not in 0..{MAX_EXPERTS}"
+                )
             }
-            Self::DuplicateExpert { lane, id } => write!(f, "lane {lane}: expert {id} selected twice"),
+            Self::DuplicateExpert { lane, id } => {
+                write!(f, "lane {lane}: expert {id} selected twice")
+            }
             Self::MissingCodec { expert } => write!(f, "expert {expert} has no declared codec"),
-            Self::UnsupportedQt { kind, qt } => write!(f, "qt {qt} is not an admitted {kind:?} type"),
-            Self::QtPairMismatch { gate_up_qt, down_qt } => {
-                write!(f, "qt pair ({gate_up_qt}, {down_qt}) is not (131, 132) or (44, 53)")
+            Self::UnsupportedQt { kind, qt } => {
+                write!(f, "qt {qt} is not an admitted {kind:?} type")
             }
-            Self::ProfileMismatch { kind, profile } => write!(f, "{kind:?} does not admit profile {profile:?}"),
+            Self::QtPairMismatch {
+                gate_up_qt,
+                down_qt,
+            } => {
+                write!(
+                    f,
+                    "qt pair ({gate_up_qt}, {down_qt}) is not (131, 132) or (44, 53)"
+                )
+            }
+            Self::ProfileMismatch { kind, profile } => {
+                write!(f, "{kind:?} does not admit profile {profile:?}")
+            }
             Self::Geometry { what, got, want } => write!(f, "{what} {got} != frozen {want}"),
             Self::Layout(why) => write!(f, "union layout: {why}"),
             Self::Operand { name, reason } => write!(f, "operand {name}: {reason}"),
-            Self::Arch(got) => write!(f, "mq_i4_moe_gemv is exact gfx1201/gfx1151 only, device is {got:?}"),
+            Self::Arch(got) => write!(
+                f,
+                "mq_i4_moe_gemv is exact gfx1201/gfx1151 only, device is {got:?}"
+            ),
             Self::Unavailable(why) => write!(f, "{why}"),
         }
     }
@@ -344,7 +387,7 @@ fn hip_err(e: SlabMoeError) -> HipError {
 // Frozen kernarg ABI
 // ---------------------------------------------------------------------------
 
-/// The frozen F4 GEMV kernarg, 88 bytes. Strides are F32 elements.
+/// The frozen F4 GEMV kernarg, 96 bytes. Strides are F32 elements.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MoeGemvKernargs {
@@ -379,6 +422,10 @@ pub struct MoeGemvKernargs {
     pub x_row_stride: u32,
     /// `@84` F32 elements between original-slot output rows.
     pub y_slot_stride: u32,
+    /// `@88` extent of the `expert_weight_ptrs` table; an `expert_ids` entry at or past it is never indexed.
+    pub n_experts: u32,
+    /// `@92` reserved, always zero (pads the block to 8 bytes).
+    pub reserved: u32,
 }
 
 const _: () = {
@@ -400,6 +447,8 @@ const _: () = {
     assert!(offset_of!(MoeGemvKernargs, x_src_rows) == 76);
     assert!(offset_of!(MoeGemvKernargs, x_row_stride) == 80);
     assert!(offset_of!(MoeGemvKernargs, y_slot_stride) == 84);
+    assert!(offset_of!(MoeGemvKernargs, n_experts) == 88);
+    assert!(offset_of!(MoeGemvKernargs, reserved) == 92);
 };
 
 impl MoeGemvKernargs {
@@ -428,6 +477,8 @@ impl MoeGemvKernargs {
             self.x_src_rows,
             self.x_row_stride,
             self.y_slot_stride,
+            self.n_experts,
+            self.reserved,
         ];
         for (i, w) in words.iter().enumerate() {
             out[56 + i * 4..56 + i * 4 + 4].copy_from_slice(&w.to_le_bytes());
@@ -498,14 +549,20 @@ impl UnionLayout {
         let (mut e, mut s, mut prev) = (0usize, 0usize, None::<usize>);
         for (i, b) in self.buckets.iter().enumerate() {
             if prev.is_some_and(|p| b.codec.order_index() <= p) {
-                return Err(SlabMoeError::Layout("buckets not in fixed strictly increasing codec order"));
+                return Err(SlabMoeError::Layout(
+                    "buckets not in fixed strictly increasing codec order",
+                ));
             }
             prev = Some(b.codec.order_index());
             if b.expert_count == 0 || b.slot_count == 0 || b.expert_count > b.slot_count {
-                return Err(SlabMoeError::Layout("bucket must be non-empty with 1 <= U_b <= n_b"));
+                return Err(SlabMoeError::Layout(
+                    "bucket must be non-empty with 1 <= U_b <= n_b",
+                ));
             }
             if b.expert_start != e || b.slot_start != s || b.offsets_start != e + i {
-                return Err(SlabMoeError::Layout("bucket spans are not contiguous in descriptor order"));
+                return Err(SlabMoeError::Layout(
+                    "bucket spans are not contiguous in descriptor order",
+                ));
             }
             e = e
                 .checked_add(b.expert_count)
@@ -515,13 +572,17 @@ impl UnionLayout {
                 .ok_or(SlabMoeError::Layout("slot span overflows"))?;
         }
         if e != self.u_total {
-            return Err(SlabMoeError::Layout("u_total differs from the bucket expert counts"));
+            return Err(SlabMoeError::Layout(
+                "u_total differs from the bucket expert counts",
+            ));
         }
         if self.u_total > max_union(self.c) {
             return Err(SlabMoeError::Layout("U exceeds min(10 C, 512)"));
         }
         if s != TOP_K * self.c {
-            return Err(SlabMoeError::Layout("buckets do not partition the 10 C slots"));
+            return Err(SlabMoeError::Layout(
+                "buckets do not partition the 10 C slots",
+            ));
         }
         Ok(())
     }
@@ -611,9 +672,19 @@ impl LaneUnionPlan {
         for (pos, &slot) in slot_ids.iter().enumerate() {
             inverse[slot as usize] = pos as u32;
         }
-        let layout = UnionLayout { c, u_total: expert_ids.len(), buckets };
+        let layout = UnionLayout {
+            c,
+            u_total: expert_ids.len(),
+            buckets,
+        };
         layout.validate()?;
-        Ok(Self { layout, expert_ids, expert_offsets, slot_ids, inverse })
+        Ok(Self {
+            layout,
+            expert_ids,
+            expert_offsets,
+            slot_ids,
+            inverse,
+        })
     }
 
     /// Expert ids of bucket `b`.
@@ -674,13 +745,23 @@ pub fn fixed_union_bytes(c: usize) -> Result<usize, SlabMoeError> {
 /// Host-side extent check before a planner launch: `c` must be `1..=32`, the
 /// routed-id buffer must hold `10 c` i32 words and the descriptor buffer
 /// `6 * 10 c + 2` u32 words. Returns the descriptor word count.
-pub fn check_plan_extents(c: usize, topk_bytes: usize, union_bytes: usize) -> Result<usize, SlabMoeError> {
+pub fn check_plan_extents(
+    c: usize,
+    topk_bytes: usize,
+    union_bytes: usize,
+) -> Result<usize, SlabMoeError> {
     let words = fixed_union_words(c)?;
     if topk_bytes < TOP_K * c * U32_BYTES {
-        return Err(SlabMoeError::Operand { name: "topk", reason: "allocation smaller than 10 * lanes ids" });
+        return Err(SlabMoeError::Operand {
+            name: "topk",
+            reason: "allocation smaller than 10 * lanes ids",
+        });
     }
     if union_bytes < words * U32_BYTES {
-        return Err(SlabMoeError::Operand { name: "union scratch", reason: "allocation smaller than 6 * 10 * lanes + 2 words" });
+        return Err(SlabMoeError::Operand {
+            name: "union scratch",
+            reason: "allocation smaller than 6 * 10 * lanes + 2 words",
+        });
     }
     Ok(words)
 }
@@ -719,19 +800,28 @@ impl FixedUnion {
         let words_len = fixed_union_words(lanes)?;
         let s = TOP_K * lanes;
         if topk.len() < s {
-            return Err(SlabMoeError::Operand { name: "topk", reason: "fewer than 10 * lanes ids" });
+            return Err(SlabMoeError::Operand {
+                name: "topk",
+                reason: "fewer than 10 * lanes ids",
+            });
         }
         if uniform_bucket >= PLAN_BUCKETS as i32 {
             return Err(SlabMoeError::Layout("uniform bucket must be 0 or 1"));
         }
         if uniform_bucket < 0 && !codec.is_some_and(|t| t.len() >= MAX_EXPERTS) {
-            return Err(SlabMoeError::Operand { name: "codec", reason: "table shorter than 512 bytes" });
+            return Err(SlabMoeError::Operand {
+                name: "codec",
+                reason: "table shorter than 512 bytes",
+            });
         }
 
         let mut words = vec![UNWRITTEN; words_len];
         let mut writes = vec![0u8; words_len];
         let mut put = |at: usize, v: u32| {
-            assert!(at < words_len, "planner write {at} outside the 6 S + 2 words");
+            assert!(
+                at < words_len,
+                "planner write {at} outside the 6 S + 2 words"
+            );
             words[at] = v;
             writes[at] += 1;
         };
@@ -748,7 +838,11 @@ impl FixedUnion {
         // Phase 1: stage ids and buckets (threads t >= S are inactive).
         for t in 0..s {
             let id = topk[t];
-            let id = if (id as u32) < MAX_EXPERTS as u32 { id } else { 0 };
+            let id = if (id as u32) < MAX_EXPERTS as u32 {
+                id
+            } else {
+                0
+            };
             s_id[t] = id;
             s_b[t] = if uniform_bucket >= 0 {
                 uniform_bucket as usize
@@ -801,8 +895,10 @@ impl FixedUnion {
             if t < s {
                 let b = s_b[t];
                 let e = s_eidx[first[t]];
-                let start: usize =
-                    (0..s).filter(|&j| s_first[j] && s_b[j] == b && s_eidx[j] < e).map(|j| s_total[j]).sum();
+                let start: usize = (0..s)
+                    .filter(|&j| s_first[j] && s_b[j] == b && s_eidx[j] < e)
+                    .map(|j| s_total[j])
+                    .sum();
                 put(slots_base + b * s + start + rank[t], t as u32);
                 if rank[t] == 0 {
                     put(b * s + e, s_id[t] as u32);
@@ -895,17 +991,25 @@ impl FixedUnion {
             return Err(SlabMoeError::Layout("descriptor is not 6 S + 2 words"));
         }
         if self.writes.iter().any(|&n| n != 1) || self.words.contains(&UNWRITTEN) {
-            return Err(SlabMoeError::Layout("a descriptor word has zero or several owners"));
+            return Err(SlabMoeError::Layout(
+                "a descriptor word has zero or several owners",
+            ));
         }
         let mut seen = vec![false; self.s];
         for b in 0..PLAN_BUCKETS {
             let (ids, offs, slots) = (self.ids(b), self.offsets(b), self.slots(b));
             let (u, n) = (self.expert_count(b), self.slot_count(b));
             if offs[0] != 0 || offs.windows(2).any(|w| w[1] < w[0]) || n > self.s || u > n {
-                return Err(SlabMoeError::Layout("offsets are not monotonic from 0 to n_b"));
+                return Err(SlabMoeError::Layout(
+                    "offsets are not monotonic from 0 to n_b",
+                ));
             }
-            if offs[..=u].windows(2).any(|w| w[1] <= w[0]) || offs[u..].iter().any(|&o| o as usize != n) {
-                return Err(SlabMoeError::Layout("live offsets must rise strictly, tail must equal n_b"));
+            if offs[..=u].windows(2).any(|w| w[1] <= w[0])
+                || offs[u..].iter().any(|&o| o as usize != n)
+            {
+                return Err(SlabMoeError::Layout(
+                    "live offsets must rise strictly, tail must equal n_b",
+                ));
             }
             if ids[u..].iter().any(|&i| i != 0) || slots[n..].iter().any(|&p| p != 0) {
                 return Err(SlabMoeError::Layout("unused ids/slots tail is not zero"));
@@ -920,18 +1024,25 @@ impl FixedUnion {
                     return Err(SlabMoeError::Layout("slots of an expert do not ascend"));
                 }
                 if prev_first.is_some_and(|p| run[0] <= p) {
-                    return Err(SlabMoeError::Layout("experts are not in first-occurrence order"));
+                    return Err(SlabMoeError::Layout(
+                        "experts are not in first-occurrence order",
+                    ));
                 }
                 prev_first = Some(run[0]);
                 for &slot in run {
-                    if slot as usize >= self.s || std::mem::replace(&mut seen[slot as usize], true) {
-                        return Err(SlabMoeError::Layout("a slot is out of range or listed twice"));
+                    if slot as usize >= self.s || std::mem::replace(&mut seen[slot as usize], true)
+                    {
+                        return Err(SlabMoeError::Layout(
+                            "a slot is out of range or listed twice",
+                        ));
                     }
                 }
             }
         }
         if seen.iter().any(|&x| !x) {
-            return Err(SlabMoeError::Layout("buckets do not partition the 10 C slots"));
+            return Err(SlabMoeError::Layout(
+                "buckets do not partition the 10 C slots",
+            ));
         }
         Ok(())
     }
@@ -944,7 +1055,13 @@ impl FixedUnion {
         for b in 0..PLAN_BUCKETS {
             let (ids, offs, slots) = (self.ids(b), self.offsets(b), self.slots(b));
             let mut rows: Vec<(Codec, u32, Vec<u32>)> = (0..self.expert_count(b))
-                .map(|e| (Codec::ORDER[b], ids[e], slots[offs[e] as usize..offs[e + 1] as usize].to_vec()))
+                .map(|e| {
+                    (
+                        Codec::ORDER[b],
+                        ids[e],
+                        slots[offs[e] as usize..offs[e + 1] as usize].to_vec(),
+                    )
+                })
                 .collect();
             rows.sort_by_key(|r| r.1);
             out.extend(rows);
@@ -976,27 +1093,37 @@ impl DevView {
 
     /// The whole tensor allocation.
     pub fn from_tensor(t: &GpuTensor) -> Self {
-        Self { ptr: t.buf.as_ptr() as usize as u64, bytes: t.buf.size() }
+        Self {
+            ptr: t.buf.as_ptr() as usize as u64,
+            bytes: t.buf.size(),
+        }
     }
 
-    fn check(
-        &self,
-        name: &'static str,
-        need_bytes: usize,
-        align: u64,
-    ) -> Result<(), SlabMoeError> {
+    fn check(&self, name: &'static str, need_bytes: usize, align: u64) -> Result<(), SlabMoeError> {
         if self.ptr == 0 {
-            return Err(SlabMoeError::Operand { name, reason: "null device pointer" });
+            return Err(SlabMoeError::Operand {
+                name,
+                reason: "null device pointer",
+            });
         }
         if self.ptr % align != 0 {
-            return Err(SlabMoeError::Operand { name, reason: "misaligned device pointer" });
+            return Err(SlabMoeError::Operand {
+                name,
+                reason: "misaligned device pointer",
+            });
         }
         if self.bytes < need_bytes {
-            return Err(SlabMoeError::Operand { name, reason: "allocation smaller than the launch extent" });
+            return Err(SlabMoeError::Operand {
+                name,
+                reason: "allocation smaller than the launch extent",
+            });
         }
         self.ptr
             .checked_add(need_bytes as u64)
-            .ok_or(SlabMoeError::Operand { name, reason: "address range overflows" })?;
+            .ok_or(SlabMoeError::Operand {
+                name,
+                reason: "address range overflows",
+            })?;
         Ok(())
     }
 }
@@ -1055,7 +1182,10 @@ pub struct LaunchPlan {
 }
 
 impl LaunchPlan {
-    const EMPTY: LaunchPlan = LaunchPlan { entries: [None; MAX_BUCKETS], len: 0 };
+    const EMPTY: LaunchPlan = LaunchPlan {
+        entries: [None; MAX_BUCKETS],
+        len: 0,
+    };
 
     // `UnionLayout::validate` bounds the bucket count by `MAX_BUCKETS`
     // before any entry is pushed.
@@ -1093,14 +1223,22 @@ impl std::ops::Index<usize> for LaunchPlan {
 }
 
 fn mul(a: usize, b: usize, name: &'static str) -> Result<usize, SlabMoeError> {
-    a.checked_mul(b)
-        .ok_or(SlabMoeError::Operand { name, reason: "extent overflows usize" })
+    a.checked_mul(b).ok_or(SlabMoeError::Operand {
+        name,
+        reason: "extent overflows usize",
+    })
 }
 
-fn disjoint(a: (&'static str, DevView, usize), b: (&'static str, DevView, usize)) -> Result<(), SlabMoeError> {
+fn disjoint(
+    a: (&'static str, DevView, usize),
+    b: (&'static str, DevView, usize),
+) -> Result<(), SlabMoeError> {
     let (a_end, b_end) = (a.1.ptr + a.2 as u64, b.1.ptr + b.2 as u64);
     if a.1.ptr < b_end && b.1.ptr < a_end {
-        return Err(SlabMoeError::Operand { name: b.0, reason: "overlaps another operand of the launch" });
+        return Err(SlabMoeError::Operand {
+            name: b.0,
+            reason: "overlaps another operand of the launch",
+        });
     }
     Ok(())
 }
@@ -1111,30 +1249,58 @@ fn disjoint(a: (&'static str, DevView, usize), b: (&'static str, DevView, usize)
 pub fn plan_launches(req: &DecodeRequest<'_>) -> Result<LaunchPlan, SlabMoeError> {
     let kind = req.kind;
     if req.profile != kind.profile() {
-        return Err(SlabMoeError::ProfileMismatch { kind, profile: req.profile });
+        return Err(SlabMoeError::ProfileMismatch {
+            kind,
+            profile: req.profile,
+        });
     }
     if req.m != kind.m() {
-        return Err(SlabMoeError::Geometry { what: "M", got: req.m, want: kind.m() });
+        return Err(SlabMoeError::Geometry {
+            what: "M",
+            got: req.m,
+            want: kind.m(),
+        });
     }
     if req.k != kind.k() {
-        return Err(SlabMoeError::Geometry { what: "K", got: req.k, want: kind.k() });
+        return Err(SlabMoeError::Geometry {
+            what: "K",
+            got: req.k,
+            want: kind.k(),
+        });
     }
     let layout = req.layout;
     layout.validate()?;
     let c = layout.c;
 
     let d = &req.descriptors;
-    d.expert_ids.check("expert_ids", mul(layout.expert_id_words(), U32_BYTES, "expert_ids")?, 4)?;
+    d.expert_ids.check(
+        "expert_ids",
+        mul(layout.expert_id_words(), U32_BYTES, "expert_ids")?,
+        4,
+    )?;
     d.expert_offsets.check(
         "expert_offsets",
         mul(layout.expert_offset_words(), U32_BYTES, "expert_offsets")?,
         4,
     )?;
-    d.slot_ids.check("slot_ids", mul(layout.slot_words(), U32_BYTES, "slot_ids")?, 4)?;
-    req.weight_ptrs.check("weight_ptrs", MAX_EXPERTS * PTR_BYTES, 8)?;
+    d.slot_ids.check(
+        "slot_ids",
+        mul(layout.slot_words(), U32_BYTES, "slot_ids")?,
+        4,
+    )?;
+    req.weight_ptrs
+        .check("weight_ptrs", MAX_EXPERTS * PTR_BYTES, 8)?;
 
-    let x_bytes = mul(mul(kind.x_src_rows(c), kind.k(), "xrot")?, F32_BYTES, "xrot")?;
-    let y_bytes = mul(mul(mul(c, TOP_K, "y0")?, kind.y_slot_stride(), "y0")?, F32_BYTES, "y0")?;
+    let x_bytes = mul(
+        mul(kind.x_src_rows(c), kind.k(), "xrot")?,
+        F32_BYTES,
+        "xrot",
+    )?;
+    let y_bytes = mul(
+        mul(mul(c, TOP_K, "y0")?, kind.y_slot_stride(), "y0")?,
+        F32_BYTES,
+        "y0",
+    )?;
     req.xrot.check("xrot", x_bytes, 4)?;
     req.y0.check("y0", y_bytes, 4)?;
     disjoint(("xrot", req.xrot, x_bytes), ("y0", req.y0, y_bytes))?;
@@ -1145,20 +1311,36 @@ pub fn plan_launches(req: &DecodeRequest<'_>) -> Result<LaunchPlan, SlabMoeError
             disjoint(("y0", req.y0, y_bytes), ("y1", y1, y_bytes))?;
             y1.ptr
         }
-        (true, None) => return Err(SlabMoeError::Operand { name: "y1", reason: "gate/up requires the up output" }),
+        (true, None) => {
+            return Err(SlabMoeError::Operand {
+                name: "y1",
+                reason: "gate/up requires the up output",
+            })
+        }
         (false, None) => 0,
-        (false, Some(_)) => return Err(SlabMoeError::Operand { name: "y1", reason: "down has no second output" }),
+        (false, Some(_)) => {
+            return Err(SlabMoeError::Operand {
+                name: "y1",
+                reason: "down has no second output",
+            })
+        }
     };
 
     let word = |view: DevView, index: usize, name: &'static str| -> Result<u64, SlabMoeError> {
         (index as u64)
             .checked_mul(U32_BYTES as u64)
             .and_then(|o| view.ptr.checked_add(o))
-            .ok_or(SlabMoeError::Operand { name, reason: "bucket base overflows" })
+            .ok_or(SlabMoeError::Operand {
+                name,
+                reason: "bucket base overflows",
+            })
     };
 
     let u32_of = |v: usize, name: &'static str| -> Result<u32, SlabMoeError> {
-        u32::try_from(v).map_err(|_| SlabMoeError::Operand { name, reason: "value exceeds u32" })
+        u32::try_from(v).map_err(|_| SlabMoeError::Operand {
+            name,
+            reason: "value exceeds u32",
+        })
     };
     let mut plan = LaunchPlan::EMPTY;
     for b in &layout.buckets {
@@ -1184,6 +1366,8 @@ pub fn plan_launches(req: &DecodeRequest<'_>) -> Result<LaunchPlan, SlabMoeError
                 x_src_rows: u32_of(kind.x_src_rows(c), "x_src_rows")?,
                 x_row_stride: u32_of(kind.k(), "x_row_stride")?,
                 y_slot_stride: u32_of(kind.y_slot_stride(), "y_slot_stride")?,
+                n_experts: u32_of(MAX_EXPERTS, "n_experts")?,
+                reserved: 0,
             },
         });
     }
@@ -1228,7 +1412,10 @@ impl SlabMoeDecodeModule {
             gpu.hip.module_get_function(&module, SYMBOLS[2])?,
             gpu.hip.module_get_function(&module, SYMBOLS[3])?,
         ];
-        Ok(Self { _module: module, functions })
+        Ok(Self {
+            _module: module,
+            functions,
+        })
     }
 
     /// Launches `req` on the device's active stream, one kernel per bucket in
@@ -1274,7 +1461,7 @@ impl SlabMoeDecodeModule {
         for l in launches.iter() {
             let func = &self.functions[l.key.order_index()];
             let mut bytes = l.kernargs.to_bytes();
-            // SAFETY: `bytes` is the exact frozen 88-byte kernarg of
+            // SAFETY: `bytes` is the exact frozen 96-byte kernarg of
             // `l.symbol`; shapes were validated by `plan_launches`, and the
             // address-validity, immutability and module-lifetime
             // preconditions are this function's contract.

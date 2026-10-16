@@ -419,9 +419,9 @@ fn report(label: &str, e: &Err2) -> bool {
     pass
 }
 
-// ── kernarg blob (5 pointers + M, K, K_TOP) ────────────────────────────────
+// ── kernarg blob (5 pointers + M, K, K_TOP, n_experts) ─────────────────────
 
-fn blob(ptrs: [u64; 5], m: i32, k: i32, k_top: i32) -> Vec<u8> {
+fn blob(ptrs: [u64; 5], m: i32, k: i32, k_top: i32, n_experts: i32) -> Vec<u8> {
     let mut b = KernargBlob::new();
     for p in ptrs {
         b.push_u64(p);
@@ -429,6 +429,7 @@ fn blob(ptrs: [u64; 5], m: i32, k: i32, k_top: i32) -> Vec<u8> {
     b.push_i32(m);
     b.push_i32(k);
     b.push_i32(k_top);
+    b.push_i32(n_experts);
     b.into_vec()
 }
 
@@ -486,7 +487,8 @@ impl Case {
             let mut acc = 0.0f32;
             for r in 0..kt {
                 idx[b * kt + r] = ((b * 29 + r * 7 + 3) % ne) as i32;
-                let v = 0.05 + 0.95 * (unit(0x7017_0000 ^ ((b as u64) << 8) ^ r as u64) * 0.5 + 0.5);
+                let v =
+                    0.05 + 0.95 * (unit(0x7017_0000 ^ ((b as u64) << 8) ^ r as u64) * 0.5 + 0.5);
                 w[b * kt + r] = v;
                 acc += v;
             }
@@ -565,7 +567,13 @@ fn correctness(gpu: &mut Gpu, c: &Case, n: usize, row_stride: usize, label: &str
     let yp = y_t.buf.as_ptr() as u64;
 
     // ---- arm 1: one batched launch, grid (M, K_TOP, N) ----
-    let mut b_batched = blob([pp, ip, wp, rp, yp], m as i32, k as i32, kt as i32);
+    let mut b_batched = blob(
+        [pp, ip, wp, rp, yp],
+        m as i32,
+        k as i32,
+        kt as i32,
+        c.n_exp() as i32,
+    );
     gpu.launch_kernel_blob(
         FUNC,
         [m as u32, kt as u32, n as u32],
@@ -606,10 +614,7 @@ fn correctness(gpu: &mut Gpu, c: &Case, n: usize, row_stride: usize, label: &str
             cnt += 1;
         }
     }
-    let (rms_pre, rms_con) = (
-        (s_pre / cnt as f64).sqrt(),
-        (s_con / cnt as f64).sqrt(),
-    );
+    let (rms_pre, rms_con) = ((s_pre / cnt as f64).sqrt(), (s_con / cnt as f64).sqrt());
     println!(
         "    signal check: rms(residual preload)={rms_pre:.4e}  rms(GEMV contribution)={rms_con:.4e}  \
          contribution/preload={:.2}x",
@@ -637,6 +642,7 @@ fn correctness(gpu: &mut Gpu, c: &Case, n: usize, row_stride: usize, label: &str
             m as i32,
             k as i32,
             kt as i32,
+            c.n_exp() as i32,
         );
         gpu.launch_kernel_blob(FUNC, [m as u32, kt as u32, 1], [32, 1, 1], 0, &mut bi)
             .unwrap();
@@ -671,6 +677,7 @@ fn correctness(gpu: &mut Gpu, c: &Case, n: usize, row_stride: usize, label: &str
             m as i32,
             k as i32,
             kt as i32,
+            c.n_exp() as i32,
         );
         gpu.launch_kernel_blob(
             FUNC,
@@ -702,9 +709,7 @@ fn correctness(gpu: &mut Gpu, c: &Case, n: usize, row_stride: usize, label: &str
         }
         // sanity: the live token MUST have moved, else the assay is vacuous
         let moved = (0..m)
-            .filter(|&row| {
-                poisoned[live * m + row].to_bits() != resid[live * m + row].to_bits()
-            })
+            .filter(|&row| poisoned[live * m + row].to_bits() != resid[live * m + row].to_bits())
             .count();
         let leak_ok = leaked == 0 && moved * 20 >= m * 19;
         println!(
@@ -753,6 +758,7 @@ fn time_case(gpu: &mut Gpu, c: &Case, n: usize) -> (f64, f64) {
         m as i32,
         k as i32,
         kt as i32,
+        c.n_exp() as i32,
     );
     let grid = [m as u32, kt as u32, n as u32];
     let block = [32u32, 1, 1];
@@ -762,7 +768,8 @@ fn time_case(gpu: &mut Gpu, c: &Case, n: usize) -> (f64, f64) {
 
     // warmup — absorbs JIT of this (kernel, shape) cell and warms the caches
     for _ in 0..8 {
-        gpu.launch_kernel_blob(FUNC, grid, block, 0, &mut b).unwrap();
+        gpu.launch_kernel_blob(FUNC, grid, block, 0, &mut b)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
@@ -770,7 +777,8 @@ fn time_case(gpu: &mut Gpu, c: &Case, n: usize) -> (f64, f64) {
     for _ in 0..7 {
         let t0 = Instant::now();
         for _ in 0..inner {
-            gpu.launch_kernel_blob(FUNC, grid, block, 0, &mut b).unwrap();
+            gpu.launch_kernel_blob(FUNC, grid, block, 0, &mut b)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         samples.push(t0.elapsed().as_secs_f64() * 1e6 / inner as f64);
@@ -879,7 +887,9 @@ fn main() {
             );
         }
         if pass == 0 {
-            println!("  * pass 0 is JIT- and cold-cache-contaminated BY CONSTRUCTION — discard it.");
+            println!(
+                "  * pass 0 is JIT- and cold-cache-contaminated BY CONSTRUCTION — discard it."
+            );
             println!("    JIT is per-(kernel, shape) cell, so each N warms separately.\n");
         }
     }

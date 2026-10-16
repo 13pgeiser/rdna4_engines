@@ -175,7 +175,8 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    int n_experts
 ) {
     (void)K;
     __shared__ float4 xs[kSlots * 64];
@@ -200,7 +201,7 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151(
     const int expert_id = expert_tile_ids[slot_start >> 4];
 #pragma unroll
     for (int slot = 0; slot < R; ++slot) asm volatile("" :: "s"(flat_raw[slot]));
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 

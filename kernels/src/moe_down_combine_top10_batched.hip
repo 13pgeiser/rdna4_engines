@@ -25,7 +25,8 @@ extern "C" __global__ void moe_down_combine_top10_batched(
     const float* __restrict__ topk_weights,    // [N * 10]
     float* __restrict__ residual,              // [N * H], in-place +=
     int hidden,
-    int tokens
+    int tokens,
+    int n_experts
 ) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     const int token = blockIdx.y;
@@ -35,15 +36,20 @@ extern "C" __global__ void moe_down_combine_top10_batched(
     // expert order is then chosen in registers, accumulating as before.
     int experts[10];
     float weights[10], outputs[10];
+    // A rank whose id is outside [0, n_experts) (the router's -1 marker for a
+    // non-finite row) is unrouted: it is never selected, so neither its weight
+    // nor its (possibly uninitialised) output row contributes.
+    int used_ranks = 0;
 #pragma unroll
     for (int rank = 0; rank < 10; ++rank) {
         experts[rank] = topk_indices[token_slot + rank];
+        const bool live = experts[rank] >= 0 && experts[rank] < n_experts;
         weights[rank] = topk_weights[token_slot + rank];
-        outputs[rank] = expert_outputs[(token_slot + rank) * hidden + column];
+        outputs[rank] = live ? expert_outputs[(token_slot + rank) * hidden + column] : 0.0f;
+        if (!live) used_ranks |= 1 << rank;
     }
     __hip_bfloat16 accumulated = moe_top10_bf16_round(
         residual[(size_t)token * hidden + column]);
-    int used_ranks = 0;
     for (int count = 0; count < 10; ++count) {
         int selected_rank = -1;
         int selected_expert = 0x7fffffff;

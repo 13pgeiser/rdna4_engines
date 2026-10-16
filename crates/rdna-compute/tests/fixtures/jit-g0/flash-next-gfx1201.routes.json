@@ -49,7 +49,7 @@
       "kind": "embedded",
       "module": "qwen4_moe_iu4_sym_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-      "sha256": "fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481",
+      "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
       "symbols": [
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -500,7 +500,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "18f59f719b97c67bc4cf0d30b1a1ec8153da65db3b50e8f72f38199cd75ae564",
+      "sha256": "852671824c7ce850b71a05b911edfaaec863b1f6e13ccea6c3cebb43896f96fc",
       "symbols": [
         "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4"
       ],
@@ -862,7 +862,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+      "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
       "symbols": [
         "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
         "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -1220,7 +1220,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+      "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
       "symbols": [
         "moe_combine_order_top10",
         "moe_down_combine_grouped_top10_bf16in_zinit"
@@ -1277,7 +1277,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+      "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
       "symbols": [
         "moe_down_combine_top10_batched"
       ],
@@ -1369,7 +1369,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+      "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
       "symbols": [
         "moe_router_softmax_top10_f32"
       ],
@@ -1412,7 +1412,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+      "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
       "symbols": [
         "moe_router_softmax_top10_f32_fast"
       ],
@@ -1455,7 +1455,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "aba7e396a4d5cc1d3570c4ead8152dc181d76ca86b881ae276886c9067a54c10",
+      "sha256": "47a0d58e48944ce33c5d2be507eb45008ac948a240dbdad08ebbdc02da5b2dd2",
       "symbols": [
         "moe_scatter_fused_top10"
       ],
@@ -2042,7 +2042,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "d36c19d027c49dd1a1a95053628f4ca11e25944f07cce0518f7505eb976f9758",
+      "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
       "symbols": [
         "qwen4_moe_group_prefix",
         "qwen4_moe_group_ranks",
@@ -2768,7 +2768,7 @@
           "kind": "embedded",
           "module": "qwen4_moe_iu4_sym_pm_gfx1201",
           "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-          "sha256": "fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481",
+          "sha256": "0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e",
           "symbols": [
             "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
             "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"
@@ -3342,7 +3342,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "90f83a7f935c558607885dc787b502c923b9910d2adff4ec30d332f75b52a550",
+          "sha256": "b6f1e1686597e9c456dd6562776120f48d669c3a86ac1021191b0bd68bc3313e",
           "symbols": [
             "gemv_mq4g256v2_moe_gate_up_k2560_rows8_indexed_batched",
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched"
@@ -3657,7 +3657,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "a2d1023bda6d15022386a6f7ed6de7c71cfa345c125fae78b16c2c1b0fa37e44",
+          "sha256": "b5714d81799dee960acd90adb2aba167df2ccacbe2a2907bd58e98d041cba334",
           "symbols": [
             "moe_combine_order_top10",
             "moe_down_combine_grouped_top10_bf16in_zinit"
@@ -3714,7 +3714,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "5272cd3090827197e0d8db5367497997212466c80ea8d808d9a3455c132ba726",
+          "sha256": "cc84757390d87f275af3fc621fcee00e63a03465c02f9737b44bd6974eb60491",
           "symbols": [
             "moe_down_combine_top10_batched"
           ],
@@ -3757,7 +3757,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "29485c2aa7a4dae722aae4139fb82a09ff6997c5ff6fa30dd1fa6b33e8749071",
+          "sha256": "2912b3edb092b0586ee58f3e28502a4865f1e6b33085eab4ee6c24bbc4301d32",
           "symbols": [
             "moe_router_softmax_top10_f32"
           ],
@@ -3800,7 +3800,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "58bfaf053aa2763382a91a0a82a4f349a465184f79b6eec8d339460bf7939910",
+          "sha256": "5664142b8350721326adba278fd26cbde29e19c932e8db77072f4b8016773924",
           "symbols": [
             "moe_router_softmax_top10_f32_fast"
           ],
@@ -4329,7 +4329,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "d36c19d027c49dd1a1a95053628f4ca11e25944f07cce0518f7505eb976f9758",
+          "sha256": "c0db256b8e7b34be46cf15a14f232951394cb9c4f7d6673d5486066913824621",
           "symbols": [
             "qwen4_moe_group_prefix",
             "qwen4_moe_group_ranks",

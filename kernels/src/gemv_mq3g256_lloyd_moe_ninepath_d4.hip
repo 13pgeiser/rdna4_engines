@@ -76,7 +76,7 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_ninepath_d4(
     const float* __restrict__ topk_weights,             // [8]
     const float* __restrict__ act,                      // [8 x 512] rotated silu out
     float*       __restrict__ out,                      // [down_m] accumulated
-    int down_m, int down_k
+    int down_m, int down_k, int n_experts
 ) {
     constexpr int RPB = MQ3_NINEPATH_RPB;
     __shared__ float act_s[8][512];
@@ -92,8 +92,9 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_ninepath_d4(
         (&act_s[0][0])[i] = act[i];
 
     const int expert_id = topk_indices[warp];
+    const bool expert_valid = (unsigned)expert_id < (unsigned)n_experts;
     const char* __restrict__ A =
-        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+        expert_valid ? reinterpret_cast<const char*>(expert_ptrs[expert_id]) : nullptr;
     const int r0 = blockIdx.x * RPB;
 
     // ---- stage every row's codebooks for THIS warp's expert, once ----
@@ -101,7 +102,7 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_ninepath_d4(
     // = 16*RPB values, covered by 32 lanes in ceil(16*RPB/32) passes.
     {
         const int per_warp = RPB * 2 * 8;
-        for (int i = lane; i < per_warp; i += 32) {
+        for (int i = lane; i < (expert_valid ? per_warp : 0); i += 32) {
             const int e = i & 7;          // codebook entry
             const int g = (i >> 3) & 1;   // group
             const int r = i >> 4;         // row within the tile
@@ -130,6 +131,10 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_ninepath_d4(
     } while (0)
 
     for (int r = 0; r < RPB; r++) {
+        if (!expert_valid) {
+            if (lane == 0) part[warp][r] = 0.0f;
+            continue;
+        }
         const char* row_ptr = A + (long long)(r0 + r) * 2 * 112;
 
         const float4 xv0a = *reinterpret_cast<const float4*>(xa + lane * 8);

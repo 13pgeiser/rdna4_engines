@@ -370,7 +370,11 @@ pub(crate) fn scratch_requirement(
         k_top: p.k_top,
         mi: p.mi,
         down_m: p.down_m,
-        grouped_rows: if use_path2 || is_fp8(p) { grouped_rows } else { 0 },
+        grouped_rows: if use_path2 || is_fp8(p) {
+            grouped_rows
+        } else {
+            0
+        },
         shared_down: p.prelude.shared.is_some() && p.shared_down_out.is_none(),
     })
 }
@@ -417,7 +421,11 @@ fn require_shared_rows(p: &MoePrefillParams<'_>, need: usize) -> Result<(), Disp
 /// rows in slot order in `down_expanded` for the canonical top-10 combine to
 /// read: the decode-kernel down (path 1, or path 2's few-row indexed down) with
 /// no expert-stage table. This is the layout an EP row gather fills.
-pub(crate) fn writes_slot_ordered_rows(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+pub(crate) fn writes_slot_ordered_rows(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> bool {
     // The FP8 grouped down leaves grouped rows, never slot-ordered rows.
     !is_fp8(p)
         && p.expert_stage_ptrs.is_none()
@@ -609,7 +617,13 @@ fn shared_gu_pm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
                 && w.down.dtype == DType::BF16
                 && w.down.k == shared.intermediate
                 && gpu.qwen4_f16_wmma_applies(w.down.buf, w.down.k, p.batch_size)
-                && gpu.qwen4_shared_gu_pm_applies(w.gate.buf, w.up.buf, w.gate.m, w.gate.k, p.batch_size)
+                && gpu.qwen4_shared_gu_pm_applies(
+                    w.gate.buf,
+                    w.up.buf,
+                    w.gate.m,
+                    w.gate.k,
+                    p.batch_size,
+                )
         })
 }
 
@@ -671,7 +685,9 @@ pub(crate) fn shared_gate_up(
             // conversion), then the gate/up GEMMs, the BF16-recipe activation
             // (selector sigmoid in place) and the hidden's F16 conversion as ONE
             // PeaceMaker launch, the F16 hidden left in `rotated`'s bytes.
-            let hidden = shared.rotated.prefix_as_f16(p.batch_size * shared.intermediate);
+            let hidden = shared
+                .rotated
+                .prefix_as_f16(p.batch_size * shared.intermediate);
             let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(
                 (router.buf, p.prelude.router_logits, router.m),
                 (weights.selector.buf, shared.scalar, weights.selector.m),
@@ -885,15 +901,25 @@ pub(crate) fn shared_down(
     let target = p.routed_out.unwrap_or(p.x_batch);
     // The fused shared gate/up leaves the activation as F16 in `rotated`'s bytes.
     let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
-    if down.dtype == DType::BF16 && p.recipe.bf16_round_trip()
+    if down.dtype == DType::BF16
+        && p.recipe.bf16_round_trip()
         && hip(gpu.qwen4_shared_down_bf16_epi(
-            down.buf, &hidden, target, shared.scalar,
-            down.m, down.k, p.batch_size,
+            down.buf,
+            &hidden,
+            target,
+            shared.scalar,
+            down.m,
+            down.k,
+            p.batch_size,
         ))?
     {
         return Ok(());
     }
-    let out = f32_view(p.shared_down_out.unwrap_or(p.down_expanded), 0, p.batch_size * p.down_m);
+    let out = f32_view(
+        p.shared_down_out.unwrap_or(p.down_expanded),
+        0,
+        p.batch_size * p.down_m,
+    );
     match down.dtype {
         DType::BF16 | DType::F32 | DType::Q8_0 | DType::MQ4G256V2 | DType::MQ4G128V2 => {
             // The shared activation is already in the basis consumed by this
@@ -903,7 +929,14 @@ pub(crate) fn shared_down(
                 // The fused F16 hidden (BF16 down on the F16 WMMA route, see
                 // `shared_gu_pm`): the GEMM `batch_projection` would launch off
                 // the F32 activation's conversion, minus the conversion.
-                hip(gpu.gemm_bf16_xf16_f16_wmma(down.buf, &hidden, &out, down.m, down.k, p.batch_size))?;
+                hip(gpu.gemm_bf16_xf16_f16_wmma(
+                    down.buf,
+                    &hidden,
+                    &out,
+                    down.m,
+                    down.k,
+                    p.batch_size,
+                ))?;
             } else {
                 batch_projection(gpu, down, &hidden, &out, p.batch_size)?;
             }
@@ -1035,7 +1068,8 @@ pub(crate) fn shared_down_hc(
     if !hc_shared_down_admits(gpu, p, hc) {
         if hc.row_fold.is_some() {
             return Err(DispatchError::Hip(
-                "qt44 shared down: the HC row fold was planned but its route no longer applies".into(),
+                "qt44 shared down: the HC row fold was planned but its route no longer applies"
+                    .into(),
             ));
         }
         return Ok(false);
@@ -1127,6 +1161,7 @@ pub(crate) fn combine_order_only(
         p.down_expanded,
         grouped_rows,
         p.batch_size,
+        p.n_exp,
     ))
 }
 
@@ -1163,20 +1198,22 @@ fn shared_down_row_fold(
         p.batch_size,
         target,
     ))?;
-    hip(gpu.hc_row_fold_norm_gate(&rdna_compute::hc_row_fold::HcRowFold {
-        grouped_down: p.y_down_grouped,
-        order: p.down_expanded,
-        shared_bf16: target,
-        selector: shared.scalar,
-        streams: &hc.streams,
-        gates: &hc.gates,
-        norm_weight: &next.norm_weight,
-        gate_weight: &next.gate_weight,
-        next_gates: &next.next_gates,
-        normalized_f16: &x16,
-        rows: hc.rows,
-        hidden: hc.hidden,
-    }))
+    hip(
+        gpu.hc_row_fold_norm_gate(&rdna_compute::hc_row_fold::HcRowFold {
+            grouped_down: p.y_down_grouped,
+            order: p.down_expanded,
+            shared_bf16: target,
+            selector: shared.scalar,
+            streams: &hc.streams,
+            gates: &hc.gates,
+            norm_weight: &next.norm_weight,
+            gate_weight: &next.gate_weight,
+            next_gates: &next.next_gates,
+            normalized_f16: &x16,
+            rows: hc.rows,
+            hidden: hc.hidden,
+        }),
+    )
 }
 
 /// Whether path 2 takes the symmetric IU4 arm (fn-moe-sym): the layer's
@@ -1191,8 +1228,7 @@ fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
         return use_path2 && slab_k2(gpu, p);
     }
     use_path2
-        && p
-            .route_policy
+        && p.route_policy
             .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
         && p.recipe.bf16_round_trip()
         && p.x_norm_batch.dtype == DType::F32
@@ -1254,9 +1290,9 @@ fn gateup_bf16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// `down`, output as BF16 for the combine, which rounds every row to BF16.
 fn down_wmma(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     !is_slab(p)
-        && p.down_k == p.mi && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
+        && p.down_k == p.mi
+        && gpu.qwen4_moe_down_wmma_applies(p.down_m, p.down_k, p.batch_size * p.k_top)
 }
-
 
 /// The tile ids the grouped symmetric GEMMs read: the scatter's `expert_tile_ids`, or under the
 /// owner-routed EP chunk exchange its masked copy (`-1` on every tile of an expert another rank
@@ -1848,6 +1884,7 @@ fn combine_stage(
             grouped_rows,
             p.batch_size,
             initial_zero,
+            p.n_exp,
         ))?;
     } else if use_path2 {
         hip(gpu.moe_down_combine_grouped_top10(
@@ -1859,6 +1896,7 @@ fn combine_stage(
             p.down_m,
             grouped_rows,
             p.batch_size,
+            p.n_exp,
         ))?;
     } else {
         let expanded = f32_view(p.down_expanded, 0, p.batch_size * p.k_top * p.down_m);
@@ -1869,6 +1907,7 @@ fn combine_stage(
             target,
             p.down_m,
             p.batch_size,
+            p.n_exp,
         ))?;
     }
     // A shared down placed after the combine rounds `target` to BF16 as its
@@ -1892,7 +1931,9 @@ fn slab_gate_up(
 ) -> Result<(), DispatchError> {
     use rdna_compute::slab_moe::SlabBuckets;
     if !gpu.qwen4_slab_arch() {
-        return Err(DispatchError::Hip("sealed expert-slab route is gfx1151/gfx1201-only".into()));
+        return Err(DispatchError::Hip(
+            "sealed expert-slab route is gfx1151/gfx1201-only".into(),
+        ));
     }
     let buckets = super::slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
     if !slab_k2(gpu, p) {
@@ -2215,7 +2256,13 @@ impl Fp8Plan {
     }
 
     fn gate_up_table(&self, p: &MoePrefillParams<'_>) -> GpuTensor {
-        self.table(p, self.gate_up_base, self.gate_up_stride, 2 * p.mi, p.gate_up_k)
+        self.table(
+            p,
+            self.gate_up_base,
+            self.gate_up_stride,
+            2 * p.mi,
+            p.gate_up_k,
+        )
     }
 
     fn down_table(&self, p: &MoePrefillParams<'_>) -> GpuTensor {
@@ -2226,14 +2273,19 @@ impl Fp8Plan {
 fn fp8_need_bytes(tensor: &GpuTensor, name: &str, need: usize) -> Result<(), DispatchError> {
     let have = tensor_bytes(tensor);
     if have < need {
-        return Err(fp8_refuse(format!("{name} holds {have} bytes, the route needs {need}")));
+        return Err(fp8_refuse(format!(
+            "{name} holds {have} bytes, the route needs {need}"
+        )));
     }
     Ok(())
 }
 
 fn fp8_need_f32(tensor: &GpuTensor, name: &str, need: usize) -> Result<(), DispatchError> {
     if tensor.dtype != DType::F32 {
-        return Err(fp8_refuse(format!("{name} is {:?}, the route needs F32", tensor.dtype)));
+        return Err(fp8_refuse(format!(
+            "{name} is {:?}, the route needs F32",
+            tensor.dtype
+        )));
     }
     fp8_need_bytes(tensor, name, need)
 }
@@ -2248,7 +2300,9 @@ fn fp8_bf16_weight(w: &WeightRef<'_>, name: &str, m: usize, k: usize) -> Result<
         )));
     }
     if w.rotation.is_some() || w.awq_scale.is_some() {
-        return Err(fp8_refuse(format!("{name} carries a rotation or AWQ sidecar")));
+        return Err(fp8_refuse(format!(
+            "{name} carries a rotation or AWQ sidecar"
+        )));
     }
     let need = scratch_mul(scratch_mul(m, k)?, BF16_BYTES)?;
     if w.buf.buf.size() < need {
@@ -2280,7 +2334,9 @@ fn fp8_expert_base(
             )));
         }
         if w.rotation.is_some() || w.awq_scale.is_some() {
-            return Err(fp8_refuse(format!("{what} {label} expert carries a rotation or AWQ sidecar")));
+            return Err(fp8_refuse(format!(
+                "{what} {label} expert carries a rotation or AWQ sidecar"
+            )));
         }
         if w.buf.buf.is_host_mapped() {
             return Err(fp8_refuse(format!("{what} {label} expert is host-mapped")));
@@ -2294,7 +2350,10 @@ fn fp8_expert_base(
     }
     let base = first.buf.buf.as_ptr();
     if (base as usize) % rdna_compute::fp8_e4m3::B128_ALIGN != 0 {
-        return Err(fp8_refuse(format!("{what} base {:p} is not 256-byte aligned", base)));
+        return Err(fp8_refuse(format!(
+            "{what} base {:p} is not 256-byte aligned",
+            base
+        )));
     }
     let want_last = scratch_mul(experts - 1, stride)?
         .checked_add(base as usize)
@@ -2377,9 +2436,21 @@ fn fp8_validate(
     fp8_need_bytes(p.topk_indices, "topk_indices", index_bytes)?;
     fp8_need_bytes(p.topk_weights, "topk_weights", index_bytes)?;
     fp8_need_bytes(p.inverse_perm, "inverse_perm", index_bytes)?;
-    fp8_need_bytes(p.sorted_slot_index, "sorted_slot_index", scratch_mul(grouped_rows, F32_BYTES)?)?;
-    fp8_need_bytes(p.expert_tile_ids, "expert_tile_ids", scratch_mul(n_tiles, F32_BYTES)?)?;
-    fp8_need_bytes(p.expert_token_counts, "expert_token_counts", scratch_mul(p.n_exp, F32_BYTES)?)?;
+    fp8_need_bytes(
+        p.sorted_slot_index,
+        "sorted_slot_index",
+        scratch_mul(grouped_rows, F32_BYTES)?,
+    )?;
+    fp8_need_bytes(
+        p.expert_tile_ids,
+        "expert_tile_ids",
+        scratch_mul(n_tiles, F32_BYTES)?,
+    )?;
+    fp8_need_bytes(
+        p.expert_token_counts,
+        "expert_token_counts",
+        scratch_mul(p.n_exp, F32_BYTES)?,
+    )?;
     fp8_need_bytes(
         p.expert_offsets,
         "expert_offsets",
@@ -2388,7 +2459,11 @@ fn fp8_validate(
     let x_elem = match p.x_norm_batch.dtype {
         DType::F32 => F32_BYTES,
         DType::BF16 => BF16_BYTES,
-        other => return Err(fp8_refuse(format!("x_norm_batch is {other:?}, the route needs F32 or BF16"))),
+        other => {
+            return Err(fp8_refuse(format!(
+                "x_norm_batch is {other:?}, the route needs F32 or BF16"
+            )))
+        }
     };
     fp8_need_bytes(
         p.x_norm_batch,
@@ -2396,7 +2471,11 @@ fn fp8_validate(
         scratch_mul(scratch_mul(rows, p.gate_up_k)?, x_elem)?,
     )?;
     let target = p.routed_out.unwrap_or(p.x_batch);
-    fp8_need_f32(target, "combine target", scratch_mul(scratch_mul(rows, p.down_m)?, F32_BYTES)?)?;
+    fp8_need_f32(
+        target,
+        "combine target",
+        scratch_mul(scratch_mul(rows, p.down_m)?, F32_BYTES)?,
+    )?;
 
     // Router and shared expert: BF16 `project_weight`, F32 outputs.
     let router = &p.prelude.router;
@@ -2420,7 +2499,11 @@ fn fp8_validate(
         fp8_bf16_weight(&w.up, "shared up", inter, p.gate_up_k)?;
         fp8_bf16_weight(&w.down, "shared down", p.down_m, inter)?;
         let live = scratch_mul(scratch_mul(rows, inter)?, F32_BYTES)?;
-        fp8_need_f32(shared.scalar, "shared scalar", scratch_mul(rows, F32_BYTES)?)?;
+        fp8_need_f32(
+            shared.scalar,
+            "shared scalar",
+            scratch_mul(rows, F32_BYTES)?,
+        )?;
         fp8_need_f32(shared.gate_out, "shared gate_out", live)?;
         fp8_need_f32(shared.up_out, "shared up_out", live)?;
         fp8_need_f32(shared.rotated, "shared rotated", live)?;
@@ -2429,7 +2512,9 @@ fn fp8_validate(
     // Routed experts: one immutable, resident, contiguous qt=55 table per projection.
     let experts = p.routed_experts;
     if experts.immutable_identity().is_none() {
-        return Err(fp8_refuse("the routed expert set has no immutable identity"));
+        return Err(fp8_refuse(
+            "the routed expert set has no immutable identity",
+        ));
     }
     if experts.host_mapped() || experts.len() != p.n_exp {
         return Err(fp8_refuse(format!(
@@ -2442,15 +2527,29 @@ fn fp8_validate(
     let (Some((first_gu, first_dn)), Some((last_gu, last_dn))) =
         (experts.get(0), experts.get(p.n_exp - 1))
     else {
-        return Err(fp8_refuse("the routed expert set does not resolve its first and last expert"));
+        return Err(fp8_refuse(
+            "the routed expert set does not resolve its first and last expert",
+        ));
     };
     let gate_up_stride = fp8_block_stride(2 * p.mi, p.gate_up_k)?;
     let down_stride = fp8_block_stride(p.down_m, p.down_k)?;
     let gate_up_base = fp8_expert_base(
-        &first_gu, &last_gu, "gate_up", 2 * p.mi, p.gate_up_k, p.n_exp, gate_up_stride,
+        &first_gu,
+        &last_gu,
+        "gate_up",
+        2 * p.mi,
+        p.gate_up_k,
+        p.n_exp,
+        gate_up_stride,
     )?;
     let down_base = fp8_expert_base(
-        &first_dn, &last_dn, "down", p.down_m, p.down_k, p.n_exp, down_stride,
+        &first_dn,
+        &last_dn,
+        "down",
+        p.down_m,
+        p.down_k,
+        p.n_exp,
+        down_stride,
     )?;
     Ok(Fp8Plan {
         rows,
@@ -2681,7 +2780,9 @@ fn fp8_combine(
     initial_zero: bool,
 ) -> Result<(), DispatchError> {
     if initial_zero {
-        return Err(fp8_refuse("a zero-initialized combine target is not available"));
+        return Err(fp8_refuse(
+            "a zero-initialized combine target is not available",
+        ));
     }
     let plan = fp8_validate(gpu, p, grouped_rows)?;
     let target = p.routed_out.unwrap_or(p.x_batch);
@@ -2694,6 +2795,7 @@ fn fp8_combine(
         p.down_m,
         plan.grouped_rows,
         plan.rows,
+        p.n_exp,
     ))?;
     if !p.recipe.shared_after_combine() {
         hip(gpu.bf16_round_trip_f32(&f32_view(target, 0, plan.rows * p.down_m)))?;
@@ -2742,19 +2844,34 @@ mod scratch_tests {
     }
 
     fn sym() -> ScratchRoute {
-        ScratchRoute { sym_iu4: true, ..route(true) }
+        ScratchRoute {
+            sym_iu4: true,
+            ..route(true)
+        }
     }
 
     fn wmma() -> ScratchRoute {
-        ScratchRoute { gateup_bf16: true, gateup_silu: true, down_wmma: true, ..route(true) }
+        ScratchRoute {
+            gateup_bf16: true,
+            gateup_silu: true,
+            down_wmma: true,
+            ..route(true)
+        }
     }
 
     fn wmma_unfused() -> ScratchRoute {
-        ScratchRoute { gateup_bf16: true, down_wmma: true, ..route(true) }
+        ScratchRoute {
+            gateup_bf16: true,
+            down_wmma: true,
+            ..route(true)
+        }
     }
 
     fn indexed() -> ScratchRoute {
-        ScratchRoute { indexed_down: true, ..route(true) }
+        ScratchRoute {
+            indexed_down: true,
+            ..route(true)
+        }
     }
 
     fn fp8() -> ScratchRoute {
@@ -2794,20 +2911,38 @@ mod scratch_tests {
         // With `shared_down_out` the F32 shared-down rows are not charged to
         // `down_expanded` (they are checked on that tensor by `validate_scratch`).
         let rows = 8192;
-        let shared = ScratchDims { shared_down: true, ..dims(rows) };
-        let separate = ScratchDims { shared_down: false, ..dims(rows) };
+        let shared = ScratchDims {
+            shared_down: true,
+            ..dims(rows)
+        };
+        let separate = ScratchDims {
+            shared_down: false,
+            ..dims(rows)
+        };
         let with = sym().requirement(&shared).unwrap();
         let without = sym().requirement(&separate).unwrap();
         assert_eq!(with.down_expanded, shared_down_bytes(rows, HIDDEN).unwrap());
         assert_eq!(without.down_expanded, rows * 80);
         // Everything else is the same.
         assert_eq!(
-            ScratchBytes { down_expanded: 0, ..with },
-            ScratchBytes { down_expanded: 0, ..without }
+            ScratchBytes {
+                down_expanded: 0,
+                ..with
+            },
+            ScratchBytes {
+                down_expanded: 0,
+                ..without
+            }
         );
         // The few-row indexed route's routed rows are the same either way.
-        let few = ScratchDims { shared_down: false, ..dims(4) };
-        assert_eq!(indexed().requirement(&few).unwrap().down_expanded, 4 * K_TOP * HIDDEN * 4);
+        let few = ScratchDims {
+            shared_down: false,
+            ..dims(4)
+        };
+        assert_eq!(
+            indexed().requirement(&few).unwrap().down_expanded,
+            4 * K_TOP * HIDDEN * 4
+        );
     }
 
     #[test]
@@ -2828,8 +2963,14 @@ mod scratch_tests {
     fn combine_order_alone_is_eighty_bytes_per_row() {
         let mut no_shared = dims(1024);
         no_shared.shared_down = false;
-        assert_eq!(sym().requirement(&no_shared).unwrap().down_expanded, 1024 * 80);
-        assert_eq!(wmma().requirement(&no_shared).unwrap().down_expanded, 1024 * 80);
+        assert_eq!(
+            sym().requirement(&no_shared).unwrap().down_expanded,
+            1024 * 80
+        );
+        assert_eq!(
+            wmma().requirement(&no_shared).unwrap().down_expanded,
+            1024 * 80
+        );
     }
 
     #[test]
@@ -2876,7 +3017,15 @@ mod scratch_tests {
     #[test]
     fn full_width_buffers_always_pass() {
         for rows in [1, 8, 9, 64, 511, 512, 513, 4096, 8192] {
-            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed(), fp8()] {
+            for r in [
+                route(false),
+                route(true),
+                sym(),
+                wmma(),
+                wmma_unfused(),
+                indexed(),
+                fp8(),
+            ] {
                 let need = r.requirement(&dims(rows)).unwrap();
                 need.require_within(&full_scratch(rows))
                     .unwrap_or_else(|e| panic!("rows={rows} route={r:?}: {e:?}"));
@@ -2887,7 +3036,15 @@ mod scratch_tests {
     #[test]
     fn buffers_short_by_one_word_are_rejected_naming_the_buffer() {
         for rows in [8, 513, 4096] {
-            for r in [route(false), route(true), sym(), wmma(), wmma_unfused(), indexed(), fp8()] {
+            for r in [
+                route(false),
+                route(true),
+                sym(),
+                wmma(),
+                wmma_unfused(),
+                indexed(),
+                fp8(),
+            ] {
                 let need = r.requirement(&dims(rows)).unwrap();
                 // Exactly the requirement passes.
                 need.require_within(&need).unwrap();
@@ -2934,15 +3091,26 @@ mod scratch_tests {
         let n = 8192;
         let held = compact_scratch(n);
         // Ordinary large prefill on the symmetric IU4 route.
-        sym().requirement(&dims(n)).unwrap().require_within(&held).unwrap();
+        sym()
+            .requirement(&dims(n))
+            .unwrap()
+            .require_within(&held)
+            .unwrap();
         // The same route at the 4096 chunk and every smaller row count.
         for rows in [1, 8, 9, 64, 511, 512, 513, 4096, 8192] {
-            sym().requirement(&dims(rows)).unwrap().require_within(&held).unwrap();
+            sym()
+                .requirement(&dims(rows))
+                .unwrap()
+                .require_within(&held)
+                .unwrap();
         }
         // Fallback arms at <= 512 rows keep their F32 sizes inside the cap.
         for rows in [1, 8, 9, 64, 511, 512] {
             for r in [route(false), route(true), wmma(), wmma_unfused(), indexed()] {
-                r.requirement(&dims(rows)).unwrap().require_within(&held).unwrap();
+                r.requirement(&dims(rows))
+                    .unwrap()
+                    .require_within(&held)
+                    .unwrap();
             }
         }
     }
@@ -2952,18 +3120,27 @@ mod scratch_tests {
         let held = compact_scratch(8192);
         for r in [route(false), route(true)] {
             assert!(
-                r.requirement(&dims(513)).unwrap().require_within(&held).is_err(),
+                r.requirement(&dims(513))
+                    .unwrap()
+                    .require_within(&held)
+                    .is_err(),
                 "route {r:?} must be refused above 512 rows on compact scratch"
             );
         }
         // The 4096 plan too: the F32 grouped writer needs more than the cap.
-        assert!(route(true).requirement(&dims(1024)).unwrap().require_within(&compact_scratch(4096)).is_err());
+        assert!(route(true)
+            .requirement(&dims(1024))
+            .unwrap()
+            .require_within(&compact_scratch(4096))
+            .is_err());
     }
 
     #[test]
     fn tensor_bytes_takes_the_smaller_of_shape_and_allocation() {
         let tensor = |bytes: usize, shape: &[usize]| GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(0x1000 as *mut std::ffi::c_void, bytes) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(0x1000 as *mut std::ffi::c_void, bytes)
+            },
             shape: shape.to_vec(),
             dtype: DType::F32,
         };
@@ -3037,7 +3214,10 @@ mod scratch_tests {
             ..fp8()
         };
         assert_eq!(flagged.requirement(&dims(rows)).unwrap(), base);
-        let separate = ScratchDims { shared_down: false, ..dims(rows) };
+        let separate = ScratchDims {
+            shared_down: false,
+            ..dims(rows)
+        };
         assert_eq!(fp8().requirement(&separate).unwrap().down_expanded, 0);
         assert_eq!(base.down_expanded, shared_down_bytes(rows, HIDDEN).unwrap());
     }
@@ -3046,9 +3226,21 @@ mod scratch_tests {
     fn fp8_route_needs_full_f32_grouped_scratch() {
         // Compact scratch (`c = min(n, 512)`) holds the F32 grouped rows only up to 512 rows.
         let held = compact_scratch(8192);
-        fp8().requirement(&dims(512)).unwrap().require_within(&held).unwrap();
-        assert!(fp8().requirement(&dims(513)).unwrap().require_within(&held).is_err());
-        assert!(fp8().requirement(&dims(8192)).unwrap().require_within(&held).is_err());
+        fp8()
+            .requirement(&dims(512))
+            .unwrap()
+            .require_within(&held)
+            .unwrap();
+        assert!(fp8()
+            .requirement(&dims(513))
+            .unwrap()
+            .require_within(&held)
+            .is_err());
+        assert!(fp8()
+            .requirement(&dims(8192))
+            .unwrap()
+            .require_within(&held)
+            .is_err());
         // One word short of the F32 gate/up rows is refused naming the buffer.
         let rows = 1536;
         let need = fp8().requirement(&dims(rows)).unwrap();

@@ -21,8 +21,8 @@
 //!   one peer's `y_down_grouped` base), dst `*u8` @24 (this rank's), n_experts
 //!   i32 @32, rank i32 @36, tile_u4 i32 @40, tiles i32 @44. Owner semantics: the
 //!   only other valid owner is the peer, so `owner != rank` pulls from the one
-//!   peer base with no owner range check (an owner outside `{0, 1}` is a caller
-//!   contract violation, never produced).
+//!   peer base; an owner outside `{0, 1}` (a corrupt owner table, never produced
+//!   by the caller) is not pulled.
 //! * [`Variant::N8`], `ep_gather_grouped_rows_by_tile_owner_n8_pm_<arch>`: the
 //!   rank-generic kernel (104-byte kernarg, serves 2..=8 ranks). tile_ids @0,
 //!   owner_table @8, src0..src7 `*u8` @16/@24/@32/@40/@48/@56/@64/@72 (the bases
@@ -42,7 +42,7 @@
 //! Law (the same predicate as the mask kernel's complement):
 //! ```text
 //!   pull(t) = 0 <= tile_ids[t] < n_experts && owner_table[tile_ids[t]] != rank
-//!             [&& owner_table[tile_ids[t]] < 8]                          (N8 only)
+//!             && owner_table[tile_ids[t]] < 2 (EP2) / < 8 (N8)
 //!   pull(t) => dst[t * 16 rows ..+ 16 rows] = src[owner_table[tile_ids[t]]][same bytes]
 //! ```
 //!
@@ -60,7 +60,12 @@
 //! three upper offsets are per-lane VGPRs (`16 tid + 4096 k`) instead of
 //! immediates; gfx1201 keeps the immediates.
 use super::common::{add64, add64_imm, bload, bstore_b128, op, s, smem, sop, srd_tail, v};
-use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, insn::Instruction, plan::Access, reg::{Kind, Live}};
+use crate::{
+    insn::Instruction,
+    plan::Access,
+    reg::{Kind, Live},
+    Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan,
+};
 use peacemaker_author::{End, Gfx1100, Gfx1201, Scc, Target, WgUniform, Workgroup};
 
 type R = Result<(), String>;
@@ -107,25 +112,44 @@ impl Variant {
     }
 }
 
-pub fn symbol(variant: Variant, arch: Arch) -> String { format!("{}_{}", variant.kernel_id(), arch.name()) }
-pub fn module(variant: Variant, arch: Arch) -> String { symbol(variant, arch) }
+pub fn symbol(variant: Variant, arch: Arch) -> String {
+    format!("{}_{}", variant.kernel_id(), arch.name())
+}
+pub fn module(variant: Variant, arch: Arch) -> String {
+    symbol(variant, arch)
+}
 
 // ---- SGPRs ------------------------------------------------------------------
 const KARG: u8 = 0;
 // EP2: kernarg words 0..8 -> s8..s15 (tile_ids 8:9, table 10:11, peer 12:13, dst 14:15), words 8..12 -> s16..s19.
 // N8: kernarg words 0..4 -> s8..s11 (tile_ids 8:9, table 10:11), dst (@80) -> s12:13, words @88..104 -> s16..s19.
 // N8 loads the per-tile source base from kernarg[16 + 8 * owner] into SRC; KSLOT is that kernarg address.
-const TIDS: u8 = 8; const TABLE: u8 = 10; const PEER: u8 = 12; const DST_EP2: u8 = 14;
-const DST_N8: u8 = 12; const KSLOT: u8 = 14;
-const NEXP: u8 = 16; const RANK: u8 = 17; const TU4: u8 = 18; const TILES: u8 = 19;
-const WGX: u8 = 20; const ID: u8 = 21; const OWN: u8 = 22; const T0: u8 = 23; const T64: u8 = 24;
-const TRIPS: u8 = 26; const BYTES: u8 = 27; const SRC: u8 = 28;
+const TIDS: u8 = 8;
+const TABLE: u8 = 10;
+const PEER: u8 = 12;
+const DST_EP2: u8 = 14;
+const DST_N8: u8 = 12;
+const KSLOT: u8 = 14;
+const NEXP: u8 = 16;
+const RANK: u8 = 17;
+const TU4: u8 = 18;
+const TILES: u8 = 19;
+const WGX: u8 = 20;
+const ID: u8 = 21;
+const OWN: u8 = 22;
+const T0: u8 = 23;
+const T64: u8 = 24;
+const TRIPS: u8 = 26;
+const BYTES: u8 = 27;
+const SRC: u8 = 28;
 // Source / destination raw buffer descriptors of the trip loop (4-aligned SGPR quads).
-const SRD_SRC: u8 = 32; const SRD_OUT: u8 = 36;
+const SRD_SRC: u8 = 32;
+const SRD_OUT: u8 = 36;
 const S_END: u8 = 40;
 
 // ---- VGPRs ------------------------------------------------------------------
-const TID: u8 = 0; const VOFF: u8 = 1;
+const TID: u8 = 0;
+const VOFF: u8 = 1;
 /// gfx1100 only: per-lane buffer offsets `VOFF + 4096 k` for k = 1..=3 (v2..v4); the gfx11 immediate offset field is 12 bits.
 const VOFFK: u8 = 2;
 /// Four 16-byte loads per lane and trip (each quad inside one 8-VGPR plan block).
@@ -164,37 +188,73 @@ fn kernargs(variant: Variant) -> KernargLayout {
 fn plan(arch: Arch) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(V_END), 104)?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
-    if !arch.gfx12() { p.s::<1>("wg_x_in", WGX_IN, Live::Whole)?; }
-    for base in (8u8..S_END).step_by(8) { p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?; }
-    for base in (0u8..V_END).step_by(8) { p.add_range(&format!("v_blk{base}"), Kind::V, base, 8, Live::Whole)?; }
+    if !arch.gfx12() {
+        p.s::<1>("wg_x_in", WGX_IN, Live::Whole)?;
+    }
+    for base in (8u8..S_END).step_by(8) {
+        p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
+    }
+    for base in (0u8..V_END).step_by(8) {
+        p.add_range(&format!("v_blk{base}"), Kind::V, base, 8, Live::Whole)?;
+    }
     Ok(p)
 }
 
 /// The builder-emitted kernel (gfx1100 and gfx1201; every other target is refused).
 pub fn emit(variant: Variant, arch: Arch) -> Result<Emitted, String> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) { return Err(format!("{}: built for gfx1100 and gfx1201 only, not {}", variant.kernel_id(), arch.name())) }
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1201) {
+        return Err(format!(
+            "{}: built for gfx1100 and gfx1201 only, not {}",
+            variant.kernel_id(),
+            arch.name()
+        ));
+    }
     let kspec = KernelSpec {
-        kernel_id: variant.kernel_id().into(), variant: "pull".into(), arch, symbol: symbol(variant, arch), kernargs: kernargs(variant),
-        user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: BLOCK as u16, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
+        kernel_id: variant.kernel_id().into(),
+        variant: "pull".into(),
+        arch,
+        symbol: symbol(variant, arch),
+        kernargs: kernargs(variant),
+        user_sgpr_count: 2,
+        system_sgpr_workgroup_id_y: false,
+        workgroup_size: BLOCK as u16,
+        group_segment_fixed_size: 0,
+        wave32: true,
+        cu_mode: false,
     };
     let mut b = Builder::new(kspec, plan(arch)?);
     b.enable_delay_alu();
     match arch {
-        Arch::Gfx1100 => kernel(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, variant, arch)?,
-        _ => kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?, variant, arch)?,
+        Arch::Gfx1100 => kernel(
+            &mut Workgroup::<Gfx1100, Builder>::new(&mut b)?,
+            variant,
+            arch,
+        )?,
+        _ => kernel(
+            &mut Workgroup::<Gfx1201, Builder>::new(&mut b)?,
+            variant,
+            arch,
+        )?,
     }
     b.finish()
 }
 
 /// The single-symbol module `<symbol>` of one variant.
-pub fn emit_module(variant: Variant, arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+pub fn emit_module(
+    variant: Variant,
+    arch: Arch,
+) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
     let emitted = vec![emit(variant, arch)?];
     let (text, proof) = super::iu4_gemm::module(&emitted, &module(variant, arch))?;
     Ok((emitted, text, proof))
 }
 
 // ---- helpers ----------------------------------------------------------------
-fn cmp_wg<T: Target>(wg: &mut Workgroup<'_, T, Builder>, text: String, uses: &[crate::reg::RegRef]) -> Result<WgUniform<Scc>, String> {
+fn cmp_wg<T: Target>(
+    wg: &mut Workgroup<'_, T, Builder>,
+    text: String,
+    uses: &[crate::reg::RegRef],
+) -> Result<WgUniform<Scc>, String> {
     wg.scmp_wg_uniform(Instruction::new(text, vec![], uses.to_vec()))
 }
 
@@ -207,11 +267,19 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, variant: Variant, arch:
 }
 
 /// Kernarg loads and the workgroup-uniform exits: tile out of range, tile
-/// without a live expert, tile owned by this rank (N8: or by no rank of `[0, 8)`).
+/// without a live expert, tile owned by this rank (or by no rank of the variant: N8 `[0, 8)`, EP2 `{0, 1}`).
 /// Leaves the running source and destination pairs at the tile's first byte and
 /// `TRIPS` = `tile_u4 / 1024`.
-fn prologue<T: Target>(wg: &mut Workgroup<'_, T, Builder>, end: &End, variant: Variant, arch: Arch) -> R {
-    let dst = match variant { Variant::Ep2 => DST_EP2, Variant::N8 => DST_N8 };
+fn prologue<T: Target>(
+    wg: &mut Workgroup<'_, T, Builder>,
+    end: &End,
+    variant: Variant,
+    arch: Arch,
+) -> R {
+    let dst = match variant {
+        Variant::Ep2 => DST_EP2,
+        Variant::N8 => DST_N8,
+    };
     let b = wg.isa();
     match variant {
         Variant::Ep2 => {
@@ -225,27 +293,48 @@ fn prologue<T: Target>(wg: &mut Workgroup<'_, T, Builder>, end: &End, variant: V
         }
     }
     // Workgroup id x (gfx12: ttmp9, gfx11: the system SGPR after the user SGPRs) = the tile.
-    if arch.gfx12() { sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?; } else { sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?; }
-    let outside = cmp_wg(wg, format!("s_cmp_ge_u32 s{WGX}, s{TILES}"), &[s(WGX), s(TILES)])?;
+    if arch.gfx12() {
+        sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
+    } else {
+        sop(b, format!("s_mov_b32 s{WGX}, s{WGX_IN}"), &[WGX], &[WGX_IN])?;
+    }
+    let outside = cmp_wg(
+        wg,
+        format!("s_cmp_ge_u32 s{WGX}, s{TILES}"),
+        &[s(WGX), s(TILES)],
+    )?;
     wg.exit_if(outside, end)?;
     // id = tile_ids[tile]; the unsigned compare also rejects the -1 sentinel.
     let b = wg.isa();
     sop(b, format!("s_lshl_b32 s{T0}, s{WGX}, 2"), &[T0], &[WGX])?;
     add64(b, T64, TIDS, T0)?;
     smem(b, ID, 1, T64, 0)?;
-    let dead = cmp_wg(wg, format!("s_cmp_ge_u32 s{ID}, s{NEXP}"), &[s(ID), s(NEXP)])?;
+    let dead = cmp_wg(
+        wg,
+        format!("s_cmp_ge_u32 s{ID}, s{NEXP}"),
+        &[s(ID), s(NEXP)],
+    )?;
     wg.exit_if(dead, end)?;
     // owner = owner_table[id].
     let b = wg.isa();
     sop(b, format!("s_lshl_b32 s{T0}, s{ID}, 2"), &[T0], &[ID])?;
     add64(b, T64, TABLE, T0)?;
     smem(b, OWN, 1, T64, 0)?;
-    let mine = cmp_wg(wg, format!("s_cmp_eq_u32 s{OWN}, s{RANK}"), &[s(OWN), s(RANK)])?;
+    let mine = cmp_wg(
+        wg,
+        format!("s_cmp_eq_u32 s{OWN}, s{RANK}"),
+        &[s(OWN), s(RANK)],
+    )?;
     wg.exit_if(mine, end)?;
-    if variant == Variant::N8 {
-        // The owner is a rank in [0, 8): anything else (never produced by the caller) is not pulled,
-        // so the source-base lookup below stays inside the eight source slots.
-        let range = cmp_wg(wg, format!("s_cmp_ge_u32 s{OWN}, {MAX_RANKS}"), &[s(OWN)])?;
+    {
+        // The owner is a rank of the variant: [0, 8) for N8 (so the source-base lookup below stays inside the eight
+        // source slots), {0, 1} for EP2 (the one peer base serves only the other rank). Anything else (never
+        // produced by the caller, e.g. a corrupt owner table) is not pulled.
+        let limit = match variant {
+            Variant::Ep2 => 2,
+            Variant::N8 => MAX_RANKS,
+        };
+        let range = cmp_wg(wg, format!("s_cmp_ge_u32 s{OWN}, {limit}"), &[s(OWN)])?;
         wg.exit_if(range, end)?;
     }
     // Tile byte offset = tile * tile_u4 * 16 (fits 32 bits by contract); trips; the
@@ -262,17 +351,46 @@ fn prologue<T: Target>(wg: &mut Workgroup<'_, T, Builder>, end: &End, variant: V
             SRC
         }
     };
-    sop(b, format!("s_lshl_b32 s{BYTES}, s{TU4}, 4"), &[BYTES], &[TU4])?;
-    sop(b, format!("s_mul_i32 s{T0}, s{WGX}, s{BYTES}"), &[T0], &[WGX, BYTES])?;
+    sop(
+        b,
+        format!("s_lshl_b32 s{BYTES}, s{TU4}, 4"),
+        &[BYTES],
+        &[TU4],
+    )?;
+    sop(
+        b,
+        format!("s_mul_i32 s{T0}, s{WGX}, s{BYTES}"),
+        &[T0],
+        &[WGX, BYTES],
+    )?;
     add64(b, SRD_SRC, src, T0)?;
     srd_tail(b, SRD_SRC, Some(BYTES))?;
     add64(b, SRD_OUT, dst, T0)?;
     srd_tail(b, SRD_OUT, Some(BYTES))?;
-    sop(b, format!("s_lshr_b32 s{TRIPS}, s{TU4}, 10"), &[TRIPS], &[TU4])?;
-    op(b, format!("v_lshlrev_b32_e32 v{VOFF}, 4, v{TID}"), &[v(VOFF)], &[v(TID)])?;
+    sop(
+        b,
+        format!("s_lshr_b32 s{TRIPS}, s{TU4}, 10"),
+        &[TRIPS],
+        &[TU4],
+    )?;
+    op(
+        b,
+        format!("v_lshlrev_b32_e32 v{VOFF}, 4, v{TID}"),
+        &[v(VOFF)],
+        &[v(TID)],
+    )?;
     if !arch.gfx12() {
         for k in 1..UNROLL as u8 {
-            op(b, format!("v_add_nc_u32_e32 v{}, {}, v{VOFF}", VOFFK + k - 1, super::common::lit(4096 * u32::from(k))), &[v(VOFFK + k - 1)], &[v(VOFF)])?;
+            op(
+                b,
+                format!(
+                    "v_add_nc_u32_e32 v{}, {}, v{VOFF}",
+                    VOFFK + k - 1,
+                    super::common::lit(4096 * u32::from(k))
+                ),
+                &[v(VOFFK + k - 1)],
+                &[v(VOFF)],
+            )?;
         }
     }
     Ok(())
@@ -283,7 +401,15 @@ fn copy_tile<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     wg.loop_carried(".Lpull_trip", (), |wg, ()| {
         let b = wg.isa();
         // gfx12: immediate offsets 4096 k; gfx11: the same offsets from per-lane VGPRs (12-bit immediate field).
-        let voff = |k: u8| if arch.gfx12() { (VOFF, 4096 * u32::from(k)) } else if k == 0 { (VOFF, 0) } else { (VOFFK + k - 1, 0) };
+        let voff = |k: u8| {
+            if arch.gfx12() {
+                (VOFF, 4096 * u32::from(k))
+            } else if k == 0 {
+                (VOFF, 0)
+            } else {
+                (VOFFK + k - 1, 0)
+            }
+        };
         for k in 0..UNROLL as u8 {
             let (o, i) = voff(k);
             bload(b, 4, DATA + 4 * k, o, SRD_SRC, i)?;
@@ -294,7 +420,15 @@ fn copy_tile<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
         }
         add64_imm(b, SRD_SRC, 4096 * UNROLL)?;
         add64_imm(b, SRD_OUT, 4096 * UNROLL)?;
-        sop(b, format!("{} s{TRIPS}, s{TRIPS}, -1", super::common::s_add_i32(b.spec.arch)), &[TRIPS], &[TRIPS])?;
+        sop(
+            b,
+            format!(
+                "{} s{TRIPS}, s{TRIPS}, -1",
+                super::common::s_add_i32(b.spec.arch)
+            ),
+            &[TRIPS],
+            &[TRIPS],
+        )?;
         let more = cmp_wg(wg, format!("s_cmp_gt_i32 s{TRIPS}, 0"), &[s(TRIPS)])?;
         Ok(((), more))
     })?;
@@ -306,8 +440,21 @@ fn copy_tile<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
 /// the kernel is allowed, the forbidden families and the resource limits.
 pub fn contract(variant: Variant, arch: Arch, e: &Emitted) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
-    for name in ["s_load_b32", "s_load_b128", "s_load_b256", "buffer_load_b128", "buffer_store_b128", "s_barrier_signal", "s_barrier_wait", "s_endpgm"] {
-        let n = e.s_text.lines().filter(|l| l.trim().split_whitespace().next() == Some(name)).count();
+    for name in [
+        "s_load_b32",
+        "s_load_b128",
+        "s_load_b256",
+        "buffer_load_b128",
+        "buffer_store_b128",
+        "s_barrier_signal",
+        "s_barrier_wait",
+        "s_endpgm",
+    ] {
+        let n = e
+            .s_text
+            .lines()
+            .filter(|l| l.trim().split_whitespace().next() == Some(name))
+            .count();
         counts.insert(name.into(), n.into());
     }
     serde_json::json!({

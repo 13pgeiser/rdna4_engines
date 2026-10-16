@@ -18,12 +18,22 @@ const Q4: Option<Codec> = Some(Codec::Mq4Sym);
 
 /// Even experts MQ4, odd experts W3.
 fn alternating() -> Vec<Option<Codec>> {
-    (0..MAX_EXPERTS).map(|e| if e % 2 == 0 { Q4 } else { W3 }).collect()
+    (0..MAX_EXPERTS)
+        .map(|e| if e % 2 == 0 { Q4 } else { W3 })
+        .collect()
 }
 
 /// Pseudo-random mix by expert id.
 fn scrambled() -> Vec<Option<Codec>> {
-    (0..MAX_EXPERTS).map(|e| if (e * 2_654_435_761usize >> 7) & 1 == 0 { Q4 } else { W3 }).collect()
+    (0..MAX_EXPERTS)
+        .map(|e| {
+            if (e * 2_654_435_761usize >> 7) & 1 == 0 {
+                Q4
+            } else {
+                W3
+            }
+        })
+        .collect()
 }
 
 /// `c` lanes of 10 unique ids in `0..512` (partial Fisher-Yates, xorshift).
@@ -78,10 +88,19 @@ fn flatten(plan: &LaneUnionPlan) -> Vec<(Codec, u32, Vec<u32>)> {
         let offsets = plan.bucket_offsets(b);
         assert_eq!(offsets.len(), bucket.expert_count + 1);
         assert_eq!(offsets[0], 0, "offsets start at 0 of the own bucket");
-        assert_eq!(offsets[bucket.expert_count] as usize, bucket.slot_count, "offsets end at own slot count");
-        assert!(offsets.windows(2).all(|w| w[0] < w[1]), "no empty expert listed");
+        assert_eq!(
+            offsets[bucket.expert_count] as usize, bucket.slot_count,
+            "offsets end at own slot count"
+        );
+        assert!(
+            offsets.windows(2).all(|w| w[0] < w[1]),
+            "no empty expert listed"
+        );
         let ids = plan.bucket_experts(b);
-        assert!(ids.windows(2).all(|w| w[0] < w[1]), "expert ids strictly increase in a bucket");
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "expert ids strictly increase in a bucket"
+        );
         for (u, &id) in ids.iter().enumerate() {
             out.push((bucket.codec, id, plan.expert_slots(b, u).to_vec()));
         }
@@ -105,7 +124,12 @@ fn check_plan(codecs: &[Option<Codec>], top: &[[u32; TOP_K]]) -> LaneUnionPlan {
     assert!(plan.layout.u_total <= max_union(c));
     assert_eq!(plan.expert_ids.len(), plan.layout.expert_id_words());
     assert_eq!(plan.expert_offsets.len(), plan.layout.expert_offset_words());
-    let order: Vec<usize> = plan.layout.buckets.iter().map(|b| b.codec.order_index()).collect();
+    let order: Vec<usize> = plan
+        .layout
+        .buckets
+        .iter()
+        .map(|b| b.codec.order_index())
+        .collect();
     assert!(order.windows(2).all(|w| w[0] < w[1]));
     // Inverse permutation.
     for (slot, &pos) in plan.inverse.iter().enumerate() {
@@ -119,9 +143,9 @@ fn check_plan(codecs: &[Option<Codec>], top: &[[u32; TOP_K]]) -> LaneUnionPlan {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn kernarg_abi_is_the_frozen_88_bytes() {
-    assert_eq!(size_of::<MoeGemvKernargs>(), 88);
-    assert_eq!(KERNARG_BYTES, 88);
+fn kernarg_abi_is_the_frozen_96_bytes() {
+    assert_eq!(size_of::<MoeGemvKernargs>(), 96);
+    assert_eq!(KERNARG_BYTES, 96);
     assert_eq!(align_of::<MoeGemvKernargs>(), 8);
     let offsets = [
         (offset_of!(MoeGemvKernargs, expert_weight_ptrs), 0),
@@ -139,6 +163,8 @@ fn kernarg_abi_is_the_frozen_88_bytes() {
         (offset_of!(MoeGemvKernargs, x_src_rows), 76),
         (offset_of!(MoeGemvKernargs, x_row_stride), 80),
         (offset_of!(MoeGemvKernargs, y_slot_stride), 84),
+        (offset_of!(MoeGemvKernargs, n_experts), 88),
+        (offset_of!(MoeGemvKernargs, reserved), 92),
     ];
     for (got, want) in offsets {
         assert_eq!(got, want);
@@ -163,20 +189,49 @@ fn kernarg_bytes_are_little_endian_at_the_frozen_offsets() {
         x_src_rows: 0xf1f2_f3f4,
         x_row_stride: 0x0a0b_0c0d,
         y_slot_stride: 0x1a1b_1c1d,
+        n_experts: 0x2a2b_2c2d,
+        reserved: 0,
     };
     let b = a.to_bytes();
-    assert_eq!(b.len(), 88);
-    assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), a.expert_weight_ptrs);
-    assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), a.expert_ids);
-    assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), a.expert_offsets);
-    assert_eq!(u64::from_le_bytes(b[24..32].try_into().unwrap()), a.slot_ids);
+    assert_eq!(b.len(), 96);
+    assert_eq!(
+        u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        a.expert_weight_ptrs
+    );
+    assert_eq!(
+        u64::from_le_bytes(b[8..16].try_into().unwrap()),
+        a.expert_ids
+    );
+    assert_eq!(
+        u64::from_le_bytes(b[16..24].try_into().unwrap()),
+        a.expert_offsets
+    );
+    assert_eq!(
+        u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        a.slot_ids
+    );
     assert_eq!(u64::from_le_bytes(b[32..40].try_into().unwrap()), a.xrot);
     assert_eq!(u64::from_le_bytes(b[40..48].try_into().unwrap()), a.y0);
     assert_eq!(u64::from_le_bytes(b[48..56].try_into().unwrap()), a.y1);
-    let words = [a.m, a.k, a.u, a.c, a.x_row_div, a.x_src_rows, a.x_row_stride, a.y_slot_stride];
+    let words = [
+        a.m,
+        a.k,
+        a.u,
+        a.c,
+        a.x_row_div,
+        a.x_src_rows,
+        a.x_row_stride,
+        a.y_slot_stride,
+        a.n_experts,
+        a.reserved,
+    ];
     for (i, want) in words.iter().enumerate() {
         let o = 56 + 4 * i;
-        assert_eq!(u32::from_le_bytes(b[o..o + 4].try_into().unwrap()), *want, "word {i}");
+        assert_eq!(
+            u32::from_le_bytes(b[o..o + 4].try_into().unwrap()),
+            *want,
+            "word {i}"
+        );
     }
 }
 
@@ -226,12 +281,28 @@ fn only_mq3i4_and_mq4sym_qt_types_are_admitted() {
         (Kind::GateUp, 0),
         (Kind::Down, 255),
     ] {
-        assert_eq!(Codec::from_qt(kind, qt), Err(SlabMoeError::UnsupportedQt { kind, qt }));
+        assert_eq!(
+            Codec::from_qt(kind, qt),
+            Err(SlabMoeError::UnsupportedQt { kind, qt })
+        );
     }
     for (g, d) in [(131, 53), (44, 132)] {
-        assert_eq!(Codec::from_qt_pair(g, d), Err(SlabMoeError::QtPairMismatch { gate_up_qt: g, down_qt: d }));
+        assert_eq!(
+            Codec::from_qt_pair(g, d),
+            Err(SlabMoeError::QtPairMismatch {
+                gate_up_qt: g,
+                down_qt: d
+            })
+        );
     }
-    for (g, d) in [(133, 134), (131, 134), (133, 132), (132, 131), (53, 44), (0, 0)] {
+    for (g, d) in [
+        (133, 134),
+        (131, 134),
+        (133, 132),
+        (132, 131),
+        (53, 44),
+        (0, 0),
+    ] {
         assert!(Codec::from_qt_pair(g, d).is_err(), "({g}, {d})");
     }
 }
@@ -257,7 +328,10 @@ fn c1_mixed_order_buckets_w3_first_then_mq4_with_stable_slots() {
     assert_eq!(plan.bucket_slots(1), &[5, 3, 1, 9, 7]);
     assert_eq!(plan.bucket_offsets(1), &[0, 1, 2, 3, 4, 5]);
     // Descriptor layout: ids concatenated, one (U_b + 1) offsets run per bucket.
-    assert_eq!(plan.expert_offsets, vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]);
+    assert_eq!(
+        plan.expert_offsets,
+        vec![0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]
+    );
     assert_eq!(plan.layout.buckets[1].expert_start, 5);
     assert_eq!(plan.layout.buckets[1].offsets_start, 6);
     assert_eq!(plan.layout.buckets[1].slot_start, 5);
@@ -284,7 +358,10 @@ fn c8_union_of_mixed_codecs_matches_the_oracle_for_many_routes() {
             for c in [1, 2, 3, 7, 8] {
                 let top = lanes(c, seed.wrapping_mul(0x9e37_79b9));
                 let plan = check_plan(&codecs, &top);
-                assert!(plan.layout.u_total >= TOP_K, "each lane alone selects 10 distinct experts");
+                assert!(
+                    plan.layout.u_total >= TOP_K,
+                    "each lane alone selects 10 distinct experts"
+                );
             }
         }
     }
@@ -305,7 +382,10 @@ fn c8_shared_experts_keep_original_slot_order_and_read_once() {
         for u in 0..plan.layout.buckets[b].expert_count {
             let slots = plan.expert_slots(b, u);
             assert_eq!(slots.len(), 8);
-            assert!(slots.windows(2).all(|w| w[0] < w[1]), "slots ascend (lane-major)");
+            assert!(
+                slots.windows(2).all(|w| w[0] < w[1]),
+                "slots ascend (lane-major)"
+            );
             for (lane, &s) in slots.iter().enumerate() {
                 assert_eq!(s as usize / TOP_K, lane, "one slot per lane, lane order");
             }
@@ -319,8 +399,9 @@ fn union_bound_is_min_10c_512() {
     assert_eq!(max_union(8), 80);
     assert_eq!(max_union(60), 512);
     // Eight lanes of pairwise disjoint experts reach the bound 80.
-    let top: Vec<[u32; TOP_K]> =
-        (0..8u32).map(|l| core::array::from_fn(|r| l * 10 + r as u32)).collect();
+    let top: Vec<[u32; TOP_K]> = (0..8u32)
+        .map(|l| core::array::from_fn(|r| l * 10 + r as u32))
+        .collect();
     let plan = check_plan(&alternating(), &top);
     assert_eq!(plan.layout.u_total, 80);
     // A layout above the bound is refused.
@@ -340,7 +421,10 @@ fn expert_ids_511_and_0_are_valid_bounds() {
 fn planner_refuses_out_of_bounds_routes() {
     let codecs = alternating();
     let good = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-    assert_eq!(LaneUnionPlan::build(&codecs, &[]), Err(SlabMoeError::InvalidLaneCount { c: 0 }));
+    assert_eq!(
+        LaneUnionPlan::build(&codecs, &[]),
+        Err(SlabMoeError::InvalidLaneCount { c: 0 })
+    );
     assert_eq!(
         LaneUnionPlan::build(&codecs, &vec![good; 33]),
         Err(SlabMoeError::InvalidLaneCount { c: 33 })
@@ -350,7 +434,11 @@ fn planner_refuses_out_of_bounds_routes() {
     high[3] = 512;
     assert_eq!(
         LaneUnionPlan::build(&codecs, &[good, high]),
-        Err(SlabMoeError::ExpertOutOfRange { lane: 1, rank: 3, id: 512 })
+        Err(SlabMoeError::ExpertOutOfRange {
+            lane: 1,
+            rank: 3,
+            id: 512
+        })
     );
     high[3] = u32::MAX;
     assert!(matches!(
@@ -487,8 +575,14 @@ fn gate_up_launch_plan_matches_the_frozen_geometry() {
             assert_eq!(k.expert_offsets, DESC_OFFS + 4 * b.offsets_start as u64);
             assert_eq!(k.slot_ids, DESC_SLOTS + 4 * b.slot_start as u64);
             assert_eq!((k.xrot, k.y0, k.y1), (X, Y0, Y1));
-            assert_eq!((k.m, k.k, k.u, k.c), (1280, 2560, b.expert_count as u32, c as u32));
-            assert_eq!((k.x_row_div, k.x_src_rows, k.x_row_stride, k.y_slot_stride), (10, c as u32, 2560, 640));
+            assert_eq!(
+                (k.m, k.k, k.u, k.c),
+                (1280, 2560, b.expert_count as u32, c as u32)
+            );
+            assert_eq!(
+                (k.x_row_div, k.x_src_rows, k.x_row_stride, k.y_slot_stride),
+                (10, c as u32, 2560, 640)
+            );
         }
     }
 }
@@ -508,7 +602,10 @@ fn down_launch_plan_is_unweighted_original_slot_output() {
             assert_eq!(l.grid, [2560, b.expert_count as u32, 1]);
             let k = &l.kernargs;
             assert_eq!(k.y1, 0, "down has no second output");
-            assert_eq!((k.m, k.k, k.u, k.c), (2560, 640, b.expert_count as u32, c as u32));
+            assert_eq!(
+                (k.m, k.k, k.u, k.c),
+                (2560, 640, b.expert_count as u32, c as u32)
+            );
             assert_eq!(
                 (k.x_row_div, k.x_src_rows, k.x_row_stride, k.y_slot_stride),
                 (1, 10 * c as u32, 640, 2560)
@@ -538,26 +635,52 @@ fn launch_refuses_wrong_profile_geometry_and_outputs() {
     r.profile = Profile::R128;
     assert_eq!(
         plan_launches(&r),
-        Err(SlabMoeError::ProfileMismatch { kind: Kind::GateUp, profile: Profile::R128 })
+        Err(SlabMoeError::ProfileMismatch {
+            kind: Kind::GateUp,
+            profile: Profile::R128
+        })
     );
     let mut r = ok;
     r.m = 640;
-    assert_eq!(plan_launches(&r), Err(SlabMoeError::Geometry { what: "M", got: 640, want: 1280 }));
+    assert_eq!(
+        plan_launches(&r),
+        Err(SlabMoeError::Geometry {
+            what: "M",
+            got: 640,
+            want: 1280
+        })
+    );
     let mut r = ok;
     r.k = 640;
-    assert_eq!(plan_launches(&r), Err(SlabMoeError::Geometry { what: "K", got: 640, want: 2560 }));
+    assert_eq!(
+        plan_launches(&r),
+        Err(SlabMoeError::Geometry {
+            what: "K",
+            got: 640,
+            want: 2560
+        })
+    );
     let mut r = ok;
     r.y1 = None;
-    assert!(matches!(plan_launches(&r), Err(SlabMoeError::Operand { name: "y1", .. })));
+    assert!(matches!(
+        plan_launches(&r),
+        Err(SlabMoeError::Operand { name: "y1", .. })
+    ));
     let d = fixture(Kind::Down, 8, 5);
     let mut r = request(Kind::Down, &d);
     r.y1 = Some(d.y1);
-    assert!(matches!(plan_launches(&r), Err(SlabMoeError::Operand { name: "y1", .. })));
+    assert!(matches!(
+        plan_launches(&r),
+        Err(SlabMoeError::Operand { name: "y1", .. })
+    ));
     // Down geometry swapped onto gate/up is refused by the explicit M/K.
     let mut r = request(Kind::Down, &d);
     r.m = 1280;
     r.k = 2560;
-    assert!(matches!(plan_launches(&r), Err(SlabMoeError::Geometry { .. })));
+    assert!(matches!(
+        plan_launches(&r),
+        Err(SlabMoeError::Geometry { .. })
+    ));
 }
 
 #[test]
@@ -621,7 +744,10 @@ fn descriptor_bytes_are_little_endian_u32_arrays() {
     let bytes = u32_le_bytes(&plan.slot_ids);
     assert_eq!(bytes.len(), 80);
     for (i, w) in plan.slot_ids.iter().enumerate() {
-        assert_eq!(u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()), *w);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()),
+            *w
+        );
     }
 }
 

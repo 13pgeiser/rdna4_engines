@@ -90,6 +90,7 @@ impl Gfx1201Device<'_> {
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let k_top_i32 = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &dummy_ptr as *const _ as *mut c_void,
@@ -100,6 +101,7 @@ impl Gfx1201Device<'_> {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
             &k_top_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.gpu.launch_maybe_blob(
             MQ2_LLOYD_GATE_UP_COMPACT_EP_KERNEL,
@@ -118,6 +120,7 @@ impl Gfx1201Device<'_> {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(k_top_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         )
@@ -156,6 +159,7 @@ impl Gfx1201Device<'_> {
         let up_ptr = y_up.buf.as_ptr();
         let m_i32 = m as i32;
         let k_i32 = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &dummy_ptr as *const _ as *mut c_void,
@@ -165,6 +169,7 @@ impl Gfx1201Device<'_> {
             &up_ptr as *const _ as *mut c_void,
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer =
@@ -185,6 +190,7 @@ impl Gfx1201Device<'_> {
                 blob.push_ptr(up_ptr);
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );
@@ -227,6 +233,7 @@ impl Gfx1201Device<'_> {
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let k_top_i32 = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &ownership_ptrs_ptr as *const _ as *mut c_void,
@@ -237,6 +244,7 @@ impl Gfx1201Device<'_> {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
             &k_top_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -262,6 +270,7 @@ impl Gfx1201Device<'_> {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(k_top_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );
@@ -303,6 +312,7 @@ impl Gfx1201Device<'_> {
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let k_top_i32 = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &ownership_ptrs_ptr as *const _ as *mut c_void,
@@ -313,6 +323,7 @@ impl Gfx1201Device<'_> {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
             &k_top_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.gpu.launch_maybe_blob(
             MQ2_LLOYD_DOWN_EXPANDED_COMPACT_EP_KERNEL,
@@ -331,6 +342,7 @@ impl Gfx1201Device<'_> {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(k_top_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         )
@@ -368,6 +380,7 @@ impl Gfx1201Device<'_> {
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let k_top_i32 = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &ownership_ptrs_ptr as *const _ as *mut c_void,
@@ -378,6 +391,7 @@ impl Gfx1201Device<'_> {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
             &k_top_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -403,6 +417,7 @@ impl Gfx1201Device<'_> {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(k_top_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );

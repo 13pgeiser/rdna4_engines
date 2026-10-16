@@ -20,8 +20,8 @@ use crate::gpu_forward::{
 use crate::kv_backend::Qwen4KvBackend;
 use crate::mtp_gpu::{MtpAppendScratch, MtpFillContext, MtpGpuStateSnapshot, MtpStep, Qwen4MtpGpu};
 use crate::ple::PleHashMetadata;
-use crate::state::Qwen4StateFormat;
 use crate::state::decode_map_ahead_tokens;
+use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
     ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, Qwen4Weights,
@@ -105,9 +105,8 @@ fn live_position(
     head_position: Option<usize>,
     row_capture_armed: bool,
 ) -> Option<usize> {
-    (!row_capture_armed
-        && (route == SessionRoute::Ar || head_position == Some(target_position)))
-    .then_some(target_position)
+    (!row_capture_armed && (route == SessionRoute::Ar || head_position == Some(target_position)))
+        .then_some(target_position)
 }
 
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
@@ -316,7 +315,8 @@ impl SessionState for Qwen4Bundle {
             || prompt.len() < self.tail_snapshot_min_prompt
             || p - after.max((p / chunk) * chunk) < self.tail_snapshot_min_gap
             || up_to / chunk > p / chunk
-            || p % chunk == 0 || self.turn_end_token_active() == Some(prompt[p - 1])
+            || p % chunk == 0
+            || self.turn_end_token_active() == Some(prompt[p - 1])
         {
             return None;
         }
@@ -542,7 +542,12 @@ impl Qwen4Bundle {
         let scope = crate::weights::Qwen4BandScope::single(&config);
         let assembled = match expert_tiers {
             Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
-                &mut transaction, &config, recipe, placements, &scope, lease,
+                &mut transaction,
+                &config,
+                recipe,
+                placements,
+                &scope,
+                lease,
             ),
             None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, &scope),
         };
@@ -1480,6 +1485,7 @@ impl Qwen4Bundle {
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..bytes_len], &top1.buf)
             .map_err(BundleError::Hip)?;
+        gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let mut picks = Vec::with_capacity(output_count);
         for bytes in self.spec_host_top1[..bytes_len].chunks_exact(4) {
             picks.push(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -1712,6 +1718,7 @@ impl Qwen4Bundle {
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
             .map_err(BundleError::Hip)?;
+        gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let bytes = &self.spec_host_top1[..top1_bytes];
         Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
@@ -2489,6 +2496,9 @@ impl Qwen4Bundle {
         if self.ep.is_some() {
             return self.ep_reset(gpu);
         }
+        // A new request starts with a clear router fault word. Only here, never
+        // mid-pipeline: a clear would drop an earlier row's pending report.
+        gpu.clear_router_fault();
         self.begin_npu_trunk_request(gpu)?;
         if let Some(stage) = &mut self.pair_session_stage {
             stage.position = None;
@@ -3621,7 +3631,13 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         remaining_new_tokens: usize,
         max_draft_rows: usize,
     ) {
-        Qwen4Bundle::map_ahead_for_decode(self, gpu, position, remaining_new_tokens, max_draft_rows);
+        Qwen4Bundle::map_ahead_for_decode(
+            self,
+            gpu,
+            position,
+            remaining_new_tokens,
+            max_draft_rows,
+        );
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
@@ -4142,10 +4158,14 @@ fn ple_descriptors(
         // decodes, so a sealed BF16-PLE artifact stays loadable next to a
         // Q8F16 one; the stock-FP8 recipe's qt=56 rows declare one byte per
         // value.
-        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16, RowEncoding::Fp8PerTensor]
-            .into_iter()
-            .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
-            .collect::<Vec<_>>();
+        let accepted = [
+            RowEncoding::Bf16,
+            RowEncoding::Q8F16,
+            RowEncoding::Fp8PerTensor,
+        ]
+        .into_iter()
+        .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
+        .collect::<Vec<_>>();
         if !accepted.contains(&row_bytes) || valid_rows != ple.shard_valid_rows(index) {
             return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                 entry.name.clone(),

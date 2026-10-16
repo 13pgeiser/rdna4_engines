@@ -144,7 +144,7 @@ __device__ __forceinline__ void fp8moe_grouped_body(
     const int* __restrict__ sorted_rows,
     const void* __restrict__ X,
     float* __restrict__ Y,
-    int R, int K, int x_row_div) {
+    int R, int K, int x_row_div, int n_exp) {
     constexpr int NSUB = FP8MOE_NSUB;
     constexpr int D = FP8MOE_D;
     // [D][16 rows][128 bf16 + 8 pad] as dwords; pad breaks the 256-B row stride.
@@ -154,7 +154,9 @@ __device__ __forceinline__ void fp8moe_grouped_body(
     const int expert = td.x;
     const int row0 = td.y;
     const int nrows = td.z;
-    if (expert < 0) return;
+    // Fail closed: an expert id outside [0, n_exp) (-1 sentinel, or a non-finite-router / corrupt id)
+    // skips the tile before `W + expert * expert_stride` is formed.
+    if (expert < 0 || expert >= n_exp) return;
     const unsigned char* __restrict__ blk = W + (unsigned long long)expert * expert_stride;
     const unsigned short* __restrict__ sc = reinterpret_cast<const unsigned short*>(blk + (size_t)R * K);
     const int nkb = K >> 7;
@@ -333,8 +335,8 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16m
     const int* __restrict__ sorted_rows,
     const float* __restrict__ X,
     float* __restrict__ Y,
-    int R, int K, int x_row_div) {
-    fp8moe_grouped_body<false>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+    int R, int K, int x_row_div, int n_exp) {
+    fp8moe_grouped_body<false>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div, n_exp);
 }
 
 // X: [x_rows, K] BF16 bits.
@@ -345,8 +347,8 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16m
     const int* __restrict__ sorted_rows,
     const unsigned short* __restrict__ X,
     float* __restrict__ Y,
-    int R, int K, int x_row_div) {
-    fp8moe_grouped_body<true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+    int R, int K, int x_row_div, int n_exp) {
+    fp8moe_grouped_body<true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div, n_exp);
 }
 
 // Retained cdc37659a transport/order for exact F32 A/B, absent from production
@@ -355,14 +357,14 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16m
 extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16mfma_reference(
     const unsigned char* __restrict__ W, unsigned long long expert_stride,
     const int4* __restrict__ tile_desc, const int* __restrict__ sorted_rows,
-    const float* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div) {
-    fp8moe_grouped_body<false, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+    const float* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div, int n_exp) {
+    fp8moe_grouped_body<false, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div, n_exp);
 }
 extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16(
     const unsigned char* __restrict__ W, unsigned long long expert_stride,
     const int4* __restrict__ tile_desc, const int* __restrict__ sorted_rows,
-    const unsigned short* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div) {
-    fp8moe_grouped_body<true, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div);
+    const unsigned short* __restrict__ X, float* __restrict__ Y, int R, int K, int x_row_div, int n_exp) {
+    fp8moe_grouped_body<true, true>(W, expert_stride, tile_desc, sorted_rows, X, Y, R, K, x_row_div, n_exp);
 }
 #endif
 

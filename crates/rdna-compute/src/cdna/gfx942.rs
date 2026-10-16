@@ -60,7 +60,8 @@ const FP8B128_MOE_GROUPED_REFERENCE_SRC: &str =
     include_str!("../../tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip");
 const FP8B128_MOE_GROUPED_REFERENCE_MODULE: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
 const FP8B128_MOE_GROUPED_REFERENCE_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference";
-const FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL: &str = "gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16";
+const FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL: &str =
+    "gemm_fp8b128_moe_grouped_bf16mfma_reference_xbf16";
 /// Output rows per workgroup of the retained baseline: frozen at P1's 64, so
 /// a candidate geometry change never moves the reference launch (pinned
 /// against the snapshot's `FP8REF_NSUB` by a unit test below).
@@ -137,6 +138,7 @@ impl Gfx942Device<'_> {
         let up_ptr = y_up.buf.as_ptr();
         let m_i32 = m as i32;
         let k_i32 = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &topk_indices_ptr as *const _ as *mut c_void,
@@ -145,6 +147,7 @@ impl Gfx942Device<'_> {
             &up_ptr as *const _ as *mut c_void,
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -168,6 +171,7 @@ impl Gfx942Device<'_> {
                 blob.push_ptr(up_ptr);
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );
@@ -203,12 +207,14 @@ impl Gfx942Device<'_> {
         let x_ptr = x_rot.buf.as_ptr();
         let gate_ptr = y_gate.buf.as_ptr();
         let up_ptr = y_up.buf.as_ptr();
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &topk_indices_ptr as *const _ as *mut c_void,
             &x_ptr as *const _ as *mut c_void,
             &gate_ptr as *const _ as *mut c_void,
             &up_ptr as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.gpu.launch_maybe_blob(
             MQ2_LLOYD_GATE_UP_WAVE64X8_CANDIDATE_KERNEL,
@@ -223,6 +229,7 @@ impl Gfx942Device<'_> {
                 blob.push_ptr(x_ptr);
                 blob.push_ptr(gate_ptr);
                 blob.push_ptr(up_ptr);
+                blob.push_i32(n_experts_val);
                 blob
             },
         )
@@ -329,6 +336,7 @@ impl Gfx942Device<'_> {
         let m_i32 = m as i32;
         let k_i32 = k as i32;
         let k_top_i32 = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &topk_indices_ptr as *const _ as *mut c_void,
@@ -337,6 +345,7 @@ impl Gfx942Device<'_> {
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
             &k_top_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -360,6 +369,7 @@ impl Gfx942Device<'_> {
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
                 blob.push_i32(k_top_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );
@@ -398,6 +408,7 @@ impl Gfx942Device<'_> {
         let residual_ptr = residual.buf.as_ptr();
         let m_i32 = m as i32;
         let k_i32 = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &expert_ptrs_ptr as *const _ as *mut c_void,
             &topk_indices_ptr as *const _ as *mut c_void,
@@ -406,6 +417,7 @@ impl Gfx942Device<'_> {
             &residual_ptr as *const _ as *mut c_void,
             &m_i32 as *const _ as *mut c_void,
             &k_i32 as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = k_top * (m * (k / 256) * 72 + k * 4 + m * 4);
         let timer = crate::profile::begin_timer(
@@ -429,6 +441,7 @@ impl Gfx942Device<'_> {
                 blob.push_ptr(residual_ptr);
                 blob.push_i32(m_i32);
                 blob.push_i32(k_i32);
+                blob.push_i32(n_experts_val);
                 blob
             },
         );
@@ -617,7 +630,12 @@ impl Gfx942Device<'_> {
     /// ```text
     /// reserve_fp8b128_moe_group(max_rows: usize, k_top: usize, n_exp: usize) -> HipResult<()>
     /// ```
-    pub fn reserve_fp8b128_moe_group(&mut self, max_rows: usize, k_top: usize, n_exp: usize) -> HipResult<()> {
+    pub fn reserve_fp8b128_moe_group(
+        &mut self,
+        max_rows: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
         let slots = max_rows.checked_mul(k_top).ok_or_else(|| {
             hip_bridge::HipError::new(0, "reserve_fp8b128_moe_group: max_rows * k_top overflows")
         })?;
@@ -630,7 +648,9 @@ impl Gfx942Device<'_> {
             self.gpu.invalidate_for_scratch_growth();
         }
         self.gpu.bind_thread()?;
-        self.gpu.scratch.reserve_qwen4_moe_group(&self.gpu.hip, slots, n_exp)
+        self.gpu
+            .scratch
+            .reserve_qwen4_moe_group(&self.gpu.hip, slots, n_exp)
     }
 
     /// Grouped MoE GEMM over qt=55 `FP8E4M3B128` expert blocks (BF16 MFMA,
@@ -698,7 +718,20 @@ impl Gfx942Device<'_> {
         k: usize,
     ) -> HipResult<()> {
         self.gemm_fp8b128_moe_grouped_launch(
-            false, w, expert_stride, n_exp, tile_desc, n_tiles, sorted_rows, x, x_row_div, x_rows, y, n_sorted, r, k,
+            false,
+            w,
+            expert_stride,
+            n_exp,
+            tile_desc,
+            n_tiles,
+            sorted_rows,
+            x,
+            x_row_div,
+            x_rows,
+            y,
+            n_sorted,
+            r,
+            k,
         )
     }
 
@@ -732,7 +765,20 @@ impl Gfx942Device<'_> {
         k: usize,
     ) -> HipResult<()> {
         self.gemm_fp8b128_moe_grouped_launch(
-            true, w, expert_stride, n_exp, tile_desc, n_tiles, sorted_rows, x, x_row_div, x_rows, y, n_sorted, r, k,
+            true,
+            w,
+            expert_stride,
+            n_exp,
+            tile_desc,
+            n_tiles,
+            sorted_rows,
+            x,
+            x_row_div,
+            x_rows,
+            y,
+            n_sorted,
+            r,
+            k,
         )
     }
 
@@ -742,17 +788,24 @@ impl Gfx942Device<'_> {
     /// the code object the compiler resolves for it. Compiles (or hits the
     /// kernel cache) as a side effect.
     #[doc(hidden)]
-    pub fn fp8b128_moe_grouped_build_identity(&mut self, reference: bool) -> HipResult<Fp8MoeBuildIdentity> {
+    pub fn fp8b128_moe_grouped_build_identity(
+        &mut self,
+        reference: bool,
+    ) -> HipResult<Fp8MoeBuildIdentity> {
         use sha2::{Digest, Sha256};
         let (module, src) = if reference {
-            (FP8B128_MOE_GROUPED_REFERENCE_MODULE, FP8B128_MOE_GROUPED_REFERENCE_SRC)
+            (
+                FP8B128_MOE_GROUPED_REFERENCE_MODULE,
+                FP8B128_MOE_GROUPED_REFERENCE_SRC,
+            )
         } else {
             (FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC)
         };
         self.gpu.bind_thread()?;
         let object = self.gpu.compiler.compile(module, src)?.to_path_buf();
-        let bytes = std::fs::read(&object)
-            .map_err(|e| hip_bridge::HipError::new(0, &format!("{module}: read {}: {e}", object.display())))?;
+        let bytes = std::fs::read(&object).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("{module}: read {}: {e}", object.display()))
+        })?;
         Ok(Fp8MoeBuildIdentity {
             module,
             source_sha256: format!("{:x}", Sha256::digest(src.as_bytes())),
@@ -787,13 +840,19 @@ impl Gfx942Device<'_> {
             return refuse(format!("needs r % 16 == 0, k % 128 == 0, x_row_div >= 1 (r={r} k={k} x_row_div={x_row_div})"));
         }
         if r.checked_mul(k).is_none_or(|rk| rk > i32::MAX as usize) || n_tiles > u32::MAX as usize {
-            return refuse(format!("r*k={r}*{k} exceeds i32 or n_tiles={n_tiles} exceeds the grid"));
+            return refuse(format!(
+                "r*k={r}*{k} exceeds i32 or n_tiles={n_tiles} exceeds the grid"
+            ));
         }
-        let Some(min_stride) = crate::fp8_e4m3::b128_scale_count(r, k).and_then(|s| (r * k).checked_add(2 * s)) else {
+        let Some(min_stride) =
+            crate::fp8_e4m3::b128_scale_count(r, k).and_then(|s| (r * k).checked_add(2 * s))
+        else {
             return refuse(format!("block geometry overflows (r={r} k={k})"));
         };
         if expert_stride % 16 != 0 || expert_stride < min_stride {
-            return refuse(format!("expert_stride {expert_stride} must be a multiple of 16 and >= {min_stride}"));
+            return refuse(format!(
+                "expert_stride {expert_stride} must be a multiple of 16 and >= {min_stride}"
+            ));
         }
         let (func, x_elem) = match (x.dtype, reference) {
             (DType::F32, false) => (FP8B128_MOE_GROUPED_KERNEL, 4),
@@ -802,10 +861,26 @@ impl Gfx942Device<'_> {
             (DType::BF16, true) => (FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL, 2),
             (other, _) => return refuse(format!("x must be F32 or BF16, got {other:?}")),
         };
-        crate::moe::require_span(w, &[n_exp, expert_stride], "gemm_fp8b128_moe_grouped_bf16mfma w")?;
-        crate::moe::require_span(tile_desc, &[n_tiles, 16], "gemm_fp8b128_moe_grouped_bf16mfma tile_desc")?;
-        crate::moe::require_span(sorted_rows, &[n_sorted, 4], "gemm_fp8b128_moe_grouped_bf16mfma sorted_rows")?;
-        crate::moe::require_span(x, &[x_rows, k, x_elem], "gemm_fp8b128_moe_grouped_bf16mfma x")?;
+        crate::moe::require_span(
+            w,
+            &[n_exp, expert_stride],
+            "gemm_fp8b128_moe_grouped_bf16mfma w",
+        )?;
+        crate::moe::require_span(
+            tile_desc,
+            &[n_tiles, 16],
+            "gemm_fp8b128_moe_grouped_bf16mfma tile_desc",
+        )?;
+        crate::moe::require_span(
+            sorted_rows,
+            &[n_sorted, 4],
+            "gemm_fp8b128_moe_grouped_bf16mfma sorted_rows",
+        )?;
+        crate::moe::require_span(
+            x,
+            &[x_rows, k, x_elem],
+            "gemm_fp8b128_moe_grouped_bf16mfma x",
+        )?;
         crate::moe::require_span(y, &[n_sorted, r, 4], "gemm_fp8b128_moe_grouped_bf16mfma y")?;
         if n_tiles == 0 {
             return Ok(());
@@ -832,6 +907,9 @@ impl Gfx942Device<'_> {
         let rv = r as i32;
         let kv = k as i32;
         let rd = x_row_div as i32;
+        let nev = i32::try_from(n_exp).map_err(|_| {
+            hip_bridge::HipError::new(0, &format!("{WHAT}: n_exp {n_exp} exceeds i32"))
+        })?;
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &stride as *const _ as *mut c_void,
@@ -842,6 +920,7 @@ impl Gfx942Device<'_> {
             &rv as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
             &rd as *const _ as *mut c_void,
+            &nev as *const _ as *mut c_void,
         ];
         // Weight bytes streamed per tile + X + Y (upper bound: 16 rows per tile).
         let bytes = n_tiles.saturating_mul(r * k + 16 * k * x_elem + 16 * r * 4);
@@ -863,6 +942,7 @@ impl Gfx942Device<'_> {
                 blob.push_i32(rv);
                 blob.push_i32(kv);
                 blob.push_i32(rd);
+                blob.push_i32(nev);
                 blob
             },
         );
@@ -890,11 +970,25 @@ impl Gfx942Device<'_> {
         n_tiles: usize,
     ) -> HipResult<()> {
         const FUNC: &str = "gemm_fp8b128_moe_tile_desc_pad16";
-        if n_tiles.checked_mul(16).is_none_or(|rows| rows > i32::MAX as usize) {
-            return Err(hip_bridge::HipError::new(0, &format!("{FUNC}: n_tiles={n_tiles} exceeds i32 rows")));
+        if n_tiles
+            .checked_mul(16)
+            .is_none_or(|rows| rows > i32::MAX as usize)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{FUNC}: n_tiles={n_tiles} exceeds i32 rows"),
+            ));
         }
-        crate::moe::require_span(tile_ids, &[n_tiles, 4], "fp8b128_moe_tile_desc_pad16 tile_ids")?;
-        crate::moe::require_span(tile_desc, &[n_tiles, 16], "fp8b128_moe_tile_desc_pad16 tile_desc")?;
+        crate::moe::require_span(
+            tile_ids,
+            &[n_tiles, 4],
+            "fp8b128_moe_tile_desc_pad16 tile_ids",
+        )?;
+        crate::moe::require_span(
+            tile_desc,
+            &[n_tiles, 16],
+            "fp8b128_moe_tile_desc_pad16 tile_desc",
+        )?;
         if n_tiles == 0 {
             return Ok(());
         }
@@ -947,11 +1041,19 @@ impl Gfx942Device<'_> {
         k: usize,
     ) -> HipResult<()> {
         let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
-        if r == 0 || k == 0 || k % 16 != 0 || r.checked_mul(k).is_none_or(|rk| rk > i32::MAX as usize) {
-            return refuse(format!("dequant_fp8b128_to_bf16: needs k % 16 == 0 and r*k <= i32::MAX (r={r} k={k})"));
+        if r == 0
+            || k == 0
+            || k % 16 != 0
+            || r.checked_mul(k).is_none_or(|rk| rk > i32::MAX as usize)
+        {
+            return refuse(format!(
+                "dequant_fp8b128_to_bf16: needs k % 16 == 0 and r*k <= i32::MAX (r={r} k={k})"
+            ));
         }
         let Some(stride) = crate::fp8_e4m3::b128_block_stride(r, k) else {
-            return refuse(format!("dequant_fp8b128_to_bf16: block stride overflows (r={r} k={k})"));
+            return refuse(format!(
+                "dequant_fp8b128_to_bf16: block stride overflows (r={r} k={k})"
+            ));
         };
         crate::moe::require_span(blocks, &[experts, stride], "dequant_fp8b128_to_bf16 blocks")?;
         crate::moe::require_span(out, &[experts, r, k, 2], "dequant_fp8b128_to_bf16 out")?;
@@ -1040,7 +1142,10 @@ impl Gfx942Device<'_> {
         }
         let grid_y = mi.div_ceil(256);
         if grid_y > u16::MAX as usize {
-            return refuse(format!("{WHAT}: mi={mi} needs grid.y={grid_y} > {}", u16::MAX));
+            return refuse(format!(
+                "{WHAT}: mi={mi} needs grid.y={grid_y} > {}",
+                u16::MAX
+            ));
         }
         // `sorted` is i32 data; the sealed route carries the stable scatter's index scratch as
         // `DType::Raw` (1 B/elem in byte_size), so accept a 4-byte dtype or Raw — the byte-span check
@@ -1052,12 +1157,26 @@ impl Gfx942Device<'_> {
                 gate_up.dtype, activation.dtype, sorted.dtype
             ));
         }
-        crate::moe::require_span(gate_up, &[n_sorted, 2, mi, 4], "fp8b128_moe_unscatter_silu gate_up")?;
+        crate::moe::require_span(
+            gate_up,
+            &[n_sorted, 2, mi, 4],
+            "fp8b128_moe_unscatter_silu gate_up",
+        )?;
         crate::moe::require_span(sorted, &[n_sorted, 4], "fp8b128_moe_unscatter_silu sorted")?;
-        crate::moe::require_span(activation, &[slots, mi, 4], "fp8b128_moe_unscatter_silu activation")?;
-        let (yp, sp, ap) = (gate_up.buf.as_ptr(), sorted.buf.as_ptr(), activation.buf.as_ptr());
+        crate::moe::require_span(
+            activation,
+            &[slots, mi, 4],
+            "fp8b128_moe_unscatter_silu activation",
+        )?;
+        let (yp, sp, ap) = (
+            gate_up.buf.as_ptr(),
+            sorted.buf.as_ptr(),
+            activation.buf.as_ptr(),
+        );
         if yp == ap || sp == ap || yp == sp {
-            return refuse(format!("{WHAT}: gate_up, sorted and activation must be distinct buffers"));
+            return refuse(format!(
+                "{WHAT}: gate_up, sorted and activation must be distinct buffers"
+            ));
         }
         if mi == 0 || n_sorted == 0 || slots == 0 {
             return Ok(());
@@ -1135,32 +1254,55 @@ impl Gfx942Device<'_> {
         let refuse = |msg: String| Err(hip_bridge::HipError::new(0, &msg));
         let max_dim = i32::MAX as usize;
         if rows > max_dim || mi > max_dim {
-            return refuse(format!("{WHAT}: scalar dimension exceeds i32::MAX (rows={rows} mi={mi})"));
+            return refuse(format!(
+                "{WHAT}: scalar dimension exceeds i32::MAX (rows={rows} mi={mi})"
+            ));
         }
         let Some(n) = rows.checked_mul(mi) else {
             return refuse(format!("{WHAT}: rows*mi overflows (rows={rows} mi={mi})"));
         };
         let grid_x = n.div_ceil(256);
         if grid_x > u32::MAX as usize {
-            return refuse(format!("{WHAT}: rows*mi={n} needs grid.x={grid_x} > u32::MAX"));
+            return refuse(format!(
+                "{WHAT}: rows*mi={n} needs grid.x={grid_x} > u32::MAX"
+            ));
         }
-        for (name, t) in [("gate", gate), ("up", up), ("activation", activation), ("selector", selector)] {
+        for (name, t) in [
+            ("gate", gate),
+            ("up", up),
+            ("activation", activation),
+            ("selector", selector),
+        ] {
             if t.dtype != DType::F32 {
                 return refuse(format!("{WHAT}: {name} must be F32 (got {:?})", t.dtype));
             }
         }
         crate::moe::require_span(gate, &[rows, mi, 4], "fp8b128_moe_shared_activation gate")?;
         crate::moe::require_span(up, &[rows, mi, 4], "fp8b128_moe_shared_activation up")?;
-        crate::moe::require_span(activation, &[rows, mi, 4], "fp8b128_moe_shared_activation activation")?;
-        crate::moe::require_span(selector, &[rows, 4], "fp8b128_moe_shared_activation selector")?;
+        crate::moe::require_span(
+            activation,
+            &[rows, mi, 4],
+            "fp8b128_moe_shared_activation activation",
+        )?;
+        crate::moe::require_span(
+            selector,
+            &[rows, 4],
+            "fp8b128_moe_shared_activation selector",
+        )?;
         let (gp, up_p, ap, sp) = (
             gate.buf.as_ptr(),
             up.buf.as_ptr(),
             activation.buf.as_ptr(),
             selector.buf.as_ptr(),
         );
-        if [gp, up_p, ap, sp].iter().enumerate().any(|(i, a)| [gp, up_p, ap, sp][..i].contains(a)) {
-            return refuse(format!("{WHAT}: gate, up, activation and selector must be distinct buffers"));
+        if [gp, up_p, ap, sp]
+            .iter()
+            .enumerate()
+            .any(|(i, a)| [gp, up_p, ap, sp][..i].contains(a))
+        {
+            return refuse(format!(
+                "{WHAT}: gate, up, activation and selector must be distinct buffers"
+            ));
         }
         if n == 0 {
             return Ok(());
@@ -1242,7 +1384,10 @@ mod tests {
     fn fp8b128_moe_reference_snapshot_is_pinned() {
         use sha2::{Digest, Sha256};
         const PIN: &str = "98edc4e17a855270f2b1c74bf1d5f34b3f743a93179bdfe3d7252b274920a0cc";
-        let got = format!("{:x}", Sha256::digest(super::FP8B128_MOE_GROUPED_REFERENCE_SRC.as_bytes()));
+        let got = format!(
+            "{:x}",
+            Sha256::digest(super::FP8B128_MOE_GROUPED_REFERENCE_SRC.as_bytes())
+        );
         assert_eq!(
             got, PIN,
             "tests/fixtures/fp8_moe_grouped_reference_p1_cdc37659a.gfx942.hip changed: the retained \
@@ -1263,8 +1408,14 @@ mod tests {
         assert_eq!(src.matches("__launch_bounds__(256)").count(), 2);
         // Same exports as the launcher selects; nothing from the production
         // kernel's helpers, flags or module.
-        for k in [super::FP8B128_MOE_GROUPED_REFERENCE_KERNEL, super::FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL] {
-            assert!(src.contains(&format!("void {k}(")), "reference snapshot lacks export {k}");
+        for k in [
+            super::FP8B128_MOE_GROUPED_REFERENCE_KERNEL,
+            super::FP8B128_MOE_GROUPED_REFERENCE_XBF16_KERNEL,
+        ] {
+            assert!(
+                src.contains(&format!("void {k}(")),
+                "reference snapshot lacks export {k}"
+            );
         }
         assert!(!src.contains("fp8moe_") && !src.contains("FP8MOE_"));
         assert!(!src.contains("HIPFIRE_COMPILER_FLAGS"));

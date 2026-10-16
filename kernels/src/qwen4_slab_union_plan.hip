@@ -42,6 +42,14 @@
 // workgroup, 5 * 320 * 4 = 6400 B LDS); threads t >= S are inactive but still
 // reach every barrier. S outside 1..=320 returns uniformly before any
 // barrier and writes nothing (the host refuses such a call before launch).
+//
+// Unrouted slots: an id outside [0, n_experts) (the router's -1 marker for a
+// non-finite row, or any corrupt id) joins no bucket, no expert, no offset run
+// and no slot list, and `codec` is never read for it. The planner never
+// substitutes another expert for it; the K1 kernels therefore load no weights
+// for it. The tails are sized from the live slots only (n_b, U_b above count
+// live slots only; an unrouted thread owns no head word and its tail words are
+// written by the tail rules like any other thread's).
 
 #include <hip/hip_runtime.h>
 
@@ -55,7 +63,7 @@ static_assert(SLAB_PLAN_MAX_SLOTS <= SLAB_PLAN_THREADS, "one thread per slot");
 
 extern "C" __global__ __launch_bounds__(SLAB_PLAN_THREADS) void qwen4_slab_union_plan(
     const int* __restrict__ topk, const unsigned char* __restrict__ codec,
-    unsigned* __restrict__ out, int S, int uniform_bucket) {
+    unsigned* __restrict__ out, int S, int uniform_bucket, int n_experts) {
     __shared__ int s_id[SLAB_PLAN_MAX_SLOTS];
     __shared__ int s_b[SLAB_PLAN_MAX_SLOTS];
     __shared__ int s_first[SLAB_PLAN_MAX_SLOTS];
@@ -63,29 +71,32 @@ extern "C" __global__ __launch_bounds__(SLAB_PLAN_THREADS) void qwen4_slab_union
     __shared__ int s_eidx[SLAB_PLAN_MAX_SLOTS];
     if (S < 1 || S > SLAB_PLAN_MAX_SLOTS) return;  // kernarg-uniform: no barrier divergence
     const int t = threadIdx.x;
+    bool live = false;
     if (t < S) {
-        int id = topk[t];
-        id = ((unsigned)id < 512u) ? id : 0;
-        s_id[t] = id;
-        s_b[t] = uniform_bucket >= 0 ? uniform_bucket : (codec[id] == 1 ? 0 : 1);
+        const int id = topk[t];
+        live = id >= 0 && id < n_experts;
+        s_id[t] = live ? id : -1;
+        s_b[t] = live ? (uniform_bucket >= 0 ? uniform_bucket : (codec[id] == 1 ? 0 : 1)) : -1;
     }
     __syncthreads();
     int rank = 0, total = 0, f = t;
     if (t < S) {
         const int id = s_id[t];
         f = -1;
-        for (int j = 0; j < S; ++j) {
-            if (s_id[j] == id) {
-                if (f < 0) f = j;
-                ++total;
-                if (j < t) ++rank;
+        if (live) {
+            for (int j = 0; j < S; ++j) {
+                if (s_id[j] == id) {
+                    if (f < 0) f = j;
+                    ++total;
+                    if (j < t) ++rank;
+                }
             }
         }
-        s_first[t] = rank == 0;
+        s_first[t] = live && rank == 0;
         s_total[t] = total;
     }
     __syncthreads();
-    if (t < S && rank == 0) {
+    if (t < S && live && rank == 0) {
         const int b = s_b[t];
         int e = 0;
         for (int j = 0; j < t; ++j) e += s_first[j] && s_b[j] == b;
@@ -102,16 +113,18 @@ extern "C" __global__ __launch_bounds__(SLAB_PLAN_THREADS) void qwen4_slab_union
         }
     }
     if (t < S) {
-        const int b = s_b[t];
-        const int e = s_eidx[f];
-        int start = 0;
-        for (int j = 0; j < S; ++j) {
-            if (s_first[j] && s_b[j] == b && s_eidx[j] < e) start += s_total[j];
-        }
-        slots[b * S + start + rank] = (unsigned)t;
-        if (rank == 0) {
-            ids[b * S + e] = (unsigned)s_id[t];
-            offs[b * (S + 1) + e] = (unsigned)start;
+        if (live) {
+            const int b = s_b[t];
+            const int e = s_eidx[f];
+            int start = 0;
+            for (int j = 0; j < S; ++j) {
+                if (s_first[j] && s_b[j] == b && s_eidx[j] < e) start += s_total[j];
+            }
+            slots[b * S + start + rank] = (unsigned)t;
+            if (rank == 0) {
+                ids[b * S + e] = (unsigned)s_id[t];
+                offs[b * (S + 1) + e] = (unsigned)start;
+            }
         }
         if (t >= ub0) { ids[t] = 0u; offs[t] = (unsigned)nb0; }
         if (t >= ub1) { ids[S + t] = 0u; offs[(S + 1) + t] = (unsigned)nb1; }

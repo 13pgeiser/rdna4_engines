@@ -70,7 +70,18 @@ mod awq_rcp_planes_tests {
         let hi = 1_048_576.0f32;
         let below = f32::from_bits(lo.to_bits() - 1);
         let above = f32::from_bits(hi.to_bits() + 1);
-        let awq = [3.0f32, -0.1, lo, below, hi, above, 0.0, f32::INFINITY, f32::NAN, 1.0];
+        let awq = [
+            3.0f32,
+            -0.1,
+            lo,
+            below,
+            hi,
+            above,
+            0.0,
+            f32::INFINITY,
+            f32::NAN,
+            1.0,
+        ];
         let p = awq_rcp_planes(&awq);
         let k = awq.len();
         assert_eq!(p.len(), 3 * k);
@@ -83,7 +94,10 @@ mod awq_rcp_planes_tests {
                 let err = (r as f64 + rl as f64) * a as f64 - 1.0;
                 assert!(err.abs() <= 2f64.powi(-47), "a={a} err={err}");
             } else {
-                assert!(r.is_nan() && rl.is_nan(), "a={a} must fall back to the divide");
+                assert!(
+                    r.is_nan() && rl.is_nan(),
+                    "a={a} must fall back to the divide"
+                );
             }
         }
     }
@@ -246,10 +260,13 @@ pub(crate) fn fp8_row_scale_shift() -> HipResult<i32> {
     static SHIFT: LazyLock<Result<i32, String>> = LazyLock::new(|| {
         let raw = hipfire_config::developer_var("HIPFIRE_FP8_ROW_SCALE_SHIFT")
             .unwrap_or_else(|_| "0".to_owned());
-        let shift = raw.parse::<i32>()
+        let shift = raw
+            .parse::<i32>()
             .map_err(|_| format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: invalid integer {raw:?}"))?;
         if ![-1, 0, 1, 2, 3].contains(&shift) {
-            return Err(format!("HIPFIRE_FP8_ROW_SCALE_SHIFT: unsupported shift {shift}"));
+            return Err(format!(
+                "HIPFIRE_FP8_ROW_SCALE_SHIFT: unsupported shift {shift}"
+            ));
         }
         Ok(shift)
     });
@@ -271,7 +288,6 @@ pub enum SigmoidGate<'a> {
     /// left by `FaPrepQOut::Fp8Codes` with no gate copy.
     QGateInterleaved(&'a GpuTensor),
 }
-
 
 fn validate_mq_rotate_live(input: &[f32], output: &[f32], k: usize, batch: usize) {
     let signs1 = crate::dispatch::gen_fwht_signs(42, 256);
@@ -1056,7 +1072,9 @@ impl Gpu {
                 .scratch
                 .paro_fused_scratch
                 .as_ref()
-                .map_or(true, |bufs| bufs.iter().any(|b| b.buf.size() < needed_bytes));
+                .map_or(true, |bufs| {
+                    bufs.iter().any(|b| b.buf.size() < needed_bytes)
+                });
             if will_grow {
                 self.invalidate_for_scratch_growth();
             }
@@ -2980,8 +2998,11 @@ impl Gpu {
         // gfx1201 / gfx1151 / gfx1100 decode: K/256 workgroups, each redoing the row's reduction
         // and rotating one group (bit-identical to the one-workgroup launch).
         let group_grid = self.flags.dec_norm_grids_enabled() && k % 256 == 0;
-        let (module, source, shared_mem) =
-            if group_grid { awq_norm_dec_kernel() } else { awq_norm_kernel() };
+        let (module, source, shared_mem) = if group_grid {
+            awq_norm_dec_kernel()
+        } else {
+            awq_norm_kernel()
+        };
         self.ensure_kernel(module, source, module)?;
         let grid_x = if group_grid { (k / 256) as u32 } else { 1 };
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -3494,7 +3515,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate",
-            folded_rows_grid("fused_silu_mul_mq_rotate_batched", n_groups as usize, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_mul_mq_rotate_batched",
+                n_groups as usize,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -3638,7 +3663,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate_awq",
-            folded_rows_grid("fused_silu_mul_mq_rotate_awq_batched", n_groups as usize, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_mul_mq_rotate_awq_batched",
+                n_groups as usize,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -3697,7 +3726,15 @@ impl Gpu {
             if f.y == x.buf.as_ptr() && f.m == k && f.n == batch_size {
                 self.residual_fold_pending = None;
                 return self.fused_rmsnorm_rotate_mq_i4_fold_batched(
-                    x, f.delta, weight, awq, x_rot, reservation, k, eps, batch_size,
+                    x,
+                    f.delta,
+                    weight,
+                    awq,
+                    x_rot,
+                    reservation,
+                    k,
+                    eps,
+                    batch_size,
                 );
             }
             self.flush_residual_fold()?;
@@ -3829,7 +3866,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// [`Self::fused_rmsnorm_rotate_mq_i4_batched`] fused with the residual
@@ -3939,7 +3978,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
@@ -3973,8 +4014,9 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let v2 = self.flags.g12_norm_enabled();
         let slab = awq.is_some() && v2 && self.a4_slab_active();
-        let fdiv =
-            slab && crate::gemm::a4_rms_fdiv_enabled() && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
+        let fdiv = slab
+            && crate::gemm::a4_rms_fdiv_enabled()
+            && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
         let (module, source, kernel) = match (awq.is_some(), v2) {
             (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
@@ -4338,7 +4380,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
         self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(
-            gate, Some(up), awq, Some(x_rot), k, batch_size,
+            gate,
+            Some(up),
+            awq,
+            Some(x_rot),
+            k,
+            batch_size,
         )
     }
 
@@ -4506,7 +4553,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let mut xrp = x_rot.map(|x_rot| x_rot.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|x_rot| x_rot.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut x8p = x_fp8_ptr;
         let mut sump = half_sums_ptr;
         let mut sclp = row_scales_ptr;
@@ -4542,8 +4591,20 @@ impl Gpu {
                 &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
-        let bytes = ((if h_input { if bf16_h { 2 } else { 4 } } else { 8 }) * k
-            + k * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
+        let bytes = ((if h_input {
+            if bf16_h {
+                2
+            } else {
+                4
+            }
+        } else {
+            8
+        }) * k
+            + k * 4
+            + k
+            + (k / 256) * 2 * 4
+            + 4)
+            * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -4598,8 +4659,6 @@ impl Gpu {
             scale_mode: 1,
         })
     }
-
-
 
     /// C2 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` sidecar.
     /// `x_rot = None` skips the f32 store. `awq = Some` selects the AWQ twin.
@@ -4686,7 +4745,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            folded_rows_grid("fused_silu_mul_mq_rotate_i4_batched", n_groups as usize, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_mul_mq_rotate_i4_batched",
+                n_groups as usize,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -4713,7 +4776,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// F1-lite h-producer: [`Self::fused_silu_mul_rotate_mq_i4_batched`]'s
     /// AWQ twin with phase 1 reading h = silu(gate)*up (FP32 [N][K], formed
@@ -4792,14 +4857,19 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ];
-        let bytes = (k * if bf16_h { 2 } else { 4 } + k * 4 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
+        let bytes =
+            (k * if bf16_h { 2 } else { 4 } + k * 4 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             if tokfast {
                 [batch_size as u32, n_groups, 1]
             } else {
-                folded_rows_grid("fused_silu_hin_rotate_mq_i4_batched", n_groups as usize, batch_size)?
+                folded_rows_grid(
+                    "fused_silu_hin_rotate_mq_i4_batched",
+                    n_groups as usize,
+                    batch_size,
+                )?
             },
             [32, 1, 1],
             0,
@@ -4918,7 +4988,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            folded_rows_grid("fused_silu_mul_mq_rotate_i4_gfx12_batched", n_groups as usize, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_mul_mq_rotate_i4_gfx12_batched",
+                n_groups as usize,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -4945,7 +5019,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// Route A MoE-AWQ — per-routed-expert variant of
@@ -4990,6 +5066,8 @@ impl Gpu {
         let s1 = s1_ptr;
         let s2 = s2_ptr;
         let kv = k as i32;
+        // `expert_down_awq_ptrs` holds one u64 device pointer per expert.
+        let n_exp = (expert_down_awq_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &gp as *const _ as *mut c_void,
             &up_p as *const _ as *mut c_void,
@@ -4999,6 +5077,7 @@ impl Gpu {
             &s2 as *const _ as *mut c_void,
             &xrp as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
+            &n_exp as *const _ as *mut c_void,
         ];
         // Read gate + up, 2×256 signs, write x_rot (awq_scale read is per-slot
         // strided — folded into the gate/up term for the bandwidth estimate).
@@ -5011,7 +5090,11 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_silu_mul_mq_rotate_awq_indexed",
-            folded_rows_grid("fused_silu_mul_mq_rotate_awq_indexed_batched", n_groups as usize, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_mul_mq_rotate_awq_indexed_batched",
+                n_groups as usize,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -5025,6 +5108,7 @@ impl Gpu {
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
                 b.push_i32(kv);
+                b.push_i32(n_exp);
                 b
             },
         );
@@ -5096,7 +5180,11 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (module, src, kernel) = if n_heads == 48 {
-            match (self.arch_caps.is_gfx1100(), self.arch_caps.is_gfx1201(), awq_scale.is_some()) {
+            match (
+                self.arch_caps.is_gfx1100(),
+                self.arch_caps.is_gfx1201(),
+                awq_scale.is_some(),
+            ) {
                 (true, _, true) => (
                     "gated_norm_mq_rotate_awq_k6144_gfx1100",
                     kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(),
@@ -5291,19 +5379,34 @@ impl Gpu {
         let bf16 = x_fmt == crate::norm::GdnScanOut::Bf16;
         let slab = awq.is_some() && v2 && self.a4_slab_active();
         let (module, source) = match (awq.is_some(), v2, bf16) {
-            (true, false, false) => ("gated_norm_mq_rotate_awq_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC),
-            (false, false, false) => ("gated_norm_mq_rotate_i4_gfx12", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC),
+            (true, false, false) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
+            ),
+            (false, false, false) => (
+                "gated_norm_mq_rotate_i4_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
+            ),
             (true, true, false) if slab => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_v2_slab",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC,
             ),
-            (true, true, false) => ("gated_norm_mq_rotate_awq_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC),
-            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx12_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC),
+            (true, true, false) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+            ),
+            (false, true, false) => (
+                "gated_norm_mq_rotate_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC,
+            ),
             (true, false, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_xbf16",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_XBF16_SRC,
             ),
-            (false, false, true) => ("gated_norm_mq_rotate_i4_gfx12_xbf16", kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC),
+            (false, false, true) => (
+                "gated_norm_mq_rotate_i4_gfx12_xbf16",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_XBF16_SRC,
+            ),
             (true, true, true) if slab => (
                 "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SLAB_SRC,
@@ -5329,7 +5432,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -5359,7 +5464,8 @@ impl Gpu {
             .into_iter(),
         );
         let blocks_k = k / 128;
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + blocks_k * 72
             - if bf16 { k * 2 } else { 0 })
             * batch_size;
@@ -5686,18 +5792,30 @@ impl Gpu {
             || (self.arch_caps.is_gfx1100()
                 && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true));
         let (module, source) = match (awq.is_some(), v2, gfx1151) {
-            (true, false, _) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
-            (false, false, _) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
+            (true, false, _) => (
+                "gated_norm_mq_rotate_awq_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC,
+            ),
+            (false, false, _) => (
+                "gated_norm_mq_rotate_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC,
+            ),
             (true, true, false) => (
                 "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC,
             ),
-            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
+            (false, true, false) => (
+                "gated_norm_mq_rotate_i4_gfx1100_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC,
+            ),
             (true, true, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx1151_v2",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC,
             ),
-            (false, true, true) => ("gated_norm_mq_rotate_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC),
+            (false, true, true) => (
+                "gated_norm_mq_rotate_i4_gfx1151_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC,
+            ),
         };
         let kernel = module;
         // v2: two 256-groups (one per wave) per 64-thread workgroup.
@@ -5711,7 +5829,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -5741,7 +5861,8 @@ impl Gpu {
             .into_iter(),
         );
         let blocks_k = k / 128;
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + blocks_k * 72)
             * batch_size;
         let timer = crate::profile::begin_timer(
@@ -5787,7 +5908,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// The HC read's four-branch mix (`hyper_read_projected`) of `rows` rows
@@ -6121,8 +6244,7 @@ impl Gpu {
             ]
         };
         let blocks_k = k / 128;
-        let bytes =
-            (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let bytes = (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fwht",
@@ -6161,7 +6283,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 slices-3 IU4 producer: standalone FWHT rotate + in-register
@@ -6205,7 +6329,9 @@ impl Gpu {
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x_in.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
@@ -6234,8 +6360,7 @@ impl Gpu {
             ]
         };
         let blocks_k = k / 128;
-        let bytes =
-            (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let bytes = (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fwht",
@@ -6274,7 +6399,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
     /// divide. Emits MQ4v2 FP8 prepared planes; the opt-in in-register
@@ -6442,11 +6569,8 @@ impl Gpu {
             ]
             .into_iter(),
         );
-        let bytes = (k * 4 * (if gate.is_some() { 3 } else { 2 })
-            + k
-            + (k / 256) * 2 * 4
-            + 4)
-            * batch_size;
+        let bytes =
+            (k * 4 * (if gate.is_some() { 3 } else { 2 }) + k + (k / 256) * 2 * 4 + 4) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
@@ -6560,7 +6684,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i4p = reservation.ptr();
@@ -6640,15 +6766,23 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if awq.is_some() {
-            (FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_awq_i8_gfx12")
+            (
+                FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i8_gfx12",
+            )
         } else {
-            (FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_i8_gfx12")
+            (
+                FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i8_gfx12",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i8p = reservation.ptr();
@@ -6708,7 +6842,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 down-proj producer: [`Self::fused_silu_hin_rotate_mq_i4_batched`]'s
@@ -6732,7 +6868,11 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         const KERNEL: &str = "fused_silu_mul_mq_rotate_awq_i8_hin_gfx12";
-        self.ensure_kernel(KERNEL, FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC, KERNEL)?;
+        self.ensure_kernel(
+            KERNEL,
+            FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC,
+            KERNEL,
+        )?;
         let mut hp = h.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -6755,7 +6895,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
         let result = self.launch_maybe_blob(
             KERNEL,
-            folded_rows_grid("fused_silu_hin_rotate_mq_i8_gfx12_batched", k / 256, batch_size)?,
+            folded_rows_grid(
+                "fused_silu_hin_rotate_mq_i8_gfx12_batched",
+                k / 256,
+                batch_size,
+            )?,
             [32, 1, 1],
             0,
             &mut params,
@@ -6776,7 +6920,9 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 LA `wo` producer: [`Self::gated_norm_rotate_mq_i4_gfx12_batched`]'s
@@ -6820,9 +6966,15 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if awq.is_some() {
-            (GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "gated_norm_mq_rotate_awq_i8_gfx12")
+            (
+                GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_i8_gfx12",
+            )
         } else {
-            (GATED_NORM_MQ_ROTATE_I8_GFX12_SRC, "gated_norm_mq_rotate_i8_gfx12")
+            (
+                GATED_NORM_MQ_ROTATE_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_i8_gfx12",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
@@ -6831,7 +6983,9 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut i8p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -6857,13 +7011,18 @@ impl Gpu {
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
         ]);
-        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+        let bytes = (crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
             + (k / 128) * 136)
             * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            folded_rows_grid("gated_norm_rotate_mq_i8_gfx12_batched", (k / 256).div_ceil(2), batch_size)?,
+            folded_rows_grid(
+                "gated_norm_rotate_mq_i8_gfx12_batched",
+                (k / 256).div_ceil(2),
+                batch_size,
+            )?,
             [64, 1, 1],
             0,
             &mut params,
@@ -6894,7 +7053,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
 
     /// gfx1201 A8 FA out-proj producer: [`Self::sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched`]'s
@@ -6925,7 +7086,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i8p = reservation.ptr();
@@ -6971,7 +7134,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int8MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int8MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
     /// gfx11 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +
     /// in-register `block_i4_128`, under the `_gfx11` entry symbol. The old
@@ -7008,7 +7173,9 @@ impl Gpu {
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
-        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i4p = reservation.ptr();
@@ -7060,9 +7227,10 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
-        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(
+            reservation,
+        ))
     }
-
 
     /// FWHT-128 rotation for qt53 activations.
     ///
@@ -12296,7 +12464,10 @@ impl Gpu {
             ));
         }
         let blocks = m0.div_ceil(2) + m1.div_ceil(2) + m2.div_ceil(2);
-        if blocks == 0 || [m0, m1, m2, k].iter().any(|&v| v > i32::MAX as usize) || blocks > u32::MAX as usize {
+        if blocks == 0
+            || [m0, m1, m2, k].iter().any(|&v| v > i32::MAX as usize)
+            || blocks > u32::MAX as usize
+        {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!("{WHAT}: invalid shape m0={m0} m1={m1} m2={m2} k={k}"),
@@ -14197,6 +14368,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = 8i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -14206,6 +14378,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(kname, [m as u32, 8, 1], [32, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -14217,6 +14390,7 @@ impl Gpu {
             b.push_i32(m_val);
             b.push_i32(k_val);
             b.push_i32(kt_val);
+            b.push_i32(n_experts_val);
             b
         })
     }
@@ -14294,6 +14468,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -14303,6 +14478,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             KERNEL,
@@ -14320,6 +14496,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         )
@@ -14401,6 +14578,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -14410,6 +14588,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             kname,
@@ -14427,6 +14606,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         )
@@ -14470,6 +14650,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -14478,6 +14659,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             KERNEL,
@@ -14494,6 +14676,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         )
@@ -14564,6 +14747,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -14572,6 +14756,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             kname,
@@ -14588,6 +14773,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         )
@@ -15068,6 +15254,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15076,6 +15263,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -15111,6 +15299,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -15169,6 +15358,7 @@ impl Gpu {
             bytes,
         );
 
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut gate_params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15176,6 +15366,7 @@ impl Gpu {
             &ygp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(GATE, grid, block, 0, &mut gate_params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -15185,9 +15376,11 @@ impl Gpu {
             b.push_ptr(ygp);
             b.push_i32(m_val);
             b.push_i32(k_val);
+            b.push_i32(n_experts_val);
             b
         })?;
 
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut up_params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15195,6 +15388,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(UP, grid, block, 0, &mut up_params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -15204,6 +15398,7 @@ impl Gpu {
             b.push_ptr(yup);
             b.push_i32(m_val);
             b.push_i32(k_val);
+            b.push_i32(n_experts_val);
             b
         });
         if let Some(t) = timer {
@@ -15242,6 +15437,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15250,6 +15446,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = 8 * (crate::profile::gemv_hfq4g128_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -15273,6 +15470,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -15328,6 +15526,7 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15336,6 +15535,7 @@ impl Gpu {
             &xrp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -15354,6 +15554,7 @@ impl Gpu {
                 b.push_ptr(xrp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             });
         if let Some(t) = timer {
@@ -15483,6 +15684,10 @@ impl Gpu {
     }
     /// Batched top-10 companion for sealed Qwen4 prefill.  Inputs are already
     /// softmaxed/sigmoid scores; route normalization is performed once here.
+    /// A row without ten valid finite picks (NaN probabilities) fails closed as a
+    /// whole (ids -1, weights 0) and is recorded in the router fault word as
+    /// (`layer`, `row_base` + row); see [`Self::moe_router_logits_guard_top10`].
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_topk_renorm_top10_batched(
         &mut self,
         probs: &GpuTensor,
@@ -15491,6 +15696,8 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
         batch_size: usize,
+        layer: usize,
+        row_base: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const FUNC: &str = "moe_topk_renorm_top10_batched";
@@ -15500,12 +15707,18 @@ impl Gpu {
         let wp = topk_w.buf.as_ptr();
         let n = n_exp as i32;
         let nr = if norm_topk { 1i32 } else { 0i32 };
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
         let mut params: Vec<*mut c_void> = vec![
             &lp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
             &n as *const _ as *mut c_void,
             &nr as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
         ];
         let bytes = (n_exp * 4 + 10 * (4 + 4)) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
@@ -15522,6 +15735,67 @@ impl Gpu {
                 b.push_ptr(wp);
                 b.push_i32(n);
                 b.push_i32(nr);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Pre-softmax guard of the unfused Qwen4 prefill router.  Records
+    /// (`layer`, `row_base` + row) in the router fault word for every row of
+    /// `scores` (`[batch_size x n_exp]`, the router logits, after any BF16 round
+    /// trip) holding a NaN or +/-Inf, and poisons that row with a NaN so the
+    /// in-place `softmax_f32` plus [`Self::moe_topk_renorm_top10_batched`] fail
+    /// it closed (ids -1, weights 0).  A -Inf logit alone would otherwise soften
+    /// into a finite probability.  Finite rows are untouched.  Run it
+    /// immediately before `softmax_f32`.
+    pub fn moe_router_logits_guard_top10(
+        &mut self,
+        scores: &GpuTensor,
+        n_exp: usize,
+        batch_size: usize,
+        layer: usize,
+        row_base: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_router_logits_guard_top10";
+        // Same module (one source, two exports) as `moe_topk_renorm_top10_batched`,
+        // so the guard needs no module identity of its own.
+        const MODULE: &str = "moe_topk_renorm_top10_batched";
+        self.ensure_kernel(MODULE, kernels::MOE_TOPK_RENORM_TOP10_BATCHED_SRC, FUNC)?;
+        let sp = scores.buf.as_ptr();
+        let n = n_exp as i32;
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_i32(n);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
                 b
             },
         );
@@ -15599,6 +15873,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15608,6 +15883,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -15633,6 +15909,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -15711,6 +15988,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15720,6 +15998,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -15745,6 +16024,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -15875,6 +16155,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15883,6 +16164,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
@@ -15927,6 +16209,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -15983,6 +16266,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -15991,6 +16275,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
@@ -16048,6 +16333,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16087,6 +16373,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16095,6 +16382,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // 200 B/group: mirror the qt44 timer shape with the MQ6V2 weight helper.
         let bytes = 8 * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
@@ -16129,6 +16417,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16190,6 +16479,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16199,6 +16489,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // Same 136 B/group stride as qt13, so the qt13 byte estimate is exact.
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
@@ -16224,6 +16515,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16249,8 +16541,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        crate::moe::require_span(y_gate, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched gate rows")?;
-        crate::moe::require_span(y_up, &[batch_size, 10, m / 2, 4], "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched up rows")?;
+        crate::moe::require_span(
+            y_gate,
+            &[batch_size, 10, m / 2, 4],
+            "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched gate rows",
+        )?;
+        crate::moe::require_span(
+            y_up,
+            &[batch_size, 10, m / 2, 4],
+            "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched up rows",
+        )?;
         const FUNC: &str = "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched";
         self.ensure_kernel(
             FUNC,
@@ -16265,6 +16565,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = 10i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16274,6 +16575,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * 10 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
@@ -16285,6 +16587,7 @@ impl Gpu {
                 kernels::GEMV_MQ4G256V2_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC,
                 ROWS8,
             )?;
+            let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &pp as *const _ as *mut c_void,
                 &ip as *const _ as *mut c_void,
@@ -16293,6 +16596,7 @@ impl Gpu {
                 &yup as *const _ as *mut c_void,
                 &m_val as *const _ as *mut c_void,
                 &kt_val as *const _ as *mut c_void,
+                &n_experts_val as *const _ as *mut c_void,
             ];
             let result = self.launch_maybe_blob(
                 ROWS8,
@@ -16309,6 +16613,7 @@ impl Gpu {
                     b.push_ptr(yup);
                     b.push_i32(m_val);
                     b.push_i32(kt_val);
+                    b.push_i32(n_experts_val);
                     b
                 },
             );
@@ -16333,6 +16638,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16394,6 +16700,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16403,6 +16710,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // 200 B/group: mirror the HFQ6 batched timer shape with MQ6V2 helper.
         let bytes = batch_size * k_top * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
@@ -16428,6 +16736,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16488,6 +16797,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16496,6 +16806,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -16530,6 +16841,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16589,6 +16901,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16597,6 +16910,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_mq6g256v2_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -16630,6 +16944,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16674,6 +16989,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let mi_val = mi as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16682,6 +16998,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &mi_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = 8 * crate::profile::gemv_hfq4g256_bytes(2 * mi, k) + k * 4;
         let timer =
@@ -16701,6 +17018,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(mi_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16748,6 +17066,7 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let dm_val = down_m as i32;
         let dk_val = down_k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16756,6 +17075,7 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &dm_val as *const _ as *mut c_void,
             &dk_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ3-Lloyd: 112 bytes / 256-weight group.
         let bytes = 8 * (down_m * (down_k / 256) * 112) + 8 * down_k * 4 + down_m * 4;
@@ -16780,6 +17100,7 @@ impl Gpu {
                 b.push_ptr(op);
                 b.push_i32(dm_val);
                 b.push_i32(dk_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16810,6 +17131,7 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let dm_val = down_m as i32;
         let dk_val = down_k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16818,6 +17140,7 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &dm_val as *const _ as *mut c_void,
             &dk_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes =
             8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
@@ -16838,6 +17161,7 @@ impl Gpu {
                 b.push_ptr(op);
                 b.push_i32(dm_val);
                 b.push_i32(dk_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -16962,6 +17286,7 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let dm_val = down_m as i32;
         let dk_val = down_k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -16970,6 +17295,7 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &dm_val as *const _ as *mut c_void,
             &dk_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes =
             8 * crate::profile::gemv_hfq4g256_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
@@ -16989,6 +17315,7 @@ impl Gpu {
                 b.push_ptr(op);
                 b.push_i32(dm_val);
                 b.push_i32(dk_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17025,6 +17352,7 @@ impl Gpu {
         let op = out.buf.as_ptr();
         let dm_val = down_m as i32;
         let dk_val = down_k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17033,6 +17361,7 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &dm_val as *const _ as *mut c_void,
             &dk_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes =
             8 * crate::profile::gemv_mq6g256v2_bytes(down_m, down_k) + 8 * down_k * 4 + down_m * 4;
@@ -17053,6 +17382,7 @@ impl Gpu {
                 b.push_ptr(op);
                 b.push_i32(dm_val);
                 b.push_i32(dk_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17091,6 +17421,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17101,6 +17432,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -17133,6 +17465,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17179,6 +17512,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17188,6 +17522,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // Fused path skips the expanded [N×K_TOP×M] write + re-read; traffic
         // is the routed-expert weight reads plus the per-token residual write.
@@ -17218,6 +17553,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17284,6 +17620,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17293,6 +17630,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g128_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -17317,6 +17655,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17368,6 +17707,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17376,6 +17716,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g128_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
@@ -17399,6 +17740,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17441,6 +17783,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17449,6 +17792,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // HFQ6 uses 200 bytes/group vs HFQ4's 136. Bytes estimate scales
         // accordingly. Reuse the existing profile helper with a 200/136
@@ -17476,6 +17820,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17510,6 +17855,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17518,6 +17864,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // HFQ5 uses 168 bytes/group vs HFQ4's 136. Bytes estimate scales
         // accordingly. Reuse the existing profile helper with a 168/136
@@ -17545,6 +17892,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17605,6 +17953,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17614,6 +17963,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // 200 vs 136 B/group: scale the HFQ4 byte estimate by 200/136.
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
@@ -17640,6 +17990,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17702,6 +18053,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
@@ -17712,6 +18064,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // Mixed dtype: byte estimate uses the larger (MQ6 200 B/group) bound.
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
@@ -17739,6 +18092,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17796,6 +18150,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17805,6 +18160,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // 168 vs 136 B/group: scale the HFQ4 byte estimate by 168/136.
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
@@ -17831,6 +18187,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17887,6 +18244,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -17895,6 +18253,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
@@ -17919,6 +18278,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -17978,6 +18338,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
@@ -17987,6 +18348,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // Mixed dtype: byte estimate uses the larger (MQ6 200 B/group) bound.
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
@@ -18013,6 +18375,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -18067,6 +18430,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -18075,6 +18439,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let bytes = batch_size * k_top * (hfq4_bytes * 168 / 136 + m * 4);
@@ -18099,6 +18464,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -18793,7 +19159,14 @@ impl Gpu {
                 func,
             )?;
             self.launch_gemv_k4_raw(
-                func, tiles as u32, w_ptr, x_base, y_base, m, k, hc_act_scale,
+                func,
+                tiles as u32,
+                w_ptr,
+                x_base,
+                y_base,
+                m,
+                k,
+                hc_act_scale,
             )?;
         }
         if tail > 0 {
@@ -19722,7 +20095,14 @@ impl Gpu {
                         self.rotate_x_mq_batched(&values, &values, k, rows)?;
                     }
                     let packed = at(&out, written);
-                    run(self, "requant_pack_mqg256v2", at(&values, 0), packed, n / 128, bits)?;
+                    run(
+                        self,
+                        "requant_pack_mqg256v2",
+                        at(&values, 0),
+                        packed,
+                        n / 128,
+                        bits,
+                    )?;
                     written += rows * out_row;
                     row += rows;
                 }
@@ -20122,7 +20502,11 @@ impl Gpu {
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_bf16_xf32_x2_q8_0_k2560_staged_pair";
-        self.ensure_kernel("qwen4_decode_head_fuse", kernels::QWEN4_DECODE_HEAD_FUSE_SRC, FUNC)?;
+        self.ensure_kernel(
+            "qwen4_decode_head_fuse",
+            kernels::QWEN4_DECODE_HEAD_FUSE_SRC,
+            FUNC,
+        )?;
         let w = bf16.map(|(w, _, _)| w.buf.as_ptr());
         let a = q8.map(|(a, _)| a.buf.as_ptr());
         let x_ptr = x.buf.as_ptr();
@@ -20679,6 +21063,7 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -20687,6 +21072,7 @@ impl Gpu {
             &xrp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
@@ -20717,6 +21103,7 @@ impl Gpu {
                 b.push_ptr(xrp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -20751,6 +21138,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -20760,6 +21148,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -20785,6 +21174,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -20820,6 +21210,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -20829,6 +21220,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * k_top * (mq2_weight_bytes + k * 4 + m * 4);
@@ -20854,6 +21246,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -20894,6 +21287,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -20903,6 +21297,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq3_weight_bytes = m * (k / 256) * 112;
         let bytes = batch_size * k_top * (mq3_weight_bytes + k * 4 + m * 4);
@@ -20928,6 +21323,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -20964,6 +21360,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -20972,6 +21369,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ2-Lloyd: 72 bytes / 256-weight group.
         let mq2_weight_bytes = m * (k / 256) * 72;
@@ -20997,6 +21395,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21033,6 +21432,7 @@ impl Gpu {
         let yup = y_up.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21041,6 +21441,7 @@ impl Gpu {
             &yup as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ3-Lloyd: 112 bytes / 256-weight group.
         let mq3_weight_bytes = m * (k / 256) * 112;
@@ -21066,6 +21467,7 @@ impl Gpu {
                 b.push_ptr(yup);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21137,6 +21539,7 @@ impl Gpu {
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21145,6 +21548,7 @@ impl Gpu {
             &xrp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ3-Lloyd: 112 bytes / 256-weight group.
         let mq3_weight_bytes = m * (k / 256) * 112;
@@ -21170,6 +21574,7 @@ impl Gpu {
                 b.push_ptr(xrp);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21231,6 +21636,7 @@ impl Gpu {
         let k_val = k as i32;
         // extern "C": (expert_ptrs, topk_indices, x_rot, y_gate, y_up,
         //              cb0, cb1, cb2, cb3, M, K)
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21243,6 +21649,7 @@ impl Gpu {
             &cb[3] as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         // MQ2-GL SoA: 64 B indices + 2 B fp16 scale per 256-weight group.
         let gpr = k / 256;
@@ -21272,6 +21679,7 @@ impl Gpu {
                 }
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21316,6 +21724,7 @@ impl Gpu {
         let k_val = k as i32;
         // extern "C": (expert_ptrs, topk_indices, topk_weights, rot_batch,
         //              x_residual, cb0, cb1, cb2, cb3, M, K)
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21328,6 +21737,7 @@ impl Gpu {
             &cb[3] as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let gpr = k / 256;
         let w_bytes = m * gpr * (crate::GL_MQ2_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
@@ -21356,6 +21766,7 @@ impl Gpu {
                 }
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21396,6 +21807,7 @@ impl Gpu {
         let k_val = k as i32;
         // extern "C": (expert_ptrs, topk_indices, x_rot, y_gate, y_up,
         //              cb0..cb7, M, K)
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21412,6 +21824,7 @@ impl Gpu {
             &cb[7] as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let gpr = k / 256;
         let w_bytes = m * gpr * (crate::GL_MQ3_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
@@ -21440,6 +21853,7 @@ impl Gpu {
                 }
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21479,6 +21893,7 @@ impl Gpu {
         let k_val = k as i32;
         // extern "C": (expert_ptrs, topk_indices, topk_weights, rot_batch,
         //              x_residual, cb0..cb7, M, K)
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21495,6 +21910,7 @@ impl Gpu {
             &cb[7] as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let gpr = k / 256;
         let w_bytes = m * gpr * (crate::GL_MQ3_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
@@ -21523,6 +21939,7 @@ impl Gpu {
                 }
                 b.push_i32(m_val);
                 b.push_i32(k_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21559,6 +21976,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21568,6 +21986,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -21593,6 +22012,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -21681,6 +22101,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -21690,6 +22111,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * k_top * (mq2_weight_bytes + k * 4 + m * 4);
@@ -21715,6 +22137,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -22046,6 +22469,7 @@ impl Gpu {
         let m_val = m as i32;
         let k_val = k as i32;
         let kt_val = k_top as i32;
+        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -22054,6 +22478,7 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
+            &n_experts_val as *const _ as *mut c_void,
         ];
         let mq2_weight_bytes = m * (k / 256) * 72;
         let bytes = batch_size * (k_top as usize) * (mq2_weight_bytes + k * 4 + m * 4);
@@ -22073,6 +22498,7 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
+                b.push_i32(n_experts_val);
                 b
             },
         );
@@ -22813,14 +23239,7 @@ mod mq4v2_multirow_r2_x3_tests {
     /// Direct launch of the incumbent `gemv_mq4g256v2_multirow_r2` symbol in the
     /// default MQ4V2 multirow module, bypassing the arch-selected launcher
     /// (which may pick r4/r8 on other GPUs).
-    fn launch_r2(
-        gpu: &mut Gpu,
-        a: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) {
+    fn launch_r2(gpu: &mut Gpu, a: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) {
         const SYMBOL: &str = "gemv_mq4g256v2_multirow_r2";
         gpu.ensure_kernel(
             "gemv_hfq4g256_multirow_default_mq4v2",
@@ -22924,7 +23343,8 @@ mod mq4v2_multirow_r2_x3_tests {
             .enumerate()
             .map(|(i, &m)| {
                 let bytes = synth_mq4v2(m, K, 0x5eed_0000 + i as u64);
-                gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight upload")
+                gpu.upload_raw(&bytes, &[bytes.len()])
+                    .expect("weight upload")
             })
             .collect();
         let x_host = synth_x(K, 0xa11c_e5ed);
@@ -22942,10 +23362,17 @@ mod mq4v2_multirow_r2_x3_tests {
             launch_r2(&mut gpu, &weights[i], &x, &y_ref[i], MS[i], K);
         }
         gpu.gemv_mq4g256v2_multirow_r2_x3(
-            &weights[0], &y_x3[0], MS[0],
-            &weights[1], &y_x3[1], MS[1],
-            &weights[2], &y_x3[2], MS[2],
-            &x, K,
+            &weights[0],
+            &y_x3[0],
+            MS[0],
+            &weights[1],
+            &y_x3[1],
+            MS[1],
+            &weights[2],
+            &y_x3[2],
+            MS[2],
+            &x,
+            K,
         )
         .expect("x3 launch");
         gpu.hip.device_synchronize().expect("sync");

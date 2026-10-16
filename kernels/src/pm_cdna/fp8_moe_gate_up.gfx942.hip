@@ -8,11 +8,12 @@
 // wave64). Same ABI, LDS layout, lane mapping and numerical order; the module
 // doc of the PM kernel is the specification. Compiled offline, not run.
 //
-// ABI (68 kernarg bytes): W, expert_stride (u64), tile_desc (i32x4 {expert,
+// ABI (72 kernarg bytes): W, expert_stride (u64), tile_desc (i32x4 {expert,
 // row0, nrows, 0}), sorted_rows (i32, -1 = padding), X (FNUZ e4m3 codes
 // [x_rows, K] from the activation producer: cvt_pk_fp8_f32((x/a)*0.5)),
 // x_scale (f32 [x_rows], power-of-two a), Y (f32 [n_sorted, R]), R, K,
-// x_row_div. Grid [R/64, n_tiles], block 256. Contract: K % 128 == 0,
+// x_row_div, n_experts (u32; a tile whose expert is outside [0, n_experts) is skipped).
+// Grid [R/64, n_tiles], block 256. Contract: K % 128 == 0,
 // R % 64 == 0, nrows 1..16, weight codes never 0x7F/0xFF, activation codes
 // never 0x80, finite scales.
 //
@@ -56,7 +57,7 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_fp8mf
     const unsigned char* __restrict__ X,
     const float* __restrict__ x_scale,
     float* __restrict__ Y,
-    int R, int K, int x_row_div) {
+    int R, int K, int x_row_div, int n_experts) {
     // [2 buffers][16 rows][128 codes + 16 pad]
     __shared__ __attribute__((aligned(16))) unsigned char xl[2][16][FP8MFMA_LDS_ROW];
 
@@ -64,7 +65,8 @@ extern "C" __global__ __launch_bounds__(256) void gemm_fp8b128_moe_grouped_fp8mf
     const int expert = td.x;
     const int row0 = td.y;
     const int nrows = td.z;
-    if (expert < 0) return;
+    // Fail closed before W + expert * expert_stride is formed (-1 sentinel or an out-of-range id).
+    if (expert < 0 || expert >= n_experts) return;
     const unsigned char* __restrict__ blk = W + (unsigned long long)expert * expert_stride;
     const unsigned short* __restrict__ sc = reinterpret_cast<const unsigned short*>(blk + (size_t)R * K);
     const int nkb = K >> 7;

@@ -1321,6 +1321,14 @@ impl Gpus {
     /// zeroed before the error returns, so the next step starts from a known
     /// tape whatever the stalled rank left behind.
     pub fn take_device_wait_errors(&mut self) -> HipResult<()> {
+        // A non-finite router row (`rdna_compute::router_fault`) invalidates the step
+        // like a stalled wait does, but leaves the TP barrier tape intact.
+        let router_faults: Vec<String> = self
+            .devices
+            .iter()
+            .filter_map(|gpu| gpu.take_router_fault())
+            .map(|fault| fault.to_string())
+            .collect();
         let timeouts: Vec<String> = self
             .devices
             .iter()
@@ -1328,9 +1336,17 @@ impl Gpus {
             .map(|timeout| timeout.to_string())
             .collect();
         if timeouts.is_empty() {
-            return Ok(());
+            return if router_faults.is_empty() {
+                Ok(())
+            } else {
+                Err(HipError::new(0, &router_faults.join("; ")))
+            };
         }
-        let mut message = timeouts.join("; ");
+        let mut message = timeouts
+            .into_iter()
+            .chain(router_faults)
+            .collect::<Vec<_>>()
+            .join("; ");
         if self.tp_graph_signals.len() == self.devices.len() && self.tp_graph_barrier_count > 0 {
             let reset = self
                 .devices
@@ -1341,7 +1357,9 @@ impl Gpus {
                 })
                 .and_then(|()| self.reset_tp_graph_signals());
             if let Err(error) = reset {
-                message.push_str(&format!("; TP graph signal reset after the timeout failed: {error}"));
+                message.push_str(&format!(
+                    "; TP graph signal reset after the timeout failed: {error}"
+                ));
             }
         }
         Err(HipError::new(0, &message))
@@ -3807,10 +3825,26 @@ mod tests {
             );
             // Explicit graph `1` turns an unset alternating knob on; graph
             // `0` keeps it off; an explicit alternating knob always wins.
-            assert!(tp_peer_alternating_for_mesh(None, Some("1"), arches.into_iter()));
-            assert!(!tp_peer_alternating_for_mesh(None, Some("0"), arches.into_iter()));
-            assert!(tp_peer_alternating_for_mesh(Some("1"), None, arches.into_iter()));
-            assert!(!tp_peer_alternating_for_mesh(Some("0"), Some("1"), arches.into_iter()));
+            assert!(tp_peer_alternating_for_mesh(
+                None,
+                Some("1"),
+                arches.into_iter()
+            ));
+            assert!(!tp_peer_alternating_for_mesh(
+                None,
+                Some("0"),
+                arches.into_iter()
+            ));
+            assert!(tp_peer_alternating_for_mesh(
+                Some("1"),
+                None,
+                arches.into_iter()
+            ));
+            assert!(!tp_peer_alternating_for_mesh(
+                Some("0"),
+                Some("1"),
+                arches.into_iter()
+            ));
         }
     }
 

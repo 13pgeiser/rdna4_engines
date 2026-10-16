@@ -3777,6 +3777,10 @@ fn redline_qwen4_arm(
             gpu.hip
                 .device_synchronize()
                 .map_err(|error| error.to_string())?;
+            // The snapshot below reads logits and state raw: a non-finite router row
+            // (layer, row in the message) must fail the arm, not be compared.
+            gpu.take_device_wait_error()
+                .map_err(|error| format!("Qwen4 shadow iteration {i}: {error}"))?;
             snapshots.push(redline_qwen4_snapshot(gpu, bundle, &logits)?);
         }
         Ok((snapshots, started.elapsed().as_secs_f64() * 1_000_000.0))

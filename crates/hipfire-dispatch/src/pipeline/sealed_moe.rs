@@ -1028,7 +1028,11 @@ impl LiveTensorIdentity {
         Self::capture_with_tail(tensor, name, 0)
     }
 
-    fn capture_with_tail(tensor: &GpuTensor, name: &str, tail: usize) -> Result<Self, DispatchError> {
+    fn capture_with_tail(
+        tensor: &GpuTensor,
+        name: &str,
+        tail: usize,
+    ) -> Result<Self, DispatchError> {
         let tensor_bytes = tensor_capacity_bytes(tensor)?;
         let byte_capacity = tensor.buf.size();
         if byte_capacity != tensor_bytes + tail {
@@ -1217,16 +1221,17 @@ pub struct RetainedRouteInputs<'a> {
 /// the tables, codec digest and generation separately.
 pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, String)> {
     let suffix = input.tier.map_or_else(String::new, tier_identity_suffix);
-    let tags = input
-        .tag_table
-        .map_or_else(|| "none".to_owned(), |(ptr, bytes)| format!("{ptr:x}:{bytes}"));
+    let tags = input.tag_table.map_or_else(
+        || "none".to_owned(),
+        |(ptr, bytes)| format!("{ptr:x}:{bytes}"),
+    );
     let Some(codecs) = input.codecs else {
         if input.tier.is_none() {
             return vec![(input.table_identity, input.mapping_fingerprint.to_owned())];
         }
-        let layer_key = fnv1a_u64(
-            format!("tier-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes(),
-        ) | (1 << 63);
+        let layer_key =
+            fnv1a_u64(format!("tier-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes())
+                | (1 << 63);
         return vec![
             (
                 input.table_identity,
@@ -1247,9 +1252,9 @@ pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, S
         ];
     };
     let codec = fnv1a_u64(codecs);
-    let layer_key = fnv1a_u64(
-        format!("slab-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes(),
-    ) | (1 << 63);
+    let layer_key =
+        fnv1a_u64(format!("slab-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes())
+            | (1 << 63);
     vec![
         (
             input.table_identity,
@@ -1455,8 +1460,14 @@ impl ExpertBindingCache {
             table_identity: live.table_identity,
             mapping_fingerprint: &live.mapping_fingerprint,
             codecs: codecs.as_deref(),
-            gate_up_table: (live.gate_up_ptrs.ptr as u64, live.gate_up_ptrs.byte_capacity as u64),
-            down_table: (live.down_ptrs.ptr as u64, live.down_ptrs.byte_capacity as u64),
+            gate_up_table: (
+                live.gate_up_ptrs.ptr as u64,
+                live.gate_up_ptrs.byte_capacity as u64,
+            ),
+            down_table: (
+                live.down_ptrs.ptr as u64,
+                live.down_ptrs.byte_capacity as u64,
+            ),
             tag_table: live
                 .dtype_tags
                 .as_ref()
@@ -2266,7 +2277,9 @@ impl<'a> SealedMoeCall<'a> {
         if let (SealedParams::Prefill(params), MoeKernelSelection::Prefill(selection)) =
             (&self.params, &self.selection)
         {
-            if selection.route.is_some_and(MoeRouteCapability::is_fp8_grouped)
+            if selection
+                .route
+                .is_some_and(MoeRouteCapability::is_fp8_grouped)
                 && !gpu.arch_caps.is_gfx942()
             {
                 return Err(DispatchError::UnsupportedVariant {
@@ -2276,7 +2289,10 @@ impl<'a> SealedMoeCall<'a> {
                     quant: "FP8E4M3B128",
                 });
             }
-            if selection.route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
+            if selection
+                .route
+                .is_some_and(MoeRouteCapability::is_sealed_grouped)
+            {
                 super::qt44_qt53_prefill::validate_scratch(
                     gpu,
                     params,
@@ -2364,6 +2380,10 @@ pub(super) fn produce_prefill_route<'a>(
                 ));
             }
             let grouped = route.is_some_and(MoeRouteCapability::is_sealed_grouped);
+            // Fail-closed router faults name the sealed call's layer and the global
+            // row (prefill chunk offset + row in this batch).
+            let router_layer = params.ep_layer_idx as usize;
+            let row_base = gpu.router_row_base();
             // The grouped top-10 router rounds each logit it reads itself.
             if params.recipe.bf16_round_trip() && !grouped {
                 gpu.bf16_round_trip_f32(scores)
@@ -2377,12 +2397,24 @@ pub(super) fn produce_prefill_route<'a>(
                     params.batch_size,
                     normalize,
                     params.recipe.bf16_round_trip(),
+                    router_layer,
+                    row_base,
                 )
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             } else {
-                gpu.softmax_f32(scores)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let result = if params.k_top == 10 {
+                    // Pre-softmax guard: records any NaN/Inf logit row and poisons it
+                    // so the renorm below fails it closed (ids -1, weights 0).
+                    gpu.moe_router_logits_guard_top10(
+                        scores,
+                        params.n_exp,
+                        params.batch_size,
+                        router_layer,
+                        row_base,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    gpu.softmax_f32(scores)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_top10_batched(
                         scores,
                         params.topk_indices,
@@ -2390,8 +2422,12 @@ pub(super) fn produce_prefill_route<'a>(
                         params.n_exp,
                         normalize,
                         params.batch_size,
+                        router_layer,
+                        row_base,
                     )
                 } else {
+                    gpu.softmax_f32(scores)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     gpu.moe_topk_renorm_k8_batched(
                         scores,
                         params.topk_indices,
@@ -3401,7 +3437,11 @@ fn validate_decode(
     // An explicit tier layer's replay dereferences the uploaded pointer
     // tables: their host mirror is mandatory on every call, not only on a
     // specialized retained body.
-    if experts.cache.live.as_ref().is_some_and(|live| live.tier.is_some())
+    if experts
+        .cache
+        .live
+        .as_ref()
+        .is_some_and(|live| live.tier.is_some())
         && params.expert_ptrs_host.is_none()
     {
         return Err(invalid(
@@ -4518,7 +4558,8 @@ fn validate_live_binding(
             expected_down.matches(&down, "live down")?;
         }
     }
-    live.gate_up_ptrs.matches(gate_up_ptrs, "gate/up pointer table")?;
+    live.gate_up_ptrs
+        .matches(gate_up_ptrs, "gate/up pointer table")?;
     live.down_ptrs.matches(down_ptrs, "down pointer table")?;
     // Table *contents*, not just the table tensor: a replay dereferences these
     // entries without re-uploading them, so each entry must point at the live
@@ -5248,8 +5289,16 @@ mod tests {
             .iter()
             .map(|expert| expert.down.buf.buf.as_ptr() as usize)
             .collect();
-        ExpertTierIdentity::new(generation, [3; 32], placement, codecs, &gate_up, &down, keep.clone())
-            .unwrap()
+        ExpertTierIdentity::new(
+            generation,
+            [3; 32],
+            placement,
+            codecs,
+            &gate_up,
+            &down,
+            keep.clone(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -5258,17 +5307,36 @@ mod tests {
         let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
         let fixture = live_fixture(&table, 0x90_0000);
         // Expert 0 is device-resident, expert 1 host-mapped.
-        let tier = tier_for(&fixture, 5, &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST], &[0, 0], &keep);
-        let entries = (tier.gate_up_entries().to_vec(), tier.down_entries().to_vec());
+        let tier = tier_for(
+            &fixture,
+            5,
+            &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST],
+            &[0, 0],
+            &keep,
+        );
+        let entries = (
+            tier.gate_up_entries().to_vec(),
+            tier.down_entries().to_vec(),
+        );
         let routed = TierRouted {
             inner: fixture.routed,
             tier,
         };
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         cache
-            .bind_live(&table, &routed, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .bind_live(
+                &table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
             .unwrap();
-        assert!(std::sync::Arc::ptr_eq(&cache.tier_keepalive().unwrap(), &keep));
+        assert!(std::sync::Arc::ptr_eq(
+            &cache.tier_keepalive().unwrap(),
+            &keep
+        ));
         assert_eq!(routed.host_mapped_projections(), (true, true));
         assert!(crate::families::moe::routed_host_mapped(&routed));
         let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
@@ -5288,13 +5356,23 @@ mod tests {
         .unwrap();
         let identities = cache.retained_route_identities(&table, 3).unwrap();
         assert_eq!(identities.len(), 2);
-        assert!(identities.iter().all(|(_, identity)| identity.contains("|tier-v1|gen=5|")));
-        assert!(identities.iter().all(|(_, identity)| identity.contains("|host=1|")));
+        assert!(identities
+            .iter()
+            .all(|(_, identity)| identity.contains("|tier-v1|gen=5|")));
+        assert!(identities
+            .iter()
+            .all(|(_, identity)| identity.contains("|host=1|")));
 
         // A reloaded owner set (new generation) at identical addresses is refused.
         let twin = live_fixture(&table, 0x90_0000);
         let reloaded = TierRouted {
-            tier: tier_for(&twin, 6, &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST], &[0, 0], &keep),
+            tier: tier_for(
+                &twin,
+                6,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_HOST],
+                &[0, 0],
+                &keep,
+            ),
             inner: twin.routed,
         };
         let error = validate_live_binding(
@@ -5312,7 +5390,13 @@ mod tests {
         // A flipped placement byte is refused.
         let flipped_fixture = live_fixture(&table, 0x90_0000);
         let flipped = TierRouted {
-            tier: tier_for(&flipped_fixture, 5, &[EXPERT_TIER_HOST, EXPERT_TIER_HOST], &[0, 0], &keep),
+            tier: tier_for(
+                &flipped_fixture,
+                5,
+                &[EXPERT_TIER_HOST, EXPERT_TIER_HOST],
+                &[0, 0],
+                &keep,
+            ),
             inner: flipped_fixture.routed,
         };
         let error = validate_live_binding(
@@ -5367,24 +5451,50 @@ mod tests {
         let fixture = live_fixture(&table, 0xA0_0000);
         // W3 codec for an MQ4 expert.
         let wrong_codec = TierRouted {
-            tier: tier_for(&fixture, 1, &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE], &[0, 1], &keep),
+            tier: tier_for(
+                &fixture,
+                1,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE],
+                &[0, 1],
+                &keep,
+            ),
             inner: live_fixture(&table, 0xA0_0000).routed,
         };
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         let error = cache
-            .bind_live(&table, &wrong_codec, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .bind_live(
+                &table,
+                &wrong_codec,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(format!("{error:?}").contains("tier codec"));
 
         // Entries minted from a different base than the live tensors.
         let other = live_fixture(&table, 0xB0_0000);
         let misplaced = TierRouted {
-            tier: tier_for(&other, 1, &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE], &[0, 0], &keep),
+            tier: tier_for(
+                &other,
+                1,
+                &[EXPERT_TIER_DEVICE, EXPERT_TIER_DEVICE],
+                &[0, 0],
+                &keep,
+            ),
             inner: live_fixture(&table, 0xA0_0000).routed,
         };
         let mut cache = table.prepare_binding(0, 1, 0).unwrap();
         let error = cache
-            .bind_live(&table, &misplaced, &fixture.gate_up_ptrs, &fixture.down_ptrs, None, None)
+            .bind_live(
+                &table,
+                &misplaced,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(format!("{error:?}").contains("tier pointer entries"));
     }
@@ -5565,8 +5675,12 @@ mod tests {
         assert!(LiveTensorIdentity::capture(&tags, "tags").is_err());
         let bound = LiveTensorIdentity::capture_with_tail(&tags, "tags", 8).unwrap();
         bound.matches(&tags, "tags").unwrap();
-        assert!(bound.matches(&live_tensor(0xb0_0000, 2, &[2], DType::Raw), "tags").is_err());
-        assert!(bound.matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags").is_err());
+        assert!(bound
+            .matches(&live_tensor(0xb0_0000, 2, &[2], DType::Raw), "tags")
+            .is_err());
+        assert!(bound
+            .matches(&live_tensor(0xb0_1000, 2 + 8, &[2], DType::Raw), "tags")
+            .is_err());
         assert!(LiveTensorIdentity::capture_with_tail(&tags, "tags", 4).is_err());
     }
 
@@ -7404,7 +7518,7 @@ mod tests {
     // ---- EP row gather lowering (decode and few-row grouped prefill) ----
 
     use crate::families::moe::{MoeRouteCapability, MoeRowGather};
-    use moe_program::{MoeStage, MoePrefillSelection, MoeDecodeSelection};
+    use moe_program::{MoeDecodeSelection, MoePrefillSelection, MoeStage};
 
     struct NoopGather;
 
@@ -7454,8 +7568,11 @@ mod tests {
         params: &MoeParams<'_>,
         route: Option<MoeRouteCapability>,
     ) -> MoeKernelSelection {
-        let mut resolution =
-            crate::families::moe::MoeResolution::resolve_arch(&params.dtypes, params.k, ctx.arch.has_wmma());
+        let mut resolution = crate::families::moe::MoeResolution::resolve_arch(
+            &params.dtypes,
+            params.k,
+            ctx.arch.has_wmma(),
+        );
         if route.is_some() {
             resolution.use_gpu_topk = true;
             resolution.needs_x_rot_local = true;
@@ -7583,8 +7700,11 @@ mod tests {
                     shared_after_combine: true,
                 },
                 ..ep_prefill_params(
-                    &scratch, &fixture.routed, &fixture.gate_up_ptrs,
-                    &fixture.down_ptrs, None,
+                    &scratch,
+                    &fixture.routed,
+                    &fixture.gate_up_ptrs,
+                    &fixture.down_ptrs,
+                    None,
                 )
             };
             let resolution = crate::families::moe::MoePrefillResolution::sealed_fp8();
@@ -7598,13 +7718,26 @@ mod tests {
                 cpu_deferred_experts: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
-            assert_eq!(moe_program::lowered_stages(&call).unwrap(), [
-                MoeStage::Normalize, MoeStage::InputBasis, MoeStage::RouterProjection,
-                MoeStage::SharedGateUp, MoeStage::SharedActivation, MoeStage::Route,
-                MoeStage::Scatter, MoeStage::GateUp, MoeStage::Unscatter,
-                MoeStage::Activation, MoeStage::Down, MoeStage::MutationFence,
-                MoeStage::Combine, MoeStage::SharedDown,
-            ], "rows={rows}");
+            assert_eq!(
+                moe_program::lowered_stages(&call).unwrap(),
+                [
+                    MoeStage::Normalize,
+                    MoeStage::InputBasis,
+                    MoeStage::RouterProjection,
+                    MoeStage::SharedGateUp,
+                    MoeStage::SharedActivation,
+                    MoeStage::Route,
+                    MoeStage::Scatter,
+                    MoeStage::GateUp,
+                    MoeStage::Unscatter,
+                    MoeStage::Activation,
+                    MoeStage::Down,
+                    MoeStage::MutationFence,
+                    MoeStage::Combine,
+                    MoeStage::SharedDown,
+                ],
+                "rows={rows}"
+            );
         }
     }
 
@@ -7693,7 +7826,9 @@ mod tests {
             "static ownership lowers no OwnerAssign stage: {without:?}"
         );
         assert_eq!(
-            with.iter().filter(|stage| **stage == MoeStage::OwnerAssign).count(),
+            with.iter()
+                .filter(|stage| **stage == MoeStage::OwnerAssign)
+                .count(),
             1,
             "{with:?}"
         );
@@ -7705,7 +7840,10 @@ mod tests {
         let assign = route + 1;
         for reader in [MoeStage::Scatter, MoeStage::GateUp, MoeStage::Down] {
             if let Some(position) = with.iter().position(|stage| *stage == reader) {
-                assert!(assign < position, "{reader:?} reads the live tables: {with:?}");
+                assert!(
+                    assign < position,
+                    "{reader:?} reads the live tables: {with:?}"
+                );
             }
         }
         let mut stripped = with.to_vec();
@@ -7796,9 +7934,11 @@ mod tests {
             },
             ep_row_gather: gather,
             // Lowering never reads the masked ids; any tensor stands in for them.
-            ep_tile_exchange: exchange.map(|exchange| crate::families::moe::MoeTileExchangeParams {
-                exchange,
-                tile_ids_owned: &scratch.partial,
+            ep_tile_exchange: exchange.map(|exchange| {
+                crate::families::moe::MoeTileExchangeParams {
+                    exchange,
+                    tile_ids_owned: &scratch.partial,
+                }
             }),
             ..ep_prefill_params(
                 &scratch,
@@ -7817,13 +7957,22 @@ mod tests {
     /// `TileExchange` between the mutation fence and the combine.
     fn assert_tile_stages(with: &[MoeStage], without: &[MoeStage]) {
         for stage in [MoeStage::TileMask, MoeStage::TileExchange] {
-            assert!(!without.contains(&stage), "no exchange installed, no {stage:?}: {without:?}");
+            assert!(
+                !without.contains(&stage),
+                "no exchange installed, no {stage:?}: {without:?}"
+            );
             assert_eq!(with.iter().filter(|s| **s == stage).count(), 1, "{with:?}");
         }
-        let scatter = with.iter().position(|s| *s == MoeStage::Scatter).expect("scatter");
+        let scatter = with
+            .iter()
+            .position(|s| *s == MoeStage::Scatter)
+            .expect("scatter");
         assert_eq!(with[scatter + 1], MoeStage::TileMask, "{with:?}");
         assert_eq!(with[scatter + 2], MoeStage::GateUp, "{with:?}");
-        let fence = with.iter().position(|s| *s == MoeStage::MutationFence).expect("fence");
+        let fence = with
+            .iter()
+            .position(|s| *s == MoeStage::MutationFence)
+            .expect("fence");
         assert_eq!(with[fence + 1], MoeStage::TileExchange, "{with:?}");
         assert_eq!(with[fence + 2], MoeStage::Combine, "{with:?}");
         let mut stripped = with.to_vec();
@@ -7862,8 +8011,12 @@ mod tests {
     #[test]
     fn prefill_lowering_refuses_a_tile_exchange_off_the_grouped_qt44_qt53_route() {
         for route in [None, Some(MoeRouteCapability::Fp8B128Grouped)] {
-            let error = tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
-            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+            let error =
+                tile_prefill_stages(Some(&NoopTileExchange), None, route, false).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
         }
         for route in [
             MoeRouteCapability::Qt44Qt53Grouped,
@@ -7872,11 +8025,21 @@ mod tests {
             // A compact EP partial and the few-row row gather are other EP contracts.
             let error =
                 tile_prefill_stages(Some(&NoopTileExchange), None, Some(route), true).unwrap_err();
-            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
-            let error =
-                tile_prefill_stages(Some(&NoopTileExchange), Some(&NoopGather), Some(route), false)
-                    .unwrap_err();
-            assert!(format!("{error:?}").contains("tile exchange"), "{route:?}: {error:?}");
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
+            let error = tile_prefill_stages(
+                Some(&NoopTileExchange),
+                Some(&NoopGather),
+                Some(route),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("tile exchange"),
+                "{route:?}: {error:?}"
+            );
         }
     }
 }
@@ -7901,7 +8064,10 @@ mod retained_route_identity_tests {
 
     #[test]
     fn legacy_layers_keep_their_one_pair() {
-        assert_eq!(retained_route_identities(&input(None, 9)), vec![(7, "fp".to_owned())]);
+        assert_eq!(
+            retained_route_identities(&input(None, 9)),
+            vec![(7, "fp".to_owned())]
+        );
     }
 
     fn tier(
@@ -7912,17 +8078,39 @@ mod retained_route_identity_tests {
         let n = placement.len();
         let gate_up: Vec<usize> = (0..n).map(|i| 0x10_0000 + i * 0x1000).collect();
         let down: Vec<usize> = (0..n).map(|i| 0x20_0000 + i * 0x1000).collect();
-        ExpertTierIdentity::new(generation, [9; 32], placement, &vec![0u8; n], &gate_up, &down, keep.clone())
-            .unwrap()
+        ExpertTierIdentity::new(
+            generation,
+            [9; 32],
+            placement,
+            &vec![0u8; n],
+            &gate_up,
+            &down,
+            keep.clone(),
+        )
+        .unwrap()
     }
 
     #[test]
     fn tier_identity_rejects_malformed_tables() {
         let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
         assert!(ExpertTierIdentity::new(1, [0; 32], &[], &[], &[], &[], keep.clone()).is_err());
-        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 2], &[0, 0], &[1, 2], &[3, 4], keep.clone()).is_err());
-        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0], &[1, 2], &[3, 4], keep.clone()).is_err());
-        assert!(ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0, 0], &[1, 0], &[3, 4], keep).is_err());
+        assert!(ExpertTierIdentity::new(
+            1,
+            [0; 32],
+            &[0, 2],
+            &[0, 0],
+            &[1, 2],
+            &[3, 4],
+            keep.clone()
+        )
+        .is_err());
+        assert!(
+            ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0], &[1, 2], &[3, 4], keep.clone())
+                .is_err()
+        );
+        assert!(
+            ExpertTierIdentity::new(1, [0; 32], &[0, 1], &[0, 0], &[1, 0], &[3, 4], keep).is_err()
+        );
     }
 
     #[test]
@@ -7942,8 +8130,15 @@ mod retained_route_identity_tests {
         base.tier = Some(&base_tier);
         let reference = retained_route_identities(&base);
         assert_eq!(reference.len(), 2);
-        assert_ne!(reference, retained_route_identities(&input(None, 5)), "tier vs legacy");
-        assert_ne!(reference[1].0, 7, "the tier layer key never collides with a table id");
+        assert_ne!(
+            reference,
+            retained_route_identities(&input(None, 5)),
+            "tier vs legacy"
+        );
+        assert_ne!(
+            reference[1].0, 7,
+            "the tier layer key never collides with a table id"
+        );
         let check = |changed: ExpertTierIdentity, name: &str| {
             let mut other = input(None, 5);
             other.tier = Some(&changed);
@@ -7985,8 +8180,16 @@ mod retained_route_identity_tests {
         let base = retained_route_identities(&input(Some(&[0, 1, 1]), 1));
         assert_eq!(base.len(), 2);
         assert_ne!(base[1].0, 7, "the layer key never collides with a table id");
-        assert_ne!(base, retained_route_identities(&input(Some(&[1, 1, 1]), 1)), "codec");
-        assert_ne!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 2)), "generation");
+        assert_ne!(
+            base,
+            retained_route_identities(&input(Some(&[1, 1, 1]), 1)),
+            "codec"
+        );
+        assert_ne!(
+            base,
+            retained_route_identities(&input(Some(&[0, 1, 1]), 2)),
+            "generation"
+        );
         assert_eq!(base, retained_route_identities(&input(Some(&[0, 1, 1]), 1)));
     }
 
@@ -8014,15 +8217,21 @@ mod retained_route_identity_tests {
         let mut reloaded = base.clone();
         reloaded.table_identity += 100;
         let fresh = retained_route_identities(&reloaded);
-        assert!(reference.iter().all(|(key, _)| fresh.iter().all(|(other, _)| other != key)));
-        let mut controller =
-            rdna_compute::replay::ReplayController::new(rdna_compute::replay::ReplayBackendRequest::Auto);
+        assert!(reference
+            .iter()
+            .all(|(key, _)| fresh.iter().all(|(other, _)| other != key)));
+        let mut controller = rdna_compute::replay::ReplayController::new(
+            rdna_compute::replay::ReplayBackendRequest::Auto,
+        );
         for (key, identity) in &reference {
             controller.note_route_identity(*key, identity).unwrap();
         }
         let bound = |pairs: &'static [(u64, String)]| {
             controller.validate_route_identities(|key| {
-                pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.as_str())
             })
         };
         let fresh: &'static [(u64, String)] = Box::leak(fresh.into_boxed_slice());

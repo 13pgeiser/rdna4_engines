@@ -62,19 +62,28 @@ impl Gpu {
         order: &GpuTensor,
         grouped_rows: usize,
         tokens: usize,
+        n_experts: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if order.buf.size() < tokens * 10 * 8 {
-            return Err(HipError::new(0, "moe_combine_order_top10: order scratch too small"));
+            return Err(HipError::new(
+                0,
+                "moe_combine_order_top10: order scratch too small",
+            ));
         }
         const FUNC: &str = "moe_combine_order_top10";
-        self.ensure_kernel("moe_down_combine_grouped_top10", kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, FUNC)?;
+        self.ensure_kernel(
+            "moe_down_combine_grouped_top10",
+            kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC,
+            FUNC,
+        )?;
         let ip = inverse_perm.buf.as_ptr();
         let tp = topk_indices.buf.as_ptr();
         let wp = topk_weights.buf.as_ptr();
         let op = order.buf.as_ptr();
         let gr = grouped_rows as i32;
         let tv = tokens as i32;
+        let nx = n_experts as i32;
         let mut params = [
             &ip as *const _ as *mut c_void,
             &tp as *const _ as *mut c_void,
@@ -82,17 +91,26 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &gr as *const _ as *mut c_void,
             &tv as *const _ as *mut c_void,
+            &nx as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(FUNC, [(tokens as u32).div_ceil(64), 1, 1], [64, 1, 1], 0, &mut params, || {
-            let mut b = KernargBlob::new();
-            b.push_ptr(ip);
-            b.push_ptr(tp);
-            b.push_ptr(wp);
-            b.push_ptr(op);
-            b.push_i32(gr);
-            b.push_i32(tv);
-            b
-        })
+        self.launch_maybe_blob(
+            FUNC,
+            [(tokens as u32).div_ceil(64), 1, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(tp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_i32(gr);
+                b.push_i32(tv);
+                b.push_i32(nx);
+                b
+            },
+        )
     }
 
     /// Whether [`Gpu::hc_row_fold_norm_gate`] takes `hidden` columns: exact
@@ -122,7 +140,10 @@ impl Gpu {
             || p.next_gates.numel() < p.rows * 4
             || p.normalized_f16.buf.size() < p.rows * wide * 2
         {
-            return Err(HipError::new(0, "hc_row_fold_norm_gate: route does not apply"));
+            return Err(HipError::new(
+                0,
+                "hc_row_fold_norm_gate: route does not apply",
+            ));
         }
         self.bind_thread()?;
         self.ensure_kernel("hc_row_fold", SRC, ENTRY)?;
@@ -151,20 +172,27 @@ impl Gpu {
             &nop as *const _ as *mut c_void,
             &hv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(ENTRY, [p.rows as u32, 1, 1], [256, 1, 1], lds, &mut params, || {
-            let mut b = KernargBlob::new();
-            b.push_ptr(gp);
-            b.push_ptr(op);
-            b.push_ptr(sp);
-            b.push_ptr(selp);
-            b.push_ptr(stp);
-            b.push_ptr(gtp);
-            b.push_ptr(nwp);
-            b.push_ptr(gwp);
-            b.push_ptr(ngp);
-            b.push_ptr(nop);
-            b.push_i32(hv);
-            b
-        })
+        self.launch_maybe_blob(
+            ENTRY,
+            [p.rows as u32, 1, 1],
+            [256, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(selp);
+                b.push_ptr(stp);
+                b.push_ptr(gtp);
+                b.push_ptr(nwp);
+                b.push_ptr(gwp);
+                b.push_ptr(ngp);
+                b.push_ptr(nop);
+                b.push_i32(hv);
+                b
+            },
+        )
     }
 }

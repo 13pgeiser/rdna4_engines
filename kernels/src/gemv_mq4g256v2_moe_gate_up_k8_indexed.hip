@@ -69,7 +69,7 @@ extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
     const float* __restrict__ x,                         // [K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int mi = M >> 1;
     const int row = blockIdx.x;
@@ -124,6 +124,13 @@ extern "C" __global__ void HIPFIRE_MQ4V2_GATE_UP_KERNEL(
 
     // Read expert_id from device and index into the pointer table.
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            y_gate[krank * mi + row] = 0.0f;
+            y_up[krank * mi + row] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 

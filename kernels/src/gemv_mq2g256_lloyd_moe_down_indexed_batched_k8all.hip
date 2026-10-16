@@ -22,7 +22,7 @@ gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed_batched(
     float* __restrict__ x_residual,
     int M,
     int K,
-    int K_TOP
+    int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M || K != 2048) return;
@@ -32,6 +32,7 @@ gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed_batched(
     const int routing_base = bid * K_TOP;
     const int routing_index = routing_base + krank;
     const int expert_id = topk_indices[routing_index];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =

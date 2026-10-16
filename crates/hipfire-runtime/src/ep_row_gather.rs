@@ -52,8 +52,8 @@
 //! `Drop` impl does not own.
 
 use hip_bridge::{
-    Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_EVENT_DISABLE_TIMING,
+    HIP_EVENT_RELEASE_TO_SYSTEM,
 };
 use rdna_compute::{Gpu, GpuTensor};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -76,9 +76,9 @@ pub const MAX_BUFFERS: usize = 4;
 #[derive(Clone, Copy)]
 pub enum EpSlotOwners<'a> {
     /// Static placement: slot `s` is owned by rank `slot_experts[s] % ranks`
-    /// (a negative id owns nothing). The historical kernel
-    /// `ep_gather_rows_by_owner`.
-    ExpertModulo(&'a GpuTensor),
+    /// (an id outside `[0, n_experts)` owns nothing). The historical kernel
+    /// `ep_gather_rows_by_owner`; the second field is `n_experts`.
+    ExpertModulo(&'a GpuTensor, usize),
     /// Per-call assigned owners (balanced ownership): slot `s` is owned by rank
     /// `owners[s]` (a negative value owns nothing), written on this rank's
     /// stream by the call's owner assignment. Kernel
@@ -359,13 +359,11 @@ impl EpRowGatherBuilder {
         }
         let states = ranks
             .into_iter()
-            .map(|r| {
-                RankState {
-                    device_id: r.device_id,
-                    ptrs: r.ptrs,
-                    events: r.events.into_iter().map(|e| Mutex::new(Some(e))).collect(),
-                    peers_enabled: AtomicBool::new(false),
-                }
+            .map(|r| RankState {
+                device_id: r.device_id,
+                ptrs: r.ptrs,
+                events: r.events.into_iter().map(|e| Mutex::new(Some(e))).collect(),
+                peers_enabled: AtomicBool::new(false),
             })
             .collect();
         Ok(Arc::new(EpRowGather {
@@ -467,7 +465,9 @@ impl EpRowGather {
                 Err(e) => return Err(e),
             }
         }
-        self.ranks[rank].peers_enabled.store(true, Ordering::Release);
+        self.ranks[rank]
+            .peers_enabled
+            .store(true, Ordering::Release);
         Ok(())
     }
 
@@ -525,7 +525,7 @@ impl EpRowGather {
             }
         }
         match slot_owners {
-            EpSlotOwners::ExpertModulo(slot_experts) => gpu.ep_gather_rows_by_owner(
+            EpSlotOwners::ExpertModulo(slot_experts, n_experts) => gpu.ep_gather_rows_by_owner(
                 slot_experts,
                 src,
                 self.ranks[rank].ptrs[buffer],
@@ -533,6 +533,7 @@ impl EpRowGather {
                 self.spec.ranks,
                 rank,
                 self.spec.row_bytes / 16,
+                n_experts,
             ),
             EpSlotOwners::Explicit(owners) => gpu.ep_gather_rows_by_slot_owner(
                 owners,
@@ -671,7 +672,11 @@ mod tests {
     #[test]
     fn device_waits_require_explicit_opt_in() {
         assert!(!EpRowGather::builder(spec(2, 10, 10240)).device_waits);
-        assert!(EpRowGather::builder(spec(2, 10, 10240)).device_waits(true).device_waits);
+        assert!(
+            EpRowGather::builder(spec(2, 10, 10240))
+                .device_waits(true)
+                .device_waits
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942(
     float* __restrict__ x_residual,
     int M,
     int K,
-    int k_top
+    int k_top, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -38,6 +38,7 @@ void gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942(
 
     for (int krank = 0; krank < k_top; ++krank) {
         const int expert_id = topk_indices[krank];
+            if ((unsigned)expert_id >= (unsigned)n_experts) continue;
         const char* __restrict__ A =
             reinterpret_cast<const char*>(expert_ptrs[expert_id]);
         const float* __restrict__ x = rot_batch + (long long)krank * K;

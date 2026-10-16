@@ -93,6 +93,7 @@ __device__ __forceinline__ void grouped_top10_o4_body(
     int K,
     int x_row_div,
     int grouped_rows,
+    int n_experts,
     float4* xs
 ) {
     static_assert(R % 2 == 0 && R <= 8, "slots per subtile");
@@ -116,7 +117,7 @@ __device__ __forceinline__ void grouped_top10_o4_body(
     const int expert_id = expert_tile_ids[slot_start >> 4];
 #pragma unroll
     for (int slot = 0; slot < R; ++slot) asm volatile("" :: "s"(flat_raw[slot]));
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
@@ -292,11 +293,12 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    int n_experts
 ) {
     __shared__ float4 xs[8 * 64];
     grouped_top10_o4_body<8>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
-                             Y_grouped, M, K, x_row_div, grouped_rows, xs);
+                             Y_grouped, M, K, x_row_div, grouped_rows, n_experts, xs);
 }
 
 // Grid [ceil(M / 16), ceil(grouped_rows / 2), 1], block 128.
@@ -310,9 +312,10 @@ extern "C" __global__ void gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4(
     int M,
     int K,
     int x_row_div,
-    int grouped_rows
+    int grouped_rows,
+    int n_experts
 ) {
     __shared__ float4 xs[2 * 64];
     grouped_top10_o4_body<2>(expert_weight_ptrs, expert_tile_ids, sorted_slot_index, X_src,
-                             Y_grouped, M, K, x_row_div, grouped_rows, xs);
+                             Y_grouped, M, K, x_row_div, grouped_rows, n_experts, xs);
 }

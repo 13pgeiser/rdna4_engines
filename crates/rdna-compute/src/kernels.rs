@@ -15,12 +15,16 @@ pub const QSA_BF16_SCORES_SRC: &str = include_str!("../../../kernels/src/qsa_bf1
 /// G80 activation producer and exact integer BF16 epilogue (logged PM gaps).
 pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
 /// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.
-pub const NPU_TRUNK_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_pm_gfx1151.hxaco");
-pub const NPU_TRUNK_PM_GFX1151_SHA256: &str = "f0199464d5a94253678ecd4c6720440734e24a213d7ae37966ce9d5c361ebe09";
+pub const NPU_TRUNK_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/npu_trunk_pm_gfx1151.hxaco");
+pub const NPU_TRUNK_PM_GFX1151_SHA256: &str =
+    "f0199464d5a94253678ecd4c6720440734e24a213d7ae37966ce9d5c361ebe09";
 
 /// Certified direct BF16/F32 row-major cache readers (M7, gfx1151).
-pub const NPU_TRUNK_ARENA_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_arena_pm_gfx1151.hxaco");
-pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str = "dbfaf02cbf12015b6c2b4637d82d35c5824d042a4d80490b649c2343d286cc7f";
+pub const NPU_TRUNK_ARENA_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/npu_trunk_arena_pm_gfx1151.hxaco");
+pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str =
+    "dbfaf02cbf12015b6c2b4637d82d35c5824d042a4d80490b649c2343d286cc7f";
 
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
@@ -4244,8 +4248,11 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
 /// ARCH`, one contract-checked `peacemaker custom build` per symbol, M7
 /// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
 /// SHA-256 (contracts under `crates/peacemaker-isa/kernels/qwen4_moe_sym.*.contract.json`):
-/// gfx1151 c0f826ba42ea1b334840a7dc1d25379484f15bfaa31c69ce6d519aff7537b27c (was ede9af50…, 2540a22b…),
-/// gfx1201 fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 (was 792b207a…, 7179393f…);
+/// gfx1151 20d6a98d700d2eb47dc5c5f8b74ee65835912c317898ce42c345cf0cddb78c0a (was c0f826ba…, ede9af50…, 2540a22b…),
+/// gfx1201 0eea1673a530880586dc0cd179b7a3ef3dfd491660dff439f7b54e921792791e (was fea044d0…, 792b207a…, 7179393f…);
+/// the latest step widens the kernarg ABI from 60 to 64 bytes (trailing `n_experts` at offset 60) and replaces the
+/// `expert id < 0` sentinel exit with one unsigned `expert id >= n_experts` exit, so an out-of-range id (non-finite
+/// router row) returns before any `expert_weight_ptrs[id]` load; finite-id outputs are unchanged;
 /// the earlier steps differ from their predecessors only by the `.comment` stamp
 /// (`hipfire peacemaker native-emit`); the latest differs only by the emitter's code-end tail fill
 /// (`.text` grows by the fill, bytes before it are unchanged).
@@ -4264,7 +4271,8 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// qualification twin `..._acc`. A separate image: the MQ4 module above is
 /// byte-identical and carries no W3 symbol. No hipcc kernel. The gfx1151 images
 /// are [`QWEN4_MOE_IU4_SYM_W3_PM_GFX1151`] and [`QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151`].
-/// SHA-256 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833.
+/// SHA-256 b1c05e645d424491e3d1dd69e6145ab2d6081fb97474662fd1fa14351ba5200f (was 83822312…; 64-byte ABI with
+/// trailing `n_experts` and the `expert id >= n_experts` unsigned exit).
 pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco");
 /// Certified builder module of the gathered QSA prefill attention
@@ -4277,15 +4285,18 @@ pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1201: &[u8] =
 /// (was 3ede3516…, b7809d03…), gfx1201 e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 /// (was 9d0b83cc…, deee483f…); the earlier steps differ only by the `.comment` stamp
 /// (`hipfire peacemaker native-emit`), the latest only by the emitter's code-end tail fill.
-pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
-pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
+pub const QSA_GATHER_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
+pub const QSA_GATHER_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// Certified builder module of the production sampled-DFlash device accept
 /// (`peacemaker-isa emit --kernel dflash_accept --arch gfx1201`, M7
 /// obligation-free): `dflash_sampled_accept_sparse_q_f32_pm_gfx1201`, with the
 /// ABI, grid, payload and decision words of the retained hipcc oracle
 /// `kernels/src/dflash_sampled_accept_sparse_q.hip`. gfx1201 only, no hipcc
 /// production fallback.
-pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/dflash_sampled_accept_pm_gfx1201.hxaco");
+pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/dflash_sampled_accept_pm_gfx1201.hxaco");
 /// Certified builder module of the live QSA selector pair
 /// (`peacemaker-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
 /// obligation-free): the rows16 and rows32 F32 score kernels and the
@@ -4298,7 +4309,8 @@ pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../ker
 /// keep the hipcc kernels). Regenerated with the `s_code_end` guard and the rows32
 /// score (`--epi all --bundle … --host-target host-x86_64-unknown-linux-gnu-`);
 /// SHA-256 `fa80eac5dca2d8c5d69745c13f664db2a70ce250adb9d6d8066d7ac0b5cee4db`.
-pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
+pub const QSA_SELECT_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
 /// Certified builder (PeaceMaker) modules of the production CPU-AR sampling
 /// kernels, gfx1151 and gfx1201 only (`peacemaker-isa emit --kernel
 /// spec_sampling_rows_pm|spec_accept_pm --arch ARCH`, M7 obligation-free,
@@ -4412,7 +4424,8 @@ pub const QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256: &str =
 /// the chain).
 /// SHA-256 f243bcec8e431289f6decd9e797fdfb5d5ef750faff5fad57a72fccfdd70bdcc
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
-pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
+pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
 /// Standalone gfx1151 MTP append DET dense projection (`peacemaker-isa` kernel
 /// `mtp_dense_det_gfx11`, module `mtp_dense_det_pm_gfx1151`, entry `mtp_dense_det_pm_gfx1151_w8`):
 /// F16 WMMA `Y32[N, M] = W16[M, K] · X16[N, K]^T`, fixed 128 x 256 tile, one ascending K16 chain
@@ -4421,7 +4434,8 @@ pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/q
 /// (no product route, no env flag). The bundle is generated from the emitter after its source
 /// lands (`kernels/mtp_dense_det_pm_gfx1151.hxaco`); its SHA-256 is recorded in the validation
 /// receipt.
-pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_dense_det_pm_gfx1151.hxaco");
+pub const MTP_DENSE_DET_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/mtp_dense_det_pm_gfx1151.hxaco");
 /// gfx1151 MTP append DET Q8_0 -> F16 weight converter (`peacemaker-isa` kernel `mtp_q8_det_gfx11`,
 /// module `mtp_q8_det_pm_gfx1151`, entry `mtp_q8_0_to_f16_pm_gfx1151`): one element per lane,
 /// element `i` of a contiguous Q8_0 `[M, K]` weight (34-byte blocks: F16 scale + 32 int8) is
@@ -4430,7 +4444,8 @@ pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp
 /// dense GEMM reads for Q8_0 weights); no product route, no env flag. The bundle is generated from
 /// the emitter after its source lands (`kernels/mtp_q8_det_pm_gfx1151.hxaco`); its SHA-256 is
 /// recorded in the validation receipt.
-pub const MTP_Q8_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_q8_det_pm_gfx1151.hxaco");
+pub const MTP_Q8_DET_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/mtp_q8_det_pm_gfx1151.hxaco");
 /// Certified builder rows16 and rows32 BF16 pooled-key score kernels for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block (rows32:
 /// `indexed_attention_select_scores_rows32_bf16_pm_gfx1151`, row tile 32, grid y `ceil(rows/32)`).
@@ -4461,17 +4476,17 @@ pub const QWEN4_SLAB_TILE_MASK_SRC: &str =
 pub const MQ_I4_MOE_GEMV_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco");
 /// K1 builder module of gfx1151 (`peacemaker-isa emit --kernel mq_i4_moe_gemv --arch
-/// gfx1151`): the same four symbols and 88-byte kernarg ABI as the gfx1201 module above.
+/// gfx1151`): the same twelve symbols and 96-byte kernarg ABI (`n_experts@88`) as the gfx1201 module above.
 pub const MQ_I4_MOE_GEMV_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco");
 /// SHA-256 pin of the gfx1201 K1 module image: twelve symbols (the four C8 entries plus their `_c16` / `_c32` wide twins)
 /// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco`).
 pub const MQ_I4_MOE_GEMV_PM_GFX1201_SHA256: &str =
-    "d2b59a3621044836d40dc50a2c9cd463b299076c332756f3f1744ebc809d542a";
+    "96d54224118e48d321d44c99b85cfe410c9b4b4d9d92ea7a530444afe442a432";
 /// SHA-256 pin of the gfx1151 K1 module image: the same twelve symbols
 /// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco`).
 pub const MQ_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
-    "354655627ad87ab42c7dc64e907a3ce2e4e31a51d12af1e3e480c650f3041d00";
+    "443f03cf0eed10bf1d6b34dd61ecb22c72fe00d5c72c4de3c9405374aeee9633";
 /// Certified builder module of the MQ3-I4 NT1 entries on gfx1151
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1151`): module
 /// `qwen4_moe_iu4_sym_w3_pm_gfx1151`, the gfx1201 module's four symbols with `gfx1151` in
@@ -7094,8 +7109,7 @@ pub const QSA_POOLED_BF16_MIRROR_SRC: &str =
 /// (exact gfx1151; `=0` kill switch); F32 K/V, head_dim 256, 1..8 rows, eager
 /// only): split-K QSA decode attention, `qsa_decode_splitk_partial_f32` plus
 /// `qsa_decode_splitk_combine_f32`. KLD-gated, not bit-exact.
-pub const QSA_DECODE_SPLITK_SRC: &str =
-    include_str!("../../../kernels/src/qsa_decode_splitk.hip");
+pub const QSA_DECODE_SPLITK_SRC: &str = include_str!("../../../kernels/src/qsa_decode_splitk.hip");
 /// The MQ6G256V2 draft-head re-score (`Gpu::topk8_rescore_k2560`).
 pub const TOPK8_RESCORE_MQ6G256V2_SRC: &str = concat!(
     "#define HIPFIRE_TOPK8_RESCORE 1\n",

@@ -592,9 +592,11 @@ fn radiowave_vmem_only_consumer(
     let Some(artifact) = launch.artifact.as_ref() else {
         return false;
     };
-    certifications.get(&artifact.id()).is_some_and(|certification| {
-        certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
-    })
+    certifications
+        .get(&artifact.id())
+        .is_some_and(|certification| {
+            certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
+        })
 }
 
 /// Where Redline's resource effects for `launch` came from: the object's
@@ -1540,11 +1542,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "deepseek4_moe_topk_bias_aware_f32"
             | "gemv_mfp4g32_e8_soa_grouped_gfx1151"
             | "gemv_mq2g256_lloyd_moe_down_expanded_k4"
-            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
-            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
-            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed"
-            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
-            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb"
             | "hc_compute_control"
             | "hc_compute_control_vec4"
             | "hc_finalize_control"
@@ -1562,6 +1559,18 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     // 5 pointers + 6 scalars + the wait-error block pointer = 72, padded to 16 B.
     if kernel == "hc_compute_control_vec4_finalize" {
         return Some(80);
+    }
+    // Indexed MoE kernels carry a trailing `n_experts` i32: 5 ptr + M,K +
+    // n_experts = 52 explicit bytes, padded to 16 B.
+    if matches!(
+        kernel,
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
+            | "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed"
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"
+            | "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb"
+    ) {
+        return Some(64);
     }
     if kernel == "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed" {
         return Some(56);
@@ -1634,7 +1643,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048_route_all_buffer_gfx1151"
             | "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64"
     ) {
-        return Some(48);
+        // 5 ptr + M,K + n_experts = 52 explicit bytes, padded to 16 B.
+        return Some(64);
     }
     if matches!(
         kernel,
@@ -1673,10 +1683,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4"
             | "gemv_mq3g256_lloyd_moe_ninepath_d4"
     ) {
-        return Some(48);
+        // 5 ptr + M,K + n_experts = 52 explicit bytes, padded to 16 B.
+        return Some(64);
     }
-    // Batched-K4 codebook MoE: 5 pointers (40 B) + M, K, K_TOP (12 B) = 52 B.
-    // The trailing K_TOP is what makes these NOT 48 like their decode siblings;
+    // Batched-K4 codebook MoE: 5 pointers (40 B) + M, K, K_TOP, n_experts (16 B) = 56 B.
+    // The trailing K_TOP/n_experts are what make these NOT 48 like their decode siblings;
     // assuming 48 here would make every kernarg length check fail closed.
     if matches!(
         kernel,
@@ -1685,7 +1696,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
             | "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4"
     ) {
-        return Some(52);
+        return Some(56);
     }
     if matches!(
         kernel,
@@ -1704,13 +1715,13 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
 
     // MQ4G256V2 / MQ6G256V2 MoE: exact sister ABIs. Sizes are the recorded
     // launch_maybe_blob lengths (natural fields + pad_to(16)).
-    //   gate_up / ninepath: 5 ptr + 2 i32 = 48
-    //   expanded down:      4 ptr + 3 i32 = 44 → 48 padded
-    //   gate_up batched:    5 ptr + 3 i32 = 52 → 64 padded
-    //   grouped WMMA:       5 ptr + 4 i32 = 56 → 64 padded
+    //   gate_up / ninepath: 5 ptr + 2 i32 + n_experts = 52 → 64 padded
+    //   expanded down:      4 ptr + 3 i32 + n_experts = 48
+    //   gate_up batched:    5 ptr + 3 i32 + n_experts = 56 → 64 padded
+    //   grouped WMMA:       5 ptr + 5 i32 (M,K,x_row_div,m_total,n_experts) = 60 → 64 padded
     //   mixed gate_up:      6 ptr + 3 i32 = 60 → 64 padded
     //   mixed down:         5 ptr + 3 i32 = 52 → 64 padded
-    //   mixed grouped:      6 ptr + 4 i32 = 64 (already aligned)
+    //   mixed grouped:      6 ptr + 5 i32 (…,n_experts) = 68 → 80 padded
     //   dense GEMV:         3 ptr + 2 i32 = 32
     //   dense GEMM WMMA:    3 ptr + 3 i32 = 36 → 48 padded
     if matches!(
@@ -1718,11 +1729,16 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "gemv_mq4g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
-            | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
-            | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
             | "gemv_mq6g256v2_moe_ninepath_d4"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
     ) {
         return Some(48);
     }
@@ -1736,12 +1752,17 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_moe_grouped_wmma_gfx12"
             | "gemv_mixed_moe_gate_up_k8_indexed_batched"
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
-            | "gemm_mixed_moe_grouped_wmma_k2"
+    ) {
+        return Some(64);
+    }
+    if matches!(
+        kernel,
+        "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
             | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
-        return Some(64);
+        return Some(80);
     }
     if matches!(
         kernel,
@@ -1874,20 +1895,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gated_norm_f32"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"
         | "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
-        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
-        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "hc_mix_4stream"
@@ -1921,6 +1928,21 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
+        // 5 ptr + M,K + n_experts = 52 explicit bytes, padded to 16 B.
+        "gemv_hfq4g256_moe_gate_up_k8_indexed"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
+        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816" => Some(64),
         "attention_flash_q8_0_tile"
         | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
@@ -2224,7 +2246,9 @@ fn relocation_ranges(moves: &[VmmResourceMove]) -> Result<Vec<RelocationRange>, 
             return Err(format!("VMM move {index}: null base"));
         }
         if old_start == new_start {
-            return Err(format!("VMM move {index}: old and new base are both {old_start:#x}"));
+            return Err(format!(
+                "VMM move {index}: old and new base are both {old_start:#x}"
+            ));
         }
         if reserved == 0 {
             return Err(format!("VMM move {index}: zero reserved bytes"));
@@ -2391,7 +2415,9 @@ fn untyped_launch_relocation_hazard(
                 classify_range(
                     ranges,
                     access.allocation_base,
-                    access.allocation_base.saturating_add(access.allocation_bytes),
+                    access
+                        .allocation_base
+                        .saturating_add(access.allocation_bytes),
                 ),
                 RangeMatch::Outside
             )
@@ -2414,7 +2440,9 @@ fn relocate_accesses(
 ) -> Result<Option<Vec<RecordedResourceAccess>>, String> {
     let mut relocated: Option<Vec<RecordedResourceAccess>> = None;
     for (index, access) in accesses.iter().enumerate() {
-        let end = access.allocation_base.saturating_add(access.allocation_bytes);
+        let end = access
+            .allocation_base
+            .saturating_add(access.allocation_bytes);
         match classify_range(ranges, access.allocation_base, end) {
             RangeMatch::Outside => {}
             RangeMatch::Straddles(range) => {
@@ -2429,7 +2457,9 @@ fn relocate_accesses(
                         .checked_sub(range.old_start)
                         .and_then(|offset| range.new_start.checked_add(offset))
                         .ok_or_else(|| {
-                            format!("{kernel}: recorded access address {address:#x} cannot relocate")
+                            format!(
+                                "{kernel}: recorded access address {address:#x} cannot relocate"
+                            )
                         })
                 };
                 let out = relocated.get_or_insert_with(|| accesses.to_vec());
@@ -2457,7 +2487,10 @@ fn relocate_kernarg_slots(
             continue;
         };
         let reach = slot.interior_offset.checked_add(8).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} interior overflows", slot.offset)
+            format!(
+                "{kernel}: pointer slot at offset {} interior overflows",
+                slot.offset
+            )
         })?;
         if reach > planned.coverage {
             return Err(format!(
@@ -2470,7 +2503,12 @@ fn relocate_kernarg_slots(
             .new_key
             .0
             .checked_add(slot.interior_offset)
-            .ok_or_else(|| format!("{kernel}: pointer slot at offset {} base overflows", slot.offset))?;
+            .ok_or_else(|| {
+                format!(
+                    "{kernel}: pointer slot at offset {} base overflows",
+                    slot.offset
+                )
+            })?;
         let end = slot
             .offset
             .checked_add(8)
@@ -5709,7 +5747,10 @@ impl ReplayController {
                 continue;
             }
             let artifact = launch.artifact.as_ref().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning code object", launch.kernel)
+                format!(
+                    "captured kernel {:?} has no owning code object",
+                    launch.kernel
+                )
             })?;
             let executable = Executable::load(&device, artifact.image().clone())
                 .map_err(|error| format!("load {artifact}: {error}"))?;
@@ -5797,7 +5838,10 @@ impl ReplayController {
 
         for launch in self.recorded.iter().take(prefix) {
             let artifact = launch.artifact.as_ref().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning code object", launch.kernel)
+                format!(
+                    "captured kernel {:?} has no owning code object",
+                    launch.kernel
+                )
             })?;
             let id = artifact.id();
             if !executables.contains_key(&id) {
@@ -6054,7 +6098,10 @@ impl ReplayController {
 
         for launch in self.recorded.iter().take(prefix) {
             let artifact = launch.artifact.as_ref().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning code object", launch.kernel)
+                format!(
+                    "captured kernel {:?} has no owning code object",
+                    launch.kernel
+                )
             })?;
             let id = artifact.id();
             if !executables.contains_key(&id) {
@@ -6595,12 +6642,8 @@ impl ReplayController {
             } else {
                 None
             };
-            let graph = commands.create_graph(
-                &device,
-                &pool,
-                ib_pool.as_ref(),
-                dispatch_profile,
-            )?;
+            let graph =
+                commands.create_graph(&device, &pool, ib_pool.as_ref(), dispatch_profile)?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
             if self
@@ -7432,8 +7475,22 @@ impl ReplayController {
         );
         if self.recorded.len() > before {
             if let Some(shadow) = self.railgun_shadow.as_mut() {
-                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_ref()).map(|artifact| artifact.id());
-                shadow.observe(hip, compiler, kernel, artifact, grid, block, shared_mem, kernarg, declared_words);
+                let artifact = self
+                    .recorded
+                    .last()
+                    .and_then(|launch| launch.artifact.as_ref())
+                    .map(|artifact| artifact.id());
+                shadow.observe(
+                    hip,
+                    compiler,
+                    kernel,
+                    artifact,
+                    grid,
+                    block,
+                    shared_mem,
+                    kernarg,
+                    declared_words,
+                );
             }
         }
     }
@@ -7808,7 +7865,9 @@ impl ReplayController {
                                 classify_range(
                                     &ranges,
                                     access.allocation_base,
-                                    access.allocation_base.saturating_add(access.allocation_bytes),
+                                    access
+                                        .allocation_base
+                                        .saturating_add(access.allocation_bytes),
                                 ),
                                 RangeMatch::Outside
                             )
@@ -7826,8 +7885,10 @@ impl ReplayController {
             return Ok(self.unchanged_relocation_report());
         }
         let next_revision = self.binding_revision.next();
-        let moved: BTreeMap<ResourceId, PlannedRelocation> =
-            plan.iter().map(|planned| (planned.resource, *planned)).collect();
+        let moved: BTreeMap<ResourceId, PlannedRelocation> = plan
+            .iter()
+            .map(|planned| (planned.resource, *planned))
+            .collect();
 
         // Stage 1: every tape resource rebinds at the next revision (moved
         // ones at their new base), like the post-growth refresh.
@@ -7928,7 +7989,8 @@ impl ReplayController {
             self.tape_resources.remove(&planned.old_key);
         }
         for planned in &plan {
-            self.tape_resources.insert(planned.new_key, planned.resource);
+            self.tape_resources
+                .insert(planned.new_key, planned.resource);
         }
         self.binding_revision = next_revision;
         let mut prepared_rewritten = 0usize;
@@ -8586,11 +8648,13 @@ mod tests {
         };
         let certifications = BTreeMap::new();
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
-        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
-            "m",
-            (b"uncertified" as &'static [u8]).into(),
-            None,
-        )));
+        launch.artifact = Some(std::sync::Arc::new(
+            crate::code_object::CodeObjectArtifact::native_embedded(
+                "m",
+                (b"uncertified" as &'static [u8]).into(),
+                None,
+            ),
+        ));
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
 
         let artifact = "native:m";
@@ -8627,23 +8691,33 @@ mod tests {
             artifact
         );
         let certified = |manifest: Option<&str>| {
-            std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded("m", (&[] as &'static [u8]).into(), manifest))
+            std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
+                "m",
+                (&[] as &'static [u8]).into(),
+                manifest,
+            ))
         };
         // The certification travels with the admitted image, keyed by digest.
         launch.artifact = Some(certified(Some(&manifest)));
         let certifications = radiowave_certifications(std::slice::from_ref(&launch), 1);
         assert_eq!(certifications.len(), 1);
         assert!(radiowave_vmem_only_consumer(&certifications, &launch));
-        assert_eq!(redline_effect_source(&launch), "none", "vmem_only alone declares no argument effects");
+        assert_eq!(
+            redline_effect_source(&launch),
+            "none",
+            "vmem_only alone declares no argument effects"
+        );
         launch.kernel = "unknown_kernel".to_owned();
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
         // A manifest that does not bind this image's hash certifies nothing.
         launch.kernel = "fused_rmsnorm_mq_rotate".to_owned();
-        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
-            "m",
-            (b"other" as &'static [u8]).into(),
-            Some(&manifest),
-        )));
+        launch.artifact = Some(std::sync::Arc::new(
+            crate::code_object::CodeObjectArtifact::native_embedded(
+                "m",
+                (b"other" as &'static [u8]).into(),
+                Some(&manifest),
+            ),
+        ));
         assert!(radiowave_certifications(std::slice::from_ref(&launch), 1).is_empty());
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
     }
@@ -9219,8 +9293,16 @@ mod tests {
         assert_eq!(
             modes,
             vec![
-                (0, Read), (8, Write), (16, Write), (24, Write), (32, Read),
-                (40, Write), (48, Write), (56, Read), (64, Read), (72, Read),
+                (0, Read),
+                (8, Write),
+                (16, Write),
+                (24, Write),
+                (32, Read),
+                (40, Write),
+                (48, Write),
+                (56, Read),
+                (64, Read),
+                (72, Read),
             ]
         );
 
@@ -9243,7 +9325,15 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Write),
+                (48, Write)
+            ]
         );
 
         // The other bounded-wait kernels' explicit layouts end with the block too.
@@ -9255,7 +9345,10 @@ mod tests {
         blob.push_f32(0.0);
         blob.push_ptr(std::ptr::null());
         blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes("fused_rmsnorm_mq_rotate_wavegrid"), Some(blob.len()));
+        assert_eq!(
+            expected_kernarg_bytes("fused_rmsnorm_mq_rotate_wavegrid"),
+            Some(blob.len())
+        );
         let mut blob = hip_bridge::KernargBlob::new();
         for _ in 0..5 {
             blob.push_ptr(std::ptr::null());
@@ -9265,7 +9358,10 @@ mod tests {
         }
         blob.push_ptr(std::ptr::null());
         blob.pad_to(16);
-        assert_eq!(expected_kernarg_bytes("hc_compute_control_vec4_finalize"), Some(blob.len()));
+        assert_eq!(
+            expected_kernarg_bytes("hc_compute_control_vec4_finalize"),
+            Some(blob.len())
+        );
     }
 
     #[test]
@@ -9482,19 +9578,19 @@ mod tests {
         let qkvza = "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151";
         let qkvza_hybrid = "fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151";
         let qkvza_r4 = "fused_qkvza_hfq4g256_k2048_r4_stream_gfx1151";
-        assert_eq!(expected_kernarg_bytes(gate), Some(48));
+        assert_eq!(expected_kernarg_bytes(gate), Some(64));
         assert_eq!(pointer_effects(gate).map(|effects| effects.len()), Some(5));
-        assert_eq!(expected_kernarg_bytes(gate_hybrid), Some(48));
+        assert_eq!(expected_kernarg_bytes(gate_hybrid), Some(64));
         assert_eq!(
             pointer_effects(gate_hybrid).map(|effects| effects.len()),
             Some(5)
         );
-        assert_eq!(expected_kernarg_bytes(gate_up_paired), Some(48));
+        assert_eq!(expected_kernarg_bytes(gate_up_paired), Some(64));
         assert_eq!(
             pointer_effects(gate_up_paired).map(|effects| effects.len()),
             Some(5)
         );
-        assert_eq!(expected_kernarg_bytes(gate_up_persistent), Some(48));
+        assert_eq!(expected_kernarg_bytes(gate_up_persistent), Some(64));
         assert_eq!(
             pointer_effects(gate_up_persistent).map(|effects| effects.len()),
             Some(5)
@@ -9601,12 +9697,12 @@ mod tests {
         for (symbol, kernarg_bytes, effects) in [
             (
                 "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
-                48usize,
+                64usize,
                 &gate_up_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed",
-                48,
+                64,
                 &gate_up_effects,
             ),
             (
@@ -9621,35 +9717,35 @@ mod tests {
             ),
             (
                 "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
-                48,
+                64,
                 &down_effects,
             ),
             (
                 "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
-                48,
+                64,
                 &down_effects,
             ),
             (
                 "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
-                48,
+                64,
                 &down_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed",
-                48,
+                64,
                 &down_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r2",
-                48,
+                64,
                 &down_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_r4",
-                48,
+                64,
                 &down_effects,
             ),
-            ("gemv_mq3g256_lloyd_moe_ninepath_d4", 48, &down_effects),
+            ("gemv_mq3g256_lloyd_moe_ninepath_d4", 64, &down_effects),
             (
                 "gemv_mq2g256gl_moe_down_residual_scaled_k8_indexed",
                 64,
@@ -9660,27 +9756,27 @@ mod tests {
                 80,
                 &down_effects,
             ),
-            // Batched-K4 prefill siblings. 52 B, NOT 48: the K_TOP scalar is
+            // Batched-K4 prefill siblings. 56 B, NOT 48: the K_TOP and n_experts scalars are
             // exactly the kind of quiet ABI difference that makes a
             // pattern-matched contract fail closed instead of loudly.
             (
                 "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
-                52,
+                56,
                 &gate_up_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
-                52,
+                56,
                 &gate_up_effects,
             ),
             (
                 "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
-                52,
+                56,
                 &down_effects,
             ),
             (
                 "gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed_batched_k4",
-                52,
+                56,
                 &down_effects,
             ),
         ] {
@@ -9710,7 +9806,7 @@ mod tests {
         let ninepath_effects = vec![read(0), read(8), read(16), read(24), write(32)];
         let grouped_effects = vec![read(0), read(8), read(16), read(24), write(32)];
 
-        // Decode gate_up: 5 ptr + M,K = 48 B (already 16-aligned).
+        // Decode gate_up: 5 ptr + M,K,n_experts = 52 B → 64 padded.
         // Includes gfx1100 exact K=2048 nolds candidate: same ABI/grid contract
         // as the generic gate_up, only workgroup/LDS/barrier removal differs.
         for symbol in [
@@ -9718,7 +9814,7 @@ mod tests {
             "gemv_mq6g256v2_moe_gate_up_k8_indexed",
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
         ] {
-            assert_eq!(expected_kernarg_bytes(symbol), Some(48));
+            assert_eq!(expected_kernarg_bytes(symbol), Some(64));
             let got = pointer_effects(symbol).expect("mqv2 gate_up pointer contract");
             assert_eq!(got.len(), gate_up_effects.len());
             for (got_effect, want) in got.iter().zip(gate_up_effects.iter()) {
@@ -9727,7 +9823,7 @@ mod tests {
             }
         }
 
-        // Path1 batched gate_up: 5 ptr + M,K,K_TOP = 52 → pad_to(16) = 64.
+        // Path1 batched gate_up: 5 ptr + M,K,K_TOP,n_experts = 56 → pad_to(16) = 64.
         // Prove the padded recorded length, not the bare field total.
         for symbol in [
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
@@ -9740,7 +9836,8 @@ mod tests {
             blob.push_i32(0);
             blob.push_i32(0);
             blob.push_i32(0);
-            assert_eq!(blob.len(), 52, "{symbol} explicit args occupy 52 bytes");
+            blob.push_i32(0);
+            assert_eq!(blob.len(), 56, "{symbol} explicit args occupy 56 bytes");
             blob.pad_to(16);
             assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
@@ -9752,7 +9849,7 @@ mod tests {
             }
         }
 
-        // Expanded down: 4 ptr + M,K,K_TOP = 44 → 48 padded.
+        // Expanded down: 4 ptr + M,K,K_TOP,n_experts = 48 (already 16-aligned).
         for symbol in [
             "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
             "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
@@ -9764,7 +9861,8 @@ mod tests {
             blob.push_i32(0);
             blob.push_i32(0);
             blob.push_i32(0);
-            assert_eq!(blob.len(), 44, "{symbol} explicit args occupy 44 bytes");
+            blob.push_i32(0);
+            assert_eq!(blob.len(), 48, "{symbol} explicit args occupy 48 bytes");
             blob.pad_to(16);
             assert_eq!(blob.len(), 48, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
@@ -9776,14 +9874,14 @@ mod tests {
             }
         }
 
-        // Ninepath fused down+combine: 5 ptr + down_m,down_k = 48.
-        // RPB8 gfx1100 candidate shares the frozen 48-byte ABI.
+        // Ninepath fused down+combine: 5 ptr + down_m,down_k,n_experts = 52 → 64 padded.
+        // RPB8 gfx1100 candidate shares the frozen ABI.
         for symbol in [
             "gemv_mq4g256v2_moe_ninepath_d4",
             "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100",
             "gemv_mq6g256v2_moe_ninepath_d4",
         ] {
-            assert_eq!(expected_kernarg_bytes(symbol), Some(48));
+            assert_eq!(expected_kernarg_bytes(symbol), Some(64));
             let got = pointer_effects(symbol).expect("mqv2 ninepath pointer contract");
             assert_eq!(got.len(), ninepath_effects.len());
             for (got_effect, want) in got.iter().zip(ninepath_effects.iter()) {
@@ -9796,7 +9894,7 @@ mod tests {
             assert_eq!(got[4].mode, RecordedAccessMode::Write);
         }
 
-        // Grouped prefill WMMA: 5 ptr + M,K,x_row_div,m_total = 56 → 64.
+        // Grouped prefill WMMA: 5 ptr + M,K,x_row_div,m_total,n_experts = 60 → 64.
         // gfx11 `_k2` and gfx12 `_gfx12` are distinct symbols, not aliases.
         for symbol in [
             "gemm_mq4g256v2_moe_grouped_wmma_k2",
@@ -9808,10 +9906,10 @@ mod tests {
             for _ in 0..5 {
                 blob.push_ptr(std::ptr::null());
             }
-            for _ in 0..4 {
+            for _ in 0..5 {
                 blob.push_i32(0);
             }
-            assert_eq!(blob.len(), 56, "{symbol} explicit args occupy 56 bytes");
+            assert_eq!(blob.len(), 60, "{symbol} explicit args occupy 60 bytes");
             blob.pad_to(16);
             assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
@@ -9850,16 +9948,16 @@ mod tests {
         let mixed_down_effects = vec![read(0), read(8), read(16), read(24), write(32)];
         let mixed_grouped_effects = vec![read(0), read(8), read(16), read(24), read(32), write(40)];
 
-        // Mixed gate_up batched: 6 ptr + M,K,K_TOP = 60 → 64 padded.
+        // Mixed gate_up batched: 6 ptr + M,K,K_TOP,n_experts = 64 (already aligned).
         for symbol in ["gemv_mixed_moe_gate_up_k8_indexed_batched"] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..6 {
                 blob.push_ptr(std::ptr::null());
             }
-            for _ in 0..3 {
+            for _ in 0..4 {
                 blob.push_i32(0);
             }
-            assert_eq!(blob.len(), 60, "{symbol} explicit args occupy 60 bytes");
+            assert_eq!(blob.len(), 64, "{symbol} explicit args occupy 64 bytes");
             blob.pad_to(16);
             assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
@@ -9884,16 +9982,16 @@ mod tests {
             assert_eq!(got[5].mode, RecordedAccessMode::Write);
         }
 
-        // Mixed down expanded: 5 ptr + M,K,K_TOP = 52 → 64 padded.
+        // Mixed down expanded: 5 ptr + M,K,K_TOP,n_experts = 56 → 64 padded.
         for symbol in ["gemv_mixed_moe_down_k8_indexed_batched_expanded"] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..5 {
                 blob.push_ptr(std::ptr::null());
             }
-            for _ in 0..3 {
+            for _ in 0..4 {
                 blob.push_i32(0);
             }
-            assert_eq!(blob.len(), 52, "{symbol} explicit args occupy 52 bytes");
+            assert_eq!(blob.len(), 56, "{symbol} explicit args occupy 56 bytes");
             blob.pad_to(16);
             assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
@@ -9912,7 +10010,7 @@ mod tests {
             assert_eq!(got[4].mode, RecordedAccessMode::Write);
         }
 
-        // Mixed grouped WMMA: 6 ptr + M,K,x_row_div,m_total = 64 (already aligned).
+        // Mixed grouped WMMA: 6 ptr + M,K,x_row_div,m_total,n_experts = 68 → 80.
         // gfx11 k2, gfx12, and 4w_k2 tiling variants are distinct symbols.
         for symbol in [
             "gemm_mixed_moe_grouped_wmma_k2",
@@ -9924,12 +10022,12 @@ mod tests {
             for _ in 0..6 {
                 blob.push_ptr(std::ptr::null());
             }
-            for _ in 0..4 {
+            for _ in 0..5 {
                 blob.push_i32(0);
             }
-            assert_eq!(blob.len(), 64, "{symbol} explicit args occupy 64 bytes");
+            assert_eq!(blob.len(), 68, "{symbol} explicit args occupy 68 bytes");
             blob.pad_to(16);
-            assert_eq!(blob.len(), 64, "{symbol} recorded launches pad to 16");
+            assert_eq!(blob.len(), 80, "{symbol} recorded launches pad to 16");
             assert_eq!(expected_kernarg_bytes(symbol), Some(blob.len()));
             let got = pointer_effects(symbol).expect("mixed grouped pointer contract");
             assert_eq!(
@@ -10500,8 +10598,8 @@ mod tests {
             assert_eq!(gfx1151_cu_count_refusal(value), Ok(()), "{value:?}");
         }
         for value in ["32", "36", "35", "42"] {
-            let message = gfx1151_cu_count_refusal(value)
-                .expect_err(&format!("{value:?} must be refused"));
+            let message =
+                gfx1151_cu_count_refusal(value).expect_err(&format!("{value:?} must be refused"));
             assert!(
                 message.contains("HIPFIRE_GFX1151_REDLINE_CU_COUNT"),
                 "{message}"
@@ -11313,9 +11411,13 @@ mod tests {
         check(&[(1, "a"), (2, "b"), (3, "c"), (9, "extra")]).unwrap();
         // Missing, changed, or replaced (a rebuilt table has a new id) tables
         // fail the whole binding.
-        assert!(check(&[(1, "a"), (2, "b")]).unwrap_err().contains("not bound"));
+        assert!(check(&[(1, "a"), (2, "b")])
+            .unwrap_err()
+            .contains("not bound"));
         assert!(check(&[(1, "a"), (2, "B"), (3, "c")]).is_err());
-        assert!(check(&[(1, "a"), (2, "b"), (30, "c")]).unwrap_err().contains("not bound"));
+        assert!(check(&[(1, "a"), (2, "b"), (30, "c")])
+            .unwrap_err()
+            .contains("not bound"));
     }
 
     #[test]
@@ -12534,7 +12636,12 @@ mod tests {
         }
     }
 
-    fn relocation_move(old_base: u64, new_base: u64, reserved: usize, mapped: usize) -> VmmResourceMove {
+    fn relocation_move(
+        old_base: u64,
+        new_base: u64,
+        reserved: usize,
+        mapped: usize,
+    ) -> VmmResourceMove {
         VmmResourceMove {
             old_base: old_base as usize,
             new_base: new_base as usize,
@@ -12583,7 +12690,10 @@ mod tests {
     }
 
     fn bound_base(controller: &ReplayController, resource: ResourceId) -> (u64, BindingRevision) {
-        let binding = controller.replay_bindings.resource(resource).expect("bound");
+        let binding = controller
+            .replay_bindings
+            .resource(resource)
+            .expect("bound");
         (binding.base().as_ptr() as usize as u64, binding.revision())
     }
 
@@ -12591,10 +12701,25 @@ mod tests {
     fn relocation_rewrites_only_the_moved_slot_and_bumps_revision() {
         let (mut controller, base_a, base_b) = relocation_controller();
         let before = controller.recorded[0].kernarg.clone();
-        let resource_a = controller.recorded[0].binding_layout.as_ref().unwrap().slots[0].resource;
-        let resource_b = controller.recorded[0].binding_layout.as_ref().unwrap().slots[1].resource;
+        let resource_a = controller.recorded[0]
+            .binding_layout
+            .as_ref()
+            .unwrap()
+            .slots[0]
+            .resource;
+        let resource_b = controller.recorded[0]
+            .binding_layout
+            .as_ref()
+            .unwrap()
+            .slots[1]
+            .resource;
         let report = controller
-            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .relocate_bindings(&[relocation_move(
+                base_a,
+                MOVED_A,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )])
             .expect("relocates");
         assert_eq!(
             report,
@@ -12608,11 +12733,23 @@ mod tests {
         let after = &controller.recorded[0].kernarg;
         assert_eq!(&after[0..8], &(MOVED_A + 0x40).to_ne_bytes());
         assert_eq!(&after[8..], &before[8..]);
-        assert!(controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
-        assert!(!controller.tape_resources.contains_key(&(base_a, FIXTURE_A_BYTES)));
-        assert!(controller.tape_resources.contains_key(&(base_b, FIXTURE_B_BYTES)));
-        assert_eq!(bound_base(&controller, resource_a), (MOVED_A, BindingRevision(1)));
-        assert_eq!(bound_base(&controller, resource_b), (base_b, BindingRevision(1)));
+        assert!(controller
+            .tape_resources
+            .contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+        assert!(!controller
+            .tape_resources
+            .contains_key(&(base_a, FIXTURE_A_BYTES)));
+        assert!(controller
+            .tape_resources
+            .contains_key(&(base_b, FIXTURE_B_BYTES)));
+        assert_eq!(
+            bound_base(&controller, resource_a),
+            (MOVED_A, BindingRevision(1))
+        );
+        assert_eq!(
+            bound_base(&controller, resource_b),
+            (base_b, BindingRevision(1))
+        );
         let accesses = controller.recorded[0].accesses.as_ref().unwrap();
         assert_eq!(accesses[0].allocation_base, MOVED_A);
         assert_eq!(accesses[0].access_base, MOVED_A + 0x40);
@@ -12623,7 +12760,12 @@ mod tests {
     fn relocated_recorded_snapshot_equals_encoding_of_new_bindings() {
         let (mut controller, base_a, _) = relocation_controller();
         controller
-            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .relocate_bindings(&[relocation_move(
+                base_a,
+                MOVED_A,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )])
             .expect("relocates");
         let launch = &controller.recorded[0];
         let encoded = encode_bound_kernarg(
@@ -12641,10 +12783,20 @@ mod tests {
     fn chained_relocation_follows_the_rekeyed_resource() {
         let (mut controller, base_a, _) = relocation_controller();
         controller
-            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .relocate_bindings(&[relocation_move(
+                base_a,
+                MOVED_A,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )])
             .expect("A to B");
         let report = controller
-            .relocate_bindings(&[relocation_move(MOVED_A, MOVED_A2, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .relocate_bindings(&[relocation_move(
+                MOVED_A,
+                MOVED_A2,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )])
             .expect("B to C");
         assert_eq!(
             report,
@@ -12658,8 +12810,12 @@ mod tests {
             &controller.recorded[0].kernarg[0..8],
             &(MOVED_A2 + 0x40).to_ne_bytes()
         );
-        assert!(controller.tape_resources.contains_key(&(MOVED_A2, FIXTURE_A_BYTES)));
-        assert!(!controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+        assert!(controller
+            .tape_resources
+            .contains_key(&(MOVED_A2, FIXTURE_A_BYTES)));
+        assert!(!controller
+            .tape_resources
+            .contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
     }
 
     #[test]
@@ -12685,25 +12841,52 @@ mod tests {
         );
         assert_eq!(controller.binding_revision(), BindingRevision(0));
         assert_eq!(controller.recorded[0].kernarg, before);
-        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+        assert_eq!(
+            controller
+                .tape_resources
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            keys
+        );
     }
 
     #[test]
     fn failed_relocation_leaves_every_piece_of_state_unchanged() {
         let (mut controller, base_a, _) = relocation_controller();
         // Slot 0 would read 8 bytes at the very end of the mapped coverage.
-        controller.recorded[0].binding_layout.as_mut().unwrap().slots[0].interior_offset = 0xFFFC;
+        controller.recorded[0]
+            .binding_layout
+            .as_mut()
+            .unwrap()
+            .slots[0]
+            .interior_offset = 0xFFFC;
         let before = controller.recorded[0].clone();
         let keys: Vec<_> = controller.tape_resources.keys().copied().collect();
         let error = controller
-            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .relocate_bindings(&[relocation_move(
+                base_a,
+                MOVED_A,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )])
             .expect_err("slot past coverage");
         assert!(error.contains("mapped"), "{error}");
         assert_eq!(controller.recorded[0], before);
         assert_eq!(controller.binding_revision(), BindingRevision(0));
-        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+        assert_eq!(
+            controller
+                .tape_resources
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            keys
+        );
         let resource_a = before.binding_layout.as_ref().unwrap().slots[0].resource;
-        assert_eq!(bound_base(&controller, resource_a), (base_a, BindingRevision(0)));
+        assert_eq!(
+            bound_base(&controller, resource_a),
+            (base_a, BindingRevision(0))
+        );
     }
 
     #[test]
@@ -12711,7 +12894,12 @@ mod tests {
         let (controller, base_a, _) = relocation_controller();
         let error = plan_relocation(
             &controller.tape_resources,
-            &[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, 0x8000)],
+            &[relocation_move(
+                base_a,
+                MOVED_A,
+                FIXTURE_A_BYTES as usize,
+                0x8000,
+            )],
         )
         .expect_err("not fully mapped");
         assert!(error.contains("not fully mapped"), "{error}");
@@ -12723,8 +12911,18 @@ mod tests {
         let plan = plan_relocation(
             &controller.tape_resources,
             &[
-                relocation_move(base_b, MOVED_A2, FIXTURE_B_BYTES as usize, FIXTURE_B_BYTES as usize),
-                relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize),
+                relocation_move(
+                    base_b,
+                    MOVED_A2,
+                    FIXTURE_B_BYTES as usize,
+                    FIXTURE_B_BYTES as usize,
+                ),
+                relocation_move(
+                    base_a,
+                    MOVED_A,
+                    FIXTURE_A_BYTES as usize,
+                    FIXTURE_A_BYTES as usize,
+                ),
             ],
         )
         .expect("plans");
@@ -12747,7 +12945,10 @@ mod tests {
             ],
         )
         .expect_err("overlapping sources");
-        assert!(overlapping.contains("overlapping VMM move sources"), "{overlapping}");
+        assert!(
+            overlapping.contains("overlapping VMM move sources"),
+            "{overlapping}"
+        );
         let duplicate = plan_relocation(
             tape,
             &[
@@ -12811,11 +13012,18 @@ mod tests {
     #[test]
     fn untyped_launch_touching_a_moved_range_is_rejected() {
         let (mut controller, base_a, _) = relocation_controller();
-        let moved = relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize);
+        let moved = relocation_move(
+            base_a,
+            MOVED_A,
+            FIXTURE_A_BYTES as usize,
+            FIXTURE_A_BYTES as usize,
+        );
         let mut untyped = test_launch("legacy_kernel");
         untyped.accesses = Some(vec![fixture_access(base_a, FIXTURE_A_BYTES, base_a)]);
         controller.recorded.push(untyped);
-        let error = controller.relocate_bindings(&[moved]).expect_err("touches range");
+        let error = controller
+            .relocate_bindings(&[moved])
+            .expect_err("touches range");
         assert!(
             error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
             "{error}"
@@ -12823,15 +13031,22 @@ mod tests {
         assert_eq!(controller.binding_revision(), BindingRevision(0));
 
         controller.recorded[1].accesses = None;
-        let error = controller.relocate_bindings(&[moved]).expect_err("unknown accesses");
+        let error = controller
+            .relocate_bindings(&[moved])
+            .expect_err("unknown accesses");
         assert!(
             error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
             "{error}"
         );
 
-        controller.recorded[1].accesses =
-            Some(vec![fixture_access(0x7e00_0000_0000, 0x1000, 0x7e00_0000_0000)]);
-        controller.relocate_bindings(&[moved]).expect("clear of every move");
+        controller.recorded[1].accesses = Some(vec![fixture_access(
+            0x7e00_0000_0000,
+            0x1000,
+            0x7e00_0000_0000,
+        )]);
+        controller
+            .relocate_bindings(&[moved])
+            .expect("clear of every move");
         assert_eq!(controller.binding_revision(), BindingRevision(1));
     }
 
@@ -12839,7 +13054,12 @@ mod tests {
     fn relocation_reports_no_route_without_tape_and_rejects_pending_refresh() {
         let mut empty = ReplayController::new(ReplayBackendRequest::Auto);
         let report = empty
-            .relocate_bindings(&[relocation_move(0x7f00_0001_0000, MOVED_A, RESERVED, RESERVED)])
+            .relocate_bindings(&[relocation_move(
+                0x7f00_0001_0000,
+                MOVED_A,
+                RESERVED,
+                RESERVED,
+            )])
             .expect("no tape");
         assert_eq!(report, BindingRefreshReport::NoRoute);
 
@@ -12885,9 +13105,27 @@ mod tests {
             &[typed, untyped],
             2,
             &[
-                (0, ReplayKernargBinding::PositionPlusU32 { offset: 12, addend: 0 }),
-                (1, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
-                (9, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
+                (
+                    0,
+                    ReplayKernargBinding::PositionPlusU32 {
+                        offset: 12,
+                        addend: 0,
+                    },
+                ),
+                (
+                    1,
+                    ReplayKernargBinding::PositionPlusU32 {
+                        offset: 4,
+                        addend: 0,
+                    },
+                ),
+                (
+                    9,
+                    ReplayKernargBinding::PositionPlusU32 {
+                        offset: 4,
+                        addend: 0,
+                    },
+                ),
             ],
             &[0],
         );

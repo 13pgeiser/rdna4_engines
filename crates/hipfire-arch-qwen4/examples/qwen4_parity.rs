@@ -2812,6 +2812,8 @@ fn run_moe_operator(
         tokens,
         true,
         false,
+        0,
+        0,
     )
     .map_err(|error| error.to_string())?;
     let selected_experts = download_i32(gpu, &selected_gpu, tokens * top_k)?;
@@ -2853,6 +2855,7 @@ fn run_moe_operator(
         &residual_gpu,
         hidden_size,
         tokens,
+        experts,
     )
     .map_err(|error| error.to_string())?;
     let routed_output = gpu
@@ -3873,10 +3876,9 @@ fn run_quality_candidate(
     let placements = receipt.placements.clone();
     // The loader's forward scratch plan, decided from the actual payload
     // while the mapping is readable.
-    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-        &gpu, &hfq, &config, &manifest,
-    )
-    .map_err(|error| error.to_string())?;
+    let scratch_mode =
+        hipfire_arch_qwen4::artifact::source_forward_scratch_mode(&gpu, &hfq, &config, &manifest)
+            .map_err(|error| error.to_string())?;
     // Load by byte range like the serve loader and state runner. The borrowed
     // mmap path never finished on gfx1151 UMA (over an hour, stuck in SVM
     // registration); range loading takes about a minute.

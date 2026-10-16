@@ -22,26 +22,48 @@ use hip_bridge::HipResult;
 use std::ffi::c_void;
 
 /// Module keys of the embedded K1 certified builder images, `[gfx1151, gfx1201]`.
-const MQ_I4_MOE_GEMV_MODULES: [&str; 2] = ["mq_i4_moe_gemv_pm_gfx1151", "mq_i4_moe_gemv_pm_gfx1201"];
+const MQ_I4_MOE_GEMV_MODULES: [&str; 2] =
+    ["mq_i4_moe_gemv_pm_gfx1151", "mq_i4_moe_gemv_pm_gfx1201"];
 /// The embedded K1 images, same order.
-const MQ_I4_MOE_GEMV_IMAGES: [&[u8]; 2] = [kernels::MQ_I4_MOE_GEMV_PM_GFX1151, kernels::MQ_I4_MOE_GEMV_PM_GFX1201];
+const MQ_I4_MOE_GEMV_IMAGES: [&[u8]; 2] = [
+    kernels::MQ_I4_MOE_GEMV_PM_GFX1151,
+    kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
+];
 
 /// K1 symbols in bucket order: `[codec][kind]`, codec 0 = W3 (`MQ3I4`),
 /// 1 = MQ4 (`Mq4Sym`), kind 0 = gate/up (R256), 1 = down (R128).
 pub const MQ_I4_MOE_GEMV_SYMBOLS: [[&str; 2]; 2] = [
-    ["mq_i4_moe_gemv_mq3i4_r256_gate_up", "mq_i4_moe_gemv_mq3i4_r128_down"],
-    ["mq_i4_moe_gemv_mq4sym_r256_gate_up", "mq_i4_moe_gemv_mq4sym_r128_down"],
-];
-
-/// Wide K1 entries, `[capacity (16/32)][codec][kind]`; the 88-byte ABI is unchanged.
-pub const MQ_I4_MOE_GEMV_WIDE_SYMBOLS: [[[&str; 2]; 2]; 2] = [
     [
-        ["mq_i4_moe_gemv_mq3i4_r256_gate_up_c16", "mq_i4_moe_gemv_mq3i4_r128_down_c16"],
-        ["mq_i4_moe_gemv_mq4sym_r256_gate_up_c16", "mq_i4_moe_gemv_mq4sym_r128_down_c16"],
+        "mq_i4_moe_gemv_mq3i4_r256_gate_up",
+        "mq_i4_moe_gemv_mq3i4_r128_down",
     ],
     [
-        ["mq_i4_moe_gemv_mq3i4_r256_gate_up_c32", "mq_i4_moe_gemv_mq3i4_r128_down_c32"],
-        ["mq_i4_moe_gemv_mq4sym_r256_gate_up_c32", "mq_i4_moe_gemv_mq4sym_r128_down_c32"],
+        "mq_i4_moe_gemv_mq4sym_r256_gate_up",
+        "mq_i4_moe_gemv_mq4sym_r128_down",
+    ],
+];
+
+/// Wide K1 entries, `[capacity (16/32)][codec][kind]`; the same 96-byte ABI as the narrow entries (`n_experts@88`, zero `reserved@92`).
+pub const MQ_I4_MOE_GEMV_WIDE_SYMBOLS: [[[&str; 2]; 2]; 2] = [
+    [
+        [
+            "mq_i4_moe_gemv_mq3i4_r256_gate_up_c16",
+            "mq_i4_moe_gemv_mq3i4_r128_down_c16",
+        ],
+        [
+            "mq_i4_moe_gemv_mq4sym_r256_gate_up_c16",
+            "mq_i4_moe_gemv_mq4sym_r128_down_c16",
+        ],
+    ],
+    [
+        [
+            "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32",
+            "mq_i4_moe_gemv_mq3i4_r128_down_c32",
+        ],
+        [
+            "mq_i4_moe_gemv_mq4sym_r256_gate_up_c32",
+            "mq_i4_moe_gemv_mq4sym_r128_down_c32",
+        ],
     ],
 ];
 
@@ -116,11 +138,19 @@ impl Gpu {
             self.ensure_kernel(MASK_MODULE, kernels::QWEN4_SLAB_TILE_MASK_SRC, MASK_SYMBOL)?;
         }
         for symbol in MQ_I4_MOE_GEMV_SYMBOLS.iter().flatten() {
-            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], symbol)?;
+            self.ensure_embedded_kernel(
+                MQ_I4_MOE_GEMV_MODULES[arch],
+                MQ_I4_MOE_GEMV_IMAGES[arch],
+                symbol,
+            )?;
         }
         if WideTwinFamily::K1.enabled() {
             for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
-                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], symbol)?;
+                self.ensure_embedded_kernel(
+                    MQ_I4_MOE_GEMV_MODULES[arch],
+                    MQ_I4_MOE_GEMV_IMAGES[arch],
+                    symbol,
+                )?;
             }
         }
         Ok(())
@@ -130,7 +160,10 @@ impl Gpu {
         self.slab_arch_index().ok_or_else(|| {
             hip_bridge::HipError::new(
                 0,
-                &format!("{what}: the sealed expert-slab route is gfx1151/gfx1201-only, got {}", self.arch),
+                &format!(
+                    "{what}: the sealed expert-slab route is gfx1151/gfx1201-only, got {}",
+                    self.arch
+                ),
             )
         })
     }
@@ -153,7 +186,8 @@ impl Gpu {
         {
             self.invalidate_for_scratch_growth();
         }
-        self.scratch.reserve_qwen4_slab(&self.hip, SLAB_MAX_LANES, tiles)
+        self.scratch
+            .reserve_qwen4_slab(&self.hip, SLAB_MAX_LANES, tiles)
     }
 
     fn slab_union_base(&self) -> HipResult<*mut c_void> {
@@ -175,27 +209,42 @@ impl Gpu {
     ) -> HipResult<()> {
         self.slab_require_arch("qwen4_slab_union_plan")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
-            return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: lanes must be 1..=32"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_slab_union_plan: lanes must be 1..=32",
+            ));
         }
         let slots = SLAB_TOP_K * lanes;
         if topk.buf.size() < slots * 4 {
-            return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: topk holds fewer than 10 * lanes ids"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_slab_union_plan: topk holds fewer than 10 * lanes ids",
+            ));
         }
         let (codec_ptr, uniform) = match buckets {
-            SlabBuckets::Uniform(bucket) if bucket < 2 => (std::ptr::null_mut::<c_void>(), bucket as i32),
+            SlabBuckets::Uniform(bucket) if bucket < 2 => {
+                (std::ptr::null_mut::<c_void>(), bucket as i32)
+            }
             SlabBuckets::Uniform(_) => {
-                return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: bucket must be 0 or 1"))
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "qwen4_slab_union_plan: bucket must be 0 or 1",
+                ))
             }
             SlabBuckets::Table(table) => {
                 if table.buf.size() < SLAB_EXPERTS {
-                    return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: codec table holds fewer than 512 bytes"));
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "qwen4_slab_union_plan: codec table holds fewer than 512 bytes",
+                    ));
                 }
                 (table.buf.as_ptr(), -1)
             }
         };
         self.bind_thread()?;
         self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_SRC, PLAN_SYMBOL)?;
-        if self.scratch.qwen4_slab_union_scratch_bytes < crate::scratch::qwen4_slab_union_words(SLAB_MAX_LANES) * 4
+        if self.scratch.qwen4_slab_union_scratch_bytes
+            < crate::scratch::qwen4_slab_union_words(SLAB_MAX_LANES) * 4
             || self.scratch.qwen4_slab_union_scratch.is_none()
         {
             self.reserve_qwen4_slab(0)?;
@@ -203,12 +252,14 @@ impl Gpu {
         let out = self.slab_union_base()?;
         let tp = topk.buf.as_ptr();
         let sv = slots as i32;
+        let nexp = SLAB_EXPERTS as i32;
         let mut params = [
             &tp as *const _ as *mut c_void,
             &codec_ptr as *const _ as *mut c_void,
             &out as *const _ as *mut c_void,
             &sv as *const _ as *mut c_void,
             &uniform as *const _ as *mut c_void,
+            &nexp as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(PLAN_SYMBOL, [1, 1, 1], [512, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
@@ -217,6 +268,7 @@ impl Gpu {
             b.push_ptr(out);
             b.push_i32(sv);
             b.push_i32(uniform);
+            b.push_i32(nexp);
             b
         })
     }
@@ -242,7 +294,10 @@ impl Gpu {
     ) -> HipResult<()> {
         let arch = self.slab_require_arch("mq_i4_moe_gemv_slab")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: lanes must be 1..=32"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: lanes must be 1..=32",
+            ));
         }
         let wide = self.qwen4_slab_wide_twin(lanes);
         if lanes > SLAB_NARROW_MAX_LANES && !wide {
@@ -255,7 +310,13 @@ impl Gpu {
         let (m, k, x_row_div, x_src_rows, y_stride) = if down {
             (SLAB_DOWN_M, SLAB_DOWN_K, 1usize, slots, SLAB_DOWN_M)
         } else {
-            (SLAB_GATE_UP_M, SLAB_GATE_UP_K, SLAB_TOP_K, lanes, SLAB_GATE_UP_M / 2)
+            (
+                SLAB_GATE_UP_M,
+                SLAB_GATE_UP_K,
+                SLAB_TOP_K,
+                lanes,
+                SLAB_GATE_UP_M / 2,
+            )
         };
         if down == y1.is_some() {
             return Err(hip_bridge::HipError::new(
@@ -268,12 +329,18 @@ impl Gpu {
             || y0.buf.size() < slots * y_stride * 4
             || y1.is_some_and(|y| y.buf.size() < slots * y_stride * 4)
         {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: operand smaller than the launch extent"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: operand smaller than the launch extent",
+            ));
         }
         let present: [bool; 2] = match buckets {
             SlabBuckets::Uniform(bucket) if bucket < 2 => [bucket == 0, bucket == 1],
             SlabBuckets::Uniform(_) => {
-                return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: bucket must be 0 or 1"))
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "mq_i4_moe_gemv_slab: bucket must be 0 or 1",
+                ))
             }
             SlabBuckets::Table(_) => [true, true],
         };
@@ -293,12 +360,22 @@ impl Gpu {
             } else {
                 MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize]
             };
-            self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], func)?;
+            self.ensure_embedded_kernel(
+                MQ_I4_MOE_GEMV_MODULES[arch],
+                MQ_I4_MOE_GEMV_IMAGES[arch],
+                func,
+            )?;
             let ids = (union + bucket * s * 4) as *mut c_void;
             let offs = (union + (2 * s + bucket * (s + 1)) * 4) as *mut c_void;
             let slot_ids = (union + (2 * s + 2 * (s + 1) + bucket * s) * 4) as *mut c_void;
             let (mv, kv, uv, cv) = (m as u32, k as u32, s as u32, lanes as u32);
-            let (dv, srows, xs, ys) = (x_row_div as u32, x_src_rows as u32, k as u32, y_stride as u32);
+            let (dv, srows, xs, ys) = (
+                x_row_div as u32,
+                x_src_rows as u32,
+                k as u32,
+                y_stride as u32,
+            );
+            let nexp = SLAB_EXPERTS as u32;
             let mut params = [
                 &wp as *const _ as *mut c_void,
                 &ids as *const _ as *mut c_void,
@@ -315,8 +392,13 @@ impl Gpu {
                 &srows as *const _ as *mut c_void,
                 &xs as *const _ as *mut c_void,
                 &ys as *const _ as *mut c_void,
+                &nexp as *const _ as *mut c_void,
             ];
-            let (grid_m, block) = if wide { (mv.div_ceil(8), 256) } else { (mv, 32) };
+            let (grid_m, block) = if wide {
+                (mv.div_ceil(8), 256)
+            } else {
+                (mv, 32)
+            };
             self.launch_maybe_blob(func, [grid_m, uv, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(wp);
@@ -326,7 +408,7 @@ impl Gpu {
                 b.push_ptr(xp);
                 b.push_ptr(y0p);
                 b.push_ptr(y1p);
-                for word in [mv, kv, uv, cv, dv, srows, xs, ys] {
+                for word in [mv, kv, uv, cv, dv, srows, xs, ys, nexp, 0] {
                     b.push_u32(word);
                 }
                 b
@@ -348,7 +430,10 @@ impl Gpu {
     ) -> HipResult<[GpuTensor; 2]> {
         self.slab_require_arch("qwen4_slab_tile_masks")?;
         if tiles == 0 {
-            return Err(hip_bridge::HipError::new(0, "qwen4_slab_tile_masks: no tiles"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_slab_tile_masks: no tiles",
+            ));
         }
         if self.scratch.qwen4_slab_tiles_scratch_bytes < 2 * tiles * 4
             || self.scratch.qwen4_slab_tiles_scratch.is_none()
@@ -382,7 +467,12 @@ impl Gpu {
         if self.arch == "gfx1201" {
             return self.ep_tile_mask(tile_ids, owned, codec_i32, tiles, SLAB_EXPERTS, codec);
         }
-        let refuse = |what: &str| Err(hip_bridge::HipError::new(0, &format!("qwen4_slab_tile_mask: {what}")));
+        let refuse = |what: &str| {
+            Err(hip_bridge::HipError::new(
+                0,
+                &format!("qwen4_slab_tile_mask: {what}"),
+            ))
+        };
         let word = std::mem::size_of::<i32>();
         if i32::try_from(tiles).is_err() {
             return refuse("tiles exceed i32");
@@ -398,7 +488,11 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_kernel(MASK_MODULE, kernels::QWEN4_SLAB_TILE_MASK_SRC, MASK_SYMBOL)?;
-        let (ids, out, table) = (tile_ids.buf.as_ptr(), owned.buf.as_ptr(), codec_i32.buf.as_ptr());
+        let (ids, out, table) = (
+            tile_ids.buf.as_ptr(),
+            owned.buf.as_ptr(),
+            codec_i32.buf.as_ptr(),
+        );
         let (tv, ev, cv) = (tiles as i32, SLAB_EXPERTS as i32, codec as i32);
         let mut params = [
             &ids as *const _ as *mut c_void,
@@ -408,7 +502,8 @@ impl Gpu {
             &ev as *const _ as *mut c_void,
             &cv as *const _ as *mut c_void,
         ];
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", MASK_SYMBOL, tiles * word * 2);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", MASK_SYMBOL, tiles * word * 2);
         let result = self.launch_maybe_blob(
             MASK_SYMBOL,
             [(tiles as u32).div_ceil(MASK_BLOCK), 1, 1],

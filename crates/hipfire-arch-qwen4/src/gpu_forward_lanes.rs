@@ -57,8 +57,8 @@ use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::{
     decode_copy, dense_ref, hyper_read_desc, invalid, layer_desc, matrix_view, ple_desc,
-    program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward,
-    Qwen4GpuForwardError, Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
+    program_dims, qwen4_ple_rows_f16, router_columns, view, Qwen4GpuForward, Qwen4GpuForwardError,
+    Qwen4GpuForwardScratch, ScratchField, DECODE_Q8_PER_LAYER, EPSILON,
 };
 use crate::ple_stage::ple_async_upload;
 use crate::program::{
@@ -357,7 +357,9 @@ pub enum LaneRowKind {
     /// An MTP verify block `[seed, drafts..]` of `1 + draft_len` rows
     /// (`2..=LANE_MAX_ROWS`), run under the lane's armed GDN ring exactly as
     /// the singleton `verify_block` runs it.
-    Verify { draft_len: usize },
+    Verify {
+        draft_len: usize,
+    },
     Prefill,
 }
 
@@ -555,7 +557,10 @@ impl SegViews {
                     seg.rows * std::mem::size_of::<i32>(),
                 ),
             ),
-            None => (view(&scratch.token_ids, 0, 0), view(&scratch.token_ids, 0, 0)),
+            None => (
+                view(&scratch.token_ids, 0, 0),
+                view(&scratch.token_ids, 0, 0),
+            ),
         };
         use ScratchField as F;
         let rows = |field: F, width: usize| seg_rows(scratch, field, seg, width);
@@ -656,12 +661,28 @@ impl SegViews {
 /// One operation of the layer program, placed by its stage's share.
 #[derive(Clone, Copy, Debug)]
 enum LaneOp {
-    HcRead { layer: usize, mlp: bool },
-    HcWrite { layer: usize, mlp: bool },
+    HcRead {
+        layer: usize,
+        mlp: bool,
+    },
+    HcWrite {
+        layer: usize,
+        mlp: bool,
+    },
     PleConv,
-    Gdn { layer: usize, slot: usize, phase: MixerPhase },
-    Qsa { layer: usize, slot: usize, phase: MixerPhase },
-    Moe { layer: usize },
+    Gdn {
+        layer: usize,
+        slot: usize,
+        phase: MixerPhase,
+    },
+    Qsa {
+        layer: usize,
+        slot: usize,
+        phase: MixerPhase,
+    },
+    Moe {
+        layer: usize,
+    },
 }
 
 /// The singleton layer program's operations in order, each with the stage
@@ -676,21 +697,22 @@ fn layer_program(
     let mut program = Vec::with_capacity(config.num_hidden_layers * 8 + 1);
     let mut gdn_slot = 0usize;
     let mut qsa_slot = 0usize;
-    let mixer_phases = |in_stage: StageName, out_stage: StageName| -> Vec<(MixerPhase, StageName)> {
-        let core = match in_stage {
-            StageName::GdnInProj => StageName::GdnCore,
-            _ => StageName::QsaCore,
+    let mixer_phases =
+        |in_stage: StageName, out_stage: StageName| -> Vec<(MixerPhase, StageName)> {
+            let core = match in_stage {
+                StageName::GdnInProj => StageName::GdnCore,
+                _ => StageName::QsaCore,
+            };
+            if policy.share(in_stage).per_lane() && policy.share(out_stage).per_lane() {
+                vec![(MixerPhase::Whole, core)]
+            } else {
+                vec![
+                    (MixerPhase::InProj, in_stage),
+                    (MixerPhase::Core, core),
+                    (MixerPhase::OutProj, out_stage),
+                ]
+            }
         };
-        if policy.share(in_stage).per_lane() && policy.share(out_stage).per_lane() {
-            vec![(MixerPhase::Whole, core)]
-        } else {
-            vec![
-                (MixerPhase::InProj, in_stage),
-                (MixerPhase::Core, core),
-                (MixerPhase::OutProj, out_stage),
-            ]
-        }
-    };
     for layer in 0..config.num_hidden_layers {
         if layer == ple_layer {
             program.push((LaneOp::PleConv, StageName::PleConv));
@@ -699,13 +721,27 @@ fn layer_program(
         match bundle.weights.layer_refs[layer].kind {
             LayerType::LinearAttention => {
                 for (phase, stage) in mixer_phases(StageName::GdnInProj, StageName::GdnOutProj) {
-                    program.push((LaneOp::Gdn { layer, slot: gdn_slot, phase }, stage));
+                    program.push((
+                        LaneOp::Gdn {
+                            layer,
+                            slot: gdn_slot,
+                            phase,
+                        },
+                        stage,
+                    ));
                 }
                 gdn_slot += 1;
             }
             LayerType::FullAttention => {
                 for (phase, stage) in mixer_phases(StageName::QsaInProj, StageName::QsaOutProj) {
-                    program.push((LaneOp::Qsa { layer, slot: qsa_slot, phase }, stage));
+                    program.push((
+                        LaneOp::Qsa {
+                            layer,
+                            slot: qsa_slot,
+                            phase,
+                        },
+                        stage,
+                    ));
                 }
                 qsa_slot += 1;
             }
@@ -747,7 +783,14 @@ pub(crate) fn forward_lanes(
     // kernels (`HIPFIRE_FN_LANE_PM_ROWS`, column-identical to the 1-row
     // incumbents); every other forward keeps the incumbents.
     let rows_scope = std::mem::replace(&mut gpu.lane_rows_scope, true);
-    let result = forward_lanes_scoped(gpu, &mut forward, bundle, lanes, &StepOutputs::Ar(out), policy);
+    let result = forward_lanes_scoped(
+        gpu,
+        &mut forward,
+        bundle,
+        lanes,
+        &StepOutputs::Ar(out),
+        policy,
+    );
     gpu.lane_rows_scope = rows_scope;
     gpu.qwen4_scope = scope;
     bundle.execution = Some(forward);
@@ -784,8 +827,8 @@ pub(crate) fn forward_wave(
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-    let invariant = rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
-        && gpu.arch == "gfx1151";
+    let invariant =
+        rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() && gpu.arch == "gfx1151";
     let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
     let result = forward_lanes_scoped(
         gpu,
@@ -826,6 +869,8 @@ fn forward_lanes_scoped(
     if lanes.is_empty() {
         return Err(invalid("a lane step needs at least one lane"));
     }
+    // Lane rows mix requests: the router fault row is the row inside the step.
+    gpu.set_router_row_base(0);
     let config = &bundle.config;
     let dims = program_dims(config);
     let vocab = config.vocab_size;
@@ -834,7 +879,9 @@ fn forward_lanes_scoped(
     let prefill = matches!(out, StepOutputs::Wave(_));
     for (lane, rows) in lanes.iter().zip(&rows) {
         if prefill != matches!(lane.kind, LaneRowKind::Prefill) {
-            return Err(invalid("a lane step is all AR/verify lanes or all prefill lanes"));
+            return Err(invalid(
+                "a lane step is all AR/verify lanes or all prefill lanes",
+            ));
         }
         let state = &*lane.state;
         match lane.kind {
@@ -899,9 +946,12 @@ fn forward_lanes_scoped(
     match out {
         StepOutputs::Ar(out) => {
             if out.logits.dtype != DType::F32 || out.logits.numel() < n * vocab {
-                return Err(invalid("lane logits must be F32 with total_rows * vocab elements"));
+                return Err(invalid(
+                    "lane logits must be F32 with total_rows * vocab elements",
+                ));
             }
-            if out.top1.dtype != DType::Raw || out.top1.buf.size() < n * std::mem::size_of::<i32>() {
+            if out.top1.dtype != DType::Raw || out.top1.buf.size() < n * std::mem::size_of::<i32>()
+            {
                 return Err(invalid("lane top1 must be Raw with one i32 per row"));
             }
         }
@@ -944,7 +994,12 @@ fn forward_lanes_scoped(
                 .map(|lane| lane.state.position + lane.tokens.len())
                 .max()
                 .unwrap_or(0);
-            if let Some(qsa) = lanes[0].state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
+            if let Some(qsa) = lanes[0]
+                .state
+                .qsa
+                .first()
+                .filter(|qsa| qsa.f16_arena.is_none())
+            {
                 rdna_compute::tensor_ops::ensure_qsa_gathered_wmma_workspace(
                     gpu,
                     qsa.format,
@@ -1000,7 +1055,13 @@ fn forward_lanes_scoped(
         }
         state
     };
-    let segs_for = |share: StageShare| if share.per_lane() { 0..lane_segs.len() } else { lane_segs.len()..lane_segs.len() + group_segs.len() };
+    let segs_for = |share: StageShare| {
+        if share.per_lane() {
+            0..lane_segs.len()
+        } else {
+            lane_segs.len()..lane_segs.len() + group_segs.len()
+        }
+    };
     let all_segs: Vec<Segment> = lane_segs.iter().chain(&group_segs).copied().collect();
     // A prefill wave's head runs per lane after the trunk (its own views), so
     // the policy's Head / Argmax segments exist only for AR steps.
@@ -1015,7 +1076,10 @@ fn forward_lanes_scoped(
     // description its singleton forward would get at its own routed rows
     // (one set for all segments under the invariant profile).
     let seg_desc_rows: Vec<usize> = if prefill {
-        all_segs.iter().map(|seg| gpu.route_rows(seg.rows)).collect()
+        all_segs
+            .iter()
+            .map(|seg| gpu.route_rows(seg.rows))
+            .collect()
     } else {
         vec![widest; all_segs.len()]
     };
@@ -1024,7 +1088,8 @@ fn forward_lanes_scoped(
     let mut row = 0usize;
     for lane in lanes.iter() {
         for &token in lane.tokens {
-            fwd.host_token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(token as i32).to_ne_bytes());
+            fwd.host_token_bytes[row * 4..row * 4 + 4]
+                .copy_from_slice(&(token as i32).to_ne_bytes());
             row += 1;
         }
     }
@@ -1069,8 +1134,10 @@ fn forward_lanes_scoped(
                 ple_head_count * ple_row_width,
             )?);
         }
-        let seg_scratch: Vec<Qwen4LayerScratch<'_>> =
-            views.iter().map(|view| view.layer_scratch(scratch)).collect();
+        let seg_scratch: Vec<Qwen4LayerScratch<'_>> = views
+            .iter()
+            .map(|view| view.layer_scratch(scratch))
+            .collect();
 
         // Per-layer weight descriptions, one set per distinct row count in
         // `seg_desc_rows` (AR: one set; decode copies bind for every
@@ -1081,7 +1148,8 @@ fn forward_lanes_scoped(
                 desc_rows.push(rows);
             }
         }
-        let mut desc_sets: Vec<Vec<Qwen4LayerDescription<'_>>> = Vec::with_capacity(desc_rows.len());
+        let mut desc_sets: Vec<Vec<Qwen4LayerDescription<'_>>> =
+            Vec::with_capacity(desc_rows.len());
         for &rows in &desc_rows {
             let mut descs: Vec<Qwen4LayerDescription<'_>> =
                 Vec::with_capacity(config.num_hidden_layers);
@@ -1109,7 +1177,14 @@ fn forward_lanes_scoped(
             .ok_or_else(|| invalid("PLE weights missing"))?;
         let ple_w = ple_desc(&bundle.weights, ple_weights)?;
         let ple_rows_f16_at = |gpu: &Gpu, rows: usize| {
-            qwen4_ple_rows_f16(gpu, bf16_state, dims.hc_count, config.hidden_size, &ple_w, rows)
+            qwen4_ple_rows_f16(
+                gpu,
+                bf16_state,
+                dims.hc_count,
+                config.hidden_size,
+                &ple_w,
+                rows,
+            )
         };
         let ple_rows_f16 = if prefill {
             // One value for the whole wave (the PLE conv runs per lane on the
@@ -1136,17 +1211,23 @@ fn forward_lanes_scoped(
         // Preflight the head of every segment before any launch.
         for i in segs_for(policy.share(StageName::FinalHyper)) {
             let (seg, v) = (&all_segs[i], &views[i]);
-            validate_final_hyper(dims, &final_hyper, &v.streams, &v.layer_scratch(scratch), seg.rows)
-                .map_err(|error| {
-                    Qwen4GpuForwardError::Dispatch(format!("validate lane final hyper: {error:?}"))
-                })?;
+            validate_final_hyper(
+                dims,
+                &final_hyper,
+                &v.streams,
+                &v.layer_scratch(scratch),
+                seg.rows,
+            )
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("validate lane final hyper: {error:?}"))
+            })?;
         }
         for i in ar_segs(policy.share(StageName::Head)) {
             let (seg, v) = (&all_segs[i], &views[i]);
             let hidden = view(&v.hc_mixed, 0, seg.rows * dims.hidden);
-            validate_lm_head(&lm_head, &hidden, &v.logits, seg.rows, seg.rows).map_err(|error| {
-                Qwen4GpuForwardError::Dispatch(format!("validate lane LM head: {error:?}"))
-            })?;
+            validate_lm_head(&lm_head, &hidden, &v.logits, seg.rows, seg.rows).map_err(
+                |error| Qwen4GpuForwardError::Dispatch(format!("validate lane LM head: {error:?}")),
+            )?;
         }
         // A prefill wave's per-lane head outputs and row requests: Final = the
         // lane's last row only (the singleton's `requested_rows == 1`), All =
@@ -1186,9 +1267,7 @@ fn forward_lanes_scoped(
             let (seg, v) = (&lane_segs[lane], &views[lane]);
             let hidden = view(&v.hc_mixed, 0, seg.rows * dims.hidden);
             validate_lm_head(&lm_head, &hidden, head_logits, seg.rows, *requested).map_err(
-                |error| {
-                    Qwen4GpuForwardError::Dispatch(format!("validate wave LM head: {error:?}"))
-                },
+                |error| Qwen4GpuForwardError::Dispatch(format!("validate wave LM head: {error:?}")),
             )?;
         }
 
@@ -1461,12 +1540,13 @@ fn forward_lanes_scoped(
                             let Qwen4FfnBinding::Moe(moe) = descs[layer].ffn else {
                                 return Err(invalid("lane steps run only the Flash-Next MoE FFN"));
                             };
-                            let sealed = seal_moe_for_layer(&ctx, dims, moe, &seg_scratch[i], r, rr)
-                                .map_err(|error| {
-                                    Qwen4GpuForwardError::Dispatch(format!(
-                                        "seal lane MoE: {error:?}"
-                                    ))
-                                })?;
+                            let sealed =
+                                seal_moe_for_layer(&ctx, dims, moe, &seg_scratch[i], r, rr)
+                                    .map_err(|error| {
+                                        Qwen4GpuForwardError::Dispatch(format!(
+                                            "seal lane MoE: {error:?}"
+                                        ))
+                                    })?;
                             steps.push(Step::Clear(ClearOp {
                                 tensor: &v.ffn_output,
                                 elements: r * config.hidden_size,
@@ -1502,7 +1582,9 @@ fn forward_lanes_scoped(
                     dim: config.hidden_size,
                 },
             )
-            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("lane embedding: {error:?}")))?;
+            .map_err(|error| {
+                Qwen4GpuForwardError::Dispatch(format!("lane embedding: {error:?}"))
+            })?;
         }
         for i in segs_for(embed_share) {
             let (seg, v) = (&all_segs[i], &views[i]);
@@ -1560,7 +1642,11 @@ fn forward_lanes_scoped(
         // F16 rows are compact halves at the base of their view, so they are
         // converted only through the lane views the PLE conv reads (the
         // gather is elementwise: the bytes equal the singleton's).
-        let ple_rows_segs = if ple_rows_f16 { 0..lane_segs.len() } else { segs_for(rows_share) };
+        let ple_rows_segs = if ple_rows_f16 {
+            0..lane_segs.len()
+        } else {
+            segs_for(rows_share)
+        };
         for i in ple_rows_segs {
             let (seg, v) = (&all_segs[i], &views[i]);
             let row_width = ple_head_count * ple_row_width;
@@ -1736,10 +1822,7 @@ mod tests {
     fn production_policy_round_trips_through_describe_and_parse() {
         let production = LaneStagePolicy::production();
         let described = production.describe();
-        let spec = format!(
-            "per-lane:{}",
-            described
-        );
+        let spec = format!("per-lane:{}", described);
         assert_eq!(LaneStagePolicy::parse(&spec).unwrap(), production);
         assert_eq!(LaneStagePolicy::parse("production").unwrap(), production);
         assert_eq!(described.split(',').count(), StageName::ALL.len());
@@ -1785,11 +1868,20 @@ mod tests {
         let rows = vec![1usize; 11];
         let lanes = lane_segments(&rows);
         assert_eq!(lanes.len(), 11);
-        assert!(lanes.iter().enumerate().all(|(i, s)| s.begin == i && s.rows == 1 && s.first_lane == i));
+        assert!(lanes
+            .iter()
+            .enumerate()
+            .all(|(i, s)| s.begin == i && s.rows == 1 && s.first_lane == i));
         let groups = group_segments(&rows);
         assert_eq!(groups.len(), 2);
-        assert_eq!((groups[0].begin, groups[0].rows, groups[0].first_lane), (0, 8, 0));
-        assert_eq!((groups[1].begin, groups[1].rows, groups[1].first_lane), (8, 3, 8));
+        assert_eq!(
+            (groups[0].begin, groups[0].rows, groups[0].first_lane),
+            (0, 8, 0)
+        );
+        assert_eq!(
+            (groups[1].begin, groups[1].rows, groups[1].first_lane),
+            (8, 3, 8)
+        );
         let wide = group_segments(&[3, 9, 2]);
         assert_eq!(wide.len(), 3);
         assert_eq!((wide[1].begin, wide[1].rows), (3, 9));

@@ -7,11 +7,11 @@
     "global_load_u8": 2,
     "global_store_b32": 8,
     "s_cbranch_scc0": 28,
-    "s_cbranch_scc1": 7,
+    "s_cbranch_scc1": 8,
     "s_endpgm": 1,
     "s_load_b128": 1,
     "s_load_b256": 2,
-    "s_load_b32": 1,
+    "s_load_b32": 2,
     "s_load_b64": 3,
     "v_add_f32_e32": 48,
     "v_add_lshl_u32": 5,
@@ -50,7 +50,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 80,
+  "sgpr_max": 81,
   "symbol": "mq_i4_moe_gemv_mq3i4_r128_down",
   "vgpr_max": 88
 }

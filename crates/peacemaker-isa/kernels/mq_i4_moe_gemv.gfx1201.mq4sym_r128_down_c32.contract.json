@@ -10,11 +10,11 @@
     "s_barrier_signal": 8,
     "s_barrier_wait": 8,
     "s_cbranch_scc0": 84,
-    "s_cbranch_scc1": 7,
+    "s_cbranch_scc1": 8,
     "s_endpgm": 1,
     "s_load_b128": 1,
     "s_load_b256": 2,
-    "s_load_b32": 1,
+    "s_load_b32": 2,
     "s_load_b64": 3,
     "v_add_f32_e32": 192,
     "v_add_lshl_u32": 5,
@@ -48,7 +48,7 @@
   "require_wave32": true,
   "require_zero_private": true,
   "require_zero_spills": true,
-  "sgpr_max": 84,
+  "sgpr_max": 85,
   "symbol": "mq_i4_moe_gemv_mq4sym_r128_down_c32",
   "vgpr_max": 80
 }

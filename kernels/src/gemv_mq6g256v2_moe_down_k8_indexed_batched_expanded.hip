@@ -67,7 +67,7 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const float* __restrict__ topk_weights,               // [N × K_TOP]
     float*       __restrict__ x_residual,                 // [N × M], in-place
 #endif
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row0 = blockIdx.x * 4;
     if (row0 >= M) return;
@@ -83,6 +83,16 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    const bool expert_valid = (unsigned)expert_id < (unsigned)n_experts;
+    if (!expert_valid) {
+        if (tid == 0) {
+            const long long out_inv = ((long long)bid * K_TOP + krank) * (long long)M;
+            expert_outputs[out_inv + row0] = 0.0f;
+            if (have_row1) expert_outputs[out_inv + row1] = 0.0f;
+            if (have_row2) expert_outputs[out_inv + row2] = 0.0f;
+            if (have_row3) expert_outputs[out_inv + row3] = 0.0f;
+        }
+    } else {
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
@@ -233,6 +243,8 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         if (have_row2) expert_outputs[out_base + row2] = ccc;
         if (have_row3) expert_outputs[out_base + row3] = dcc;
     }
+
+    }  // expert_valid
 
 #if HIPFIRE_MOE_DOWN_LAST_COMBINE
     // Preserve one independently schedulable expert wave per workgroup. Each

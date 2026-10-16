@@ -3,7 +3,7 @@
 //!
 //! Loads the code object `mq_i4_moe_gemv_pm_gfx1201` and its four symbols
 //! `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`, launches them with the
-//! frozen 88-byte F4 kernarg ABI (DESIGN §4.2, block 32, grid `(M, U, 1)`) and compares every
+//! frozen 96-byte F4 kernarg ABI (DESIGN §4.2 plus `n_experts@88` and a zero word at 92, block 32, grid `(M, U, 1)`) and compares every
 //! output word bit-for-bit (signed zeros and NaN payloads included) with a CPU oracle:
 //!
 //! * W3 (`mq3i4`): `mq_i4_reference::decode_moe_slots` (cross-checked against
@@ -44,7 +44,7 @@
 //!
 //! Wide twins (`--wide`, `--wide-only`, `--wide-c LIST`): the eight symbols
 //! `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}_c{16,32}` (grid `(ceil(M/8), 10*C, 1)`, block 256, the same
-//! 88-byte ABI with the production fixed-capacity descriptors: live experts first, `n == 0` tail up to `U = 10*C`).
+//! 96-byte ABI with the production fixed-capacity descriptors: live experts first, `n == 0` tail up to `U = 10*C`).
 //! For every C in the list (default 1..=32) and every route style (`pool`: ten distinct experts per lane from a small
 //! mixed pool so experts see 1..C slots; `ident`: every lane on the same ten experts so `n == C`; `disjoint`: ten fresh
 //! experts per lane, `U = 10*C`, at C in {1, 8, 9, 16, 17, 31, 32}) the lane union is launched through `_c16` (C <= 16)
@@ -81,7 +81,7 @@ const BUILD_COMMAND: &str =
 const DEFAULT_UUID: &str = "GPU-6109a4cb5f833235";
 const DEFAULT_BDF: &str = "0000:9a:00.0";
 const DEFAULT_ARCH: &str = "gfx1201";
-const KERNARG_BYTES: usize = 88;
+const KERNARG_BYTES: usize = 96;
 const N_EXPERTS: usize = 512;
 const GATE_M: usize = 1280;
 const GATE_K: usize = 2560;
@@ -508,7 +508,11 @@ fn gen_tensor(codec: Codec, kind: Kind, id: u32, special: bool) -> Vec<u8> {
     let mut scales = vec![0u16; m * groups];
     for r in 0..m {
         for g in 0..groups {
-            let class = if special { (r * 5 + g * 3 + salt) % 10 } else { 0 };
+            let class = if special {
+                (r * 5 + g * 3 + salt) % 10
+            } else {
+                0
+            };
             let sc = class_scale(class, codec, &mut rng);
             scales[r * groups + g] = sc;
             let base = r * k + g * 128;
@@ -535,7 +539,13 @@ fn gen_expert(id: u32, codec: Codec) -> Expert {
     let special = id % 3 != 2;
     let gate = gen_tensor(codec, Kind::GateUp, id, special);
     let down = gen_tensor(codec, Kind::Down, id, special);
-    Expert { codec, gate_sha: sha(&gate), down_sha: sha(&down), gate, down }
+    Expert {
+        codec,
+        gate_sha: sha(&gate),
+        down_sha: sha(&down),
+        gate,
+        down,
+    }
 }
 
 fn gen_x_row(style: usize, n: usize, rng: &mut Rng) -> Vec<f32> {
@@ -543,11 +553,19 @@ fn gen_x_row(style: usize, n: usize, rng: &mut Rng) -> Vec<f32> {
     for i in 0..n {
         let v = match style % 4 {
             0 => {
-                let (s, e, m) = (rng.u32() >> 31, 124 + rng.below(5) as u32, rng.u32() & 0x7f_ffff);
+                let (s, e, m) = (
+                    rng.u32() >> 31,
+                    124 + rng.below(5) as u32,
+                    rng.u32() & 0x7f_ffff,
+                );
                 f32::from_bits((s << 31) | (e << 23) | m)
             }
             1 => {
-                let (s, e, m) = (rng.u32() >> 31, 107 + rng.below(24) as u32, rng.u32() & 0x7f_ffff);
+                let (s, e, m) = (
+                    rng.u32() >> 31,
+                    107 + rng.below(24) as u32,
+                    rng.u32() & 0x7f_ffff,
+                );
                 f32::from_bits((s << 31) | (e << 23) | m)
             }
             2 => [16777216.0f32, 1.0, -16777216.0, 1.0][i % 4],
@@ -674,7 +692,11 @@ struct Bucket {
 /// Per-codec descriptor: ascending expert ids, slots in stable original order per expert,
 /// offsets spanning only this bucket's slots.
 fn build_bucket(route: &[u32], codec_of: &dyn Fn(u32) -> Codec, codec: Codec) -> Bucket {
-    let ids: BTreeSet<u32> = route.iter().copied().filter(|&e| codec_of(e) == codec).collect();
+    let ids: BTreeSet<u32> = route
+        .iter()
+        .copied()
+        .filter(|&e| codec_of(e) == codec)
+        .collect();
     let mut b = Bucket::default();
     for id in ids {
         b.ids.push(id);
@@ -691,7 +713,10 @@ fn build_bucket(route: &[u32], codec_of: &dyn Fn(u32) -> Codec, codec: Codec) ->
 
 fn buckets_of(case: &Case) -> [Bucket; 2] {
     let f = |e: u32| case.experts[&e].codec;
-    [build_bucket(&case.route, &f, Codec::W3), build_bucket(&case.route, &f, Codec::Mq4)]
+    [
+        build_bucket(&case.route, &f, Codec::W3),
+        build_bucket(&case.route, &f, Codec::Mq4),
+    ]
 }
 
 fn pick_ids(rng: &mut Rng, n: usize, edges: bool) -> Vec<u32> {
@@ -707,7 +732,10 @@ fn pick_ids(rng: &mut Rng, n: usize, edges: bool) -> Vec<u32> {
 }
 
 fn experts_for(ids: &[u32], codec_of: impl Fn(usize, u32) -> Codec) -> BTreeMap<u32, Rc<Expert>> {
-    ids.iter().enumerate().map(|(i, &id)| (id, Rc::new(gen_expert(id, codec_of(i, id))))).collect()
+    ids.iter()
+        .enumerate()
+        .map(|(i, &id)| (id, Rc::new(gen_expert(id, codec_of(i, id)))))
+        .collect()
 }
 
 const MIXED10: [Codec; 10] = [
@@ -735,8 +763,15 @@ fn lane_routes(rng: &mut Rng, pool: &[u32], c: usize) -> Vec<u32> {
 
 /// Random codec per id with `w3_tenths`/10 W3 probability; both codecs forced present when mixed.
 fn mixed_codecs(rng: &mut Rng, n: usize, w3_tenths: usize) -> Vec<Codec> {
-    let mut codecs: Vec<Codec> =
-        (0..n).map(|_| if rng.below(10) < w3_tenths { Codec::W3 } else { Codec::Mq4 }).collect();
+    let mut codecs: Vec<Codec> = (0..n)
+        .map(|_| {
+            if rng.below(10) < w3_tenths {
+                Codec::W3
+            } else {
+                Codec::Mq4
+            }
+        })
+        .collect();
     if w3_tenths > 0 && w3_tenths < 10 {
         codecs[0] = Codec::W3;
         codecs[n - 1] = Codec::Mq4;
@@ -772,12 +807,25 @@ fn build_synthetic(name: &str) -> Case {
             build_case(name, "synthetic", 1, route, experts, false, false, shift)
         }
         "c1_all_w3" | "c1_all_mq4" => {
-            let codec = if name == "c1_all_w3" { Codec::W3 } else { Codec::Mq4 };
+            let codec = if name == "c1_all_w3" {
+                Codec::W3
+            } else {
+                Codec::Mq4
+            };
             let ids = pick_ids(&mut rng, 10, true);
             let experts = experts_for(&ids, |_, _| codec);
             let mut route = ids.clone();
             rng.shuffle(&mut route);
-            build_case(name, "synthetic", 1, route, experts, false, codec == Codec::Mq4, 0)
+            build_case(
+                name,
+                "synthetic",
+                1,
+                route,
+                experts,
+                false,
+                codec == Codec::Mq4,
+                0,
+            )
         }
         "c1_mixed_1w3_9mq4" | "c1_mixed_9w3_1mq4" => {
             let ids = pick_ids(&mut rng, 10, true);
@@ -802,7 +850,10 @@ fn build_synthetic(name: &str) -> Case {
             let route = lane_routes(&mut rng, &ids, 3);
             build_case(name, "synthetic", 3, route, experts, false, false, 0)
         }
-        "c8_union_repeated_mixed" | "c8_union_all_w3" | "c8_union_all_mq4" | "c8_padded_strides_mixed" => {
+        "c8_union_repeated_mixed"
+        | "c8_union_all_w3"
+        | "c8_union_all_mq4"
+        | "c8_padded_strides_mixed" => {
             let ids = pick_ids(&mut rng, 14, true);
             let codecs: Vec<Codec> = match name {
                 "c8_union_all_w3" => vec![Codec::W3; ids.len()],
@@ -812,7 +863,16 @@ fn build_synthetic(name: &str) -> Case {
             let experts = experts_for(&ids, |i, _| codecs[i]);
             let route = lane_routes(&mut rng, &ids, 8);
             let padded = name == "c8_padded_strides_mixed";
-            build_case(name, "synthetic", 8, route, experts, padded, name == "c8_union_all_mq4", 0)
+            build_case(
+                name,
+                "synthetic",
+                8,
+                route,
+                experts,
+                padded,
+                name == "c8_union_all_mq4",
+                0,
+            )
         }
         "c8_unique_80_mixed" => {
             let ids = pick_ids(&mut rng, 80, true);
@@ -873,7 +933,10 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
     let mut avail: BTreeMap<Codec, Vec<u32>> = BTreeMap::new();
     let (mut w2, mut other) = (0usize, 0usize);
     for e in 0..N_EXPERTS {
-        let (gn, dn) = (expert_entry(layer, e, "gate_up_proj"), expert_entry(layer, e, "down_proj"));
+        let (gn, dn) = (
+            expert_entry(layer, e, "gate_up_proj"),
+            expert_entry(layer, e, "down_proj"),
+        );
         let (Some(g), Some(d)) = (hfq.find_tensor_info(&gn), hfq.find_tensor_info(&dn)) else {
             continue;
         };
@@ -889,9 +952,10 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
                 continue;
             }
         };
-        let shape_ok = g.shape == [GATE_M as u32, GATE_K as u32] && d.shape == [DOWN_M as u32, DOWN_K as u32];
-        let size_ok =
-            g.data_size == Kind::GateUp.tensor_bytes(codec) && d.data_size == Kind::Down.tensor_bytes(codec);
+        let shape_ok =
+            g.shape == [GATE_M as u32, GATE_K as u32] && d.shape == [DOWN_M as u32, DOWN_K as u32];
+        let size_ok = g.data_size == Kind::GateUp.tensor_bytes(codec)
+            && d.data_size == Kind::Down.tensor_bytes(codec);
         if !shape_ok || !size_ok {
             return Err(format!(
                 "layer {layer} expert {e}: unexpected shape/size for {} (gate {:?}/{} down {:?}/{})",
@@ -922,7 +986,8 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
         take_w3 = (want - take_mq4).min(a.len());
         take_mq4 = (want - take_w3).min(b.len());
     }
-    let spread = |v: &Vec<u32>, n: usize| -> Vec<u32> { (0..n).map(|i| v[i * v.len() / n]).collect() };
+    let spread =
+        |v: &Vec<u32>, n: usize| -> Vec<u32> { (0..n).map(|i| v[i * v.len() / n]).collect() };
     let (sel_w3, sel_mq4) = (spread(&a, take_w3), spread(&b, take_mq4));
     if sel_w3.len() + sel_mq4.len() < 10 {
         return Err(format!(
@@ -938,9 +1003,13 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
         for &id in ids {
             let gn = expert_entry(layer, id as usize, "gate_up_proj");
             let dn = expert_entry(layer, id as usize, "down_proj");
-            let (gi, gate) = hfq.tensor_data_vec(&gn).ok_or_else(|| format!("short read of {gn}"))?;
+            let (gi, gate) = hfq
+                .tensor_data_vec(&gn)
+                .ok_or_else(|| format!("short read of {gn}"))?;
             let (gq, goff, gsz) = (gi.quant_type, gi.data_offset, gi.data_size);
-            let (di, down) = hfq.tensor_data_vec(&dn).ok_or_else(|| format!("short read of {dn}"))?;
+            let (di, down) = hfq
+                .tensor_data_vec(&dn)
+                .ok_or_else(|| format!("short read of {dn}"))?;
             let (dq, doff, dsz) = (di.quant_type, di.data_offset, di.data_size);
             match codec {
                 Codec::W3 => {
@@ -950,7 +1019,8 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
                         .map_err(|e| format!("{dn}: {e}"))?;
                 }
                 Codec::Mq4 => {
-                    violations += mq4_sym_violations(Kind::GateUp, &gate) + mq4_sym_violations(Kind::Down, &down)
+                    violations += mq4_sym_violations(Kind::GateUp, &gate)
+                        + mq4_sym_violations(Kind::Down, &down)
                 }
             }
             let (gs, ds) = (sha(&gate), sha(&down));
@@ -965,7 +1035,16 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
                 "down_offset": doff, "down_bytes": dsz, "down_sha256": hex(&ds),
                 "contiguous_gate_down": goff + gsz == doff,
             }));
-            experts.insert(id, Rc::new(Expert { codec, gate_sha: gs, down_sha: ds, gate, down }));
+            experts.insert(
+                id,
+                Rc::new(Expert {
+                    codec,
+                    gate_sha: gs,
+                    down_sha: ds,
+                    gate,
+                    down,
+                }),
+            );
         }
     }
     let meta = json!({
@@ -978,12 +1057,21 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
         "selected_input_sha256": hex(&sha(lines.as_bytes())),
         "experts": recs,
     });
-    Ok(Real { experts, meta, mq4_sym_violations: violations })
+    Ok(Real {
+        experts,
+        meta,
+        mq4_sym_violations: violations,
+    })
 }
 
 fn real_cases(real: &Real, origin: &'static str, prefix: &str, wide: bool) -> Vec<Case> {
     let all: Vec<u32> = real.experts.keys().copied().collect();
-    let by = |c: Codec| -> Vec<u32> { all.iter().copied().filter(|id| real.experts[id].codec == c).collect() };
+    let by = |c: Codec| -> Vec<u32> {
+        all.iter()
+            .copied()
+            .filter(|id| real.experts[id].codec == c)
+            .collect()
+    };
     let (w3, mq4) = (by(Codec::W3), by(Codec::Mq4));
     let mut rng = Rng::new(0x7ea1_1a7e);
     // C1: 10 experts, as balanced as the pool allows, route order shuffled.
@@ -1000,15 +1088,45 @@ fn real_cases(real: &Real, origin: &'static str, prefix: &str, wide: bool) -> Ve
     }
     let mut route1 = ids.clone();
     rng.shuffle(&mut route1);
-    let sub: BTreeMap<u32, Rc<Expert>> = ids.iter().map(|id| (*id, real.experts[id].clone())).collect();
-    let c1 = build_case(&format!("{prefix}_c1_mixed"), origin, 1, route1, sub, false, false, 0);
+    let sub: BTreeMap<u32, Rc<Expert>> = ids
+        .iter()
+        .map(|id| (*id, real.experts[id].clone()))
+        .collect();
+    let c1 = build_case(
+        &format!("{prefix}_c1_mixed"),
+        origin,
+        1,
+        route1,
+        sub,
+        false,
+        false,
+        0,
+    );
     let route8 = lane_routes(&mut rng, &all, 8);
-    let c8 = build_case(&format!("{prefix}_c8_union_mixed"), origin, 8, route8, real.experts.clone(), false, false, 1);
+    let c8 = build_case(
+        &format!("{prefix}_c8_union_mixed"),
+        origin,
+        8,
+        route8,
+        real.experts.clone(),
+        false,
+        false,
+        1,
+    );
     let mut cases = vec![c1, c8];
     if wide {
         for (i, c) in [9usize, 16, 17, 32].into_iter().enumerate() {
             let route = lane_routes(&mut rng, &all, c);
-            let mut case = build_case(&format!("{prefix}_c{c}_union_mixed"), origin, c, route, real.experts.clone(), c % 2 == 1, false, 2 + i);
+            let mut case = build_case(
+                &format!("{prefix}_c{c}_union_mixed"),
+                origin,
+                c,
+                route,
+                real.experts.clone(),
+                c % 2 == 1,
+                false,
+                2 + i,
+            );
             case.wide = true;
             cases.push(case);
         }
@@ -1048,7 +1166,10 @@ fn hot_map_formats(root: &Value, layer: usize) -> Result<Vec<ExpertFormat>> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("map has no layers[\"{layer}\"] array"))?;
     if row.len() != N_EXPERTS {
-        return Err(format!("map layers[\"{layer}\"] has {} experts, expected {N_EXPERTS}", row.len()));
+        return Err(format!(
+            "map layers[\"{layer}\"] has {} experts, expected {N_EXPERTS}",
+            row.len()
+        ));
     }
     row.iter()
         .enumerate()
@@ -1056,7 +1177,9 @@ fn hot_map_formats(root: &Value, layer: usize) -> Result<Vec<ExpertFormat>> {
             Some("w3") => Ok(ExpertFormat::Mq3I4),
             Some("w2") => Ok(ExpertFormat::Mq2I4),
             Some("xts_mq4") => Ok(ExpertFormat::Mq4Xts),
-            other => Err(format!("map layers[\"{layer}\"][{e}] = {other:?} is not w3/w2/xts_mq4")),
+            other => Err(format!(
+                "map layers[\"{layer}\"][{e}] = {other:?} is not w3/w2/xts_mq4"
+            )),
         })
         .collect()
 }
@@ -1084,20 +1207,33 @@ fn spread(v: &[u32], n: usize) -> Vec<u32> {
 /// per-expert gate/down slices of the XTS aggregate tensors, read through `HfqFile` + the source entry span.
 fn load_records(cfg: &Cfg) -> Result<Real> {
     let layer = cfg.layer;
-    let (dir, manifest_path, alloc_path, xts_path) = match (&cfg.records_dir, &cfg.records_manifest, &cfg.alloc, &cfg.xts) {
+    let (dir, manifest_path, alloc_path, xts_path) = match (
+        &cfg.records_dir,
+        &cfg.records_manifest,
+        &cfg.alloc,
+        &cfg.xts,
+    ) {
         (Some(d), Some(m), Some(a), Some(x)) => (d.as_str(), m.as_str(), a.as_str(), x.as_str()),
-        _ => return Err("certified-records mode needs --records-dir, --records-manifest, --alloc and --xts".into()),
+        _ => {
+            return Err(
+                "certified-records mode needs --records-dir, --records-manifest, --alloc and --xts"
+                    .into(),
+            )
+        }
     };
     // Manifest identity.
-    let manifest_bytes = std::fs::read(manifest_path).map_err(|e| format!("{manifest_path}: {e}"))?;
+    let manifest_bytes =
+        std::fs::read(manifest_path).map_err(|e| format!("{manifest_path}: {e}"))?;
     let manifest_sha = hex(&sha(&manifest_bytes));
     if let Some(want) = &cfg.records_manifest_sha256 {
         if *want != manifest_sha {
             return Err(format!("manifest sha256 {manifest_sha} != expected {want}"));
         }
     }
-    let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|e| format!("{manifest_path}: {e}"))?;
-    let want_expert_bytes = Kind::GateUp.tensor_bytes(Codec::W3) + Kind::Down.tensor_bytes(Codec::W3);
+    let manifest: Value =
+        serde_json::from_slice(&manifest_bytes).map_err(|e| format!("{manifest_path}: {e}"))?;
+    let want_expert_bytes =
+        Kind::GateUp.tensor_bytes(Codec::W3) + Kind::Down.tensor_bytes(Codec::W3);
     let header_ok = manifest.get("layer").and_then(Value::as_u64) == Some(layer as u64)
         && manifest.get("bits").and_then(Value::as_u64) == Some(3)
         && manifest.get("grid").and_then(Value::as_str) == Some("uniform")
@@ -1106,8 +1242,10 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
         return Err(format!("{manifest_path}: header is not layer {layer} / bits 3 / grid uniform / expert_bytes {want_expert_bytes}"));
     }
     // Allocation (+ optional hot map cross-check).
-    let alloc = load_allocation(Path::new(alloc_path), &cfg.alloc_point, SlabGeometry::FN).map_err(err)?;
-    let formats: Vec<ExpertFormat> = alloc.formats[layer * N_EXPERTS..(layer + 1) * N_EXPERTS].to_vec();
+    let alloc =
+        load_allocation(Path::new(alloc_path), &cfg.alloc_point, SlabGeometry::FN).map_err(err)?;
+    let formats: Vec<ExpertFormat> =
+        alloc.formats[layer * N_EXPERTS..(layer + 1) * N_EXPERTS].to_vec();
     let mut map_meta = Value::Null;
     if let Some(map_path) = &cfg.map {
         let bytes = std::fs::read(map_path).map_err(|e| format!("{map_path}: {e}"))?;
@@ -1127,12 +1265,19 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
         }
     }
     if cold.is_empty() || hot.is_empty() {
-        return Err(format!("layer {layer} allocation has no mixed W3/MQ4 experts (w3={}, mq4={}, w2={w2})", cold.len(), hot.len()));
+        return Err(format!(
+            "layer {layer} allocation has no mixed W3/MQ4 experts (w3={}, mq4={}, w2={w2})",
+            cold.len(),
+            hot.len()
+        ));
     }
     let (take_w3, take_mq4) = select_counts(cold.len(), hot.len(), cfg.real_experts);
     let (sel_w3, sel_mq4) = (spread(&cold, take_w3), spread(&hot, take_mq4));
     if sel_w3.len() + sel_mq4.len() < 10 {
-        return Err(format!("layer {layer}: only {} usable experts; a top-10 lane needs 10", sel_w3.len() + sel_mq4.len()));
+        return Err(format!(
+            "layer {layer}: only {} usable experts; a top-10 lane needs 10",
+            sel_w3.len() + sel_mq4.len()
+        ));
     }
     // XTS source: identity, aggregate layout, then only the selected spans.
     let (xts_sha, xts_len) = file_sha256(xts_path)?;
@@ -1144,28 +1289,47 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
     let hfq = HfqFile::open_at_offset(Path::new(xts_path), 0).map_err(err)?;
     let mut aggregates = Vec::new();
     let mut agg_span: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
-    for (kind, proj, qt, group) in [(Kind::GateUp, ExpertProj::GateUp, 44u8, 256u32), (Kind::Down, ExpertProj::Down, 53u8, 128u32)] {
+    for (kind, proj, qt, group) in [
+        (Kind::GateUp, ExpertProj::GateUp, 44u8, 256u32),
+        (Kind::Down, ExpertProj::Down, 53u8, 128u32),
+    ] {
         let name = SlabGeometry::aggregate_name(layer, proj);
-        let info = hfq.find_tensor_info(&name).ok_or_else(|| format!("{xts_path}: missing aggregate `{name}`"))?;
+        let info = hfq
+            .find_tensor_info(&name)
+            .ok_or_else(|| format!("{xts_path}: missing aggregate `{name}`"))?;
         let per = kind.tensor_bytes(Codec::Mq4);
         let want_shape = vec![N_EXPERTS as u32, kind.m() as u32, kind.k() as u32];
-        if info.quant_type != qt || info.shape != want_shape || info.group_size != group || info.data_size != N_EXPERTS * per {
+        if info.quant_type != qt
+            || info.shape != want_shape
+            || info.group_size != group
+            || info.data_size != N_EXPERTS * per
+        {
             return Err(format!(
                 "aggregate `{name}` is qt{} shape {:?} group {} {} B; expected qt{qt} shape {want_shape:?} group {group} {} B",
                 info.quant_type, info.shape, info.group_size, info.data_size, N_EXPERTS * per
             ));
         }
-        aggregates.push(json!({"name": name, "quant_type": qt, "shape": want_shape, "group_size": group,
-            "data_offset": info.data_offset, "data_size": info.data_size, "per_expert_bytes": per}));
+        aggregates.push(
+            json!({"name": name, "quant_type": qt, "shape": want_shape, "group_size": group,
+            "data_offset": info.data_offset, "data_size": info.data_size, "per_expert_bytes": per}),
+        );
         agg_span.insert(kind.suffix(), (info.data_offset, per));
     }
     let xts_slice = |kind: Kind, e: u32| -> Result<(Vec<u8>, usize)> {
         let (base, per) = agg_span[kind.suffix()];
         let off = base + e as usize * per;
-        let s = hfq.data_range(off, per).ok_or_else(|| format!("{xts_path}: cannot map {} bytes at {off} (mmap dropped or range past EOF)", per))?;
+        let s = hfq.data_range(off, per).ok_or_else(|| {
+            format!(
+                "{xts_path}: cannot map {} bytes at {off} (mmap dropped or range past EOF)",
+                per
+            )
+        })?;
         Ok((s.to_vec(), off))
     };
-    let shapes = I4RecordShapes { gate_up: [GATE_M, GATE_K], down: [DOWN_M, DOWN_K] };
+    let shapes = I4RecordShapes {
+        gate_up: [GATE_M, GATE_K],
+        down: [DOWN_M, DOWN_K],
+    };
     let manifest_entry = |e: u32| manifest.get("experts").and_then(|x| x.get(format!("E{e}")));
     let mut experts = BTreeMap::new();
     let mut lines = String::new();
@@ -1176,20 +1340,40 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
             let (gate, down, rec_meta) = match codec {
                 Codec::W3 => {
                     let npz = Path::new(dir).join(format!("E{id}.npz"));
-                    let rec = I4ExpertFinalCodeRecord::import_npz_file(&npz, layer, id as usize, ExpertFormat::Mq3I4, shapes)
-                        .map_err(|e| format!("{}: {e}", npz.display()))?;
-                    let entry = manifest_entry(id).ok_or_else(|| format!("{manifest_path}: no experts.E{id}"))?;
-                    if entry.get("npz_sha256").and_then(Value::as_str) != Some(rec.source_npz_sha256.as_str()) {
-                        return Err(format!("{}: npz sha256 {} != manifest {:?}", npz.display(), rec.source_npz_sha256, entry.get("npz_sha256")));
+                    let rec = I4ExpertFinalCodeRecord::import_npz_file(
+                        &npz,
+                        layer,
+                        id as usize,
+                        ExpertFormat::Mq3I4,
+                        shapes,
+                    )
+                    .map_err(|e| format!("{}: {e}", npz.display()))?;
+                    let entry = manifest_entry(id)
+                        .ok_or_else(|| format!("{manifest_path}: no experts.E{id}"))?;
+                    if entry.get("npz_sha256").and_then(Value::as_str)
+                        != Some(rec.source_npz_sha256.as_str())
+                    {
+                        return Err(format!(
+                            "{}: npz sha256 {} != manifest {:?}",
+                            npz.display(),
+                            rec.source_npz_sha256,
+                            entry.get("npz_sha256")
+                        ));
                     }
                     let mut pack = rec.gate_up.bytes.clone();
                     pack.extend_from_slice(&rec.down.bytes);
                     let pack_sha = hex(&sha(&pack));
                     if entry.get("sha256").and_then(Value::as_str) != Some(pack_sha.as_str()) {
-                        return Err(format!("{}: encoded gate++down sha256 {pack_sha} != manifest {:?}", npz.display(), entry.get("sha256")));
+                        return Err(format!(
+                            "{}: encoded gate++down sha256 {pack_sha} != manifest {:?}",
+                            npz.display(),
+                            entry.get("sha256")
+                        ));
                     }
-                    mq_i4::decode_tensor(MqI4Profile::MQ3_R256, GATE_M, GATE_K, &rec.gate_up.bytes).map_err(err)?;
-                    mq_i4::decode_tensor(MqI4Profile::MQ3_R128, DOWN_M, DOWN_K, &rec.down.bytes).map_err(err)?;
+                    mq_i4::decode_tensor(MqI4Profile::MQ3_R256, GATE_M, GATE_K, &rec.gate_up.bytes)
+                        .map_err(err)?;
+                    mq_i4::decode_tensor(MqI4Profile::MQ3_R128, DOWN_M, DOWN_K, &rec.down.bytes)
+                        .map_err(err)?;
                     let meta = json!({"source": "r1_npz_record", "npz_path": npz.display().to_string(),
                         "npz_sha256": rec.source_npz_sha256, "manifest_npz_sha256_match": true,
                         "manifest_pack_sha256": pack_sha, "manifest_pack_sha256_match": true,
@@ -1199,18 +1383,33 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
                 Codec::Mq4 => {
                     let (gate, goff) = xts_slice(Kind::GateUp, id)?;
                     let (down, doff) = xts_slice(Kind::Down, id)?;
-                    violations += mq4_sym_violations(Kind::GateUp, &gate) + mq4_sym_violations(Kind::Down, &down);
+                    violations += mq4_sym_violations(Kind::GateUp, &gate)
+                        + mq4_sym_violations(Kind::Down, &down);
                     let meta = json!({"source": "xts_aggregate_slice", "gate_source_offset": goff, "down_source_offset": doff});
                     (gate, down, meta)
                 }
             };
             let (gs, ds) = (sha(&gate), sha(&down));
-            lines.push_str(&format!("{} {id} {} {}\n", codec.label(), hex(&gs), hex(&ds)));
+            lines.push_str(&format!(
+                "{} {id} {} {}\n",
+                codec.label(),
+                hex(&gs),
+                hex(&ds)
+            ));
             let mut rec_json = json!({"expert": id, "codec": codec.label(), "gate_bytes": gate.len(), "gate_sha256": hex(&gs),
                 "down_bytes": down.len(), "down_sha256": hex(&ds)});
             rec_json["provenance"] = rec_meta;
             recs.push(rec_json);
-            experts.insert(id, Rc::new(Expert { codec, gate_sha: gs, down_sha: ds, gate, down }));
+            experts.insert(
+                id,
+                Rc::new(Expert {
+                    codec,
+                    gate_sha: gs,
+                    down_sha: ds,
+                    gate,
+                    down,
+                }),
+            );
         }
     }
     let meta = json!({
@@ -1230,7 +1429,11 @@ fn load_records(cfg: &Cfg) -> Result<Real> {
         "selected_input_sha256": hex(&sha(lines.as_bytes())),
         "experts": recs,
     });
-    Ok(Real { experts, meta, mq4_sym_violations: violations })
+    Ok(Real {
+        experts,
+        meta,
+        mq4_sym_violations: violations,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1248,27 +1451,39 @@ struct Dev<'a> {
 }
 impl<'a> Dev<'a> {
     fn new(hip: &'a HipRuntime) -> Self {
-        Dev { hip, bufs: Vec::new() }
+        Dev {
+            hip,
+            bufs: Vec::new(),
+        }
     }
     fn alloc(&mut self, n: usize) -> Result<Buf> {
         let b = self.hip.malloc(n.max(4)).map_err(err)?;
         let ptr = b.as_ptr() as u64;
         self.bufs.push(b);
-        Ok(Buf { idx: self.bufs.len() - 1, ptr })
+        Ok(Buf {
+            idx: self.bufs.len() - 1,
+            ptr,
+        })
     }
     fn upload(&mut self, bytes: &[u8]) -> Result<Buf> {
         let b = self.alloc(bytes.len())?;
-        self.hip.memcpy_htod(&self.bufs[b.idx], bytes).map_err(err)?;
+        self.hip
+            .memcpy_htod(&self.bufs[b.idx], bytes)
+            .map_err(err)?;
         Ok(b)
     }
     fn fill(&mut self, n: usize, value: i32) -> Result<Buf> {
         let b = self.alloc(n)?;
-        self.hip.memset(&self.bufs[b.idx], value, n.max(4)).map_err(err)?;
+        self.hip
+            .memset(&self.bufs[b.idx], value, n.max(4))
+            .map_err(err)?;
         Ok(b)
     }
     fn download(&self, b: Buf, n: usize) -> Result<Vec<u8>> {
         let mut out = vec![0u8; n];
-        self.hip.memcpy_dtoh(&mut out, &self.bufs[b.idx]).map_err(err)?;
+        self.hip
+            .memcpy_dtoh(&mut out, &self.bufs[b.idx])
+            .map_err(err)?;
         Ok(out)
     }
     fn release(self) {
@@ -1317,7 +1532,17 @@ fn kernarg(
     for (i, p) in ptrs.iter().enumerate() {
         a[i * 8..i * 8 + 8].copy_from_slice(&p.to_le_bytes());
     }
-    for (off, v) in [(56, m), (60, k), (64, u), (68, c), (72, xdiv), (76, xsrc), (80, xrs), (84, ys)] {
+    for (off, v) in [
+        (56, m),
+        (60, k),
+        (64, u),
+        (68, c),
+        (72, xdiv),
+        (76, xsrc),
+        (80, xrs),
+        (84, ys),
+        (88, N_EXPERTS),
+    ] {
         a[off..off + 4].copy_from_slice(&(v as u32).to_le_bytes());
     }
     a
@@ -1335,14 +1560,24 @@ struct Ctx {
 }
 impl Ctx {
     fn func(&self, codec: Codec, kind: Kind) -> &Function {
-        &self.funcs.iter().find(|(c, k, _)| *c == codec && *k == kind).expect("all four symbols loaded").2
+        &self
+            .funcs
+            .iter()
+            .find(|(c, k, _)| *c == codec && *k == kind)
+            .expect("all four symbols loaded")
+            .2
     }
     fn wide_func(&self, codec: Codec, kind: Kind, cap: Cap) -> Result<&Function> {
         self.wide_funcs
             .iter()
             .find(|(c, k, p, _)| *c == codec && *k == kind && *p == cap)
             .map(|e| &e.3)
-            .ok_or_else(|| format!("wide symbol {} not loaded (pass --wide)", symbol_cap(codec, kind, cap)))
+            .ok_or_else(|| {
+                format!(
+                    "wide symbol {} not loaded (pass --wide)",
+                    symbol_cap(codec, kind, cap)
+                )
+            })
     }
 }
 
@@ -1375,7 +1610,11 @@ fn cpu_expected(case: &Case, kind: Kind, buckets: &[Bucket; 2]) -> Expected {
     let n = 10 * case.c * ys;
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let mut y0 = vec![sentinel; n];
-    let mut y1 = if kind == Kind::GateUp { Some(vec![sentinel; n]) } else { None };
+    let mut y1 = if kind == Kind::GateUp {
+        Some(vec![sentinel; n])
+    } else {
+        None
+    };
     let _ = n;
     let mut twin_mismatches = 0u64;
     let mut checked = 0usize;
@@ -1385,7 +1624,10 @@ fn cpu_expected(case: &Case, kind: Kind, buckets: &[Bucket; 2]) -> Expected {
         let mut exps: Vec<Option<ExpertTensor<'_>>> = (0..N_EXPERTS).map(|_| None).collect();
         for (&id, e) in &case.experts {
             if e.codec == Codec::W3 {
-                exps[id as usize] = Some(ExpertTensor { profile: kind.w3_profile(), bytes: proj_bytes(e, kind) });
+                exps[id as usize] = Some(ExpertTensor {
+                    profile: kind.w3_profile(),
+                    bytes: proj_bytes(e, kind),
+                });
             }
         }
         mq_i4_reference::decode_moe_slots(
@@ -1411,7 +1653,13 @@ fn cpu_expected(case: &Case, kind: Kind, buckets: &[Bucket; 2]) -> Expected {
             let slot = slot as usize;
             let e = &case.experts[&case.route[slot]];
             let xs = &x[(slot / kind.x_row_div()) * xrs..][..kind.k()];
-            let row = mq_i4_reference::decode_gemv_f32(kind.w3_profile(), kind.m(), kind.k(), proj_bytes(e, kind), xs);
+            let row = mq_i4_reference::decode_gemv_f32(
+                kind.w3_profile(),
+                kind.m(),
+                kind.k(),
+                proj_bytes(e, kind),
+                xs,
+            );
             for (r, v) in row.iter().enumerate() {
                 let got = if r < kind.out_rows() {
                     y0[slot * ys + r]
@@ -1436,7 +1684,12 @@ fn cpu_expected(case: &Case, kind: Kind, buckets: &[Bucket; 2]) -> Expected {
         }
         mq4_decode_moe_slots(kind, &exps, b, x, xrs, ys, &mut y0, y1.as_deref_mut());
     }
-    Expected { y0, y1, twin_mismatches, twin_slots_checked: checked }
+    Expected {
+        y0,
+        y1,
+        twin_mismatches,
+        twin_slots_checked: checked,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1522,7 +1775,11 @@ fn run_kind(
     let tb = dev.upload(&u64_bytes(&table))?;
     let n_words = slots * ys;
     let y0 = dev.fill(n_words * 4, 0xa5)?;
-    let y1 = if kind == Kind::GateUp { Some(dev.fill(n_words * 4, 0xa5)?) } else { None };
+    let y1 = if kind == Kind::GateUp {
+        Some(dev.fill(n_words * 4, 0xa5)?)
+    } else {
+        None
+    };
 
     let mut symbols = Vec::new();
     let mut prepared: Vec<(Codec, [u8; KERNARG_BYTES], [u32; 3])> = Vec::new();
@@ -1537,7 +1794,15 @@ fn run_kind(
         let ob = dev.upload(&u32_bytes(&b.offs))?;
         let sb = dev.upload(&u32_bytes(&b.slots))?;
         let args = kernarg(
-            [tb.ptr, ib.ptr, ob.ptr, sb.ptr, xb.ptr, y0.ptr, y1.map_or(0, |b| b.ptr)],
+            [
+                tb.ptr,
+                ib.ptr,
+                ob.ptr,
+                sb.ptr,
+                xb.ptr,
+                y0.ptr,
+                y1.map_or(0, |b| b.ptr),
+            ],
             m,
             k,
             b.ids.len(),
@@ -1551,9 +1816,12 @@ fn run_kind(
     }
     for (codec, args, grid) in &prepared {
         let mut a = *args;
-        // SAFETY: exact 88-byte ABI; every pointer is a live allocation of `dev` until release.
-        unsafe { ctx.hip.launch_kernel_blob(ctx.func(*codec, kind), *grid, [32, 1, 1], 0, None, &mut a) }
-            .map_err(err)?;
+        // SAFETY: exact 96-byte ABI; every pointer is a live allocation of `dev` until release.
+        unsafe {
+            ctx.hip
+                .launch_kernel_blob(ctx.func(*codec, kind), *grid, [32, 1, 1], 0, None, &mut a)
+        }
+        .map_err(err)?;
     }
     ctx.hip.device_synchronize().map_err(err)?;
 
@@ -1561,7 +1829,16 @@ fn run_kind(
     let mut per = [Mm::default(), Mm::default()];
     let mut stray = Mm::default();
     let g0 = dev.download(y0, n_words * 4)?;
-    compare_buf("y0", &g0, &expected.y0, ys, out, &slot_codec, &mut per, &mut stray);
+    compare_buf(
+        "y0",
+        &g0,
+        &expected.y0,
+        ys,
+        out,
+        &slot_codec,
+        &mut per,
+        &mut stray,
+    );
     if let (Some(yb), Some(e1)) = (y1, expected.y1.as_ref()) {
         let g1 = dev.download(yb, n_words * 4)?;
         compare_buf("y1", &g1, e1, ys, out, &slot_codec, &mut per, &mut stray);
@@ -1579,13 +1856,18 @@ fn run_kind(
             "mismatch_count": per[i].count, "first_mismatches": per[i].first,
         }));
     }
-    symbols.push(json!({"symbol": "stray_or_pad_words", "profile": kind.suffix(),
-        "mismatch_count": stray.count, "first_mismatches": stray.first}));
+    symbols.push(
+        json!({"symbol": "stray_or_pad_words", "profile": kind.suffix(),
+        "mismatch_count": stray.count, "first_mismatches": stray.first}),
+    );
 
     let mut timing_rows = Vec::new();
     if let Some(t) = timing {
         if mismatches != 0 {
-            return Err(format!("{} not byte-exact; refusing to time a wrong kernel", kind.suffix()));
+            return Err(format!(
+                "{} not byte-exact; refusing to time a wrong kernel",
+                kind.suffix()
+            ));
         }
         for (codec, args, grid) in &prepared {
             let f = ctx.func(*codec, kind);
@@ -1597,7 +1879,11 @@ fn run_kind(
                 for _ in 0..t.launches {
                     let mut a = *args;
                     // SAFETY: as above; the launch reads the blob during the call.
-                    unsafe { ctx.hip.launch_kernel_blob(f, *grid, [32, 1, 1], 0, None, &mut a) }.map_err(err)?;
+                    unsafe {
+                        ctx.hip
+                            .launch_kernel_blob(f, *grid, [32, 1, 1], 0, None, &mut a)
+                    }
+                    .map_err(err)?;
                 }
                 ctx.hip.event_record(&stop, None).map_err(err)?;
                 ctx.hip.event_synchronize(&stop).map_err(err)?;
@@ -1625,10 +1911,17 @@ fn run_kind(
 // Independent old-kernel parity (production HIP kernels, JIT via rdna_compute::Gpu)
 // ---------------------------------------------------------------------------------------
 
-fn old_kernel_parity(gpu: &mut Gpu, case: &Case, gate: &Expected, down: &Expected) -> Result<Value> {
+fn old_kernel_parity(
+    gpu: &mut Gpu,
+    case: &Case,
+    gate: &Expected,
+    down: &Expected,
+) -> Result<Value> {
     let c = case.c;
     fn up(gpu: &mut Gpu, bytes: &[u8]) -> Result<GpuTensor> {
-        let t = gpu.alloc_tensor(&[bytes.len().max(4)], DType::Raw).map_err(err)?;
+        let t = gpu
+            .alloc_tensor(&[bytes.len().max(4)], DType::Raw)
+            .map_err(err)?;
         gpu.hip.memcpy_htod(&t.buf, bytes).map_err(err)?;
         Ok(t)
     }
@@ -1669,23 +1962,38 @@ fn old_kernel_parity(gpu: &mut Gpu, case: &Case, gate: &Expected, down: &Expecte
     }
     let gt = up(gpu, &u64_bytes(&gtab))?;
     let dt = up(gpu, &u64_bytes(&dtab))?;
-    let topk: Vec<u8> = case.route.iter().flat_map(|&e| (e as i32).to_le_bytes()).collect();
+    let topk: Vec<u8> = case
+        .route
+        .iter()
+        .flat_map(|&e| (e as i32).to_le_bytes())
+        .collect();
     let tk = up(gpu, &topk)?;
     let xg = upf(gpu, &case.x_gate)?;
     let xd = upf(gpu, &case.x_down)?;
     let yg = blank(gpu, c * 10 * GATE_M / 2)?;
     let yu = blank(gpu, c * 10 * GATE_M / 2)?;
     let yd = blank(gpu, c * 10 * DOWN_M)?;
-    gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(&gt, &tk, &xg, &yg, &yu, GATE_M, GATE_K, c)
-        .map_err(err)?;
-    gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(&dt, &tk, &xd, &yd, DOWN_M, DOWN_K, c, N_EXPERTS)
-        .map_err(err)?;
+    gpu.gemv_mq4g256v2_moe_gate_up_top10_indexed_batched(
+        &gt, &tk, &xg, &yg, &yu, GATE_M, GATE_K, c,
+    )
+    .map_err(err)?;
+    gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
+        &dt, &tk, &xd, &yd, DOWN_M, DOWN_K, c, N_EXPERTS,
+    )
+    .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;
     let (n_gate, n_down) = (c * 10 * GATE_M / 2, c * 10 * DOWN_M);
-    let (g0, g1, d0) = (read(gpu, &yg, n_gate)?, read(gpu, &yu, n_gate)?, read(gpu, &yd, n_down)?);
+    let (g0, g1, d0) = (
+        read(gpu, &yg, n_gate)?,
+        read(gpu, &yu, n_gate)?,
+        read(gpu, &yd, n_down)?,
+    );
     let rows = [
         ("gate_up_y0", cmp(&g0, &gate.y0)),
-        ("gate_up_y1", cmp(&g1, gate.y1.as_ref().expect("gate has Y1"))),
+        (
+            "gate_up_y1",
+            cmp(&g1, gate.y1.as_ref().expect("gate has Y1")),
+        ),
         ("down_y0", cmp(&d0, &down.y0)),
     ];
     let total: u64 = rows.iter().map(|(_, (n, _))| *n).sum();
@@ -1696,9 +2004,11 @@ fn old_kernel_parity(gpu: &mut Gpu, case: &Case, gate: &Expected, down: &Expecte
     for t in keep.into_iter().chain([gt, dt, tk, xg, xd, yg, yu, yd]) {
         gpu.free_tensor(t).map_err(err)?;
     }
-    Ok(json!({"kernels": ["gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
+    Ok(
+        json!({"kernels": ["gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
         "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"],
-        "mismatch_count": total, "parts": detail}))
+        "mismatch_count": total, "parts": detail}),
+    )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1730,7 +2040,12 @@ struct Totals {
 
 type TimingSamples = Vec<(Codec, Kind, usize, usize, Vec<f64>)>;
 
-fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCfg>) -> Result<(Value, TimingSamples)> {
+fn run_case(
+    ctx: &mut Ctx,
+    case: &Case,
+    t: &mut Totals,
+    timing: Option<&TimingCfg>,
+) -> Result<(Value, TimingSamples)> {
     if case.wide {
         return run_case_wide(ctx, case, t);
     }
@@ -1749,11 +2064,22 @@ fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCf
     let (gate, down) = (gate?, down?);
     let mut counts = BTreeMap::new();
     for codec in Codec::ALL {
-        counts.insert(codec.label(), case.route.iter().filter(|e| case.experts[*e].codec == codec).count());
+        counts.insert(
+            codec.label(),
+            case.route
+                .iter()
+                .filter(|e| case.experts[*e].codec == codec)
+                .count(),
+        );
     }
     let unique_by_codec: BTreeMap<&str, usize> = Codec::ALL
         .iter()
-        .map(|c| (c.label(), case.experts.values().filter(|e| e.codec == *c).count()))
+        .map(|c| {
+            (
+                c.label(),
+                case.experts.values().filter(|e| e.codec == *c).count(),
+            )
+        })
         .collect();
     t.cases += 1;
     match case.origin {
@@ -1848,7 +2174,16 @@ fn build_wide_synthetic(name: &str) -> Case {
     let codecs = mixed_codecs(&mut rng, ids.len(), 5);
     let experts = experts_for(&ids, |i, _| codecs[i]);
     let padded = style == "pool" && c % 2 == 1;
-    let mut case = build_case(name, "synthetic_wide", c, route, experts, padded, false, c % 4);
+    let mut case = build_case(
+        name,
+        "synthetic_wide",
+        c,
+        route,
+        experts,
+        padded,
+        false,
+        c % 4,
+    );
     case.wide = true;
     case
 }
@@ -1881,7 +2216,10 @@ fn guard_violations(buf: &[u8], n_words: usize) -> u64 {
 }
 
 fn words_as_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4).map(|b| f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect()
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_bits(u32::from_le_bytes(b.try_into().unwrap())))
+        .collect()
 }
 
 /// One (case, kind): `C` singleton `C = 1` launches of the narrow entry (one per token lane, slots `0..10`, X / Y
@@ -1918,8 +2256,16 @@ fn run_kind_wide(
 
     // The reference: C singleton launches of the narrow entry.
     let r0 = dev.fill(ybytes, 0xa5)?;
-    let r1 = if gate { Some(dev.fill(ybytes, 0xa5)?) } else { None };
-    let (xrow_bytes, x_src_one) = if gate { (xrs * 4, 1usize) } else { (10 * xrs * 4, 10usize) };
+    let r1 = if gate {
+        Some(dev.fill(ybytes, 0xa5)?)
+    } else {
+        None
+    };
+    let (xrow_bytes, x_src_one) = if gate {
+        (xrs * 4, 1usize)
+    } else {
+        (10 * xrs * 4, 10usize)
+    };
     for lane in 0..c {
         let lane_route = &case.route[lane * 10..lane * 10 + 10];
         for codec in Codec::ALL {
@@ -1932,7 +2278,15 @@ fn run_kind_wide(
             let sb = dev.upload(&u32_bytes(&lb.slots))?;
             let yoff = (lane * 10 * ys * 4 + guard) as u64;
             let mut a = kernarg(
-                [tb.ptr, ib.ptr, ob.ptr, sb.ptr, xb.ptr + (lane * xrow_bytes) as u64, r0.ptr + yoff, r1.map_or(0, |b| b.ptr + yoff)],
+                [
+                    tb.ptr,
+                    ib.ptr,
+                    ob.ptr,
+                    sb.ptr,
+                    xb.ptr + (lane * xrow_bytes) as u64,
+                    r0.ptr + yoff,
+                    r1.map_or(0, |b| b.ptr + yoff),
+                ],
                 m,
                 k,
                 lb.ids.len(),
@@ -1942,9 +2296,18 @@ fn run_kind_wide(
                 xrs,
                 ys,
             );
-            // SAFETY: exact 88-byte ABI; every pointer is a live allocation of `dev` until release.
-            unsafe { ctx.hip.launch_kernel_blob(ctx.func(codec, kind), [m as u32, lb.ids.len() as u32, 1], [32, 1, 1], 0, None, &mut a) }
-                .map_err(err)?;
+            // SAFETY: exact 96-byte ABI; every pointer is a live allocation of `dev` until release.
+            unsafe {
+                ctx.hip.launch_kernel_blob(
+                    ctx.func(codec, kind),
+                    [m as u32, lb.ids.len() as u32, 1],
+                    [32, 1, 1],
+                    0,
+                    None,
+                    &mut a,
+                )
+            }
+            .map_err(err)?;
             launches += 1;
         }
     }
@@ -1954,16 +2317,37 @@ fn run_kind_wide(
         Some(b) => Some(dev.download(b, ybytes)?),
         None => None,
     };
-    let mut guard_bad = guard_violations(&ref0, n_words) + ref1.as_ref().map_or(0, |r| guard_violations(r, n_words));
+    let mut guard_bad = guard_violations(&ref0, n_words)
+        + ref1.as_ref().map_or(0, |r| guard_violations(r, n_words));
     let mut per_ref = [Mm::default(), Mm::default()];
     let mut stray_ref = Mm::default();
-    compare_buf("ref_y0", &ref0[guard..guard + n_words * 4], &expected.y0, ys, out, &slot_codec, &mut per_ref, &mut stray_ref);
+    compare_buf(
+        "ref_y0",
+        &ref0[guard..guard + n_words * 4],
+        &expected.y0,
+        ys,
+        out,
+        &slot_codec,
+        &mut per_ref,
+        &mut stray_ref,
+    );
     if let (Some(r), Some(e1)) = (ref1.as_ref(), expected.y1.as_ref()) {
-        compare_buf("ref_y1", &r[guard..guard + n_words * 4], e1, ys, out, &slot_codec, &mut per_ref, &mut stray_ref);
+        compare_buf(
+            "ref_y1",
+            &r[guard..guard + n_words * 4],
+            e1,
+            ys,
+            out,
+            &slot_codec,
+            &mut per_ref,
+            &mut stray_ref,
+        );
     }
     let reference_mismatches = stray_ref.count + per_ref[0].count + per_ref[1].count;
     let ref0_words = words_as_f32(&ref0[guard..guard + n_words * 4]);
-    let ref1_words = ref1.as_ref().map(|r| words_as_f32(&r[guard..guard + n_words * 4]));
+    let ref1_words = ref1
+        .as_ref()
+        .map(|r| words_as_f32(&r[guard..guard + n_words * 4]));
 
     let mut symbols = Vec::new();
     let (mut cpu_mismatches, mut singleton_mismatches) = (0u64, 0u64);
@@ -1973,7 +2357,11 @@ fn run_kind_wide(
             continue;
         }
         let w0 = dev.fill(ybytes, 0xa5)?;
-        let w1 = if gate { Some(dev.fill(ybytes, 0xa5)?) } else { None };
+        let w1 = if gate {
+            Some(dev.fill(ybytes, 0xa5)?)
+        } else {
+            None
+        };
         let mut prepared = Vec::new();
         for codec in Codec::ALL {
             let b = &buckets[codec.idx()];
@@ -1987,7 +2375,15 @@ fn run_kind_wide(
             let ob = dev.upload(&u32_bytes(&offs))?;
             let sb = dev.upload(&u32_bytes(&sl))?;
             let args = kernarg(
-                [tb.ptr, ib.ptr, ob.ptr, sb.ptr, xb.ptr, w0.ptr + guard as u64, w1.map_or(0, |b| b.ptr + guard as u64)],
+                [
+                    tb.ptr,
+                    ib.ptr,
+                    ob.ptr,
+                    sb.ptr,
+                    xb.ptr,
+                    w0.ptr + guard as u64,
+                    w1.map_or(0, |b| b.ptr + guard as u64),
+                ],
                 m,
                 k,
                 slots,
@@ -1997,13 +2393,21 @@ fn run_kind_wide(
                 xrs,
                 ys,
             );
-            prepared.push((codec, args, [m.div_ceil(WIDE_M_BLOCK) as u32, slots as u32, 1]));
+            prepared.push((
+                codec,
+                args,
+                [m.div_ceil(WIDE_M_BLOCK) as u32, slots as u32, 1],
+            ));
         }
         for (codec, args, grid) in &prepared {
             let mut a = *args;
             let f = ctx.wide_func(*codec, kind, cap)?;
-            // SAFETY: exact 88-byte ABI; every pointer is a live allocation of `dev` until release.
-            unsafe { ctx.hip.launch_kernel_blob(f, *grid, [WIDE_BLOCK, 1, 1], 0, None, &mut a) }.map_err(err)?;
+            // SAFETY: exact 96-byte ABI; every pointer is a live allocation of `dev` until release.
+            unsafe {
+                ctx.hip
+                    .launch_kernel_blob(f, *grid, [WIDE_BLOCK, 1, 1], 0, None, &mut a)
+            }
+            .map_err(err)?;
             launches += 1;
         }
         ctx.hip.device_synchronize().map_err(err)?;
@@ -2012,17 +2416,56 @@ fn run_kind_wide(
             Some(b) => Some(dev.download(b, ybytes)?),
             None => None,
         };
-        let wide_guard = guard_violations(&g0, n_words) + g1.as_ref().map_or(0, |r| guard_violations(r, n_words));
+        let wide_guard = guard_violations(&g0, n_words)
+            + g1.as_ref().map_or(0, |r| guard_violations(r, n_words));
         guard_bad += wide_guard;
         let (mut per_cpu, mut stray_cpu) = ([Mm::default(), Mm::default()], Mm::default());
         let (mut per_one, mut stray_one) = ([Mm::default(), Mm::default()], Mm::default());
         let body0 = &g0[guard..guard + n_words * 4];
-        compare_buf("y0", body0, &expected.y0, ys, out, &slot_codec, &mut per_cpu, &mut stray_cpu);
-        compare_buf("y0_vs_singleton", body0, &ref0_words, ys, out, &slot_codec, &mut per_one, &mut stray_one);
-        if let (Some(g), Some(e1), Some(r1w)) = (g1.as_ref(), expected.y1.as_ref(), ref1_words.as_ref()) {
+        compare_buf(
+            "y0",
+            body0,
+            &expected.y0,
+            ys,
+            out,
+            &slot_codec,
+            &mut per_cpu,
+            &mut stray_cpu,
+        );
+        compare_buf(
+            "y0_vs_singleton",
+            body0,
+            &ref0_words,
+            ys,
+            out,
+            &slot_codec,
+            &mut per_one,
+            &mut stray_one,
+        );
+        if let (Some(g), Some(e1), Some(r1w)) =
+            (g1.as_ref(), expected.y1.as_ref(), ref1_words.as_ref())
+        {
             let body1 = &g[guard..guard + n_words * 4];
-            compare_buf("y1", body1, e1, ys, out, &slot_codec, &mut per_cpu, &mut stray_cpu);
-            compare_buf("y1_vs_singleton", body1, r1w, ys, out, &slot_codec, &mut per_one, &mut stray_one);
+            compare_buf(
+                "y1",
+                body1,
+                e1,
+                ys,
+                out,
+                &slot_codec,
+                &mut per_cpu,
+                &mut stray_cpu,
+            );
+            compare_buf(
+                "y1_vs_singleton",
+                body1,
+                r1w,
+                ys,
+                out,
+                &slot_codec,
+                &mut per_one,
+                &mut stray_one,
+            );
         }
         cpu_mismatches += stray_cpu.count;
         singleton_mismatches += stray_one.count;
@@ -2091,7 +2534,11 @@ fn run_case_wide(ctx: &mut Ctx, case: &Case, t: &mut Totals) -> Result<(Value, T
     t.wide_guard_violations += gate.guard_violations + down.guard_violations;
     t.twin_mismatches += gate.twin_mismatches + down.twin_mismatches;
     let buckets = buckets_of(case);
-    let max_slots = buckets.iter().flat_map(|b| b.offs.windows(2).map(|w| w[1] - w[0])).max().unwrap_or(0);
+    let max_slots = buckets
+        .iter()
+        .flat_map(|b| b.offs.windows(2).map(|w| w[1] - w[0]))
+        .max()
+        .unwrap_or(0);
     let row = json!({
         "case": case.name, "origin": case.origin, "wide": true, "c": case.c, "slots": 10 * case.c,
         "unique_experts": case.experts.len(), "max_slots_per_expert": max_slots,
@@ -2203,11 +2650,15 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
     let mut layer_explicit: Option<usize> = None;
     let value = |i: &mut usize| -> Result<String> {
         *i += 1;
-        argv.get(*i).cloned().ok_or_else(|| format!("{} needs a value\n{USAGE}", argv[*i - 1]))
+        argv.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("{} needs a value\n{USAGE}", argv[*i - 1]))
     };
     let number = |i: &mut usize| -> Result<usize> {
         let flag = argv[*i].clone();
-        value(i)?.parse::<usize>().map_err(|e| format!("{flag}: {e}"))
+        value(i)?
+            .parse::<usize>()
+            .map_err(|e| format!("{flag}: {e}"))
     };
     while i < argv.len() {
         match argv[i].as_str() {
@@ -2235,7 +2686,9 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
             "--only" => cfg.only.push(value(&mut i)?),
             "--records-dir" => cfg.records_dir = Some(value(&mut i)?),
             "--records-manifest" => cfg.records_manifest = Some(value(&mut i)?),
-            "--records-manifest-sha256" => cfg.records_manifest_sha256 = Some(value(&mut i)?.to_ascii_lowercase()),
+            "--records-manifest-sha256" => {
+                cfg.records_manifest_sha256 = Some(value(&mut i)?.to_ascii_lowercase())
+            }
             "--alloc" => cfg.alloc = Some(value(&mut i)?),
             "--point" => cfg.alloc_point = value(&mut i)?,
             "--map" => cfg.map = Some(value(&mut i)?),
@@ -2268,7 +2721,11 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         if cfg.artifact.is_some() || cfg.old_parity {
             return Err("--timing is a separate run: no --artifact / --old-kernel-parity".into());
         }
-        for (what, v) in [("--card", &cfg.card), ("--fabric-owner", &cfg.fabric_owner), ("--fabric-wrapper", &cfg.fabric_wrapper)] {
+        for (what, v) in [
+            ("--card", &cfg.card),
+            ("--fabric-owner", &cfg.fabric_owner),
+            ("--fabric-wrapper", &cfg.fabric_wrapper),
+        ] {
             if v.is_none() {
                 return Err(format!("--timing requires {what} (or its env fallback): fabric metadata is part of the record"));
             }
@@ -2294,7 +2751,11 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         if cfg.timing {
             return Err("--timing is a separate run: no certified-records flags".into());
         }
-    } else if cfg.layer0 || cfg.map.is_some() || cfg.xts_sha256.is_some() || cfg.records_manifest_sha256.is_some() {
+    } else if cfg.layer0
+        || cfg.map.is_some()
+        || cfg.xts_sha256.is_some()
+        || cfg.records_manifest_sha256.is_some()
+    {
         return Err("--layer0/--map/--xts-sha256/--records-manifest-sha256 only apply to certified-records mode".into());
     }
     if cfg.wide && cfg.timing {
@@ -2308,14 +2769,23 @@ fn parse_c_list(s: &str) -> Result<Vec<usize>> {
     let mut out = BTreeSet::new();
     for part in s.split(',').filter(|p| !p.is_empty()) {
         let (lo, hi) = match part.split_once('-') {
-            Some((a, b)) => (a.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?, b.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?),
+            Some((a, b)) => (
+                a.parse::<usize>()
+                    .map_err(|e| format!("--wide-c {part}: {e}"))?,
+                b.parse::<usize>()
+                    .map_err(|e| format!("--wide-c {part}: {e}"))?,
+            ),
             None => {
-                let v = part.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?;
+                let v = part
+                    .parse::<usize>()
+                    .map_err(|e| format!("--wide-c {part}: {e}"))?;
                 (v, v)
             }
         };
         if lo < 1 || hi > 32 || lo > hi {
-            return Err(format!("--wide-c {part}: lane counts must satisfy 1 <= A <= B <= 32"));
+            return Err(format!(
+                "--wide-c {part}: lane counts must satisfy 1 <= A <= B <= 32"
+            ));
         }
         out.extend(lo..=hi);
     }
@@ -2340,7 +2810,8 @@ fn run() -> Result<(Value, bool)> {
     let uuid = hip.device_uuid(id).map_err(err)?;
     let bdf = hip.device_pci_bus_id(id).map_err(err)?.to_ascii_lowercase();
     let arch = hip.get_arch(id).map_err(err)?;
-    let identity_match = uuid == cfg.expect_uuid && bdf == cfg.expect_bdf && arch == cfg.expect_arch;
+    let identity_match =
+        uuid == cfg.expect_uuid && bdf == cfg.expect_bdf && arch == cfg.expect_arch;
     let device = json!({"index": id, "uuid": uuid, "bdf": bdf, "arch": arch, "card": cfg.card,
         "expected_uuid": cfg.expect_uuid, "expected_bdf": cfg.expect_bdf, "expected_arch": cfg.expect_arch,
         "identity_match": identity_match});
@@ -2360,7 +2831,9 @@ fn run() -> Result<(Value, bool)> {
     for kind in Kind::ALL {
         for codec in Codec::ALL {
             let name = symbol(codec, kind);
-            let f = hip.module_get_function(&module, &name).map_err(|e| format!("symbol {name}: {e}"))?;
+            let f = hip
+                .module_get_function(&module, &name)
+                .map_err(|e| format!("symbol {name}: {e}"))?;
             loads.push(name);
             funcs.push((codec, kind, f));
         }
@@ -2371,14 +2844,24 @@ fn run() -> Result<(Value, bool)> {
             for codec in Codec::ALL {
                 for cap in Cap::ALL {
                     let name = symbol_cap(codec, kind, cap);
-                    let f = hip.module_get_function(&module, &name).map_err(|e| format!("symbol {name}: {e}"))?;
+                    let f = hip
+                        .module_get_function(&module, &name)
+                        .map_err(|e| format!("symbol {name}: {e}"))?;
                     loads.push(name);
                     wide_funcs.push((codec, kind, cap, f));
                 }
             }
         }
     }
-    let mut ctx = Ctx { hip, funcs, wide_funcs, codeobject_sha: codeobject_sha.clone(), device: id, old_parity: cfg.old_parity, gpu: None };
+    let mut ctx = Ctx {
+        hip,
+        funcs,
+        wide_funcs,
+        codeobject_sha: codeobject_sha.clone(),
+        device: id,
+        old_parity: cfg.old_parity,
+        gpu: None,
+    };
     let mut totals = Totals::default();
     let mut rows: Vec<Value> = Vec::new();
     let mut runs: Vec<Value> = Vec::new();
@@ -2388,7 +2871,11 @@ fn run() -> Result<(Value, bool)> {
     let mut records_violations = 0u64;
 
     if cfg.timing {
-        let tcfg = TimingCfg { reps: cfg.reps, warmup: cfg.warmup, launches: cfg.launches };
+        let tcfg = TimingCfg {
+            reps: cfg.reps,
+            warmup: cfg.warmup,
+            launches: cfg.launches,
+        };
         let card = cfg.card.clone().unwrap_or_default();
         let fabric = json!({"class": "timing", "card": cfg.fabric_card.clone().unwrap_or_else(|| card.clone()),
             "owner": cfg.fabric_owner, "wrapper": cfg.fabric_wrapper});
@@ -2420,14 +2907,20 @@ fn run() -> Result<(Value, bool)> {
             }
         }
     } else {
-        for name in SYNTH_CASES.iter().filter(|n| !cfg.wide_only && selected(&cfg, n)) {
+        for name in SYNTH_CASES
+            .iter()
+            .filter(|n| !cfg.wide_only && selected(&cfg, n))
+        {
             eprintln!("[g1] {name}");
             let case = build_synthetic(name);
             let (row, _) = run_case(&mut ctx, &case, &mut totals, None)?;
             rows.push(row);
         }
         if cfg.wide {
-            for name in wide_case_names(&cfg.wide_c).iter().filter(|n| selected(&cfg, n)) {
+            for name in wide_case_names(&cfg.wide_c)
+                .iter()
+                .filter(|n| selected(&cfg, n))
+            {
                 eprintln!("[g1] {name}");
                 let case = build_wide_synthetic(name);
                 let (row, _) = run_case(&mut ctx, &case, &mut totals, None)?;
@@ -2439,7 +2932,10 @@ fn run() -> Result<(Value, bool)> {
             let real = load_real(path, cfg.layer, cfg.real_experts)?;
             mq4_violations = real.mq4_sym_violations;
             artifact_meta = real.meta.clone();
-            for case in real_cases(&real, "real", "real", cfg.wide).iter().filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide)) {
+            for case in real_cases(&real, "real", "real", cfg.wide)
+                .iter()
+                .filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide))
+            {
                 eprintln!("[g1] {}", case.name);
                 let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
                 rows.push(row);
@@ -2450,7 +2946,10 @@ fn run() -> Result<(Value, bool)> {
             let real = load_records(&cfg)?;
             records_violations = real.mq4_sym_violations;
             records_meta = real.meta.clone();
-            for case in real_cases(&real, RECORDS_ORIGIN, "real_records", cfg.wide).iter().filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide)) {
+            for case in real_cases(&real, RECORDS_ORIGIN, "real_records", cfg.wide)
+                .iter()
+                .filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide))
+            {
                 eprintln!("[g1] {}", case.name);
                 let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
                 rows.push(row);
@@ -2520,7 +3019,10 @@ fn main() {
             }
         }
         Err(e) => {
-            println!("{}", json!({"schema": SCHEMA, "error": e, "byte_exact": false, "pass": false, "rc": 1}));
+            println!(
+                "{}",
+                json!({"schema": SCHEMA, "error": e, "byte_exact": false, "pass": false, "rc": 1})
+            );
             eprintln!("{e}");
             std::process::exit(1);
         }
@@ -2559,7 +3061,9 @@ mod tests {
         scales[2 * 2 + 1] = 0x4000; // row 2: half0 scale 1, half1 scale 2
         let bytes = encode_mq4(Kind::GateUp, m, k, &codes, &scales);
         let x = vec![1.0f32; k];
-        let got: Vec<f32> = (0..m).map(|r| mq4_row_gate(&bytes[r * 136..(r + 1) * 136], &x)).collect();
+        let got: Vec<f32> = (0..m)
+            .map(|r| mq4_row_gate(&bytes[r * 136..(r + 1) * 136], &x))
+            .collect();
         // Each 16-code cycle sums to -8; 128 columns = 8 cycles = -64.
         assert_eq!(got, vec![-128.0, 0.0, -192.0]);
     }
@@ -2573,7 +3077,9 @@ mod tests {
         let bytes = encode_mq4(Kind::Down, m, k, &codes, &scales);
         let x = vec![2.0f32; k];
         let rb = (k / 128) * 68;
-        let got: Vec<f32> = (0..m).map(|r| mq4_row_down(&bytes[r * rb..(r + 1) * rb], &x)).collect();
+        let got: Vec<f32> = (0..m)
+            .map(|r| mq4_row_down(&bytes[r * rb..(r + 1) * rb], &x))
+            .collect();
         assert_eq!(got, vec![-320.0, 0.0]); // 5 groups * 8 cycles * (-8)
     }
 
@@ -2587,7 +3093,9 @@ mod tests {
         for c in codes.iter_mut() {
             *c = (rng.u32() & 15) as u8;
         }
-        let scales: Vec<u16> = (0..64 * 5).map(|_| 0x2800 + (rng.u32() as u16 & 0x3ff)).collect();
+        let scales: Vec<u16> = (0..64 * 5)
+            .map(|_| 0x2800 + (rng.u32() as u16 & 0x3ff))
+            .collect();
         let bytes = encode_mq4(Kind::Down, 64, k, &codes, &scales);
         let x = gen_x_row(0, k, &mut rng);
         let rb = 5 * 68;
@@ -2637,17 +3145,26 @@ mod tests {
 
     fn check_partition(route: &[u32], codecs: &BTreeMap<u32, Codec>) {
         let f = |e: u32| codecs[&e];
-        let bs = [build_bucket(route, &f, Codec::W3), build_bucket(route, &f, Codec::Mq4)];
+        let bs = [
+            build_bucket(route, &f, Codec::W3),
+            build_bucket(route, &f, Codec::Mq4),
+        ];
         let mut seen = vec![false; route.len()];
         for (ci, b) in bs.iter().enumerate() {
             assert_eq!(b.offs.len(), b.ids.len() + 1);
             assert_eq!(b.offs[0], 0);
             assert_eq!(*b.offs.last().unwrap() as usize, b.slots.len());
-            assert!(b.ids.windows(2).all(|w| w[0] < w[1]), "ids ascending and unique");
+            assert!(
+                b.ids.windows(2).all(|w| w[0] < w[1]),
+                "ids ascending and unique"
+            );
             for (u, &id) in b.ids.iter().enumerate() {
                 let seg = &b.slots[b.offs[u] as usize..b.offs[u + 1] as usize];
                 assert!(!seg.is_empty());
-                assert!(seg.windows(2).all(|w| w[0] < w[1]), "stable original slot order");
+                assert!(
+                    seg.windows(2).all(|w| w[0] < w[1]),
+                    "stable original slot order"
+                );
                 for &s in seg {
                     assert_eq!(route[s as usize], id);
                     assert_eq!(codecs[&id], Codec::ALL[ci]);
@@ -2663,36 +3180,62 @@ mod tests {
     fn buckets_partition_slots_for_union_and_unique_routes() {
         let mut rng = Rng::new(11);
         let pool = pick_ids(&mut rng, 14, true);
-        let codecs: BTreeMap<u32, Codec> = pool.iter().enumerate().map(|(i, &id)| (id, MIXED10[i % 10])).collect();
+        let codecs: BTreeMap<u32, Codec> = pool
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, MIXED10[i % 10]))
+            .collect();
         check_partition(&lane_routes(&mut rng, &pool, 8), &codecs); // repeated across lanes
         let uniq = pick_ids(&mut rng, 80, true);
-        let codecs: BTreeMap<u32, Codec> =
-            uniq.iter().enumerate().map(|(i, &id)| (id, MIXED10[(i * 7) % 10])).collect();
+        let codecs: BTreeMap<u32, Codec> = uniq
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, MIXED10[(i * 7) % 10]))
+            .collect();
         let mut route = uniq.clone();
         rng.shuffle(&mut route);
         check_partition(&route, &codecs); // 80 unique ids
     }
 
     #[test]
-    fn kernarg_layout_is_the_frozen_88_bytes() {
+    fn kernarg_layout_is_the_frozen_96_bytes() {
         let a = kernarg([1, 2, 3, 4, 5, 6, 7], 8, 9, 10, 11, 12, 13, 14, 15);
-        assert_eq!(a.len(), 88);
+        assert_eq!(a.len(), 96);
         for i in 0..7usize {
-            assert_eq!(u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap()), i as u64 + 1);
+            assert_eq!(
+                u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap()),
+                i as u64 + 1
+            );
         }
         for (j, off) in [56usize, 60, 64, 68, 72, 76, 80, 84].iter().enumerate() {
-            assert_eq!(u32::from_le_bytes(a[*off..*off + 4].try_into().unwrap()), 8 + j as u32);
+            assert_eq!(
+                u32::from_le_bytes(a[*off..*off + 4].try_into().unwrap()),
+                8 + j as u32
+            );
         }
+        assert_eq!(
+            u32::from_le_bytes(a[88..92].try_into().unwrap()),
+            N_EXPERTS as u32
+        );
+        assert_eq!(u32::from_le_bytes(a[92..96].try_into().unwrap()), 0);
     }
 
     #[test]
     fn synthetic_tensors_have_exact_sizes_and_valid_w3() {
         for kind in Kind::ALL {
             for codec in Codec::ALL {
-                assert_eq!(gen_tensor(codec, kind, 5, true).len(), kind.tensor_bytes(codec));
+                assert_eq!(
+                    gen_tensor(codec, kind, 5, true).len(),
+                    kind.tensor_bytes(codec)
+                );
             }
-            mq_i4::decode_tensor(kind.w3_profile(), kind.m(), kind.k(), &gen_tensor(Codec::W3, kind, 5, true))
-                .unwrap();
+            mq_i4::decode_tensor(
+                kind.w3_profile(),
+                kind.m(),
+                kind.k(),
+                &gen_tensor(Codec::W3, kind, 5, true),
+            )
+            .unwrap();
         }
     }
 
@@ -2708,7 +3251,16 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    const RECORDS: [&str; 8] = ["--records-dir", "/r/q/w3-gptq3/L0", "--records-manifest", "/r/m.json", "--alloc", "/r/a.json", "--xts", "/x.mq4"];
+    const RECORDS: [&str; 8] = [
+        "--records-dir",
+        "/r/q/w3-gptq3/L0",
+        "--records-manifest",
+        "/r/m.json",
+        "--alloc",
+        "/r/a.json",
+        "--xts",
+        "/x.mq4",
+    ];
 
     fn with(extra: &[&str]) -> Vec<String> {
         let mut v = vec!["--codeobject", "/co.hxaco"];
@@ -2719,7 +3271,16 @@ mod tests {
 
     #[test]
     fn records_flags_parse_and_default_to_layer0_point_ctl3_hot() {
-        let c = parse_args(&with(&["--layer0", "--map", "/r/map.json", "--xts-sha256", "AB12", "--records-manifest-sha256", "CD34"])).unwrap();
+        let c = parse_args(&with(&[
+            "--layer0",
+            "--map",
+            "/r/map.json",
+            "--xts-sha256",
+            "AB12",
+            "--records-manifest-sha256",
+            "CD34",
+        ]))
+        .unwrap();
         assert_eq!(c.layer, 0);
         assert!(c.layer0);
         assert_eq!(c.alloc_point, "ctl3-hot");
@@ -2734,19 +3295,48 @@ mod tests {
 
     #[test]
     fn records_flags_are_all_or_nothing_and_exclusive_of_timing() {
-        let partial = args(&["--codeobject", "/co", "--records-dir", "/d", "--alloc", "/a", "--xts", "/x"]);
-        assert!(parse_args(&partial).unwrap_err().contains("--records-manifest is missing"));
+        let partial = args(&[
+            "--codeobject",
+            "/co",
+            "--records-dir",
+            "/d",
+            "--alloc",
+            "/a",
+            "--xts",
+            "/x",
+        ]);
+        assert!(parse_args(&partial)
+            .unwrap_err()
+            .contains("--records-manifest is missing"));
         assert!(parse_args(&args(&["--codeobject", "/co", "--layer0"])).is_err());
         assert!(parse_args(&with(&["--layer0", "--layer", "3"])).is_err());
-        let timing = with(&["--timing", "--card", "c", "--fabric-owner", "o", "--fabric-wrapper", "w"]);
+        let timing = with(&[
+            "--timing",
+            "--card",
+            "c",
+            "--fabric-owner",
+            "o",
+            "--fabric-wrapper",
+            "w",
+        ]);
         assert!(parse_args(&timing).is_err());
         // The old flags are unchanged: --artifact alone still parses.
-        assert!(parse_args(&args(&["--codeobject", "/co", "--artifact", "/a.hfq", "--layer", "5"])).is_ok());
+        assert!(parse_args(&args(&[
+            "--codeobject",
+            "/co",
+            "--artifact",
+            "/a.hfq",
+            "--layer",
+            "5"
+        ]))
+        .is_ok());
     }
 
     #[test]
     fn hot_map_labels_parse_strictly() {
-        let mut row: Vec<Value> = (0..N_EXPERTS).map(|e| json!(if e % 3 == 0 { "xts_mq4" } else { "w3" })).collect();
+        let mut row: Vec<Value> = (0..N_EXPERTS)
+            .map(|e| json!(if e % 3 == 0 { "xts_mq4" } else { "w3" }))
+            .collect();
         let root = json!({"arm": "ctl3-hot", "layers": {"0": row.clone()}});
         let f = hot_map_formats(&root, 0).unwrap();
         assert_eq!(f[0], ExpertFormat::Mq4Xts);
@@ -2762,7 +3352,13 @@ mod tests {
     /// cross-checked with a map row in the other vocabulary.
     #[test]
     fn allocation_layer_slice_matches_map_vocabulary() {
-        let rows: Vec<Vec<u64>> = (0..48).map(|l| (0..N_EXPERTS).map(|e| if (e + l) % 3 == 0 { 2 } else { 1 }).collect()).collect();
+        let rows: Vec<Vec<u64>> = (0..48)
+            .map(|l| {
+                (0..N_EXPERTS)
+                    .map(|e| if (e + l) % 3 == 0 { 2 } else { 1 })
+                    .collect()
+            })
+            .collect();
         let root = json!({"schema": "ctl3-hot-allocation-v1", "profiles": ["mq2-i4", "mq3-i4", "mq4-xts"],
             "allocations": {"ctl3-hot": {"feasible": true, "profile_indices": rows}}});
         let dir = tempfile::tempdir().unwrap();
@@ -2770,8 +3366,13 @@ mod tests {
         std::fs::write(&p, root.to_string()).unwrap();
         let a = load_allocation(&p, "ctl3-hot", SlabGeometry::FN).unwrap();
         let l2 = &a.formats[2 * N_EXPERTS..3 * N_EXPERTS];
-        let map_row: Vec<Value> = (0..N_EXPERTS).map(|e| json!(if (e + 2) % 3 == 0 { "xts_mq4" } else { "w3" })).collect();
-        assert_eq!(l2, &hot_map_formats(&json!({"layers": {"2": map_row}}), 2).unwrap()[..]);
+        let map_row: Vec<Value> = (0..N_EXPERTS)
+            .map(|e| json!(if (e + 2) % 3 == 0 { "xts_mq4" } else { "w3" }))
+            .collect();
+        assert_eq!(
+            l2,
+            &hot_map_formats(&json!({"layers": {"2": map_row}}), 2).unwrap()[..]
+        );
         assert!(load_allocation(&p, "nope", SlabGeometry::FN).is_err());
     }
 
@@ -2788,16 +3389,38 @@ mod tests {
 
     #[test]
     fn wide_c_lists_parse_ranges_and_reject_bad_lanes() {
-        assert_eq!(parse_c_list("1-3,9,16-17,32").unwrap(), vec![1, 2, 3, 9, 16, 17, 32]);
+        assert_eq!(
+            parse_c_list("1-3,9,16-17,32").unwrap(),
+            vec![1, 2, 3, 9, 16, 17, 32]
+        );
         assert_eq!(parse_c_list("32,1,1").unwrap(), vec![1, 32]);
         for bad in ["", "0", "33", "5-3", "a", "1-33"] {
             assert!(parse_c_list(bad).is_err(), "{bad}");
         }
-        let c = parse_args(&args(&["--codeobject", "/co", "--wide-only", "--wide-c", "9-10"])).unwrap();
+        let c = parse_args(&args(&[
+            "--codeobject",
+            "/co",
+            "--wide-only",
+            "--wide-c",
+            "9-10",
+        ]))
+        .unwrap();
         assert!((c.wide, c.wide_only, c.wide_c.clone()) == (true, true, vec![9, 10]));
         let d = parse_args(&args(&["--codeobject", "/co"])).unwrap();
         assert!(!d.wide && !d.wide_only && d.wide_c == (1..=32).collect::<Vec<_>>());
-        assert!(parse_args(&args(&["--codeobject", "/co", "--wide", "--timing", "--card", "c", "--fabric-owner", "o", "--fabric-wrapper", "w"])).is_err());
+        assert!(parse_args(&args(&[
+            "--codeobject",
+            "/co",
+            "--wide",
+            "--timing",
+            "--card",
+            "c",
+            "--fabric-owner",
+            "o",
+            "--fabric-wrapper",
+            "w"
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -2805,11 +3428,22 @@ mod tests {
         let all: Vec<usize> = (1..=32).collect();
         let names = wide_case_names(&all);
         for c in 1..=32 {
-            assert!(names.contains(&format!("w{c}_pool")) && names.contains(&format!("w{c}_ident")));
-            assert_eq!(names.contains(&format!("w{c}_disjoint")), DISJOINT_C.contains(&c));
+            assert!(
+                names.contains(&format!("w{c}_pool")) && names.contains(&format!("w{c}_ident"))
+            );
+            assert_eq!(
+                names.contains(&format!("w{c}_disjoint")),
+                DISJOINT_C.contains(&c)
+            );
         }
-        assert_eq!(symbol_cap(Codec::W3, Kind::GateUp, Cap::C32), "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32");
-        assert_eq!(symbol_cap(Codec::Mq4, Kind::Down, Cap::C16), "mq_i4_moe_gemv_mq4sym_r128_down_c16");
+        assert_eq!(
+            symbol_cap(Codec::W3, Kind::GateUp, Cap::C32),
+            "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32"
+        );
+        assert_eq!(
+            symbol_cap(Codec::Mq4, Kind::Down, Cap::C16),
+            "mq_i4_moe_gemv_mq4sym_r128_down_c16"
+        );
         assert_eq!((Cap::C16.slots(), Cap::C32.slots()), (16, 32));
     }
 
@@ -2838,7 +3472,11 @@ mod tests {
                 }
                 let mut seen: Vec<u32> = b.slots.clone();
                 seen.sort_unstable();
-                assert_eq!(seen, (0..10 * c as u32).collect::<Vec<_>>(), "{style} C{c}: buckets partition every slot");
+                assert_eq!(
+                    seen,
+                    (0..10 * c as u32).collect::<Vec<_>>(),
+                    "{style} C{c}: buckets partition every slot"
+                );
             }
         }
     }
@@ -2854,7 +3492,10 @@ mod tests {
         assert_eq!(&ids[..b.ids.len()], &b.ids[..]);
         assert_eq!(&offs[..b.offs.len()], &b.offs[..]);
         let total = *b.offs.last().unwrap();
-        assert!(offs[b.ids.len()..].iter().all(|&o| o == total), "empty tail experts");
+        assert!(
+            offs[b.ids.len()..].iter().all(|&o| o == total),
+            "empty tail experts"
+        );
         assert!(offs.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(&slots[..b.slots.len()], &b.slots[..]);
         assert!(slots[b.slots.len()..].iter().all(|&s| s == 0));

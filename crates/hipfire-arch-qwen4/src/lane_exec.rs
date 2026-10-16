@@ -614,9 +614,9 @@ impl Qwen4LaneExecutor<'_> {
             let lane = store
                 .lane_mut(&r.epoch)
                 .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-            lane.state
-                .ensure_mapped_capacity(gpu, end)
-                .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
+            lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                format!("provision_step: map {end} positions for {:?}: {e}", r.epoch)
+            })?;
             if let Some(spec) = lane.spec.as_mut() {
                 // A retired lane's head lags the trunk and is never touched.
                 let retired = spec
@@ -625,7 +625,10 @@ impl Qwen4LaneExecutor<'_> {
                     .is_some_and(|w| w.route == LaneRoute::ArRetired);
                 if !retired {
                     spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                        format!("provision_step: map {end} head positions for {:?}: {e}", r.epoch)
+                        format!(
+                            "provision_step: map {end} head positions for {:?}: {e}",
+                            r.epoch
+                        )
                     })?;
                 }
             }
@@ -646,7 +649,12 @@ impl Qwen4LaneExecutor<'_> {
     /// a failure (or an expert-parallel bundle, an unknown / non-Decoding
     /// lane, a zero budget) is logged / skipped and `provision_step` grows on
     /// demand as before.
-    pub fn map_ahead_decode(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, remaining_new_tokens: usize) {
+    pub fn map_ahead_decode(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &RequestEpoch,
+        remaining_new_tokens: usize,
+    ) {
         if refuse_expert_parallel(self.bundle).is_err() {
             return;
         }
@@ -674,13 +682,15 @@ impl Qwen4LaneExecutor<'_> {
             .state
             .ensure_mapped_capacity(gpu, target)
             .map_err(|error| error.to_string())
-            .and_then(|()| match lane.spec.as_mut().filter(|spec| !spec.stats.retired) {
-                Some(spec) => spec
-                    .head
-                    .ensure_mapped_capacity(gpu, target.min(spec.head.context_capacity()))
-                    .map_err(|error| error.to_string()),
-                None => Ok(()),
-            });
+            .and_then(
+                |()| match lane.spec.as_mut().filter(|spec| !spec.stats.retired) {
+                    Some(spec) => spec
+                        .head
+                        .ensure_mapped_capacity(gpu, target.min(spec.head.context_capacity()))
+                        .map_err(|error| error.to_string()),
+                    None => Ok(()),
+                },
+            );
         match mapped {
             Ok(()) => eprintln!(
                 "  qwen4 QSA context mapped ahead for {target} tokens (decode budget {remaining_new_tokens})"
@@ -698,7 +708,11 @@ impl Qwen4LaneExecutor<'_> {
     /// state: a decode row is never co-batched with a prefill tile. Waits
     /// for the picks (the download synchronizes). On error every participant
     /// is poisoned and the executor returns to idle.
-    pub fn forward_step(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> Result<StepOutput, String> {
+    pub fn forward_step(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &BatchStepPlan,
+    ) -> Result<StepOutput, String> {
         refuse_expert_parallel(self.bundle)?;
         let key = StepKey::of(plan);
         let store = self
@@ -747,7 +761,9 @@ impl Qwen4LaneExecutor<'_> {
             .lanes
             .as_mut()
             .ok_or_else(|| "Qwen4 lanes are not staged".to_string())?;
-        store.phase.check_commit(&StepKey::of(plan), output.step_id)?;
+        store
+            .phase
+            .check_commit(&StepKey::of(plan), output.step_id)?;
         if output.target_picks.len() != plan.total_rows() {
             return Err("commit_step: pick count != planned rows".to_string());
         }
@@ -755,7 +771,10 @@ impl Qwen4LaneExecutor<'_> {
             let lane = match store.lane(&r.epoch) {
                 Some(lane) if lane.host.status != LaneStatus::Poisoned => lane,
                 _ => {
-                    return Err(format!("commit_step: epoch {:?} no longer owns its lane", r.epoch));
+                    return Err(format!(
+                        "commit_step: epoch {:?} no longer owns its lane",
+                        r.epoch
+                    ));
                 }
             };
             if r.rows.len == 0 || r.rows.end() > output.target_picks.len() {
@@ -775,7 +794,10 @@ impl Qwen4LaneExecutor<'_> {
                     }
                 }
                 (RequestStepKind::Verify { .. }, None) => {
-                    return Err(format!("commit_step: Verify of {:?} has no window", r.epoch));
+                    return Err(format!(
+                        "commit_step: Verify of {:?} has no window",
+                        r.epoch
+                    ));
                 }
                 _ => {}
             }
@@ -787,9 +809,8 @@ impl Qwen4LaneExecutor<'_> {
             let window = lane.spec.as_mut().and_then(|spec| spec.window.take());
             let (committed_ids, accepted_drafts, verified_rows) = match r.kind {
                 RequestStepKind::Verify { draft_len } => {
-                    let outcome: MtpWindow = window
-                        .and_then(|w| w.outcome)
-                        .expect("validated above");
+                    let outcome: MtpWindow =
+                        window.and_then(|w| w.outcome).expect("validated above");
                     commit_verify(&mut lane.host, &outcome.committed);
                     (outcome.committed, outcome.accepted, draft_len + 1)
                 }
@@ -912,7 +933,9 @@ fn forward_inner(
         entries.push(Entry { r, lane, dec });
     }
     if n_dec > rows_cap {
-        return Err(format!("{n_dec} decode rows exceed the step buffers ({rows_cap})"));
+        return Err(format!(
+            "{n_dec} decode rows exceed the step buffers ({rows_cap})"
+        ));
     }
 
     // Arm the ring, then take the target ticket, of every Verify lane.
@@ -932,10 +955,16 @@ fn forward_inner(
             || window.drafts != tokens[1..]
             || window.position != state.position
         {
-            return Err(format!("Verify lane {:?} disagrees with its window", e.r.epoch));
+            return Err(format!(
+                "Verify lane {:?} disagrees with its window",
+                e.r.epoch
+            ));
         }
         if window.target_ticket.is_some() {
-            return Err(format!("Verify lane {:?} already holds a target ticket", e.r.epoch));
+            return Err(format!(
+                "Verify lane {:?} already holds a target ticket",
+                e.r.epoch
+            ));
         }
         if state.row_capture_rows() < rows {
             return Err(format!(
@@ -946,7 +975,8 @@ fn forward_inner(
         }
         // Armed before the snapshot: the GDN states then need no copy.
         state.row_capture_armed = true;
-        let ticket = crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
+        let ticket =
+            crate::mtp_lanes::lane_call(bundle.with_lane(state, None, |b| b.snapshot(gpu)));
         match ticket {
             Ok(ticket) => window.target_ticket = Some(ticket),
             Err(error) => {
@@ -976,7 +1006,8 @@ fn forward_inner(
             top1: &top1.sub_offset(0, n_dec * std::mem::size_of::<i32>()),
             wide_hidden: hidden,
         };
-        let forwarded = forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
+        let forwarded =
+            forward_lanes(gpu, bundle, &mut rows, &out, &policy).map_err(|e| e.to_string());
         drop(rows);
         // I3: disarmed on every path out of the forward.
         for e in entries.iter_mut() {
@@ -986,8 +1017,12 @@ fn forward_inner(
         }
         forwarded?;
         gpu.hip
-            .memcpy_dtoh(&mut top1_host[..n_dec * std::mem::size_of::<i32>()], &top1.buf)
+            .memcpy_dtoh(
+                &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
+                &top1.buf,
+            )
             .map_err(|e| e.to_string())?;
+        gpu.take_device_wait_error().map_err(|e| e.to_string())?;
     }
     let mut picks = vec![u32::MAX; plan.total_rows()];
     for e in &entries {
@@ -1003,7 +1038,9 @@ fn forward_inner(
         let Some(first) = e.dec else {
             continue;
         };
-        let lane_picks: Vec<u32> = (0..e.r.rows.len).map(|j| pick_at(top1_host, first + j)).collect();
+        let lane_picks: Vec<u32> = (0..e.r.rows.len)
+            .map(|j| pick_at(top1_host, first + j))
+            .collect();
         let route = e
             .lane
             .spec
@@ -1012,8 +1049,10 @@ fn forward_inner(
             .map(|w| w.route);
         let outcome = match (e.r.kind, route) {
             (RequestStepKind::Verify { .. }, _) => {
-                let config = spec_config.ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
-                let hidden = hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
+                let config = spec_config
+                    .ok_or_else(|| "Verify row in a store without MTP lanes".to_string())?;
+                let hidden =
+                    hidden.ok_or_else(|| "Verify row without a hidden capture".to_string())?;
                 finish_lane_window(
                     bundle,
                     gpu,
@@ -1027,7 +1066,8 @@ fn forward_inner(
             }
             (RequestStepKind::Ar, Some(route)) => {
                 if route == LaneRoute::ArSynced {
-                    let hidden = hidden.ok_or_else(|| "ArSynced row without a hidden capture".to_string())?;
+                    let hidden = hidden
+                        .ok_or_else(|| "ArSynced row without a hidden capture".to_string())?;
                     ar_synced_head(bundle, gpu, &mut *e.lane, hidden, first)?;
                 }
                 MtpWindow {
@@ -1094,6 +1134,7 @@ fn forward_inner(
         gpu.hip
             .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
+        gpu.take_device_wait_error().map_err(|e| e.to_string())?;
         for &(i, row) in &final_tiles {
             picks[row] = pick_at(top1_host, rows_cap + i);
         }
@@ -1119,7 +1160,8 @@ fn forward_inner(
                 let Some(spec) = e.lane.spec.as_mut() else {
                     continue;
                 };
-                let (Some(window), policy, stats) = (spec.window.as_ref(), &mut spec.policy, &mut spec.stats)
+                let (Some(window), policy, stats) =
+                    (spec.window.as_ref(), &mut spec.policy, &mut spec.stats)
                 else {
                     continue;
                 };
@@ -1186,7 +1228,13 @@ mod tests {
         spec: Option<Option<TestWindow>>,
     }
 
-    fn host(tag: u64, slot: usize, status: LaneStatus, prompt_len: usize, prefilled: usize) -> LaneHost {
+    fn host(
+        tag: u64,
+        slot: usize,
+        status: LaneStatus,
+        prompt_len: usize,
+        prefilled: usize,
+    ) -> LaneHost {
         LaneHost {
             epoch: epoch(tag),
             slot,
@@ -1299,7 +1347,10 @@ mod tests {
         plan
     }
 
-    fn validate(plan: &BatchStepPlan, lanes: &HashMap<RequestEpoch, Lane>) -> Result<Vec<usize>, String> {
+    fn validate(
+        plan: &BatchStepPlan,
+        lanes: &HashMap<RequestEpoch, Lane>,
+    ) -> Result<Vec<usize>, String> {
         validate_plan(
             plan,
             PlanLimits {
@@ -1375,7 +1426,10 @@ mod tests {
     #[test]
     fn prefill_tiles_follow_the_singleton_schedule_and_prompt() {
         refused(&[tile(3, 2, &tile3()[..3], 4)], "singleton route uses 4");
-        refused(&[tile(3, 2, &[104, 105, 106, 999], 4)], "differ from its prompt");
+        refused(
+            &[tile(3, 2, &[104, 105, 106, 999], 4)],
+            "differ from its prompt",
+        );
         refused(&[tile(3, 2, &tile3(), 5)], "position");
         // A prefill row for a decoding lane.
         refused(&[tile(1, 0, &[1, 2, 3, 4], 10)], "Decoding");
@@ -1397,7 +1451,11 @@ mod tests {
     #[test]
     fn a_verify_row_matching_the_pending_window_is_accepted() {
         let table = spec_lanes(Some(batched_window()));
-        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20), tile(3, 2, &tile3(), 4)]);
+        let plan = plan_of(&[
+            verify(1, 0, &[77, 5, 6], 10),
+            ar(2, 1, 77, 20),
+            tile(3, 2, &tile3(), 4),
+        ]);
         assert_eq!(validate(&plan, &table), Ok(vec![13, 21, 8]));
         // One draft is fine too, when that is what the window kept.
         let mut one = batched_window();
@@ -1413,9 +1471,17 @@ mod tests {
     fn a_verify_row_must_equal_its_window() {
         let table = spec_lanes(Some(batched_window()));
         // Drafts differ.
-        refused_on(&[verify(1, 0, &[77, 5, 9], 10)], &table, "differ from its drafted window");
+        refused_on(
+            &[verify(1, 0, &[77, 5, 9], 10)],
+            &table,
+            "differ from its drafted window",
+        );
         // Fewer drafts than the window kept.
-        refused_on(&[verify(1, 0, &[77, 5], 10)], &table, "differ from its drafted window");
+        refused_on(
+            &[verify(1, 0, &[77, 5], 10)],
+            &table,
+            "differ from its drafted window",
+        );
         // Seed differs.
         refused_on(&[verify(1, 0, &[78, 5, 6], 10)], &table, "pending seed");
         // Rows at another position.
@@ -1436,11 +1502,19 @@ mod tests {
             "window position",
         );
         // No window, or a window of another route.
-        refused_on(&[verify(1, 0, &[77, 5, 6], 10)], &spec_lanes(None), "no drafted window");
+        refused_on(
+            &[verify(1, 0, &[77, 5, 6], 10)],
+            &spec_lanes(None),
+            "no drafted window",
+        );
         let mut synced = batched_window();
         synced.route = LaneRoute::ArSynced;
         synced.drafts = Vec::new();
-        refused_on(&[verify(1, 0, &[77, 5, 6], 10)], &spec_lanes(Some(synced)), "not Batched");
+        refused_on(
+            &[verify(1, 0, &[77, 5, 6], 10)],
+            &spec_lanes(Some(synced)),
+            "not Batched",
+        );
         // A verify for a lane still prefilling.
         let mut table = spec_lanes(Some(batched_window()));
         table.get_mut(&epoch(3)).unwrap().spec = Some(None);
@@ -1462,7 +1536,11 @@ mod tests {
                 seed: 77,
                 drafts: Vec::new(),
             }));
-            assert_eq!(validate(&plan_of(&[ar(1, 0, 77, 10)]), &table), Ok(vec![11]), "{route:?}");
+            assert_eq!(
+                validate(&plan_of(&[ar(1, 0, 77, 10)]), &table),
+                Ok(vec![11]),
+                "{route:?}"
+            );
         }
         // A window routed at another position is stale.
         let stale = spec_lanes(Some(TestWindow {
@@ -1495,7 +1573,9 @@ mod tests {
 
         let mut plan = plan_of(&[ar(1, 0, 77, 10)]);
         plan.requests.push(plan.requests[0]);
-        assert!(validate(&plan, &lanes()).unwrap_err().contains("planned twice"));
+        assert!(validate(&plan, &lanes())
+            .unwrap_err()
+            .contains("planned twice"));
     }
 
     #[test]
@@ -1503,7 +1583,9 @@ mod tests {
         refused(&[ar(9, 0, 77, 10)], "stale or unknown");
         let mut plan = plan_of(&[ar(1, 0, 77, 10)]);
         plan.requests[0].epoch.owner_generation = 2;
-        assert!(validate(&plan, &lanes()).unwrap_err().contains("stale or unknown"));
+        assert!(validate(&plan, &lanes())
+            .unwrap_err()
+            .contains("stale or unknown"));
         let mut table = lanes();
         table.get_mut(&epoch(1)).unwrap().host.status = LaneStatus::Poisoned;
         let error = validate(&plan_of(&[ar(1, 0, 77, 10)]), &table).unwrap_err();
@@ -1540,7 +1622,11 @@ mod tests {
         );
         let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20)]);
         assert!(validate(&plan, &spec).is_ok());
-        let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10), ar(2, 1, 77, 20), ar(4, 3, 77, 5)]);
+        let plan = plan_of(&[
+            verify(1, 0, &[77, 5, 6], 10),
+            ar(2, 1, 77, 20),
+            ar(4, 3, 77, 5),
+        ]);
         assert!(validate(&plan, &spec).unwrap_err().contains("row budget"));
     }
 
@@ -1556,7 +1642,8 @@ mod tests {
             ..batched_window()
         }));
         spec.get_mut(&epoch(1)).unwrap().position = CONTEXT - 2;
-        let error = validate(&plan_of(&[verify(1, 0, &[77, 5, 6], CONTEXT - 2)]), &spec).unwrap_err();
+        let error =
+            validate(&plan_of(&[verify(1, 0, &[77, 5, 6], CONTEXT - 2)]), &spec).unwrap_err();
         assert!(error.contains("context"), "{error}");
     }
 
@@ -1622,7 +1709,10 @@ mod tests {
         let h = &mut table.get_mut(&epoch(3)).unwrap().host;
         assert!(!wants_pick(h, &plan.requests[2]));
         assert_eq!(commit_host(h, &plan.requests[2], u32::MAX), None);
-        assert_eq!((h.prefilled, h.status, h.pending_seed), (8, LaneStatus::Prefilling, None));
+        assert_eq!(
+            (h.prefilled, h.status, h.pending_seed),
+            (8, LaneStatus::Prefilling, None)
+        );
         // The prompt-completing tile flips the lane to Decoding with a seed.
         let last = plan_of(&[tile(3, 2, &[108, 109], 8)]);
         assert!(wants_pick(h, &last.requests[0]));
@@ -1636,11 +1726,17 @@ mod tests {
     #[test]
     fn a_committed_verify_window_extends_the_lane_and_seeds_the_last_token() {
         let plan = plan_of(&[verify(1, 0, &[77, 5, 6], 10)]);
-        assert!(wants_pick(&host(1, 0, LaneStatus::Decoding, 10, 10), &plan.requests[0]));
+        assert!(wants_pick(
+            &host(1, 0, LaneStatus::Decoding, 10, 10),
+            &plan.requests[0]
+        ));
         let mut h = host(1, 0, LaneStatus::Decoding, 10, 10);
         h.generated = vec![77];
         assert_eq!(commit_verify(&mut h, &[5, 6, 8]), Some(8));
-        assert_eq!((h.pending_seed, h.generated.clone()), (Some(8), vec![77, 5, 6, 8]));
+        assert_eq!(
+            (h.pending_seed, h.generated.clone()),
+            (Some(8), vec![77, 5, 6, 8])
+        );
         // A window that committed nothing changes nothing.
         assert_eq!(commit_verify(&mut h, &[]), None);
         assert_eq!(h.generated, vec![77, 5, 6, 8]);
