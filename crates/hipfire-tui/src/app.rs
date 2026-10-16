@@ -745,6 +745,13 @@ impl App {
                 self.registry.selected = self.registry.selected.saturating_sub(1);
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
+                // A remote (not-downloaded) row can't be the default model: saving
+                // it would point serve at a file that doesn't exist. Local rows and
+                // group headers keep their behavior.
+                if let Some((tag, false)) = self.registry.selected_model() {
+                    self.toast_info(format!("{tag} is not downloaded — p to pull"));
+                    return;
+                }
                 if let Some(action) = self.registry.activate_selected() {
                     match action {
                         RegistryAction::ToggledGroup { name, expanded } => {
@@ -3308,6 +3315,61 @@ mod tests {
             "reload must carry expanded groups across the registry reload"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Enter on a not-downloaded (remote) Models row must not persist it as
+    /// `default_model` (serve would point at a file that isn't there) — it
+    /// toasts the pull hint instead. A local row still saves.
+    #[test]
+    fn models_enter_on_remote_row_does_not_save_default_model() {
+        use crate::hipfire::registry::{ModelEntry, ModelRow};
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Models;
+        let row = |tag: &str, downloaded: bool| ModelRow {
+            tag: tag.into(),
+            entry: ModelEntry::default(),
+            downloaded,
+            has_triattn: false,
+            has_mtp: false,
+        };
+        app.registry.models = vec![row("zz:remote", false), row("zz:local", true)];
+        app.registry.expanded_groups.insert("zz".into());
+        let before_cfg = std::fs::read_to_string(&app.paths.config).unwrap();
+        let before_default = app.config.default_model.clone();
+        let before_value = app.config.values.get("default_model").cloned();
+        let before_override = app.config.overrides.contains("default_model");
+        let before_active = app.active_model.clone();
+
+        // visible: [group zz, zz:remote, zz:local]
+        app.registry.selected = 1;
+        app.handle_models_key(key(KeyCode::Enter));
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            before_cfg,
+            "a remote row must leave config.toml unchanged"
+        );
+        assert!(!before_cfg.contains("default_model"));
+        assert_eq!(app.config.default_model, before_default);
+        assert_eq!(app.active_model, before_active);
+        assert_eq!(app.config.values.get("default_model").cloned(), before_value);
+        assert_eq!(
+            app.config.overrides.contains("default_model"),
+            before_override
+        );
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("zz:remote is not downloaded — p to pull")
+        );
+
+        // A local row keeps the old behavior.
+        app.registry.selected = 2;
+        app.handle_models_key(key(KeyCode::Enter));
+        assert_eq!(app.config.default_model, "zz:local");
+        assert_eq!(app.active_model, "zz:local");
+        let on_disk = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(on_disk.contains("zz:local"), "got: {on_disk}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

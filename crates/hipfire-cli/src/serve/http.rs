@@ -17,10 +17,11 @@ use crate::serve::metrics::Metrics;
 use crate::serve::{anthropic, responses};
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
-use crate::{is_standalone_model, list_local_models, unix_timestamp};
+use crate::{grandfather_table, list_local_models, unix_timestamp};
 use anyhow::{anyhow, bail, Context, Result};
-use hipfire_config::secret::BearerToken;
 use bytes::Bytes;
+use hipfire_config::secret::BearerToken;
+use hipfire_registry::is_standalone_model;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::{
@@ -1092,7 +1093,14 @@ async fn handle_request(
             data.extend(
                 local
                     .into_iter()
-                    .filter(|model| is_standalone_model(&model.path, &model.name, &registry))
+                    .filter(|model| {
+                        is_standalone_model(
+                            &model.path,
+                            &model.name,
+                            &registry,
+                            &grandfather_table(),
+                        )
+                    })
                     .map(|model| {
                         let created = (model.created > 0).then_some(model.created);
                         (model.registry_tag.unwrap_or(model.name), created)

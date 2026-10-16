@@ -18,6 +18,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+pub mod local_files;
+pub use local_files::{
+    is_expert_hotset_name, is_listable_model_file, is_model_file, is_ple_sidecar_name,
+    is_standalone_model, is_trunk_overlay_name, names_registry_model, probe_hfq_arch_id,
+    registry_sidecar_files, MODEL_SUFFIXES, PLE_AUX_SUFFIXES, SERVE_TRUNK_ARCH_IDS,
+};
 pub mod xdna;
 pub use xdna::{XdnaManifest, XdnaProfile, XdnaSidecarDescriptor};
 

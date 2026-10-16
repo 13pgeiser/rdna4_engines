@@ -620,33 +620,15 @@ impl HfqFile {
         self.mq4v2_symmetric
     }
 
-    /// Header-only sibling of [`Self::open`]: read the 32-byte container
-    /// header and return its `arch_id` — no mmap, no metadata JSON parse, no
-    /// tensor index.
+    /// Header-only sibling of [`Self::open`]: the container's `arch_id` from
+    /// its 32-byte header, no mmap, no metadata parse, no tensor index.
     ///
-    /// [`Self::open`] is the load path: it walks the metadata and
-    /// materialises every tensor entry, which is far too much work for a
-    /// discovery scan. Serve's `/v1/models` uses this to classify an on-disk
-    /// file the registry does not vouch for — a trunk versus a sidecar
-    /// artifact (the DFlash drafts and friends carry arch ids 20/21/22/23;
-    /// see `docs/architecture-ids.md` § Sidecar / reserved ids). `Err` for
-    /// anything that is not a container, or is shorter than one, so a caller
-    /// can read "cannot tell" as "not a trunk".
-    ///
-    /// The layout is the one [`Self::open_at_offset`] parses: `HFQM` magic,
-    /// `u32` version, `u32` arch id, `u32` tensor count, then the metadata and
-    /// data offsets — little-endian, relative to the container start.
+    /// Delegates to [`hipfire_registry::probe_hfq_arch_id`], which
+    /// owns the header layout (the one [`Self::open_at_offset`] parses) so the
+    /// registry's local-file classification and the loader cannot drift. `Err`
+    /// for anything that is not a container, or is shorter than one.
     pub fn probe_arch_id(path: &Path) -> std::io::Result<u32> {
-        let mut file = File::open(path)?;
-        let mut header = [0u8; 32];
-        file.read_exact(&mut header)?;
-        if &header[..4] != b"HFQM" {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("HfqFile: not an HFQ container: {}", path.display()),
-            ));
-        }
-        Ok(u32::from_le_bytes(header[8..12].try_into().unwrap()))
+        hipfire_registry::probe_hfq_arch_id(path)
     }
 
     /// `open` with the REAP plan injected instead of taken from process config.

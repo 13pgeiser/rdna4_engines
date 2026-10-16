@@ -27,10 +27,6 @@ use std::time::{Duration, Instant};
 /// Minimum spacing of two progress lines inside one conversion phase.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Suffixes of PLE-adjacent files that belong to a model but are never models
-/// themselves (besides the `.ple-<key>` row files, see [`is_ple_sidecar_name`]).
-const PLE_AUX_SUFFIXES: [&str; 2] = [".plehot", ".plehotrows"];
-
 /// `hipfire pull --ple` selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PleSelection {
@@ -359,19 +355,6 @@ pub(crate) fn split_model_files(entry: &ModelEntry) -> Vec<String> {
         files.push(pin.legacy_file.to_owned());
     }
     files
-}
-
-/// True for files that belong to a model without being one: the PLE row
-/// sidecars of any format key (`.ple-q4`, `.ple-q8`, a future `.ple-q2`), the
-/// hot-rank file and the hot-row packs.
-pub(crate) fn is_ple_sidecar_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    PLE_AUX_SUFFIXES
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
-        || lower.rsplit_once(".ple-").is_some_and(|(stem, key)| {
-            !stem.is_empty() && hipfire_registry::is_ple_format_token(key)
-        })
 }
 
 /// Path of the PLE sidecar of format `key` beside `model`
@@ -1879,35 +1862,6 @@ mod tests {
         std::fs::write(ple_sidecar_path(&target, PleFormat::Q8), b"rows").unwrap();
         ensure().unwrap();
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn sidecar_classification_covers_rows_hot_rank_and_hot_packs() {
-        for name in [
-            "m.mq4-xts.ple-q4",
-            "m.mq4-xts.ple-q8",
-            "M.MQ4-XTS.PLE-Q8",
-            "m.mq4-xts.ple-q2",
-            "m.mq4-xts.ple-nf4",
-            "m.mq4-xts.plehot",
-            "m.mq4-xts.plehotrows",
-            "m.mq4-xts.ple-q4.plehotrows",
-            "m.mq4-xts.ple-q8.plehotrows",
-        ] {
-            assert!(is_ple_sidecar_name(name), "{name}");
-        }
-        for name in [
-            "m.mq4-xts",
-            "qwen3.8-flash-next-base.mq4-xts",
-            "qwen3.8-flash-next.mq4",
-            "m.q8",
-            "ple-q8.mq4",
-            "m.ple-",
-            "m.ple-q_2",
-            ".ple-q8",
-        ] {
-            assert!(!is_ple_sidecar_name(name), "{name}");
-        }
     }
 
     #[test]

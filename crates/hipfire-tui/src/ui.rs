@@ -1116,16 +1116,20 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(pad(area, 1, 0));
+    let registry_label = match (&app.registry.loaded_path, app.registry.bundled) {
+        (Some(path), _) => path.display().to_string(),
+        (None, true) => match app.registry.generated_at.get(..10) {
+            Some(date) => format!("bundled ({date})"),
+            None => "bundled".into(),
+        },
+        (None, false) => "missing".into(),
+    };
     let summary = format!(
         "active: {}    {} downloaded / {} available    registry: {}    aliases: {}",
         app.active_model,
         app.registry.downloaded_count(),
         app.registry.models.len(),
-        app.registry
-            .loaded_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "missing".into()),
+        registry_label,
         app.registry.aliases.len(),
     );
     frame.render_widget(
@@ -1164,6 +1168,29 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    // Fixed-width columns; the Tag column grows to the longest visible tag (up to
+    // what leaves Notes a usable remainder) so wide terminals show full tags.
+    const TAG_MIN: usize = 24;
+    const HAVE_W: usize = 11; // fits "NN/NN local" group counts
+    const SIZE_W: usize = 9;
+    const VRAM_W: usize = 7;
+    const COL_GAPS: usize = 4;
+    const NOTES_MIN: usize = 30;
+    let inner_w = chunks[1].width.saturating_sub(2) as usize;
+    let longest_tag = visible_items
+        .iter()
+        .map(|item| match item {
+            ModelListItem::Group { name, .. } => 2 + name.chars().count(),
+            ModelListItem::Model { model_index } => {
+                4 + app.registry.models[*model_index].tag.chars().count()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let tag_cap = inner_w
+        .saturating_sub(HAVE_W + SIZE_W + VRAM_W + COL_GAPS + NOTES_MIN)
+        .max(TAG_MIN);
+    let tag_w = longest_tag.clamp(TAG_MIN, tag_cap);
     let rows = visible_items
         .iter()
         .enumerate()
@@ -1179,43 +1206,40 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     expanded,
                 } => {
                     let marker = if *expanded { "v" } else { ">" };
+                    // The action hint belongs to the selected group only.
+                    let hint = match (selected, *expanded) {
+                        (false, _) => "",
+                        (true, false) => "Enter/Right to expand",
+                        (true, true) => "Enter/Left to collapse",
+                    };
                     Row::new([
                         format!("{marker} {name}"),
                         format!("{downloaded}/{count} local"),
                         String::new(),
                         String::new(),
-                        String::new(),
-                        "Enter/Right to expand, Left to collapse".into(),
+                        hint.into(),
                     ])
                 }
                 ModelListItem::Model { model_index } => {
                     let row = &app.registry.models[*model_index];
-                    let status = if row.tag == app.active_model {
-                        "active"
-                    } else if row.downloaded {
-                        "local"
-                    } else if row.entry.repo.is_empty() {
-                        "local-only"
+                    let active = if row.tag == app.active_model {
+                        "*"
                     } else {
-                        "remote"
+                        " "
                     };
-                    let extras = match (row.has_triattn, row.has_mtp) {
-                        (true, true) => "triattn mtp",
-                        (true, false) => "triattn",
-                        (false, true) => "mtp",
-                        _ => "",
+                    let have = if row.downloaded { "local" } else { "remote" };
+                    let mtp = if row.has_mtp { "[mtp] " } else { "" };
+                    let notes = if row.entry.repo.is_empty() {
+                        format!("{mtp}{} (no remote repo)", row.entry.desc)
+                    } else {
+                        format!("{mtp}{}", row.entry.desc)
                     };
                     Row::new([
-                        format!("  {}", row.tag),
-                        status.into(),
+                        format!("  {active} {}", row.tag),
+                        have.into(),
                         format!("{:.1} GB", row.entry.size_gb),
                         format!("{:.0} GB", row.entry.min_vram_gb),
-                        extras.into(),
-                        if row.entry.repo.is_empty() {
-                            format!("{} (no remote repo)", row.entry.desc)
-                        } else {
-                            row.entry.desc.clone()
-                        },
+                        notes,
                     ])
                 }
             };
@@ -1241,18 +1265,14 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(24),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Min(20),
+            Constraint::Length(tag_w as u16),
+            Constraint::Length(HAVE_W as u16),
+            Constraint::Length(SIZE_W as u16),
+            Constraint::Length(VRAM_W as u16),
+            Constraint::Min(10),
         ],
     )
-    .header(
-        Row::new(["Tag", "Have", "Size", "VRAM", "Sidecars", "Notes"])
-            .style(Style::default().fg(MUTED)),
-    )
+    .header(Row::new(["Tag", "Have", "Size", "VRAM", "Notes"]).style(Style::default().fg(MUTED)))
     .block(block("Registry browser"))
     .style(Style::default().bg(PANEL));
     frame.render_widget(table, chunks[1]);
@@ -3290,5 +3310,98 @@ mod render_tests {
         });
         let (text, _) = draw_at(&mut app, 160, 24);
         assert!(text.contains("5 tok @ 2 tok/s"));
+    }
+
+    /// Render the Models tab at `width`x`height` over a fixed registry: two
+    /// all-remote groups (`0/2 local`), and an expanded `qwen3.8` group holding
+    /// a long tag that is the active (local) model.
+    fn render_models(width: u16, height: u16) -> String {
+        use crate::hipfire::registry::{LocalModel, ModelEntry, ModelRow};
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Models;
+        let row = |tag: &str, downloaded: bool, has_mtp: bool| ModelRow {
+            tag: tag.into(),
+            entry: ModelEntry {
+                repo: "org/repo".into(),
+                size_gb: 1.5,
+                min_vram_gb: 8.0,
+                desc: "test row".into(),
+                ..ModelEntry::default()
+            },
+            downloaded,
+            has_triattn: true,
+            has_mtp,
+        };
+        app.active_model = "qwen3.8:flash-next-mq4-xts-zab".into();
+        app.registry.models = vec![
+            row("alpha:a", false, false),
+            row("alpha:b", false, false),
+            row("beta:a", false, false),
+            row("beta:b", false, false),
+            row("qwen3.8:flash-next-mq4-xts-zab", true, true),
+            row("qwen3.8:flash-next-mq3-xts", false, false),
+        ];
+        // The `.ple-q4` row file is on disk but is a sidecar, never a Models row.
+        app.registry.local_files = vec![LocalModel {
+            file: "qwen3.8.mq4.ple-q4".into(),
+            size: "29.1 GiB".into(),
+            bytes: 31_243_000_000,
+        }];
+        app.registry.expanded_groups = ["qwen3.8".to_string()].into_iter().collect();
+        app.registry.selected = 0;
+        app.registry.loaded_path = None;
+        app.registry.bundled = true;
+        app.registry.generated_at = "2026-10-01T00:00:00Z".into();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn models_tab_groups_and_header_are_fully_visible_at_80_and_160() {
+        for (w, h) in [(80, 24), (160, 48)] {
+            let text = render_models(w, h);
+            assert_eq!(
+                text.matches("0/2 local").count(),
+                2,
+                "{w}x{h}: both all-remote groups show their full `0/2 local` count"
+            );
+            assert!(text.contains("1/2 local"), "{w}x{h}: expanded group count");
+            assert!(!text.contains(".ple-q4"), "{w}x{h}: no .ple-q4 rows");
+            assert!(
+                !text.contains("triattn"),
+                "{w}x{h}: no triattn sidecar display"
+            );
+            assert!(
+                !text.contains("local-only"),
+                "{w}x{h}: Have is local/remote only"
+            );
+            assert_eq!(
+                text.matches("Enter/Right to expand").count(),
+                1,
+                "{w}x{h}: only the selected group carries the action hint"
+            );
+        }
+    }
+
+    #[test]
+    fn models_tab_wide_screen_shows_long_tag_and_separate_active_marker() {
+        let text = render_models(160, 48);
+        assert!(
+            text.contains("* qwen3.8:flash-next-mq4-xts-zab"),
+            "the long tag is fully visible with the active marker beside it"
+        );
+        assert!(
+            text.contains("qwen3.8:flash-next-mq3-xts"),
+            "the second long tag is visible"
+        );
+        assert!(
+            text.contains("registry: bundled (2026-10-01)"),
+            "a bundled registry is named with its date, not `missing`"
+        );
+        assert!(text.contains("remote") && text.contains("local"));
     }
 }
