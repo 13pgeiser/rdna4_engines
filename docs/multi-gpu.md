@@ -592,8 +592,19 @@ byte-exact PASS, 1 for a mismatch or a failed arm, 2 for an environment or
 usage problem. It is supporting manual evidence, not a
 [`VALIDATION.md`](VALIDATION.md) selector route.
 `crates/hipfire-runtime/examples/ep_transport_oracle.rs` (feature `lab`) is a
-separate no-model, one-device synthetic oracle for the row-gather and tile
-launchers at N = 2..=8.
+separate no-model synthetic oracle for the row-gather and tile launchers. Without
+`--devices` it runs every rank on one device at N = 2..=8. With `--devices 0,1[,..]`
+each rank is its own device and host thread, and it proves the host-staged transport
+for rigs without peer access: one mapped-pinned host bank (two, alternating) aliased on
+every device, each rank publishing its owned rows or tiles into the bank, system-release
+ready events, a host sync of every producer before the existing gather kernels read
+the bank, and bank reuse only after every reader's done event. It checks every byte,
+coherency across bank reuse and a read-before-publish negative control (`xrows`,
+`xtiles`, `xctl`), and times EP exchange shapes and pipeline boundary hops against P2P
+(`xtime`, `xhop`). `--transport host|peer|both` (default from
+`HIPFIRE_QWEN4_EP_TRANSPORT`, `auto` = host when any device pair lacks peer access);
+the host transport never enables peer access. It is transport evidence only: no product
+route uses host staging yet.
 
 
 ### Environment (operator-facing)
