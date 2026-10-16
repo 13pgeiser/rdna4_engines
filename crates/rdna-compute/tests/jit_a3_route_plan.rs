@@ -312,9 +312,9 @@ fn conflicting_public_entry_plans_refuse() {
 /// The accepted PM multi-column objects (`pm_xbatch.rs`): `(module, image
 /// sha256, symbol)`.
 const PM_XBATCH_OBJECTS: [(&str, &str, &str); 3] = [
-    ("gemv_hfq4g256_xbatch_mq4v2_pm", "1b4da1135f5623b6188a0c13b78106177a9a1cddef6cbc4c2839aa495753db6e", "gemv_mq4g256v2_xbatch_pm"),
-    ("gemv_hfq4g256_residual_xbatch_mq4v2_pm", "cf64991bb24e4d99fd57c304545b47b2a5a7a893e4e65c612adb0b49b7573267", "gemv_mq4g256v2_residual_xbatch"),
-    ("gemv_hfq4g256_multirow_xbatch_mq4v2_pm", "07ea1deb45e546345567bf1e891923b0fcf05f7959be51448787059a6867c2e4", "gemv_mq4g256v2_multirow_r2_xbatch_pm"),
+    ("gemv_hfq4g256_xbatch_mq4v2_pm", "97c2872246c123a03bbb4751fed75b2f7235654482c96b007eb69c2ffbb41b59", "gemv_mq4g256v2_xbatch_pm"),
+    ("gemv_hfq4g256_residual_xbatch_mq4v2_pm", "7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1", "gemv_mq4g256v2_residual_xbatch"),
+    ("gemv_hfq4g256_multirow_xbatch_mq4v2_pm", "fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf", "gemv_mq4g256v2_multirow_r2_xbatch_pm"),
 ];
 
 /// Default `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP

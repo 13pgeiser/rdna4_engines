@@ -50089,7 +50089,7 @@ mod route_selector_tests {
         // Image identity: the committed W3 module, separate from the unchanged MQ4 module.
         assert_eq!(
             crate::code_object::CodeObjectId::of(w3).to_string(),
-            "3512c8a74c6e915e00a7433a6c963cb4c60bce7dc619ebfc97f9c69d111018df"
+            "83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833"
         );
         assert_ne!(
             crate::code_object::CodeObjectId::of(w3),

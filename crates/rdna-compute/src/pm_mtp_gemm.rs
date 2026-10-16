@@ -11,7 +11,7 @@ use std::{ffi::c_void, sync::LazyLock};
 
 const MODULE: &str = "gemm_hfq4g256_rows_pm";
 const IMAGE: &[u8] = include_bytes!("../../../kernels/pm-decode/gfx1201/gemm_hfq4g256_rows_pm.hxaco");
-const SHA256: &str = "797358d9320e112003efdfa3ebc7ba684323f7d2b754bc569bfa9207e8b084c7";
+const SHA256: &str = "657eb7c1828fdb80f078c239f17527b4b6e249023824d7864178840bfe2129cb";
 static VERIFIED: LazyLock<bool> = LazyLock::new(|| {
     let got: String = Sha256::digest(IMAGE).iter().map(|b| format!("{b:02x}")).collect();
     got == SHA256

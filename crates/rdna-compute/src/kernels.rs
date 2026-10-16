@@ -16,11 +16,11 @@ pub const QSA_BF16_SCORES_SRC: &str = include_str!("../../../kernels/src/qsa_bf1
 pub const NPU_TRUNK_SRC: &str = include_str!("../../../kernels/src/npu_trunk.hip");
 /// Certified signed-IU8 WMMA and BF16/F32 scatter, exact gfx1151.
 pub const NPU_TRUNK_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_pm_gfx1151.hxaco");
-pub const NPU_TRUNK_PM_GFX1151_SHA256: &str = "b39f1b52b5da2bf9ca04304655ea6fada7fedff05f7c96b993d7f379ff7cc353";
+pub const NPU_TRUNK_PM_GFX1151_SHA256: &str = "f0199464d5a94253678ecd4c6720440734e24a213d7ae37966ce9d5c361ebe09";
 
 /// Certified direct BF16/F32 row-major cache readers (M7, gfx1151).
 pub const NPU_TRUNK_ARENA_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/npu_trunk_arena_pm_gfx1151.hxaco");
-pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str = "ba515981171b9ef533a2863ef386715bb2cc4f1956e40dcde8b97327709e49e7";
+pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str = "dbfaf02cbf12015b6c2b4637d82d35c5824d042a4d80490b649c2343d286cc7f";
 
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
@@ -4244,10 +4244,11 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
 /// ARCH`, one contract-checked `peacemaker custom build` per symbol, M7
 /// obligation-free). Same ABI, grid and bytes as the gfx1151 hipcc entries.
 /// SHA-256 (contracts under `crates/peacemaker-isa/kernels/qwen4_moe_sym.*.contract.json`):
-/// gfx1151 ede9af50a2f786eaef14ab12cdaef9eda604adbcd65faa7f170bcd307eba60cc (was 2540a22b…),
-/// gfx1201 792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515 (was 7179393f…);
-/// each differs from its predecessor only by the `.comment` stamp
-/// (`hipfire peacemaker native-emit`).
+/// gfx1151 c0f826ba42ea1b334840a7dc1d25379484f15bfaa31c69ce6d519aff7537b27c (was ede9af50…, 2540a22b…),
+/// gfx1201 fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481 (was 792b207a…, 7179393f…);
+/// the earlier steps differ from their predecessors only by the `.comment` stamp
+/// (`hipfire peacemaker native-emit`); the latest differs only by the emitter's code-end tail fill
+/// (`.text` grows by the fill, bytes before it are unchanged).
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
@@ -4263,7 +4264,7 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
 /// qualification twin `..._acc`. A separate image: the MQ4 module above is
 /// byte-identical and carries no W3 symbol. No hipcc kernel. The gfx1151 images
 /// are [`QWEN4_MOE_IU4_SYM_W3_PM_GFX1151`] and [`QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151`].
-/// SHA-256 3512c8a74c6e915e00a7433a6c963cb4c60bce7dc619ebfc97f9c69d111018df.
+/// SHA-256 83822312b26a2f90fa688e39f610f1b95528e035c5118946b7060df3cc254833.
 pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco");
 /// Certified builder module of the gathered QSA prefill attention
@@ -4272,10 +4273,10 @@ pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1201: &[u8] =
 /// attention, with the ABI, grid, LDS and output bytes of
 /// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
 /// Default on (`HIPFIRE_QWEN4_QSA_PM=0` keeps the hipcc kernels).
-/// SHA-256 gfx1151 3ede35160ca5885756372580b8f972287eb71abd4174f6f6f0f45873e46df632
-/// (was b7809d03…), gfx1201 9d0b83cc14bfb50118c2b77f1f925330372fcc730ca7140cc00bbf0614d32607
-/// (was deee483f…); each differs only by the `.comment` stamp
-/// (`hipfire peacemaker native-emit`).
+/// SHA-256 gfx1151 ad83c8da896261901671b8beeaa583c22e7a3e361f41f24ae784269c3e3de4c2
+/// (was 3ede3516…, b7809d03…), gfx1201 e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
+/// (was 9d0b83cc…, deee483f…); the earlier steps differ only by the `.comment` stamp
+/// (`hipfire peacemaker native-emit`), the latest only by the emitter's code-end tail fill.
 pub const QSA_GATHER_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1151.hxaco");
 pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_gather_pm_gfx1201.hxaco");
 /// Certified builder module of the production sampled-DFlash device accept
@@ -4320,7 +4321,7 @@ pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
 /// (64-row block of 128 threads) and `_w8` (128-row block of 256 threads),
 /// both over 256-token tiles (grid `[ceil(M/rows), ceil(N/256), 1]`).
 /// Default on (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps the hipcc kernel).
-/// SHA-256 36f07dd7cc1e80dbfa28b8d5710972ab335f231f082c0176a8ccd9afb7a19b1f
+/// SHA-256 9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");
@@ -4333,7 +4334,7 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
 /// (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and `_w8_hcw`; the runtime
 /// launches only `_w8`, `_w8_bf16out` and `_w8_regions`, from M >= 2560 and
 /// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
-/// SHA-256 3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500
+/// SHA-256 abfc9a35b60f76538e705327bc53f0ea5f5a51fa5783650b25c620004769ec11
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
@@ -4353,7 +4354,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] =
 /// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
 pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
-    "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
+    "11d0c2c7e423ef211e8c32202d20deea3d317b7f2a7ae538b069b56978c60a22";
 /// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
 /// `crates/peacemaker-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
 /// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
@@ -4363,7 +4364,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
 /// `_w8_hcw`, with the kernarg ABIs of the MQ6 entries. The runtime launches them for
 /// N >= 96 (`w4` for M <= 64); `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps hipcc bt4 and the
 /// unfused HC write.
-/// SHA-256 8281105b382654e560297af5732caff8da1198706abbc2c1f2e3f145b569574c
+/// SHA-256 d9eb27bc771f2091904194ee0311dd63487c4a3a81ec1a82337cf44701177e98
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
@@ -4374,12 +4375,12 @@ pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =
 /// `gemv_mq4g256v2` (96-byte kernarg: A0..A3, x, y0..y3, M0..M3, K, B; grid
 /// `[sum(ceil(M_i/2)), 1, 1]`, block 32). Default on
 /// (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
-/// SHA-256 bf9d23d10ca351835f1c5983f43889d5360ffa1d1866a0ca902d07e4d830184c
+/// SHA-256 a622eebb59489e4b553ccac3919f2a159c1f7bbcab2a29a798dca7920d110636
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
 /// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
-/// SHA-256 eb9f5700257e353bee5105d28129f0df9dbfb73ecdf4a312b85b374c1a7433aa
+/// SHA-256 f0f42944858fececd299f972c63c1ea3c0f57dcd007d38a99877eb209afbe88b
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
@@ -4392,7 +4393,7 @@ pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] =
 /// chains, same BF16-recipe activation ops; grid `[ceil(I / (16 wr)), ceil(N / 128), 1]`,
 /// block `32 wr`). Default on for exact gfx1151 prefill (`HIPFIRE_QWEN4_SHARED_GU_PM=0` keeps
 /// the chain).
-/// SHA-256 9509a2cdda96981bfbaa85bdda228a589bf4c2c0fd61cdb9bce8ea55f727acb1
+/// SHA-256 f243bcec8e431289f6decd9e797fdfb5d5ef750faff5fad57a72fccfdd70bdcc
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
 pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
 /// Standalone gfx1151 MTP append DET dense projection (`peacemaker-isa` kernel
@@ -4818,9 +4819,10 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 /// Certified gfx1100 builder code object, SHA-256
-/// 56b49afb87007ebf81bc23f87092cd3baa92d5a5e1e7d7c9743371b62f506289
+/// e33ac75d5560ed61cffd0de71704f8ed740226992c11dc79bf4cd36b9fa5bcf5
 /// (local 4x4 tile-coordinate transpose for N>=4096 and complete groups;
-/// short/incomplete grids retain linear ordering)
+/// short/incomplete grids retain linear ordering; 56b49afb with the emitter's
+/// code-end tail fill appended to `.text`)
 /// (`peacemaker-isa emit --kernel iu4_v2c --epi all`, one contract-checked
 /// `peacemaker custom build --arch gfx1100` per symbol): the V2C algorithm's
 /// SET, ADD and F1-lite gate/up SiLU entries with every fold op VOPD-paired
@@ -4918,9 +4920,10 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_v3.gfx12.hip")
 );
 /// Certified gfx1201 K128/T128 builder code object, all three epilogues.
-/// SHA-256 f166cf72f3c49c286aacbc627beeb204b6022fbf5865db8785dc7b54bce3321d
+/// SHA-256 5cf347e7f66c82bcc0f836b6c6b1030946ee9e6a6a23c4df32a2ee33021521c8
 /// (8edd7565 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
-/// 875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
+/// 875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical; f166cf72 with the
+/// emitter's code-end tail fill appended to `.text`):
 /// prefetch the next K128's slab-1 A/W after B2 and scale/weight metadata before B1;
 /// the fused GDN projection pads its LDS ring rows to 528 bytes; every symbol
 /// runs its K-loop at wave priority 1 and its epilogue (the fused projection:
@@ -4941,16 +4944,18 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc
+/// SHA-256 7613fc64b6639d51aaea042ee9fe94a0e0a323efe51eda8da20cba36961b58e7
 /// (cc0288f8 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
 /// 4ffe3580 with VCC counted in gfx12 `.sgpr_count`; `.text` identical)
-/// (d5190d97 with the `_b1` QKVZAGDN guard change).
+/// (d5190d97 with the `_b1` QKVZAGDN guard change; 5114752c with the emitter's
+/// code-end tail fill appended to `.text`).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco");
 /// Certified gfx1201 F2 Row/K128 bundle; production selects Row only.
-/// SHA-256 1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7
+/// SHA-256 90bcc18b59c524e092e6ae37abd9d617ca0e727bc396043e5de2141b81b2c040
 /// (6a2dbe59 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
-/// c4e5c52d with VCC counted in gfx12 `.sgpr_count`; `.text` identical):
+/// c4e5c52d with VCC counted in gfx12 `.sgpr_count`; `.text` identical; 1efb0b8b with the
+/// emitter's code-end tail fill appended to `.text`):
 /// the 1b26cd3a symbols with every Row fold's ratios batched (two
 /// `ds_load_b128` per 8-row group, loaded one group ahead through v168..v175
 /// and v[183:186]/v[188:191]) and the QKVZA+GDN ring rows padded to 1,040 B
@@ -5002,9 +5007,10 @@ pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
 /// gfx1151 only; `HIPFIRE_V2B_PM=0` opts out to hipcc,
 /// `HIPFIRE_V2B_PM_BUNDLE=<path>` loads another builder bundle (e.g. the
 /// previous one) instead.
-/// SHA-256 2395edabe77a58ba6ac8bbcb4f349d49a29f3c4e744eeb7889da498905778d2b
+/// SHA-256 c2890da64946418b3112565dcc0d8cd2d262fb6f085d63fc1265414822b517d1
 /// (485d21ba with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
-/// nothing else changed).
+/// nothing else changed; 2395edab with the emitter's code-end tail fill appended to
+/// `.text`).
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151.hxaco");
 
@@ -5021,7 +5027,8 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
 /// the round-0 panel loads (`s_waitcnt lgkmcnt(0)`): without it a WGP's other
 /// CU could overwrite a panel row before this wave read it, which made the
 /// output depend on co-tenant GPU load.
-/// SHA-256 09dbc6403013c7eab1b13e659faf6662f9c47477b64e2b5200be62e0f358b556.
+/// SHA-256 4f3cc63475c709997e3f4bfb3dcb735098c24ca5a9976e916be22da143575eaf
+/// (09dbc640 with the emitter's code-end tail fill appended to `.text`).
 pub const GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151.hxaco");
 

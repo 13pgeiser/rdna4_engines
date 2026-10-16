@@ -2,15 +2,15 @@
   "module": "gemv_hfq4g256_multirow_default_mq4v2",
   "arch": "gfx1201",
   "builder_crate_version": "0.4.1",
-  "builder_git_sha": "e95fbb84b3",
-  "s_text_sha256": "7b9fab26cff55b2ae5ab2e54594c207c794597984916a89fdaf2d4c8894c174c",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "e2c22dadd4dde135383214768d7ebb7baa3eb71f04326893356cc5e11cd4403b",
   "kernels": [
     {
       "kernel_id": "gemv_hfq4g256_multirow_default_mq4v2",
       "variant": "multirow-r2-exact",
       "arch": "gfx1201",
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "e95fbb84b3",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
       "reg_plan": [
         {
           "name": "tid",
@@ -2551,7 +2551,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "7b9fab26cff55b2ae5ab2e54594c207c794597984916a89fdaf2d4c8894c174c"
+      "s_text_sha256": "e2c22dadd4dde135383214768d7ebb7baa3eb71f04326893356cc5e11cd4403b"
     }
   ]
 }

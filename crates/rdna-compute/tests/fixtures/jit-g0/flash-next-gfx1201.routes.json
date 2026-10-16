@@ -49,7 +49,7 @@
       "kind": "embedded",
       "module": "qwen4_moe_iu4_sym_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-      "sha256": "792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515",
+      "sha256": "fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481",
       "symbols": [
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
         "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8",
@@ -113,7 +113,7 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
-      "sha256": "36f07dd7cc1e80dbfa28b8d5710972ab335f231f082c0176a8ccd9afb7a19b1f",
+      "sha256": "9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1",
       "symbols": [
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w8"
@@ -2768,7 +2768,7 @@
           "kind": "embedded",
           "module": "qwen4_moe_iu4_sym_pm_gfx1201",
           "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
-          "sha256": "792b207ae23ec9d47ab13303c60f700ce46afeddf8f163efd72fd31acdcfd515",
+          "sha256": "fea044d00e2989172fb440aef1af2304c70ccbf5c663508c0c0ec912afb15481",
           "symbols": [
             "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4",
             "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4"

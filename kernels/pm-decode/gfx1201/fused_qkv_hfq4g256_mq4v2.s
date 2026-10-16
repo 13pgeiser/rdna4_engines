@@ -524,3 +524,6 @@ amdhsa.target: amdgcn-amd-amdhsa--gfx1201
 amdhsa.version: [1, 2]
 ...
 .end_amdgpu_metadata
+.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480

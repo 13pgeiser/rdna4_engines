@@ -1,26 +1,26 @@
 {
   "schema_version": 5,
   "compiler": "radiowave",
-  "generated_unix_seconds": 1791512067,
-  "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
-  "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
+  "generated_unix_seconds": 1792116472,
+  "source": "/home/kaden/qcal/release-0.4.3/pm-code-end/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
+  "output": "/home/kaden/qcal/release-0.4.3/pm-code-end/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
   "arch": "gfx1201",
   "wavefront": "wave32",
   "scheduler_profile": "default",
   "hipcc": "/opt/rocm/core/bin/hipcc",
   "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
   "command": [
-    "/home/kaden/qcal/release-0.4.2/target-pmdt-PmGateUp/release/peacemaker",
+    "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
     "native",
     "--arch=gfx1201",
-    "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
-    "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.co",
-    "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
+    "kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
+    "--co=kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.co",
+    "--bundle=kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
     "--host-target=host-x86_64-unknown-linux-gnu"
   ],
-  "source_sha256": "e6ab680ea93bb2cc67c026d70ea8e0ba260a2a30831067d3994cc68512eab899",
+  "source_sha256": "f8209f09f524156eb4d76d01546d6173641dfaba27bffb1d35160579137bf784",
   "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "output_sha256": "23673ee66a0b3dc36b050b21282e4847cca468348868a7619e2ee09f7f193635",
+  "output_sha256": "e694451d02f97e3c0c4a18f9491c91850ba73f16b8ed966fe412e7c80a4da710",
   "inspection": {
     "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
     "identity": {
@@ -124,28 +124,28 @@
     "arm": "custom-isa",
     "producer": {
       "builder_crate_version": "0.4.1",
-      "builder_git_sha": "ab08c1ad36de9b4dcf02fd7ea71b5c128f199ba5",
-      "proof_sha256": "f11db3c1e416a518b878d98bf7c51a65b1c5e96147cdcdb1c2a3d77010713b94"
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "proof_sha256": "87f9b140e53dd900f8e413e60d7a71092e8da0a4098acef50bcbc0721bb3b917"
     },
     "tools": [
       {
         "role": "native",
-        "path": "/home/kaden/qcal/release-0.4.2/target-pmdt-PmGateUp/release/peacemaker",
-        "version": "hipfire-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
+        "path": "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
+        "version": "peacemaker-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
         "argv": [
-          "/home/kaden/qcal/release-0.4.2/target-pmdt-PmGateUp/release/peacemaker",
+          "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
           "native",
           "--arch=gfx1201",
-          "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
-          "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.co",
-          "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
+          "kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.s",
+          "--co=kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.co",
+          "--bundle=kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.hxaco",
           "--host-target=host-x86_64-unknown-linux-gnu"
         ],
-        "sha256": "5844d2957c31d037f8ad88e5a8b4db6bb9d64a42c0d38769cfb581df1c82ba0d"
+        "sha256": "e5c932568d3681aec5ce3bd84c462da2c5be27e137bb4582a50635794262b796"
       }
     ],
-    "s_text_sha256": "e6ab680ea93bb2cc67c026d70ea8e0ba260a2a30831067d3994cc68512eab899",
-    "text_section_sha256": "216bd397e84f5da5e10f0b33f7c14f03384b0b05614aeacf1cb84f82e36d6dcb",
+    "s_text_sha256": "f8209f09f524156eb4d76d01546d6173641dfaba27bffb1d35160579137bf784",
+    "text_section_sha256": "e1467f37c02bf5efd0e910047735078f8636e804f01ed0a96b2faf56290d868d",
     "shape_contract": {
       "counts": {},
       "end_label": null,

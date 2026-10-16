@@ -37,7 +37,9 @@ pub struct NativeKernelBundle {
     pub source_sha256: [u8; 32],
     /// SHA-256 of [`Self::image`] (the whole clang offload bundle).
     pub image_sha256: [u8; 32],
-    /// SHA-256 of the gfx1201 ELF inside the bundle that the oracle accepted.
+    /// SHA-256 of the gfx1201 ELF inside the bundle. For the 0.4.3 regenerations this is the
+    /// oracled ELF plus the code-end tail fill (see [`GFX1201_TWINS`]); the oracled ELF digest
+    /// is recorded in the twin's historical acceptance record.
     pub accepted_elf_sha256: [u8; 32],
     pub image: &'static [u8],
     pub radiowave_json: &'static str,
@@ -84,46 +86,57 @@ macro_rules! twin {
 
 /// Accepted exact-gfx1201 twins. Oracle reports:
 /// `release-0.4.2/pm-decode-twins/oracle-results/<module>/full-*/report.json`.
+///
+/// The image and ELF digests below are the 0.4.3 regenerations whose `.text` is the oracled
+/// `.text` with the emitter's code-end tail fill (`s_code_end` padding) appended: the kernel
+/// bodies, descriptors, symbols and metadata are unchanged, and only the added tail, the ELF
+/// layout fields derived from it (section addresses/offsets, `.relro_padding`) and the
+/// `_DYNAMIC` symbol value differ. The GPU hardware oracle was not re-run on
+/// them. The oracled `(image, elf)` digests, still recorded in the sealed acceptance, receipt,
+/// perf and timing records under `kernels/pm-decode/gfx1201/`, are `fused_qkvza`
+/// `ded83395…`/`31ac0498…`, `fused_qkv` `9e4f5309…`/`22c665a2…`, `fused_gate_up`
+/// `23673ee6…`/`1e8ca901…`, `gemv_multirow_default` `0a63776e…`/`c4732e91…`,
+/// `gemv_residual` `8e2cb8e6…`/`bca8ec25…`.
 pub static GFX1201_TWINS: &[NativeKernelBundle] = &[
     twin!(
         "fused_qkvza_hfq4g256_mq4v2",
         "fused_qkvza_hfq4g256_mq4v2",
         &["fused_qkvza_mq4g256v2"],
         source = "24946fc118db455e19f96b0e02fd67bb6bfaf46ed4a917e23352bef6153e1ba5",
-        image = "ded83395c4dc4fe78750d1669d029f725b9b69b53216ac8d25c9de5b9e79ac7d",
-        elf = "31ac049859d799558b6f9e44176f94a68c6bfbcd3145ac23bf127b7ab4f36f38"
+        image = "30caae27eb058e5c0c5b2c27c65fa243096e37edec1c0e810ea3f8e88f7fdb89",
+        elf = "68efca1359995288b39036efc6449701b774b503d633cd7dcaae99295299d505"
     ),
     twin!(
         "fused_qkv_hfq4g256_mq4v2",
         "fused_qkv_hfq4g256_mq4v2",
         &["fused_qkv_mq4g256v2"],
         source = "a0e7f85ec0a35eb777c07975cd888eb53aa21c855ae39d1c06ee02322836cd6b",
-        image = "9e4f53092542077b6b97d4b462cfb5be0f58f109b4deba65d3a1892c8402420b",
-        elf = "22c665a2548ad0a13d3b2a77212914d8ca42c3af4872dc9c394a3b0a70dbc4cb"
+        image = "fba77d765b1e946f555e915d6ed8e723207e0d81690e3c22aac79950e648cbfb",
+        elf = "bb929479236fe2ec027ced15c59ea595ffce43ac5d7cf92327f7e25c15d24b44"
     ),
     twin!(
         "fused_gate_up_hfq4g256_mq4v2",
         "fused_gate_up_hfq4g256_mq4v2",
         &["fused_gate_up_mq4g256v2"],
         source = "f61a08770f8cfdfe2be45f85ef5002d4759c1f18d815e243dc6735d2e6215930",
-        image = "23673ee66a0b3dc36b050b21282e4847cca468348868a7619e2ee09f7f193635",
-        elf = "1e8ca901ec0f68269c92890b5eb69b3031db346530ea480aa7ffc35c70ede5c8"
+        image = "e694451d02f97e3c0c4a18f9491c91850ba73f16b8ed966fe412e7c80a4da710",
+        elf = "8f43ddd70ffb03831c71bf5e6db04c954ef2209980503efc6c668f300c2e82f9"
     ),
     twin!(
         "gemv_hfq4g256_multirow_default_mq4v2",
         "gemv_hfq4g256_multirow_default_mq4v2",
         &["gemv_mq4g256v2_multirow_r2"],
         source = "64b1b7eededa4bce636b8799247d7a66e7ef045f32d1674d07180bd56b98c3af",
-        image = "0a63776ee63fe3321043bec3fd13817fc592c2f62fc0cb28d84111140d992dfe",
-        elf = "c4732e91f06e38ca9d30053e09e9645b3ff2c6be9faa798bfdbb0074186a22c6"
+        image = "1f1a0c2cd407307024c685513332b93c27b415165d625fd4787930298846cf55",
+        elf = "f50631221037bed28e03feb0329b714e44920026b493a3e42276571a4dd762d9"
     ),
     twin!(
         "gemv_hfq4g256_residual_mq4v2",
         "gemv_hfq4g256_residual_mq4v2",
         &["gemv_mq4g256v2_residual"],
         source = "869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e",
-        image = "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
-        elf = "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d"
+        image = "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+        elf = "1214242d3c152aa7919182150c96c4b1033aadc312731171679948c50658c3f0"
     ),
 ];
 

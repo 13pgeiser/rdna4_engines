@@ -18,7 +18,11 @@
 //!   route; PmMultirow oracle,
 //!   `gemv_hfq4g256_multirow_xbatch_mq4v2.acceptance.json`).
 //!
-//! The embedded objects are the oracle-accepted ones, pinned by SHA-256 and
+//! The embedded objects are the oracle-accepted ones regenerated for 0.4.3 with the emitter's
+//! code-end tail fill (`s_code_end` words appended to `.text`): kernel bodies, descriptors,
+//! symbols and metadata are unchanged, and only the added tail, the ELF layout fields derived
+//! from it and the `_DYNAMIC` symbol value differ. The oracles above
+//! ran on the pre-fill objects (GPU hardware measurements) and were not re-run. They are pinned by SHA-256 and
 //! verified once before first load (fails closed). They load only on exact
 //! `gfx1201` with `kernel.pm_decode` on — the same gate as
 //! [`crate::pm_decode_twins`]; everywhere else the launchers run the hipcc
@@ -73,7 +77,7 @@ static PLAIN: PmObject = PmObject {
     module: "gemv_hfq4g256_xbatch_mq4v2_pm",
     symbol: "gemv_mq4g256v2_xbatch_pm",
     image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_xbatch_mq4v2.hxaco"),
-    sha256: "1b4da1135f5623b6188a0c13b78106177a9a1cddef6cbc4c2839aa495753db6e",
+    sha256: "97c2872246c123a03bbb4751fed75b2f7235654482c96b007eb69c2ffbb41b59",
     rows_per_workgroup: None,
 };
 
@@ -83,7 +87,7 @@ static RESIDUAL: PmObject = PmObject {
     module: "gemv_hfq4g256_residual_xbatch_mq4v2_pm",
     symbol: "gemv_mq4g256v2_residual_xbatch",
     image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_xbatch_mq4v2.co"),
-    sha256: "cf64991bb24e4d99fd57c304545b47b2a5a7a893e4e65c612adb0b49b7573267",
+    sha256: "7ad33f79e552f550a46a96c0863760bb3ac31ac8d7223e256a59ade20eb4ade1",
     rows_per_workgroup: Some(4),
 };
 
@@ -96,7 +100,7 @@ static MULTIROW: PmObject = PmObject {
     module: "gemv_hfq4g256_multirow_xbatch_mq4v2_pm",
     symbol: "gemv_mq4g256v2_multirow_r2_xbatch_pm",
     image: include_bytes!("../../../kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_xbatch_mq4v2.co"),
-    sha256: "07ea1deb45e546345567bf1e891923b0fcf05f7959be51448787059a6867c2e4",
+    sha256: "fadb665f00c35bea787fda7c6956d9af61f5f6d1e60f759c2c7f2c23a1ddd9bf",
     rows_per_workgroup: Some(2),
 };
 
