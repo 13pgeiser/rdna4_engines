@@ -84,6 +84,7 @@ mod emu_daemon;
 use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
+mod npu_route;
 mod process_init;
 mod request_guards;
 mod slots;
@@ -820,7 +821,7 @@ fn main() {
     process_init::init();
     tracing::info!(pid = std::process::id(), "daemon starting");
 
-    let args: Vec<String> = std::env::args().collect();
+    let args = npu_route::args_or_exit_on_version();
 
     // --precompile packages the exact-source registry beside this executable.
     // The installed index, not a historical model/format hand list, defines
@@ -4513,6 +4514,7 @@ fn main() {
             }
 
             "emu_validate" => validate(&mut gpu, &msg, &mut stdout, (&model, &slot_backend)),
+            "npu_trunk_route" => npu_route::handle(&msg, &mut stdout),
 
             "bench_prefill" => {
                 // Synthetic prefill benchmark — measures the architecture's
