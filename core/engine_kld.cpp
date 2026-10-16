@@ -124,8 +124,11 @@ int Engine::run_kld() {
         r->ignore_eos = true;
         r->sp.temp    = 0.0f;
         r->score      = true;
-        r->lora_slot  = lora_slot;
-        r->lora_uid   = lora_uid;
+        /* --kld-lora-sources: the other documents run as the base, in the same steps. */
+        const bool via = cfg_.kld_lora_sources.empty() ||
+                         kld_->source(d).rfind(cfg_.kld_lora_sources, 0) == 0;
+        r->lora_slot  = via ? lora_slot : -1;
+        r->lora_uid   = via ? lora_uid : 0;
         r->sink       = sinks[d].get();
         sinks[d]->id  = r->id;
         reqs[d] = std::move(r);

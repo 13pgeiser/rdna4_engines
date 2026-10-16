@@ -78,6 +78,7 @@ public:
                       const std::string& model);
 
     size_t n_docs() const { return docs_.size(); }
+    const std::string& source(size_t d) const { return docs_[d].source; }
     /* Document d's tokens, and the request id the engine submits it under: d + 1. */
     std::vector<int32_t> tokens(size_t d) const;
     int64_t n_rows() const { return n_rows_; }

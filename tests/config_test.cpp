@@ -413,6 +413,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--lora", { "a=/adapters/a" } }, { "--max-loras", { "2" } },
         { "--max-lora-rank", { "32" } }, { "--lora-target-modules", { "q_proj,v_proj" } },
         { "--kld-lora", { "a", "--lora", "a=/adapters/a", "--kld-ref", "/r" } },
+        { "--kld-lora-sources", { "doc/", "--kld-lora", "a", "--lora", "a=/adapters/a",
+                                  "--kld-ref", "/r" } },
     };
     return v;
 }
