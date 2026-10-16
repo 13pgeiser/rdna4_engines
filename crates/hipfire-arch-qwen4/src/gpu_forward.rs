@@ -105,9 +105,18 @@ pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
 /// else [`qwen4_prefill_chunk_default`]; never above `max_seq`.  Load-time
 /// admission ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
 pub fn qwen4_prefill_chunk_requested(arch: &str, max_seq: usize) -> usize {
-    hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
+    prefill_chunk_requested_from(
+        arch,
+        hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
+            .ok()
+            .as_deref(),
+        max_seq,
+    )
+}
+
+/// [`qwen4_prefill_chunk_requested`] with the `HIPFIRE_PREFILL_CHUNK_ROWS` value supplied.
+fn prefill_chunk_requested_from(arch: &str, env: Option<&str>, max_seq: usize) -> usize {
+    env.and_then(|value| value.trim().parse::<usize>().ok())
         .map(|rows| rows / 256 * 256)
         .filter(|&rows| rows >= 256)
         .unwrap_or_else(|| qwen4_prefill_chunk_default(arch))
@@ -383,19 +392,66 @@ pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAP
 /// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
 /// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
 /// and the restore that was not hidden cost 18 ms of that chunk. Smaller
-/// forwards keep the mapped path (K3: 1536 rows expose the DMA).
+/// forwards keep the mapped path (K3: 1536 rows expose the DMA). This is the
+/// ceiling of the default threshold: an arch whose prefill chunk is smaller
+/// (gfx1100: 1536) stages its full chunk instead of never staging
+/// ([`resolve_expert_stage_min_rows`]).
 const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 
 /// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
 const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
 
-fn qwen4_expert_stage_min_rows() -> usize {
-    hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
-        .ok()
+/// Where the effective stage `min_rows` came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageMinRowsSource {
+    Env,
+    Default,
+}
+
+impl StageMinRowsSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Env => "env",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Effective stage threshold and its source. `chunk_rows` is the forward's
+/// prefill chunk capacity (the largest forward it will ever see). An explicit
+/// [`QWEN4_EXPERT_STAGE_MIN_ROWS_ENV`] (integer >= 2) is authoritative. The
+/// default is `min(2048, chunk_rows)`, so a full chunk always qualifies on an
+/// arch whose chunk is below 2048 (gfx1100: 1536). gfx1201 keeps 2048
+/// whatever its admitted rung (K3: 1536-row forwards expose the DMA), so its
+/// behavior is unchanged.
+fn resolve_expert_stage_min_rows(
+    arch: &str,
+    chunk_rows: usize,
+    env: Option<&str>,
+) -> (usize, StageMinRowsSource) {
+    if let Some(rows) = env
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&rows| rows >= 2)
-        .unwrap_or(QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT)
+    {
+        return (rows, StageMinRowsSource::Env);
+    }
+    let rows = if arch == "gfx1201" {
+        QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT
+    } else {
+        QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT.min(chunk_rows.max(2))
+    };
+    (rows, StageMinRowsSource::Default)
+}
+
+fn qwen4_expert_stage_min_rows(arch: &str, chunk_rows: usize) -> (usize, StageMinRowsSource) {
+    resolve_expert_stage_min_rows(
+        arch,
+        chunk_rows,
+        hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Which rows of a batched Qwen4 prefill write language-model logits.
@@ -3059,6 +3115,8 @@ enum DonorState {
 pub(crate) struct Qwen4ExpertStage {
     /// Forwards of at least this many rows stage.
     min_rows: usize,
+    /// Where `min_rows` came from (`HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` or the default).
+    min_rows_source: StageMinRowsSource,
     /// Long forwards with a wide-hidden capture stage too
     /// ([`QWEN4_EXPERT_STAGE_CAPTURE_ENV`]).
     capture: bool,
@@ -3131,6 +3189,7 @@ impl Qwen4ExpertStage {
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
         moe: &[Qwen4MoeLayerRuntime],
+        chunk_rows: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         if let Some(placement) = bundle.weights.ep_placement() {
             if gpu.arch != "gfx1201" {
@@ -3150,7 +3209,7 @@ impl Qwen4ExpertStage {
         // Slab arenas and tier layers use dedicated VRAM stage buffers.
         // Only legacy aggregate placement may borrow resident donor layers.
         if moe.iter().any(|layer| layer.slab.is_some()) || bundle.weights.expert_tiers().is_some() {
-            return Self::new_slab(gpu, bundle, moe, first_host);
+            return Self::new_slab(gpu, bundle, moe, first_host, chunk_rows);
         }
         let config = &bundle.config;
         // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
@@ -3248,8 +3307,10 @@ impl Qwen4ExpertStage {
             }
         }
         gpu.ensure_capture_stream()?;
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
         let mut stage = Self {
-            min_rows: qwen4_expert_stage_min_rows(),
+            min_rows,
+            min_rows_source,
             capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors,
             donor_views: Vec::with_capacity(4),
@@ -3352,13 +3413,14 @@ impl Qwen4ExpertStage {
             return Err(error);
         }
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies; wide-hidden capture forwards {})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} ({} MiB pinned restore copies; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
             stage.min_rows,
             moe.len(),
             donors[0],
             donors[1],
             2 * layer_bytes >> 20,
-            if stage.capture { "stage" } else { "mapped" }
+            if stage.capture { "stage" } else { "mapped" },
+            stage.min_rows_source.label()
         );
         Ok(Some(stage))
     }
@@ -5659,7 +5721,7 @@ impl Qwen4GpuForward {
                             .as_deref(),
                     ) && ep.as_ref().is_some_and(|state| state.tile.is_some()))
                 {
-                    expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe)?;
+                    expert_stage = Qwen4ExpertStage::new(gpu, bundle, &moe, max_chunk)?;
                 }
             } else {
                 gpu.qwen4_trunk_iu4 = false;
@@ -9341,6 +9403,34 @@ mod tests {
         assert_eq!(super::qwen4_prefill_chunk_default("gfx942"), 1536);
         assert_eq!(super::qwen4_prefill_chunk_default("gfx1151"), 8192);
         assert_eq!(super::qwen4_prefill_chunk_default("gfx1201"), 4096);
+    }
+
+    #[test]
+    fn expert_stage_min_rows_follows_the_effective_prefill_chunk() {
+        use super::{
+            prefill_chunk_requested_from, resolve_expert_stage_min_rows as resolve,
+            StageMinRowsSource::{Default, Env},
+        };
+        let chunk = |arch: &str, env: Option<&str>| prefill_chunk_requested_from(arch, env, usize::MAX);
+        // gfx1100: the 1536-row chunk is the threshold, so a full chunk stages.
+        assert_eq!(chunk("gfx1100", None), 1536);
+        assert_eq!(resolve("gfx1100", chunk("gfx1100", None), None), (1536, Default));
+        // gfx1201: chunk 4096 (>= 2048) keeps 2048, even if admission picks 1536.
+        assert_eq!(chunk("gfx1201", None), 4096);
+        assert_eq!(resolve("gfx1201", chunk("gfx1201", None), None), (2048, Default));
+        assert_eq!(resolve("gfx1201", 1536, None), (2048, Default));
+        // An explicit threshold wins on every arch and chunk.
+        assert_eq!(resolve("gfx1100", 1536, Some("512")), (512, Env));
+        assert_eq!(resolve("gfx1201", 4096, Some(" 3072 ")), (3072, Env));
+        // Below 2 or unparsable keeps the default.
+        assert_eq!(resolve("gfx1100", 1536, Some("1")), (1536, Default));
+        assert_eq!(resolve("gfx1100", 1536, Some("x")), (1536, Default));
+        // A larger chunk request caps at the 2048 ceiling.
+        assert_eq!(chunk("gfx1100", Some("8192")), 8192);
+        assert_eq!(resolve("gfx1100", chunk("gfx1100", Some("8192")), None), (2048, Default));
+        // A smaller chunk request lowers it; rounding to 256-row tiles applies.
+        assert_eq!(chunk("gfx1100", Some("1100")), 1024);
+        assert_eq!(resolve("gfx1100", chunk("gfx1100", Some("1100")), None), (1024, Default));
     }
 
     #[test]

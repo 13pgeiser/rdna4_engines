@@ -253,13 +253,14 @@ impl Qwen4ExpertStage {
         bundle: &Qwen4Bundle,
         moe: &[Qwen4MoeLayerRuntime],
         first_host: usize,
+        chunk_rows: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
             Ok(None)
         };
         if let Some(lease) = bundle.weights.expert_tiers() {
-            return Self::new_tier(gpu, bundle, moe, first_host, lease);
+            return Self::new_tier(gpu, bundle, moe, first_host, lease, chunk_rows);
         }
         if bundle.weights.ep_placement().is_some() {
             return off("slab arenas have no EP route");
@@ -314,8 +315,10 @@ impl Qwen4ExpertStage {
             }
         }
         gpu.ensure_capture_stream()?;
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
         let mut stage = Self {
-            min_rows: qwen4_expert_stage_min_rows(),
+            min_rows,
+            min_rows_source,
             capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors: [usize::MAX; 2],
             donor_views: Vec::new(),
@@ -364,11 +367,12 @@ impl Qwen4ExpertStage {
             return Err(error);
         }
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through two {} MiB VRAM stage buffers (nothing borrowed, nothing to restore; wide-hidden capture forwards {})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through two {} MiB VRAM stage buffers (nothing borrowed, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
             stage.min_rows,
             moe.len(),
             stage_bytes >> 20,
-            if stage.capture { "stage" } else { "mapped" }
+            if stage.capture { "stage" } else { "mapped" },
+            stage.min_rows_source.label()
         );
         Ok(Some(stage))
     }
@@ -383,6 +387,7 @@ impl Qwen4ExpertStage {
         moe: &[Qwen4MoeLayerRuntime],
         first_host: usize,
         lease: &ExpertTierLease,
+        chunk_rows: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         let off = |reason: &str| {
             eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
@@ -511,8 +516,10 @@ impl Qwen4ExpertStage {
                 return Err(error.into());
             }
         };
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
         let mut stage = Self {
-            min_rows: qwen4_expert_stage_min_rows(),
+            min_rows,
+            min_rows_source,
             capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors: [usize::MAX; 2],
             donor_views: Vec::new(),
@@ -570,12 +577,13 @@ impl Qwen4ExpertStage {
             .map(|(_, layout)| layout.gate_up.iter().flatten().count())
             .sum::<usize>();
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; wide-hidden capture forwards {})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
             stage.min_rows,
             layouts.len(),
             sizes[0] >> 20,
             sizes[1] >> 20,
-            if stage.capture { "stage" } else { "mapped" }
+            if stage.capture { "stage" } else { "mapped" },
+            stage.min_rows_source.label()
         );
         Ok(Some(stage))
     }
