@@ -1428,8 +1428,26 @@ impl MtpGpuState {
     }
 
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, true)
+    }
+
+    /// Cold reset of a side request: as [`Self::reset`] except the
+    /// append-only row streams (full K/V, raw index keys, pooled keys) keep
+    /// their bytes.
+    pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.reset_inner(gpu, false)
+    }
+
+    /// Per-stream row ends of a side request writing tokens `[0, through)`,
+    /// in [`Self::session_layout`] stream order: full keys, full values, raw
+    /// index keys, pooled keys.
+    pub(crate) fn side_request_rows(&self, through: usize) -> Vec<usize> {
+        vec![through, through, through, through.div_ceil(self.compress)]
+    }
+
+    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
-        for tensor in [
+        for (index, tensor) in [
             &self.full_keys,
             &self.full_values,
             &self.raw_index_keys,
@@ -1437,7 +1455,14 @@ impl MtpGpuState {
             &self.selected_indices,
             &self.selected_len_out,
             &self.wide_hidden,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The first four are the append-only row streams.
+            if !clear_rows && index < 4 {
+                continue;
+            }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
                 gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
@@ -2211,6 +2236,18 @@ impl Qwen4MtpGpu {
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.draft.reset_request_state();
         self.state.reset(gpu)
+    }
+
+    /// Side-request cold reset: fresh draft policy as [`Self::reset`], rows
+    /// of the append-only streams untouched.
+    pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.draft.reset_request_state();
+        self.state.reset_for_side(gpu)
+    }
+
+    /// See [`MtpGpuState::side_request_rows`].
+    pub(crate) fn side_request_rows(&self, through: usize) -> Vec<usize> {
+        self.state.side_request_rows(through)
     }
 
     /// See [`MtpGpuState::ensure_mapped_capacity`].

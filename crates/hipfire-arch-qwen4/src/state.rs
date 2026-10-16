@@ -16,13 +16,13 @@ use hipfire_runtime::kv_backend::{
     KvChunkPlan, KvChunkPlanError, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
 };
 use hipfire_runtime::session_cache::{RowStream, StateLayout, StatePart};
+use rdna_compute::qsa_pooled_mirror::{
+    qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
+};
 use rdna_compute::tensor_ops::{
     copy_regions, gated_delta_rollback_layers, qsa_f16_arena_rows, CopyRegion,
     GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen, QsaKvFormat,
     QsaStateLayout,
-};
-use rdna_compute::qsa_pooled_mirror::{
-    qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -370,10 +370,12 @@ impl QsaGpuState {
 
     /// The pooled BF16 mirror as the selector reads it, `None` without one.
     pub fn pooled_bf16_ref(&self) -> Option<QsaPooledBf16MirrorRef<'_>> {
-        self.pooled_bf16.as_ref().map(|arena| QsaPooledBf16MirrorRef {
-            mirror: &arena.mirror,
-            valid_blocks: &arena.valid_blocks,
-        })
+        self.pooled_bf16
+            .as_ref()
+            .map(|arena| QsaPooledBf16MirrorRef {
+                mirror: &arena.mirror,
+                valid_blocks: &arena.valid_blocks,
+            })
     }
 
     /// Leading pooled blocks whose BF16 mirror is valid against the F32
@@ -580,7 +582,11 @@ pub(crate) fn context_arena_bytes_through(
         return 0;
     }
     let rows = tokens.div_ceil(tokens_per_row);
-    let rows = if blocks { qsa_f16_arena_rows(rows) } else { rows };
+    let rows = if blocks {
+        qsa_f16_arena_rows(rows)
+    } else {
+        rows
+    };
     (tensor.byte_size() / capacity) as u64 * rows.min(capacity) as u64
 }
 
@@ -2254,6 +2260,31 @@ impl Qwen4State {
     }
 
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
+        self.reset_inner(gpu, true)
+    }
+
+    /// Cold reset of a side request: every fixed byte and every metadata
+    /// word resets exactly as [`Self::reset`], but the append-only row
+    /// streams of [`Self::session_layout`] (full K/V, raw index keys, pooled
+    /// keys) are left untouched, so rows a main conversation wrote stay
+    /// byte-exact beneath the side request's writes.
+    pub(crate) fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), StateError> {
+        self.reset_inner(gpu, false)
+    }
+
+    /// Per-stream row ends of a side request writing tokens `[0, through)`,
+    /// in [`Self::session_layout`] stream order per QSA layer: full keys,
+    /// full values, raw index keys, pooled keys.
+    pub(crate) fn side_request_rows(&self, through: usize) -> Vec<usize> {
+        let pooled = through.div_ceil(self.qsa_compress);
+        let mut rows = Vec::with_capacity(4 * self.qsa.len());
+        for _ in &self.qsa {
+            rows.extend([through, through, through, pooled]);
+        }
+        rows
+    }
+
+    fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
         for layer in &self.gdn {
@@ -2269,7 +2300,7 @@ impl Qwen4State {
         for layer in &mut self.qsa {
             // Invalidate before the first write, including a failed reset.
             layer.invalidate_f16_arena();
-            for tensor in [
+            for (index, tensor) in [
                 &layer.full_keys,
                 &layer.full_values,
                 &layer.raw_index_keys,
@@ -2277,7 +2308,14 @@ impl Qwen4State {
                 &layer.partial_keys,
                 &layer.partial_values,
                 &layer.selected_indices,
-            ] {
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // The first four are the append-only row streams.
+                if !clear_rows && index < 4 {
+                    continue;
+                }
                 if tensor.buf.size() == 0 {
                     continue;
                 }
@@ -3584,7 +3622,10 @@ mod tests {
     fn stock_fp8_profile_pins_f32_gdn_state() {
         let flash = crate::config::compact_test_config();
         assert_eq!(resolve_gdn_format("", &flash).unwrap(), GdnStateFormat::Q8);
-        assert_eq!(resolve_gdn_format("auto", &flash).unwrap(), GdnStateFormat::Q8);
+        assert_eq!(
+            resolve_gdn_format("auto", &flash).unwrap(),
+            GdnStateFormat::Q8
+        );
         let stock = flash.into_ar_only().unwrap();
         for request in ["", "auto", " AUTO ", "fp32", "f32"] {
             assert_eq!(
@@ -3595,7 +3636,10 @@ mod tests {
         }
         for request in ["q8", "Q8", "int8"] {
             let error = resolve_gdn_format(request, &stock).unwrap_err();
-            assert!(error.contains("stock-FP8") && error.contains("F32"), "{error}");
+            assert!(
+                error.contains("stock-FP8") && error.contains("F32"),
+                "{error}"
+            );
         }
         assert!(resolve_gdn_format("bf16", &stock).is_err());
     }
@@ -3661,7 +3705,9 @@ mod tests {
             );
             // One 256-byte BF16 block per `ceil(tokens / 4)` pooled block.
             let logical = config.qsa_context_arena_bytes(8193, layout).unwrap()
-                - config.qsa_context_arena_bytes(8193, QsaKvFormat::F32).unwrap();
+                - config
+                    .qsa_context_arena_bytes(8193, QsaKvFormat::F32)
+                    .unwrap();
             assert_eq!(logical, 2049 * 256);
             if backend == Qwen4KvBackend::Legacy {
                 assert_eq!(with - plain, logical);
@@ -3672,7 +3718,9 @@ mod tests {
         for (tokens, per_layer) in [(32_768usize, 2usize << 20), (262_144, 16 << 20)] {
             assert_eq!(
                 config.qsa_context_arena_bytes(tokens, layout).unwrap()
-                    - config.qsa_context_arena_bytes(tokens, QsaKvFormat::F32).unwrap(),
+                    - config
+                        .qsa_context_arena_bytes(tokens, QsaKvFormat::F32)
+                        .unwrap(),
                 per_layer
             );
             assert_eq!(per_layer * config.n_full_layers(), tokens / 4 * 256 * 12);

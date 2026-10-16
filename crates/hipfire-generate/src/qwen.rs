@@ -2412,8 +2412,16 @@ fn commit_qwen4_session(model: &mut LoadedModel) {
 /// `HIPFIRE_QWEN_CACHE_TRACE=1`: one `[qwen4-session]` line per Qwen4 request
 /// with the reuse the session cache planned against the committed history
 /// (`prior`, the previous turn's consumed tokens) and, on a divergent render,
-/// the token ids around the first difference. Host-only; no device work.
-fn trace_qwen4_session_plan(route: SessionRoute, prior: &[u32], prompt: &[u32], reused: usize) {
+/// the token ids around the first difference. `live` is the bundle's report
+/// that the planned reuse restores live state rather than a snapshot.
+/// Host-only; no device work.
+fn trace_qwen4_session_plan(
+    route: SessionRoute,
+    prior: &[u32],
+    prompt: &[u32],
+    reused: usize,
+    live: bool,
+) {
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -2424,7 +2432,7 @@ fn trace_qwen4_session_plan(route: SessionRoute, prior: &[u32], prompt: &[u32], 
     let lcp = prior.iter().zip(prompt).take_while(|(a, b)| a == b).count();
     let source = if reused == 0 {
         "cold"
-    } else if reused == prior.len() && lcp == prior.len() {
+    } else if live {
         "live"
     } else {
         "snapshot"
@@ -3463,11 +3471,15 @@ pub fn generate_dflash(
             .as_deref()
             .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Mtp))
             .unwrap_or(0);
+        let start_is_live = m
+            .qwen4()
+            .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, SessionRoute::Mtp, start));
         trace_qwen4_session_plan(
             SessionRoute::Mtp,
             &m.conversation_tokens,
             &prompt_tokens,
             start,
+            start_is_live,
         );
         prefill_start = start;
         prefill_tokens = prompt_tokens[start..].to_vec();
@@ -4244,6 +4256,15 @@ pub fn generate_spec(
             return None;
         }
     };
+    // One-shot advisory for the session begin inside prefill: the request's
+    // write end covers the prompt, up to max_tokens decode rows and one
+    // speculative window past the last seed. Other arches ignore it.
+    slot.session_request_write_limit(
+        prompt_tokens
+            .len()
+            .saturating_add(max_tokens)
+            .saturating_add(spec.block_size()),
+    );
     let prefill_outcome = spec.prefill(
         gpu,
         slot,
@@ -10332,18 +10353,31 @@ pub fn generate_qwen4_ar(
         return;
     }
 
-    // Plan a durable whole-chunk session snapshot against the canonical render.
-    // Prefill restores into the live buffers, then runs the remaining suffix.
+    // One-shot advisory for the session begin inside prefill: the request
+    // writes at most the prompt, max_tokens decode rows and one trailer row.
+    // (Planning below stays against the canonical render.)
+    if let Some(state) = m.state.as_deref_mut() {
+        state.session_request_write_limit(
+            prompt_tokens
+                .len()
+                .saturating_add(max_tokens)
+                .saturating_add(1),
+        );
+    }
     let reused = m
         .state
         .as_deref()
         .map(|state| state.session_plan(&prompt_tokens, SessionRoute::Ar))
         .unwrap_or(0);
+    let reused_is_live = m
+        .qwen4()
+        .is_some_and(|b| b.session_plan_is_live(&prompt_tokens, SessionRoute::Ar, reused));
     trace_qwen4_session_plan(
         SessionRoute::Ar,
         &m.conversation_tokens,
         &prompt_tokens,
         reused,
+        reused_is_live,
     );
     m.seq_pos = 0;
     m.conversation_tokens.clear();

@@ -593,6 +593,10 @@ impl SpecTarget for Qwen4Bundle {
         true
     }
 
+    fn session_request_write_limit(&mut self, through: usize) {
+        Qwen4Bundle::session_request_write_limit(self, through);
+    }
+
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,

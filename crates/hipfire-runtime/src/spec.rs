@@ -229,6 +229,14 @@ pub trait SpecTarget {
         false
     }
 
+    /// One-shot advisory for the next session begin (the following
+    /// [`Speculator::prefill`]): this request will write state rows at most
+    /// up to absolute position `through`, including speculative rows. A target
+    /// that parks side state may use it to bound that parking before prefill.
+    /// It is not validation and never rejects a request; the limit applies to
+    /// the next begin only. Default: no-op.
+    fn session_request_write_limit(&mut self, _through: usize) {}
+
     // ── Arch-generic speculation primitives ─────────────────────────────────
     //
     // These let a *model-free* speculator (n-gram / PLD) drive any arch's target

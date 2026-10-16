@@ -430,6 +430,31 @@ impl SessionState for Qwen4Bundle {
         context.saturating_add(gather)
     }
 
+    fn side_request_rows(&self, route: SessionRoute, through: usize) -> Option<Vec<usize>> {
+        if through > self.state.max_seq_len || self.state.row_capture_armed {
+            return None;
+        }
+        let mut rows = self.state.side_request_rows(through);
+        if route == SessionRoute::Mtp {
+            rows.extend(self.mtp.as_ref()?.side_request_rows(through));
+        }
+        Some(rows)
+    }
+
+    fn reset_for_side(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.begin_npu_trunk_request(gpu)
+            .map_err(|e| e.to_string())?;
+        if let Some(stage) = &mut self.pair_session_stage {
+            stage.position = None;
+        }
+        self.invalidate_ple_epoch().map_err(|e| e.to_string())?;
+        self.state.reset_for_side(gpu).map_err(|e| e.to_string())?;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.reset_for_side(gpu).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         Qwen4Bundle::reset(self, gpu).map_err(|e| e.to_string())
     }
@@ -2746,6 +2771,14 @@ impl Qwen4Bundle {
             .map_or(0, |session| session.plan_capped(self, prompt, route, cap))
     }
 
+    /// Whether a planned reuse continues current or parked live state rather
+    /// than a pool/resident boundary. Used by request-source tracing.
+    pub fn session_plan_is_live(&self, prompt: &[u32], route: SessionRoute, reused: usize) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
+    }
+
     /// The host-visible request configuration every EP rank must share.
     pub(crate) fn ep_replication_fingerprint(&self) -> ReplicaFingerprint {
         ReplicaFingerprint {
@@ -2759,6 +2792,25 @@ impl Qwen4Bundle {
             tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
             has_mtp: self.mtp.is_some(),
             has_lanes: self.lanes.is_some(),
+        }
+    }
+
+    /// Bound all row writes of the next request, including speculative
+    /// lookahead. Without this advisory bound, side-request parking is off.
+    pub(crate) fn session_request_write_limit(&mut self, through: usize) {
+        let set = |bundle: &mut Self| {
+            if let Some(session) = bundle.session.as_mut() {
+                session.set_request_write_limit(through);
+            }
+            Ok(())
+        };
+        if let Err(error) = self.ep_fanout("session_request_write_limit", set, &|bundle, _, _| {
+            if let Some(session) = bundle.session.as_mut() {
+                session.set_request_write_limit(through);
+            }
+            Ok(())
+        }) {
+            eprintln!("  qwen4 EP: session_request_write_limit: {error}");
         }
     }
 
@@ -3590,6 +3642,10 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         self.session.is_some()
     }
 
+    fn session_request_write_limit(&mut self, through: usize) {
+        Qwen4Bundle::session_request_write_limit(self, through);
+    }
+
     fn session_plan(&self, prompt: &[u32], route: SessionRoute) -> usize {
         if self.ep.is_some() {
             return self.ep_session_plan(prompt, route);
@@ -3609,11 +3665,9 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 
     /// Publish as [`Self::session_commit`] and keep the live state when
-    /// `consumed` (the host history the client committed) extends this turn's
-    /// prompt and the owners sit exactly at its end. The next turn of the
-    /// conversation then prefills only the suffix in place (session-exact,
-    /// decode lineage); the snapshots just published stay cold-exact because a
-    /// live turn captures none unless message-end snapshots are active.
+    /// `consumed` extends this turn's prompt and the owners sit exactly at its
+    /// end. Later turns prefill only the suffix; their pool snapshots are
+    /// session-exact, not cold-prefill references.
     fn session_commit_live(&mut self, consumed: &[u32]) {
         if self.ep.is_some() {
             return self.ep_session_commit(Some(consumed));
@@ -4624,6 +4678,26 @@ mod tests {
             let no_ple = session_snapshot_bytes(&without, format, false, p).expect("without PLE");
             assert_eq!(with_ple - no_ple, part(ple_bytes) as u64, "p={p}");
         }
+    }
+
+    #[test]
+    fn side_request_parking_cost_is_fixed_parts_plus_bounded_rows() {
+        use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
+        let config = crate::config::compact_test_config();
+        // The measured chain used Q8 GDN; F32 below refers to QSA rows.
+        for (qsa, row_bytes) in [(QsaKvFormat::Q8, 21_632u64), (QsaKvFormat::F32, 61_568)] {
+            let format = Qwen4StateFormat {
+                qsa,
+                gdn: GdnStateFormat::Q8,
+                ..Qwen4StateFormat::F32
+            };
+            let fixed = session_snapshot_bytes(&config, format, true, 0).unwrap();
+            assert_eq!(fixed, 34_180_608);
+            let bounded = session_snapshot_bytes(&config, format, true, 8192).unwrap();
+            assert_eq!(bounded, fixed + 8192 * row_bytes);
+        }
+        let full_f32 = session_snapshot_bytes(&config, Qwen4StateFormat::F32, true, 0).unwrap();
+        assert_eq!(full_f32, 118_230_528);
     }
 
     #[test]

@@ -35,9 +35,19 @@
 //! Besides the pool, the cache keeps fixed-only *resident* snapshots backed by
 //! the live row streams: the deepest regular boundary and an optional lineage
 //! split before the prompt's final message end. A tail restore preserves the
-//! earlier resident's rows, but its descendants never enter the cold-exact
-//! pool. Other restores or resets invalidate residents whose rows are rewritten
+//! earlier resident's rows. Pool captures of a turn that descends from a
+//! lineage split (or from a session-exact snapshot) stay enabled but are keyed
+//! under `session_exact_domain`, so a cold-exact lookup never aliases them;
+//! `live_cold_exact` and each resident's `cold_exact` track the lineage.
+//! Other restores or resets invalidate residents whose rows are rewritten
 //! (external owners report resets through [`SessionCache::live_state_reset`]).
+//!
+//! A short side request that diverges early from a long committed live
+//! conversation would overwrite its rows. [`SessionDriver`] then *parks* the
+//! conversation first: the fixed parts and only the leading rows the side
+//! request can write ([`SessionState::side_request_rows`]) are copied aside,
+//! together with the residents, and a later request that extends the whole
+//! parked history restores them byte-exact and continues in place.
 //!
 //! An optional disk tier ([`SessionCache::with_disk`]) keeps snapshots the
 //! device tier evicts (and every published snapshot at [`SessionCache::clear`])
@@ -154,6 +164,22 @@ pub trait SessionState {
     fn growth_reserve_bytes(&self, gpu: &Gpu, through: usize) -> u64;
     /// Cold-start the live state.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+    /// Per-stream row ends (in `snapshot_parts(route, ..).layout.rows` order,
+    /// pooled and compressed streams included) that a cold or restored
+    /// request of `through` tokens (its prompt plus every row decode may write,
+    /// speculative margin included) can overwrite on `route`; `None` = this
+    /// state cannot park the live state around a side request. `Some`
+    /// obliges [`Self::reset_for_side`], [`Self::restore_parts`] and
+    /// [`Self::finish_restore`] to leave row bytes above what they write alone.
+    fn side_request_rows(&self, _route: SessionRoute, _through: usize) -> Option<Vec<usize>> {
+        None
+    }
+    /// [`Self::reset`] that keeps every row byte (only host, position and
+    /// fixed state restart): called for any cold start while the cache holds
+    /// a parked conversation.
+    fn reset_for_side(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        Err("session cache: this state cannot reset around a parked conversation".to_string())
+    }
 }
 
 /// Where a snapshot's bytes live: device memory (VRAM, or system RAM on
@@ -168,7 +194,7 @@ enum SnapshotLocation {
 type Key = (CacheDomain, u64, u64);
 
 /// Rows `[from, to)` of one row stream held by a snapshot.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Segment {
     row_bytes: usize,
     from: usize,
@@ -220,8 +246,9 @@ struct Turn {
     boundaries: VecDeque<usize>,
     /// Extra split captured only in the tail resident.
     lineage: Option<usize>,
-    /// False after any lineage split or restore: the pool stays cold-exact.
-    pool_capture: bool,
+    /// False after any lineage split or session-exact restore: the pool
+    /// captures then go under `session_exact_domain`.
+    cold_exact: bool,
     start: usize,
     /// Length of the prompt in flight.
     end: usize,
@@ -236,6 +263,138 @@ struct Resident {
     rows: Vec<usize>,
     meta: Vec<u8>,
     cold_exact: bool,
+}
+
+/// `domain` narrowed to snapshots whose state descends from a lineage split
+/// or a decode continuation: never the key of a cold-exact snapshot.
+fn session_exact_domain(domain: &CacheDomain) -> CacheDomain {
+    let mut exact = domain.clone();
+    exact.arch_policy.state_abi_tag.push_str("/session-exact");
+    exact
+}
+
+/// Domain a capture of the current lineage is keyed under.
+fn capture_domain(domain: &CacheDomain, cold_exact: bool) -> CacheDomain {
+    if cold_exact {
+        domain.clone()
+    } else {
+        session_exact_domain(domain)
+    }
+}
+
+/// Largest `through` (prompt plus every row decode may write) of a side
+/// request the cache parks the live conversation for.
+const SIDE_PARK_MAX_THROUGH: usize = 8192;
+/// Longest common prefix a side request may share with the parked history.
+const SIDE_PARK_EARLY_LCP: usize = 1024;
+
+/// One byte range copied between live state and a parked buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParkCopy {
+    /// Fixed parts first (index `i`), then row streams (`fixed.len() + j`).
+    part: usize,
+    live_offset: usize,
+    park_offset: usize,
+    bytes: usize,
+}
+
+/// Geometry of a parked buffer: every fixed part whole, then rows `[0, to)`
+/// of each stream, packed at [`PART_ALIGN`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParkPlan {
+    fixed_bytes: Vec<usize>,
+    segments: Vec<Segment>,
+    offsets: Vec<usize>,
+    total: usize,
+}
+
+impl ParkPlan {
+    /// `fixed` is `(offset, bytes)` per fixed part, `rows` is `(row_bytes,
+    /// live rows)` per stream, `side_rows` the rows each stream may be
+    /// overwritten up to. `None` when the stream counts differ.
+    fn new(fixed: &[(usize, usize)], rows: &[(usize, usize)], side_rows: &[usize]) -> Option<Self> {
+        if rows.len() != side_rows.len() {
+            return None;
+        }
+        let fixed_bytes: Vec<usize> = fixed.iter().map(|&(_, bytes)| bytes).collect();
+        let segments: Vec<Segment> = rows
+            .iter()
+            .zip(side_rows)
+            .map(|(&(row_bytes, live), &side)| Segment {
+                row_bytes,
+                from: 0,
+                to: live.min(side),
+            })
+            .collect();
+        let (offsets, total) = layout(
+            fixed_bytes
+                .iter()
+                .copied()
+                .chain(segments.iter().map(Segment::bytes)),
+        );
+        Some(Self {
+            fixed_bytes,
+            segments,
+            offsets,
+            total,
+        })
+    }
+
+    /// Non-empty copies between live state and the parked buffer, in the
+    /// same geometry for capture and restore. `fixed_offsets` are the live
+    /// fixed parts' offsets; row streams start at byte 0.
+    fn copies(&self, fixed_offsets: &[usize]) -> Vec<ParkCopy> {
+        let fixed = self
+            .fixed_bytes
+            .iter()
+            .zip(fixed_offsets)
+            .map(|(&bytes, &live_offset)| (live_offset, bytes));
+        let rows = self
+            .segments
+            .iter()
+            .map(|segment| (segment.from * segment.row_bytes, segment.bytes()));
+        fixed
+            .chain(rows)
+            .zip(&self.offsets)
+            .enumerate()
+            .filter(|(_, ((_, bytes), _))| *bytes > 0)
+            .map(|(part, ((live_offset, bytes), &park_offset))| ParkCopy {
+                part,
+                live_offset,
+                park_offset,
+                bytes,
+            })
+            .collect()
+    }
+}
+
+/// A committed conversation's state set aside while a side request owns the
+/// live state: fixed parts and the leading rows the side request can
+/// overwrite, plus the residents (which stay valid for the rest of the rows).
+struct Parked {
+    buf: DeviceBuffer,
+    plan: ParkPlan,
+    meta: Vec<u8>,
+    /// Rows each stream held at `position`.
+    live_rows: Vec<usize>,
+    scope: String,
+    route: SessionRoute,
+    /// Tokens the parked state holds.
+    position: usize,
+    /// Rows the park protects: requests up to this many tokens are safe.
+    through: usize,
+    live_cold_exact: bool,
+    resident: Option<Resident>,
+    tail: Option<Resident>,
+}
+
+impl Parked {
+    fn into_buffers(self) -> Vec<DeviceBuffer> {
+        std::iter::once(self.buf)
+            .chain(self.resident.map(|resident| resident.buf))
+            .chain(self.tail.map(|tail| tail.buf))
+            .collect()
+    }
 }
 
 pub struct SessionCache {
@@ -262,6 +421,8 @@ pub struct SessionCache {
     /// Displaced resident buffers; freed at the next `begin`/`clear`.
     release_bufs: Vec<DeviceBuffer>,
     disk: Option<disk::DiskTier>,
+    /// The committed conversation parked around side requests (module docs).
+    parked: Option<Parked>,
 }
 
 /// Offsets of `part_bytes` packed at [`PART_ALIGN`], and the total size.
@@ -416,6 +577,7 @@ impl SessionCache {
             live_cold_exact: true,
             release_bufs: Vec::new(),
             disk: None,
+            parked: None,
         }
     }
 
@@ -484,11 +646,15 @@ impl SessionCache {
             .unwrap_or(0);
         // Only a strictly deeper pool snapshot beats the resident one (no row
         // copy, see `begin`); each probe hashes its whole prefix.
+        let exact = session_exact_domain(&domain);
         let planned = state
             .snapshot_boundaries(prompt, resident, prompt.len() - 1)
             .into_iter()
             .rev()
-            .find(|&p| self.present(&domain, p as u64, prefix_fingerprint(&prompt[..p])))
+            .find(|&p| {
+                let fp = prefix_fingerprint(&prompt[..p]);
+                self.present(&domain, p as u64, fp) || self.present(&exact, p as u64, fp)
+            })
             .unwrap_or(resident);
         if planned > 0
             && hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
@@ -611,6 +777,9 @@ impl SessionCache {
     /// the resident snapshot.
     pub fn live_state_reset(&mut self) {
         self.live_cold_exact = true;
+        if let Some(parked) = self.parked.take() {
+            self.release_bufs.extend(parked.into_buffers());
+        }
         for resident in [
             self.resident.take(),
             self.resident_pending.take(),
@@ -647,7 +816,8 @@ impl SessionCache {
 
     /// Start a prefill of `prompt`: restore the `reused`-token snapshot
     /// [`Self::plan`] returned (or cold-start the state for 0) and arm the
-    /// boundaries this prefill crosses.
+    /// boundaries this prefill crosses. With a parked conversation present
+    /// a cold start keeps row bytes ([`SessionState::reset_for_side`]).
     pub fn begin(
         &mut self,
         gpu: &mut Gpu,
@@ -657,14 +827,71 @@ impl SessionCache {
         reused: usize,
     ) -> Result<(), String> {
         self.start_turn(gpu);
+        self.begin_started(gpu, state, prompt, route, reused, false)
+    }
+
+    /// [`Self::begin`] that first parks the live state at `position` (the
+    /// committed conversation about to be overwritten) for a side request of
+    /// `through` tokens. A park the state or the memory guard refuses leaves
+    /// plain `begin` behavior; [`Self::parked_through`] tells whether it
+    /// happened.
+    #[allow(clippy::too_many_arguments)]
+    fn begin_parking(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+        position: usize,
+        through: usize,
+    ) -> Result<(), String> {
+        self.start_turn(gpu);
+        let stash = self.park_main(gpu, state, route, position, through);
+        self.begin_started(gpu, state, prompt, route, reused, stash)
+    }
+
+    /// Cold-start the live state, keeping its row bytes while a parked
+    /// conversation depends on them.
+    fn reset_state(&mut self, gpu: &mut Gpu, state: &mut dyn SessionState) -> Result<(), String> {
+        if self.parked.is_some() {
+            state.reset_for_side(gpu)
+        } else {
+            state.reset(gpu)
+        }
+    }
+
+    /// Move the live residents into the park (they back its rows).
+    fn stash_residents(&mut self) {
+        if let Some(parked) = self.parked.as_mut() {
+            parked.resident = self.resident.take();
+            parked.tail = self.tail.take();
+        }
+    }
+
+    /// `begin` body after the turn head. With `stash`, residents are kept
+    /// (they belong to the park just made) instead of dropped.
+    fn begin_started(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+        stash: bool,
+    ) -> Result<(), String> {
         let Some(scope) = state.snapshot_scope(route) else {
             if reused > 0 {
                 return Err(format!(
                     "session cache: route {route:?} has no snapshot scope"
                 ));
             }
-            self.drop_resident(gpu);
-            return state.reset(gpu);
+            if stash {
+                self.stash_residents();
+            } else {
+                self.drop_resident(gpu);
+            }
+            return self.reset_state(gpu, state);
         };
         let domain = self.domain.scoped(&scope);
         let key = (
@@ -672,44 +899,60 @@ impl SessionCache {
             reused as u64,
             prefix_fingerprint(&prompt[..reused]),
         );
-        let mut pool_capture = true;
+        let mut cold_exact = true;
+        let mut tail_hit = false;
         let restored = if reused > 0 && self.tail.as_ref().is_some_and(|r| r.key == key) {
-            pool_capture = false;
+            cold_exact = false;
+            tail_hit = true;
             // Message-end snapshots may sit above the tail when enabled.
-            if self.resident.as_ref().is_some_and(|r| r.key.1 > reused as u64) {
+            if !stash
+                && self
+                    .resident
+                    .as_ref()
+                    .is_some_and(|r| r.key.1 > reused as u64)
+            {
                 free_device(gpu, self.resident.take().unwrap().buf);
             }
             restore_resident(gpu, state, route, self.tail.as_ref().unwrap())
         } else if reused > 0 && self.resident.as_ref().is_some_and(|r| r.key == key) {
-            if let Some(tail) = self.tail.take() {
-                free_device(gpu, tail.buf);
+            if !stash {
+                if let Some(tail) = self.tail.take() {
+                    free_device(gpu, tail.buf);
+                }
             }
             let resident = self.resident.as_ref().unwrap();
-            pool_capture = resident.cold_exact;
+            cold_exact = resident.cold_exact;
             restore_resident(gpu, state, route, resident)
         } else {
-            self.drop_resident(gpu);
+            if !stash {
+                self.drop_resident(gpu);
+            }
             if reused == 0 {
-                state.reset(gpu)
+                self.reset_state(gpu, state)
             } else {
-                self.restore(gpu, state, route, &domain, &prompt[..reused], prompt.len())
+                // The cold-exact snapshot wins a tie with a session-exact one.
+                let (from, exact) = self.restore_domain(&domain, key.1, key.2);
+                cold_exact = exact;
+                self.restore(gpu, state, route, &from, &prompt[..reused], prompt.len())
             }
         };
+        if stash {
+            self.stash_residents();
+        }
         if let Err(error) = restored {
-            let _ = state.reset(gpu);
+            let _ = self.reset_state(gpu, state);
             self.drop_resident(gpu);
             return Err(error);
         }
-        self.live_cold_exact = pool_capture;
+        self.live_cold_exact = cold_exact;
         // A turn restored from the tail does not split at its own tail: that
         // extra small tile would land on every chained append, and a retry of
         // this turn still restores the earlier tail (it stays valid below).
-        let tail_restore = reused > 0 && self.tail.as_ref().is_some_and(|r| r.key == key);
-        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused, !tail_restore);
+        let (boundaries, lineage) = Self::turn_boundaries(state, prompt, reused, !tail_hit);
         self.turn = Some(Turn {
             boundaries,
             lineage,
-            pool_capture,
+            cold_exact,
             start: reused,
             domain,
             route,
@@ -725,16 +968,17 @@ impl SessionCache {
     /// continuation only appends rows above it.
     ///
     /// With `capture == false` it arms no boundary, so
-    /// [`Self::next_boundary`] is `None` and nothing is captured this turn: a
-    /// live-continued turn's state descends from decode, never from a cold
-    /// canonical prefill, so it must not enter the cross-session cache.
+    /// [`Self::next_boundary`] is `None` and nothing is captured this turn.
+    ///
+    /// A live-continued turn's state descends from decode, never from a cold
+    /// canonical prefill, so it is marked session-exact (`live_cold_exact`
+    /// false) whether or not it captures: every capture it arms, and every
+    /// resident it leaves, is keyed under `session_exact_domain`.
     ///
     /// With `capture == true` it arms `snapshot_boundaries(prompt, reused,
-    /// prompt.len())` under the route's scoped domain exactly like
-    /// [`Self::begin`] (still no reset, no restore), and the captures publish
-    /// at [`Self::commit`]. The caller passes `true` only for boundaries the
-    /// architecture defines as session-lineage reusable (message ends), whose
-    /// scope never aliases cold-exact snapshots.
+    /// prompt.len())` under the route's scoped domain (exact-marked as above;
+    /// still no reset, no restore), and the captures publish at
+    /// [`Self::commit`].
     pub fn begin_live(
         &mut self,
         gpu: &mut Gpu,
@@ -745,7 +989,12 @@ impl SessionCache {
         capture: bool,
     ) {
         self.start_turn(gpu);
-        if self.tail.as_ref().is_some_and(|tail| reused < tail.key.1 as usize) {
+        self.live_cold_exact = false;
+        if self
+            .tail
+            .as_ref()
+            .is_some_and(|tail| reused < tail.key.1 as usize)
+        {
             free_device(gpu, self.tail.take().unwrap().buf);
         }
         if !capture {
@@ -758,7 +1007,7 @@ impl SessionCache {
         self.turn = Some(Turn {
             boundaries,
             lineage,
-            pool_capture: self.live_cold_exact,
+            cold_exact: self.live_cold_exact,
             start: reused,
             domain: self.domain.scoped(&scope),
             route,
@@ -1112,13 +1361,17 @@ impl SessionCache {
         turn.boundaries.pop_front();
         let lineage = turn.lineage == Some(prefix.len());
         if lineage {
-            turn.pool_capture = false;
+            turn.cold_exact = false;
             self.live_cold_exact = false;
         }
-        let pool_capture = turn.pool_capture;
+        let cold_exact = turn.cold_exact;
         let (domain, route, p, end) = (turn.domain.clone(), turn.route, prefix.len(), turn.end);
         let fp = prefix_fingerprint(prefix);
-        let in_pool = !pool_capture || self.present(&domain, p as u64, fp);
+        // Captures that descend from a lineage split never alias cold-exact
+        // keys. The split itself is the tail resident only; later boundaries
+        // of the lineage still enter the pool.
+        let capture_domain = capture_domain(&domain, cold_exact);
+        let in_pool = lineage || self.present(&capture_domain, p as u64, fp);
         let growth = state.growth_reserve_bytes(gpu, end);
         let ancestors: Vec<Key> = if in_pool {
             Vec::new()
@@ -1127,7 +1380,13 @@ impl SessionCache {
                 .snapshot_boundaries(prefix, 0, p - 1)
                 .into_iter()
                 .rev()
-                .map(|b| (domain.clone(), b as u64, prefix_fingerprint(&prefix[..b])))
+                .map(|b| {
+                    (
+                        capture_domain.clone(),
+                        b as u64,
+                        prefix_fingerprint(&prefix[..b]),
+                    )
+                })
                 .collect()
         };
         let SnapshotParts { meta, layout: live } = state.snapshot_parts(route, p)?;
@@ -1137,10 +1396,19 @@ impl SessionCache {
             &mut self.resident_pending
         };
         Self::capture_resident(
-            pending, gpu, (domain.clone(), p as u64, fp), &meta, &live, growth, pool_capture,
+            pending,
+            gpu,
+            (domain.clone(), p as u64, fp),
+            &meta,
+            &live,
+            growth,
+            cold_exact,
         )?;
         if lineage
-            && self.tail_pending.as_ref().is_some_and(|tail| tail.key.1 == p as u64)
+            && self
+                .tail_pending
+                .as_ref()
+                .is_some_and(|tail| tail.key.1 == p as u64)
             && hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false)
         {
             eprintln!("  session cache: tail resident at {p}");
@@ -1237,7 +1505,8 @@ impl SessionCache {
             self.drop_snapshot(gpu, snapshot);
             return Err(format!("session cache: snapshot copy failed: {error}"));
         }
-        self.pending.push(((domain, p as u64, fp), snapshot));
+        self.pending
+            .push(((capture_domain, p as u64, fp), snapshot));
         Ok(())
     }
 
@@ -1341,7 +1610,9 @@ impl SessionCache {
                 self.release_bufs.push(displaced.buf);
             }
         } else if self.tail.as_ref().is_some_and(|tail| {
-            self.turn.as_ref().is_some_and(|turn| turn.start < tail.key.1 as usize)
+            self.turn
+                .as_ref()
+                .is_some_and(|turn| turn.start < tail.key.1 as usize)
         }) {
             self.release_bufs.push(self.tail.take().unwrap().buf);
         }
@@ -1390,6 +1661,11 @@ impl SessionCache {
         {
             free_device(gpu, resident.buf);
         }
+        if let Some(parked) = self.parked.take() {
+            for buf in parked.into_buffers() {
+                free_device(gpu, buf);
+            }
+        }
         for buf in std::mem::take(&mut self.release_bufs) {
             free_device(gpu, buf);
         }
@@ -1431,7 +1707,16 @@ impl SessionCache {
                 },
             };
             let Some(snapshot) = snapshot else {
-                break;
+                // The parked conversation goes last: it is the live state's
+                // own history, not an opportunistic snapshot.
+                let Some(parked) = self.parked.take() else {
+                    break;
+                };
+                for buf in parked.into_buffers() {
+                    freed += buf.size() as u64;
+                    free_device(gpu, buf);
+                }
+                continue;
             };
             freed += snapshot.bytes;
             self.drop_snapshot(gpu, snapshot);
@@ -1443,6 +1728,229 @@ impl SessionCache {
             );
         }
         freed
+    }
+
+    /// Domain a restore of the `p`-token snapshot with prefix fingerprint
+    /// `fp` reads, and whether it is cold-exact: the cold-exact domain when
+    /// it holds the snapshot, else the session-exact one.
+    fn restore_domain(&self, domain: &CacheDomain, p: u64, fp: u64) -> (CacheDomain, bool) {
+        if self.present(domain, p, fp) {
+            (domain.clone(), true)
+        } else {
+            (session_exact_domain(domain), false)
+        }
+    }
+
+    /// Tokens the parked conversation's park protects (`through` of the side
+    /// request it was made for); `None` without a park.
+    fn parked_through(&self) -> Option<usize> {
+        self.parked.as_ref().map(|parked| parked.through)
+    }
+
+    /// Whether a park exists for `route` under the state's current scope.
+    fn parked_valid(&self, state: &dyn SessionState, route: SessionRoute) -> bool {
+        self.parked.as_ref().is_some_and(|parked| {
+            parked.route == route
+                && state.snapshot_scope(route).as_deref() == Some(parked.scope.as_str())
+        })
+    }
+
+    /// Free the park and its residents.
+    fn discard_parked(&mut self, gpu: &mut Gpu) {
+        if let Some(parked) = self.parked.take() {
+            for buf in parked.into_buffers() {
+                free_device(gpu, buf);
+            }
+        }
+    }
+
+    /// Park the live state at `position` (committed, row streams intact) for
+    /// a side request of `through` tokens. Returns whether it parked; every
+    /// refusal (unsupported state, an existing park, row bound, memory guard,
+    /// allocation, copy) leaves the cache as if it never tried.
+    fn park_main(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        route: SessionRoute,
+        position: usize,
+        through: usize,
+    ) -> bool {
+        if self.parked.is_some() || position == 0 {
+            return false;
+        }
+        let Some(scope) = state.snapshot_scope(route) else {
+            return false;
+        };
+        let Some(side_rows) = state.side_request_rows(route, through) else {
+            return false;
+        };
+        let growth = state.growth_reserve_bytes(gpu, through);
+        let live_cold_exact = self.live_cold_exact;
+        let skip = |reason: &str| {
+            eprintln!("  session cache: skipped parking {position} tokens ({reason})")
+        };
+        let SnapshotParts { meta, layout: live } = match state.snapshot_parts(route, position) {
+            Ok(parts) => parts,
+            Err(reason) => {
+                skip(&reason);
+                return false;
+            }
+        };
+        let fixed_offsets: Vec<usize> = live.fixed.iter().map(|part| part.offset).collect();
+        let fixed: Vec<(usize, usize)> = live
+            .fixed
+            .iter()
+            .map(|part| (part.offset, part.bytes))
+            .collect();
+        let rows: Vec<(usize, usize)> = live
+            .rows
+            .iter()
+            .map(|stream| (stream.row_bytes, stream.rows))
+            .collect();
+        let Some(plan) = ParkPlan::new(&fixed, &rows, &side_rows) else {
+            skip("row bound does not match the layout");
+            return false;
+        };
+        if plan.total == 0 || memory_fits(gpu, plan.total as u64, growth) != Some(true) {
+            skip("memory guard");
+            return false;
+        }
+        let buf = match gpu.bind_thread().and_then(|()| gpu.hip.malloc(plan.total)) {
+            Ok(buf) => buf,
+            Err(_) => {
+                skip("allocation");
+                return false;
+            }
+        };
+        let fixed_count = live.fixed.len();
+        let copies = plan.copies(&fixed_offsets);
+        let regions: Vec<CopyRegion<'_>> = copies
+            .iter()
+            .map(|copy| CopyRegion {
+                dst: &buf,
+                dst_offset: copy.park_offset,
+                src: if copy.part < fixed_count {
+                    live.fixed[copy.part].buf
+                } else {
+                    live.rows[copy.part - fixed_count].buf
+                },
+                src_offset: copy.live_offset,
+                bytes: copy.bytes,
+            })
+            .collect();
+        if let Err(error) = copy_regions(gpu, &regions) {
+            skip(&error.to_string());
+            free_device(gpu, buf);
+            return false;
+        }
+        let live_rows = rows.iter().map(|&(_, rows)| rows).collect();
+        self.parked = Some(Parked {
+            buf,
+            plan,
+            meta,
+            live_rows,
+            scope,
+            route,
+            position,
+            through,
+            live_cold_exact,
+            resident: None,
+            tail: None,
+        });
+        true
+    }
+
+    /// Copy the parked fixed parts and leading rows back over the live state.
+    fn restore_parked(
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        parked: &Parked,
+    ) -> Result<(), String> {
+        let dst = state.restore_parts(gpu, parked.route, &parked.meta)?;
+        let plan = &parked.plan;
+        let fixed_count = plan.fixed_bytes.len();
+        let fits = dst.fixed.len() == fixed_count
+            && dst
+                .fixed
+                .iter()
+                .zip(&plan.fixed_bytes)
+                .all(|(part, &bytes)| part.bytes == bytes)
+            && dst.rows.len() == plan.segments.len()
+            && dst
+                .rows
+                .iter()
+                .zip(&plan.segments)
+                .zip(&parked.live_rows)
+                .all(|((stream, segment), &rows)| {
+                    stream.row_bytes == segment.row_bytes && stream.rows == rows
+                });
+        if !fits {
+            return Err("session cache: parked conversation layout mismatch".to_string());
+        }
+        let fixed_offsets: Vec<usize> = dst.fixed.iter().map(|part| part.offset).collect();
+        let copies = plan.copies(&fixed_offsets);
+        let regions: Vec<CopyRegion<'_>> = copies
+            .iter()
+            .map(|copy| CopyRegion {
+                dst: if copy.part < fixed_count {
+                    dst.fixed[copy.part].buf
+                } else {
+                    dst.rows[copy.part - fixed_count].buf
+                },
+                dst_offset: copy.live_offset,
+                src: &parked.buf,
+                src_offset: copy.park_offset,
+                bytes: copy.bytes,
+            })
+            .collect();
+        copy_regions(gpu, &regions).map_err(|e| e.to_string())?;
+        state.finish_restore(gpu, parked.route, &parked.meta)
+    }
+
+    /// Start a prefill of `prompt` that continues the parked conversation:
+    /// the live state (a side request's) is overwritten with the parked
+    /// bytes, the parked residents return, and the turn is armed like
+    /// [`Self::begin_live`] (`capture` as there). `reused` must be the parked
+    /// position. A failure drops the park and cold-starts the state.
+    fn begin_parked(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+        capture: bool,
+    ) -> Result<(), String> {
+        self.start_turn(gpu);
+        let Some(mut parked) = self.parked.take() else {
+            return Err("session cache: no parked conversation".to_string());
+        };
+        let restored = if parked.route == route
+            && parked.position == reused
+            && state.snapshot_scope(route).as_deref() == Some(parked.scope.as_str())
+        {
+            Self::restore_parked(gpu, state, &parked)
+        } else {
+            Err("session cache: parked conversation does not match the request".to_string())
+        };
+        let (resident, tail) = (parked.resident.take(), parked.tail.take());
+        self.release_bufs.push(parked.buf);
+        if let Err(error) = restored {
+            for resident in [resident, tail].into_iter().flatten() {
+                free_device(gpu, resident.buf);
+            }
+            let _ = state.reset(gpu);
+            self.drop_resident(gpu);
+            return Err(error);
+        }
+        // The side request's residents back rows that were just replaced.
+        self.drop_resident(gpu);
+        self.resident = resident;
+        self.tail = tail;
+        self.live_cold_exact = parked.live_cold_exact;
+        self.begin_live(gpu, state, prompt, route, reused, capture);
+        Ok(())
     }
 }
 
@@ -1475,8 +1983,8 @@ pub fn stride_boundaries(
 /// Host record of the committed live state: the consumed history it holds and
 /// the route that produced it. A live continuation is *session-exact* (its
 /// state descends from decode, as in a continuous conversation), not
-/// cold-exact, so it is only resumed in place and never captured into the
-/// cross-session cache, except by boundaries the architecture scopes apart.
+/// cold-exact: it is resumed in place, and whatever it captures is keyed
+/// under `session_exact_domain`, never as a cold-exact snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LiveRecord {
     tokens: Vec<u32>,
@@ -1525,6 +2033,46 @@ fn plan_start(snapshot: usize, live: Option<usize>) -> usize {
     }
 }
 
+/// Longest common prefix length of `a` and `b`.
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// Whether the committed live history of `main_len` tokens is parked for a
+/// side request that shares `lcp` tokens with it and writes `through` rows:
+/// short, diverging early, and the parked history longer than the side's rows.
+fn side_park_eligible(main_len: usize, lcp: usize, through: usize) -> bool {
+    through <= SIDE_PARK_MAX_THROUGH && lcp <= SIDE_PARK_EARLY_LCP && main_len > through
+}
+
+/// Whether an existing park (covering `parked_through` tokens) stays usable
+/// across a request of `through` tokens: only a bounded extension of the
+/// live side lineage keeps it; any other request frees it.
+fn parked_survives(parked_through: usize, through: usize, extends_live: bool) -> bool {
+    extends_live && through <= parked_through
+}
+
+/// `Some(L)` when the parked history extends into `prompt` on `route` like a
+/// live record would (`0 < L < prompt.len()`, `prompt[..L]` equal to it).
+fn parked_start(parked: Option<&LiveRecord>, prompt: &[u32], route: SessionRoute) -> Option<usize> {
+    live_start(
+        parked,
+        prompt,
+        route,
+        parked.map(|record| record.tokens.len()),
+    )
+}
+
+/// Longest reuse length across the live/snapshot start and parked history.
+/// On an equal-length pool hit, `begin` still restores the parked state to
+/// preserve the main conversation's exact lineage.
+fn plan_with_parked(base: usize, parked: Option<usize>) -> usize {
+    match parked {
+        Some(parked) if parked > base => parked,
+        _ => base,
+    }
+}
+
 /// The session machinery an architecture's bundle holds: the shared snapshot
 /// cache plus the committed live state of the current conversation.
 pub struct SessionDriver {
@@ -1534,6 +2082,10 @@ pub struct SessionDriver {
     live: Option<LiveRecord>,
     /// Prompt and route of the request in flight.
     turn: Option<(Vec<u32>, SessionRoute)>,
+    /// History of the conversation the cache parked around side requests.
+    parked: Option<LiveRecord>,
+    /// One-shot `through` bound for the next [`Self::begin`].
+    write_limit: Option<usize>,
 }
 
 impl SessionDriver {
@@ -1542,11 +2094,59 @@ impl SessionDriver {
             cache,
             live: None,
             turn: None,
+            parked: None,
+            write_limit: None,
         }
     }
 
     pub fn cache(&self) -> &SessionCache {
         &self.cache
+    }
+
+    /// Bound the next [`Self::begin`]'s request: its prompt plus every row
+    /// decode may write (speculative margin included). Without it the
+    /// request is never parked around, and a parked conversation is dropped.
+    pub fn set_request_write_limit(&mut self, through: usize) {
+        self.write_limit = Some(through);
+    }
+
+    /// Longest history of the parked conversation `prompt` extends, if it
+    /// can be restored for `route`.
+    fn parked_hit(
+        &self,
+        state: &dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+    ) -> Option<usize> {
+        if !self.cache.parked_valid(state, route) {
+            return None;
+        }
+        parked_start(self.parked.as_ref(), prompt, route)
+    }
+
+    /// Keep the park across this request only when it is a bounded
+    /// extension of the live side lineage on the parked route and scope;
+    /// else drop it.
+    fn settle_parked(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &dyn SessionState,
+        route: SessionRoute,
+        limit: Option<usize>,
+        live: bool,
+    ) {
+        if self.parked.is_none() {
+            return;
+        }
+        let keep = self.cache.parked_valid(state, route)
+            && match (limit, self.cache.parked_through()) {
+                (Some(through), Some(covered)) => parked_survives(covered, through, live),
+                _ => false,
+            };
+        if !keep {
+            self.parked = None;
+            self.cache.discard_parked(gpu);
+        }
     }
 
     /// [`SessionCache::release_for`].
@@ -1585,11 +2185,31 @@ impl SessionDriver {
         cap: usize,
     ) -> usize {
         let head = &prompt[..prompt.len().min(cap.saturating_add(1))];
-        plan_start(
+        let base = plan_start(
             self.cache.plan(state, head, route),
             self.live_hit(state, prompt, route)
                 .filter(|&live| live <= cap),
+        );
+        plan_with_parked(
+            base,
+            self.parked_hit(state, prompt, route)
+                .filter(|&parked| parked <= cap),
         )
+    }
+
+    /// Whether a prefill that skips `reused` tokens continues state kept in
+    /// place (the committed live state, or a parked conversation restored
+    /// byte-exact, as [`Self::begin`] decides) rather than a cache snapshot.
+    pub fn plan_is_live(
+        &self,
+        state: &dyn SessionState,
+        prompt: &[u32],
+        route: SessionRoute,
+        reused: usize,
+    ) -> bool {
+        reused > 0
+            && (self.live_hit(state, prompt, route) == Some(reused)
+                || self.parked_hit(state, prompt, route) == Some(reused))
     }
 
     /// Start a prefill of `prompt` on `route` that skips the `reused` tokens
@@ -1597,10 +2217,15 @@ impl SessionDriver {
     /// - live: `reused` is the end of the committed live state; every owner
     ///   is kept, nothing is restored, and boundaries above `reused` are
     ///   captured only with `capture_live`;
+    /// - parked: `reused` is the end of the parked conversation; its bytes
+    ///   replace the live state and the turn continues it like a live one;
     /// - snapshot: restore the `reused`-token snapshot;
     /// - `reused == 0`: cold start.
     ///
-    /// Returns whether the prefill continues the live state.
+    /// A request bounded by [`Self::set_request_write_limit`] that is short
+    /// and diverges early from a longer committed live state parks that state
+    /// first (unless the memory guard or the state refuses). Returns whether
+    /// the prefill continues the live state.
     pub fn begin(
         &mut self,
         gpu: &mut Gpu,
@@ -1610,14 +2235,50 @@ impl SessionDriver {
         reused: usize,
         capture_live: bool,
     ) -> Result<bool, String> {
+        let limit = self.write_limit.take();
         let live = reused > 0 && self.live_hit(state, prompt, route) == Some(reused);
-        self.live = None;
+        let parked_hit =
+            !live && reused > 0 && self.parked_hit(state, prompt, route) == Some(reused);
+        let previous = self.live.take();
         self.turn = None;
+        if parked_hit {
+            self.parked = None;
+            self.cache
+                .begin_parked(gpu, state, prompt, route, reused, capture_live)?;
+            self.turn = Some((prompt.to_vec(), route));
+            return Ok(true);
+        }
+        self.settle_parked(gpu, state, route, limit, live);
         if live {
             self.cache
                 .begin_live(gpu, state, prompt, route, reused, capture_live);
         } else {
-            self.cache.begin(gpu, state, prompt, route, reused)?;
+            let park = match (&previous, limit) {
+                (Some(record), Some(through))
+                    if self.parked.is_none()
+                        && record.route == route
+                        && side_park_eligible(
+                            record.tokens.len(),
+                            common_prefix(prompt, &record.tokens),
+                            through,
+                        ) =>
+                {
+                    Some((record.tokens.len(), through))
+                }
+                _ => None,
+            };
+            match park {
+                Some((position, through)) => {
+                    let result = self
+                        .cache
+                        .begin_parking(gpu, state, prompt, route, reused, position, through);
+                    if self.cache.parked_through().is_some() {
+                        self.parked = previous;
+                    }
+                    result?;
+                }
+                None => self.cache.begin(gpu, state, prompt, route, reused)?,
+            }
         }
         self.turn = Some((prompt.to_vec(), route));
         Ok(live)
@@ -1676,6 +2337,7 @@ impl SessionDriver {
         self.cache.commit();
         self.live = None;
         self.turn = None;
+        self.write_limit = None;
     }
 
     /// Publish this turn's snapshots and keep the live state when `consumed`
@@ -1683,6 +2345,7 @@ impl SessionDriver {
     /// every owner sits exactly at its end. The next turn of the conversation
     /// then prefills only the suffix in place.
     pub fn commit_live(&mut self, state: &dyn SessionState, consumed: &[u32]) {
+        self.write_limit = None;
         self.cache.commit();
         self.live = self.turn.take().and_then(|(prompt, route)| {
             live_after_commit(&prompt, consumed, state.live_position(route)).then(|| LiveRecord {
@@ -1697,6 +2360,8 @@ impl SessionDriver {
     pub fn forget_live(&mut self) {
         self.live = None;
         self.turn = None;
+        self.parked = None;
+        self.write_limit = None;
         self.cache.live_state_reset();
     }
 
@@ -1704,6 +2369,8 @@ impl SessionDriver {
     pub fn clear(&mut self, gpu: &mut Gpu) {
         self.live = None;
         self.turn = None;
+        self.parked = None;
+        self.write_limit = None;
         self.cache.clear(gpu);
     }
 }
@@ -1795,7 +2462,7 @@ mod tests {
             boundaries: VecDeque::from([8192, 10000, 16384]),
             end: 16384,
             lineage: None,
-            pool_capture: true,
+            cold_exact: true,
             start: 0,
         });
         assert_eq!(cache.next_boundary(), Some(8192));
@@ -1816,7 +2483,7 @@ mod tests {
             boundaries: VecDeque::from([8192, 10000, 16384]),
             end: 16384,
             lineage: None,
-            pool_capture: true,
+            cold_exact: true,
             start: 0,
         });
         for (position, expected) in [
@@ -2122,18 +2789,31 @@ mod tests {
         b.extend([7, 8, 9]);
         assert_eq!(a.iter().zip(&b).take_while(|(a, b)| a == b).count(), tail);
         assert_eq!(cache.plan(&toy, &b, SessionRoute::Ar), tail);
-        cache.begin(gpu, &mut toy, &b, SessionRoute::Ar, tail).unwrap();
+        cache
+            .begin(gpu, &mut toy, &b, SessionRoute::Ar, tail)
+            .unwrap();
         assert_eq!(cache.resident.as_ref().unwrap().key, chunk_key);
         assert_eq!(cache.tail.as_ref().unwrap().key.1, tail as u64);
-        assert!(!cache.turn.as_ref().unwrap().pool_capture);
+        assert!(!cache.turn.as_ref().unwrap().cold_exact);
+        // A tail-restored turn still captures its regular boundaries, but only
+        // under the session-exact domain: its rows descend from the lineage.
+        let exact = session_exact_domain(&scope);
         while let Some(p) = cache.next_boundary() {
             toy.advance(gpu, &b[..p]);
             cache.at_boundary(gpu, &mut toy, &b[..p]).unwrap();
-            assert!(cache.pending.is_empty());
+            assert!(!cache.pending.is_empty());
+            assert!(cache.pending.iter().all(|(key, _)| key.0 == exact));
         }
+        assert_eq!(cache.pending.len(), 2);
         toy.advance(gpu, &b);
         cache.commit();
-        assert_eq!(cache.stored_bytes(), pool_bytes);
+        let exact_pool_bytes = cache.stored_bytes();
+        assert!(exact_pool_bytes > pool_bytes);
+        for p in [2 * STRIDE, 3 * STRIDE] {
+            let fp = prefix_fingerprint(&b[..p]);
+            assert!(cache.present(&exact, p as u64, fp));
+            assert!(!cache.present(&scope, p as u64, fp));
+        }
         assert!(!cache.resident.as_ref().unwrap().cold_exact);
         // A tail-restored turn does not split at its own tail: A's tail stays
         // (rows below it are unchanged) and serves a retry of this turn too.
@@ -2141,15 +2821,17 @@ mod tests {
 
         // A lineage-derived chunk restore also cannot publish to the pool.
         let reused = cache.resident.as_ref().unwrap().key.1 as usize;
-        cache.begin(gpu, &mut toy, &b, SessionRoute::Ar, reused).unwrap();
+        cache
+            .begin(gpu, &mut toy, &b, SessionRoute::Ar, reused)
+            .unwrap();
         assert!(cache.tail.is_none());
-        assert!(!cache.turn.as_ref().unwrap().pool_capture);
+        assert!(!cache.turn.as_ref().unwrap().cold_exact);
         while let Some(p) = cache.next_boundary() {
             toy.advance(gpu, &b[..p]);
             cache.at_boundary(gpu, &mut toy, &b[..p]).unwrap();
         }
         cache.commit();
-        assert_eq!(cache.stored_bytes(), pool_bytes);
+        assert_eq!(cache.stored_bytes(), exact_pool_bytes);
         assert!(cache.resident.is_some());
         assert!(cache.tail.is_some());
         cache.live_state_reset();
@@ -2158,6 +2840,23 @@ mod tests {
         assert!(cache.tail.is_none());
         assert!(cache.tail_pending.is_none());
         assert_eq!(cache.release_bufs.len(), 2);
+
+        // Session-exact pool snapshots serve a later restore (no resident
+        // left), and the restored lineage keeps capturing under the exact domain.
+        let mut c = b.clone();
+        c.extend([11, 12]);
+        assert_eq!(cache.plan(&toy, &c, SessionRoute::Ar), 3 * STRIDE);
+        cache
+            .begin(gpu, &mut toy, &c, SessionRoute::Ar, 3 * STRIDE)
+            .unwrap();
+        assert_eq!(toy.position, 3 * STRIDE);
+        assert_eq!(
+            toy.bytes(gpu),
+            (fixed_of(&c[..3 * STRIDE]), rows_of(&c[..3 * STRIDE]))
+        );
+        assert!(!cache.turn.as_ref().unwrap().cold_exact);
+        assert!(!cache.live_cold_exact);
+        cache.commit();
         cache.clear(gpu);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
@@ -2517,20 +3216,29 @@ mod tests {
         prompt[2] = END; // ends at 3
         prompt[7] = END; // ends at 8: a stride multiple
         prompt[13] = END; // ends at 14
-        assert_eq!(stride_boundaries(4, &prompt, None, 0, 20), [4, 8, 12, 16, 20]);
+        assert_eq!(
+            stride_boundaries(4, &prompt, None, 0, 20),
+            [4, 8, 12, 16, 20]
+        );
         // Union, sorted and deduplicated (8 is both).
         assert_eq!(
             stride_boundaries(4, &prompt, Some(END), 0, 20),
             [3, 4, 8, 12, 14, 16, 20]
         );
         // `after` is exclusive and `up_to` inclusive for both sources.
-        assert_eq!(stride_boundaries(4, &prompt, Some(END), 3, 14), [4, 8, 12, 14]);
+        assert_eq!(
+            stride_boundaries(4, &prompt, Some(END), 3, 14),
+            [4, 8, 12, 14]
+        );
         assert_eq!(stride_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
         // Message ends below one stride are boundaries on their own.
         assert_eq!(stride_boundaries(64, &prompt, Some(END), 0, 20), [3, 8, 14]);
         assert!(stride_boundaries(64, &prompt, None, 0, 20).is_empty());
         // Consecutive ends each count; `up_to` past the prompt never reads past it.
-        assert_eq!(stride_boundaries(64, &[END, END, 1, END], Some(END), 0, 9), [1, 2, 4]);
+        assert_eq!(
+            stride_boundaries(64, &[END, END, 1, END], Some(END), 0, 9),
+            [1, 2, 4]
+        );
     }
 
     #[test]
@@ -2546,7 +3254,10 @@ mod tests {
         assert_eq!(at(&[1, 2]), None);
         // No record, an empty one, another route, or owners off the end.
         assert_eq!(live_start(None, &[1, 2, 3, 4], AR, Some(3)), None);
-        assert_eq!(live_start(Some(&record(&[], AR)), &[1, 2], AR, Some(0)), None);
+        assert_eq!(
+            live_start(Some(&record(&[], AR)), &[1, 2], AR, Some(0)),
+            None
+        );
         assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], MTP, Some(3)), None);
         assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], AR, Some(2)), None);
         assert_eq!(live_start(Some(&rec), &[1, 2, 3, 4], AR, None), None);
@@ -2710,7 +3421,9 @@ mod tests {
 
         let canonical = prompt(1, 2 * STRIDE + 5);
         let mut request = canonical.clone();
-        assert!(!driver.begin(gpu, &mut toy, &request, MTP, 0, false).unwrap());
+        assert!(!driver
+            .begin(gpu, &mut toy, &request, MTP, 0, false)
+            .unwrap());
         assert_eq!(driver.turn_route(), Some(MTP));
         // The caller's buffer is no longer the prompt in flight.
         request[0] ^= 1;
@@ -2748,7 +3461,10 @@ mod tests {
             .unwrap());
         assert_eq!(
             toy.bytes(gpu),
-            (fixed_of(&canonical[..2 * STRIDE]), rows_of(&canonical[..2 * STRIDE]))
+            (
+                fixed_of(&canonical[..2 * STRIDE]),
+                rows_of(&canonical[..2 * STRIDE])
+            )
         );
         toy.advance(gpu, &continuation[..3 * STRIDE]);
         driver.at_turn_boundary(gpu, &mut toy, 3 * STRIDE).unwrap();
@@ -2764,7 +3480,9 @@ mod tests {
         assert_eq!(driver.cache.release_bufs.len(), 2);
         assert_eq!(driver.plan(&toy, &continuation, MTP), 0);
         assert_eq!(
-            driver.at_turn_boundary(gpu, &mut toy, 3 * STRIDE).unwrap_err(),
+            driver
+                .at_turn_boundary(gpu, &mut toy, 3 * STRIDE)
+                .unwrap_err(),
             "session boundary has no prompt in flight"
         );
         driver.clear(gpu);
@@ -2773,7 +3491,9 @@ mod tests {
 
         // Clear must also drop a committed live record and resident, not
         // just the deferred buffers from forget_live.
-        driver.begin(gpu, &mut toy, &canonical, AR, 0, false).unwrap();
+        driver
+            .begin(gpu, &mut toy, &canonical, AR, 0, false)
+            .unwrap();
         while let Some(b) = driver.next_boundary() {
             toy.advance(gpu, &canonical[..b]);
             driver.at_turn_boundary(gpu, &mut toy, b).unwrap();
@@ -2791,5 +3511,779 @@ mod tests {
         assert_eq!(driver.plan(&toy, &continuation, AR), 0);
         gpu.free_tensor(toy.fixed).unwrap();
         gpu.free_tensor(toy.rows).unwrap();
+    }
+
+    // CPU doubles for the parked-conversation tests: host bytes run through
+    // the production `ParkPlan` geometry and the production planning helpers;
+    // no GPU is initialized.
+
+    const HOST_FIXED_A: usize = 100;
+    const HOST_FIXED_B: usize = 48;
+    const HOST_FIXED_A_AT: usize = 64;
+    const HOST_FIXED_B_AT: usize = 200;
+    const HOST_FIXED_BUF: usize = 512;
+    const HOST_ROW_BYTES: usize = 16;
+    const HOST_POOL_ROW_BYTES: usize = 24;
+    /// Tokens per pooled row; the last pooled row may be partial.
+    const POOL_RATIO: usize = 4;
+    const HOST_TOKENS: usize = 4096;
+    const GUARD: u8 = 0xEE;
+    /// Salt of the fixed bytes a prefill leaves.
+    const COLD: u8 = 0;
+    /// Salt of the fixed bytes a decode leaves: no cold prefill reproduces them.
+    const DECODED: u8 = 0x5A;
+    const PARK_FIXED: [usize; 2] = [HOST_FIXED_A_AT, HOST_FIXED_B_AT];
+
+    const MAIN_PROMPT: usize = 3000;
+    const MAIN_DECODED: usize = 41;
+    const SIDE_PROMPT: usize = 435;
+    /// Rows the side request may write: `4 * 125 + 1`, so the pooled
+    /// stream's last row is partial and `ceil` differs from `floor`.
+    const SIDE_THROUGH: usize = 501;
+    const SHARED_LCP: usize = 17;
+
+    fn host_hashes(hist: &[u32]) -> Vec<u64> {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        hist.iter()
+            .map(|&token| {
+                hash = (hash ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3);
+                hash
+            })
+            .collect()
+    }
+
+    fn host_bytes(seed: u64, len: usize, salt: u8) -> Vec<u8> {
+        let seed = seed.to_le_bytes();
+        (0..len)
+            .map(|i| seed[i % 8] ^ (i as u8).wrapping_mul(29) ^ salt)
+            .collect()
+    }
+
+    /// Host byte double of a state with two fixed parts in separate buffers
+    /// (guard bytes around them), one row per token and a pooled stream with
+    /// one row per `POOL_RATIO` tokens, partial last row included. Its GPU
+    /// methods are never reached: the parking geometry is exercised through
+    /// [`ParkPlan`] on host copies.
+    struct HostState {
+        scope: String,
+        /// Fixed buffer A, fixed buffer B, token rows, pooled rows.
+        bufs: Vec<Vec<u8>>,
+        position: usize,
+    }
+
+    impl HostState {
+        fn new(scope: &str) -> Self {
+            Self {
+                scope: scope.to_string(),
+                bufs: vec![
+                    vec![GUARD; HOST_FIXED_BUF],
+                    vec![GUARD; HOST_FIXED_BUF],
+                    vec![GUARD; HOST_TOKENS * HOST_ROW_BYTES],
+                    vec![GUARD; HOST_TOKENS.div_ceil(POOL_RATIO) * HOST_POOL_ROW_BYTES],
+                ],
+                position: 0,
+            }
+        }
+
+        /// What prefilling (or decoding up to) `hist` leaves: the fixed parts
+        /// from its last token and rows `[0, hist.len())`, pooled rows
+        /// `[0, ceil(hist.len() / POOL_RATIO))`. Rows above are not touched.
+        fn write(&mut self, hist: &[u32], salt: u8) {
+            let n = hist.len();
+            let hashes = host_hashes(hist);
+            let last = hashes[n - 1];
+            self.bufs[0][HOST_FIXED_A_AT..][..HOST_FIXED_A].copy_from_slice(&host_bytes(
+                last,
+                HOST_FIXED_A,
+                salt,
+            ));
+            self.bufs[1][HOST_FIXED_B_AT..][..HOST_FIXED_B].copy_from_slice(&host_bytes(
+                last.rotate_left(17),
+                HOST_FIXED_B,
+                salt ^ 0x0F,
+            ));
+            for (i, &hash) in hashes.iter().enumerate() {
+                self.bufs[2][i * HOST_ROW_BYTES..][..HOST_ROW_BYTES].copy_from_slice(&host_bytes(
+                    hash,
+                    HOST_ROW_BYTES,
+                    0x11,
+                ));
+            }
+            for row in 0..n.div_ceil(POOL_RATIO) {
+                let hash = hashes[(row * POOL_RATIO + POOL_RATIO - 1).min(n - 1)];
+                self.bufs[3][row * HOST_POOL_ROW_BYTES..][..HOST_POOL_ROW_BYTES]
+                    .copy_from_slice(&host_bytes(hash, HOST_POOL_ROW_BYTES, 0x22));
+            }
+            self.position = n;
+        }
+
+        /// `(offset, bytes)` of the fixed parts and `(row_bytes, rows)` of the
+        /// streams at the current position, as a state layout reports them.
+        fn geometry(&self) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+            (
+                vec![
+                    (HOST_FIXED_A_AT, HOST_FIXED_A),
+                    (HOST_FIXED_B_AT, HOST_FIXED_B),
+                ],
+                vec![
+                    (HOST_ROW_BYTES, self.position),
+                    (HOST_POOL_ROW_BYTES, self.position.div_ceil(POOL_RATIO)),
+                ],
+            )
+        }
+
+        /// Whether every range a state holding `hist` owns (both fixed parts,
+        /// all token rows, all pooled rows) has exactly the bytes of a state
+        /// that was written with `hist` and `salt`.
+        fn holds(&self, hist: &[u32], salt: u8) -> bool {
+            let mut want = HostState::new(&self.scope);
+            want.write(hist, salt);
+            let rows = hist.len() * HOST_ROW_BYTES;
+            let pooled = hist.len().div_ceil(POOL_RATIO) * HOST_POOL_ROW_BYTES;
+            self.position == hist.len()
+                && self.bufs[0][HOST_FIXED_A_AT..][..HOST_FIXED_A]
+                    == want.bufs[0][HOST_FIXED_A_AT..][..HOST_FIXED_A]
+                && self.bufs[1][HOST_FIXED_B_AT..][..HOST_FIXED_B]
+                    == want.bufs[1][HOST_FIXED_B_AT..][..HOST_FIXED_B]
+                && self.bufs[2][..rows] == want.bufs[2][..rows]
+                && self.bufs[3][..pooled] == want.bufs[3][..pooled]
+        }
+    }
+
+    impl SessionState for HostState {
+        fn snapshot_scope(&self, route: SessionRoute) -> Option<String> {
+            Some(format!("{}/{route:?}", self.scope))
+        }
+        fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
+            stride_boundaries(STRIDE, prompt, None, after, up_to)
+        }
+        fn snapshot_parts(
+            &mut self,
+            _route: SessionRoute,
+            _position: usize,
+        ) -> Result<SnapshotParts<'_>, String> {
+            unreachable!("the host double has no device buffers")
+        }
+        fn restore_parts(
+            &mut self,
+            _gpu: &mut Gpu,
+            _route: SessionRoute,
+            _meta: &[u8],
+        ) -> Result<StateLayout<'_>, String> {
+            unreachable!("the host double has no device buffers")
+        }
+        fn finish_restore(
+            &mut self,
+            _gpu: &mut Gpu,
+            _route: SessionRoute,
+            _meta: &[u8],
+        ) -> Result<(), String> {
+            unreachable!("the host double has no device buffers")
+        }
+        fn live_position(&self, _route: SessionRoute) -> Option<usize> {
+            Some(self.position)
+        }
+        fn growth_reserve_bytes(&self, _gpu: &Gpu, _through: usize) -> u64 {
+            0
+        }
+        fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!("the host double has no device buffers")
+        }
+        fn side_request_rows(&self, _route: SessionRoute, through: usize) -> Option<Vec<usize>> {
+            Some(vec![through, through.div_ceil(POOL_RATIO)])
+        }
+    }
+
+    /// A state that implements only the required methods: it keeps the
+    /// default (unsupported) side-request hook.
+    struct PlainState;
+
+    impl SessionState for PlainState {
+        fn snapshot_scope(&self, _route: SessionRoute) -> Option<String> {
+            Some("plain".to_string())
+        }
+        fn snapshot_boundaries(&self, _: &[u32], _: usize, _: usize) -> Vec<usize> {
+            Vec::new()
+        }
+        fn snapshot_parts(
+            &mut self,
+            _route: SessionRoute,
+            _position: usize,
+        ) -> Result<SnapshotParts<'_>, String> {
+            unreachable!()
+        }
+        fn restore_parts(
+            &mut self,
+            _gpu: &mut Gpu,
+            _route: SessionRoute,
+            _meta: &[u8],
+        ) -> Result<StateLayout<'_>, String> {
+            unreachable!()
+        }
+        fn finish_restore(
+            &mut self,
+            _gpu: &mut Gpu,
+            _route: SessionRoute,
+            _meta: &[u8],
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+        fn live_position(&self, _route: SessionRoute) -> Option<usize> {
+            None
+        }
+        fn growth_reserve_bytes(&self, _gpu: &Gpu, _through: usize) -> u64 {
+            0
+        }
+        fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    /// A borrowed buffer that is never dereferenced or freed: CPU tests only
+    /// read its size.
+    fn fake_buf(bytes: usize) -> DeviceBuffer {
+        // SAFETY: the pointer is null and no test copies through or frees it.
+        unsafe { DeviceBuffer::from_raw(std::ptr::null_mut(), bytes) }
+    }
+
+    /// Capture `state` as `park_main` does: the plan's copies, live -> parked.
+    fn park_capture(state: &HostState, side_rows: &[usize]) -> (ParkPlan, Vec<u8>) {
+        let (fixed, rows) = state.geometry();
+        let plan = ParkPlan::new(&fixed, &rows, side_rows).expect("stream counts match");
+        let mut parked = vec![0xCD; plan.total];
+        for copy in plan.copies(&PARK_FIXED) {
+            parked[copy.park_offset..][..copy.bytes]
+                .copy_from_slice(&state.bufs[copy.part][copy.live_offset..][..copy.bytes]);
+        }
+        (plan, parked)
+    }
+
+    /// Restore as `restore_parked` does: the same copies, parked -> live.
+    fn park_restore(state: &mut HostState, plan: &ParkPlan, parked: &[u8]) {
+        for copy in plan.copies(&PARK_FIXED) {
+            state.bufs[copy.part][copy.live_offset..][..copy.bytes]
+                .copy_from_slice(&parked[copy.park_offset..][..copy.bytes]);
+        }
+    }
+
+    /// The parked record `park_main` stores for `state` at its current
+    /// position (the conversation about to be overwritten).
+    fn fake_parked(
+        state: &HostState,
+        plan: ParkPlan,
+        route: SessionRoute,
+        through: usize,
+    ) -> Parked {
+        let (_, rows) = state.geometry();
+        Parked {
+            buf: fake_buf(plan.total),
+            plan,
+            meta: Vec::new(),
+            live_rows: rows.iter().map(|&(_, live)| live).collect(),
+            scope: state.snapshot_scope(route).unwrap(),
+            route,
+            position: state.position,
+            through,
+            live_cold_exact: true,
+            resident: None,
+            tail: None,
+        }
+    }
+
+    /// A driver whose cache parks `main` (the host state holds it) for a side
+    /// request of [`SIDE_THROUGH`] rows.
+    fn parked_driver(state: &HostState, main: &[u32], route: SessionRoute) -> SessionDriver {
+        let (fixed, rows) = state.geometry();
+        let side_rows = state.side_request_rows(route, SIDE_THROUGH).unwrap();
+        let plan = ParkPlan::new(&fixed, &rows, &side_rows).unwrap();
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 1 << 20));
+        driver.cache.parked = Some(fake_parked(state, plan, route, SIDE_THROUGH));
+        driver.parked = Some(record(main, route));
+        driver
+    }
+
+    fn fake_snapshot(rows: usize) -> StoredSnapshot {
+        StoredSnapshot {
+            location: SnapshotLocation::Device(fake_buf(4096)),
+            parent: None,
+            fixed_bytes: vec![HOST_FIXED_A, HOST_FIXED_B],
+            segments: vec![
+                Segment {
+                    row_bytes: HOST_ROW_BYTES,
+                    from: 0,
+                    to: rows,
+                },
+                Segment {
+                    row_bytes: HOST_POOL_ROW_BYTES,
+                    from: 0,
+                    to: rows.div_ceil(POOL_RATIO),
+                },
+            ],
+            meta: Vec::new(),
+            bytes: 4096,
+        }
+    }
+
+    /// Publish a snapshot of `hist[..p]` under the domain `capture_domain`
+    /// picks for the lineage's exactness.
+    fn publish(cache: &mut SessionCache, scope: &str, cold_exact: bool, hist: &[u32], p: usize) {
+        let domain = capture_domain(&cache.domain.scoped(scope), cold_exact);
+        cache.pending.push((
+            (domain, p as u64, prefix_fingerprint(&hist[..p])),
+            fake_snapshot(p),
+        ));
+        cache.commit();
+    }
+
+    /// `(main prompt, consumed main history, side prompt, side history)`: the
+    /// side request shares [`SHARED_LCP`] tokens with the main conversation.
+    fn host_chats() -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let main_prompt = prompt(1, MAIN_PROMPT);
+        let mut consumed = main_prompt.clone();
+        consumed.extend(prompt(4, MAIN_DECODED));
+        let mut side = consumed[..SHARED_LCP].to_vec();
+        side.extend(prompt(7, SIDE_PROMPT - SHARED_LCP));
+        let mut side_full = side.clone();
+        side_full.extend(prompt(8, SIDE_THROUGH - SIDE_PROMPT));
+        (main_prompt, consumed, side, side_full)
+    }
+
+    #[test]
+    fn short_side_parks_and_main_extension_restores_exact_bytes_as_live() {
+        let (main_prompt, consumed, side, side_full) = host_chats();
+        let mut state = HostState::new("host");
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 1 << 20));
+
+        // Prime, then the live main turn: decode leaves fixed bytes a cold
+        // prefill of the same tokens does not produce.
+        state.write(&main_prompt, COLD);
+        state.write(&consumed, DECODED);
+        assert!(state.holds(&consumed, DECODED));
+        assert!(!state.holds(&consumed, COLD));
+        driver.live = Some(record(&consumed, AR));
+        let mut next_main = consumed.clone();
+        next_main.extend(prompt(2, 12));
+        assert_eq!(driver.plan(&state, &next_main, AR), consumed.len());
+        assert!(driver.plan_is_live(&state, &next_main, AR, consumed.len()));
+
+        // A short side request shares only SHARED_LCP tokens: it is parked
+        // around, and by itself plans a cold start.
+        assert_eq!(common_prefix(&side, &consumed), SHARED_LCP);
+        assert_eq!(driver.plan(&state, &side, AR), 0);
+        assert!(side_park_eligible(
+            consumed.len(),
+            common_prefix(&side, &consumed),
+            SIDE_THROUGH
+        ));
+
+        // Park: fixed parts whole, rows [0, ceil bound) of every stream.
+        let side_rows = state.side_request_rows(AR, SIDE_THROUGH).unwrap();
+        assert_eq!(
+            side_rows,
+            vec![SIDE_THROUGH, SIDE_THROUGH.div_ceil(POOL_RATIO)]
+        );
+        assert_eq!(side_rows[1], 126);
+        let main_before = state.bufs.clone();
+        let (plan, parked) = park_capture(&state, &side_rows);
+        assert_eq!(plan.fixed_bytes, vec![HOST_FIXED_A, HOST_FIXED_B]);
+        assert_eq!(
+            plan.segments,
+            vec![
+                Segment {
+                    row_bytes: HOST_ROW_BYTES,
+                    from: 0,
+                    to: SIDE_THROUGH,
+                },
+                Segment {
+                    row_bytes: HOST_POOL_ROW_BYTES,
+                    from: 0,
+                    to: 126,
+                },
+            ]
+        );
+        let packed = layout([
+            HOST_FIXED_A,
+            HOST_FIXED_B,
+            SIDE_THROUGH * HOST_ROW_BYTES,
+            126 * HOST_POOL_ROW_BYTES,
+        ]);
+        assert_eq!((plan.offsets.clone(), plan.total), packed);
+        assert_eq!(parked.len(), plan.total);
+        assert!(plan.total < consumed.len() * HOST_ROW_BYTES);
+        let copies = plan.copies(&PARK_FIXED);
+        assert_eq!(
+            copies.iter().map(|copy| copy.part).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        for pair in copies.windows(2) {
+            assert_eq!(pair[0].park_offset % PART_ALIGN, 0);
+            assert!(pair[0].park_offset + pair[0].bytes <= pair[1].park_offset);
+        }
+        assert_eq!(copies[3].bytes, 126 * HOST_POOL_ROW_BYTES);
+        let park = fake_parked(&state, plan.clone(), AR, SIDE_THROUGH);
+        assert_eq!(park.position, consumed.len());
+        assert_eq!(
+            park.live_rows,
+            vec![consumed.len(), consumed.len().div_ceil(POOL_RATIO)]
+        );
+
+        // The side request overwrites the prefix rows (its prompt plus every
+        // row decode may write) and both fixed parts; rows above survive.
+        state.write(&side_full, DECODED);
+        assert_eq!(state.position, SIDE_THROUGH);
+        assert!(!state.holds(&consumed, DECODED));
+        let rows_end = consumed.len() * HOST_ROW_BYTES;
+        let keep = SIDE_THROUGH * HOST_ROW_BYTES;
+        assert!(state.bufs[2][..keep] != main_before[2][..keep]);
+        assert!(state.bufs[2][keep..rows_end] == main_before[2][keep..rows_end]);
+        let pooled_end = consumed.len().div_ceil(POOL_RATIO) * HOST_POOL_ROW_BYTES;
+        let pooled_keep = 126 * HOST_POOL_ROW_BYTES;
+        assert!(state.bufs[3][..pooled_keep] != main_before[3][..pooled_keep]);
+        assert!(state.bufs[3][pooled_keep..pooled_end] == main_before[3][pooled_keep..pooled_end]);
+
+        // The side turn commits live; the park (and its history) stays.
+        driver.cache.parked = Some(park);
+        driver.parked = Some(record(&consumed, AR));
+        driver.live = None;
+        driver.turn = Some((side.clone(), AR));
+        driver.commit_live(&state, &side_full);
+        assert_eq!(driver.live, Some(record(&side_full, AR)));
+        assert_eq!(driver.parked, Some(record(&consumed, AR)));
+        assert_eq!(driver.cache.parked_through(), Some(SIDE_THROUGH));
+
+        // The main conversation's next request plans the FULL main history,
+        // served as live state (the parked bytes continue in place).
+        assert_eq!(driver.plan(&state, &next_main, AR), consumed.len());
+        assert!(driver.plan_is_live(&state, &next_main, AR, consumed.len()));
+        assert_eq!(
+            driver.plan_capped(&state, &next_main, AR, consumed.len()),
+            consumed.len()
+        );
+        assert_eq!(
+            driver.plan_capped(&state, &next_main, AR, consumed.len() - 1),
+            0
+        );
+        // The side lineage's own follow-up still continues the live side state.
+        let mut side_next = side_full.clone();
+        side_next.extend(prompt(9, 5));
+        assert_eq!(driver.plan(&state, &side_next, AR), side_full.len());
+        assert!(driver.plan_is_live(&state, &side_next, AR, side_full.len()));
+        assert!(!driver.plan_is_live(&state, &side_next, AR, consumed.len()));
+
+        // Restore: fixed parts and all rows are byte-identical to the main
+        // state, decoded (non-cold) fixed bytes included.
+        let before_restore = state.bufs.clone();
+        park_restore(&mut state, &plan, &parked);
+        state.position = consumed.len();
+        assert!(
+            state.holds(&consumed, DECODED),
+            "parked main state differs after restore"
+        );
+        assert!(!state.holds(&consumed, COLD));
+        // Nothing outside the parked ranges was written.
+        for (buf, at, bytes) in [
+            (0, HOST_FIXED_A_AT, HOST_FIXED_A),
+            (1, HOST_FIXED_B_AT, HOST_FIXED_B),
+        ] {
+            assert!(state.bufs[buf][..at] == before_restore[buf][..at]);
+            assert!(state.bufs[buf][at + bytes..] == before_restore[buf][at + bytes..]);
+        }
+        for (buf, bound) in [(2, plan.segments[0].bytes()), (3, plan.segments[1].bytes())] {
+            assert!(state.bufs[buf][bound..] == before_restore[buf][bound..]);
+        }
+
+        // Every bound is load-bearing: one token row fewer, the pooled
+        // stream's `floor` instead of `ceil`, or no rows at all, and the
+        // restored state no longer equals the main state.
+        for bounds in [
+            [SIDE_THROUGH - 1, SIDE_THROUGH.div_ceil(POOL_RATIO)],
+            [SIDE_THROUGH, SIDE_THROUGH / POOL_RATIO],
+            [0, 0],
+        ] {
+            let mut clobbered = HostState::new("host");
+            clobbered.write(&consumed, DECODED);
+            let (short_plan, short_bytes) = park_capture(&clobbered, &bounds);
+            clobbered.write(&side_full, DECODED);
+            park_restore(&mut clobbered, &short_plan, &short_bytes);
+            clobbered.position = consumed.len();
+            assert!(
+                !clobbered.holds(&consumed, DECODED),
+                "bounds {bounds:?} restored exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn long_unknown_or_overflowing_side_requests_are_not_parked() {
+        assert_eq!(SIDE_PARK_MAX_THROUGH, 8192);
+        assert_eq!(SIDE_PARK_EARLY_LCP, 1024);
+        let main = 9000;
+        assert!(side_park_eligible(main, SHARED_LCP, 8192));
+        assert!(!side_park_eligible(main, SHARED_LCP, 8193));
+        assert!(!side_park_eligible(main, 0, usize::MAX));
+        assert!(!side_park_eligible(usize::MAX, 0, usize::MAX));
+        // Early divergence only.
+        assert!(side_park_eligible(main, SIDE_PARK_EARLY_LCP, 100));
+        assert!(!side_park_eligible(main, SIDE_PARK_EARLY_LCP + 1, 100));
+        assert!(!side_park_eligible(main, usize::MAX, 100));
+        // The parked history must be longer than the rows the side may write.
+        assert!(!side_park_eligible(500, 0, 500));
+        assert!(side_park_eligible(501, 0, 500));
+        assert!(!side_park_eligible(0, 0, 0));
+
+        // A state that does not implement the hook never parks.
+        assert_eq!(PlainState.side_request_rows(AR, 100), None);
+        assert_eq!(PlainState.side_request_rows(MTP, usize::MAX), None);
+
+        // An unknown bound is one-shot: it is cleared by every turn end and
+        // reset, so a request without one never inherits an old limit.
+        let state = HostState::new("host");
+        let mut driver = SessionDriver::new(SessionCache::new(domain(), 1 << 20));
+        assert_eq!(driver.write_limit, None);
+        for end in 0..3 {
+            driver.set_request_write_limit(100);
+            assert_eq!(driver.write_limit, Some(100));
+            match end {
+                0 => driver.commit(),
+                1 => driver.commit_live(&state, &[1, 2]),
+                _ => driver.forget_live(),
+            }
+            assert_eq!(driver.write_limit, None);
+        }
+
+        // Row bounds beyond the live rows (or usize::MAX) clamp instead of
+        // overflowing; zero-row streams contribute no copy; a stream-count
+        // mismatch parks nothing.
+        let mut host = HostState::new("host");
+        host.write(&prompt(1, 600), DECODED);
+        let (fixed, rows) = host.geometry();
+        let plan = ParkPlan::new(&fixed, &rows, &[usize::MAX, usize::MAX]).unwrap();
+        assert_eq!(plan.segments[0].to, 600);
+        assert_eq!(plan.segments[1].to, 150);
+        assert_eq!(
+            host.side_request_rows(AR, usize::MAX),
+            Some(vec![usize::MAX, usize::MAX.div_ceil(POOL_RATIO)])
+        );
+        let (full, everything) = park_capture(&host, &[usize::MAX, usize::MAX]);
+        let mut clobbered = HostState::new("host");
+        clobbered.write(&prompt(1, 600), DECODED);
+        clobbered.write(&prompt(2, 600), COLD);
+        park_restore(&mut clobbered, &full, &everything);
+        clobbered.position = 600;
+        assert!(clobbered.holds(&prompt(1, 600), DECODED));
+        assert!(ParkPlan::new(&fixed, &rows, &[1]).is_none());
+        assert!(ParkPlan::new(&fixed, &rows, &[1, 2, 3]).is_none());
+        let empty = ParkPlan::new(
+            &fixed,
+            &[(HOST_ROW_BYTES, 0), (HOST_POOL_ROW_BYTES, 0)],
+            &[9, 9],
+        )
+        .unwrap();
+        assert_eq!(
+            empty
+                .copies(&PARK_FIXED)
+                .iter()
+                .map(|copy| copy.part)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn parked_history_wins_only_when_longer_than_every_other_source() {
+        assert_eq!(plan_with_parked(0, None), 0);
+        assert_eq!(plan_with_parked(0, Some(3072)), 3072);
+        assert_eq!(plan_with_parked(2048, Some(3072)), 3072);
+        assert_eq!(plan_with_parked(3072, Some(3072)), 3072);
+        assert_eq!(plan_with_parked(4096, Some(3072)), 4096);
+        assert_eq!(plan_with_parked(4096, None), 4096);
+
+        let main = prompt(1, 3072);
+        let mut extended = main.clone();
+        extended.extend(prompt(3, 1500));
+        let mut state = HostState::new("host");
+        state.write(&main, DECODED);
+        let mut driver = parked_driver(&state, &main, AR);
+        let scope = state.snapshot_scope(AR).unwrap();
+
+        // Nothing else: the parked history serves, as live state.
+        assert_eq!(driver.plan(&state, &extended, AR), 3072);
+        assert!(driver.plan_is_live(&state, &extended, AR, 3072));
+        // A shallower cold snapshot of the same prompt loses to it.
+        publish(&mut driver.cache, &scope, true, &extended, 2048);
+        assert_eq!(driver.plan(&state, &extended, AR), 3072);
+        assert!(driver.plan_is_live(&state, &extended, AR, 3072));
+        // A deeper snapshot (the side lineage matched further) beats it.
+        publish(&mut driver.cache, &scope, true, &extended, 4096);
+        assert_eq!(driver.plan(&state, &extended, AR), 4096);
+        assert!(!driver.plan_is_live(&state, &extended, AR, 4096));
+        // The cap excludes each source on its own: the snapshot above the cap
+        // falls back to the parked history, which the cap excludes too.
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 4095), 3072);
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 3072), 3072);
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 3071), 2048);
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 4096), 4096);
+        // A deeper live (side) state beats both.
+        driver.live = Some(record(&extended[..4400], AR));
+        state.position = 4400;
+        assert_eq!(driver.plan(&state, &extended, AR), 4400);
+        assert!(driver.plan_is_live(&state, &extended, AR, 4400));
+        // The live source above the cap is excluded; the cap-bounded snapshot
+        // and the parked history compete again.
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 4399), 4096);
+        assert_eq!(driver.plan_capped(&state, &extended, AR, 4095), 3072);
+    }
+
+    #[test]
+    fn parked_history_serves_only_its_own_route_scope_and_extension() {
+        let main = prompt(1, 3072);
+        let mut next = main.clone();
+        next.extend([1, 2, 3]);
+        let parked = record(&main, AR);
+        assert_eq!(parked_start(Some(&parked), &next, AR), Some(3072));
+        assert_eq!(parked_start(Some(&parked), &next, MTP), None);
+        assert_eq!(parked_start(None, &next, AR), None);
+        // A strict extension only: the same history or a divergence is not served.
+        assert_eq!(parked_start(Some(&parked), &main, AR), None);
+        assert_eq!(parked_start(Some(&parked), &main[..3000], AR), None);
+        let mut diverged = next.clone();
+        diverged[100] ^= 1;
+        assert_eq!(parked_start(Some(&parked), &diverged, AR), None);
+        assert_eq!(parked_start(Some(&record(&[], AR)), &next, AR), None);
+
+        let mut state = HostState::new("host");
+        state.write(&main, DECODED);
+        let driver = parked_driver(&state, &main, AR);
+        assert_eq!(driver.plan(&state, &next, AR), 3072);
+        // Another route (its own scope) or another scope never sees the park.
+        assert_eq!(driver.plan(&state, &next, MTP), 0);
+        assert!(!driver.plan_is_live(&state, &next, MTP, 3072));
+        assert!(!driver.cache.parked_valid(&state, MTP));
+        let other = HostState::new("other");
+        assert!(driver.cache.parked_valid(&state, AR));
+        assert!(!driver.cache.parked_valid(&other, AR));
+        assert_eq!(driver.plan(&other, &next, AR), 0);
+        assert!(!driver.plan_is_live(&other, &next, AR, 3072));
+        // A park made for MTP serves MTP only.
+        let mtp = parked_driver(&state, &main, MTP);
+        assert_eq!(mtp.plan(&state, &next, MTP), 3072);
+        assert_eq!(mtp.plan(&state, &next, AR), 0);
+    }
+
+    #[test]
+    fn parked_history_expires_unless_a_bounded_side_extension_keeps_it() {
+        // Only an extension of the live side lineage that stays within the
+        // protected rows keeps the park.
+        assert!(parked_survives(SIDE_THROUGH, SIDE_THROUGH, true));
+        assert!(parked_survives(SIDE_THROUGH, 1, true));
+        assert!(!parked_survives(SIDE_THROUGH, SIDE_THROUGH + 1, true));
+        assert!(!parked_survives(SIDE_THROUGH, usize::MAX, true));
+        assert!(!parked_survives(SIDE_THROUGH, 100, false));
+        assert!(!parked_survives(SIDE_THROUGH, SIDE_THROUGH, false));
+
+        let main = prompt(1, 3072);
+        let mut next = main.clone();
+        next.extend([1, 2, 3]);
+        let mut state = HostState::new("host");
+        state.write(&main, DECODED);
+        let mut driver = parked_driver(&state, &main, AR);
+        driver.set_request_write_limit(100);
+        assert_eq!(driver.plan(&state, &next, AR), 3072);
+        assert_eq!(driver.cache.parked_through(), Some(SIDE_THROUGH));
+        // A live-state reset outside the cache drops the park and its history.
+        driver.forget_live();
+        assert!(driver.parked.is_none());
+        assert!(driver.cache.parked.is_none());
+        assert_eq!(driver.cache.parked_through(), None);
+        assert_eq!(driver.cache.release_bufs.len(), 1);
+        assert_eq!(driver.plan(&state, &next, AR), 0);
+        assert!(!driver.plan_is_live(&state, &next, AR, 3072));
+    }
+
+    #[test]
+    fn tail_restored_boundaries_publish_session_exact_and_serve_plan_and_restore() {
+        let state = HostState::new("host");
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        let scope = state.snapshot_scope(AR).unwrap();
+        let cold = cache.domain.scoped(&scope);
+        let exact = session_exact_domain(&cold);
+        assert_ne!(cold, exact);
+        assert!(exact.arch_policy.state_abi_tag.ends_with("/session-exact"));
+        assert_eq!(capture_domain(&cold, true), cold);
+        assert_eq!(capture_domain(&cold, false), exact);
+
+        // A prompt that extends the final message restores the tail resident
+        // (reused = tail): its regular boundaries above still capture.
+        let tail = STRIDE + 30;
+        let c = prompt(5, 3 * STRIDE + 40);
+        let (boundaries, lineage) = SessionCache::turn_boundaries(&state, &c, tail, false);
+        assert_eq!(lineage, None);
+        assert_eq!(boundaries, VecDeque::from([2 * STRIDE, 3 * STRIDE]));
+        cache.turn = Some(Turn {
+            domain: cold.clone(),
+            route: AR,
+            boundaries: boundaries.clone(),
+            lineage,
+            cold_exact: false,
+            start: tail,
+            end: c.len(),
+        });
+        for &p in &boundaries {
+            let turn = cache.turn.as_ref().unwrap();
+            let key = (
+                capture_domain(&turn.domain, turn.cold_exact),
+                p as u64,
+                prefix_fingerprint(&c[..p]),
+            );
+            cache.pending.push((key, fake_snapshot(p)));
+        }
+        assert_eq!(cache.pending.len(), 2);
+        assert!(cache.pending.iter().all(|(key, _)| key.0 == exact));
+        cache.commit();
+        assert!(cache.pending.is_empty());
+        assert_eq!(cache.pool.len(), 2);
+        assert_eq!(cache.stored_bytes(), 2 * 4096);
+        for p in [2 * STRIDE, 3 * STRIDE] {
+            let fp = prefix_fingerprint(&c[..p]);
+            assert!(cache.present(&exact, p as u64, fp));
+            assert!(!cache.present(&cold, p as u64, fp));
+        }
+
+        // Planning and restore find them: the deepest matching exact boundary.
+        let mut next = c.clone();
+        next.extend(prompt(6, 20));
+        assert_eq!(cache.plan(&state, &next, AR), 3 * STRIDE);
+        let mut forked = next.clone();
+        forked[2 * STRIDE + 5] ^= 1;
+        assert_eq!(cache.plan(&state, &forked, AR), 2 * STRIDE);
+        assert_eq!(cache.plan(&state, &next, MTP), 0);
+        let fp = prefix_fingerprint(&next[..3 * STRIDE]);
+        assert_eq!(
+            cache.restore_domain(&cold, 3 * STRIDE as u64, fp),
+            (exact.clone(), false)
+        );
+
+        // A cold-exact snapshot of the same prefix wins the tie.
+        publish(&mut cache, &scope, true, &next, 3 * STRIDE);
+        assert_eq!(cache.pool.len(), 3);
+        assert_eq!(
+            cache.restore_domain(&cold, 3 * STRIDE as u64, fp),
+            (cold.clone(), true)
+        );
+        assert_eq!(cache.plan(&state, &next, AR), 3 * STRIDE);
+
+        // A cache holding only cold-exact snapshots never reports exact keys.
+        let mut fresh = SessionCache::new(domain(), 1 << 20);
+        publish(&mut fresh, &scope, true, &c, STRIDE);
+        assert!(fresh.present(&cold, STRIDE as u64, prefix_fingerprint(&c[..STRIDE])));
+        assert!(!fresh.present(&exact, STRIDE as u64, prefix_fingerprint(&c[..STRIDE])));
+        assert_eq!(
+            fresh.restore_domain(
+                &cold,
+                2 * STRIDE as u64,
+                prefix_fingerprint(&c[..2 * STRIDE])
+            ),
+            (exact, false)
+        );
     }
 }
