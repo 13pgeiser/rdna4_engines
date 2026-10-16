@@ -1145,7 +1145,15 @@ all-reduce, so it works at any `--tp`.
   A and B for every targeted weight; startup prints the size. With free slots, adapters load and
   unload while serving: `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/dir"}` and
   `POST /v1/unload_lora_adapter {"lora_name": "x"}` (vLLM's routes; loopback-only without
-  `--api-key`). An unload is refused (409) while a request uses the adapter.
+  `--api-key`).
+- An unload of an idle adapter answers 200 and frees its slot. An unload of an adapter requests
+  are still using **drains** it and answers 202
+  `{"action": "draining", "lora_name": "x", "in_flight": N}`: from then on a request naming `x`
+  gets the 404 an unknown model gets and `/v1/models` no longer lists it, the N requests finish
+  normally, and the last of them frees the slot. Asking again while it drains answers 202 with the
+  count as it is then, and 404 once it is gone. Loading the same name while it drains answers 409;
+  load it again once the unload answers 404. A freed slot is reused a few steps later (a step
+  already on the card may still read it), which a load waits for by itself.
 - `--max-lora-rank R` (default 16) is the rank every slot is sized for. A smaller rank is padded,
   a larger one refused.
 - `--lora-target-modules q_proj,k_proj,...` names what adapters may target. Default: what the

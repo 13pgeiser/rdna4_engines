@@ -1,4 +1,5 @@
-/* lora_test.cpp -- core/lora: sites from the declared Program, and a PEFT adapter packed per rank.
+/* lora_test.cpp -- core/lora: sites from the declared Program, a PEFT adapter packed per rank, and
+ * the adapter slots' bookkeeping (slots.h).
  *
  * HOST ONLY, AND IT NEVER REACHES THE DEVICE LAYER. No kernel plugin is loaded: a Registry that
  * loads one brackets the dlopen with the device backend's code mark, which in a HIP build starts the
@@ -18,6 +19,7 @@
 
 #include "build/rad_build.h"
 #include "lora/lora.h"
+#include "lora/slots.h"
 #include "plugin/registry.h"
 #include "rad_plugin.h"
 
@@ -30,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1213,6 +1216,91 @@ TEST(adapter_info_and_scales) {
     REQUIRE_EQ(ri.modules.size(), (size_t)1);
     CHECK_EQ(ri.modules[0].scale, 4.0f);
     CHECK(ri.content_hash != info.content_hash);
+}
+
+/* ================================================================== the slot table
+ * lora/slots.h: which adapter a slot holds, the holds requests take on it, and draining. */
+
+/* An unload with no request on the adapter frees its slot at once, and the slot is written again
+ * only after the step loop has gone round kSlotCoolRounds times. */
+TEST(an_idle_adapter_unloads_at_once_and_its_slot_cools) {
+    std::atomic<uint64_t> epoch{10};
+    lora::SlotTable t;
+    t.reset(1, &epoch);
+    int slot = -1, n = -1;
+    bool cooling = true;
+    std::string err;
+    CHECK_OK(t.reserve("a", &slot, &cooling, &err));
+    CHECK_EQ(slot, 0);
+    CHECK(!cooling);
+    const uint64_t u1 = t.publish(slot, "a", "/a");
+    CHECK(u1 != 0);
+    CHECK_EQ(t.reserve("a", &slot, &cooling, &err), RAD_E_INVAL);   /* already loaded */
+    CHECK_OK(t.unload("a", &n, &err));
+    CHECK_EQ(n, 0);
+    CHECK(t.names().empty());
+    CHECK_EQ(t.unload("a", &n, &err), RAD_E_NOTFOUND);
+    CHECK_EQ(t.reserve("b", &slot, &cooling, &err), RAD_E_FULL);
+    CHECK(cooling);
+    epoch += lora::kSlotCoolRounds;
+    CHECK_OK(t.reserve("b", &slot, &cooling, &err));
+    CHECK_EQ(slot, 0);
+    const uint64_t u2 = t.publish(slot, "b", "/b");
+    CHECK(u2 != 0 && u2 != u1);   /* a fresh uid: its prefix-cache blocks start cold */
+}
+
+/* An unload of an adapter requests hold drains it: new requests cannot name it, the ones holding
+ * it keep it, a second unload reports the count as it is then, a load of the same name is refused,
+ * and the last hold to go frees the slot -- which then cools like any freed slot. A hold copied
+ * into every choice of one request counts once. */
+TEST(an_adapter_in_use_drains_and_its_last_request_frees_it) {
+    std::atomic<uint64_t> epoch{0};
+    lora::SlotTable t;
+    t.reset(1, &epoch);
+    int slot = -1, n = -1;
+    bool cooling = false;
+    std::string err;
+    CHECK_OK(t.reserve("a", &slot, &cooling, &err));
+    const uint64_t u = t.publish(slot, "a", "/a");
+    epoch += 10;
+
+    int32_t s1 = -1, s2 = -1;
+    uint64_t v1 = 0, v2 = 0;
+    std::shared_ptr<void> h1, h2;
+    CHECK_OK(t.acquire("a", &s1, &v1, &h1));
+    CHECK_OK(t.acquire("a", &s2, &v2, &h2));
+    CHECK_EQ(s1, 0);
+    CHECK_EQ(v1, u);
+    std::shared_ptr<void> h2_choice = h2;   /* a second choice of the same request */
+    CHECK_EQ(t.in_flight("a"), 2);
+
+    CHECK_OK(t.unload("a", &n, &err));
+    CHECK_EQ(n, 2);
+    CHECK(t.names().empty());
+    std::shared_ptr<void> h3;
+    int32_t s3 = -1;
+    uint64_t v3 = 0;
+    CHECK_EQ(t.acquire("a", &s3, &v3, &h3), RAD_E_NOTFOUND);   /* as for a name never loaded */
+    CHECK(!h3);
+    CHECK_EQ(t.reserve("a", &slot, &cooling, &err), RAD_E_STATE);
+    CHECK(has(err, "being unloaded"));
+    CHECK_OK(t.unload("a", &n, &err));                         /* asked again: the same */
+    CHECK_EQ(n, 2);
+
+    h1.reset();
+    CHECK_OK(t.unload("a", &n, &err));
+    CHECK_EQ(n, 1);
+    h2.reset();
+    CHECK_EQ(t.in_flight("a"), 1);                             /* the other choice still holds */
+    h2_choice.reset();
+    CHECK_EQ(t.in_flight("a"), 0);
+    CHECK_EQ(t.unload("a", &n, &err), RAD_E_NOTFOUND);         /* gone, by itself */
+
+    CHECK_EQ(t.reserve("a", &slot, &cooling, &err), RAD_E_FULL);
+    CHECK(cooling);
+    epoch += lora::kSlotCoolRounds;
+    CHECK_OK(t.reserve("a", &slot, &cooling, &err));
+    CHECK(t.publish(slot, "a", "/a2") != u);
 }
 
 TEST(zz_remove_the_temporary_adapters) {

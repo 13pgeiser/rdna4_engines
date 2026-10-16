@@ -1832,17 +1832,28 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
         return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
     std::string err;
     int s;
+    int in_flight = 0;
     if (load) {
         if (!j.contains("lora_path") || !j["lora_path"].is_string())
             return fail(400, "invalid_request_error", "load_lora_adapter needs lora_path");
         s = opt_.lora_load(name, j["lora_path"].get<std::string>(), &err);
     } else {
-        s = opt_.lora_unload(name, &err);
+        s = opt_.lora_unload(name, &err, &in_flight);
     }
+    /* 409 for a load of a name that is still draining: the old adapter's requests are running. */
     if (s == RAD_E_NOTFOUND) return fail(404, "not_found_error", err);
     if (s == RAD_E_STATE) return fail(409, "conflict_error", err);
     if (s == RAD_E_FULL) return fail(503, "service_unavailable", err);
     if (s < 0) return fail(400, "invalid_request_error", err.empty() ? std::string(rad_strerror(s)) : err);
+    /* AN UNLOAD OF AN ADAPTER IN USE DRAINS IT (lora/slots.h): accepted, not done. New requests
+     * naming it are already refused as an unknown model and it is off /v1/models; the requests
+     * counted here finish normally, and the last of them frees the slot. Asking again answers
+     * the same with the count as it is then, and a 404 once it is gone. */
+    if (!load && in_flight > 0) {
+        metrics_.observe_http(202);
+        return HttpResponse::json_body(202, json{ { "action", "draining" }, { "lora_name", name },
+                                                  { "in_flight", in_flight } }.dump());
+    }
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json{ { "status", "ok" }, { "lora_name", name },
                                               { "action", load ? "loaded" : "unloaded" } }.dump());

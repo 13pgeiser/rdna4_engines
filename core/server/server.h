@@ -119,13 +119,16 @@ struct ServerOptions {
      * clock only mean something under load: queried during a long prefill, it tells a link parked
      * below its maximum from one at rest. */
     std::function<std::string()> diagnostics_json;
-    /* RUNTIME LoRA (Engine::lora_resolve): a request's `model` naming a loaded adapter gets that
-     * adapter's slot and load uid. Unset with LoRA off, and then any `model` is served by the base. */
+    /* RUNTIME LoRA (Engine::lora_acquire): a request's `model` naming a loaded adapter gets that
+     * adapter's slot, load uid and a hold on it. Unset with LoRA off, and then any `model` is
+     * served by the base. `lora_names` lists the adapters a request may name (not the draining
+     * ones). */
     std::function<int(const std::string&, int32_t*, uint64_t*, std::shared_ptr<void>*)> lora_acquire;
     std::function<std::vector<std::string>()>                  lora_names;
-    /* POST /v1/load_lora_adapter and /v1/unload_lora_adapter (vLLM's names and bodies). */
+    /* POST /v1/load_lora_adapter and /v1/unload_lora_adapter (vLLM's names and bodies). An unload
+     * of an adapter requests still use drains it: RAD_OK with *in_flight > 0 (Engine::lora_unload). */
     std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
-    std::function<int(const std::string&, std::string*)>                    lora_unload;
+    std::function<int(const std::string&, std::string*, int*)>              lora_unload;
 
     std::string api_key;
     bool        cors = true;

@@ -2086,7 +2086,9 @@ int Engine::run_server() {
         o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
             return lora_load(n, d, e);
         };
-        o.lora_unload = [this](const std::string& n, std::string* e) { return lora_unload(n, e); };
+        o.lora_unload = [this](const std::string& n, std::string* e, int* in_flight) {
+            return lora_unload(n, e, in_flight);
+        };
     }
 
     /* Media, when the program declared an encoder. The processor's geometry comes from the

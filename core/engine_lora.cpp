@@ -77,7 +77,7 @@ int Engine::lora_targets() {
             return RAD_E_INVAL;
         }
     }
-    lora_slots_.assign((size_t)cfg_.lora.slots(), LoraSlotState{});
+    lora_table_.reset(cfg_.lora.slots(), &lora_epoch_);
     return RAD_OK;
 }
 
@@ -115,43 +115,25 @@ int Engine::lora_start() {
 }
 
 int Engine::lora_load(const std::string& name, const std::string& dir, std::string* err) {
-    std::unique_lock<std::mutex> lk(lora_mu_);
+    std::lock_guard<std::mutex> lk(lora_mu_);
     if (!cfg_.lora.enabled()) { *err = "the engine was started without adapters"; return RAD_E_STATE; }
     if (name.empty()) { *err = "an adapter needs a name"; return RAD_E_INVAL; }
-    int slot = -1;
-    bool cooling = false;
     /* A SLOT FREED A MOMENT AGO IS WAITED FOR HERE, not handed back as a retry. It is reusable once
      * the step loop has gone round three times (a pass issued ahead may still read it), and the
      * loop goes round idle or busy, so that is milliseconds -- an unload followed at once by a load
-     * (a hot swap) would otherwise fail almost every time under traffic. The lock is let go while
-     * waiting; the step loop's counter is an atomic and needs none of it. */
+     * (a hot swap) would otherwise fail almost every time under traffic. Only other loads wait on
+     * lora_mu_ meanwhile; requests and unloads go to the table, and the step loop's counter is an
+     * atomic. */
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    int slot = -1;
     for (;;) {
-        slot = -1;
-        cooling = false;
-        const uint64_t now = lora_epoch_.load(std::memory_order_acquire);
-        for (size_t i = 0; i < lora_slots_.size(); ++i) {
-            const LoraSlotState& x = lora_slots_[i];
-            if (x.uid != 0 && x.name == name) {
-                *err = "an adapter named '" + name + "' is already loaded";
-                return RAD_E_INVAL;
-            }
-            if (x.uid != 0 || slot >= 0) continue;
-            if (x.used && now < x.freed_at + 3) { cooling = true; continue; }
-            slot = (int)i;
-        }
-        if (slot >= 0 || !cooling || stopping_.load(std::memory_order_acquire) ||
+        bool cooling = false;
+        const int s = lora_table_.reserve(name, &slot, &cooling, err);
+        if (s >= 0) break;
+        if (s != RAD_E_FULL || !cooling || stopping_.load(std::memory_order_acquire) ||
             std::chrono::steady_clock::now() >= give_up)
-            break;
-        lk.unlock();
+            return s;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        lk.lock();
-    }
-    if (slot < 0) {
-        *err = cooling ? std::string("the free slot was unloaded a moment ago and a step on the card "
-                                     "may still read it; retry")
-                       : fmt("all %zu adapter slots are in use (--max-loras)", lora_slots_.size());
-        return RAD_E_FULL;
     }
 
     /* ---- pack, per rank (host only) */
@@ -222,11 +204,7 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
         }
     }
 
-    LoraSlotState& ls = lora_slots_[(size_t)slot];
-    ls.name = name;
-    ls.dir = dir;
-    ls.uid = lora_next_uid_++;
-    ls.used = true;
+    lora_table_.publish(slot, name, dir);
     const lora::AdapterInfo& a = infos[0];
     RAD_INFO("lora: '%s' in slot %d -- %zu modules, rank %lld, alpha %g%s, base %s", name.c_str(),
              slot, a.modules.size(), (long long)a.max_module_rank, a.alpha, a.rslora ? " (rsLoRA)" : "",
@@ -236,49 +214,15 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
 
 int Engine::lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
                          std::shared_ptr<void>* hold) {
-    std::lock_guard<std::mutex> lk(lora_mu_);
-    for (size_t i = 0; i < lora_slots_.size(); ++i)
-        if (lora_slots_[i].uid != 0 && lora_slots_[i].name == name) {
-            const uint64_t u = lora_slots_[i].uid;
-            *slot = (int32_t)i;
-            *uid = u;
-            ++lora_refs_[u];
-            *hold = std::shared_ptr<void>(nullptr, [this, u](void*) {
-                std::lock_guard<std::mutex> g(lora_mu_);
-                auto it = lora_refs_.find(u);
-                if (it != lora_refs_.end() && --it->second <= 0) lora_refs_.erase(it);
-            });
-            return RAD_OK;
-        }
-    return RAD_E_NOTFOUND;
+    return lora_table_.acquire(name, slot, uid, hold);
 }
 
-int Engine::lora_unload(const std::string& name, std::string* err) {
-    std::lock_guard<std::mutex> lk(lora_mu_);
-    for (LoraSlotState& x : lora_slots_) {
-        if (x.uid == 0 || x.name != name) continue;
-        auto it = lora_refs_.find(x.uid);
-        if (it != lora_refs_.end() && it->second > 0) {
-            *err = fmt("%d request%s still use%s '%s'", it->second, it->second == 1 ? "" : "s",
-                       it->second == 1 ? "s" : "", name.c_str());
-            return RAD_E_STATE;
-        }
-        RAD_INFO("lora: '%s' unloaded (uid %llu)", name.c_str(), (unsigned long long)x.uid);
-        x.uid = 0;
-        x.name.clear();
-        x.freed_at = lora_epoch_.load(std::memory_order_acquire);
-        return RAD_OK;
-    }
-    *err = "no adapter named '" + name + "' is loaded";
-    return RAD_E_NOTFOUND;
+int Engine::lora_unload(const std::string& name, std::string* err, int* in_flight) {
+    return lora_table_.unload(name, in_flight, err);
 }
 
 std::vector<std::string> Engine::lora_names() const {
-    std::lock_guard<std::mutex> lk(lora_mu_);
-    std::vector<std::string> out;
-    for (const LoraSlotState& s : lora_slots_)
-        if (s.uid != 0) out.push_back(s.name);
-    return out;
+    return lora_table_.names();
 }
 
 }  /* namespace rad */
