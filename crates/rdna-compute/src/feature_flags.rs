@@ -653,8 +653,9 @@ pub struct FeatureFlags {
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
     /// for F32 K/V and split-KV for q8 K/V. Parsed on unless the value is
     /// exactly `0` (kill switch for both). KLD-gated, not bit-exact against
-    /// the per-head kernel; acted on only for exact gfx1151 (see
-    /// `qwen4_qsa_decode_splitk_enabled`).
+    /// the per-head kernel; the F32 split-K is acted on only for exact gfx1151
+    /// (`qwen4_qsa_decode_splitk_enabled`) and the q8 split-KV for exact
+    /// gfx1151 and gfx1100 (`qwen4_qsa_decode_splitkv_q8_enabled`).
     pub qwen4_qsa_decode_splitk: bool,
     /// Developer QSA mapped/allocation extent checks; exactly `1` or `2`.
     pub qwen4_qsa_extent_check: bool,
@@ -1203,11 +1204,23 @@ impl FeatureFlags {
 
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default
     /// on; `=0` is the kill switch for both the F32 split-K and the q8
-    /// split-KV routes). Exact gfx1151 only; the runtime additionally requires
-    /// F32 or q8 K/V, head_dim 256, an admitted decode call (1..=`few_row_limit`
-    /// rows) and an eager (unrecorded, uncaptured) launch.
+    /// split-KV routes). This gate covers the F32 split-K route: exact gfx1151
+    /// only; the runtime additionally requires F32 K/V, head_dim 256, an
+    /// admitted decode call (1..=`few_row_limit` rows) and an eager (unrecorded,
+    /// uncaptured) launch. The q8 split-KV route uses
+    /// [`Self::qwen4_qsa_decode_splitkv_q8_enabled`].
     pub fn qwen4_qsa_decode_splitk_enabled(&self) -> bool {
         self.qwen4_qsa_decode_splitk && self.arch == "gfx1151"
+    }
+
+    /// Q8 split-KV QSA decode attention: the same
+    /// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK` switch (default on; `=0` kills it),
+    /// acted on for exact gfx1151 and exact gfx1100. The runtime additionally
+    /// requires q8 K/V, head_dim 256, 24 query heads over 2 KV heads, an
+    /// admitted decode call (1..=`few_row_limit` rows) and an eager
+    /// (unrecorded, uncaptured) launch.
+    pub fn qwen4_qsa_decode_splitkv_q8_enabled(&self) -> bool {
+        self.qwen4_qsa_decode_splitk && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -1712,8 +1725,9 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
     }
 
-    /// The QSA split-K decode knob is default on and only the exact value `0`
-    /// turns it off; the arch gate admits gfx1151 alone.
+    /// The QSA split decode knob is default on and only the exact value `0`
+    /// turns it off; the F32 split-K arch gate admits gfx1151 alone and the
+    /// q8 split-KV arch gate admits gfx1151 and gfx1100.
     #[test]
     fn qwen4_qsa_decode_splitk_defaults_on_and_zero_opts_out() {
         for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
@@ -1724,10 +1738,17 @@ mod tests {
                 })
             };
             let gfx1151 = arch == "gfx1151";
+            let q8_arch = arch == "gfx1151" || arch == "gfx1100";
             assert!(flags(None).qwen4_qsa_decode_splitk, "{arch}: unset");
             assert_eq!(flags(None).qwen4_qsa_decode_splitk_enabled(), gfx1151, "{arch}: unset enabled");
+            assert_eq!(
+                flags(None).qwen4_qsa_decode_splitkv_q8_enabled(),
+                q8_arch,
+                "{arch}: unset q8 enabled"
+            );
             assert!(!flags(Some("0")).qwen4_qsa_decode_splitk, "{arch}: 0");
             assert!(!flags(Some("0")).qwen4_qsa_decode_splitk_enabled(), "{arch}: 0 enabled");
+            assert!(!flags(Some("0")).qwen4_qsa_decode_splitkv_q8_enabled(), "{arch}: 0 q8 enabled");
             for raw in ["1", "", "true", "TRUE", "on", "yes", "2", " 0", "0 ", "00"] {
                 assert!(flags(Some(raw)).qwen4_qsa_decode_splitk, "{arch}: {raw:?}");
                 assert_eq!(
@@ -1735,10 +1756,17 @@ mod tests {
                     gfx1151,
                     "{arch}: {raw:?} enabled"
                 );
+                assert_eq!(
+                    flags(Some(raw)).qwen4_qsa_decode_splitkv_q8_enabled(),
+                    q8_arch,
+                    "{arch}: {raw:?} q8 enabled"
+                );
             }
         }
         // for_test zeroes every default-on flag (dn_snapshot_flip, fn_gdn_dense_scan, ...).
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
+        assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
+        assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());
     }
 
     #[test]

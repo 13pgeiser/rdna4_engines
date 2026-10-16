@@ -641,8 +641,9 @@ compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
 
 **Flash-Next (Qwen4, arch 16)** has its own `kv_cache` table for the QSA
 full-attention K/V arenas: `auto` is `fp8` on exact gfx1201 (for a head
-geometry the kernels implement) and the exact `bf16` state elsewhere; `q8` is
-opt-in on gfx11/gfx12; `fwhtN`/`asymN` are refused. The GatedDeltaNet state is
+geometry the kernels implement), `q8` on exact gfx1100 (head_dim 256) and the
+exact `bf16` state elsewhere (gfx1151 included); `q8` is opt-in on the other
+gfx11/gfx12 arches; `fwhtN`/`asymN` are refused. The GatedDeltaNet state is
 separate. Table and sizes: [`CONFIG.md`](CONFIG.md).
 
 **Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only

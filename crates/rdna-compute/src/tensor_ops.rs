@@ -7773,10 +7773,10 @@ fn indexed_attention_attention_batch_arena(
             ),
         ));
     }
-    // Split decode, default on (exact gfx1151; HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0
-    // kill switch): eager gfx1151 hd256 admitted decode calls, split-K for F32
-    // K/V and split-KV for q8 K/V; KLD-gated, not bit-exact. The reference
-    // entry (`allow_fast = false`) stays per-head.
+    // Split decode, default on (HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0 kill switch):
+    // eager hd256 admitted decode calls, split-K for F32 K/V (exact gfx1151)
+    // and split-KV for q8 K/V (exact gfx1151 and gfx1100); KLD-gated, not
+    // bit-exact. The reference entry (`allow_fast = false`) stays per-head.
     if allow_fast {
         match policy {
             Some(QsaDecodeAttentionPolicy::SplitK { splits, layout }) => {
@@ -8065,8 +8065,8 @@ pub enum QsaDecodeAttentionPolicy {
     PerHead,
 }
 
-/// The policy proper. Inputs only: the architecture and flag (gfx1151 +
-/// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`), K/V format, head_dim, head grouping, the
+/// The policy proper. Inputs only: the architecture and flag (F32 split-K:
+/// gfx1151; q8 split-KV: gfx1151 or gfx1100; `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`), K/V format, head_dim, head grouping, the
 /// context-derived `max_selected` (LDS fit of the F32 slice; the q8 split-KV
 /// LDS is fixed) and the launch mode (`eager`: no recorder or capture armed;
 /// both split routes bake their grid, LDS and position into the launch and
@@ -8128,8 +8128,8 @@ fn qsa_decode_attention_policy_with(
         };
     }
     let split_kv_q8 = eager
-        && flags.qwen4_qsa_decode_splitk_enabled()
-        && arch_caps.is_gfx1151()
+        && flags.qwen4_qsa_decode_splitkv_q8_enabled()
+        && (arch_caps.is_gfx1151() || arch_caps.is_gfx1100())
         && qsa_decode_splitkv_q8_geometry_fits(format, head_dim, n_heads, n_kv_heads);
     if split_kv_q8 {
         QsaDecodeAttentionPolicy::SplitKvQ8 { splits: QSA_DECODE_SPLITK_SPLITS }
@@ -9803,8 +9803,8 @@ mod tests {
     use super::*;
 
     /// The decode attention policy over the flags and architecture alone:
-    /// F32 K/V keeps split-K, q8 K/V at 24 query heads over 2 KV heads takes
-    /// split-KV, everything else (recorded/captured, kill switch, other
+    /// F32 K/V keeps split-K (exact gfx1151), q8 K/V at 24 query heads over 2
+    /// KV heads takes split-KV (exact gfx1151 and gfx1100), everything else (recorded/captured, kill switch, other
     /// geometry or architecture) stays per-head. Row counts are not an input.
     #[test]
     fn qsa_decode_attention_policy_routes_f32_split_k_and_q8_split_kv() {
@@ -9833,6 +9833,13 @@ mod tests {
         assert_eq!(policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 128, true), per_head);
         // Another architecture.
         assert_eq!(policy("gfx1201", true, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        // gfx1100 takes q8 split-KV (eager, flag on) but never the F32 split-K.
+        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, true), q8);
+        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, false), per_head);
+        assert_eq!(policy("gfx1100", false, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
+        assert_eq!(policy("gfx1100", true, QsaKvFormat::Q8, 12, 1, 256, true), per_head);
+        assert_eq!(policy("gfx1100", true, QsaKvFormat::F32, 24, 2, 256, true), per_head);
+        assert_eq!(policy("gfx1101", true, QsaKvFormat::Q8, 24, 2, 256, true), per_head);
         // F32 K/V is unchanged: split-K, never split-KV.
         assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, true), f32_split_k);
         assert_eq!(policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, false), per_head);

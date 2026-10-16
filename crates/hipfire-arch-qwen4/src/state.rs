@@ -728,11 +728,13 @@ fn grow_context_arena(
 /// a head geometry its kernels implement (head_dim 256, an even KV-head
 /// count) and is [`QsaKvFormat::Fp8`] (OCP E4M3, BF16 index keys) on gfx1201
 /// and [`QsaKvFormat::Fp8Fnuz`] (E4M3 FNUZ hardware codes, F32 index and
-/// pooled keys) on gfx942; `q8` ([`QsaKvFormat::Q8`], opt-in) needs
-/// gfx11/gfx12 and head_dim 256. `auto` is fp8 on gfx1201 where the geometry
-/// holds and the reference F32 state elsewhere, gfx942 included: gfx942
-/// serves fp8 K/V only when explicitly requested. An explicit request the
-/// device or model cannot serve is refused, never rewritten.
+/// pooled keys) on gfx942; `q8` ([`QsaKvFormat::Q8`]) needs gfx11/gfx12 and
+/// head_dim 256. `auto` is fp8 on gfx1201 and q8 on gfx1100 where the
+/// geometry holds (the reference F32 state where it does not) and the
+/// reference F32 state elsewhere, gfx942 and gfx1151 included: gfx942 serves
+/// fp8 K/V only when explicitly requested, and `bf16` is the exact F32 state
+/// everywhere. An explicit request the device or model cannot serve is
+/// refused, never rewritten.
 pub fn resolve_qsa_format(
     request: &str,
     gpu: &Gpu,
@@ -764,6 +766,7 @@ fn resolve_qsa_format_for_arch(
              (have {kv_heads} x {head_dim}); use bf16"
         )),
         KvMode::Q8 if QsaKvFormat::Q8.supports(kv_heads, head_dim) => Ok(QsaKvFormat::Q8),
+        KvMode::Q8 if auto => Ok(QsaKvFormat::F32),
         KvMode::Q8 => Err(format!(
             "qwen4: q8 QSA K/V needs head_dim 256 (have {kv_heads} x {head_dim}); use bf16"
         )),
@@ -4320,7 +4323,9 @@ mod tests {
 
     /// gfx942 serves fp8 K/V only on an explicit request, as the FNUZ format
     /// (F32 index keys); `auto`/unset/`bf16` stay on the F32 reference state.
-    /// gfx1201 keeps its OCP `Fp8` (BF16 index) default.
+    /// gfx1201 keeps its OCP `Fp8` (BF16 index) default; the gfx1100 q8 default
+    /// and the gfx1151 F32 default are covered by
+    /// `gfx1100_auto_is_q8_gfx1201_fp8_other_archs_f32`.
     #[test]
     fn gfx942_explicit_fp8_is_fnuz_and_auto_stays_f32() {
         let config = crate::config::compact_test_config();
@@ -4347,11 +4352,7 @@ mod tests {
                 "{request:?} on gfx1201"
             );
         }
-        assert_eq!(
-            resolve_qsa_format_for_arch("auto", "gfx1151", &config),
-            Ok(QsaKvFormat::F32)
-        );
-        assert!(resolve_qsa_format_for_arch("fp8", "gfx1151", &config).is_err());
+
         // An odd KV-head count has no FNUZ kernel: explicit fp8 is refused,
         // never rewritten, and auto stays F32.
         let mut odd = config.clone();
@@ -4362,6 +4363,78 @@ mod tests {
             resolve_qsa_format_for_arch("auto", "gfx942", &odd),
             Ok(QsaKvFormat::F32)
         );
+    }
+
+    /// `auto`/unset is q8 on exact gfx1100 (where the geometry holds), fp8 on
+    /// exact gfx1201 and the F32 reference state on every other arch, gfx1151
+    /// included; explicit `bf16` is the exact F32 state everywhere and
+    /// explicit `q8` is served on every gfx11/gfx12 arch.
+    #[test]
+    fn gfx1100_auto_is_q8_gfx1201_fp8_other_archs_f32() {
+        let config = crate::config::compact_test_config();
+        for arch in ["gfx1100"] {
+            for request in ["", "auto", " auto ", "q8"] {
+                assert_eq!(
+                    resolve_qsa_format_for_arch(request, arch, &config),
+                    Ok(QsaKvFormat::Q8),
+                    "{request:?} on {arch}"
+                );
+            }
+            for request in ["bf16", " bf16 "] {
+                assert_eq!(
+                    resolve_qsa_format_for_arch(request, arch, &config),
+                    Ok(QsaKvFormat::F32),
+                    "{request:?} on {arch}"
+                );
+            }
+            assert!(resolve_qsa_format_for_arch("fp8", arch, &config).is_err());
+        }
+        for request in ["", "auto"] {
+            assert_eq!(
+                resolve_qsa_format_for_arch(request, "gfx1201", &config),
+                Ok(QsaKvFormat::Fp8),
+                "{request:?} on gfx1201"
+            );
+        }
+        for arch in ["gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200"] {
+            for request in ["", "auto"] {
+                assert_eq!(
+                    resolve_qsa_format_for_arch(request, arch, &config),
+                    Ok(QsaKvFormat::F32),
+                    "{request:?} on {arch}"
+                );
+            }
+            assert_eq!(
+                resolve_qsa_format_for_arch("q8", arch, &config),
+                Ok(QsaKvFormat::Q8),
+                "q8 on {arch}"
+            );
+        }
+        for arch in ["gfx942", "gfx1030"] {
+            for request in ["", "auto"] {
+                assert_eq!(
+                    resolve_qsa_format_for_arch(request, arch, &config),
+                    Ok(QsaKvFormat::F32),
+                    "{request:?} on {arch}"
+                );
+            }
+        }
+        // A geometry q8 does not serve (head_dim != 256): auto falls back to
+        // the F32 state, an explicit q8 is refused, never rewritten, and the
+        // explicit bf16 state is unaffected.
+        let mut narrow = config.clone();
+        narrow.head_dim = 128;
+        for arch in ["gfx1100", "gfx1151"] {
+            for request in ["", "auto", "bf16"] {
+                assert_eq!(
+                    resolve_qsa_format_for_arch(request, arch, &narrow),
+                    Ok(QsaKvFormat::F32),
+                    "{request:?} on {arch} with head_dim 128"
+                );
+            }
+            let error = resolve_qsa_format_for_arch("q8", arch, &narrow).unwrap_err();
+            assert!(error.contains("q8 QSA K/V needs head_dim 256"), "{error}");
+        }
     }
 
     /// Flash-Next (H24 Hkv2 D256, one 128-wide index head, compress 4) charge
