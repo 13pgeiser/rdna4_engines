@@ -806,6 +806,10 @@ whose free VRAM cannot hold it refuses instead of shrinking it.
   reused. The disk tier and message-end snapshots are refused. A load with native
   MTP attaches no session cache (the output band logs
   `qwen4 session cache: off under topology.pp with native MTP`); AR loads keep theirs.
+  **Known limitation:** only the all-band stride snapshots (every 4,096 tokens) are
+  reusable under PP. The single-card resident tail/lineage snapshot is not shared
+  across bands, so a prompt shorter than 4,096 tokens is always prefilled cold and
+  a longer one reuses at most its last 4,096-token boundary.
 - **Greedy native MTP, explicit only**: `speculation.mtp = on` / `--spec mtp`.
   `auto` and `off` stay AR under PP. The output band drafts, samples and decides;
   every band runs the same verify block `[seed, drafts...]`, partial rejections
