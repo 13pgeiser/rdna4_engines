@@ -2,18 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1151 Flash-Next lane-step row kernels as one PeaceMaker module
-//! (`qwen4_lane_rows_pm`): four multi-column (1..=8 activation columns)
-//! GEMV exports whose every column keeps the arithmetic DAG of its 1-row HIP
-//! incumbent byte for byte while the activation loads are shared across
-//! several weight rows.
+//! gfx1151 Flash-Next exact decode GEMV twins in `qwen4_lane_rows_pm`.
 //!
-//! Exports, in frozen table order: `gemv_mq6g256v2_xbatch_pm` and
-//! `gemv_mq6g256v2_x4_xbatch_pm` (authored by [`super::qwen4_lane_rows_mq6`]),
-//! `gemv_q8_0_k8_xbatch_pm` and `gemv_q8_0_k320_xbatch_pm` (authored by
-//! [`super::qwen4_lane_rows_q8`]). [`emit_module`] combines both authors with
-//! [`super::iu4_gemm::module`] and refuses any other export list or any arch
-//! but exact gfx1151.
+//! The first four exports are the frozen 1..=8-row specializations. Wide
+//! capacities 16 and 32 follow them without changing their emitted text.
+//! Ordinary wide entries use eight wave32 output owners and an 8-row K256
+//! F32 activation tile (8192 B LDS); HC k8 uses two output owners with eight
+//! partitions each and a two-row partition tile (16384 B LDS). Runtime B
+//! masks inactive rows; invalid output waves still participate in barriers.
+//! Each row preserves its selected single-decode arithmetic DAG. See the
+//! family authors for the weight reconstruction, stream and fold contracts.
 use crate::{Arch, Emitted};
 use super::iu4_gemm::ModuleProof;
 use super::{qwen4_lane_rows_mq6, qwen4_lane_rows_q8};
@@ -22,21 +20,35 @@ use super::{qwen4_lane_rows_mq6, qwen4_lane_rows_q8};
 pub const MODULE: &str = "qwen4_lane_rows_pm";
 
 /// The frozen exports, in module order.
-pub const SYMBOLS: [&str; 4] = [
+pub const SYMBOLS: [&str; 18] = [
     "gemv_mq6g256v2_xbatch_pm",
     "gemv_mq6g256v2_x4_xbatch_pm",
     "gemv_q8_0_k8_xbatch_pm",
     "gemv_q8_0_k320_xbatch_pm",
+    "gemv_mq6g256v2_xbatch_wide_r16_pm",
+    "gemv_mq6g256v2_xbatch_wide_r32_pm",
+    "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
+    "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
+    "gemv_q8_0_k8_xbatch_wide_r16_pm",
+    "gemv_q8_0_k8_xbatch_wide_r32_pm",
+    "gemv_q8_0_k320_xbatch_wide_r16_pm",
+    "gemv_q8_0_k320_xbatch_wide_r32_pm",
+    "gemv_q8_0_k2560_xbatch_wide_r16_pm",
+    "gemv_q8_0_k2560_xbatch_wide_r32_pm",
+    "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
+    "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
+    "gemv_q8_0_wide_xbatch_wide_r16_pm",
+    "gemv_q8_0_wide_xbatch_wide_r32_pm",
 ];
 
 /// Kernarg block size in bytes of each export, in [`SYMBOLS`] order.
-pub const KERNARG_BYTES: [u32; 4] = [36, 96, 44, 32];
+pub const KERNARG_BYTES: [u32; 18] = [36, 96, 44, 32, 36, 36, 96, 96, 44, 44, 36, 36, 36, 36, 56, 56, 36, 36];
 
 /// Workgroup size (threads) of each export, in [`SYMBOLS`] order.
-pub const WORKGROUP_SIZE: [u32; 4] = [32, 32, 256, 64];
+pub const WORKGROUP_SIZE: [u32; 18] = [32, 32, 256, 64, 256, 256, 256, 256, 512, 512, 256, 256, 256, 256, 256, 256, 256, 256];
 
 /// `(offset, size)` of every kernarg of each export, in [`SYMBOLS`] order.
-pub const KERNARGS: [&[(u32, u32)]; 4] = [
+pub const KERNARGS: [&[(u32, u32)]; 18] = [
     &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4), (32, 4)],
     &[
         (0, 8), (8, 8), (16, 8), (24, 8), (32, 8), (40, 8), (48, 8), (56, 8), (64, 8),
@@ -44,7 +56,18 @@ pub const KERNARGS: [&[(u32, u32)]; 4] = [
     ],
     &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4), (32, 4), (36, 4), (40, 4)],
     &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4)],
+    SINGLE_ARGS, SINGLE_ARGS, X4_ARGS, X4_ARGS, HC_ARGS, HC_ARGS,
+    SINGLE_ARGS, SINGLE_ARGS, SINGLE_ARGS, SINGLE_ARGS, X2_ARGS, X2_ARGS,
+    SINGLE_ARGS, SINGLE_ARGS,
 ];
+
+const SINGLE_ARGS: &[(u32, u32)] = &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4), (32, 4)];
+const X4_ARGS: &[(u32, u32)] = &[
+    (0, 8), (8, 8), (16, 8), (24, 8), (32, 8), (40, 8), (48, 8), (56, 8), (64, 8),
+    (72, 4), (76, 4), (80, 4), (84, 4), (88, 4), (92, 4),
+];
+const HC_ARGS: &[(u32, u32)] = &[(0, 8), (8, 8), (16, 8), (24, 4), (28, 4), (32, 4), (36, 4), (40, 4)];
+const X2_ARGS: &[(u32, u32)] = &[(0, 8), (8, 8), (16, 8), (24, 8), (32, 8), (40, 4), (44, 4), (48, 4), (52, 4)];
 
 /// Committed image file name.
 pub fn bundle_name() -> String { format!("{MODULE}_{}.hxaco", Arch::Gfx1151.name()) }
@@ -59,6 +82,8 @@ fn exported(e: &Emitted) -> Option<&str> {
 pub fn emit_module() -> Result<(Vec<Emitted>, String, ModuleProof), String> {
     let mut emitted = qwen4_lane_rows_mq6::build_gfx1151().map_err(|e| format!("{MODULE}: mq6: {e}"))?;
     emitted.extend(qwen4_lane_rows_q8::build_gfx1151().map_err(|e| format!("{MODULE}: q8: {e}"))?);
+    emitted.extend(qwen4_lane_rows_mq6::build_wide_gfx1151().map_err(|e| format!("{MODULE}: mq6 wide: {e}"))?);
+    emitted.extend(qwen4_lane_rows_q8::build_wide_gfx1151().map_err(|e| format!("{MODULE}: q8 wide: {e}"))?);
     let got: Vec<&str> = emitted.iter().map(|e| exported(e).unwrap_or("")).collect();
     if got != SYMBOLS {
         return Err(format!("{MODULE}: builders export {got:?}, the frozen exports are {SYMBOLS:?}"));

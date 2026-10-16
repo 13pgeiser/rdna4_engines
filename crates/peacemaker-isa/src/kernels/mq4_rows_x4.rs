@@ -4,7 +4,10 @@
 
 //! Few-row (B = 1..8 activation rows) exact MQ4G256V2 GEMV over up to four
 //! matrices per launch, emitted with the checked ISA builder for gfx1151 and
-//! gfx1201: `gemv_mq4g256v2_rows_x4_pm_<arch>`, module `mq4_rows_x4_pm_<arch>`.
+//! gfx1201: `gemv_mq4g256v2_rows_x4_pm_<arch>`, module `mq4_rows_x4_pm_<arch>`,
+//! which also exports the row-exact wide twins
+//! `gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_<arch>` ([`wide`], 9..=32 verify rows;
+//! this entry is unchanged by them).
 //!
 //! ABI (96-byte kernarg segment): `A0@0 A1@8 A2@16 A3@24` (weights, read-only
 //! pointers), `x@32` (read-only), `y0@40 y1@48 y2@56 y3@64` (write-only),
@@ -68,6 +71,10 @@
 //! the weight loads retire with an explicit vmcnt (the builder's ledger does
 //! not order buffer against global loads on gfx11).
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
+
+/// The wide R=16/32 twins linked into the same module.
+#[path = "mq4_rows_x4_wide.rs"]
+pub mod wide;
 use crate::insn::{Instruction, MemoryClass};
 use crate::kernels::common::{add64, lit, op, s_add_i32, smem, sop, sr, SRD_WORD3};
 use crate::ledger::Counter;
@@ -186,9 +193,11 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// The entry as one code object (`Spec::module`).
+/// The module `mq4_rows_x4_pm_<arch>`: the narrow entry, then the wide
+/// twins `wide::Spec { cap: 16 | 32 }` (`mq4_rows_x4_wide.rs`).
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = vec![emit(Spec { arch })?];
+    let mut emitted = vec![emit(Spec { arch })?];
+    for cap in wide::CAPS { emitted.push(wide::emit(wide::Spec { arch, cap })?); }
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
     Ok((emitted, text, proof))
 }

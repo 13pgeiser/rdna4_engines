@@ -20,9 +20,9 @@ fn standalone_qsa_select_matches_rust_and_shipped_objects() {
     let tools = Toolchain { host_target: "host-x86_64-unknown-linux-gnu-".into(), ..Toolchain::oracle() };
     let arch = Arch::Gfx1151;
     for other in [Arch::Gfx1100, Arch::Gfx1201] {
-        assert!(peacemaker_rip::compile(SCORE, other, "score").is_err() && peacemaker_rip::compile(TOPK, other, "select").is_err());
+        assert!(["score", "score32"].into_iter().all(|v| peacemaker_rip::compile(SCORE, other, v).is_err()) && peacemaker_rip::compile(TOPK, other, "select").is_err());
     }
-    let rip = vec![peacemaker_rip::compile(SCORE, arch, "score").unwrap(), peacemaker_rip::compile(TOPK, arch, "select").unwrap()];
+    let rip = vec![peacemaker_rip::compile(SCORE, arch, "score").unwrap(), peacemaker_rip::compile(SCORE, arch, "score32").unwrap(), peacemaker_rip::compile(TOPK, arch, "select").unwrap()];
     let (rip_text, rip_proof) = iu4_gemm::module(&rip, &qsa_select::module(arch)).unwrap();
     let (rust, rust_text, rust_proof) = qsa_select::emit_module(arch).unwrap();
     assert_eq!(rip_text, rust_text, "assembly");
@@ -47,7 +47,12 @@ fn standalone_qsa_select_matches_rust_and_shipped_objects() {
     assert_eq!(fs::read(&b.hsaco).unwrap(), fs::read(&shipped).unwrap(), "shipped bundle");
     for kind in Kind::ALL {
         let _ = Spec { arch, kind };
-        let (symbol, tag) = match kind { Kind::Score => (qsa_score::symbol(arch), "score"), Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => (qsa_topk::symbol(arch), "select") };
+        let (symbol, tag) = match kind {
+            Kind::Score => (qsa_score::symbol(arch), "score"),
+            Kind::Score32 => (qsa_score::symbol32(arch), "score32"),
+            Kind::ScoreBf16 | Kind::ScoreBf16Rows32 => unreachable!("F32 module test"),
+            Kind::Select => (qsa_topk::symbol(arch), "select"),
+        };
         let report = pm_check::m7(&b.elf, arch.name(), &symbol).unwrap();
         assert_eq!(report["lift"], "byte-exact");
         assert_eq!(report["obligations"], serde_json::json!({}));

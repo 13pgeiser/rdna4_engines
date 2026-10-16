@@ -20,7 +20,28 @@
 //                                      bucket's slot count n_b; tail = n_b
 //   slot_ids [2 S + 2 (S+1) + b S + p] original slot ids, grouped by expert in
 //                                      ascending slot order, tail 0
-// Total 6 S + 2 words. Every word is written exactly once per invocation.
+// Total 6 S + 2 words. Every word is written exactly once per invocation, by
+// exactly one thread (single-owner map, with U_b = distinct experts and n_b =
+// slots of bucket b, t = thread = original slot, f = first-occurrence slot of
+// t's expert, e = s_eidx[f] the expert's index in its bucket):
+//   ids[b S + e], e < U_b          the first-occurrence thread of expert e
+//   ids[b S + t], t >= U_b         thread t (tail)
+//   offs[b (S+1) + e], e < U_b     the first-occurrence thread of expert e
+//                                  (the start of its run; the previous
+//                                  expert's end is NOT written separately)
+//   offs[b (S+1) + t], t >= U_b,
+//                      t < S       thread t (tail = n_b; offs[b (S+1) + U_b]
+//                                  = n_b is owned by tail thread U_b, or by
+//                                  thread 0 when U_b = S)
+//   offs[b (S+1) + S]              thread 0 (= n_b), for both buckets
+//   slots[b S + p], p < n_b        the thread whose (start + rank) is p
+//   slots[b S + t], t >= n_b       thread t (tail)
+//
+// Capacity: S = 10 * lanes <= SLAB_PLAN_MAX_SLOTS = 320 (32 lanes). One
+// thread per slot, so the launch is SLAB_PLAN_THREADS = 512 threads (one
+// workgroup, 5 * 320 * 4 = 6400 B LDS); threads t >= S are inactive but still
+// reach every barrier. S outside 1..=320 returns uniformly before any
+// barrier and writes nothing (the host refuses such a call before launch).
 
 #include <hip/hip_runtime.h>
 
@@ -28,9 +49,11 @@
 #error "qwen4_slab_union_plan.hip is gfx1201/gfx1151-only"
 #endif
 
-#define SLAB_PLAN_MAX_SLOTS 128
+#define SLAB_PLAN_MAX_SLOTS 320
+#define SLAB_PLAN_THREADS 512
+static_assert(SLAB_PLAN_MAX_SLOTS <= SLAB_PLAN_THREADS, "one thread per slot");
 
-extern "C" __global__ __launch_bounds__(128) void qwen4_slab_union_plan(
+extern "C" __global__ __launch_bounds__(SLAB_PLAN_THREADS) void qwen4_slab_union_plan(
     const int* __restrict__ topk, const unsigned char* __restrict__ codec,
     unsigned* __restrict__ out, int S, int uniform_bucket) {
     __shared__ int s_id[SLAB_PLAN_MAX_SLOTS];
@@ -38,6 +61,7 @@ extern "C" __global__ __launch_bounds__(128) void qwen4_slab_union_plan(
     __shared__ int s_first[SLAB_PLAN_MAX_SLOTS];
     __shared__ int s_total[SLAB_PLAN_MAX_SLOTS];
     __shared__ int s_eidx[SLAB_PLAN_MAX_SLOTS];
+    if (S < 1 || S > SLAB_PLAN_MAX_SLOTS) return;  // kernarg-uniform: no barrier divergence
     const int t = threadIdx.x;
     if (t < S) {
         int id = topk[t];
@@ -88,12 +112,12 @@ extern "C" __global__ __launch_bounds__(128) void qwen4_slab_union_plan(
         if (rank == 0) {
             ids[b * S + e] = (unsigned)s_id[t];
             offs[b * (S + 1) + e] = (unsigned)start;
-            offs[b * (S + 1) + e + 1] = (unsigned)(start + total);
         }
-        if (t >= ub0) { ids[t] = 0u; offs[t + 1] = (unsigned)nb0; }
-        if (t >= ub1) { ids[S + t] = 0u; offs[(S + 1) + t + 1] = (unsigned)nb1; }
+        if (t >= ub0) { ids[t] = 0u; offs[t] = (unsigned)nb0; }
+        if (t >= ub1) { ids[S + t] = 0u; offs[(S + 1) + t] = (unsigned)nb1; }
         if (t >= nb0) slots[t] = 0u;
         if (t >= nb1) slots[S + t] = 0u;
-        if (t == 0) { offs[0] = 0u; offs[S + 1] = 0u; }
     }
+    // Final offset of each bucket run (offs[S] = n_b); no other thread writes it.
+    if (t == 0) { offs[S] = (unsigned)nb0; offs[(S + 1) + S] = (unsigned)nb1; }
 }

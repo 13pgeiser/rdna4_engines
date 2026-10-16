@@ -2,10 +2,30 @@
 // Copyright (c) 2026 Kaden Schutt
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
 use crate::kernels;
+use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+
+/// Per-part output views of rows `first..first + n` (row stride `m`) of the
+/// four-part row launchers; an empty part (`m == 0`) views nothing.
+fn x4_group_ys(parts: &[(&GpuTensor, &GpuTensor, usize); 4], first: usize, n: usize) -> [GpuTensor; 4] {
+    std::array::from_fn(|i| parts[i].1.sub_offset(first * parts[i].2, n * parts[i].2))
+}
+
+/// `parts` with each output replaced by its group view from [`x4_group_ys`].
+fn x4_group_parts<'a>(
+    parts: &[(&'a GpuTensor, &GpuTensor, usize); 4],
+    ys: &'a [GpuTensor; 4],
+) -> [(&'a GpuTensor, &'a GpuTensor, usize); 4] {
+    std::array::from_fn(|i| (parts[i].0, &ys[i], parts[i].2))
+}
+
+/// Whether F32 `x` holds `[rows, k]` and every part's F32 output `[rows, m]`.
+fn x4_rows_fit(parts: &[(&GpuTensor, &GpuTensor, usize); 4], x: &GpuTensor, k: usize, rows: usize) -> bool {
+    x.buf.size() >= rows * k * 4 && parts.iter().all(|&(_, y, m)| y.buf.size() >= rows * m * 4)
+}
 
 /// Rows of an AWQ scale tensor that carries the gfx1201 A4 RMSNorm producer's
 /// reciprocal planes: `[a 0..K-1][R K..2K-1][Rlo 2K..3K-1]` under shape
@@ -77,6 +97,121 @@ static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 /// bytes, slower). Read once.
 static QWEN4_MQ4_ROWS_PM: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_ROWS_PM", true));
+
+/// S2 exact-wide verify twin kernel families (design §2/§5; `WideTwinGemvSol`).
+/// Each family has one developer switch, default OFF, read once:
+/// `HIPFIRE_QWEN4_WIDE_TWIN_{MQ4,MQ6,BF16,Q8,K1}` (`=1` on). `Bf16` covers the
+/// ordinary BF16 x4 rows and the BF16 HC k4 rows; `Q8` the three Q8 decode
+/// recipes, the K=2560 x2 pair and the HC k8 rows; `K1` the slab K1 `_c16/_c32`
+/// entries (bound by `slab_moe.rs`). A wide twin serves 9..=32 rows only on
+/// exact gfx1151 / gfx1201 and only inside [`Gpu::few_row_limit`]
+/// ([`Gpu::wide_twin_cap`]); every other case keeps the exact <=8-row group loops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideTwinFamily {
+    Mq4,
+    Mq6,
+    Bf16,
+    Q8,
+    K1,
+}
+
+impl WideTwinFamily {
+    pub const ALL: [WideTwinFamily; 5] = [
+        WideTwinFamily::Mq4,
+        WideTwinFamily::Mq6,
+        WideTwinFamily::Bf16,
+        WideTwinFamily::Q8,
+        WideTwinFamily::K1,
+    ];
+
+    /// The developer variable that turns this family's wide twins on.
+    pub const fn env_var(self) -> &'static str {
+        match self {
+            WideTwinFamily::Mq4 => "HIPFIRE_QWEN4_WIDE_TWIN_MQ4",
+            WideTwinFamily::Mq6 => "HIPFIRE_QWEN4_WIDE_TWIN_MQ6",
+            WideTwinFamily::Bf16 => "HIPFIRE_QWEN4_WIDE_TWIN_BF16",
+            WideTwinFamily::Q8 => "HIPFIRE_QWEN4_WIDE_TWIN_Q8",
+            WideTwinFamily::K1 => "HIPFIRE_QWEN4_WIDE_TWIN_K1",
+        }
+    }
+
+    /// Whether the family's switch is on (developer var, read once, default off).
+    pub fn enabled(self) -> bool {
+        static SWITCHES: LazyLock<[bool; 5]> = LazyLock::new(|| {
+            WideTwinFamily::ALL.map(|family| hipfire_config::developer_bool(family.env_var(), false))
+        });
+        SWITCHES[self as usize]
+    }
+}
+
+/// Output columns per workgroup of the ordinary wide twins (MQ4/MQ6/BF16/Q8).
+pub const WIDE_TWIN_M_BLOCK: usize = 8;
+/// Output columns per workgroup of the BF16 HC k4 / Q8 HC k8 wide twins.
+pub const WIDE_TWIN_HC_M_BLOCK: usize = 2;
+
+/// Compile-time row capacity (`RCAP`) of the wide twin serving `rows`: 16 for
+/// 9..=16, 32 for 17..=32, `None` otherwise (<= 8 keeps the narrow kernels).
+pub const fn wide_twin_rcap(rows: usize) -> Option<usize> {
+    match rows {
+        9..=16 => Some(16),
+        17..=32 => Some(32),
+        _ => None,
+    }
+}
+
+impl Gpu {
+    /// `RCAP` (16 or 32) of the `family` wide twin that serves `rows`, or
+    /// `None` when the exact <=8-row group loops must run: the family switch
+    /// is off, the arch is not exact gfx1151 / gfx1201, `rows` is <= 8 or above
+    /// 32, or `rows` exceeds the admitted [`Gpu::few_row_limit`] (verify
+    /// scope, eager only; recording and capture keep it at 8).
+    pub fn wide_twin_cap(&self, family: WideTwinFamily, rows: usize) -> Option<usize> {
+        if !family.enabled()
+            || !(self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201())
+            || rows > self.few_row_limit()
+        {
+            return None;
+        }
+        wide_twin_rcap(rows)
+    }
+}
+
+/// gfx1151 BF16 x4 wide PM module (`peacemaker-isa` `bf16_rows_wide`), PM primary
+/// whenever [`WideTwinFamily::Bf16`] admits the rows; the image is pinned by
+/// `kernels::QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256` and verified once (fails closed).
+pub(crate) const BF16_ROWS_WIDE_PM_MODULE: &str = "bf16_rows_wide_pm_gfx1151";
+pub(crate) const BF16_X4_ROWS_WIDE_PM: [&str; 2] = [
+    "gemv_bf16_xf32_x4_rows_wide_r16_pm_gfx1151",
+    "gemv_bf16_xf32_x4_rows_wide_r32_pm_gfx1151",
+];
+pub(crate) const BF16_K4_ROWS_WIDE_PM: [&str; 2] = [
+    "gemv_bf16_xf32_k4_rows_wide_r16_pm_gfx1151",
+    "gemv_bf16_xf32_k4_rows_wide_r32_pm_gfx1151",
+];
+/// Every export of the BF16 wide PM module, for route closure.
+pub(crate) const BF16_ROWS_WIDE_PM_SYMBOLS: [&str; 4] = [
+    BF16_X4_ROWS_WIDE_PM[0],
+    BF16_X4_ROWS_WIDE_PM[1],
+    BF16_K4_ROWS_WIDE_PM[0],
+    BF16_K4_ROWS_WIDE_PM[1],
+];
+static BF16_ROWS_WIDE_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let want = kernels::QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256;
+    if want.is_empty() {
+        return Err(format!(
+            "{BF16_ROWS_WIDE_PM_MODULE}: QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256 is not pinned"
+        ));
+    }
+    let got: String = Sha256::digest(kernels::BF16_ROWS_WIDE_PM_GFX1151)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got != want {
+        return Err(format!("{BF16_ROWS_WIDE_PM_MODULE}: embedded image sha256 {got} is not the pinned {want}"));
+    }
+    Ok(())
+});
 
 fn gfx942_rotate_live_validation_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE")
@@ -18544,8 +18679,11 @@ impl Gpu {
         self.launch_gemv_split("gemv_bf16_xf32_k4", 128, weight, x, y, m, k, hc_act_scale)
     }
 
-    /// [`Gpu::gemv_bf16_xf32_k4`] of `rows` activation rows (x row stride K,
-    /// y row stride M) in one launch; each row bitwise the single-row kernel's.
+    /// [`Gpu::gemv_bf16_xf32_k4`] of `rows` (1..=[`WIDE_VERIFY_MAX_ROWS`])
+    /// activation rows (x row stride K, y row stride M); each row bitwise the
+    /// single-row kernel's. Up to eight rows are one launch; more rows go to
+    /// [`Gpu::gemv_bf16_xf32_k4_rows_tiled`] (same kernel body per eight-row
+    /// tile, remainder one launch, a remainder of one row is the decode kernel).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_bf16_xf32_k4_rows(
         &mut self,
@@ -18569,11 +18707,35 @@ impl Gpu {
         if rows == 1 {
             return self.gemv_bf16_xf32_k4(weight, x, y, m, k, hc_act_scale);
         }
-        if !k.is_multiple_of(32) || !(2..=8).contains(&rows) {
+        if !k.is_multiple_of(32) || !(2..=WIDE_VERIFY_MAX_ROWS).contains(&rows) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemv_bf16_xf32_k4_rows needs K % 32 == 0 and 1..=8 rows",
+                "gemv_bf16_xf32_k4_rows needs K % 32 == 0 and 1..=32 rows",
             ));
+        }
+        if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Bf16, rows) {
+            if self.arch_caps.is_gfx1151() {
+                // gfx1151 PM primary (bf16_rows_wide_pm_gfx1151 HC k4 export); the HIP
+                // wide twin below serves gfx1201.
+                let func = BF16_K4_ROWS_WIDE_PM[usize::from(cap == 32)];
+                self.ensure_bf16_rows_wide_pm_entry(func)?;
+                return self.launch_hc_rows_wide(func, 256, false, weight, x, y, m, k, hc_act_scale, rows);
+            }
+            const WIDE: [&str; 2] = [
+                "gemv_bf16_xf32_k4_rows_wide_r16",
+                "gemv_bf16_xf32_k4_rows_wide_r32",
+            ];
+            let func = WIDE[usize::from(cap == 32)];
+            self.bind_thread()?;
+            self.ensure_kernel(
+                "qwen4_gemv_bf16_xf32",
+                kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                func,
+            )?;
+            return self.launch_hc_rows_wide(func, 256, false, weight, x, y, m, k, hc_act_scale, rows);
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            return self.gemv_bf16_xf32_k4_rows_tiled(weight, x, y, m, k, hc_act_scale, rows);
         }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
@@ -18727,8 +18889,11 @@ impl Gpu {
         self.launch_gemv_split("gemv_q8_0_k8", 256, weight, x, y, m, k, hc_act_scale)
     }
 
-    /// [`Gpu::gemv_q8_0_k8`] of `rows` activation rows (x row stride K, y row
-    /// stride M) in one launch; each row bitwise the single-row kernel's.
+    /// [`Gpu::gemv_q8_0_k8`] of `rows` (1..=[`WIDE_VERIFY_MAX_ROWS`]) activation
+    /// rows (x row stride K, y row stride M); each row bitwise the single-row
+    /// kernel's. Up to eight rows are one launch; more rows loop that launch
+    /// over groups of eight (remainder last; a remainder of one row is the
+    /// single-row kernel).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8_0_k8_rows(
         &mut self,
@@ -18752,11 +18917,37 @@ impl Gpu {
         if rows == 1 {
             return self.gemv_q8_0_k8(weight, x, y, m, k, hc_act_scale);
         }
-        if !k.is_multiple_of(256) || !(2..=8).contains(&rows) {
+        if !k.is_multiple_of(256) || !(2..=WIDE_VERIFY_MAX_ROWS).contains(&rows) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
+                "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=32 rows",
             ));
+        }
+        if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Q8, rows) {
+            let ix = usize::from(cap == 32);
+            // gfx1151: the PM export is primary (module qwen4_lane_rows_pm); HIP
+            // wide serves gfx1201 and shapes the PM export does not admit.
+            if self.arch_caps.is_gfx1151() && crate::lane_rows_pm::q8_k8_wide_admits(m, k, rows) {
+                let func = crate::lane_rows_pm::Q8_K8_WIDE[ix];
+                self.ensure_lane_rows_pm(func, func)?;
+                return self.launch_hc_rows_wide(func, 512, true, weight, x, y, m, k, hc_act_scale, rows);
+            }
+            const WIDE: [&str; 2] = [
+                "gemv_q8_0_k8_rows_wide_r16",
+                "gemv_q8_0_k8_rows_wide_r32",
+            ];
+            let func = WIDE[ix];
+            self.bind_thread()?;
+            self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
+            return self.launch_hc_rows_wide(func, 512, false, weight, x, y, m, k, hc_act_scale, rows);
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let yg = y.sub_offset(first * m, n * m);
+                self.gemv_q8_0_k8_rows(weight, &xg, &yg, m, k, hc_act_scale, n)?;
+            }
+            return Ok(());
         }
         if self.lane_rows_pm_enabled() && crate::lane_rows_pm::q8_k8_admits(m, k, rows) {
             return self.gemv_q8_0_k8_xbatch_pm(weight, x, y, m, k, hc_act_scale, rows);
@@ -18915,16 +19106,35 @@ impl Gpu {
     /// 8 candidates and their 8 exact scores, 4 bytes each.
     pub const TOPK8_OUT_BYTES: usize = 18 * 4;
 
-    /// Whether [`Gpu::gemv_q8_0_staged_rows`] covers this shape.
-    pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {
+    /// Whether the staged-rows kernels cover `k` (exact gfx1151 only).
+    fn gemv_q8_0_staged_k_supported(&self, k: usize) -> bool {
         self.arch_caps.is_gfx1151()
             && (k == 2560 || k == 320 || (k <= 1536 && k.is_multiple_of(32)))
-            && (1..=8).contains(&rows)
+    }
+
+    /// Whether the few-row route takes [`Gpu::gemv_q8_0_staged_rows`] for this
+    /// shape: `rows` within [`Gpu::few_row_limit`] (route rows, so closed
+    /// under the prefill invariant profile).
+    pub fn gemv_q8_0_staged_rows_supported(&self, k: usize, rows: usize) -> bool {
+        self.gemv_q8_0_staged_k_supported(k) && (1..=self.few_row_limit()).contains(&rows)
+    }
+
+    /// Whether the Q8 wide twins cover `k` at `rows`: [`Gpu::wide_twin_cap`]
+    /// admits the Q8 family and `k` is a staged shape. Unlike the <=8-row
+    /// staged kernels this includes exact gfx1201 (raw Q8 oracle against the
+    /// unstaged `gemv_q8_0`); production Q8 copies and
+    /// [`Gpu::gemv_q8_0_staged_rows_supported`] stay gfx1151-only.
+    fn gemv_q8_0_wide_k_supported(&self, k: usize, rows: usize) -> bool {
+        self.wide_twin_cap(WideTwinFamily::Q8, rows).is_some()
+            && (k == 2560 || k == 320 || (k <= 1536 && k.is_multiple_of(32)))
     }
 
     /// [`Gpu::gemv_q8_0`]'s gfx1151 kernels (staged K = 2560 / 320, wide K <= 1536) over
-    /// `rows` activation rows in one launch: each weight row is loaded once;
-    /// each output row is bitwise the single-row kernel's.
+    /// `rows` (1..=[`WIDE_VERIFY_MAX_ROWS`]) activation rows: each weight row is
+    /// loaded once per launch; each output row is bitwise the single-row
+    /// kernel's. Up to eight rows are one launch; more rows loop that launch
+    /// over groups of eight (remainder last; a one-row remainder is the same
+    /// one-row launch).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8_0_staged_rows(
         &mut self,
@@ -18935,8 +19145,71 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> HipResult<()> {
-        if !self.gemv_q8_0_staged_rows_supported(k, rows) {
+        if !(self.gemv_q8_0_staged_k_supported(k) || self.gemv_q8_0_wide_k_supported(k, rows))
+            || !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+        {
             return Err(hip_bridge::HipError::new(1, "gemv_q8_0_staged_rows shape"));
+        }
+        if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Q8, rows) {
+            if self.arch_caps.is_gfx1151() {
+                // PM primary: the export of the decode recipe selected by K.
+                let ix = usize::from(cap == 32);
+                let pm = if k == 2560 {
+                    crate::lane_rows_pm::q8_k2560_wide_admits(m, k, rows)
+                        .then_some(crate::lane_rows_pm::Q8_K2560_WIDE[ix])
+                } else if k == 320 {
+                    crate::lane_rows_pm::q8_k320_wide_admits(m, k, rows)
+                        .then_some(crate::lane_rows_pm::Q8_K320_WIDE[ix])
+                } else {
+                    crate::lane_rows_pm::q8_small_wide_admits(m, k, rows)
+                        .then_some(crate::lane_rows_pm::Q8_SMALL_WIDE[ix])
+                };
+                if let Some(func) = pm {
+                    self.ensure_lane_rows_pm(func, func)?;
+                    return self.launch_rows_wide_m8(func, a_raw, x, y, m, k, rows);
+                }
+            }
+            // The tag selects the decode arithmetic recipe, not just geometry:
+            // K=2560 / K=320 one chain; every other staged K the four-chain
+            // small-K kernel (`gemv_q8_0_wide_rows`'s recipe).
+            let ix = usize::from(cap == 32);
+            let (module, src, func) = match k {
+                2560 => (
+                    "qwen4_gemv_q8_0",
+                    kernels::QWEN4_GEMV_Q8_0_SRC,
+                    [
+                        "gemv_q8_0_k2560_staged_rows_wide_r16",
+                        "gemv_q8_0_k2560_staged_rows_wide_r32",
+                    ][ix],
+                ),
+                320 => (
+                    "qwen4_gemv_q8_0",
+                    kernels::QWEN4_GEMV_Q8_0_SRC,
+                    [
+                        "gemv_q8_0_k320_staged_rows_wide_r16",
+                        "gemv_q8_0_k320_staged_rows_wide_r32",
+                    ][ix],
+                ),
+                _ => (
+                    "qwen4_gemv_q8_0_wide",
+                    kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
+                    [
+                        "gemv_q8_0_wide_rows_wide_r16",
+                        "gemv_q8_0_wide_rows_wide_r32",
+                    ][ix],
+                ),
+            };
+            self.bind_thread()?;
+            self.ensure_kernel(module, src, func)?;
+            return self.launch_rows_wide_m8(func, a_raw, x, y, m, k, rows);
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let yg = y.sub_offset(first * m, n * m);
+                self.gemv_q8_0_staged_rows(a_raw, &xg, &yg, m, k, n)?;
+            }
+            return Ok(());
         }
         if (2..=8).contains(&rows)
             && self.lane_rows_pm_enabled()
@@ -19013,8 +19286,10 @@ impl Gpu {
     }
 
     /// [`Gpu::gemv_q8_0_staged_rows`] (K = 2560) of two matrices that read
-    /// the same `rows` activation rows, in one launch; each output row is
-    /// bitwise the single-matrix kernel's. Few-row verify, shared gate/up.
+    /// the same `rows` (1..=[`WIDE_VERIFY_MAX_ROWS`]) activation rows; each
+    /// output row is bitwise the single-matrix kernel's. Few-row verify,
+    /// shared gate/up. Up to eight rows are one launch; more rows loop that
+    /// launch over groups of eight (remainder last).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8_0_k2560_staged_rows_x2(
         &mut self,
@@ -19027,11 +19302,91 @@ impl Gpu {
         x: &GpuTensor,
         rows: usize,
     ) -> HipResult<()> {
-        if !self.gemv_q8_0_staged_rows_supported(2560, rows) {
+        if !(self.gemv_q8_0_staged_k_supported(2560) || self.gemv_q8_0_wide_k_supported(2560, rows))
+            || !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 "gemv_q8_0_k2560_staged_rows_x2 shape",
             ));
+        }
+        if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Q8, rows) {
+            let ix = usize::from(cap == 32);
+            // gfx1151 PM primary (qwen4_lane_rows_pm x2 export); HIP wide otherwise.
+            let pm = self.arch_caps.is_gfx1151()
+                && [m0, m1]
+                    .iter()
+                    .all(|&mm| crate::lane_rows_pm::q8_k2560_wide_admits(mm, 2560, rows));
+            let func = if pm {
+                let func = crate::lane_rows_pm::Q8_K2560_X2_WIDE[ix];
+                self.ensure_lane_rows_pm(func, func)?;
+                func
+            } else {
+                const WIDE: [&str; 2] = [
+                    "gemv_q8_0_k2560_staged_rows_x2_wide_r16",
+                    "gemv_q8_0_k2560_staged_rows_x2_wide_r32",
+                ];
+                let func = WIDE[ix];
+                self.bind_thread()?;
+                self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
+                func
+            };
+            let (a0_ptr, a1_ptr, x_ptr, y0_ptr, y1_ptr) = (
+                a0.buf.as_ptr(),
+                a1.buf.as_ptr(),
+                x.buf.as_ptr(),
+                y0.buf.as_ptr(),
+                y1.buf.as_ptr(),
+            );
+            let (m0_val, m1_val, k_val, rows_val) = (m0 as i32, m1 as i32, 2560i32, rows as i32);
+            let blocks = m0.div_ceil(WIDE_TWIN_M_BLOCK) + m1.div_ceil(WIDE_TWIN_M_BLOCK);
+            if blocks == 0 || blocks > u32::MAX as usize {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemv_q8_0_k2560_staged_rows_x2 wide twin needs a non-empty grid",
+                ));
+            }
+            // A0, A1, X, Y0, Y1 at 0/8/16/24/32; M0, M1, K, R at 40/44/48/52.
+            let mut params = [
+                &a0_ptr as *const _ as *mut c_void,
+                &a1_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y0_ptr as *const _ as *mut c_void,
+                &y1_ptr as *const _ as *mut c_void,
+                &m0_val as *const _ as *mut c_void,
+                &m1_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &rows_val as *const _ as *mut c_void,
+            ];
+            return self.launch_maybe_blob(
+                func,
+                [blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a0_ptr);
+                    b.push_ptr(a1_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y0_ptr);
+                    b.push_ptr(y1_ptr);
+                    b.push_i32(m0_val);
+                    b.push_i32(m1_val);
+                    b.push_i32(k_val);
+                    b.push_i32(rows_val);
+                    b
+                },
+            );
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * 2560, n * 2560);
+                let y0g = y0.sub_offset(first * m0, n * m0);
+                let y1g = y1.sub_offset(first * m1, n * m1);
+                self.gemv_q8_0_k2560_staged_rows_x2(a0, &y0g, m0, a1, &y1g, m1, &xg, n)?;
+            }
+            return Ok(());
         }
         self.bind_thread()?;
         const FUNC: &str = "gemv_q8_0_k2560_staged_rows_x2";
@@ -19386,6 +19741,214 @@ impl Gpu {
         }
     }
 
+    /// One launch of a wide x4 twin (`gemm_mq6g256v2_f32_rows_x4_wide_r*`,
+    /// `gemv_bf16_xf32_x4_rows_wide_r*`, `gemv_mq4g256v2_rows_x4_wide_r*_pm_*`):
+    /// argument order `A0..A3, X, Y0..Y3, M0..M3, K, R` (pointers at 0..24, 32,
+    /// 40..64; ints at 72..84, 88, 92 - the MQ4 PM 96-byte ABI), grid
+    /// `sum ceil(Mi / 8)`, block 256. The kernel must already be loaded.
+    fn launch_x4_rows_wide(
+        &mut self,
+        func: &str,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let a = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let r_val = rows as i32;
+        let blocks: usize = parts
+            .iter()
+            .map(|&(_, _, m)| m.div_ceil(WIDE_TWIN_M_BLOCK))
+            .sum();
+        if blocks == 0 || blocks > u32::MAX as usize {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "wide x4 twin needs at least one part with m > 0",
+            ));
+        }
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(14);
+        for p in &a {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        params.push(&r_val as *const _ as *mut c_void);
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b.push_i32(r_val);
+                b
+            },
+        )
+    }
+
+    /// One launch of a single-matrix wide twin `(A, X, Y, M, K, R)` (MQ6 rows,
+    /// Q8 K2560 / K320 / small-K), grid `ceil(M / 8)`, block 256. The kernel
+    /// must already be loaded.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_rows_wide_m8(
+        &mut self,
+        func: &str,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, r_val) = (m as i32, k as i32, rows as i32);
+        let blocks = m.div_ceil(WIDE_TWIN_M_BLOCK);
+        if blocks == 0 || blocks > u32::MAX as usize {
+            return Err(hip_bridge::HipError::new(1, "wide rows twin needs m > 0"));
+        }
+        let mut params: [*mut c_void; 6] = [
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &r_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(r_val);
+                b
+            },
+        )
+    }
+
+    /// Verify the pinned `bf16_rows_wide_pm_gfx1151` image and load `symbol` of its
+    /// module (x4 or HC k4 wide export; exact gfx1151 only). Public so the byte
+    /// oracles can launch the exports directly.
+    pub fn ensure_bf16_rows_wide_pm_entry(&mut self, symbol: &str) -> HipResult<()> {
+        if !self.arch_caps.is_gfx1151() {
+            return Err(hip_bridge::HipError::new(1, "the BF16 wide PM kernels are exact gfx1151 only"));
+        }
+        BF16_ROWS_WIDE_PM_VERIFIED.clone().map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(BF16_ROWS_WIDE_PM_MODULE, kernels::BF16_ROWS_WIDE_PM_GFX1151, symbol)
+    }
+
+    /// One launch of an HC wide twin `(W, X, Y, M, K, scale, hc_act, R)`
+    /// (BF16 k4 with `block = 256`, Q8 k8 with `block = 512`), grid
+    /// `ceil(M / 2)`. `hc_act_scale == None` is `hc_act = 0` (scale 1.0).
+    /// `batch_before_scale` selects the lane-rows PM kernarg order.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hc_rows_wide(
+        &mut self,
+        func: &str,
+        block: u32,
+        batch_before_scale: bool,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, r_val) = (m as i32, k as i32, rows as i32);
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let blocks = m.div_ceil(WIDE_TWIN_HC_M_BLOCK);
+        if blocks == 0 || blocks > u32::MAX as usize {
+            return Err(hip_bridge::HipError::new(1, "wide HC twin needs m > 0"));
+        }
+        // HIP wide ABI: M@24 K@28 scale@32 hc_act@36 R@40; the lane-rows PM
+        // export orders the column count first: M@24 K@28 B@32 scale@36 hc_act@40.
+        let mut params: [*mut c_void; 8] = if batch_before_scale {
+            [
+                &w_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &r_val as *const _ as *mut c_void,
+                &scale as *const _ as *mut c_void,
+                &hc_act as *const _ as *mut c_void,
+            ]
+        } else {
+            [
+                &w_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &scale as *const _ as *mut c_void,
+                &hc_act as *const _ as *mut c_void,
+                &r_val as *const _ as *mut c_void,
+            ]
+        };
+        self.launch_maybe_blob(
+            func,
+            [blocks as u32, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                if batch_before_scale {
+                    b.push_i32(r_val);
+                    b.push_f32(scale);
+                    b.push_i32(hc_act);
+                } else {
+                    b.push_f32(scale);
+                    b.push_i32(hc_act);
+                    b.push_i32(r_val);
+                }
+                b
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch_gemv_split(
         &mut self,
@@ -19604,8 +20167,11 @@ impl Gpu {
         )
     }
     /// [`Gpu::gemm_mq6g256v2_f32_rows`] of up to four MQ6G256V2 matrices
-    /// reading the same rotated `[rows, k]` x in one launch (blocks routed as
-    /// [`Gpu::gemv_mq6g256v2_x4`]); each output bitwise the one-matrix call.
+    /// reading the same rotated `[rows, k]` x (2..=[`WIDE_VERIFY_MAX_ROWS`]
+    /// rows) in one launch (blocks routed as [`Gpu::gemv_mq6g256v2_x4`]); each
+    /// output bitwise the one-matrix call. Up to eight rows are one launch;
+    /// more rows loop that launch over groups of eight (remainder last; a
+    /// one-row remainder is [`Gpu::gemv_mq6g256v2_x4`], the AR decode launch).
     pub fn gemm_mq6g256v2_f32_rows_x4(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -19622,11 +20188,52 @@ impl Gpu {
             "gemm_mq6g256v2_f32_rows_x4_r7",
             "gemm_mq6g256v2_f32_rows_x4_r8",
         ];
-        if !(2..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) {
+        if !(2..=WIDE_VERIFY_MAX_ROWS).contains(&rows) || k == 0 || !k.is_multiple_of(256) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0",
+                "MQ6 F32 rows x4 needs 2..=32 rows, K % 256 == 0",
             ));
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            if !x4_rows_fit(&parts, x, k, rows) {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "MQ6 F32 rows x4 x / y views too small for the rows",
+                ));
+            }
+            if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Mq6, rows) {
+                if self.arch_caps.is_gfx1151()
+                    && crate::lane_rows_pm::mq6_x4_wide_admits(parts.map(|(_, _, m)| m), k, rows)
+                {
+                    // gfx1151 PM primary (qwen4_lane_rows_pm); HIP wide below.
+                    let func = crate::lane_rows_pm::MQ6_X4_WIDE[usize::from(cap == 32)];
+                    self.ensure_lane_rows_pm(func, func)?;
+                    return self.launch_x4_rows_wide(func, parts, x, k, rows);
+                }
+                const WIDE: [&str; 2] = [
+                    "gemm_mq6g256v2_f32_rows_x4_wide_r16",
+                    "gemm_mq6g256v2_f32_rows_x4_wide_r32",
+                ];
+                let func = WIDE[usize::from(cap == 32)];
+                self.bind_thread()?;
+                self.ensure_kernel(
+                    "gemm_mq6g256v2_f32_rows",
+                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                    func,
+                )?;
+                return self.launch_x4_rows_wide(func, parts, x, k, rows);
+            }
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let ys = x4_group_ys(&parts, first, n);
+                let pg = x4_group_parts(&parts, &ys);
+                if n == 1 {
+                    self.gemv_mq6g256v2_x4(pg, &xg, k)?;
+                } else {
+                    self.gemm_mq6g256v2_f32_rows_x4(pg, &xg, k, n)?;
+                }
+            }
+            return Ok(());
         }
         if self.lane_rows_pm_enabled()
             && crate::lane_rows_pm::mq6_x4_admits(parts.map(|(_, _, m)| m), k, rows)
@@ -19682,7 +20289,7 @@ impl Gpu {
         )
     }
 
-    /// MQ4G256V2 few-row (2..=8 activation rows, MTP verify) projections of up
+    /// MQ4G256V2 few-row (1..=32 activation rows, MTP verify) projections of up
     /// to four matrices that read the same rotated `[rows, k]` F32 `x`, in one
     /// launch. `parts` are `(weights, y, m)`; unused slots carry `m == 0` (any
     /// tensors) and `y` is `[rows, m]` per part. Each output element is bitwise
@@ -19693,7 +20300,9 @@ impl Gpu {
     /// `[sum(ceil(m_i / 2)), 1, 1]`, block 32, one weight-row pair per
     /// workgroup, each group dequantized once for all rows) unless
     /// `HIPFIRE_QWEN4_MQ4_ROWS_PM=0`; otherwise (and on other arches) it is
-    /// the per-part per-row `gemv_mq4g256v2` loop, exact by definition.
+    /// the per-part per-row `gemv_mq4g256v2` loop, exact by definition. More
+    /// than eight rows loop the launch over groups of eight (remainder last; a
+    /// one-row remainder is this launch at `rows == 1`).
     pub fn gemv_mq4g256v2_rows_x4(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -19703,8 +20312,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
-        if !(1..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) || k > i32::MAX as usize {
-            return bad("MQ4 rows x4 needs 1..=8 rows, K > 0, K % 256 == 0");
+        if !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows) || k == 0 || !k.is_multiple_of(256) || k > i32::MAX as usize {
+            return bad("MQ4 rows x4 needs 1..=32 rows, K > 0, K % 256 == 0");
         }
         let fits = |n: Option<usize>| n.is_some_and(|n| n <= u32::MAX as usize);
         let x_bytes = rows.checked_mul(k).and_then(|n| n.checked_mul(4));
@@ -19731,6 +20340,54 @@ impl Gpu {
         }
         if blocks == 0 {
             return bad("MQ4 rows x4 needs at least one part with m > 0");
+        }
+        if let Some((module, image, symbol)) = self
+            .wide_twin_cap(WideTwinFamily::Mq4, rows)
+            // One switch per family: the legacy <=8-row `HIPFIRE_QWEN4_MQ4_ROWS_PM` does not gate it.
+            .and_then(|cap| match (self.arch.as_str(), cap) {
+                ("gfx1151", 16) => Some((
+                    "mq4_rows_x4_pm_gfx1151",
+                    kernels::MQ4_ROWS_X4_PM_GFX1151,
+                    "gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1151",
+                )),
+                ("gfx1151", 32) => Some((
+                    "mq4_rows_x4_pm_gfx1151",
+                    kernels::MQ4_ROWS_X4_PM_GFX1151,
+                    "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1151",
+                )),
+                ("gfx1201", 16) => Some((
+                    "mq4_rows_x4_pm_gfx1201",
+                    kernels::MQ4_ROWS_X4_PM_GFX1201,
+                    "gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1201",
+                )),
+                ("gfx1201", 32) => Some((
+                    "mq4_rows_x4_pm_gfx1201",
+                    kernels::MQ4_ROWS_X4_PM_GFX1201,
+                    "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1201",
+                )),
+                _ => None,
+            })
+        {
+            self.ensure_embedded_kernel(module, image, symbol)?;
+            let bytes = parts.iter().fold(x_bytes.unwrap_or(0), |acc, &(_, _, m)| {
+                acc.saturating_add(m.saturating_mul(k / 256).saturating_mul(136))
+                    .saturating_add(rows.saturating_mul(m).saturating_mul(4))
+            });
+            let timer = crate::profile::begin_timer(&self.hip, "gemv", symbol, bytes);
+            let result = self.launch_x4_rows_wide(symbol, parts, x, k, rows);
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let ys = x4_group_ys(&parts, first, n);
+                let pg = x4_group_parts(&parts, &ys);
+                self.gemv_mq4g256v2_rows_x4(pg, &xg, k, n)?;
+            }
+            return Ok(());
         }
         let pm = if !*QWEN4_MQ4_ROWS_PM {
             None
@@ -19816,9 +20473,12 @@ impl Gpu {
         result
     }
 
-    /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
-    /// `[rows, k]`, each output `[rows, m]`; every weight row is read once
-    /// and each output element is bitwise the one-row kernel's.
+    /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=[`WIDE_VERIFY_MAX_ROWS`])
+    /// activation rows: x is `[rows, k]`, each output `[rows, m]`; every weight
+    /// row is read once per launch and each output element is bitwise the
+    /// one-row kernel's. Up to eight rows are one launch; more rows loop that
+    /// launch over groups of eight (remainder last; a one-row remainder is
+    /// [`Gpu::gemv_bf16_xf32_x4`]).
     pub fn gemv_bf16_xf32_x4_rows(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -19835,11 +20495,68 @@ impl Gpu {
             "gemv_bf16_xf32_x4_rows_r7",
             "gemv_bf16_xf32_x4_rows_r8",
         ];
-        if !(2..=8).contains(&rows) {
+        if !(2..=WIDE_VERIFY_MAX_ROWS).contains(&rows) {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemv_bf16_xf32_x4_rows needs 2..=8 rows",
+                "gemv_bf16_xf32_x4_rows needs 2..=32 rows",
             ));
+        }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            if !x4_rows_fit(&parts, x, k, rows) {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemv_bf16_xf32_x4_rows x / y views too small for the rows",
+                ));
+            }
+            if let Some(cap) = self
+                .wide_twin_cap(WideTwinFamily::Bf16, rows)
+                .filter(|_| self.arch_caps.is_gfx1151())
+                .filter(|_| {
+                    // 32-bit byte offsets of the PM kernels.
+                    let fits = |bytes: Option<usize>| bytes.is_some_and(|b| b <= u32::MAX as usize);
+                    fits(rows.checked_mul(k).and_then(|n| n.checked_mul(4)))
+                        && parts.iter().all(|&(_, _, m)| {
+                            fits(m.checked_mul(k).and_then(|n| n.checked_mul(2)))
+                                && fits(rows.checked_mul(m).and_then(|n| n.checked_mul(4)))
+                        })
+                })
+            {
+                // gfx1151 PM primary, K % 8 == 0 and the scalar domain alike;
+                // HIP wide (K % 8 == 0 only) serves gfx1201 below.
+                let func = BF16_X4_ROWS_WIDE_PM[usize::from(cap == 32)];
+                self.ensure_bf16_rows_wide_pm_entry(func)?;
+                return self.launch_x4_rows_wide(func, parts, x, k, rows);
+            }
+            if let Some(cap) = self
+                .wide_twin_cap(WideTwinFamily::Bf16, rows)
+                .filter(|_| k.is_multiple_of(8))
+            {
+                // K % 8 != 0 is the incumbent's all-scalar domain: it keeps
+                // the exact <=8-row group loop below.
+                const WIDE: [&str; 2] = [
+                    "gemv_bf16_xf32_x4_rows_wide_r16",
+                    "gemv_bf16_xf32_x4_rows_wide_r32",
+                ];
+                let func = WIDE[usize::from(cap == 32)];
+                self.bind_thread()?;
+                self.ensure_kernel(
+                    "qwen4_gemv_bf16_xf32",
+                    kernels::QWEN4_GEMV_BF16_XF32_SRC,
+                    func,
+                )?;
+                return self.launch_x4_rows_wide(func, parts, x, k, rows);
+            }
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let ys = x4_group_ys(&parts, first, n);
+                let pg = x4_group_parts(&parts, &ys);
+                if n == 1 {
+                    self.gemv_bf16_xf32_x4(pg, &xg, k)?;
+                } else {
+                    self.gemv_bf16_xf32_x4_rows(pg, &xg, k, n)?;
+                }
+            }
+            return Ok(());
         }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
@@ -21653,10 +22370,13 @@ impl Gpu {
         )
     }
 
-    /// Shared-weight F32 MQ6G256V2 for 2–4 pre-rotated activation rows.
-    /// `x` is contiguous [rows, k]; `y` is contiguous [rows, m].
-    /// Each warp owns one weight row and computes every activation row in
-    /// the scalar GEMV's four-accumulator and shuffle reduction order.
+    /// Shared-weight F32 MQ6G256V2 for 2..=[`WIDE_VERIFY_MAX_ROWS`] pre-rotated
+    /// activation rows. `x` is contiguous [rows, k]; `y` is contiguous
+    /// [rows, m]. Each warp owns one weight row and computes every activation
+    /// row in the scalar GEMV's four-accumulator and shuffle reduction order.
+    /// Up to eight rows are one launch; more rows loop that launch over groups
+    /// of eight (remainder last; a one-row remainder is [`Gpu::gemv_mq6g256v2`],
+    /// the AR decode launch).
     pub fn gemm_mq6g256v2_f32_rows(
         &mut self,
         a_raw: &GpuTensor,
@@ -21666,16 +22386,18 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> HipResult<()> {
-        let name = match rows {
-            2 => "gemm_mq6g256v2_f32_rows_r2",
-            3 => "gemm_mq6g256v2_f32_rows_r3",
-            4 => "gemm_mq6g256v2_f32_rows_r4",
-            5 => "gemm_mq6g256v2_f32_rows_r5",
-            6 => "gemm_mq6g256v2_f32_rows_r6",
-            7 => "gemm_mq6g256v2_f32_rows_r7",
-            8 => "gemm_mq6g256v2_f32_rows_r8",
-            _ => return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=8")),
-        };
+        const NAMES: [&str; 7] = [
+            "gemm_mq6g256v2_f32_rows_r2",
+            "gemm_mq6g256v2_f32_rows_r3",
+            "gemm_mq6g256v2_f32_rows_r4",
+            "gemm_mq6g256v2_f32_rows_r5",
+            "gemm_mq6g256v2_f32_rows_r6",
+            "gemm_mq6g256v2_f32_rows_r7",
+            "gemm_mq6g256v2_f32_rows_r8",
+        ];
+        if !(2..=WIDE_VERIFY_MAX_ROWS).contains(&rows) {
+            return Err(hip_bridge::HipError::new(1, "MQ6 F32 rows must be 2..=32"));
+        }
         if m == 0 || k == 0 || k % 256 != 0 || m > i32::MAX as usize || k > i32::MAX as usize {
             return Err(hip_bridge::HipError::new(
                 1,
@@ -21697,6 +22419,39 @@ impl Gpu {
                 "MQ6 F32 rows tensor view too small",
             ));
         }
+        if rows > FEW_ROW_ROUTE_ROWS {
+            if let Some(cap) = self.wide_twin_cap(WideTwinFamily::Mq6, rows) {
+                if self.arch_caps.is_gfx1151() && crate::lane_rows_pm::mq6_wide_admits(m, k, rows) {
+                    // gfx1151 PM primary (qwen4_lane_rows_pm); HIP wide below.
+                    let func = crate::lane_rows_pm::MQ6_WIDE[usize::from(cap == 32)];
+                    self.ensure_lane_rows_pm(func, func)?;
+                    return self.launch_rows_wide_m8(func, a_raw, x, y, m, k, rows);
+                }
+                const WIDE: [&str; 2] = [
+                    "gemm_mq6g256v2_f32_rows_wide_r16",
+                    "gemm_mq6g256v2_f32_rows_wide_r32",
+                ];
+                let func = WIDE[usize::from(cap == 32)];
+                self.bind_thread()?;
+                self.ensure_kernel(
+                    "gemm_mq6g256v2_f32_rows",
+                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                    func,
+                )?;
+                return self.launch_rows_wide_m8(func, a_raw, x, y, m, k, rows);
+            }
+            for (first, n) in few_row_groups(rows) {
+                let xg = x.sub_offset(first * k, n * k);
+                let yg = y.sub_offset(first * m, n * m);
+                if n == 1 {
+                    self.gemv_mq6g256v2(a_raw, &xg, &yg, m, k)?;
+                } else {
+                    self.gemm_mq6g256v2_f32_rows(a_raw, &xg, &yg, m, k, n)?;
+                }
+            }
+            return Ok(());
+        }
+        let name = NAMES[rows - 2];
         if self.lane_rows_pm_enabled() && crate::lane_rows_pm::mq6_admits(m, k, rows) {
             return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
         }

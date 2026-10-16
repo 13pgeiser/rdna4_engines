@@ -4354,7 +4354,15 @@ fn decode_down_stage(
             // Over the union this call's gate/up planned (same stream, no
             // other slab launch between the two stages).
             let buckets = slab_route::buckets(&p.dtypes, p.expert_dtype_tags)?;
-            slab_route::k1_down(gpu, buckets, p.expert_down_ptrs, &rot_batch, &down_expanded, 1)?;
+            slab_route::k1_down(
+                gpu,
+                buckets,
+                p.topk_indices,
+                p.expert_down_ptrs,
+                &rot_batch,
+                &down_expanded,
+                1,
+            )?;
             // The top-10 combine rounds every expert output it reads to BF16; a
             // deferred combine may read the buffer elsewhere, so it keeps the pass.
             if p.recipe.bf16_round_trip() && p.defer_routed_combine {

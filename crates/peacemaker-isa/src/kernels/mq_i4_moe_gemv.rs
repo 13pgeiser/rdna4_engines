@@ -77,11 +77,17 @@
 //! GPU but slower than the reference, so the optimization was rejected by timing and is kept only for
 //! comparison; no speed claim is made for either network. The network is an emitter choice, not a
 //! symbol axis or ABI field; `Mq4Sym` and every arithmetic step are unchanged.
+//!
+//! Wide twins (`_c16`, `_c32`, [`Cap`]; [`wide`]): the same four symbols with the suffix `_c16` / `_c32`, row-exact wide
+//! verify for up to 16 / 32 token lanes (`n <= 16 | 32` slots per expert, `U` distinct experts up to `10*C`). Same 88-byte ABI
+//! and the same arithmetic; grid `[ceil(M/8), U, 1]`, block 256 (one wave per matrix-local output row, eight rows per
+//! workgroup, every slot of the expert per wave), the slots' X staged through LDS eight at a time. The C8 entries above are
+//! unchanged byte for byte.
 
 use crate::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan};
 use crate::insn::{Instruction, MemoryClass};
 use crate::arch::{WgIdSource, WgIds};
-use crate::kernels::common::{add64, bload, gather_offset, lit, op, s, s_add_i32, smem, sop, sr, srd_tail, v, GatherTemps};
+use crate::kernels::common::{add64, bload, gather_offset, lit, op, s, s_add_i32, smem, sop, sr, srd_tail, v, vr, GatherTemps};
 use crate::plan::Access;
 use crate::reg::{Kind as RKind, Live, RegRef};
 
@@ -95,6 +101,8 @@ pub const WORKGROUP_SIZE: u32 = 32;
 pub const MAX_SLOTS: u32 = 8;
 /// Planar scale / activation group width in columns.
 pub const GROUP: u32 = 128;
+
+pub mod wide;
 
 /// Weight codec of the tensor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -124,14 +132,28 @@ impl Kind {
     pub fn chains(self) -> u8 { match self { Self::GateUp => 4, Self::Down => 1 } }
 }
 
-/// One entry: `(arch, codec, kind)`; gfx1151 or gfx1201.
+/// Token-lane capacity of an entry: `C8` is the narrow entry (one wave32 per workgroup, at most eight slots per expert),
+/// `C16` / `C32` the wide twins ([`wide`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Cap { C8, C16, C32 }
+impl Cap {
+    pub const ALL: [Cap; 3] = [Cap::C8, Cap::C16, Cap::C32];
+    /// Most distinct original slots one expert workgroup serves.
+    pub fn slots(self) -> u32 { match self { Self::C8 => MAX_SLOTS, Self::C16 => 16, Self::C32 => 32 } }
+    /// Symbol / tag suffix (empty for the narrow entry).
+    pub fn suffix(self) -> &'static str { match self { Self::C8 => "", Self::C16 => "_c16", Self::C32 => "_c32" } }
+}
+
+/// One entry: `(arch, codec, kind, cap)`; gfx1151 or gfx1201.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Spec { pub arch: Arch, pub codec: Codec, pub kind: Kind }
+pub struct Spec { pub arch: Arch, pub codec: Codec, pub kind: Kind, pub cap: Cap }
 impl Spec {
-    /// The exported symbol, `mq_i4_moe_gemv_<codec>_<kind>`.
+    /// The narrow (C8) entry.
+    pub fn narrow(arch: Arch, codec: Codec, kind: Kind) -> Self { Self { arch, codec, kind, cap: Cap::C8 } }
+    /// The exported symbol, `mq_i4_moe_gemv_<codec>_<kind>` plus `_c16` / `_c32` for a wide twin.
     pub fn symbol(&self) -> String { format!("mq_i4_moe_gemv_{}", self.tag()) }
-    /// `<codec>_<kind>`: the `--epi` name, the label prefix and the contract file tag.
-    pub fn tag(&self) -> String { format!("{}_{}", self.codec.tag(), self.kind.tag()) }
+    /// `<codec>_<kind>[_c16|_c32]`: the `--epi` name, the label prefix and the contract file tag.
+    pub fn tag(&self) -> String { format!("{}_{}{}", self.codec.tag(), self.kind.tag(), self.cap.suffix()) }
     pub fn module(arch: Arch) -> String { format!("mq_i4_moe_gemv_pm_{}", arch.name()) }
     pub fn validate(&self) -> R {
         if !matches!(self.arch, Arch::Gfx1151 | Arch::Gfx1201) { return Err("mq_i4_moe_gemv builder is exact-gfx1151 / gfx1201 only".into()) }
@@ -141,12 +163,20 @@ impl Spec {
     pub fn lane_elems(&self) -> u8 { if self.codec == Codec::Mq4Sym && self.kind == Kind::GateUp { 8 } else { 4 } }
     /// Group instances in the emitted body: gate four loop groups plus three tail groups, down one.
     pub fn group_instances(&self) -> u32 { match self.kind { Kind::GateUp => 7, Kind::Down => 1 } }
+    /// Threads per workgroup: one wave32 (narrow) or eight (wide).
+    pub fn workgroup_size(&self) -> u32 { if self.cap == Cap::C8 { WORKGROUP_SIZE } else { wide::WORKGROUP_SIZE } }
+    /// Static LDS bytes: none (narrow) or the X tile of eight slots (`nw` f32 per lane per slot).
+    pub fn lds_bytes(&self) -> u32 { if self.cap == Cap::C8 { 0 } else { wide::SLOT_TILE * 32 * 4 * u32::from(self.lane_elems()) } }
 }
 
-/// Every entry of one architecture in module order: Mq3I4 gate, Mq3I4 down, Mq4Sym gate, Mq4Sym down.
+/// Every entry of one architecture in module order: the C8 entries (Mq3I4 gate, Mq3I4 down, Mq4Sym gate, Mq4Sym down),
+/// then the same four at C16, then at C32.
 pub fn module_specs(arch: Arch) -> Vec<Spec> {
-    Codec::ALL.into_iter().flat_map(|codec| Kind::ALL.into_iter().map(move |kind| Spec { arch, codec, kind })).collect()
+    Cap::ALL.into_iter().flat_map(|cap| Codec::ALL.into_iter().flat_map(move |codec| Kind::ALL.into_iter().map(move |kind| Spec { arch, codec, kind, cap }))).collect()
 }
+
+/// The four narrow (C8) entries of one architecture.
+pub fn narrow_specs(arch: Arch) -> Vec<Spec> { module_specs(arch).into_iter().filter(|s| s.cap == Cap::C8).collect() }
 
 // ----------------------------------------------------------------------- SGPRs
 // s0:1 kernarg pointer; s2, s3 workgroup ids on gfx11 (the first system SGPRs after the two user SGPRs; gfx12:
@@ -265,6 +295,7 @@ pub enum Network {
 
 fn emit_with_network(spec: Spec, net: Network) -> Result<Emitted, String> {
     spec.validate()?;
+    if spec.cap != Cap::C8 { return wide::emit(spec, net) }
     let l = Lay::new(spec);
     let kernargs = KernargLayout::new(KERNARG_BYTES)
         .pointer_access("expert_weight_ptrs", 0, Access::ReadOnly).pointer_access("expert_ids", 8, Access::ReadOnly)
@@ -316,7 +347,7 @@ fn emit_with_network(spec: Spec, net: Network) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// The four entries as one code object (`Spec::module`).
+/// All twelve entries as one code object (`Spec::module`): the four C8 entries, then the C16 and C32 twins.
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
     let emitted = module_specs(arch).into_iter().map(emit).collect::<Result<Vec<_>, _>>()?;
     let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
@@ -627,10 +658,12 @@ fn epilogue(b: &mut Builder, spec: Spec, l: &Lay) -> R {
 }
 
 /// The shape contract of one emitted entry: counts of its characteristic
-/// instructions, the forbidden families, honest register ceilings of the C8 slot
-/// state (accumulators, X registers and per-slot offsets/addresses are inside
+/// instructions, the forbidden families, honest register ceilings (accumulators, X registers and, for the
+/// narrow entries, per-slot offsets/addresses are inside
 /// `vgpr_max`; the scalar bookkeeping is `sgpr_max`), wave32, no spills, no private
-/// or LDS memory. Committed as `kernels/mq_i4_moe_gemv.<arch>.<tag>.contract.json`. The forbidden wait
+/// memory. The narrow entries use no LDS and no barrier; the wide twins declare their static X tile
+/// (`group_segment_fixed_bytes`) and may use LDS and barriers (`ds_swizzle`, `flat_*` stay forbidden).
+/// Committed as `kernels/mq_i4_moe_gemv.<arch>.<tag>.contract.json`. The forbidden wait
 /// family is the other architecture's: `s_waitcnt*` on gfx12, the gfx12 counter waits on gfx11.
 pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
     let mut counts = serde_json::Map::new();
@@ -638,8 +671,13 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         let n = e.s_text.lines().filter(|l| l.split_whitespace().next() == Some(name)).count();
         if n > 0 { counts.insert(name.into(), n.into()); }
     }
-    let mut forbidden = vec!["scratch_*", "flat_*", "ds_load*", "ds_store*", "ds_swizzle*", "ds_read*", "ds_write*", "s_barrier*",
-                             "v_writelane*", "v_wmma*", "v_swmmac*", "v_fma_mix*"];
+    // Narrow entries: the committed list, in its committed order; the wide twins use LDS and barriers.
+    let narrow = spec.cap == Cap::C8;
+    let mut forbidden = vec!["scratch_*", "flat_*"];
+    if narrow { forbidden.extend(["ds_load*", "ds_store*"]) }
+    forbidden.push("ds_swizzle*");
+    if narrow { forbidden.extend(["ds_read*", "ds_write*", "s_barrier*"]) }
+    forbidden.extend(["v_writelane*", "v_wmma*", "v_swmmac*", "v_fma_mix*"]);
     if spec.arch.gfx12() { forbidden.push("s_waitcnt*") } else { forbidden.extend(["s_wait_loadcnt*", "s_wait_storecnt*", "s_wait_dscnt*", "s_wait_kmcnt*", "s_wait_alu*"]) }
     forbidden.extend(["s_setpc*", "s_swappc*"]);
     serde_json::json!({
@@ -647,14 +685,15 @@ pub fn contract(spec: Spec, e: &Emitted) -> serde_json::Value {
         "forbidden": forbidden,
         "vgpr_max": e.shape.next_free_vgpr, "sgpr_max": e.shape.next_free_sgpr,
         "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
-        "launch_dynamic_lds_bytes": 0, "group_segment_fixed_bytes": 0,
+        "launch_dynamic_lds_bytes": 0, "group_segment_fixed_bytes": spec.lds_bytes(),
     })
 }
-const COUNTED: [&str; 29] = [
+const COUNTED: [&str; 35] = [
     "s_load_b256", "s_load_b128", "s_load_b64", "s_load_b32", "global_load_u8", "global_load_u16", "global_load_b32", "buffer_load_b128",
     "global_store_b32", "ds_bpermute_b32", "v_readlane_b32", "v_cvt_f32_f16_e64", "v_cvt_f32_i32_e32", "v_cvt_f32_u32_e32", "v_bfe_u32",
     "v_lshl_or_b32", "v_mul_f32_e32", "v_fma_f32", "v_fmac_f32_e32", "v_add_f32_e32", "v_cmpx_eq_u32_e32", "v_cndmask_b32_e64",
     "v_add_lshl_u32", "v_mul_lo_u32", "v_min_u32_e32", "s_cbranch_scc0", "s_cbranch_scc1", "s_cselect_b64", "s_endpgm",
+    "ds_load_b128", "ds_store_b128", "s_barrier", "s_barrier_signal", "s_barrier_wait", "v_readfirstlane_b32",
 ];
 
 fn vreg(base: u8, len: u8) -> RegRef { RegRef { kind: RKind::V, base, len } }

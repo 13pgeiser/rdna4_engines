@@ -155,8 +155,14 @@ pub(super) fn execute(name:&str,i:&Inst,s:&mut State,mem:&mut Memory,lds:&mut [u
             raw_bounds=Some((relative,u64::from(s.s[r+2])));
             addr=base.wrapping_add(relative);
         } else if name.starts_with("global_") || name.starts_with("flat_") {
-            let a=if load {1}else{0};addr=s.read64(&ops[a],lane)?.wrapping_add_signed(offset);
-            if let Some(Operand::Reg(r))=ops.get(if load{2}else{2}) {if r.kind==crate::reg::Kind::S {addr=addr.wrapping_add(s.read64(&ops[2],lane)?);}}
+            let a=if load {1}else{0};
+            // SADDR form: a 32-bit VGPR byte offset added to the SGPR-pair base (the RDNA ISA rule); otherwise a 64-bit VGPR address.
+            let saddr=matches!(ops.get(2),Some(Operand::Reg(r)) if r.kind==crate::reg::Kind::S&&r.len==2)&&matches!(&ops[a],Operand::Reg(v) if v.kind==crate::reg::Kind::V&&v.len==1);
+            if saddr {addr=s.read64(&ops[2],lane)?.wrapping_add(u64::from(s.read(&ops[a],lane,0)?)).wrapping_add_signed(offset);}
+            else {
+                addr=s.read64(&ops[a],lane)?.wrapping_add_signed(offset);
+                if let Some(Operand::Reg(r))=ops.get(2) {if r.kind==crate::reg::Kind::S {addr=addr.wrapping_add(s.read64(&ops[2],lane)?);}}
+            }
         } else {return Err(format!("memory opcode {name} unsupported"));}
         let data=if load{&ops[0]}else if buffer{&ops[0]}else{&ops[1]};
         let count=if two{2}else{1};

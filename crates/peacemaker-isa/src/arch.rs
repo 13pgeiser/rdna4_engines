@@ -40,7 +40,7 @@ impl Arch {
         if self.wave64() {
             return Err(format!("{mnemonic} cannot be emitted by the RDNA text builder on {}; use peacemaker_isa::cdna", self.name()));
         }
-        if (self.gfx12() && (mnemonic == "s_waitcnt" || mnemonic == "s_waitcnt_vscnt")) || (!self.gfx12() && (mnemonic.starts_with("s_wait_loadcnt") || mnemonic.starts_with("s_wait_storecnt") || mnemonic.starts_with("s_wait_dscnt") || mnemonic.starts_with("s_wait_kmcnt") || mnemonic == "s_wait_alu" || mnemonic.starts_with("v_swmmac") || mnemonic == "v_wmma_f32_16x16x16_fp8_fp8" || mnemonic == "v_wmma_i32_16x16x32_iu4" || mnemonic == "global_inv" || mnemonic == "s_barrier_signal" || mnemonic == "s_barrier_wait" || mnemonic == "s_add_f32" || mnemonic == "s_mul_f32" || mnemonic == "v_s_rcp_f32")) || (self.gfx12() && (mnemonic == "s_barrier" || mnemonic.starts_with("buffer_gl") || mnemonic == "s_waitcnt_depctr")) {
+        if (self.gfx12() && (mnemonic == "s_waitcnt" || mnemonic == "s_waitcnt_vscnt")) || (!self.gfx12() && (mnemonic.starts_with("s_wait_loadcnt") || mnemonic.starts_with("s_wait_storecnt") || mnemonic.starts_with("s_wait_dscnt") || mnemonic.starts_with("s_wait_kmcnt") || mnemonic == "s_wait_alu" || mnemonic.starts_with("v_swmmac") || mnemonic == "v_wmma_f32_16x16x16_fp8_fp8" || mnemonic == "v_wmma_i32_16x16x32_iu4" || mnemonic == "global_inv" || mnemonic == "s_barrier_signal" || mnemonic == "s_barrier_wait" || (self != Self::Gfx1151 && (mnemonic == "s_add_f32" || mnemonic == "s_mul_f32")) || mnemonic == "v_s_rcp_f32")) || (self.gfx12() && (mnemonic == "s_barrier" || mnemonic.starts_with("buffer_gl") || mnemonic == "s_waitcnt_depctr")) {
             return Err(format!("{mnemonic} is unsupported on {}", self.name()));
         }
         Ok(())
@@ -74,6 +74,17 @@ mod arch_tests {
         for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
             assert!(!arch.wave64());
             assert!(arch.check_mnemonic("s_nop").is_ok());
+        }
+    }
+
+    #[test]
+    fn gfx1151_scalar_float_add_mul() {
+        // RDNA3.5's scalar FP fold/scale instructions are pinned in gfx1151.tbl.
+        for mnemonic in ["s_add_f32", "s_mul_f32"] {
+            assert!(Arch::Gfx1151.check_mnemonic(mnemonic).is_ok());
+            assert!(Arch::Gfx1201.check_mnemonic(mnemonic).is_ok());
+            assert!(Arch::Gfx1100.check_mnemonic(mnemonic).is_err());
+            assert!(Arch::Gfx942.check_mnemonic(mnemonic).is_err());
         }
     }
 }

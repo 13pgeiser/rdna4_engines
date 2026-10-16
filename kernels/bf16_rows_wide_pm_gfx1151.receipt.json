@@ -1,0 +1,70 @@
+{
+  "schema": "hipfire.bf16_rows_wide.receipt.v1",
+  "module": "bf16_rows_wide_pm_gfx1151",
+  "arch": "gfx1151",
+  "image": "kernels/bf16_rows_wide_pm_gfx1151.hxaco",
+  "image_sha256": "f1d14ba22190a6be4e85bc5905ed240d31395c51f7a3d9583d21fb09e55a4122",
+  "constants": ["BF16_ROWS_WIDE_PM_GFX1151", "QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256"],
+  "exports": [
+    "gemv_bf16_xf32_x4_rows_wide_r16_pm_gfx1151",
+    "gemv_bf16_xf32_x4_rows_wide_r32_pm_gfx1151",
+    "gemv_bf16_xf32_k4_rows_wide_r16_pm_gfx1151",
+    "gemv_bf16_xf32_k4_rows_wide_r32_pm_gfx1151"
+  ],
+  "ordinary": {
+    "kernarg_bytes": 96,
+    "offsets": {"A0":0,"A1":8,"A2":16,"A3":24,"X":32,"Y0":40,"Y1":48,"Y2":56,"Y3":64,"M0":72,"M1":76,"M2":80,"M3":84,"K":88,"R":92},
+    "grid": "sum_i ceil(M_i/8)", "block": [256,1,1],
+    "static_lds_bytes": 8192, "dynamic_lds_bytes": 0,
+    "vgpr_count_r16_r32": [104,168], "sgpr_count_including_vcc": 66,
+    "schedule": "One output column per wave, all R rows' four chains persistent; one weight vector per K256 group, then all X8 row tiles; unchanged F32 X bits shared by all eight output waves.",
+    "scalar_domain": "K%8!=0 traverses all K as lane+32*t in a0 only; no padded FMA. Vector-domain final partial256 masks invalid complete vectors."
+  },
+  "hc_k4": {
+    "kernarg_bytes": 48,
+    "offsets": {"W":0,"X":8,"Y":16,"M":24,"K":28,"scale":32,"hc_act":36,"R":40},
+    "grid": "ceil(M/2)", "block": [256,1,1],
+    "static_lds_bytes": 16384, "dynamic_lds_bytes": 0,
+    "vgpr_count_r16_r32": [104,168], "sgpr_count_including_vcc": 82,
+    "constraint": "K%32==0; 1<=R<=compiled cap",
+    "schedule": "wave/4 owns one of two output columns, wave%4 owns the incumbent contiguous K/4 quarter; X4 rows across four quarters staged once; quarter partials reuse LDS after final X drain.",
+    "epilogue": "Exact scalar (q0+q1)+(q2+q3), BF16 round trip, scalar scale multiply, BF16 round trip, compensated scalar exp range reduction with v_exp/v_ldexp and original clamps, full div_scale/rcp/refinement/div_fmas/div_fixup sequence, final BF16 round trip. No exp2/reciprocal shortcut.",
+    "decision": "Full HC PM exports delivered; HIP twins retained as fallback. The initial HIP-only diagnosis was corrected after finding the actual peacemaker-ir opcode tables."
+  },
+  "all_exports": {"wave32":true,"wgp_mode":true,"private_segment_bytes":0,"vgpr_spills":0,"sgpr_spills":0,"code_end_tail_dword":"0xbf9f0000","code_end_tail_count":96},
+  "records": {
+    "assembly":"kernels/bf16_rows_wide_pm_gfx1151.s",
+    "builder_proof":"kernels/bf16_rows_wide_pm_gfx1151.proof.json",
+    "shape_and_object_resources":"kernels/bf16_rows_wide_pm_gfx1151.shape.json",
+    "extracted_decode_dag":"kernels/bf16_rows_wide_pm_gfx1151.decode.json",
+    "extracted_decode_isa":"kernels/bf16_rows_wide_pm_gfx1151.decode.isa",
+    "shared_parser_identity":"kernels/bf16_rows_wide_pm_gfx1151.identity.json",
+    "structural_tests":"crates/peacemaker-isa/tests/qwen4_bf16_rows_wide.rs",
+    "contracts":"crates/peacemaker-isa/kernels/qwen4_bf16_rows_wide.gfx1151.{r16,r32,k4_r16,k4_r32}.contract.json",
+    "byte_oracle":"crates/rdna-compute/examples/bf16_rows_pm_oracle.rs"
+  },
+  "exercised_cpu_commands": [
+    "cargo build --release -p peacemaker-isa --features toolchain --bin peacemaker-isa --bin peacemaker",
+    "target/release/peacemaker-isa emit --kernel qwen4_bf16_rows_wide --epi all --arch gfx1151 --out kernels/bf16_rows_wide_pm_gfx1151.s --proof kernels/bf16_rows_wide_pm_gfx1151.proof.json --co /tmp/bf16_rows_wide_pm_gfx1151.co --bundle kernels/bf16_rows_wide_pm_gfx1151.hxaco",
+    "target/release/peacemaker audit --lds-barrier /tmp/bf16_rows_wide_pm_gfx1151.co",
+    "llvm-readobj --notes /tmp/bf16_rows_wide_pm_gfx1151.co",
+    "sha256sum kernels/bf16_rows_wide_pm_gfx1151.hxaco /tmp/bf16_rows_wide_pm_gfx1151.co"
+  ],
+  "cpu_results": {
+    "emitter_build":"passed; existing unrelated dead-code/unused-variable warnings remain",
+    "native_image_emission":"passed for all four exports",
+    "object_metadata":"verified ABI96/48, block256, wave32, WGP, resources and zero spills/private segment",
+    "lds_barrier_audit":"4 kernels, 88 barriers, 0 unwaited LDS stores, 0 unchecked files",
+    "code_end_guard":"verified .text ends with 96 s_code_end dwords",
+    "shared_parser_identity":"44/44 re-emittable pre-existing images byte-identical; archived b1_control SHA unchanged and accepted by lead (not re-emitted). Every path, command and SHA is in identity.json.",
+    "not_run":["cargo test","cargo clippy","cargo fmt","rdna-compute example build","GPU oracle","GPU graph/replay","state identity","latency/occupancy measurements"]
+  },
+  "lead_gpu_oracle_commands_not_run": [
+    "cargo run --release -p rdna-compute --example bf16_rows_pm_oracle -- --quick",
+    "cargo run --release -p rdna-compute --example bf16_rows_pm_oracle",
+    "cargo run --release -p rdna-compute --example bf16_rows_pm_oracle -- --router512 --hc",
+    "HIPFIRE_QWEN4_WIDE_TWIN_BF16=1 cargo run --release -p rdna-compute --example bf16_rows_pm_oracle -- --quick --hc --launcher"
+  ],
+  "oracle_scope":"R1..32 at both capacities against independent actual Gpu singleton BF16 ordinary/x4 and HC k4 launches; scalar and partial256 domains, production/router/HC shapes, varied rows/magnitudes/subnormals/signed-zero, guards, permutations, changed-input and swapped-weight controls, activated/unactivated HC. Quarter-first gate exercises independently packed quarter ordinary DAGs; it does not claim direct observation of internal PM k4 partial LDS.",
+  "admission":"No hardware byte/state/performance certification is claimed. Lead owns GPU holds and product cap admission. No git commit performed, as directed."
+}

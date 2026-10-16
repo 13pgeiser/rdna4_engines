@@ -19,6 +19,8 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
     let expert_stage = None;
     let bf16_state = gpu.qwen4_bf16_streams(n);
     let route_n = gpu.route_rows(n);
+    // The admitted exact few-row cap; one-row banks always sit within it.
+    let few_row_limit = gpu.few_row_limit();
     let mut steps = Vec::with_capacity(QWEN4_STEP_INLINE_CAPACITY);
     let mut ranges = SmallVec::new();
     let mut gdn_slot = 0;
@@ -90,6 +92,7 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                 &config,
                 &owner.decode_q8,
                 route_n,
+                few_row_limit,
                 expert_stage,
             )?;
             if let (Some(gather), Qwen4FfnBinding::Moe(binding)) =
@@ -112,12 +115,14 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                     &owner.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER,
                     route_n,
+                    few_row_limit,
                     attn_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &owner.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 1,
                     route_n,
+                    few_row_limit,
                     attn_read.input_mix_up,
                 ),
                 normalized: &scratch.hc_normalized,
@@ -278,12 +283,14 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                     &owner.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 2,
                     route_n,
+                    few_row_limit,
                     mlp_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &owner.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 3,
                     route_n,
+                    few_row_limit,
                     mlp_read.input_mix_up,
                 ),
                 normalized: &scratch.hc_normalized,

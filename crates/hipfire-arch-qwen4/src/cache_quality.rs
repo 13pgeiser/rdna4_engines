@@ -973,9 +973,9 @@ fn cq_session_budget(raw: Option<&str>) -> Result<u64, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CqFamily {
-    digest: String,
-    bytes: u64,
+pub(crate) struct CqFamily {
+    pub(crate) digest: String,
+    pub(crate) bytes: u64,
 }
 
 fn cq_family_of(bytes: &[u8]) -> CqFamily {
@@ -1514,7 +1514,7 @@ fn cq_read_final_row(
 /// (`SessionState::snapshot_parts`, as the session-cache hardware test's
 /// `state_digests`): part 0 is the metadata, then every fixed part, then the
 /// valid rows of every row stream. Keys are `part.<i>`.
-fn cq_state_families(
+pub(crate) fn cq_state_families(
     gpu: &mut Gpu,
     bundle: &mut Qwen4Bundle,
     route: SessionRoute,

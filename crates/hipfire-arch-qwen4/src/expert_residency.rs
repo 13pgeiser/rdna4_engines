@@ -1499,8 +1499,9 @@ mod tests {
         let census = real_census(&config, 16384);
         // 97 + 144 + 48 + 2 shadowed BF16 owners.
         assert_eq!(census.f16_shadows, 1_298_923_520);
-        // The 4096-row pool workspace with every short tail.
-        assert_eq!(census.workspace.iter().map(|term| term.1).sum::<u64>(), 153_256_072);
+        // The 4096-row pool workspace with every short tail (slab union plan
+        // sized for 32 lanes: 7688 B).
+        assert_eq!(census.workspace.iter().map(|term| term.1).sum::<u64>(), 153_261_832);
         // The split selector's constant score + filter extent.
         assert_eq!(census.qsa_selector, 83_894_272);
         assert!(census.gather > 0 && census.forward > 0 && census.state > 0);

@@ -27,7 +27,8 @@
 //! G1 (expected card, fixtures first, then optional real layer):
 //!   target/release/examples/mq_i4_moe_gemv_byte_oracle --codeobject /abs/mq_i4_moe_gemv_pm_gfx1201.hxaco \
 //!     [--artifact /abs/ctl3-hot.hfq --layer 0 [--real-experts 24]] [--old-kernel-parity] \
-//!     [--device N] [--card NAME] [--expect-uuid GPU-… --expect-bdf 0000:… --expect-arch gfx1201] [--only SUBSTR]…
+//!     [--device N] [--card NAME] [--expect-uuid GPU-… --expect-bdf 0000:… --expect-arch gfx1201] [--wide|--wide-only [--wide-c 1-32]] [--only SUBSTR]…
+//!   gfx1151: `--codeobject …/mq_i4_moe_gemv_pm_gfx1151.hxaco --expect-arch gfx1151 --expect-uuid … --expect-bdf …` (the symbols are the same).
 //! Certified R1 records (real weights, no packed HFQM; cases labelled origin `real_records_layer`):
 //!   … --records-dir …/r1/q/w3-gptq3/L0 --records-manifest …/r1/pack/w3-gptq3/L0/manifest.json \
 //!     --alloc …/alloc.ctl3hot.json [--point ctl3-hot] --xts /models/….mq4 --layer0 \
@@ -40,6 +41,17 @@
 //!     --fabric-owner OWNER --fabric-wrapper /path/fabric-run.sh [--fabric-card NAME]
 //!   (`--card`/`--fabric-owner`/`--fabric-wrapper` fall back to env `FABRIC_CARD`/`FABRIC_OWNER`/`FABRIC_WRAPPER`.)
 //! Prints one machine JSON line on stdout; exit code 1 on any mismatch or error.
+//!
+//! Wide twins (`--wide`, `--wide-only`, `--wide-c LIST`): the eight symbols
+//! `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}_c{16,32}` (grid `(ceil(M/8), 10*C, 1)`, block 256, the same
+//! 88-byte ABI with the production fixed-capacity descriptors: live experts first, `n == 0` tail up to `U = 10*C`).
+//! For every C in the list (default 1..=32) and every route style (`pool`: ten distinct experts per lane from a small
+//! mixed pool so experts see 1..C slots; `ident`: every lane on the same ten experts so `n == C`; `disjoint`: ten fresh
+//! experts per lane, `U = 10*C`, at C in {1, 8, 9, 16, 17, 31, 32}) the lane union is launched through `_c16` (C <= 16)
+//! and `_c32` and every output word (Y0/Y1 incl. unwritten pad words, both guard bands) is compared bit for bit
+//! with (a) the CPU oracle above and (b) `C` singleton `C = 1` launches of the narrow K1 entry on the same GPU, one per
+//! token lane (slots `0..10`, X / Y re-based to the lane). Mixed W3 / MQ4 routes launch both codec symbols into one
+//! Y. With `--artifact` / records the real-weight cases gain C = 9, 16, 17, 32 unions.
 use hip_bridge::{DeviceBuffer, Function, HipRuntime};
 use hipfire_arch_qwen4::expert_slabs::{ExpertFormat, ExpertProj};
 use hipfire_quantize::i4_records::{I4ExpertFinalCodeRecord, I4RecordShapes};
@@ -60,7 +72,10 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 
 const SCHEMA: &str = "mq-i4-moe-gemv-byte-oracle-v1";
-const MODULE: &str = "mq_i4_moe_gemv_pm_gfx1201";
+/// Module name of the code object of device `arch` (the symbols are the same on both architectures).
+fn module_name(arch: &str) -> String {
+    format!("mq_i4_moe_gemv_pm_{arch}")
+}
 const BUILD_COMMAND: &str =
     "cargo build -p hipfire-runtime --release --features lab --example mq_i4_moe_gemv_byte_oracle";
 const DEFAULT_UUID: &str = "GPU-6109a4cb5f833235";
@@ -183,6 +198,42 @@ impl Kind {
 fn symbol(codec: Codec, kind: Kind) -> String {
     format!("mq_i4_moe_gemv_{}_{}", codec.tag(), kind.suffix())
 }
+
+/// Capacity of a wide twin (`_c16` / `_c32`: token lanes, `n <= C` slots per expert).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cap {
+    C16,
+    C32,
+}
+impl Cap {
+    const ALL: [Cap; 2] = [Cap::C16, Cap::C32];
+    fn suffix(self) -> &'static str {
+        match self {
+            Cap::C16 => "_c16",
+            Cap::C32 => "_c32",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Cap::C16 => "c16",
+            Cap::C32 => "c32",
+        }
+    }
+    fn slots(self) -> usize {
+        match self {
+            Cap::C16 => 16,
+            Cap::C32 => 32,
+        }
+    }
+}
+fn symbol_cap(codec: Codec, kind: Kind, cap: Cap) -> String {
+    format!("{}{}", symbol(codec, kind), cap.suffix())
+}
+/// Threads of a wide workgroup (eight waves, one output row each) and output rows per workgroup.
+const WIDE_BLOCK: u32 = 256;
+const WIDE_M_BLOCK: usize = 8;
+/// Sentinel words guarding both ends of every wide / reference output buffer.
+const GUARD_WORDS: usize = 64;
 
 // ---------------------------------------------------------------------------------------
 // Small utilities
@@ -525,6 +576,9 @@ struct Case {
     ys_gate: usize,
     ys_down: usize,
     old_parity: bool,
+    /// A lane-union wide case (C up to 32): run through the `_c16` / `_c32` twins against the CPU oracle and
+    /// `C` singleton narrow launches, never through the narrow entry's own union path.
+    wide: bool,
 }
 
 impl Case {
@@ -606,6 +660,7 @@ fn build_case(
         ys_gate,
         ys_down,
         old_parity,
+        wide: false,
     }
 }
 
@@ -926,7 +981,7 @@ fn load_real(path: &str, layer: usize, want: usize) -> Result<Real> {
     Ok(Real { experts, meta, mq4_sym_violations: violations })
 }
 
-fn real_cases(real: &Real, origin: &'static str, prefix: &str) -> Vec<Case> {
+fn real_cases(real: &Real, origin: &'static str, prefix: &str, wide: bool) -> Vec<Case> {
     let all: Vec<u32> = real.experts.keys().copied().collect();
     let by = |c: Codec| -> Vec<u32> { all.iter().copied().filter(|id| real.experts[id].codec == c).collect() };
     let (w3, mq4) = (by(Codec::W3), by(Codec::Mq4));
@@ -949,7 +1004,16 @@ fn real_cases(real: &Real, origin: &'static str, prefix: &str) -> Vec<Case> {
     let c1 = build_case(&format!("{prefix}_c1_mixed"), origin, 1, route1, sub, false, false, 0);
     let route8 = lane_routes(&mut rng, &all, 8);
     let c8 = build_case(&format!("{prefix}_c8_union_mixed"), origin, 8, route8, real.experts.clone(), false, false, 1);
-    vec![c1, c8]
+    let mut cases = vec![c1, c8];
+    if wide {
+        for (i, c) in [9usize, 16, 17, 32].into_iter().enumerate() {
+            let route = lane_routes(&mut rng, &all, c);
+            let mut case = build_case(&format!("{prefix}_c{c}_union_mixed"), origin, c, route, real.experts.clone(), c % 2 == 1, false, 2 + i);
+            case.wide = true;
+            cases.push(case);
+        }
+    }
+    cases
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1262,6 +1326,8 @@ fn kernarg(
 struct Ctx {
     hip: HipRuntime,
     funcs: Vec<(Codec, Kind, Function)>,
+    /// The wide twins, loaded only with `--wide` / `--wide-only`.
+    wide_funcs: Vec<(Codec, Kind, Cap, Function)>,
     codeobject_sha: String,
     device: i32,
     old_parity: bool,
@@ -1270,6 +1336,13 @@ struct Ctx {
 impl Ctx {
     fn func(&self, codec: Codec, kind: Kind) -> &Function {
         &self.funcs.iter().find(|(c, k, _)| *c == codec && *k == kind).expect("all four symbols loaded").2
+    }
+    fn wide_func(&self, codec: Codec, kind: Kind, cap: Cap) -> Result<&Function> {
+        self.wide_funcs
+            .iter()
+            .find(|(c, k, p, _)| *c == codec && *k == kind && *p == cap)
+            .map(|e| &e.3)
+            .ok_or_else(|| format!("wide symbol {} not loaded (pass --wide)", symbol_cap(codec, kind, cap)))
     }
 }
 
@@ -1643,11 +1716,24 @@ struct Totals {
     twin_mismatches: u64,
     old_kernel_mismatches: u64,
     old_kernel_cases: u64,
+    wide_cases: u64,
+    wide_launches: u64,
+    /// Wide words that differ from the CPU oracle (also counted in `mismatches`).
+    wide_cpu_mismatches: u64,
+    /// Wide words that differ from the C singleton narrow GPU launches.
+    wide_singleton_mismatches: u64,
+    /// Singleton narrow GPU words that differ from the CPU oracle.
+    wide_reference_mismatches: u64,
+    /// Guard-band / sentinel violations around the wide and reference outputs.
+    wide_guard_violations: u64,
 }
 
 type TimingSamples = Vec<(Codec, Kind, usize, usize, Vec<f64>)>;
 
 fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCfg>) -> Result<(Value, TimingSamples)> {
+    if case.wide {
+        return run_case_wide(ctx, case, t);
+    }
     let mut dev = Dev::new(&ctx.hip);
     let slabs = upload_experts(&mut dev, case);
     let gate = match &slabs {
@@ -1709,6 +1795,320 @@ fn run_case(ctx: &mut Ctx, case: &Case, t: &mut Totals, timing: Option<&TimingCf
 }
 
 // ---------------------------------------------------------------------------------------
+// Wide twins: lane unions at C1..32 against the CPU oracle and C singleton narrow launches
+// ---------------------------------------------------------------------------------------
+
+/// C values with the `disjoint` style (`U = 10*C` distinct experts, every first-occurrence slot position).
+const DISJOINT_C: [usize; 7] = [1, 8, 9, 16, 17, 31, 32];
+
+fn wide_case_names(cs: &[usize]) -> Vec<String> {
+    let mut names = Vec::new();
+    for &c in cs {
+        names.push(format!("w{c}_pool"));
+        names.push(format!("w{c}_ident"));
+        if DISJOINT_C.contains(&c) {
+            names.push(format!("w{c}_disjoint"));
+        }
+    }
+    names
+}
+
+/// Expert pool and `route[lane*10 + rank]` of a wide synthetic case: `pool` draws ten distinct experts per lane from a
+/// small pool (experts see 1..=C slots); `ident` routes every lane to the same ten experts (`n == C`); `disjoint` gives
+/// every slot its own expert (`U == 10*C`).
+fn wide_plan(rng: &mut Rng, c: usize, style: &str) -> (Vec<u32>, Vec<u32>) {
+    match style {
+        "pool" => {
+            let ids = pick_ids(rng, (12 + c / 2).min(64), true);
+            let route = lane_routes(rng, &ids, c);
+            (ids, route)
+        }
+        "ident" => {
+            let ids = pick_ids(rng, 10, true);
+            let mut lane = ids.clone();
+            rng.shuffle(&mut lane);
+            let route = (0..c).flat_map(|_| lane.clone()).collect();
+            (ids, route)
+        }
+        "disjoint" => {
+            let ids = pick_ids(rng, 10 * c, true);
+            let mut route = ids.clone();
+            rng.shuffle(&mut route);
+            (ids, route)
+        }
+        other => panic!("unknown wide route style {other}"),
+    }
+}
+
+fn build_wide_synthetic(name: &str) -> Case {
+    let (head, style) = name.split_once('_').expect("wide case name w<C>_<style>");
+    let c: usize = head.trim_start_matches('w').parse().expect("wide case C");
+    let mut rng = Rng::new(name_seed(name) ^ 0x71de);
+    let (ids, route) = wide_plan(&mut rng, c, style);
+    let codecs = mixed_codecs(&mut rng, ids.len(), 5);
+    let experts = experts_for(&ids, |i, _| codecs[i]);
+    let padded = style == "pool" && c % 2 == 1;
+    let mut case = build_case(name, "synthetic_wide", c, route, experts, padded, false, c % 4);
+    case.wide = true;
+    case
+}
+
+/// The production fixed-capacity descriptor of one codec bucket: live experts first, then `n == 0` tail experts up to the
+/// capacity `S = 10*C` (`ids` zero filled, every tail offset the bucket's slot count, `slot_ids` zero filled to `S`).
+fn pad_descriptor(b: &Bucket, s: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let (mut ids, mut offs, mut slots) = (b.ids.clone(), b.offs.clone(), b.slots.clone());
+    ids.resize(s, 0);
+    offs.resize(s + 1, *b.offs.last().expect("offsets are never empty"));
+    slots.resize(s, 0);
+    (ids, offs, slots)
+}
+
+struct WideOut {
+    symbols: Vec<Value>,
+    cpu_mismatches: u64,
+    singleton_mismatches: u64,
+    reference_mismatches: u64,
+    guard_violations: u64,
+    twin_mismatches: u64,
+    launches: u64,
+}
+
+/// Words of `buf` outside `[guard, guard + n_words*4)` that are not the sentinel byte.
+fn guard_violations(buf: &[u8], n_words: usize) -> u64 {
+    let g = GUARD_WORDS * 4;
+    let bad = |s: &[u8]| s.iter().filter(|&&b| b != 0xa5).count() as u64;
+    bad(&buf[..g]) + bad(&buf[g + n_words * 4..])
+}
+
+fn words_as_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|b| f32::from_bits(u32::from_le_bytes(b.try_into().unwrap()))).collect()
+}
+
+/// One (case, kind): `C` singleton `C = 1` launches of the narrow entry (one per token lane, slots `0..10`, X / Y
+/// re-based to the lane) into a reference buffer, then the wide twins (`_c16` for C <= 16, always `_c32`) over the whole
+/// union at production capacity; every word of every output (and the guard bands) is compared with the CPU oracle and
+/// the wide words also with the singleton words.
+fn run_kind_wide(
+    ctx: &Ctx,
+    dev: &mut Dev,
+    case: &Case,
+    kind: Kind,
+    slabs: &BTreeMap<u32, (u64, u64)>,
+) -> Result<WideOut> {
+    let c = case.c;
+    let slots = 10 * c;
+    let (m, k, out) = (kind.m(), kind.k(), kind.out_rows());
+    let (x, xrs, ys) = case.x(kind);
+    let x_src_rows = x.len() / xrs;
+    let gate = kind == Kind::GateUp;
+    let buckets = buckets_of(case);
+    let expected = cpu_expected(case, kind, &buckets);
+    let xb = dev.upload(&f32_bytes(x))?;
+    let mut table = vec![0u64; N_EXPERTS];
+    for (&id, &(g, d)) in slabs {
+        table[id as usize] = if gate { g } else { d };
+    }
+    let tb = dev.upload(&u64_bytes(&table))?;
+    let n_words = slots * ys;
+    let guard = GUARD_WORDS * 4;
+    let ybytes = n_words * 4 + 2 * guard;
+    let slot_codec: Vec<Codec> = (0..slots).map(|s| case.codec_of_slot(s)).collect();
+    let codec_of = |e: u32| case.experts[&e].codec;
+    let mut launches = 0u64;
+
+    // The reference: C singleton launches of the narrow entry.
+    let r0 = dev.fill(ybytes, 0xa5)?;
+    let r1 = if gate { Some(dev.fill(ybytes, 0xa5)?) } else { None };
+    let (xrow_bytes, x_src_one) = if gate { (xrs * 4, 1usize) } else { (10 * xrs * 4, 10usize) };
+    for lane in 0..c {
+        let lane_route = &case.route[lane * 10..lane * 10 + 10];
+        for codec in Codec::ALL {
+            let lb = build_bucket(lane_route, &codec_of, codec);
+            if lb.ids.is_empty() {
+                continue;
+            }
+            let ib = dev.upload(&u32_bytes(&lb.ids))?;
+            let ob = dev.upload(&u32_bytes(&lb.offs))?;
+            let sb = dev.upload(&u32_bytes(&lb.slots))?;
+            let yoff = (lane * 10 * ys * 4 + guard) as u64;
+            let mut a = kernarg(
+                [tb.ptr, ib.ptr, ob.ptr, sb.ptr, xb.ptr + (lane * xrow_bytes) as u64, r0.ptr + yoff, r1.map_or(0, |b| b.ptr + yoff)],
+                m,
+                k,
+                lb.ids.len(),
+                1,
+                kind.x_row_div(),
+                x_src_one,
+                xrs,
+                ys,
+            );
+            // SAFETY: exact 88-byte ABI; every pointer is a live allocation of `dev` until release.
+            unsafe { ctx.hip.launch_kernel_blob(ctx.func(codec, kind), [m as u32, lb.ids.len() as u32, 1], [32, 1, 1], 0, None, &mut a) }
+                .map_err(err)?;
+            launches += 1;
+        }
+    }
+    ctx.hip.device_synchronize().map_err(err)?;
+    let ref0 = dev.download(r0, ybytes)?;
+    let ref1 = match r1 {
+        Some(b) => Some(dev.download(b, ybytes)?),
+        None => None,
+    };
+    let mut guard_bad = guard_violations(&ref0, n_words) + ref1.as_ref().map_or(0, |r| guard_violations(r, n_words));
+    let mut per_ref = [Mm::default(), Mm::default()];
+    let mut stray_ref = Mm::default();
+    compare_buf("ref_y0", &ref0[guard..guard + n_words * 4], &expected.y0, ys, out, &slot_codec, &mut per_ref, &mut stray_ref);
+    if let (Some(r), Some(e1)) = (ref1.as_ref(), expected.y1.as_ref()) {
+        compare_buf("ref_y1", &r[guard..guard + n_words * 4], e1, ys, out, &slot_codec, &mut per_ref, &mut stray_ref);
+    }
+    let reference_mismatches = stray_ref.count + per_ref[0].count + per_ref[1].count;
+    let ref0_words = words_as_f32(&ref0[guard..guard + n_words * 4]);
+    let ref1_words = ref1.as_ref().map(|r| words_as_f32(&r[guard..guard + n_words * 4]));
+
+    let mut symbols = Vec::new();
+    let (mut cpu_mismatches, mut singleton_mismatches) = (0u64, 0u64);
+    let max_n = |b: &Bucket| b.offs.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    for cap in Cap::ALL {
+        if cap == Cap::C16 && c > cap.slots() {
+            continue;
+        }
+        let w0 = dev.fill(ybytes, 0xa5)?;
+        let w1 = if gate { Some(dev.fill(ybytes, 0xa5)?) } else { None };
+        let mut prepared = Vec::new();
+        for codec in Codec::ALL {
+            let b = &buckets[codec.idx()];
+            if b.ids.is_empty() {
+                symbols.push(json!({"symbol": symbol_cap(codec, kind, cap), "cap": cap.label(), "codec": codec.label(),
+                    "profile": kind.suffix(), "launched": false, "slots": 0, "unique_experts": 0}));
+                continue;
+            }
+            let (ids, offs, sl) = pad_descriptor(b, slots);
+            let ib = dev.upload(&u32_bytes(&ids))?;
+            let ob = dev.upload(&u32_bytes(&offs))?;
+            let sb = dev.upload(&u32_bytes(&sl))?;
+            let args = kernarg(
+                [tb.ptr, ib.ptr, ob.ptr, sb.ptr, xb.ptr, w0.ptr + guard as u64, w1.map_or(0, |b| b.ptr + guard as u64)],
+                m,
+                k,
+                slots,
+                c,
+                kind.x_row_div(),
+                x_src_rows,
+                xrs,
+                ys,
+            );
+            prepared.push((codec, args, [m.div_ceil(WIDE_M_BLOCK) as u32, slots as u32, 1]));
+        }
+        for (codec, args, grid) in &prepared {
+            let mut a = *args;
+            let f = ctx.wide_func(*codec, kind, cap)?;
+            // SAFETY: exact 88-byte ABI; every pointer is a live allocation of `dev` until release.
+            unsafe { ctx.hip.launch_kernel_blob(f, *grid, [WIDE_BLOCK, 1, 1], 0, None, &mut a) }.map_err(err)?;
+            launches += 1;
+        }
+        ctx.hip.device_synchronize().map_err(err)?;
+        let g0 = dev.download(w0, ybytes)?;
+        let g1 = match w1 {
+            Some(b) => Some(dev.download(b, ybytes)?),
+            None => None,
+        };
+        let wide_guard = guard_violations(&g0, n_words) + g1.as_ref().map_or(0, |r| guard_violations(r, n_words));
+        guard_bad += wide_guard;
+        let (mut per_cpu, mut stray_cpu) = ([Mm::default(), Mm::default()], Mm::default());
+        let (mut per_one, mut stray_one) = ([Mm::default(), Mm::default()], Mm::default());
+        let body0 = &g0[guard..guard + n_words * 4];
+        compare_buf("y0", body0, &expected.y0, ys, out, &slot_codec, &mut per_cpu, &mut stray_cpu);
+        compare_buf("y0_vs_singleton", body0, &ref0_words, ys, out, &slot_codec, &mut per_one, &mut stray_one);
+        if let (Some(g), Some(e1), Some(r1w)) = (g1.as_ref(), expected.y1.as_ref(), ref1_words.as_ref()) {
+            let body1 = &g[guard..guard + n_words * 4];
+            compare_buf("y1", body1, e1, ys, out, &slot_codec, &mut per_cpu, &mut stray_cpu);
+            compare_buf("y1_vs_singleton", body1, r1w, ys, out, &slot_codec, &mut per_one, &mut stray_one);
+        }
+        cpu_mismatches += stray_cpu.count;
+        singleton_mismatches += stray_one.count;
+        for codec in Codec::ALL {
+            let b = &buckets[codec.idx()];
+            if b.ids.is_empty() {
+                continue;
+            }
+            let i = codec.idx();
+            cpu_mismatches += per_cpu[i].count;
+            singleton_mismatches += per_one[i].count;
+            symbols.push(json!({
+                "symbol": symbol_cap(codec, kind, cap), "cap": cap.label(), "codec": codec.label(), "profile": kind.suffix(),
+                "launched": true, "grid": [m.div_ceil(WIDE_M_BLOCK), slots, 1], "block": WIDE_BLOCK,
+                "union_capacity": slots, "slots": b.slots.len(), "unique_experts": b.ids.len(), "max_slots_per_expert": max_n(b),
+                "mismatch_vs_cpu": per_cpu[i].count, "first_mismatches_vs_cpu": per_cpu[i].first,
+                "mismatch_vs_singleton": per_one[i].count, "first_mismatches_vs_singleton": per_one[i].first,
+            }));
+        }
+        symbols.push(json!({"symbol": "stray_or_pad_words", "cap": cap.label(), "profile": kind.suffix(),
+            "mismatch_vs_cpu": stray_cpu.count, "first_mismatches_vs_cpu": stray_cpu.first,
+            "mismatch_vs_singleton": stray_one.count, "first_mismatches_vs_singleton": stray_one.first,
+            "guard_violations": wide_guard}));
+    }
+    Ok(WideOut {
+        symbols,
+        cpu_mismatches,
+        singleton_mismatches,
+        reference_mismatches,
+        guard_violations: guard_bad,
+        twin_mismatches: expected.twin_mismatches,
+        launches,
+    })
+}
+
+fn run_case_wide(ctx: &mut Ctx, case: &Case, t: &mut Totals) -> Result<(Value, TimingSamples)> {
+    let mut dev = Dev::new(&ctx.hip);
+    let slabs = upload_experts(&mut dev, case);
+    let gate = match &slabs {
+        Ok(s) => run_kind_wide(ctx, &mut dev, case, Kind::GateUp, s),
+        Err(e) => Err(e.clone()),
+    };
+    let down = match (&slabs, &gate) {
+        (Ok(s), Ok(_)) => run_kind_wide(ctx, &mut dev, case, Kind::Down, s),
+        _ => Err("skipped after earlier failure".to_string()),
+    };
+    dev.release();
+    slabs?;
+    let (gate, down) = (gate?, down?);
+    t.cases += 1;
+    t.wide_cases += 1;
+    match case.origin {
+        "synthetic_wide" => {}
+        RECORDS_ORIGIN => {
+            t.real += 1;
+            t.real_records += 1;
+        }
+        _ => t.real += 1,
+    }
+    t.launches += gate.launches + down.launches;
+    t.wide_launches += gate.launches + down.launches;
+    t.mismatches += gate.cpu_mismatches + down.cpu_mismatches;
+    t.wide_cpu_mismatches += gate.cpu_mismatches + down.cpu_mismatches;
+    t.wide_singleton_mismatches += gate.singleton_mismatches + down.singleton_mismatches;
+    t.wide_reference_mismatches += gate.reference_mismatches + down.reference_mismatches;
+    t.wide_guard_violations += gate.guard_violations + down.guard_violations;
+    t.twin_mismatches += gate.twin_mismatches + down.twin_mismatches;
+    let buckets = buckets_of(case);
+    let max_slots = buckets.iter().flat_map(|b| b.offs.windows(2).map(|w| w[1] - w[0])).max().unwrap_or(0);
+    let row = json!({
+        "case": case.name, "origin": case.origin, "wide": true, "c": case.c, "slots": 10 * case.c,
+        "unique_experts": case.experts.len(), "max_slots_per_expert": max_slots,
+        "strides": {"x_row_stride_gate": case.xrs_gate, "x_row_stride_down": case.xrs_down,
+            "y_slot_stride_gate": case.ys_gate, "y_slot_stride_down": case.ys_down},
+        "input_sha256": case.input_sha256(),
+        "gate_up": gate.symbols, "down": down.symbols,
+        "mismatch_count": gate.cpu_mismatches + down.cpu_mismatches,
+        "singleton_mismatch_count": gate.singleton_mismatches + down.singleton_mismatches,
+        "singleton_vs_cpu_mismatch_count": gate.reference_mismatches + down.reference_mismatches,
+        "guard_violation_count": gate.guard_violations + down.guard_violations,
+        "twin_selfcheck": {"mismatch_count": gate.twin_mismatches + down.twin_mismatches},
+    });
+    Ok((row, Vec::new()))
+}
+
+// ---------------------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------------------
 
@@ -1746,6 +2146,12 @@ struct Cfg {
     xts: Option<String>,
     xts_sha256: Option<String>,
     layer0: bool,
+    /// Include the wide-twin lane-union cases (`_c16` / `_c32`, C1..32 by default).
+    wide: bool,
+    /// Run only the wide cases (no narrow synthetic / real cases).
+    wide_only: bool,
+    /// Lane counts of the wide synthetic sweep.
+    wide_c: Vec<usize>,
 }
 
 const USAGE: &str = "usage: mq_i4_moe_gemv_byte_oracle --codeobject PATH [--artifact HFQM --layer N [--real-experts N]] \
@@ -1753,7 +2159,8 @@ const USAGE: &str = "usage: mq_i4_moe_gemv_byte_oracle --codeobject PATH [--arti
 [--records-manifest-sha256 HEX] [--xts-sha256 HEX] [--real-experts N]] \
 [--old-kernel-parity] [--timing --reps N(>=20) --warmup N(>=3) [--launches N] --card NAME --fabric-owner OWNER \
 --fabric-wrapper fabric-run.sh [--fabric-card NAME]] [--device N] [--expect-uuid U] [--expect-bdf B] [--expect-arch A] \
-[--only SUBSTR]...  (card/fabric flags fall back to env FABRIC_CARD / FABRIC_OWNER / FABRIC_WRAPPER)";
+[--wide|--wide-only [--wide-c LIST]] [--only SUBSTR]...  (card/fabric flags fall back to env FABRIC_CARD / FABRIC_OWNER / FABRIC_WRAPPER; \
+--wide adds the _c16/_c32 lane-union cases, --wide-c a list or ranges of C within 1..=32, e.g. 1-32 or 1,9,16-17,32)";
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -1788,6 +2195,9 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
         xts: None,
         xts_sha256: None,
         layer0: false,
+        wide: false,
+        wide_only: false,
+        wide_c: (1..=32).collect(),
     };
     let mut i = 0;
     let mut layer_explicit: Option<usize> = None;
@@ -1832,6 +2242,12 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
             "--xts" => cfg.xts = Some(value(&mut i)?),
             "--xts-sha256" => cfg.xts_sha256 = Some(value(&mut i)?.to_ascii_lowercase()),
             "--layer0" => cfg.layer0 = true,
+            "--wide" => cfg.wide = true,
+            "--wide-only" => {
+                cfg.wide = true;
+                cfg.wide_only = true;
+            }
+            "--wide-c" => cfg.wide_c = parse_c_list(&value(&mut i)?)?,
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
         i += 1;
@@ -1881,7 +2297,32 @@ fn parse_args(argv: &[String]) -> Result<Cfg> {
     } else if cfg.layer0 || cfg.map.is_some() || cfg.xts_sha256.is_some() || cfg.records_manifest_sha256.is_some() {
         return Err("--layer0/--map/--xts-sha256/--records-manifest-sha256 only apply to certified-records mode".into());
     }
+    if cfg.wide && cfg.timing {
+        return Err("--wide is a correctness run: no --timing".into());
+    }
     Ok(cfg)
+}
+
+/// `--wide-c` list: comma separated lane counts or inclusive `A-B` ranges within 1..=32.
+fn parse_c_list(s: &str) -> Result<Vec<usize>> {
+    let mut out = BTreeSet::new();
+    for part in s.split(',').filter(|p| !p.is_empty()) {
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (a.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?, b.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?),
+            None => {
+                let v = part.parse::<usize>().map_err(|e| format!("--wide-c {part}: {e}"))?;
+                (v, v)
+            }
+        };
+        if lo < 1 || hi > 32 || lo > hi {
+            return Err(format!("--wide-c {part}: lane counts must satisfy 1 <= A <= B <= 32"));
+        }
+        out.extend(lo..=hi);
+    }
+    if out.is_empty() {
+        return Err("--wide-c needs at least one lane count".into());
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn selected(cfg: &Cfg, name: &str) -> bool {
@@ -1924,7 +2365,20 @@ fn run() -> Result<(Value, bool)> {
             funcs.push((codec, kind, f));
         }
     }
-    let mut ctx = Ctx { hip, funcs, codeobject_sha: codeobject_sha.clone(), device: id, old_parity: cfg.old_parity, gpu: None };
+    let mut wide_funcs = Vec::new();
+    if cfg.wide {
+        for kind in Kind::ALL {
+            for codec in Codec::ALL {
+                for cap in Cap::ALL {
+                    let name = symbol_cap(codec, kind, cap);
+                    let f = hip.module_get_function(&module, &name).map_err(|e| format!("symbol {name}: {e}"))?;
+                    loads.push(name);
+                    wide_funcs.push((codec, kind, cap, f));
+                }
+            }
+        }
+    }
+    let mut ctx = Ctx { hip, funcs, wide_funcs, codeobject_sha: codeobject_sha.clone(), device: id, old_parity: cfg.old_parity, gpu: None };
     let mut totals = Totals::default();
     let mut rows: Vec<Value> = Vec::new();
     let mut runs: Vec<Value> = Vec::new();
@@ -1957,7 +2411,7 @@ fn run() -> Result<(Value, bool)> {
                     "row_count": kind.m() * 10, "c": 1, "slots": slots, "unique_experts": unique,
                     "elapsed_s": elapsed, "reps": tcfg.reps, "warmup": tcfg.warmup,
                     "launches_per_sample": tcfg.launches,
-                    "symbol_codeobject": MODULE, "code_object_sha": ctx.codeobject_sha,
+                    "symbol_codeobject": module_name(&arch), "code_object_sha": ctx.codeobject_sha,
                     "timing_source": "device", "event_timing": "hipEventElapsedTime over launches_per_sample launches",
                     "device": {"arch": arch, "card": card, "uuid": uuid, "bdf": bdf},
                     "fabric": fabric,
@@ -1966,18 +2420,26 @@ fn run() -> Result<(Value, bool)> {
             }
         }
     } else {
-        for name in SYNTH_CASES.iter().filter(|n| selected(&cfg, n)) {
+        for name in SYNTH_CASES.iter().filter(|n| !cfg.wide_only && selected(&cfg, n)) {
             eprintln!("[g1] {name}");
             let case = build_synthetic(name);
             let (row, _) = run_case(&mut ctx, &case, &mut totals, None)?;
             rows.push(row);
+        }
+        if cfg.wide {
+            for name in wide_case_names(&cfg.wide_c).iter().filter(|n| selected(&cfg, n)) {
+                eprintln!("[g1] {name}");
+                let case = build_wide_synthetic(name);
+                let (row, _) = run_case(&mut ctx, &case, &mut totals, None)?;
+                rows.push(row);
+            }
         }
         if let Some(path) = &cfg.artifact {
             eprintln!("[g1] loading layer {} of {path}", cfg.layer);
             let real = load_real(path, cfg.layer, cfg.real_experts)?;
             mq4_violations = real.mq4_sym_violations;
             artifact_meta = real.meta.clone();
-            for case in real_cases(&real, "real", "real").iter().filter(|c| selected(&cfg, &c.name)) {
+            for case in real_cases(&real, "real", "real", cfg.wide).iter().filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide)) {
                 eprintln!("[g1] {}", case.name);
                 let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
                 rows.push(row);
@@ -1988,7 +2450,7 @@ fn run() -> Result<(Value, bool)> {
             let real = load_records(&cfg)?;
             records_violations = real.mq4_sym_violations;
             records_meta = real.meta.clone();
-            for case in real_cases(&real, RECORDS_ORIGIN, "real_records").iter().filter(|c| selected(&cfg, &c.name)) {
+            for case in real_cases(&real, RECORDS_ORIGIN, "real_records", cfg.wide).iter().filter(|c| selected(&cfg, &c.name) && (!cfg.wide_only || c.wide)) {
                 eprintln!("[g1] {}", case.name);
                 let (row, _) = run_case(&mut ctx, case, &mut totals, None)?;
                 rows.push(row);
@@ -1999,23 +2461,32 @@ fn run() -> Result<(Value, bool)> {
     let byte_exact = totals.mismatches == 0
         && totals.twin_mismatches == 0
         && totals.old_kernel_mismatches == 0
+        && totals.wide_singleton_mismatches == 0
+        && totals.wide_reference_mismatches == 0
+        && totals.wide_guard_violations == 0
         && !rows.is_empty()
+        && (!cfg.wide || totals.wide_cases > 0)
         && (!cfg.old_parity || totals.old_kernel_cases > 0);
     let mut out = json!({
         "schema": SCHEMA,
         "mode": if cfg.timing { "timing" } else { "g1" },
-        "module": MODULE,
+        "module": module_name(&arch),
         "command": command,
         "config": {"layer": cfg.layer, "real_experts": cfg.real_experts, "old_kernel_parity": cfg.old_parity,
             "only": cfg.only, "timing": cfg.timing, "reps": cfg.reps, "warmup": cfg.warmup,
-            "launches_per_sample": cfg.launches},
+            "launches_per_sample": cfg.launches, "wide": cfg.wide, "wide_only": cfg.wide_only, "wide_c": cfg.wide_c},
         "codeobject": {"path": cfg.codeobject, "sha256": codeobject_sha, "bytes": image.len()},
         "code_object_sha": codeobject_sha,
         "kernarg_bytes": KERNARG_BYTES,
         "symbols_loaded": loads,
         "device": device,
         "case_counts": {"total": totals.cases, "synthetic": totals.synthetic, "real": totals.real,
-            "real_records_layer": totals.real_records, "old_kernel_parity": totals.old_kernel_cases},
+            "real_records_layer": totals.real_records, "old_kernel_parity": totals.old_kernel_cases, "wide": totals.wide_cases},
+        "wide_symbol_launches": totals.wide_launches,
+        "wide_cpu_mismatch_count": totals.wide_cpu_mismatches,
+        "wide_vs_singleton_mismatch_count": totals.wide_singleton_mismatches,
+        "singleton_vs_cpu_mismatch_count": totals.wide_reference_mismatches,
+        "wide_guard_violation_count": totals.wide_guard_violations,
         "symbol_launches": totals.launches,
         "cases": rows,
         "mismatch_count": totals.mismatches,
@@ -2313,5 +2784,90 @@ mod tests {
         let v: Vec<u32> = (0..100).collect();
         let s = spread(&v, 12);
         assert!(s.windows(2).all(|w| w[0] < w[1]) && s[0] == 0 && *s.last().unwrap() < 100);
+    }
+
+    #[test]
+    fn wide_c_lists_parse_ranges_and_reject_bad_lanes() {
+        assert_eq!(parse_c_list("1-3,9,16-17,32").unwrap(), vec![1, 2, 3, 9, 16, 17, 32]);
+        assert_eq!(parse_c_list("32,1,1").unwrap(), vec![1, 32]);
+        for bad in ["", "0", "33", "5-3", "a", "1-33"] {
+            assert!(parse_c_list(bad).is_err(), "{bad}");
+        }
+        let c = parse_args(&args(&["--codeobject", "/co", "--wide-only", "--wide-c", "9-10"])).unwrap();
+        assert!((c.wide, c.wide_only, c.wide_c.clone()) == (true, true, vec![9, 10]));
+        let d = parse_args(&args(&["--codeobject", "/co"])).unwrap();
+        assert!(!d.wide && !d.wide_only && d.wide_c == (1..=32).collect::<Vec<_>>());
+        assert!(parse_args(&args(&["--codeobject", "/co", "--wide", "--timing", "--card", "c", "--fabric-owner", "o", "--fabric-wrapper", "w"])).is_err());
+    }
+
+    #[test]
+    fn wide_case_names_cover_every_lane_count_and_the_disjoint_set() {
+        let all: Vec<usize> = (1..=32).collect();
+        let names = wide_case_names(&all);
+        for c in 1..=32 {
+            assert!(names.contains(&format!("w{c}_pool")) && names.contains(&format!("w{c}_ident")));
+            assert_eq!(names.contains(&format!("w{c}_disjoint")), DISJOINT_C.contains(&c));
+        }
+        assert_eq!(symbol_cap(Codec::W3, Kind::GateUp, Cap::C32), "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32");
+        assert_eq!(symbol_cap(Codec::Mq4, Kind::Down, Cap::C16), "mq_i4_moe_gemv_mq4sym_r128_down_c16");
+        assert_eq!((Cap::C16.slots(), Cap::C32.slots()), (16, 32));
+    }
+
+    /// Every wide route is a valid union of `C` lanes: ten distinct experts per lane, so an expert has at most `C` slots,
+    /// `ident` puts all `C` slots on every expert and `disjoint` gives `10*C` experts of one slot (slot 10C-1 included).
+    #[test]
+    fn wide_routes_are_valid_lane_unions() {
+        for c in [1usize, 8, 9, 16, 17, 31, 32] {
+            for style in ["pool", "ident", "disjoint"] {
+                let mut rng = Rng::new(name_seed(&format!("w{c}_{style}")) ^ 0x71de);
+                let (ids, route) = wide_plan(&mut rng, c, style);
+                assert_eq!(route.len(), 10 * c);
+                for lane in route.chunks(10) {
+                    let set: BTreeSet<u32> = lane.iter().copied().collect();
+                    assert_eq!(set.len(), 10, "{style} C{c}: lane experts distinct");
+                    assert!(lane.iter().all(|e| ids.contains(e)));
+                }
+                let codec_of = |_: u32| Codec::W3;
+                let b = build_bucket(&route, &codec_of, Codec::W3);
+                let max_n = b.offs.windows(2).map(|w| w[1] - w[0]).max().unwrap() as usize;
+                assert!(max_n <= c, "{style} C{c}: n {max_n} > C");
+                match style {
+                    "ident" => assert!(b.offs.windows(2).all(|w| w[1] - w[0] == c as u32)),
+                    "disjoint" => assert_eq!((b.ids.len(), max_n), (10 * c, 1)),
+                    _ => {}
+                }
+                let mut seen: Vec<u32> = b.slots.clone();
+                seen.sort_unstable();
+                assert_eq!(seen, (0..10 * c as u32).collect::<Vec<_>>(), "{style} C{c}: buckets partition every slot");
+            }
+        }
+    }
+
+    /// The padded production descriptor: live experts first, `n == 0` tail experts up to `S = 10*C`, monotone offsets
+    /// ending at the bucket's slot count, slots zero filled to `S`.
+    #[test]
+    fn padded_descriptors_keep_live_prefix_and_empty_tail() {
+        let route: Vec<u32> = (0..20).map(|i| 100 + (i % 12) as u32).collect();
+        let b = build_bucket(&route, &|_| Codec::Mq4, Codec::Mq4);
+        let (ids, offs, slots) = pad_descriptor(&b, 20);
+        assert_eq!((ids.len(), offs.len(), slots.len()), (20, 21, 20));
+        assert_eq!(&ids[..b.ids.len()], &b.ids[..]);
+        assert_eq!(&offs[..b.offs.len()], &b.offs[..]);
+        let total = *b.offs.last().unwrap();
+        assert!(offs[b.ids.len()..].iter().all(|&o| o == total), "empty tail experts");
+        assert!(offs.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(&slots[..b.slots.len()], &b.slots[..]);
+        assert!(slots[b.slots.len()..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn guard_bands_are_checked_around_the_payload() {
+        let mut buf = vec![0xa5u8; GUARD_WORDS * 8 + 12];
+        assert_eq!(guard_violations(&buf, 3), 0);
+        buf[3] = 0;
+        buf[GUARD_WORDS * 4 + 12 + 5] = 1;
+        assert_eq!(guard_violations(&buf, 3), 2);
+        buf[GUARD_WORDS * 4 + 4] = 9; // payload bytes are not guards
+        assert_eq!(guard_violations(&buf, 3), 2);
     }
 }

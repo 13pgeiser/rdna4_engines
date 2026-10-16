@@ -1093,6 +1093,7 @@ fn forward_lanes_scoped(
                     config,
                     &fwd.decode_q8,
                     rows,
+                    gpu.few_row_limit(),
                     None,
                 )?);
             }
@@ -1233,12 +1234,14 @@ fn forward_lanes_scoped(
                                     &fwd.decode_q8,
                                     copy,
                                     rr,
+                                    gpu.few_row_limit(),
                                     read.input_mix_down,
                                 ),
                                 input_mix_up: decode_copy(
                                     &fwd.decode_q8,
                                     copy + 1,
                                     rr,
+                                    gpu.few_row_limit(),
                                     read.input_mix_up,
                                 ),
                                 normalized: &v.hc_normalized,

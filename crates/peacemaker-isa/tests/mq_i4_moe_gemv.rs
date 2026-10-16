@@ -2,16 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The gfx1151 and gfx1201 pointer-addressed F4 read-once C8 lane-union decode GEMV modules
-//! `mq_i4_moe_gemv_pm_<arch>` (`mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}`):
-//! symbols, the frozen 88-byte kernarg ABI and its typed ownership, exact-arch gating (gfx1100 is refused),
-//! the instruction census of the frozen numerical tree, the read-once structure
-//! (no weight load inside any slot branch), the derived shape contract, native
-//! assembly, the per-architecture workgroup-id and wait spellings, and (feature `toolchain`) wait replay, M7,
-//! certification and the native code object / bundle identity against the ROCm oracle for the four entries
+//! The gfx1151 and gfx1201 pointer-addressed F4 read-once lane-union decode GEMV modules
+//! `mq_i4_moe_gemv_pm_<arch>`: the four C8 symbols `mq_i4_moe_gemv_{mq3i4,mq4sym}_{r256_gate_up,r128_down}` and
+//! their eight wide twins with the suffix `_c16` / `_c32`: symbols, the frozen 88-byte kernarg ABI and its typed
+//! ownership, exact-arch gating (gfx1100 is refused), the instruction census of the frozen numerical tree, the
+//! read-once structure (no weight load inside any slot branch; for the wide twins none inside any tile or slot
+//! branch, and no barrier inside a divergent region), the unchanged narrow emission, the derived shape contract, native
+//! assembly, the per-architecture workgroup-id, wait and barrier spellings, and (feature `toolchain`) wait replay, M7,
+//! certification and the native code object / bundle identity against the ROCm oracle for every entry
 //! and the module of each architecture.
 use peacemaker_isa::Arch;
-use peacemaker_isa::kernels::mq_i4_moe_gemv::{self, Codec, Kind, Spec};
+use peacemaker_isa::kernels::mq_i4_moe_gemv::{self, Cap, Codec, Kind, Spec};
 #[cfg(feature = "toolchain")]
 #[path = "support/native_compare.rs"]
 mod native_compare;
@@ -21,11 +22,32 @@ mod rocm;
 
 const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
 fn module(arch: Arch) -> String { format!("mq_i4_moe_gemv_pm_{}", arch.name()) }
-/// Every entry of every supported architecture, module order within an architecture.
-fn all_specs() -> Vec<Spec> { ARCHES.into_iter().flat_map(mq_i4_moe_gemv::module_specs).collect() }
+/// Every narrow (C8) entry of every supported architecture, module order within an architecture.
+fn all_specs() -> Vec<Spec> { ARCHES.into_iter().flat_map(mq_i4_moe_gemv::narrow_specs).collect() }
+/// The eight wide twins (C16 then C32) of every supported architecture.
+fn wide_specs() -> Vec<Spec> { ARCHES.into_iter().flat_map(mq_i4_moe_gemv::module_specs).filter(|s| s.cap != Cap::C8).collect() }
+/// All twelve entries of every architecture's module.
+fn module_entries() -> Vec<Spec> { ARCHES.into_iter().flat_map(mq_i4_moe_gemv::module_specs).collect() }
 const SYMBOLS: [&str; 4] = [
     "mq_i4_moe_gemv_mq3i4_r256_gate_up", "mq_i4_moe_gemv_mq3i4_r128_down",
     "mq_i4_moe_gemv_mq4sym_r256_gate_up", "mq_i4_moe_gemv_mq4sym_r128_down",
+];
+const WIDE_SYMBOLS: [&str; 8] = [
+    "mq_i4_moe_gemv_mq3i4_r256_gate_up_c16", "mq_i4_moe_gemv_mq3i4_r128_down_c16",
+    "mq_i4_moe_gemv_mq4sym_r256_gate_up_c16", "mq_i4_moe_gemv_mq4sym_r128_down_c16",
+    "mq_i4_moe_gemv_mq3i4_r256_gate_up_c32", "mq_i4_moe_gemv_mq3i4_r128_down_c32",
+    "mq_i4_moe_gemv_mq4sym_r256_gate_up_c32", "mq_i4_moe_gemv_mq4sym_r128_down_c32",
+];
+/// sha256 of the narrow entries' emitted assembly text before the wide twins existed (`(arch, tag, s_text sha256)`).
+const NARROW_S_TEXT_SHA256: [(&str, &str, &str); 8] = [
+    ("gfx1151", "mq3i4_r256_gate_up", "baebbe544d87cb9b42ec663a6f588dc72188f21b4f0f122db604f33b863d584e"),
+    ("gfx1151", "mq3i4_r128_down", "05fcf5f7ed2a635c3c9ea95c54651cd7cc38d2e96ef48e1765fe2177776b1af8"),
+    ("gfx1151", "mq4sym_r256_gate_up", "9397110b2e326390f01e575a35ca9e8e6edfe984cb81529127ce51a6bcce263c"),
+    ("gfx1151", "mq4sym_r128_down", "9006adf5c13fcc96204348b786ac549c3a73fbd39e2396de4f1c77724a92cbc6"),
+    ("gfx1201", "mq3i4_r256_gate_up", "7666870e1f77ba52bdac74f4c8096ff99c6d7dc0af5d2dedc677a1809366883c"),
+    ("gfx1201", "mq3i4_r128_down", "a875b2b1897776bd8bf9f17ca50aa2b8b6f82de069d24ab57ee0dd388d557a03"),
+    ("gfx1201", "mq4sym_r256_gate_up", "dfe4591d7a131572cabdd3802128b6c868be43d92dcd81add41c7178998ce20a"),
+    ("gfx1201", "mq4sym_r128_down", "46847a6d02eceef65f67b3800a360d548a78592351ebae6759752ad8c332e3ca"),
 ];
 /// Frozen ABI (DESIGN §4.2): `(offset, size, name)` in kernarg order.
 const ARGS: [(u32, u32, &str); 15] = [
@@ -41,7 +63,7 @@ fn field(text: &str, key: &str) -> Vec<u32> {
 fn count(text: &str, mnemonic: &str) -> usize {
     text.lines().filter(|l| l.split_whitespace().next() == Some(mnemonic)).count()
 }
-fn spec(arch: Arch, codec: Codec, kind: Kind) -> Spec { Spec { arch, codec, kind } }
+fn spec(arch: Arch, codec: Codec, kind: Kind) -> Spec { Spec::narrow(arch, codec, kind) }
 fn mnemonic(line: &str) -> &str { line.split_whitespace().next().unwrap_or("") }
 /// Operand `n` (0-based) of an instruction line, split on `", "`.
 fn operand(line: &str, n: usize) -> String {
@@ -50,21 +72,26 @@ fn operand(line: &str, n: usize) -> String {
 fn vreg(token: &str) -> u32 { token.trim_start_matches('v').parse().unwrap_or_else(|_| panic!("not a VGPR: {token}")) }
 
 #[test]
-fn module_exports_are_the_four_frozen_symbols_in_order() {
+fn module_exports_are_the_twelve_frozen_symbols_in_order() {
     for arch in ARCHES {
         let specs = mq_i4_moe_gemv::module_specs(arch);
-        assert_eq!(specs, [
+        assert_eq!(&specs[..4], [
             spec(arch, Codec::Mq3I4, Kind::GateUp), spec(arch, Codec::Mq3I4, Kind::Down),
             spec(arch, Codec::Mq4Sym, Kind::GateUp), spec(arch, Codec::Mq4Sym, Kind::Down),
         ]);
-        assert_eq!(specs.iter().map(Spec::symbol).collect::<Vec<_>>(), SYMBOLS);
+        assert_eq!(mq_i4_moe_gemv::narrow_specs(arch), specs[..4]);
+        assert_eq!(specs.len(), SYMBOLS.len() + WIDE_SYMBOLS.len());
+        assert_eq!(specs[..4].iter().map(Spec::symbol).collect::<Vec<_>>(), SYMBOLS);
+        assert_eq!(specs[4..].iter().map(Spec::symbol).collect::<Vec<_>>(), WIDE_SYMBOLS);
+        assert!(specs[4..8].iter().all(|s| s.cap == Cap::C16) && specs[8..].iter().all(|s| s.cap == Cap::C32));
         assert_eq!(Spec::module(arch), module(arch));
         let (emitted, text, proof) = mq_i4_moe_gemv::emit_module(arch).unwrap();
-        assert_eq!(emitted.len(), SYMBOLS.len());
+        let all: Vec<&str> = SYMBOLS.iter().chain(&WIDE_SYMBOLS).copied().collect();
+        assert_eq!(emitted.len(), all.len());
         assert_eq!((proof.module.as_str(), proof.arch), (module(arch).as_str(), arch));
-        assert_eq!(proof.kernels.len(), SYMBOLS.len());
-        assert_eq!(text.matches(".amdhsa_kernel ").count(), SYMBOLS.len());
-        for symbol in SYMBOLS {
+        assert_eq!(proof.kernels.len(), all.len());
+        assert_eq!(text.matches(".amdhsa_kernel ").count(), all.len());
+        for symbol in all {
             assert!(text.contains(&format!(".amdhsa_kernel {symbol}\n")), "{arch:?} {symbol}: missing from module source");
             assert!(text.contains(&format!(".globl {symbol}\n")), "{arch:?} {symbol}: not global");
             assert!(text.contains(&format!(".name: {symbol}\n")), "{arch:?} {symbol}: missing from module metadata");
@@ -72,11 +99,24 @@ fn module_exports_are_the_four_frozen_symbols_in_order() {
     }
 }
 
+/// The wide twins are additive: every narrow entry's emitted assembly (and so its machine code) is byte for byte the
+/// text that was committed before they existed.
+#[test]
+fn narrow_entries_are_unchanged_by_the_wide_twins() {
+    for (arch_name, tag, sha) in NARROW_S_TEXT_SHA256 {
+        let arch: Arch = arch_name.parse().unwrap();
+        let spec = mq_i4_moe_gemv::module_specs(arch).into_iter().find(|s| s.tag() == tag).unwrap();
+        assert_eq!(spec.cap, Cap::C8);
+        let e = mq_i4_moe_gemv::emit(spec).unwrap();
+        assert_eq!(e.proof.s_text_sha256, sha, "{arch_name} {tag}: the narrow emission changed");
+    }
+}
+
 /// Emission is bit-deterministic per architecture, and every other architecture (gfx1100) is refused
 /// (the builder is exact-gfx1151 / gfx1201: no implicit alias).
 #[test]
 fn emission_is_deterministic_and_refuses_other_arches() {
-    for spec in all_specs() {
+    for spec in module_entries() {
         let (a, b) = (mq_i4_moe_gemv::emit(spec).unwrap(), mq_i4_moe_gemv::emit(spec).unwrap());
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "{spec:?}");
         assert_eq!(a.s_text, b.s_text, "{spec:?}");
@@ -393,19 +433,236 @@ fn native_writer_assembles_every_entry_and_the_module() {
     }
 }
 
-/// The shipped `kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco` must be exactly what the builder emits today: the whole
-/// offload bundle, byte for byte (native writer, no ROCm; host entry `host-x86_64-unknown-linux-gnu`, device
-/// `hipv4-amdgcn-amd-amdhsa--gfx1151`, `.comment` `hipfire peacemaker native-emit 0.4.1`).
+/// The shipped `kernels/mq_i4_moe_gemv_pm_<arch>.hxaco` (both architectures) must be exactly what the builder emits
+/// today: the whole offload bundle, byte for byte (native writer, no ROCm; host entry
+/// `host-x86_64-unknown-linux-gnu`, device `hipv4-amdgcn-amd-amdhsa--<arch>`, `.comment`
+/// `hipfire peacemaker native-emit 0.4.1`).
 #[test]
-fn committed_gfx1151_bundle_equals_fresh_emission() {
-    let arch = Arch::Gfx1151;
-    let module = module(arch);
-    let path = format!("{}/../../kernels/{module}.hxaco", env!("CARGO_MANIFEST_DIR"));
-    let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv --arch gfx1151 ... --bundle)"));
-    let (_, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
-    let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
-    let fresh = peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
-    assert!(committed == fresh, "{module}: fresh emission differs from the committed bundle {path}");
+fn committed_bundles_equal_fresh_emission() {
+    for arch in ARCHES {
+        let module = module(arch);
+        let path = format!("{}/../../kernels/{module}.hxaco", env!("CARGO_MANIFEST_DIR"));
+        let committed = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel mq_i4_moe_gemv --arch {} ... --bundle)", arch.name()));
+        let (_, text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
+        let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
+        let fresh = peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
+        assert!(committed == fresh, "{module}: fresh emission differs from the committed bundle {path}");
+    }
+}
+
+/// The wide twins' interface: the narrow 88-byte kernarg ABI field for field, block 256, the static X tile as the only
+/// LDS (4096 B; `Mq4Sym` gate G256: 8192 B), wave32, no scratch / spills / flat, barrier spellings per architecture.
+#[test]
+fn wide_entries_keep_the_abi_and_declare_block_256_and_the_x_tile() {
+    for spec in wide_specs() {
+        let e = mq_i4_moe_gemv::emit(spec).unwrap();
+        let symbol = format!("{:?} {}", spec.arch, spec.symbol());
+        let t = &e.s_text;
+        assert_eq!(spec.workgroup_size(), 256, "{symbol}");
+        assert_eq!(spec.lds_bytes(), if spec.lane_elems() == 8 { 8192 } else { 4096 }, "{symbol}");
+        assert!(t.contains(".kernarg_segment_size: 88\n") && t.contains(".amdhsa_kernarg_size 88\n"), "{symbol}: kernarg size");
+        assert_eq!(field(t, ".offset:"), ARGS.iter().map(|a| a.0).collect::<Vec<_>>(), "{symbol}: kernarg offsets");
+        assert_eq!(field(t, ".size:"), ARGS.iter().map(|a| a.1).collect::<Vec<_>>(), "{symbol}: kernarg sizes");
+        let names: Vec<String> = t.lines().filter_map(|l| l.trim().strip_prefix(".name: ")).take(ARGS.len()).map(str::to_owned).collect();
+        assert_eq!(names, ARGS.iter().map(|a| a.2.to_owned()).collect::<Vec<_>>(), "{symbol}: kernarg names");
+        assert_eq!(field(t, ".max_flat_workgroup_size:"), [256], "{symbol}: block 256");
+        assert!(t.contains(&format!(".group_segment_fixed_size: {}\n", spec.lds_bytes())), "{symbol}: static LDS");
+        assert!(t.contains(&format!(".amdhsa_group_segment_fixed_size {}\n", spec.lds_bytes())), "{symbol}: descriptor LDS");
+        assert!(t.contains(".amdhsa_wavefront_size32 1") && t.contains(".amdhsa_system_sgpr_workgroup_id_y 1"), "{symbol}: wave32 / grid y");
+        assert!(t.contains(".private_segment_fixed_size: 0\n") && t.contains(".sgpr_spill_count: 0\n") && t.contains(".vgpr_spill_count: 0\n"), "{symbol}: no private memory");
+        assert!(!t.lines().any(|l| mnemonic(l).starts_with("scratch_") || mnemonic(l).starts_with("flat_") || mnemonic(l).starts_with("ds_swizzle")), "{symbol}: scratch/flat/swizzle");
+        let plan: Vec<&str> = e.proof.reg_plan.iter().map(|r| r.name.as_ref()).collect();
+        for owner in ["kernel_arguments_ptrs", "x_descriptor", "y_select", "accumulators", "x_values", "weights", "slot_x_offsets", "slot_y_addresses",
+                      "x_tile_store_address", "x_tile_read_base", "wave", "row_block"] {
+            assert!(plan.contains(&owner), "{symbol}: reg plan misses {owner}");
+        }
+        // Workgroup ids and barriers follow the architecture; the first loads are the narrow kernarg loads.
+        if spec.arch.gfx12() {
+            assert!(t.contains("s_mov_b32 s81, ttmp9") && t.contains("s_and_b32 s31, ttmp7, 0xffff"), "{symbol}: gfx12 workgroup ids");
+            assert!(count(t, "s_barrier_signal") > 0 && count(t, "s_barrier_signal") == count(t, "s_barrier_wait") && count(t, "s_barrier") == 0, "{symbol}: gfx12 barrier");
+            assert!(t.contains("s_barrier_signal -1") && t.contains("s_barrier_wait 0xffff"), "{symbol}: gfx12 barrier operands");
+        } else {
+            assert!(t.contains("s_mov_b32 s81, s2") && t.contains("s_mov_b32 s31, s3") && !t.contains("ttmp"), "{symbol}: gfx11 workgroup ids");
+            assert!(count(t, "s_barrier") > 0 && count(t, "s_barrier_signal") == 0 && count(t, "s_barrier_wait") == 0, "{symbol}: gfx11 barrier");
+        }
+        let zero = if spec.arch.gfx12() { "0x0" } else { "null" };
+        for load in [format!("s_load_b256 s[8:15], s[0:1], {zero}"), "s_load_b256 s[16:23], s[0:1], 0x20".into(), "s_load_b128 s[24:27], s[0:1], 0x40".into(), "s_load_b64 s[28:29], s[0:1], 0x50".into()] {
+            assert!(t.contains(&load), "{symbol}: kernarg load {load}");
+        }
+    }
+}
+
+/// Honest register and LDS ceilings of the wide state (design §4): `4*C` gate / `C` down accumulators per lane, one weight
+/// group and one X vector; whole-granule VGPR reservation, SGPR bookkeeping, the contract equals the plan.
+#[test]
+fn wide_register_ceilings_hold_the_design_budget() {
+    for spec in wide_specs() {
+        let e = mq_i4_moe_gemv::emit(spec).unwrap();
+        let symbol = format!("{:?} {}", spec.arch, spec.symbol());
+        let (nw, chains, cap) = (spec.lane_elems() as u16, spec.kind.chains() as u16, spec.cap.slots() as u16);
+        let floor = cap * chains + 2 * nw;
+        let ceiling = match (spec.kind, spec.cap) { (Kind::GateUp, Cap::C16) => 128, (Kind::GateUp, _) => 192, (Kind::Down, _) => 80 };
+        assert!(e.shape.next_free_vgpr >= floor && e.shape.next_free_vgpr % 8 == 0 && e.shape.next_free_vgpr <= ceiling, "{symbol}: vgpr {} (ceiling {ceiling})", e.shape.next_free_vgpr);
+        assert!(e.shape.next_free_sgpr <= 88, "{symbol}: sgpr {}", e.shape.next_free_sgpr);
+        assert!(e.s_text.contains(&format!(".vgpr_count: {}\n", e.shape.next_free_vgpr)), "{symbol}: metadata vgpr count");
+        let c = mq_i4_moe_gemv::contract(spec, &e);
+        assert_eq!((c["vgpr_max"].as_u64(), c["sgpr_max"].as_u64()), (Some(u64::from(e.shape.next_free_vgpr)), Some(u64::from(e.shape.next_free_sgpr))), "{symbol}");
+        assert_eq!(c["group_segment_fixed_bytes"].as_u64(), Some(u64::from(spec.lds_bytes())), "{symbol}");
+    }
+}
+
+/// The frozen numerical tree of the wide twins: the narrow per-slot chains (weights reconstructed once per group, so the
+/// weight-side counts do not depend on the capacity), `C` stores, five snapshot shuffle steps per slot, the X tile
+/// staged `tiles` times per group with two barriers each.
+#[test]
+fn wide_instruction_census_matches_the_frozen_dag() {
+    for spec in wide_specs() {
+        let t = mq_i4_moe_gemv::emit(spec).unwrap().s_text;
+        let symbol = format!("{:?} {}", spec.arch, spec.symbol());
+        let inst = spec.group_instances() as usize;
+        let (nw, cap) = (spec.lane_elems() as usize, spec.cap.slots() as usize);
+        let tiles = cap / 8;
+        let planar = spec.codec == Codec::Mq3I4;
+        let gate = spec.kind == Kind::GateUp;
+        let (u8s, u16s, b32s) = match (spec.codec, spec.kind) {
+            (Codec::Mq3I4, _) => (2 * inst, inst, 1),
+            (Codec::Mq4Sym, Kind::GateUp) => (0, 0, 2 * inst + 1),
+            (Codec::Mq4Sym, Kind::Down) => (0, inst, inst + 1),
+        };
+        assert_eq!(count(&t, "global_load_u8"), u8s, "{symbol}: packet byte loads (capacity independent)");
+        assert_eq!(count(&t, "global_load_u16"), u16s, "{symbol}: u16 loads");
+        assert_eq!(count(&t, "global_load_b32"), b32s, "{symbol}: dword loads");
+        assert_eq!(count(&t, "buffer_load_b128"), inst * tiles * nw / 4, "{symbol}: X loads, one per (group, tile)");
+        assert_eq!(count(&t, "ds_store_b128"), inst * tiles * nw / 4, "{symbol}: X tile stores");
+        assert_eq!(count(&t, "ds_load_b128"), inst * cap * nw / 4, "{symbol}: X tile reads");
+        assert_eq!(count(&t, "global_store_b32"), cap, "{symbol}: stores");
+        let barriers = if spec.arch.gfx12() { count(&t, "s_barrier_signal") } else { count(&t, "s_barrier") };
+        assert_eq!(barriers, 2 * tiles * inst, "{symbol}: two barriers per (group, tile)");
+        assert_eq!(count(&t, "v_bfe_u32"), nw * inst, "{symbol}: code extracts");
+        assert_eq!(count(&t, "v_cvt_f32_i32_e32"), if planar { 4 * inst } else { 0 }, "{symbol}: signed grid converts");
+        assert_eq!(count(&t, "v_cvt_f32_u32_e32"), 2 + if planar { 0 } else { nw * inst }, "{symbol}: unsigned converts (2 are the slot divide)");
+        assert_eq!(count(&t, "v_fma_f32"), if planar { 0 } else { nw * inst }, "{symbol}: affine fma");
+        assert_eq!(count(&t, "v_cvt_f32_f16_e64"), inst * if planar { 1 } else { 2 }, "{symbol}: header converts");
+        assert_eq!(count(&t, "v_lshl_or_b32"), if planar { inst } else { 0 }, "{symbol}: W3 packet combine");
+        assert_eq!(count(&t, "v_mul_f32_e32"), cap * inst + if planar { 4 * inst } else { 0 } + 1, "{symbol}: multiplies");
+        assert_eq!(count(&t, "v_fmac_f32_e32"), (nw - 1) * cap * inst, "{symbol}: fused steps");
+        assert_eq!(count(&t, "v_add_f32_e32"), cap * inst + cap * (if gate { 3 } else { 0 } + 5), "{symbol}: group-partial, fold and shuffle adds");
+        assert_eq!(count(&t, "ds_bpermute_b32"), 5 * cap, "{symbol}: shuffle steps");
+        assert_eq!(count(&t, "v_readlane_b32"), inst * tiles + cap, "{symbol}: producer slot offsets and store addresses");
+        assert_eq!(count(&t, "v_readfirstlane_b32"), 1, "{symbol}: wave index");
+        assert_eq!(count(&t, "v_cmpx_eq_u32_e32"), 1, "{symbol}: lane-0 store mask");
+        for forbidden in ["ds_swizzle", "v_fma_mix_f32", "v_xor_b32", "flat_", "scratch_", "v_wmma", "global_atomic", "buffer_atomic"] {
+            let hit = t.lines().find(|l| mnemonic(l).starts_with(forbidden));
+            assert!(hit.is_none(), "{symbol}: emits {hit:?}");
+        }
+        let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !mnemonic(l).starts_with("s_delay_alu") && !mnemonic(l).starts_with("s_wait") && !mnemonic(l).starts_with("s_nop") && !mnemonic(l).starts_with("ds_load")).collect();
+        let first_fmac = lines.iter().position(|l| mnemonic(l) == "v_fmac_f32_e32").unwrap();
+        let mul = lines[first_fmac - 1];
+        assert_eq!(mnemonic(mul), "v_mul_f32_e32", "{symbol}: first dot term");
+        // Mq3I4: p = RN(w0*x0), fma(w_j,x_j,p) j = 1..; Mq4Sym: p = RN(w1*x1), fma(w0,x0,p), then j = 2.. ascending.
+        let order: Vec<u32> = if planar { (0..nw as u32).collect() } else { [1, 0].into_iter().chain(2..nw as u32).collect() };
+        let (dot, wf, xf) = (vreg(&operand(mul, 0)), vreg(&operand(mul, 1)), vreg(&operand(mul, 2)));
+        let (w0, x0) = (wf - order[0], xf - order[0]);
+        for (k, &j) in order.iter().enumerate().skip(1) {
+            let l = lines[first_fmac + k - 1];
+            assert_eq!(mnemonic(l), "v_fmac_f32_e32", "{symbol}: fused step {k}");
+            assert_eq!((vreg(&operand(l, 0)), vreg(&operand(l, 1)), vreg(&operand(l, 2))), (dot, w0 + j, x0 + j), "{symbol}: fused step {k} (element {j}) operands");
+        }
+        let add = lines[first_fmac + nw - 1];
+        assert_eq!((mnemonic(add), operand(add, 0), operand(add, 1), vreg(&operand(add, 2))), ("v_add_f32_e32", operand(add, 0), operand(add, 0), dot), "{symbol}: group partial add");
+        let offsets: Vec<u32> = lines.iter().filter(|l| mnemonic(l) == "v_cndmask_b32_e64" && operand(l, 1) == "0").map(|l| operand(l, 2).parse().unwrap()).collect();
+        assert_eq!(offsets, [16, 8, 4, 2, 1], "{symbol}: shuffle offsets");
+        // Four exchange registers; each shuffle sum goes to its own exchange register and a select keeps out-of-range lanes.
+        let exch: Vec<u32> = lines.iter().filter(|l| mnemonic(l) == "ds_bpermute_b32").map(|l| vreg(&operand(l, 0))).collect();
+        let base = *exch.iter().min().unwrap();
+        assert!(exch.iter().all(|&r| (base..base + 4).contains(&r)), "{symbol}: exchange registers");
+        let selects = lines.iter().filter(|l| mnemonic(l) == "v_cndmask_b32_e64" && operand(l, 0) == operand(l, 1) && (base..base + 4).contains(&vreg(&operand(l, 2)))).count();
+        assert_eq!(selects, 5 * cap, "{symbol}: accumulator selects");
+        let sums = lines.iter().filter(|l| mnemonic(l) == "v_add_f32_e32" && (base..base + 4).contains(&vreg(&operand(l, 0))) && operand(l, 0) == operand(l, 2)).count();
+        assert_eq!(sums, 5 * cap, "{symbol}: shuffle sums into scratch");
+        if spec.codec == Codec::Mq4Sym {
+            let fmas: Vec<&&str> = lines.iter().filter(|l| mnemonic(l) == "v_fma_f32").collect();
+            let (d, z) = (operand(fmas[0], 1), operand(fmas[0], 3));
+            assert!(fmas.iter().all(|l| operand(l, 0) == operand(l, 2) && operand(l, 1) == d && operand(l, 3) == z), "{symbol}: affine weight fma(d, q, z)");
+        }
+    }
+}
+
+/// Read-once and uniform-barrier structure of the wide twins: every weight-class global load sits in the group's
+/// valid-row region before any tile, no X / LDS access sits outside its guarded phase, tiles past the expert's slots are
+/// skipped as a whole with their barriers, and no barrier sits inside any divergent region (tail waves reach every barrier).
+#[test]
+fn wide_weights_load_once_per_group_and_barriers_are_never_inside_a_branch_region() {
+    for spec in wide_specs() {
+        let t = mq_i4_moe_gemv::emit(spec).unwrap().s_text;
+        let symbol = format!("{:?} {}", spec.arch, spec.symbol());
+        let (inst, tiles) = (spec.group_instances() as usize, spec.cap.slots() as usize / 8);
+        // (region suffix, instruction class that may sit inside it)
+        let regions = ["_wdone", "_pdone", "_sdone", "_udone", "_cdone"];
+        let mut open: Option<&str> = None;
+        let (mut seen_slot_load, mut weight_loads, mut gend_branches) = (false, 0usize, 0usize);
+        for line in t.lines().map(str::trim) {
+            let m = mnemonic(line);
+            if line.ends_with(':') && !line.contains(' ') {
+                if let Some(r) = open { if line.ends_with(&format!("{r}:")) { open = None } }
+                continue;
+            }
+            if m == "s_cbranch_scc0" {
+                if line.ends_with("_gend") { gend_branches += 1; continue }
+                if let Some(r) = regions.into_iter().find(|r| line.ends_with(r)) { if open.is_none() { open = Some(r) } }
+                continue;
+            }
+            if m.starts_with("s_barrier") { assert!(open.is_none(), "{symbol}: barrier inside the {open:?} region"); }
+            if m.starts_with("global_load") {
+                if !seen_slot_load { seen_slot_load = true; assert!(open.is_none(), "{symbol}: slot-id load inside a region"); continue }
+                assert_eq!(open, Some("_wdone"), "{symbol}: weight load outside the valid-row weight region: {line}");
+                weight_loads += 1;
+            }
+            if m == "buffer_load_b128" { assert_eq!(open, Some("_pdone"), "{symbol}: X load outside the producer region"); }
+            if m == "ds_store_b128" { assert_eq!(open, Some("_sdone"), "{symbol}: LDS store outside the store region"); }
+            if m == "ds_load_b128" { assert_eq!(open, Some("_cdone"), "{symbol}: LDS read outside the consume region"); }
+        }
+        assert!(open.is_none(), "{symbol}: unterminated region");
+        let per_group = match spec.codec { Codec::Mq3I4 => 3, Codec::Mq4Sym => 2 };
+        assert_eq!(weight_loads, per_group * inst, "{symbol}: weight loads per group (capacity independent)");
+        assert_eq!(gend_branches, (tiles - 1) * inst, "{symbol}: one uniform tile skip per tile past the first");
+    }
+}
+
+/// The wide contract: the narrow counts' vocabulary plus the LDS / barrier mnemonics, the static X tile as the group
+/// segment, and no ban on `ds_load*` / `ds_store*` / `s_barrier*` (the swizzle, scratch and flat bans stay).
+#[test]
+fn wide_shape_contract_declares_the_x_tile_and_allows_lds() {
+    for spec in wide_specs() {
+        let e = mq_i4_moe_gemv::emit(spec).unwrap();
+        let c = mq_i4_moe_gemv::contract(spec, &e);
+        let (cap, nw, tiles) = (spec.cap.slots() as u64, spec.lane_elems() as u64, spec.cap.slots() as u64 / 8);
+        let inst = spec.group_instances() as u64;
+        assert_eq!(c["symbol"], spec.symbol().as_str());
+        assert_eq!(c["counts"]["global_store_b32"], cap);
+        assert_eq!(c["counts"]["ds_bpermute_b32"], 5 * cap);
+        assert_eq!(c["counts"]["ds_load_b128"], inst * cap * nw / 4);
+        assert_eq!(c["counts"]["ds_store_b128"], inst * tiles * nw / 4);
+        assert_eq!(c["counts"][if spec.arch.gfx12() { "s_barrier_signal" } else { "s_barrier" }], 2 * tiles * inst);
+        assert_eq!((c["launch_dynamic_lds_bytes"].as_u64(), c["group_segment_fixed_bytes"].as_u64()), (Some(0), Some(u64::from(spec.lds_bytes()))));
+        let forbidden: Vec<&str> = c["forbidden"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        for family in ["scratch_*", "flat_*", "ds_swizzle*", "v_wmma*", "v_fma_mix*"] { assert!(forbidden.contains(&family), "{family}"); }
+        for family in ["ds_load*", "ds_store*", "s_barrier*"] { assert!(!forbidden.contains(&family), "{family}"); }
+        assert_eq!(c, mq_i4_moe_gemv::contract(spec, &mq_i4_moe_gemv::emit(spec).unwrap()));
+    }
+}
+
+/// The capacity axis: symbols and tags carry the suffix, the narrow entry none; slots, block size and LDS per entry.
+#[test]
+fn cap_axis_names_and_resources() {
+    assert_eq!((Cap::C8.suffix(), Cap::C16.suffix(), Cap::C32.suffix()), ("", "_c16", "_c32"));
+    assert_eq!((Cap::C8.slots(), Cap::C16.slots(), Cap::C32.slots()), (8, 16, 32));
+    for spec in module_entries() {
+        assert_eq!(spec.symbol(), format!("mq_i4_moe_gemv_{}_{}{}", spec.codec.tag(), spec.kind.tag(), spec.cap.suffix()));
+        assert_eq!(spec.tag(), format!("{}_{}{}", spec.codec.tag(), spec.kind.tag(), spec.cap.suffix()));
+        assert_eq!(spec.workgroup_size(), if spec.cap == Cap::C8 { 32 } else { 256 });
+        assert_eq!(spec.lds_bytes(), if spec.cap == Cap::C8 { 0 } else { 8 * 128 * 4 * (spec.lane_elems() as u32 / 4) });
+    }
 }
 
 #[cfg(feature = "toolchain")]
@@ -432,7 +689,8 @@ mod toolchain {
             std::fs::create_dir_all(&dir).unwrap();
             let co = dir.join("module.co");
             std::fs::write(&co, native::assemble(&text, arch).unwrap()).unwrap();
-            for symbol in SYMBOLS {
+            for symbol in mq_i4_moe_gemv::module_specs(arch).iter().map(Spec::symbol) {
+                let symbol = symbol.as_str();
                 let m7 = pm_check::m7(&co, arch.name(), symbol).unwrap_or_else(|e| panic!("{arch:?} {symbol}: {e}"));
                 assert_eq!((m7["lift"].as_str(), &m7["obligations"]), (Some("byte-exact"), &serde_json::json!({})), "{arch:?} {symbol}");
             }
@@ -458,7 +716,7 @@ mod toolchain {
             let dir = std::env::temp_dir().join(format!("peacemaker-isa-mqi4moe-identity-{}-{}", arch.name(), std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let (emitted, module_text, _) = mq_i4_moe_gemv::emit_module(arch).unwrap();
-            let mut units: Vec<(String, String)> = emitted.iter().zip(SYMBOLS).map(|(e, symbol)| (format!("{} {symbol}", arch.name()), e.s_text.clone())).collect();
+            let mut units: Vec<(String, String)> = emitted.iter().zip(mq_i4_moe_gemv::module_specs(arch)).map(|(e, s)| (format!("{} {}", arch.name(), s.symbol()), e.s_text.clone())).collect();
             units.push((format!("{} (module)", module(arch)), module_text));
             total += units.len();
             for (i, (name, text)) in units.iter().enumerate() {

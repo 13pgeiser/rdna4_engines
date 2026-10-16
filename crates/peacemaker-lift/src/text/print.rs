@@ -112,6 +112,15 @@ pub fn canonical(inst: &Inst, arch: Arch) -> Result<String, PrintError> {
         }
         parts.push(text);
     }
+    // `s_fmamk_f32 D, S0, K, S1` / `s_fmaak_f32 D, S0, S1, K`: the K constant is
+    // the instruction's literal word, spelled as the fourth operand.
+    if matches!(row.name, "s_fmamk_f32" | "s_fmaak_f32") {
+        let literal = inst.literal.ok_or_else(|| {
+            PrintError::Unspellable(format!("{} is missing its literal word", row.name))
+        })?;
+        let at = if row.name == "s_fmamk_f32" { 2 } else { parts.len() };
+        parts.insert(at.min(parts.len()), format!("{literal:#x}"));
+    }
     // Trailing operands the grammar does not declare (DS offsets, VMEM
     // offset/offen/scope) join with a space, exactly as objdump does.
     let mut tail: Vec<String> = Vec::new();

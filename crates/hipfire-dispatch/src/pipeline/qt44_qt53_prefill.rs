@@ -125,7 +125,7 @@ fn slab_k2(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
         && p.recipe.bf16_round_trip()
         && p.x_norm_batch.dtype == DType::F32
         && p.down_k == p.mi
-        && gpu.route_rows(p.batch_size) > super::slab_route::K1_MAX_ROWS
+        && gpu.route_rows(p.batch_size) > gpu.few_row_limit()
 }
 
 /// Geometry gate of whichever grouped route `p` declares.
@@ -475,7 +475,8 @@ fn batch_projection(
         DType::MQ4G128V2 => {
             hip(gpu.gemm_mq4g128v2_batched(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
-        // Qwen4's few-row decode copies: rows <= 8 run the decode GEMV per row.
+        // Qwen4's few-row decode copies: rows within `Gpu::few_row_limit` run
+        // the decode GEMV per row.
         DType::Q8_0 => {
             hip(gpu.gemm_q8_0_batched_f32_chunked(weight.buf, x, y, weight.m, weight.k, batch_size))
         }
@@ -513,12 +514,16 @@ pub(crate) fn router_projection(
     )
 }
 
-/// Whether a few-row forward (<= 8 rows, where the grouped BF16 row kernel is
-/// bitwise each projection's own) projects the router together with the
-/// all-BF16 shared selector/gate/up in one launch (the shared gate/up stage,
-/// which the route always runs right after the router stage).
+/// Whether a few-row forward (route rows within `Gpu::few_row_limit`: the
+/// historic 8, or the verify scope's admitted exact cap, where the grouped
+/// BF16 row kernel is bitwise each projection's own) projects the router
+/// together with the all-BF16 shared selector/gate/up (every K the router's)
+/// in one x4 launch (the shared gate/up stage, which the route always runs
+/// right after the router stage and before route selection). Row counts keep
+/// `route_rows`, never the actual `batch_size`. A missing shared branch or a
+/// mismatched K keeps the independent router launch.
 fn router_with_shared(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    gpu.route_rows(p.batch_size) <= 8
+    gpu.route_rows(p.batch_size) <= gpu.few_row_limit()
         && p.prelude.router.dtype == DType::BF16
         && p.prelude.shared.as_ref().is_some_and(|shared| {
             [
@@ -527,24 +532,34 @@ fn router_with_shared(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
                 &shared.weights.up,
             ]
             .iter()
-            .all(|w| w.dtype == DType::BF16)
+            .all(|w| w.dtype == DType::BF16 && w.k == p.prelude.router.k)
         })
 }
 
-/// Whether a few-row forward on gfx11+ projects the router together with the
-/// BF16 shared selector (one K, both reading `x_norm_batch`) in one grouped
-/// BF16 row launch when the shared gate/up are not BF16 (the decode Q8
-/// copies). The grouped row kernel computes each projection bitwise as its
-/// own launch; the shared gate/up stage runs right after the router stage.
+/// Whether a few-row forward (route rows within `Gpu::few_row_limit`) on
+/// gfx11+ projects the router together with the BF16 shared selector (one K,
+/// both reading `x_norm_batch`) in one grouped BF16 row launch when the
+/// shared gate/up are not BF16 (the gfx1151 Q8 decode copies, which keep
+/// their own separate Q8 x2 launch; the BF16 router/selector weights are
+/// never read through a Q8 interpretation). The grouped row kernel computes
+/// each projection bitwise as its own launch; the shared gate/up stage runs
+/// right after the router stage.
 fn router_with_selector(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
-    (2..=8).contains(&gpu.route_rows(p.batch_size))
+    (2..=gpu.few_row_limit()).contains(&gpu.route_rows(p.batch_size))
         && gpu.arch_caps.has_gfx11_plus_simt()
         && !router_with_shared(gpu, p)
         && p.prelude.router.dtype == DType::BF16
         && p.x_norm_batch.dtype == DType::F32
         && p.prelude.shared.as_ref().is_some_and(|shared| {
-            shared.weights.selector.dtype == DType::BF16
-                && shared.weights.selector.k == p.prelude.router.k
+            // Only the shared gate/up stage's mixed-dtype branch projects the
+            // fused pair; an all-BF16 shared set (whatever its K) takes the
+            // grouped branch, which never issues the router.
+            let weights = &shared.weights;
+            ![&weights.selector, &weights.gate, &weights.up]
+                .iter()
+                .all(|w| w.dtype == DType::BF16)
+                && weights.selector.dtype == DType::BF16
+                && weights.selector.k == p.prelude.router.k
         })
 }
 
@@ -555,7 +570,7 @@ fn router_with_selector(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 /// of `x_norm_batch` instead of converting it a second time.
 fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     let router = &p.prelude.router;
-    gpu.route_rows(p.batch_size) > 8
+    gpu.route_rows(p.batch_size) > gpu.few_row_limit()
         && p.x_norm_batch.dtype == DType::F32
         && router.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(router.buf, router.k, p.batch_size)
@@ -1611,7 +1626,7 @@ pub(crate) fn activation(
 /// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
 /// slot order.
 fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    use_path2 && gpu.route_rows(p.batch_size) <= 8 && !down_wmma(gpu, p)
+    use_path2 && gpu.route_rows(p.batch_size) <= gpu.few_row_limit() && !down_wmma(gpu, p)
 }
 
 /// Release the stage immediately after the routed down, before combine.
@@ -2007,7 +2022,15 @@ fn slab_down(
     if !slab_k2(gpu, p) {
         let rot = f32_view(p.rot_batch, 0, total_slots * p.mi);
         let y0 = f32_view(p.down_expanded, 0, total_slots * p.down_m);
-        return super::slab_route::k1_down(gpu, buckets, p.expert_down_ptrs, &rot, &y0, p.batch_size);
+        return super::slab_route::k1_down(
+            gpu,
+            buckets,
+            p.topk_indices,
+            p.expert_down_ptrs,
+            &rot,
+            &y0,
+            p.batch_size,
+        );
     }
     let xq = hip(gpu.qwen4_moe_rotate128_i4(
         p.y_gate_up_grouped,

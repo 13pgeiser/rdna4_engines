@@ -479,6 +479,10 @@ const PINNED_BRANCH: &[Pinned] = &[
 const PINNED_EDGES: &[Pinned] = &[
     ("v_fmamk_f32 v1, v2, 0x3f800000, v3", &[0x58020702, 0x3f800000], &[0x58020702, 0x3f800000], &[0x58020702, 0x3f800000]),
     ("v_fmaak_f32 v1, v2, v3, 0x3f800000", &[0x5a020702, 0x3f800000], &[0x5a020702, 0x3f800000], &[0x5a020702, 0x3f800000]),
+    ("s_fmamk_f32 s18, s13, 0x3fb8aa3b, s18", &[], &[0xa312120d, 0x3fb8aa3b], &[0xa312120d, 0x3fb8aa3b]),
+    ("s_fmamk_f32 s4, s0, 0xbfb8aa3b, s4", &[], &[0xa3040400, 0xbfb8aa3b], &[0xa3040400, 0xbfb8aa3b]),
+    ("s_fmamk_f32 s70, s68, 0xbfb8aa3b, s70", &[], &[0xa3464644, 0xbfb8aa3b], &[0xa3464644, 0xbfb8aa3b]),
+    ("s_fmaak_f32 s3, s3, s5, 0x358637bd", &[], &[0xa2830503, 0x358637bd], &[0xa2830503, 0x358637bd]),
     ("v_pk_fma_f16 v1, v2, v3, v4 op_sel:[0,1,0]", &[0xcc0e5001, 0x1c120702], &[0xcc0e5001, 0x1c120702], &[0xcc0e5001, 0x1c120702]),
     ("v_pk_fma_f16 v1, v2, v3, v4 op_sel_hi:[1,0,1]", &[0xcc0e4001, 0x0c120702], &[0xcc0e4001, 0x0c120702], &[0xcc0e4001, 0x0c120702]),
     ("v_pk_fma_f16 v1, v2, v3, v4 op_sel:[1,0,1] op_sel_hi:[0,1,0] neg_lo:[1,0,0] neg_hi:[0,0,1]", &[0xcc0e2c01, 0x34120702], &[0xcc0e2c01, 0x34120702], &[0xcc0e2c01, 0x34120702]),
@@ -562,6 +566,48 @@ fn numeric_branches_match_llvm_mc_and_reject_out_of_range() {
 #[test]
 fn embedded_literal_packed_swizzle_and_buffer_edges_match_llvm_mc() {
     check_pinned(PINNED_EDGES, &[Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201]);
+}
+
+/// `s_fmamk_f32 D, S0, K, S1` / `s_fmaak_f32 D, S0, S1, K` (gfx1151 and gfx1201):
+/// the K constant is the instruction's literal word and S1 the third table
+/// slot. Parse, canonical text and codec decode agree, including the pinned
+/// BF16 words `A3040400 BFB8AA3B` and the remapped `s70`/`s68` spelling.
+#[test]
+fn scalar_fmamk_fmaak_literal_roundtrips_on_gfx1151_and_gfx1201() {
+    for (text, words) in [
+        ("s_fmamk_f32 s4, s0, 0xbfb8aa3b, s4", &[0xa304_0400, 0xbfb8_aa3b][..]),
+        ("s_fmamk_f32 s4, s0, 0xb2a5705f, s4", &[0xa304_0400, 0xb2a5_705f][..]),
+        ("s_fmamk_f32 s70, s68, 0xbfb8aa3b, s70", &[0xa346_4644, 0xbfb8_aa3b][..]),
+        ("s_fmamk_f32 s70, s68, 0xb2a5705f, s70", &[0xa346_4644, 0xb2a5_705f][..]),
+        ("s_fmamk_f32 s5, s6, 0x3f800000, s7", &[0xa305_0706, 0x3f80_0000][..]),
+        ("s_fmaak_f32 s3, s3, s5, 0x358637bd", &[0xa283_0503, 0x3586_37bd][..]),
+    ] {
+        for arch in [Arch::Gfx1151, Arch::Gfx1201] {
+            let inst = parse_line(text, arch).unwrap_or_else(|e| panic!("{arch:?} {text}: {e}"));
+            assert_eq!(inst.operands.len(), 3, "{arch:?} {text}: three register slots");
+            assert_eq!(inst.literal, Some(words[1]), "{arch:?} {text}: literal word");
+            assert_eq!(canonical(&inst, arch).expect("prints"), text, "{arch:?} canonical");
+            assert_eq!(encode_for_arch(arch, &inst).as_deref(), Ok(words), "{arch:?} {text}: words");
+            let (decoded, n) = match arch {
+                Arch::Gfx1201 => gfx12::decode(words),
+                _ => gfx11::decode(arch, words),
+            }
+            .unwrap_or_else(|e| panic!("{arch:?} decode {text}: {e}"));
+            assert_eq!(n, 2);
+            assert_eq!(decoded.op, inst.op);
+            assert_eq!(decoded.operands, inst.operands, "{arch:?} {text}: decoded operands");
+            assert_eq!(decoded.literal, inst.literal);
+            assert_eq!(canonical(&decoded, arch).expect("decoded prints"), text, "{arch:?} decoded canonical");
+        }
+    }
+    // Source accumulator stays S1: the third register is not forced to the destination.
+    let inst = parse_line("s_fmamk_f32 s5, s6, 0x3f800000, s7", Arch::Gfx1151).unwrap();
+    assert_eq!(format!("{}", inst.operands[2]), "s7");
+    // Literal must be hex, and a missing fourth operand is still a count error.
+    for bad in ["s_fmamk_f32 s4, s0, 1.0, s4", "s_fmamk_f32 s4, s0, s4", "s_fmaak_f32 s3, s3, s5, 7"] {
+        assert!(parse_line(bad, Arch::Gfx1151).is_err(), "must reject {bad:?}");
+    }
+    assert!(parse_line("s_fmamk_f32 s4, s0, 0xbfb8aa3b, s4", Arch::Gfx1100).is_err());
 }
 
 /// gfx1201 buffer `offen offset th scope` words from llvm-mc. llvm-mc only

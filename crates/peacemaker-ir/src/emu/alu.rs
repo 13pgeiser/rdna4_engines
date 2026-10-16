@@ -734,6 +734,7 @@ fn vector(arch: Arch, name: &str, o: &[Operand], i: &Inst, s: &State, lane: usiz
         "v_lshrrev_b32" => (Class::Int, raw(1)? >> (raw(0)? & 31)),
         "v_ashrrev_i32" => (Class::Int, ((raw(1)? as i32) >> (raw(0)? & 31)) as u32),
         "v_lshl_add_u32" => (Class::Int, (raw(0)? << (raw(1)? & 31)).wrapping_add(raw(2)?)),
+        "v_add_lshl_u32" => (Class::Int, raw(0)?.wrapping_add(raw(1)?) << (raw(2)? & 31)),
         "v_lshl_or_b32" => (Class::Int, (raw(0)? << (raw(1)? & 31)) | raw(2)?),
         "v_mul_lo_u32" => (Class::Int, raw(0)?.wrapping_mul(raw(1)?)),
         "v_mul_hi_u32" => (Class::Int, (u64::from(raw(0)?) * u64::from(raw(1)?) >> 32) as u32),
@@ -1447,6 +1448,10 @@ fn f32_class(a: u32) -> u32 {
 fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     let o = &i.operands;
     let rd = |s: &State, idx: usize| -> Result<u32> { s.read(o.get(idx).ok_or("missing scalar operand")?, 0, 0) };
+    if name == "s_cselect_b64" {
+        let (a, b) = (s.read_wide(o.get(1).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?, s.read_wide(o.get(2).ok_or("missing scalar operand")?, 0, Wide::Unsigned)?);
+        return s.put_wide(o.first().ok_or("missing scalar operand")?, 0, if s.scc { a } else { b });
+    }
     if let Some(rest) = name.strip_prefix("s_cmp_") {
         let (p, ty) = rest.split_once('_').ok_or_else(|| format!("unsupported scalar compare {name}"))?;
         let p = match p {

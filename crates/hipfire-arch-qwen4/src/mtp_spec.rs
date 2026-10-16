@@ -451,6 +451,44 @@ impl Qwen4Bundle {
     }
 }
 
+/// Developer hooks of the wide-verify oracle (`wide_verify_oracle`): thin
+/// crate-internal entry points onto the private verify transaction, compiled
+/// only for the parity tools. No production route calls them.
+#[cfg(feature = "reference-parity")]
+impl Qwen4Bundle {
+    /// [`Self::verify_block_rows`] exactly: the production verify transaction.
+    pub(crate) fn dev_verify_block_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        read_picks: bool,
+    ) -> Result<Vec<u32>, String> {
+        self.verify_block_rows(gpu, block, position, scratch, read_picks)
+    }
+
+    /// Rewind a finished verify without committing: restore the scratch's
+    /// target snapshot ticket (the state the verify started from) and consume
+    /// it, the first step of `commit_prefix`'s partial-accept path minus the
+    /// replay.
+    pub(crate) fn dev_rollback_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        let snapshot = scratch
+            .as_any_mut()
+            .downcast_mut::<Qwen4SpecScratch>()
+            .ok_or("Qwen4 rollback: scratch is not Qwen4SpecScratch")?
+            .target_snapshot
+            .take()
+            .ok_or("Qwen4 rollback: target snapshot is not active")?;
+        self.restore(gpu, snapshot)
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl SpecTarget for Qwen4Bundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
@@ -3341,17 +3379,21 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             let config = &bundle.config;
             if native_mtp_row_capture(gpu, config) {
-                if copy_lane {
-                    bundle
-                        .state
-                        .ensure_row_capture(gpu, capacity + 1, config.linear_conv_kernel_dim - 1)
-                        .map_err(|error| error.to_string())?;
+                // Verify blocks up to the arch's row-exact limit keep capture
+                // rollback: the ring holds the wider of the window (a copy
+                // lane's `proposal_capacity + 1`, else an MTP window
+                // `max_k + 1`) and the per-GPU row-exact verify rows.
+                let window_rows = if copy_lane {
+                    capacity + 1
                 } else {
-                    bundle
-                        .state
-                        .ensure_row_capture(gpu, self.max_k + 1, config.linear_conv_kernel_dim - 1)
-                        .map_err(|error| error.to_string())?;
-                }
+                    self.max_k + 1
+                };
+                let capture_rows =
+                    window_rows.max(crate::gpu_forward::qwen4_row_exact_verify_rows(gpu));
+                bundle
+                    .state
+                    .ensure_row_capture(gpu, capture_rows, config.linear_conv_kernel_dim - 1)
+                    .map_err(|error| error.to_string())?;
             }
             bundle.spec_chunk_rows().unwrap_or(1).max(1)
         };

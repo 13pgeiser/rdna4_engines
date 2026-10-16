@@ -52,6 +52,7 @@ s_cmp_lg_u32	alu
 s_cmp_lt_i32	alu
 s_cmp_lt_u32	alu
 s_cselect_b32	alu
+s_cselect_b64	alu
 s_ctz_i32_b32	alu
 s_delay_alu	wait
 s_endpgm	control
@@ -259,3 +260,12 @@ v_cmp_eq_f32_e64	alu
 v_mbcnt_lo_u32_b32	alu
 v_readlane_b32	alu
 v_writelane_b32	alu
+# K1 wide verify (mq_i4_moe_gemv): global dword/byte/half accesses, cross-lane bpermute and the few ALU forms its narrow and wide entries use.
+ds_bpermute_b32	memory
+global_load_b32	memory
+global_load_u16	memory
+global_load_u8	memory
+global_store_b32	memory
+v_add_lshl_u32	alu
+v_cmpx_eq_u32_e32	alu
+v_cvt_f32_i32_e32	alu

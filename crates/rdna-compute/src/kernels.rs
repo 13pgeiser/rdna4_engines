@@ -4288,12 +4288,16 @@ pub const QSA_GATHER_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qsa_ga
 pub const DFLASH_SAMPLED_ACCEPT_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/dflash_sampled_accept_pm_gfx1201.hxaco");
 /// Certified builder module of the live QSA selector pair
 /// (`peacemaker-isa emit --kernel qsa_select --epi all --arch gfx1151`, M7
-/// obligation-free): the rows16 F32 score and the select-from-scores kernels,
-/// with the kernargs, grids, blocks and output bytes of
+/// obligation-free): the rows16 and rows32 F32 score kernels and the
+/// select-from-scores kernel, with the kernargs, grids, blocks and output bytes of
 /// `indexed_attention_select_scores_rows16_f32` /
-/// `indexed_attention_select_from_scores` in `kernels/src/tensor_ops.hip`.
+/// `indexed_attention_select_from_scores` in `kernels/src/tensor_ops.hip`
+/// (`indexed_attention_select_scores_rows32_f32_pm_gfx1151` is the rows16
+/// kernel with the row tile 32 and grid y `ceil(rows/32)`; it has no hipcc twin).
 /// Default on (`HIPFIRE_QWEN4_QSA_SCORE_PM=0` / `HIPFIRE_QWEN4_QSA_SELECT_PM=0`
-/// keep the hipcc kernels).
+/// keep the hipcc kernels). Regenerated with the `s_code_end` guard and the rows32
+/// score (`--epi all --bundle … --host-target host-x86_64-unknown-linux-gnu-`);
+/// SHA-256 `fa80eac5dca2d8c5d69745c13f664db2a70ce250adb9d6d8066d7ac0b5cee4db`.
 pub const QSA_SELECT_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qsa_select_pm_gfx1151.hxaco");
 /// Certified builder (PeaceMaker) modules of the production CPU-AR sampling
 /// kernels, gfx1151 and gfx1201 only (`peacemaker-isa emit --kernel
@@ -4354,7 +4358,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] =
 /// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
 /// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
 pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
-    "11d0c2c7e423ef211e8c32202d20deea3d317b7f2a7ae538b069b56978c60a22";
+    "8ea2cac1b40aae940b26da08348d28db6f2fb67cc4797aeda6347499303be945";
 /// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
 /// `crates/peacemaker-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
 /// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
@@ -4368,22 +4372,35 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
-/// Certified builder modules of the few-row MQ4G256V2 projection kernel
-/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`peacemaker-isa emit --kernel
-/// mq4_rows_x4 --arch gfx{1151,1201}`): MTP verify (2..=8 activation rows) of four
-/// MQ4G256V2 trunk projections per launch, each output bitwise the AR decode GEMV
-/// `gemv_mq4g256v2` (96-byte kernarg: A0..A3, x, y0..y3, M0..M3, K, B; grid
-/// `[sum(ceil(M_i/2)), 1, 1]`, block 32). Default on
-/// (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
-/// SHA-256 a622eebb59489e4b553ccac3919f2a159c1f7bbcab2a29a798dca7920d110636
+/// Certified builder modules of the few-row MQ4G256V2 projection kernels (`peacemaker-isa
+/// emit --kernel mq4_rows_x4 --arch gfx{1151,1201}`), each module three exports:
+/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (MTP verify, 2..=8 activation rows; grid
+/// `[sum(ceil(M_i/2)), 1, 1]`, block 32) and the row-exact wide twins
+/// `gemv_mq4g256v2_rows_x4_wide_r{16,32}_pm_gfx{1151,1201}` (rows 1..=16 / 1..=32; grid
+/// `[sum(ceil(M_i/8)), 1, 1]`, block 256, static LDS 8192, one output column per wave).
+/// All three take the same 96-byte kernarg (A0..A3, x, y0..y3, M0..M3, K, B/R) and give
+/// every output bitwise the AR decode GEMV `gemv_mq4g256v2` on that activation row. Default
+/// on (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
+/// SHA-256 286c86739400f69859ea22c32a9c1e0df2f0569f610ca833085ddd18d2f4ffc7
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
 /// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
-/// SHA-256 f0f42944858fececd299f972c63c1ea3c0f57dcd007d38a99877eb209afbe88b
+/// SHA-256 d73f1431721d52b0610fa82a64b0042c2daae944fcc4b30e3669ff05c5bb1306
 /// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
 pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
+/// gfx1151 BF16 row-exact wide GEMV builders: ordinary x4 and HC k4, each at
+/// capacities 16/32 (runtime R). Ordinary: ABI96, grid sum ceil(Mi/8), LDS8192;
+/// HC: ABI48, grid ceil(M/2), LDS16384. All use block256, wave32 and WGP mode.
+/// The HC epilogue preserves the decode object's scalar fold/scale and full
+/// exp/divide instruction DAG. Hardware byte/state admission is a separate gate.
+/// Emitter/proof/shape/decode receipts: `kernels/bf16_rows_wide_pm_gfx1151.*`.
+pub const BF16_ROWS_WIDE_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/bf16_rows_wide_pm_gfx1151.hxaco");
+/// SHA-256 of [`BF16_ROWS_WIDE_PM_GFX1151`], checked before image admission.
+pub const QWEN4_BF16_ROWS_WIDE_PM_GFX1151_SHA256: &str =
+    "f1d14ba22190a6be4e85bc5905ed240d31395c51f7a3d9583d21fb09e55a4122";
 /// Certified builder module of gfx1151's fused Flash-Next shared-expert gate/up
 /// (`peacemaker-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
 /// obligation-free): one launch of `qwen4_shared_gu_pm_gfx1151_{w8,w4}` replaces the
@@ -4414,10 +4431,13 @@ pub const MTP_DENSE_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp
 /// the emitter after its source lands (`kernels/mtp_q8_det_pm_gfx1151.hxaco`); its SHA-256 is
 /// recorded in the validation receipt.
 pub const MTP_Q8_DET_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mtp_q8_det_pm_gfx1151.hxaco");
-/// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
-/// selector pair, with the F32 score kernel's kernargs, grid and block.
+/// Certified builder rows16 and rows32 BF16 pooled-key score kernels for the live QSA
+/// selector pair, with the F32 score kernel's kernargs, grid and block (rows32:
+/// `indexed_attention_select_scores_rows32_bf16_pm_gfx1151`, row tile 32, grid y `ceil(rows/32)`).
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with
 /// `HIPFIRE_QWEN4_QSA_SCORE_PM=0` retaining the fused hipcc BF16 selector.
+/// Emitted by `--epi bf16` the same way; SHA-256
+/// `b8a33ae8a2b7d2197fc4a8fdebc0c3cb66c87339141836bd48a0b6a69d7745cb`.
 pub const QSA_SELECT_BF16_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qsa_select_bf16_pm_gfx1151.hxaco");
 /// gfx1201 per-header symmetric-grid checker of the route.
@@ -4444,6 +4464,14 @@ pub const MQ_I4_MOE_GEMV_PM_GFX1201: &[u8] =
 /// gfx1151`): the same four symbols and 88-byte kernarg ABI as the gfx1201 module above.
 pub const MQ_I4_MOE_GEMV_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco");
+/// SHA-256 pin of the gfx1201 K1 module image: twelve symbols (the four C8 entries plus their `_c16` / `_c32` wide twins)
+/// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco`).
+pub const MQ_I4_MOE_GEMV_PM_GFX1201_SHA256: &str =
+    "d2b59a3621044836d40dc50a2c9cd463b299076c332756f3f1744ebc809d542a";
+/// SHA-256 pin of the gfx1151 K1 module image: the same twelve symbols
+/// (`sha256sum kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco`).
+pub const MQ_I4_MOE_GEMV_PM_GFX1151_SHA256: &str =
+    "354655627ad87ab42c7dc64e907a3ce2e4e31a51d12af1e3e480c650f3041d00";
 /// Certified builder module of the MQ3-I4 NT1 entries on gfx1151
 /// (`peacemaker-isa emit --kernel qwen4_moe_sym_w3 --epi all --arch gfx1151`): module
 /// `qwen4_moe_iu4_sym_w3_pm_gfx1151`, the gfx1201 module's four symbols with `gfx1151` in

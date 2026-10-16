@@ -24,6 +24,21 @@
 //!   an all-invalid row inside every batch of two or more rows). Every output
 //!   starts as a NaN sentinel; batched outputs are also compared with the exact
 //!   reference.
+//! * `qsa_splitk_wide_rows_*_bitwise_individual` (wide verify, design 7B): the
+//!   production geometry (compress 4, budget 512, capacity 2051, F32 K/V,
+//!   24 heads / 2 KV heads / head_dim 256) at end depths 8192 / 32768 / 131072 /
+//!   262144 (full cache capacity = depth), end displacements 0..3 (selected
+//!   lengths 2048..2051 across every tail phase). Batched n = 1..=32 rows
+//!   (every n at displacement 0, ragged 1/2/3/4/5/8/9/15/16/17/31/32 elsewhere)
+//!   equal bit for bit the n single-row launches of the same (splits, layout):
+//!   production S32/layout 2, lab S16/S48 layout 2 and layouts 0/1 at S8, plus
+//!   the production dispatcher (`indexed_attention_attention_batch`, split-K on
+//!   gfx1151, the per-head kernels on gfx1201). Selections mix padded, garbage-
+//!   after-ell, invalid-token and all-invalid rows; K/V rows no earlier row may
+//!   read (>= its visible count) are set huge and the earlier rows must not
+//!   change. The wide gate is set inside `launch` through
+//!   `Gpu::set_wide_verify_rows` (32 for a batched launch, 0 for one row), never
+//!   by env. The existing batched tests now run rows 1..=32.
 //! * `qsa_splitk_timing_table`: hipEvent timing (100 calls per sample, median
 //!   of 5, warmup) of the incumbent and every split/layout at rows 1, lengths
 //!   1131 and 8188 (the longest length whose incumbent still fits the 64 KiB
@@ -52,7 +67,11 @@ use rdna_compute::tensor_ops::{
     indexed_attention_attention_splitk_for_test, IndexedAttentionAttentionBatch, QsaKvFormat,
     QSA_DECODE_SPLITK_SCORING_LAYOUT, QSA_DECODE_SPLITK_SPLITS,
 };
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Rows of the heterogeneous batched configurations.
+const MAX_BATCH_ROWS: usize = WIDE_VERIFY_MAX_ROWS;
 
 const NH: usize = 24;
 const NKV: usize = 2;
@@ -198,6 +217,8 @@ fn valid_count(row: &[i32], sel_len: usize, visible: usize) -> usize {
 struct Dev {
     keys: GpuTensor,
     values: GpuTensor,
+    /// Cache rows (`full_capacity` of every launch).
+    full_cap: usize,
 }
 
 fn make_dev(gpu: &mut Gpu) -> Dev {
@@ -205,7 +226,7 @@ fn make_dev(gpu: &mut Gpu) -> Dev {
     let n = FULL_CAP * NKV * HD;
     let keys = gpu.upload_f32(&fill(&mut rng, n, 1.0), &[n]).expect("upload keys");
     let values = gpu.upload_f32(&fill(&mut rng, n, 1.0), &[n]).expect("upload values");
-    Dev { keys, values }
+    Dev { keys, values, full_cap: FULL_CAP }
 }
 
 fn sentinel(gpu: &mut Gpu, n: usize) -> GpuTensor {
@@ -268,10 +289,13 @@ fn launch(
         budget_blocks: sh.budget,
         compress: sh.compress,
         capacity: sh.capacity,
-        full_capacity: FULL_CAP,
+        full_capacity: dev.full_cap,
         format: QsaKvFormat::F32,
         shape_selected: sh.capacity,
     };
+    // A verify forward of two or more rows runs row-exact to the widest rows;
+    // a one-row launch is the decode itself.
+    gpu.set_wide_verify_rows(if sh.rows >= 2 { WIDE_VERIFY_MAX_ROWS } else { 0 });
     let result = match kind {
         Kind::Exact => indexed_attention_attention_batch_exact(gpu, &p),
         Kind::Production => indexed_attention_attention_batch(gpu, &p),
@@ -279,6 +303,7 @@ fn launch(
             indexed_attention_attention_splitk_for_test(gpu, &p, splits, layout)
         }
     };
+    gpu.set_wide_verify_rows(0);
     if let Err(e) = result {
         panic!("{kind:?} failed for {sh:?}: {e:?}");
     }
@@ -553,7 +578,7 @@ struct BatchCfg {
     capacity: usize,
 }
 
-/// Eight-row windows (`rows` 1..8 take the prefix) with heterogeneous
+/// `MAX_BATCH_ROWS`-row windows (`rows` 1..=32 take the prefix) with heterogeneous
 /// `selected_len`: S > len, budget at the block boundary (selected_len drops when a
 /// block completes), empty slices, capacity clamp, and the long contexts.
 const BATCH_CFGS: [BatchCfg; 9] = [
@@ -588,10 +613,10 @@ fn batch_host(cfg: &BatchCfg, force: Option<Mode>) -> (Vec<f32>, Vec<Vec<i32>>, 
             + (cfg.position_start * 13 + cfg.compress) as u64 * 7919
             + cfg.budget as u64 % 1009,
     );
-    let q = make_q(&mut rng, 8);
+    let q = make_q(&mut rng, MAX_BATCH_ROWS);
     let mut sel = Vec::new();
     let mut lens = Vec::new();
-    for r in 0..8 {
+    for r in 0..MAX_BATCH_ROWS {
         let visible = cfg.position_start + r + 1;
         let sel_len = selected_len(visible, cfg.budget, cfg.compress, cfg.capacity);
         lens.push(sel_len);
@@ -625,14 +650,14 @@ fn qsa_splitk_batched_rows_bitwise_individual() {
             "{}: selected_len must be heterogeneous: {lens:?}",
             cfg.name
         );
-        // The single-row tensors of all eight rows.
-        let singles: Vec<(GpuTensor, GpuTensor)> = (0..8)
+        // The single-row tensors of all MAX_BATCH_ROWS rows.
+        let singles: Vec<(GpuTensor, GpuTensor)> = (0..MAX_BATCH_ROWS)
             .map(|r| {
                 let q_row = &q[r * 2 * NH * HD..(r + 1) * 2 * NH * HD];
                 (upload_q(&mut gpu, q_row), upload_selected(&gpu, &sel[r..r + 1]))
             })
             .collect();
-        for rows in 1..=8usize {
+        for rows in 1..=MAX_BATCH_ROWS {
             let sh = batch_shape(cfg, rows);
             let label = format!("batched {} rows={rows}", cfg.name);
             let outs = check(
@@ -684,13 +709,282 @@ fn qsa_splitk_all_invalid_zero() {
     }
     for cfg in &BATCH_CFGS {
         let (q, sel, _) = batch_host(cfg, Some(Mode::AllInvalid));
-        for rows in 1..=8usize {
+        for rows in 1..=MAX_BATCH_ROWS {
             let sh = batch_shape(cfg, rows);
             let label = format!("all-invalid batched {} rows={rows}", cfg.name);
             check(&mut gpu, &dev, &sh, &q[..rows * 2 * NH * HD], &sel[..rows], &combos, &label, &mut stats);
         }
     }
     stats.finish(&combos);
+}
+
+// ---------------------------------------------------------------------------
+// Wide verify: production geometry, n = 1..=32 rows, 8K..256K end depths
+// ---------------------------------------------------------------------------
+
+const PROD_COMPRESS: usize = 4;
+const PROD_BUDGET: usize = 512;
+const PROD_CAPACITY: usize = 2051;
+const WIDE_ROWS_RAGGED: [usize; 12] = [1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32];
+/// (splits, layout) compared bitwise batched vs single-row: the production
+/// S32/layout 2, lab S16/S48 of layout 2 and the per-head layouts 0/1 at S8.
+const WIDE_COMBOS: [(usize, usize); 5] = [(32, 2), (16, 2), (48, 2), (8, 0), (8, 1)];
+
+/// Row `r`'s selection kind: mostly production-shaped lists (-1 padded), some
+/// with valid-looking tokens after the active length, some with invalid tokens
+/// inside it, every eleventh with no valid token at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WideRow {
+    Padded,
+    Garbage,
+    Mixed,
+    AllInvalid,
+}
+
+fn wide_row_kind(r: usize) -> WideRow {
+    if r % 11 == 10 {
+        return WideRow::AllInvalid;
+    }
+    match r % 4 {
+        1 => WideRow::Garbage,
+        2 => WideRow::Mixed,
+        _ => WideRow::Padded,
+    }
+}
+
+/// A token the kernel must reject: negative, in `[visible, full_cap)` or
+/// `>= full_cap`.
+fn wide_invalid_token(rng: &mut Rng, visible: usize, full_cap: usize) -> i32 {
+    match rng.below(3) {
+        0 => -1 - rng.below(100) as i32,
+        1 if visible < full_cap => (visible + rng.below((full_cap - visible).min(4096) as u64) as usize) as i32,
+        _ => (full_cap + rng.below(1000) as usize) as i32,
+    }
+}
+
+/// One production-geometry selected row for `visible` keys: `min(512, blocks)`
+/// random blocks expanded in token order, then the causal tail, then padding.
+fn gen_wide_row(rng: &mut Rng, kind: WideRow, visible: usize, full_cap: usize) -> Vec<i32> {
+    let blocks = visible / PROD_COMPRESS;
+    let chosen = PROD_BUDGET.min(blocks);
+    let ell = selected_len(visible, PROD_BUDGET, PROD_COMPRESS, PROD_CAPACITY);
+    let mut row = vec![-1i32; PROD_CAPACITY];
+    let mut i = 0usize;
+    for _ in 0..chosen {
+        let block = rng.below(blocks as u64) as usize;
+        for j in 0..PROD_COMPRESS {
+            row[i] = (block * PROD_COMPRESS + j) as i32;
+            i += 1;
+        }
+    }
+    for t in blocks * PROD_COMPRESS..visible {
+        row[i] = t as i32;
+        i += 1;
+    }
+    assert_eq!(i, ell, "active length of visible={visible}");
+    match kind {
+        WideRow::Padded => {}
+        WideRow::Garbage => {
+            for slot in row.iter_mut().skip(ell) {
+                *slot = valid_token(rng, visible);
+            }
+        }
+        WideRow::Mixed => {
+            for slot in row.iter_mut().take(ell) {
+                if rng.below(10) == 0 {
+                    *slot = wide_invalid_token(rng, visible, full_cap);
+                }
+            }
+        }
+        WideRow::AllInvalid => {
+            for slot in row.iter_mut() {
+                *slot = wide_invalid_token(rng, visible, full_cap);
+            }
+        }
+    }
+    row
+}
+
+/// K and V of `full_cap` rows, uploaded in chunks (no host copy of the cache).
+fn make_dev_long(gpu: &mut Gpu, full_cap: usize) -> Dev {
+    const CHUNK_ROWS: usize = 8192;
+    let row = NKV * HD;
+    let mut rng = Rng(0x5a5a_1001 ^ full_cap as u64);
+    let mut tensors = Vec::new();
+    for _ in 0..2 {
+        let t = gpu.alloc_tensor(&[full_cap * row], DType::F32).expect("alloc long K/V");
+        let mut first = 0usize;
+        while first < full_cap {
+            let rows = CHUNK_ROWS.min(full_cap - first);
+            let bytes: Vec<u8> =
+                fill(&mut rng, rows * row, 1.0).iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.hip.memcpy_htod_offset(&t.buf, first * row * 4, &bytes).expect("upload K/V chunk");
+            first += rows;
+        }
+        tensors.push(t);
+    }
+    let values = tensors.pop().unwrap();
+    let keys = tensors.pop().unwrap();
+    Dev { keys, values, full_cap }
+}
+
+/// Sets cache rows `[first_row, first_row + rows)` of K and V huge; returns the
+/// saved bytes for [`restore_rows`].
+fn perturb_rows(gpu: &mut Gpu, dev: &Dev, first_row: usize, rows: usize) -> [Vec<u8>; 2] {
+    let row_bytes = NKV * HD * 4;
+    let huge: Vec<u8> = (0..rows * NKV * HD).flat_map(|_| 3.0e18f32.to_le_bytes()).collect();
+    let mut saved = [vec![0u8; rows * row_bytes], vec![0u8; rows * row_bytes]];
+    for (slot, t) in [&dev.keys, &dev.values].into_iter().enumerate() {
+        gpu.hip.memcpy_dtoh_at(&mut saved[slot], &t.buf, first_row * row_bytes).expect("save rows");
+        gpu.hip.memcpy_htod_offset(&t.buf, first_row * row_bytes, &huge).expect("perturb rows");
+    }
+    saved
+}
+
+fn restore_rows(gpu: &mut Gpu, dev: &Dev, first_row: usize, saved: &[Vec<u8>; 2]) {
+    let row_bytes = NKV * HD * 4;
+    for (slot, t) in [&dev.keys, &dev.values].into_iter().enumerate() {
+        gpu.hip.memcpy_htod_offset(&t.buf, first_row * row_bytes, &saved[slot]).expect("restore rows");
+    }
+}
+
+/// One window `[e_end - n, e_end)`: every combo's batched launch against the n
+/// single-row launches (bitwise), no-valid-token rows exactly +0, and the
+/// future-cache perturbation. Returns the number of combo cases.
+fn wide_splitk_window(gpu: &mut Gpu, dev: &Dev, e_end: usize, n: usize, fails: &mut Vec<String>) -> usize {
+    let ps = e_end - n;
+    let sh = Shape {
+        rows: n,
+        position_start: ps,
+        budget: PROD_BUDGET,
+        compress: PROD_COMPRESS,
+        capacity: PROD_CAPACITY,
+    };
+    let mut rng = Rng(0x3000_0000 + (e_end * 131 + n) as u64 * 7919);
+    let q = make_q(&mut rng, n);
+    let sel: Vec<Vec<i32>> = (0..n)
+        .map(|r| gen_wide_row(&mut rng, wide_row_kind(r), ps + r + 1, dev.full_cap))
+        .collect();
+    let q_row = 2 * NH * HD;
+    let row_len = NH * HD;
+    let q_t = upload_q(gpu, &q);
+    let sel_t = upload_selected(gpu, &sel);
+    let singles: Vec<(GpuTensor, GpuTensor)> = (0..n)
+        .map(|r| (upload_q(gpu, &q[r * q_row..(r + 1) * q_row]), upload_selected(gpu, &sel[r..r + 1])))
+        .collect();
+    let mut kinds: Vec<Kind> = WIDE_COMBOS.iter().map(|&(s, l)| Kind::Split(s, l)).collect();
+    kinds.push(Kind::Production);
+    let mut cases = 0usize;
+    let mut base_out: Option<Vec<f32>> = None;
+    for kind in kinds {
+        let label = format!("wide E={e_end} n={n} {kind:?}");
+        let out = sentinel(gpu, n * row_len);
+        launch(gpu, kind, dev, &q_t, &sel_t, &out, &sh);
+        let got = download(gpu, &out);
+        gpu.free_tensor(out).expect("free out");
+        for r in 0..n {
+            let single = Shape { rows: 1, position_start: ps + r, ..sh };
+            let o1 = sentinel(gpu, row_len);
+            launch(gpu, kind, dev, &singles[r].0, &singles[r].1, &o1, &single);
+            let alone = download(gpu, &o1);
+            gpu.free_tensor(o1).expect("free single out");
+            let batched = &got[r * row_len..(r + 1) * row_len];
+            if let Some(i) = (0..row_len).find(|&i| alone[i].to_bits() != batched[i].to_bits()) {
+                fails.push(format!(
+                    "{label}: row {r} differs from its single-row launch at {i}: batched {:#010x} single {:#010x}",
+                    batched[i].to_bits(),
+                    alone[i].to_bits()
+                ));
+            }
+            if wide_row_kind(r) == WideRow::AllInvalid {
+                if batched.iter().any(|x| x.to_bits() != 0) {
+                    fails.push(format!("{label}: all-invalid row {r} is not +0"));
+                }
+            } else if batched.iter().any(|x| !x.is_finite()) {
+                fails.push(format!("{label}: row {r} not finite"));
+            }
+        }
+        if matches!(kind, Kind::Split(32, 2)) {
+            base_out = Some(got);
+        }
+        cases += 1;
+    }
+    // Cache rows no earlier row may read: rows [0, k) see only cache rows below
+    // `ps + k`, so they must not change when rows `ps + k..e_end` become huge.
+    if n >= 2 {
+        let k = n / 2;
+        let first = ps + k;
+        let saved = perturb_rows(gpu, dev, first, e_end - first);
+        let out = sentinel(gpu, n * row_len);
+        launch(gpu, Kind::Split(32, 2), dev, &q_t, &sel_t, &out, &sh);
+        let perturbed = download(gpu, &out);
+        gpu.free_tensor(out).expect("free out");
+        restore_rows(gpu, dev, first, &saved);
+        let base = base_out.expect("production split combo ran");
+        for r in 0..k {
+            let range = r * row_len..(r + 1) * row_len;
+            if let Some(i) = range.clone().find(|&i| perturbed[i].to_bits() != base[i].to_bits()) {
+                fails.push(format!(
+                    "wide E={e_end} n={n}: row {r} changed at {} when only cache rows >= {first} changed",
+                    i - r * row_len
+                ));
+            }
+        }
+        cases += 1;
+    }
+    gpu.free_tensor(q_t).expect("free q");
+    gpu.free_tensor(sel_t).expect("free selected");
+    for (a, b) in singles {
+        gpu.free_tensor(a).expect("free single q");
+        gpu.free_tensor(b).expect("free single selected");
+    }
+    cases
+}
+
+fn wide_splitk_depth(depth: usize) {
+    let mut gpu = Gpu::init().expect("gpu init");
+    println!("arch={} depth={depth}", gpu.arch);
+    let dev = make_dev_long(&mut gpu, depth);
+    let mut fails = Vec::new();
+    let (mut windows, mut cases) = (0usize, 0usize);
+    for disp in 0..PROD_COMPRESS {
+        let e_end = depth - disp;
+        let ns: Vec<usize> =
+            if disp == 0 { (1..=WIDE_VERIFY_MAX_ROWS).collect() } else { WIDE_ROWS_RAGGED.to_vec() };
+        for n in ns {
+            cases += wide_splitk_window(&mut gpu, &dev, e_end, n, &mut fails);
+            windows += 1;
+        }
+    }
+    println!("depth {depth}: {windows} windows, {cases} combo cases");
+    if !fails.is_empty() {
+        let shown: Vec<&str> = fails.iter().take(40).map(String::as_str).collect();
+        panic!("{} failure(s); first {}:\n{}", fails.len(), shown.len(), shown.join("\n"));
+    }
+}
+
+#[test]
+#[ignore = "needs a HIP device"]
+fn qsa_splitk_wide_rows_8k_bitwise_individual() {
+    wide_splitk_depth(8192);
+}
+
+#[test]
+#[ignore = "needs a HIP device"]
+fn qsa_splitk_wide_rows_32k_bitwise_individual() {
+    wide_splitk_depth(32768);
+}
+
+#[test]
+#[ignore = "needs a HIP device"]
+fn qsa_splitk_wide_rows_128k_bitwise_individual() {
+    wide_splitk_depth(131072);
+}
+
+#[test]
+#[ignore = "needs a HIP device"]
+fn qsa_splitk_wide_rows_256k_bitwise_individual() {
+    wide_splitk_depth(262144);
 }
 
 // ---------------------------------------------------------------------------

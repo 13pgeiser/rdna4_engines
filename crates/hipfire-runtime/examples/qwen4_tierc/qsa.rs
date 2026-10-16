@@ -94,6 +94,12 @@ pub const CASES: &[Q4Case] = &[
     Q4Case { name: "qwen4_qsa_fp8_fnuz_attention_batch_serial_equality", timeout_s: 600, run: case_fp8_attention_serial_equality },
     Q4Case { name: "qwen4_qsa_parallel_select_scores_rows8_f32", timeout_s: 900, run: parallel_rows8 },
     Q4Case { name: "qwen4_qsa_parallel_select_scores_rows16_f32", timeout_s: 900, run: parallel_rows16 },
+    Q4Case { name: "qwen4_qsa_parallel_select_scores_rows32_f32", timeout_s: 900, run: parallel_rows32 },
+    Q4Case { name: "qwen4_qsa_wide_decode_prologue_f32_one_row_bitwise", timeout_s: 1200, run: wide_prologue_f32 },
+    Q4Case { name: "qwen4_qsa_wide_decode_prologue_fp8_one_row_bitwise", timeout_s: 1200, run: wide_prologue_fp8 },
+    Q4Case { name: "qwen4_qsa_wide_pool_rope_f32_one_row_bitwise", timeout_s: 1200, run: wide_pool_f32 },
+    Q4Case { name: "qwen4_qsa_wide_pool_rope_bf16_one_row_bitwise", timeout_s: 1200, run: wide_pool_bf16 },
+    Q4Case { name: "qwen4_qsa_wide_attention_f32_one_row_bitwise", timeout_s: 1800, run: wide_attention_f32 },
     Q4Case { name: "qwen4_qsa_parallel_select_f32_batched", timeout_s: 1200, run: parallel_select_f32 },
     Q4Case { name: "qwen4_qsa_parallel_select_bf16_batched", timeout_s: 1200, run: parallel_select_bf16 },
     Q4Case { name: "qwen4_qsa_parallel_attention_f32_batched", timeout_s: 600, run: parallel_attention_batched },
@@ -1412,13 +1418,16 @@ fn case_pool_rope_bf16(gpu: &mut Gpu) -> Result<String, String> {
 }
 
 // ── parallel route: shared constants and helpers ─────────────────────────────
-/// Select row counts: 1 and 8 take rows8 at decode, 9 and 33 rows16 (33 = two
-/// full 16-row groups plus a one-row tail); the invariant prefill scope sends
-/// every count to rows16.
-const SEL_ROWS: [usize; 4] = [1, 8, 9, 33];
+/// Select row counts: 1 and 8 take rows8 at decode, 9..=16 rows16, 17..=32 the
+/// wide-verify rows32 tile (gfx1151) or rows16 groups; 33 = two full 16-row
+/// groups plus a one-row tail (not a verify width: no one-row oracle); the
+/// invariant prefill scope sends every count to rows16. 15/16/17/31/32 straddle
+/// the 16- and 32-row tile edges.
+const SEL_ROWS: [usize; 9] = [1, 8, 9, 15, 16, 17, 31, 32, 33];
 /// Attention row counts either side of the hg4 minimum (1 -> generic parallel,
-/// 2 -> hg4) and the hg12 minimum (15 -> hg4, 16 -> hg12).
-const ATTN_ROWS: [usize; 6] = [1, 2, 7, 15, 16, 33];
+/// 2 -> hg4), the hg12 minimum (15 -> hg4, 16 -> hg12) and the wide-verify
+/// widths (31, 32; 17 ragged).
+const ATTN_ROWS: [usize; 9] = [1, 2, 7, 15, 16, 17, 31, 32, 33];
 /// A budget past `select_from_scores`' 512-block cap: the launcher keeps the
 /// fused selector, and the past-radix-list-capacity rank-everything path runs.
 const FUSED_BUDGET_BLOCKS: usize = BUDGET_BLOCKS + 8;
@@ -1463,7 +1472,10 @@ fn public_select(
 ) -> Result<(Vec<i32>, Vec<i32>, bool), String> {
     let selected = raw_i32(gpu, &vec![-7777; r.rows * r.capacity])?;
     let mirror = raw_i32(gpu, &vec![-7777; r.capacity])?;
-    let persisted = indexed_attention_select_batch_mirrored(
+    // A verify forward of two or more rows runs row-exact to the widest rows;
+    // a one-row call is the decode itself.
+    gpu.set_wide_verify_rows(if r.rows >= 2 { WIDE_ROWS } else { 0 });
+    let launched = indexed_attention_select_batch_mirrored(
         gpu,
         &IndexedAttentionSelectBatch {
             query: r.query,
@@ -1483,8 +1495,9 @@ fn public_select(
             shape_blocks,
         },
         &mirror,
-    )
-    .map_err(e)?;
+    );
+    gpu.set_wide_verify_rows(0);
+    let persisted = launched.map_err(e)?;
     sync(gpu)?;
     let out = (down_i32(gpu, &selected)?, down_i32(gpu, &mirror)?, persisted);
     free_all(gpu, vec![selected, mirror])?;
@@ -1630,6 +1643,31 @@ fn select_route(gpu: &mut Gpu, bf16: bool) -> Result<String, String> {
                                 &mirror,
                                 &want_mirror,
                             ));
+                            // Wide verify (exact gfx1151 / gfx1201): the batch's selection is
+                            // bitwise the n one-row public calls at `position_start + r`.
+                            if !scope && rows <= WIDE_ROWS && wide_arch(gpu) {
+                                let mut one = Vec::with_capacity(rows * capacity);
+                                for r in 0..rows {
+                                    let row_t = up_f32(gpu, &query[r * IDX_W..(r + 1) * IDX_W])?;
+                                    let run1 = SelectRun {
+                                        query: &row_t,
+                                        pooled: run.pooled,
+                                        rows: 1,
+                                        blocks: (position_start + r + 1) / QSA_COMPRESS,
+                                        position_start: position_start + r,
+                                        budget,
+                                        capacity,
+                                    };
+                                    let (s1, _, _) = public_select(gpu, &run1, arm.shape_blocks)?;
+                                    one.extend(s1);
+                                    free_all(gpu, vec![row_t])?;
+                                }
+                                checks.push(exact_ints(
+                                    &format!("{label}/selected==one-row public calls"),
+                                    &selected,
+                                    &one,
+                                ));
+                            }
                         }
                     }
                     free_all(gpu, vec![query_t, pooled_t])?;
@@ -1704,14 +1742,33 @@ fn attn_public(
     position_start: usize,
     end: usize,
 ) -> Result<Vec<f32>, String> {
+    attn_public_parts(gpu, &t.q, &t.k, &t.v, &t.sel, g, rows, position_start, end)
+}
+
+/// [`attn_public`] over separate tensors (one-row calls reuse the K/V of a batch).
+#[allow(clippy::too_many_arguments)]
+fn attn_public_parts(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    sel: &GpuTensor,
+    g: AttnGeom,
+    rows: usize,
+    position_start: usize,
+    end: usize,
+) -> Result<Vec<f32>, String> {
     let out = nan_f32(gpu, rows * g.out_w())?;
-    indexed_attention_attention_batch_with_arena(
+    // A verify forward of two or more rows runs row-exact to the widest rows;
+    // a one-row call is the decode itself.
+    gpu.set_wide_verify_rows(if rows >= 2 { WIDE_ROWS } else { 0 });
+    let launched = indexed_attention_attention_batch_with_arena(
         gpu,
         &IndexedAttentionAttentionBatch {
-            q_with_gate: &t.q,
-            full_keys: &t.k,
-            full_values: &t.v,
-            selected: &t.sel,
+            q_with_gate: q,
+            full_keys: k,
+            full_values: v,
+            selected: sel,
             output: &out,
             rows,
             position_start,
@@ -1726,8 +1783,9 @@ fn attn_public(
             shape_selected: SEL_CAP,
         },
         None,
-    )
-    .map_err(e)?;
+    );
+    gpu.set_wide_verify_rows(0);
+    launched.map_err(e)?;
     sync(gpu)?;
     let got = down_f32(gpu, &out)?;
     free_all(gpu, vec![out])?;
@@ -3502,6 +3560,36 @@ fn parallel_rows(gpu: &mut Gpu, group_rows: usize, score_sym: &str) -> Result<St
             let twin = kind.twin_name();
             checks.push(exact_f32(&format!("{label}/scores=={twin}"), &scores, &want_masked));
             checks.push(exact_ints(&format!("{label}/selected=={twin}"), &selected, &want_sel));
+            // Wide verify: every row of the batch is bitwise the one-row launch of
+            // the same kernel at `position_start + r` (its own block count), scores
+            // and selection.
+            if rows <= WIDE_ROWS {
+                for r in 0..rows {
+                    let b_r = (position_start + r + 1) / QSA_COMPRESS;
+                    let row_t = up_f32(gpu, &query[r * IDX_W..(r + 1) * IDX_W])?;
+                    let run1 = SelectRun {
+                        query: &row_t,
+                        pooled: &pooled_t,
+                        rows: 1,
+                        blocks: b_r,
+                        position_start: position_start + r,
+                        budget: BUDGET_BLOCKS,
+                        capacity: SEL_CAP,
+                    };
+                    let (scores1, selected1) = rows_scores_and_select(gpu, &run1, group_rows, score_sym)?;
+                    checks.push(exact_f32(
+                        &format!("{label}/row{r} scores==one-row launch"),
+                        &scores[r * blocks..r * blocks + b_r],
+                        &scores1[..b_r],
+                    ));
+                    checks.push(exact_ints(
+                        &format!("{label}/row{r} selected==one-row launch"),
+                        &selected[r * SEL_CAP..(r + 1) * SEL_CAP],
+                        &selected1,
+                    ));
+                    free_all(gpu, vec![row_t])?;
+                }
+            }
             if claim && kind == DataKind::Realistic {
                 let serial = serial_select(gpu, &run, false)?;
                 checks.push(exact_ints(&format!("{label}/selected==serial_hip"), &selected, &serial));
@@ -3527,6 +3615,358 @@ fn parallel_rows8(gpu: &mut Gpu) -> Result<String, String> {
 
 fn parallel_rows16(gpu: &mut Gpu) -> Result<String, String> {
     parallel_rows(gpu, 16, "indexed_attention_select_scores_rows16_f32")
+}
+
+fn parallel_rows32(gpu: &mut Gpu) -> Result<String, String> {
+    parallel_rows(gpu, 32, "indexed_attention_select_scores_rows32_f32")
+}
+
+// ── wide verify (n <= 32 rows): batched == n one-row calls, bitwise ──────────
+/// Widest verify block (`Gpu::set_wide_verify_rows`).
+const WIDE_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+/// End depths in tokens (8K / 32K / 128K / 256K at compress 4).
+const WIDE_DEPTHS: [usize; 4] = [8192, 32768, 131072, 262144];
+
+/// The arches whose exact-width gate the wide verify work raises.
+fn wide_arch(gpu: &Gpu) -> bool {
+    gpu.arch == "gfx1151" || gpu.arch == "gfx1201"
+}
+
+/// Every n at displacement 0, ragged and tile-edge n at displacements 1..3.
+fn wide_window_ns(displacement: usize) -> Vec<usize> {
+    if displacement == 0 {
+        (1..=WIDE_ROWS).collect()
+    } else {
+        vec![1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32]
+    }
+}
+
+/// Runs `f` as a verify forward of `rows` rows would: the exact-width gate on
+/// for two or more rows, off for one.
+fn with_wide_gate<T>(gpu: &mut Gpu, rows: usize, f: impl FnOnce(&mut Gpu) -> T) -> T {
+    gpu.set_wide_verify_rows(if rows >= 2 { WIDE_ROWS } else { 0 });
+    let out = f(gpu);
+    gpu.set_wide_verify_rows(0);
+    out
+}
+
+fn cmp_bytes(fails: &mut Vec<String>, label: &str, got: &[u8], want: &[u8]) {
+    if got.len() != want.len() {
+        fails.push(format!("{label}: byte lens {} != {}", got.len(), want.len()));
+    } else if let Some(i) = (0..got.len()).find(|&i| got[i] != want[i]) {
+        fails.push(format!("{label}: first differing byte @{i}: batched {:#04x} one-row {:#04x}", got[i], want[i]));
+    }
+}
+
+fn wide_verdict(name: &str, windows: usize, fails: Vec<String>) -> Result<String, String> {
+    if fails.is_empty() {
+        Ok(format!("{name}: {windows} windows bit-exact vs n one-row calls"))
+    } else {
+        let shown: Vec<String> = fails.iter().take(40).cloned().collect();
+        Err(format!("{name}: {} failure(s) in {windows} windows: {}", fails.len(), shown.join(" | ")))
+    }
+}
+
+/// `indexed_attention_decode_prologue` (grid.y = rows) over a window of n rows
+/// at position P versus n one-row prologues at P + r on views of identical
+/// inputs: normalized index query, Q with the untouched gate, normalized K, the
+/// V source, every K/V cache byte of rows P..P+n (fp8: codes and scales) and
+/// the raw index keys, bit for bit; the poisoned rows P-1 and P+n must stay
+/// poisoned. End depths 8K..256K minus displacement 0..3; both RoPE settings.
+fn wide_prologue(gpu: &mut Gpu, fp8: bool) -> Result<String, String> {
+    if !wide_arch(gpu) {
+        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+    }
+    if fp8 && gpu.arch != "gfx1201" {
+        return Ok(format!("skip: OCP FP8 K/V is gfx1201 only (got {})", gpu.arch));
+    }
+    let format = if fp8 { QsaKvFormat::Fp8 } else { QsaKvFormat::F32 };
+    // The deepest end plus the canary row P+n after a window that ends there.
+    let depth_max = WIDE_DEPTHS[WIDE_DEPTHS.len() - 1] + 1;
+    let (row_bytes, raw_unit) = if fp8 { (FP8_ROW, IDX_DIM * 2) } else { (KV_W * 4, IDX_DIM * 4) };
+    let (k_cache, v_cache, raw) = if fp8 {
+        (
+            fp8_cache(gpu, depth_max)?,
+            fp8_cache(gpu, depth_max)?,
+            bf16_vec(gpu, &vec![f32::NAN; depth_max * IDX_DIM])?,
+        )
+    } else {
+        (
+            nan_f32(gpu, depth_max * KV_W)?,
+            nan_f32(gpu, depth_max * KV_W)?,
+            nan_f32(gpu, depth_max * IDX_DIM)?,
+        )
+    };
+    let mut fails = Vec::new();
+    let mut windows = 0usize;
+    for (yname, yarn) in yarns() {
+        let mut rng = Rng::new((if fp8 { 0x9A11u64 } else { 0x9A01u64 }) + windows as u64);
+        let iq_norm = rng.vec_bf16_exact(IDX_DIM, -0.5, 0.5);
+        let q_norm = rng.vec_bf16_exact(HD, -0.5, 0.5);
+        let k_norm = rng.vec_bf16_exact(HD, -0.5, 0.5);
+        let (iq_t, q_t, k_t) = (bf16_vec(gpu, &iq_norm)?, bf16_vec(gpu, &q_norm)?, bf16_vec(gpu, &k_norm)?);
+        let launch = |gpu: &mut Gpu, t: [&GpuTensor; 4], position: usize, rows: usize| -> Result<(), String> {
+            with_wide_gate(gpu, rows, |g| {
+                indexed_attention_decode_prologue(
+                    g,
+                    &IndexedAttentionDecodePrologue {
+                        index_row: t[0],
+                        qgate: t[1],
+                        keys: t[2],
+                        values: t[3],
+                        full_keys: &k_cache,
+                        full_values: &v_cache,
+                        raw_index_keys: &raw,
+                        index_q_norm: &iq_t,
+                        q_norm: &q_t,
+                        k_norm: &k_t,
+                        index_heads: QSA_INDEX_HEADS,
+                        index_dim: IDX_DIM,
+                        index_kv_width: IDX_DIM,
+                        heads: QSA_Q_HEADS,
+                        kv_heads: QSA_KV_HEADS,
+                        head_dim: HD,
+                        position,
+                        rows,
+                        format,
+                        yarn,
+                    },
+                )
+                .map_err(e)
+            })
+        };
+        for depth in WIDE_DEPTHS {
+            for disp in 0..4usize {
+                let end = depth - disp;
+                for n in wide_window_ns(disp) {
+                    windows += 1;
+                    let ps = end - n;
+                    let label = format!("{yname}/{}/E{end}/n{n}", if fp8 { "fp8" } else { "f32" });
+                    let inputs = [
+                        rng.vec(n * IDX_W, -2.0, 2.0),
+                        rng.vec(n * QG_W, -2.0, 2.0),
+                        rng.vec(n * KV_W, -2.0, 2.0),
+                        rng.vec(n * KV_W, -2.0, 2.0),
+                    ];
+                    let a = [
+                        up_f32(gpu, &inputs[0])?,
+                        up_f32(gpu, &inputs[1])?,
+                        up_f32(gpu, &inputs[2])?,
+                        up_f32(gpu, &inputs[3])?,
+                    ];
+                    let b = [
+                        up_f32(gpu, &inputs[0])?,
+                        up_f32(gpu, &inputs[1])?,
+                        up_f32(gpu, &inputs[2])?,
+                        up_f32(gpu, &inputs[3])?,
+                    ];
+                    let caches = [(&k_cache, row_bytes), (&v_cache, row_bytes), (&raw, raw_unit)];
+                    let poison = |gpu: &Gpu| -> Result<(), String> {
+                        for (cache, unit) in caches {
+                            gpu.hip
+                                .memcpy_htod_offset(&cache.buf, (ps - 1) * unit, &vec![0xA5u8; (n + 2) * unit])
+                                .map_err(e)?;
+                        }
+                        Ok(())
+                    };
+                    let observe = |gpu: &Gpu, t: &[GpuTensor; 4]| -> Result<Vec<Vec<u8>>, String> {
+                        let mut out = Vec::new();
+                        for tensor in t {
+                            out.push(down_bytes(gpu, tensor)?);
+                        }
+                        for (cache, unit) in caches {
+                            let mut rows = vec![0u8; (n + 2) * unit];
+                            gpu.hip.memcpy_dtoh_at(&mut rows, &cache.buf, (ps - 1) * unit).map_err(e)?;
+                            out.push(rows);
+                        }
+                        Ok(out)
+                    };
+                    poison(gpu)?;
+                    launch(gpu, [&a[0], &a[1], &a[2], &a[3]], ps, n)?;
+                    sync(gpu)?;
+                    let batched = observe(gpu, &a)?;
+                    poison(gpu)?;
+                    for r in 0..n {
+                        let views = [
+                            b[0].sub_offset(r * IDX_W, IDX_W),
+                            b[1].sub_offset(r * QG_W, QG_W),
+                            b[2].sub_offset(r * KV_W, KV_W),
+                            b[3].sub_offset(r * KV_W, KV_W),
+                        ];
+                        launch(gpu, [&views[0], &views[1], &views[2], &views[3]], ps + r, 1)?;
+                    }
+                    sync(gpu)?;
+                    let one = observe(gpu, &b)?;
+                    for (i, what) in
+                        ["index_row", "qgate", "keys", "values", "K cache rows", "V cache rows", "raw index key rows"]
+                            .into_iter()
+                            .enumerate()
+                    {
+                        cmp_bytes(&mut fails, &format!("{label}/{what}"), &batched[i], &one[i]);
+                    }
+                    let values_in: Vec<u8> = inputs[3].iter().flat_map(|v| v.to_le_bytes()).collect();
+                    cmp_bytes(&mut fails, &format!("{label}/values untouched"), &batched[3], &values_in);
+                    for (i, unit) in [(4usize, row_bytes), (5, row_bytes), (6, raw_unit)] {
+                        let kept = batched[i][..unit].iter().all(|x| *x == 0xA5)
+                            && batched[i][(n + 1) * unit..].iter().all(|x| *x == 0xA5);
+                        if !kept {
+                            fails.push(format!("{label}: wrote outside rows [P, P+n) (cache {i})"));
+                        }
+                    }
+                    free_all(gpu, a.into_iter().chain(b).collect())?;
+                }
+            }
+        }
+        free_all(gpu, vec![iq_t, q_t, k_t])?;
+    }
+    free_all(gpu, vec![k_cache, v_cache, raw])?;
+    wide_verdict(if fp8 { "wide prologue fp8" } else { "wide prologue f32" }, windows, fails)
+}
+
+fn wide_prologue_f32(gpu: &mut Gpu) -> Result<String, String> {
+    wide_prologue(gpu, false)
+}
+
+fn wide_prologue_fp8(gpu: &mut Gpu) -> Result<String, String> {
+    wide_prologue(gpu, true)
+}
+
+/// `indexed_attention_pool_rope_incremental` of a window `[P, P+n)` (blocks
+/// `P/4 .. (P+n)/4`, `ceil(n/4)` grid) versus the n one-row pools at P + r
+/// (each pooling the block its token completes, if any): the pooled bytes of
+/// blocks `P/4-1 ..= (P+n)/4` (one canary block each side) must be identical.
+fn wide_pool(gpu: &mut Gpu, bf16_arena: bool) -> Result<String, String> {
+    if !wide_arch(gpu) {
+        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+    }
+    let depth_max = WIDE_DEPTHS[WIDE_DEPTHS.len() - 1];
+    let max_blocks = depth_max / QSA_COMPRESS + 8;
+    let unit = IDX_DIM * if bf16_arena { 2 } else { 4 };
+    let mut rng = Rng::new(if bf16_arena { 0x9B02 } else { 0x9B01 });
+    let raw = rng.vec_bf16_exact(depth_max * IDX_DIM, -2.0, 2.0);
+    let norm = rng.vec_bf16_exact(IDX_DIM, -0.5, 0.5);
+    let norm_t = bf16_vec(gpu, &norm)?;
+    let raw_t = if bf16_arena { bf16_vec(gpu, &raw)? } else { up_f32(gpu, &raw)? };
+    drop(raw);
+    let new_arena = |gpu: &mut Gpu| -> Result<GpuTensor, String> {
+        if bf16_arena {
+            bf16_vec(gpu, &vec![f32::NAN; max_blocks * IDX_DIM])
+        } else {
+            nan_f32(gpu, max_blocks * IDX_DIM)
+        }
+    };
+    let (pooled_a, pooled_b) = (new_arena(gpu)?, new_arena(gpu)?);
+    let mut fails = Vec::new();
+    let mut windows = 0usize;
+    for (yname, yarn) in yarns() {
+        let pool = |gpu: &mut Gpu, pooled: &GpuTensor, position_start: usize, rows: usize| -> Result<(), String> {
+            with_wide_gate(gpu, rows, |g| {
+                indexed_attention_pool_rope_incremental(
+                    g,
+                    &IndexedAttentionPoolRope {
+                        raw_keys: &raw_t,
+                        pooled,
+                        norm: Some(&norm_t),
+                        block_count: (position_start + rows) / QSA_COMPRESS,
+                        compress: QSA_COMPRESS,
+                        index_dim: IDX_DIM,
+                        position: Some(QsaPositionBinding { position_start, rows }),
+                        grid_bound: max_blocks,
+                        yarn,
+                    },
+                )
+                .map_err(e)
+            })
+        };
+        for depth in WIDE_DEPTHS {
+            for disp in 0..4usize {
+                let end = depth - disp;
+                for n in wide_window_ns(disp) {
+                    windows += 1;
+                    let ps = end - n;
+                    let (first, last) = (ps / QSA_COMPRESS, end / QSA_COMPRESS);
+                    let lo = first - 1;
+                    let span = (last + 1 - lo + 1) * unit;
+                    let label = format!("{yname}/{}/E{end}/n{n}", if bf16_arena { "bf16" } else { "f32" });
+                    for arena in [&pooled_a, &pooled_b] {
+                        gpu.hip.memcpy_htod_offset(&arena.buf, lo * unit, &vec![0xA5u8; span]).map_err(e)?;
+                    }
+                    pool(gpu, &pooled_a, ps, n)?;
+                    for r in 0..n {
+                        pool(gpu, &pooled_b, ps + r, 1)?;
+                    }
+                    sync(gpu)?;
+                    let (mut got, mut want) = (vec![0u8; span], vec![0u8; span]);
+                    gpu.hip.memcpy_dtoh_at(&mut got, &pooled_a.buf, lo * unit).map_err(e)?;
+                    gpu.hip.memcpy_dtoh_at(&mut want, &pooled_b.buf, lo * unit).map_err(e)?;
+                    cmp_bytes(&mut fails, &format!("{label}/pooled blocks {lo}..={}", last + 1), &got, &want);
+                    // The canary blocks outside [first, last) must be untouched.
+                    let touched_outside = got[..unit].iter().any(|x| *x != 0xA5)
+                        || got[(last - lo + 1) * unit..].iter().any(|x| *x != 0xA5);
+                    if touched_outside {
+                        fails.push(format!("{label}: pooled a block outside [{first}, {last})"));
+                    }
+                }
+            }
+        }
+    }
+    free_all(gpu, vec![pooled_a, pooled_b, raw_t, norm_t])?;
+    wide_verdict(if bf16_arena { "wide pool bf16" } else { "wide pool f32" }, windows, fails)
+}
+
+fn wide_pool_f32(gpu: &mut Gpu) -> Result<String, String> {
+    wide_pool(gpu, false)
+}
+
+fn wide_pool_bf16(gpu: &mut Gpu) -> Result<String, String> {
+    wide_pool(gpu, true)
+}
+
+/// Public F32 attention (`indexed_attention_attention_batch_with_arena`, the
+/// route the verify forward calls) over n = 1..=32 rows versus the n one-row
+/// public calls at `position_start + r` on the same K/V, raw F32 bits: the
+/// split-K route on gfx1151, the per-head kernels on gfx1201. Row 0 carries
+/// injected `-1` / not-yet-visible entries. Plain and realistic operands at
+/// 2802 and 8192 cached tokens.
+fn wide_attention_f32(gpu: &mut Gpu) -> Result<String, String> {
+    if !wide_arch(gpu) {
+        return Ok(format!("skip: the wide verify gate is exact gfx1151/gfx1201 only (got {})", gpu.arch));
+    }
+    let g = QWEN4_ATTN;
+    let q_row = 2 * g.heads * g.head_dim;
+    let mut fails = Vec::new();
+    let mut windows = 0usize;
+    for end in [2802usize, 8192] {
+        for kind in [DataKind::Plain, DataKind::Realistic] {
+            for rows in 1..=WIDE_ROWS {
+                windows += 1;
+                let seed = 0x7D00 + end as u64 + rows as u64 + kind.seed();
+                let position_start = end - rows;
+                let selected = attn_selection(seed, rows, end)?;
+                let (q, keys, values) = match kind {
+                    DataKind::Plain => {
+                        let mut rng = Rng::new(seed);
+                        (rng.vec(rows * QG_W, -3.0, 3.0), rng.vec(end * KV_W, -1.0, 1.0), rng.vec(end * KV_W, -1.0, 1.0))
+                    }
+                    DataKind::Realistic => realistic_attn_qkv(seed, rows, end, QSA_Q_HEADS, QSA_KV_HEADS, HD),
+                };
+                let t = upload_attn(gpu, &q, &keys, &values, &selected)?;
+                let batched = attn_public(gpu, &t, g, rows, position_start, end)?;
+                let mut one = Vec::with_capacity(rows * g.out_w());
+                for r in 0..rows {
+                    let q_t = up_f32(gpu, &q[r * q_row..(r + 1) * q_row])?;
+                    let sel_t = raw_i32(gpu, &selected[r * SEL_CAP..(r + 1) * SEL_CAP])?;
+                    one.extend(attn_public_parts(gpu, &q_t, &t.k, &t.v, &sel_t, g, 1, position_start + r, end)?);
+                    free_all(gpu, vec![q_t, sel_t])?;
+                }
+                if let Err(msg) = exact_f32(&format!("{}/E{end}/rows{rows}", kind.name()), &batched, &one) {
+                    fails.push(msg);
+                }
+                free_attn(gpu, t)?;
+            }
+        }
+    }
+    wide_verdict("wide attention f32 (public route)", windows, fails)
 }
 
 /// `indexed_attention_select_{f32,bf16}_batched` launched directly (dynamic LDS

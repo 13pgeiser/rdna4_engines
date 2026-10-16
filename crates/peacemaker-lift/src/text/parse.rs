@@ -235,13 +235,20 @@ fn parse_single(row: &'static OpRow, rest: &str, arch: Arch) -> Result<Inst, Par
         mods: Modifiers::default(),
         literal: None,
     };
-    if matches!(row.name, "v_fmamk_f32" | "v_fmaak_f32") && operand_texts.len() == 4 {
-        let index = if row.name == "v_fmamk_f32" { 2 } else { 3 };
+    // FMAMK/FMAAK spell their K constant as a fourth operand (`literal@last`
+    // in the grammar): fmamk `D, S0, K, S1`, fmaak `D, S0, S1, K`. The constant
+    // rides in the instruction's literal word; the remaining three operands map
+    // onto the table slots in order (scalar SOP2 rows included).
+    if matches!(row.name, "v_fmamk_f32" | "v_fmaak_f32" | "s_fmamk_f32" | "s_fmaak_f32") && operand_texts.len() == 4 {
+        let index = if row.name.ends_with("_fmamk_f32") { 2 } else { 3 };
         let text = operand_texts.remove(index);
         let value = text.strip_prefix("0x")
             .and_then(|hex| u32::from_str_radix(hex, 16).ok())
             .ok_or_else(|| bad_operand(row.name, &text, "embedded literal needs a 32-bit hex value"))?;
         parsed.literal = Some(value);
+    }
+    if matches!(row.name, "s_fmamk_f32" | "s_fmaak_f32") && parsed.literal.is_none() {
+        return Err(ParseError::Count { name: row.name.into(), have: operand_texts.len(), need: 4 });
     }
     if row.form == Form::Vop2 && row.name == "v_cndmask_b32_e32" {
         if operand_texts.last().is_some_and(|t| t == "vcc_lo") {

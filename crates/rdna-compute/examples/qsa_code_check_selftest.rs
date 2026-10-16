@@ -20,7 +20,7 @@
 //! registry sees the same registrations a real run makes. No QSA (or any)
 //! kernel is launched and no operand tensor is allocated:
 //! - gfx1151: `qsa_select_bf16_pm_gfx1151`
-//!   (`indexed_attention_select_scores_rows16_bf16_pm_gfx1151`),
+//!   (`indexed_attention_select_scores_rows16_bf16_pm_gfx1151` and `..._rows32_bf16_pm_gfx1151`),
 //!   `qsa_select_pm_gfx1151`, `spec_sampling_rows_parallel_pm_gfx1151`,
 //!   `spec_accept_ordered_pm_gfx1151`, `mq_i4_moe_gemv_pm_gfx1151`;
 //! - gfx1201: the `spec_*_pm_gfx1201` pair and `mq_i4_moe_gemv_pm_gfx1201`;
@@ -114,12 +114,16 @@ const PM_GFX1151: &[Pm] = &[
     (
         "qsa_select_bf16_pm_gfx1151",
         kernels::QSA_SELECT_BF16_PM_GFX1151,
-        &["indexed_attention_select_scores_rows16_bf16_pm_gfx1151"],
+        &["indexed_attention_select_scores_rows16_bf16_pm_gfx1151", "indexed_attention_select_scores_rows32_bf16_pm_gfx1151"],
     ),
     (
         "qsa_select_pm_gfx1151",
         kernels::QSA_SELECT_PM_GFX1151,
-        &["indexed_attention_select_scores_rows16_f32_pm_gfx1151", "indexed_attention_select_from_scores_pm_gfx1151"],
+        &[
+            "indexed_attention_select_scores_rows16_f32_pm_gfx1151",
+            "indexed_attention_select_scores_rows32_f32_pm_gfx1151",
+            "indexed_attention_select_from_scores_pm_gfx1151",
+        ],
     ),
     (
         "spec_sampling_rows_parallel_pm_gfx1151",

@@ -160,11 +160,12 @@ pub fn project_weight(
 /// rotates to F32 and converts to F16 again for each); the bytes each GEMM sees
 /// are unchanged.
 ///
-/// Few-row verify (2..=8 rows): the MQ4G256V2 members of one rotated input run
+/// Few-row verify (2..=`Gpu::few_row_limit` route rows: 8, or the verify
+/// scope's admitted exact cap): the MQ4G256V2 members of one rotated input run
 /// through `Gpu::gemv_mq4g256v2_rows_x4`, four per launch (a lone member takes
 /// it too, via `project_rotated`), each output bitwise the AR `gemv_mq4g256v2`;
 /// the MQ6G256V2 members take `gemm_mq6g256v2_f32_rows_x4` the same way. One row
-/// keeps the single-matrix GEMVs; more than 8 rows keep the GEMMs.
+/// keeps the single-matrix GEMVs; more route rows than the limit keep the GEMMs.
 pub fn project_weights(
     gpu: &mut Gpu,
     input: &GpuTensor,
@@ -194,11 +195,20 @@ fn project_weights_inner(
 ) -> Result<(), DispatchError> {
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
     let route = gpu.route_rows(rows);
-    let shared = |w: &WeightRef<'_>, gpu: &Gpu| match w.dtype {
-        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
-        // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
-        DType::MQ4G256V2 => gpu.gemm_mq4g256v2_xf16_applies(w.k, rows),
-        _ => false,
+    // A verify forward row-exact past the historic few-row limit keeps the
+    // few-row decode-twin launches below; the shared-F16-rotation WMMA routes
+    // are not row-exact, so they decline there (and nowhere else: outside a
+    // verify forward `few_row_limit()` is the historic limit).
+    let wide_exact = route > rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS
+        && route <= gpu.few_row_limit();
+    let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
+        !wide_exact
+            && match w.dtype {
+                DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
+                // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
+                DType::MQ4G256V2 => gpu.gemm_mq4g256v2_xf16_applies(w.k, rows),
+                _ => false,
+            }
     };
     // Shared-rotation weights first, grouped by K: other projections reuse
     // the same F16 scratch and would overwrite the rotated copy.
@@ -325,7 +335,7 @@ fn project_weights_inner(
     // rotate it once for the whole group instead of once per weight.
     // Few rows (speculative verify) on gfx11+: BF16 weights of one K share
     // multi-row launches, four matrices at a time, each weight read once.
-    if (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt() {
+    if (2..=gpu.few_row_limit()).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt() {
         for i in 0..projections.len() {
             let (weight, _) = projections[i];
             if done[i] || weight.dtype != DType::BF16 {
@@ -379,7 +389,7 @@ fn project_weights_inner(
         let mut mq6: SmallVec<[usize; 4]> = group
             .iter()
             .copied()
-            .filter(|&j| route <= 8 && projections[j].0.dtype == DType::MQ6G256V2)
+            .filter(|&j| route <= gpu.few_row_limit() && projections[j].0.dtype == DType::MQ6G256V2)
             .collect();
         if mq6.len() < 2 {
             mq6.clear();
@@ -396,7 +406,7 @@ fn project_weights_inner(
                 gpu.gemm_mq6g256v2_f32_rows_x4(parts, x, weight.k, rows)
             })?;
         }
-        // Few-row verify (2..=8 rows): the group's MQ4G256V2 members share
+        // Few-row verify (2..=`few_row_limit` rows): the group's MQ4G256V2 members share
         // `gemv_mq4g256v2_rows_x4` launches, four at a time (a lone member
         // takes the same launch with empty slots); each output is bitwise the
         // AR singleton `gemv_mq4g256v2`. One row keeps that singleton.
@@ -404,7 +414,8 @@ fn project_weights_inner(
             .iter()
             .copied()
             .filter(|&j| {
-                (2..=8).contains(&rows) && projections[j].0.dtype == DType::MQ4G256V2
+                (2..=gpu.few_row_limit()).contains(&route)
+                    && projections[j].0.dtype == DType::MQ4G256V2
             })
             .collect();
         for chunk in mq4.chunks(4) {
@@ -683,19 +694,21 @@ fn project_rotated(
     rows: usize,
 ) -> Result<(), DispatchError> {
     let route = gpu.route_rows(rows);
-    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&route) {
+    if weight.dtype == DType::MQ6G256V2 && (2..=gpu.few_row_limit()).contains(&route) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
-    if weight.dtype == DType::BF16 && (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt()
+    if weight.dtype == DType::BF16
+        && (2..=gpu.few_row_limit()).contains(&route)
+        && gpu.arch_caps.has_gfx11_plus_simt()
     {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_bf16_xf32_x4_rows([part, none, none, none], x, weight.k, rows));
     }
-    // Few-row verify (2..=8 rows): the exact MQ4 rows kernel, bitwise the AR
-    // `gemv_mq4g256v2` per activation row. One row keeps that GEMV; more than
-    // eight rows keep the WMMA `gemm_mq4g256v2`.
-    if weight.dtype == DType::MQ4G256V2 && (2..=8).contains(&route) {
+    // Few-row verify (2..=`few_row_limit` route rows): the exact MQ4 rows kernel, bitwise the AR
+    // `gemv_mq4g256v2` per activation row. One row keeps that GEMV; more route
+    // rows than the limit keep the WMMA `gemm_mq4g256v2`.
+    if weight.dtype == DType::MQ4G256V2 && (2..=gpu.few_row_limit()).contains(&route) {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_mq4g256v2_rows_x4([part, none, none, none], x, weight.k, rows));
@@ -1141,7 +1154,7 @@ fn execute_hyper_read_inner(
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) <= 8
+        && gpu.route_rows(op.rows) <= gpu.few_row_limit()
         && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
             || (op.input_mix_down.dtype == DType::Q8_0
                 && op.input_mix_down.k.is_multiple_of(256)))
@@ -1500,7 +1513,7 @@ pub fn execute_hyper_write_then_read(
     clear: Option<&ClearOp<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
-    let fusable = (1..=8).contains(&gpu.route_rows(write.rows))
+    let fusable = (1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows))
         && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
@@ -1573,11 +1586,11 @@ fn hyper_write_gates(
     gates: &GpuTensor,
 ) -> Result<(), DispatchError> {
     let wide = checked_mul(op.branches, op.hidden, "hyper write wide")?;
-    // Decode and few-row verify (<= 8 rows): the gate GEMV splits each row's
+    // Decode and few-row verify (route rows within `few_row_limit`): the gate GEMV splits each row's
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
     let k4 = gpu.arch_caps.has_gfx11_plus_simt()
-        && gpu.route_rows(op.rows) <= 8
+        && gpu.route_rows(op.rows) <= gpu.few_row_limit()
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.k.is_multiple_of(32);
     // Multi-row: one launch normalizes each row into LDS and projects the
@@ -3296,6 +3309,7 @@ fn execute_indexed_attention_hc_impl(
     let q_width = op.heads * op.head_dim;
     let kv_width = op.kv_heads * op.head_dim;
     let initial_position = op.state.position;
+    let rows = op.rows;
     let (_, _, complete, selected_len, _) = op.next_lengths()?;
     let index_batch = view(op.index_scratch, 0, op.rows * index_width);
     let qgate_batch = view(op.qgate_scratch, 0, op.rows * 2 * q_width);
@@ -3340,7 +3354,10 @@ fn execute_indexed_attention_hc_impl(
     if phase == MixerPhase::OutProj {
         return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
     }
-
+    // Wide verify (`few_row_limit` above the historic eight, eager only) runs
+    // the whole op in one launch per stage at full width: prologue, select and
+    // attention are per-row (grid.y / grid.z = rows) with the one-row decode's
+    // arithmetic, so no row grouping is needed.
     // The prologue's kernel rotates `min(dim, 64)` channels of the queries,
     // keys and indexer; any other width takes the batched launches below.
     let prologue_rotary =
@@ -3358,7 +3375,7 @@ fn execute_indexed_attention_hc_impl(
         qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
-                values: &index_batch, norm: op.indexer_q_norm, rows: op.rows,
+                values: &index_batch, norm: op.indexer_q_norm, rows,
                 row_stride: index_width, heads: op.index_heads, head_dim: op.index_dim,
                 head_stride: op.index_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
                 yarn,
@@ -3367,22 +3384,22 @@ fn execute_indexed_attention_hc_impl(
         )?;
         let append = IndexedAttentionIndexKeyAppendBatch {
             index_rows: &index_batch, raw_index_keys: op.state.raw_index_keys,
-            rows: op.rows, index_q_width, index_kv_width, position_start: initial_position,
+            rows, index_q_width, index_kv_width, position_start: initial_position,
         };
         if let Some(idx) = src.idx {
             hip(indexed_attention_index_key_append_batch_arena(gpu, &append, idx))?;
         } else if op.state.format.index_dtype() == DType::BF16 {
             hip(indexed_attention_index_key_append_batch(gpu, &append))?;
         } else {
-            hip(gpu.bf16_round_trip_f32_strided(&index_batch, op.rows, index_q_width, index_width, index_kv_width))?;
-            let keys = view(&index_batch, index_q_width, op.rows * index_width - index_q_width);
-            hip(gpu.copy_rows_strided_f32(&keys, op.state.raw_index_keys, op.rows, index_kv_width,
+            hip(gpu.bf16_round_trip_f32_strided(&index_batch, rows, index_q_width, index_width, index_kv_width))?;
+            let keys = view(&index_batch, index_q_width, rows * index_width - index_q_width);
+            hip(gpu.copy_rows_strided_f32(&keys, op.state.raw_index_keys, rows, index_kv_width,
                 index_width, index_kv_width, initial_position * index_kv_width, Some(index_kv_width)))?;
         }
         qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
-                values: &qgate_batch, norm: op.q_norm, rows: op.rows,
+                values: &qgate_batch, norm: op.q_norm, rows,
                 row_stride: 2 * q_width, heads: op.heads, head_dim: op.head_dim,
                 head_stride: 2 * op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
                 yarn,
@@ -3392,7 +3409,7 @@ fn execute_indexed_attention_hc_impl(
         qsa_norm_source(
             gpu,
             &IndexedAttentionNormRopeBatch {
-                values: &k_batch, norm: op.k_norm, rows: op.rows,
+                values: &k_batch, norm: op.k_norm, rows,
                 row_stride: kv_width, heads: op.kv_heads, head_dim: op.head_dim,
                 head_stride: op.head_dim, position_start: initial_position, rotary_dim: op.rotary_dim,
                 yarn,
@@ -3401,7 +3418,7 @@ fn execute_indexed_attention_hc_impl(
         )?;
         let append = IndexedAttentionCacheAppendBatch {
             key: &k_batch, value: &v_batch, full_keys: op.state.full_keys,
-            full_values: op.state.full_values, rows: op.rows, kv_heads: op.kv_heads,
+            full_values: op.state.full_values, rows, kv_heads: op.kv_heads,
             head_dim: op.head_dim, position_start: initial_position, format: op.state.format,
         };
         if let Some(v) = src.v {
@@ -3409,13 +3426,13 @@ fn execute_indexed_attention_hc_impl(
         } else {
             hip(indexed_attention_cache_append_batch(gpu, &append))?;
         }
-    } else if gpu.route_rows(op.rows) <= 8
+    } else if gpu.route_rows(rows) <= gpu.few_row_limit()
         && op.index_dim <= 256
         && op.head_dim <= 256
         && prologue_rotary
     {
-        // Decode / few-row verify: the norms, RoPE, cache append and
-        // index-key round trip and copy below, in one launch.
+        // Decode / few-row (and wide-verify, grid.y = rows) prologue: the norms,
+        // RoPE, cache append and index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
             gpu,
             &IndexedAttentionDecodePrologue {
@@ -3436,7 +3453,7 @@ fn execute_indexed_attention_hc_impl(
                 kv_heads: op.kv_heads,
                 head_dim: op.head_dim,
                 position: initial_position,
-                rows: op.rows,
+                rows,
                 format: op.state.format,
                 yarn,
             },
@@ -3447,7 +3464,7 @@ fn execute_indexed_attention_hc_impl(
             &IndexedAttentionNormRopeBatch {
                 values: &index_batch,
                 norm: op.indexer_q_norm,
-                rows: op.rows,
+                rows,
                 row_stride: index_width,
                 heads: op.index_heads,
                 head_dim: op.index_dim,
@@ -3465,7 +3482,7 @@ fn execute_indexed_attention_hc_impl(
                 &IndexedAttentionIndexKeyAppendBatch {
                     index_rows: &index_batch,
                     raw_index_keys: op.state.raw_index_keys,
-                    rows: op.rows,
+                    rows,
                     index_q_width,
                     index_kv_width,
                     position_start: initial_position,
@@ -3474,7 +3491,7 @@ fn execute_indexed_attention_hc_impl(
         } else {
             hip(gpu.bf16_round_trip_f32_strided(
                 &index_batch,
-                op.rows,
+                rows,
                 index_q_width,
                 index_width,
                 index_kv_width,
@@ -3482,7 +3499,7 @@ fn execute_indexed_attention_hc_impl(
             let index_k_batch = view(
                 &index_batch,
                 index_q_width,
-                op.rows * index_width - index_q_width,
+                rows * index_width - index_q_width,
             );
             // The destination row offset travels as a scalar (`= position *
             // index_kv_width`) against the base tensor, and the recorder declares it,
@@ -3492,7 +3509,7 @@ fn execute_indexed_attention_hc_impl(
             hip(gpu.copy_rows_strided_f32(
                 &index_k_batch,
                 op.state.raw_index_keys,
-                op.rows,
+                rows,
                 index_kv_width,
                 index_width,
                 index_kv_width,
@@ -3505,7 +3522,7 @@ fn execute_indexed_attention_hc_impl(
             &IndexedAttentionNormRopeBatch {
                 values: &qgate_batch,
                 norm: op.q_norm,
-                rows: op.rows,
+                rows,
                 row_stride: 2 * q_width,
                 heads: op.heads,
                 head_dim: op.head_dim,
@@ -3520,7 +3537,7 @@ fn execute_indexed_attention_hc_impl(
             &IndexedAttentionNormRopeBatch {
                 values: &k_batch,
                 norm: op.k_norm,
-                rows: op.rows,
+                rows,
                 row_stride: kv_width,
                 heads: op.kv_heads,
                 head_dim: op.head_dim,
@@ -3537,7 +3554,7 @@ fn execute_indexed_attention_hc_impl(
                 value: &v_batch,
                 full_keys: op.state.full_keys,
                 full_values: op.state.full_values,
-                rows: op.rows,
+                rows,
                 position_start: initial_position,
                 kv_heads: op.kv_heads,
                 head_dim: op.head_dim,
@@ -3568,7 +3585,7 @@ fn execute_indexed_attention_hc_impl(
                 index_dim: index_kv_width,
                 position: Some(rdna_compute::tensor_ops::QsaPositionBinding {
                     position_start: initial_position,
-                    rows: op.rows,
+                    rows,
                 }),
                 grid_bound: op.state.pooled_capacity,
                 yarn,
@@ -3653,7 +3670,7 @@ fn execute_indexed_attention_hc_impl(
             0
         },
         selected: &selected_batch,
-        rows: op.rows,
+        rows,
         query_row_stride: index_width,
         block_count: complete,
         index_heads: op.index_heads,
@@ -3679,7 +3696,7 @@ fn execute_indexed_attention_hc_impl(
             full_values: op.state.full_values,
             selected: &selected_batch,
             output: &qsa_output_batch,
-            rows: op.rows,
+            rows,
             position_start: initial_position,
             n_heads: op.heads,
             n_kv_heads: op.kv_heads,

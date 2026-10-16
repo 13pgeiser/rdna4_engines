@@ -22,23 +22,11 @@
 //! (`Gpu::qwen4_append_f16_moe_scope`).
 
 use crate::dispatch::Gpu;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 /// Row count every routing predicate sees under the invariant profile.
 pub const QWEN4_PREFILL_CANON_ROWS: usize = 8192;
-
-/// The historic few-row limit: routes gated on `route_rows <= 8` are the per-row
-/// twins of the decode GEMV (each output row runs the decode kernel's lane->K
-/// map, FMA chain and reduction tree).
-pub const FEW_ROW_ROUTE_ROWS: usize = 8;
-
-/// The rows a Qwen4 verify forward on `arch` runs row-exact (each row bitwise
-/// the sequential single-row decode). Every arch is at [`FEW_ROW_ROUTE_ROWS`]
-/// until the wide-verify row-exactness oracle proves one wider; the verify
-/// scope and the n-gram copy lane read this single value.
-pub fn qwen4_row_exact_verify_rows(_arch: &str) -> usize {
-    FEW_ROW_ROUTE_ROWS
-}
 
 static PREFILL_PM_INVARIANT: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_PREFILL_PM_INVARIANT", false));
@@ -132,6 +120,103 @@ pub fn qwen4_append_wmma_route(
         && rows < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
 }
 
+/// The historic few-row limit: routes gated on `route_rows <= 8` are the
+/// per-row twins of the decode GEMV (each output row runs the decode kernel's
+/// lane->K map, FMA chain and reduction tree).
+pub const FEW_ROW_ROUTE_ROWS: usize = 8;
+/// Largest verify block the few-row routes are built for. Every few-row
+/// launcher capped at 8 rows serves up to this many by looping its existing
+/// <=8-row launch over row groups.
+pub const WIDE_VERIFY_MAX_ROWS: usize = 32;
+/// gfx1151 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
+/// gfx1201 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+
+/// Parse `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS`: an unsigned integer clamped to
+/// [`FEW_ROW_ROUTE_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`]; unset or unparsable is
+/// `None`.
+fn wide_verify_rows_override_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS))
+}
+
+static QWEN4_WIDE_VERIFY_ROWS_OVERRIDE: LazyLock<Option<usize>> = LazyLock::new(|| {
+    wide_verify_rows_override_value(
+        hipfire_config::developer_var("HIPFIRE_QWEN4_WIDE_VERIFY_ROWS")
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Runtime override of the verify rows (`0` = unset); see
+/// [`set_qwen4_wide_verify_rows_override`].
+static QWEN4_WIDE_VERIFY_ROWS_RUNTIME: AtomicUsize = AtomicUsize::new(0);
+
+/// Oracle/test hook: set (`Some(n)`, clamped to
+/// `FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS`) or clear (`None`) a runtime
+/// override of [`qwen4_row_exact_verify_rows`]. It takes precedence over
+/// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` and the per-arch table, so one process
+/// can run several verify widths. Not for production routes.
+pub fn set_qwen4_wide_verify_rows_override(rows: Option<usize>) {
+    let value = rows.map_or(0, |n| n.clamp(FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS));
+    QWEN4_WIDE_VERIFY_ROWS_RUNTIME.store(value, Ordering::Relaxed);
+}
+
+/// Precedence of the verify-rows sources: runtime override (`0` = unset),
+/// then the env override, then the table.
+fn resolve_verify_rows(runtime: usize, env: Option<usize>, table: usize) -> usize {
+    if runtime != 0 {
+        runtime
+    } else {
+        env.unwrap_or(table)
+    }
+}
+
+/// Per-arch proven row-exact verify rows (other arches
+/// [`FEW_ROW_ROUTE_ROWS`]). The runtime override
+/// ([`set_qwen4_wide_verify_rows_override`]) wins, then
+/// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` (developer var, read once, clamped to
+/// `FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS`), then the table; both
+/// overrides apply on exact gfx1151/gfx1201 only (oracle runs).
+pub fn qwen4_row_exact_verify_rows(arch: &str) -> usize {
+    let table = match arch {
+        "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
+        "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        _ => return FEW_ROW_ROUTE_ROWS,
+    };
+    resolve_verify_rows(
+        QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed),
+        *QWEN4_WIDE_VERIFY_ROWS_OVERRIDE,
+        table,
+    )
+}
+
+/// Largest `route_rows` a few-row (decode-exact) route serves given the
+/// current verify rows (`0` = not in a verify forward) and whether launches
+/// are eager. Wide verify is eager-only: while a replay is recording or a
+/// graph is being captured the limit stays [`FEW_ROW_ROUTE_ROWS`].
+#[inline]
+fn few_row_limit_for(wide_verify_rows: usize, eager: bool) -> usize {
+    if eager {
+        FEW_ROW_ROUTE_ROWS.max(wide_verify_rows)
+    } else {
+        FEW_ROW_ROUTE_ROWS
+    }
+}
+
+/// `(first_row, row_count)` groups a wide few-row launcher serves `rows` with:
+/// groups of [`FEW_ROW_ROUTE_ROWS`] and the remainder last. Each group is the
+/// already row-exact <=8-row launch, so every row stays bitwise the decode row
+/// whatever `rows` is.
+pub(crate) fn few_row_groups(rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows)
+        .step_by(FEW_ROW_ROUTE_ROWS)
+        .map(move |start| (start, FEW_ROW_ROUTE_ROWS.min(rows - start)))
+}
+
 impl Gpu {
     /// Row count to feed ROUTING predicates (never launch extents): the
     /// canonical prefill chunk under the invariant profile, else `rows`.
@@ -142,6 +227,29 @@ impl Gpu {
         } else {
             rows
         }
+    }
+
+    /// Largest `route_rows` a few-row (decode-exact) route serves right now:
+    /// [`FEW_ROW_ROUTE_ROWS`], or inside an eager verify forward
+    /// `max(FEW_ROW_ROUTE_ROWS, wide_verify_rows)`. Wide verify is eager-only:
+    /// while a replay is recording or a graph is being captured
+    /// (`replay.is_recording()` / `graphs.capture_mode`) the limit is
+    /// [`FEW_ROW_ROUTE_ROWS`] even when `wide_verify_rows` is set. Under
+    /// `prefill_invariant_scope` `route_rows` is already the canonical chunk,
+    /// so the few-row gates stay closed there.
+    #[inline]
+    pub fn few_row_limit(&self) -> usize {
+        few_row_limit_for(
+            self.wide_verify_rows,
+            !(self.replay.is_recording() || self.graphs.capture_mode),
+        )
+    }
+
+    /// Set the verify forward's row-exact rows (`0` = not in a verify
+    /// forward); returns the previous value.
+    #[inline]
+    pub fn set_wide_verify_rows(&mut self, rows: usize) -> usize {
+        std::mem::replace(&mut self.wide_verify_rows, rows)
     }
 }
 
@@ -208,6 +316,98 @@ mod tests {
     fn every_arch_is_at_the_few_row_limit() {
         for arch in ["gfx1151", "gfx1201", "gfx1100"] {
             assert_eq!(qwen4_row_exact_verify_rows(arch), 8, "{arch}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod wide_verify_tests {
+    use super::*;
+
+    #[test]
+    fn few_row_limit_is_historic_outside_verify_and_widens_inside() {
+        assert_eq!(few_row_limit_for(0, true), FEW_ROW_ROUTE_ROWS);
+        assert_eq!(few_row_limit_for(1, true), FEW_ROW_ROUTE_ROWS);
+        assert_eq!(few_row_limit_for(8, true), 8);
+        assert_eq!(few_row_limit_for(9, true), 9);
+        assert_eq!(few_row_limit_for(32, true), 32);
+    }
+
+    #[test]
+    fn few_row_limit_is_historic_while_recording_or_capturing() {
+        for rows in [0, 8, 9, 32] {
+            assert_eq!(few_row_limit_for(rows, false), FEW_ROW_ROUTE_ROWS);
+        }
+    }
+
+    #[test]
+    fn override_parse_and_clamp() {
+        assert_eq!(wide_verify_rows_override_value(None), None);
+        assert_eq!(wide_verify_rows_override_value(Some("")), None);
+        assert_eq!(wide_verify_rows_override_value(Some("x")), None);
+        assert_eq!(wide_verify_rows_override_value(Some("-3")), None);
+        assert_eq!(wide_verify_rows_override_value(Some("0")), Some(FEW_ROW_ROUTE_ROWS));
+        assert_eq!(wide_verify_rows_override_value(Some("5")), Some(FEW_ROW_ROUTE_ROWS));
+        assert_eq!(wide_verify_rows_override_value(Some(" 16 ")), Some(16));
+        assert_eq!(wide_verify_rows_override_value(Some("32")), Some(32));
+        assert_eq!(wide_verify_rows_override_value(Some("33")), Some(WIDE_VERIFY_MAX_ROWS));
+        assert_eq!(wide_verify_rows_override_value(Some("9999")), Some(WIDE_VERIFY_MAX_ROWS));
+    }
+
+    #[test]
+    fn verify_rows_source_precedence() {
+        // runtime > env > table
+        assert_eq!(resolve_verify_rows(16, Some(24), 8), 16);
+        assert_eq!(resolve_verify_rows(16, None, 8), 16);
+        assert_eq!(resolve_verify_rows(0, Some(24), 8), 24);
+        assert_eq!(resolve_verify_rows(0, None, 8), 8);
+        assert_eq!(resolve_verify_rows(32, Some(9), 8), 32);
+    }
+
+    #[test]
+    fn runtime_override_clamps_and_clears() {
+        // The runtime static is process-global: set, observe, clear.
+        set_qwen4_wide_verify_rows_override(Some(4));
+        assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), FEW_ROW_ROUTE_ROWS);
+        set_qwen4_wide_verify_rows_override(Some(999));
+        assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), WIDE_VERIFY_MAX_ROWS);
+        set_qwen4_wide_verify_rows_override(None);
+        assert_eq!(QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn proven_rows_table_is_within_bounds() {
+        for rows in [
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
+            QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        ] {
+            assert!((FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows));
+        }
+        for arch in ["gfx1100", "gfx1150", "gfx942", "gfx1151-x", ""] {
+            assert_eq!(qwen4_row_exact_verify_rows(arch), FEW_ROW_ROUTE_ROWS);
+        }
+    }
+}
+
+#[cfg(test)]
+mod few_row_groups_tests {
+    use super::*;
+
+    #[test]
+    fn groups_are_eights_with_remainder_last() {
+        assert_eq!(few_row_groups(0).count(), 0);
+        assert_eq!(few_row_groups(1).collect::<Vec<_>>(), vec![(0, 1)]);
+        assert_eq!(few_row_groups(8).collect::<Vec<_>>(), vec![(0, 8)]);
+        assert_eq!(few_row_groups(9).collect::<Vec<_>>(), vec![(0, 8), (8, 1)]);
+        assert_eq!(
+            few_row_groups(WIDE_VERIFY_MAX_ROWS).collect::<Vec<_>>(),
+            vec![(0, 8), (8, 8), (16, 8), (24, 8)]
+        );
+        for rows in 1..=WIDE_VERIFY_MAX_ROWS {
+            let groups: Vec<_> = few_row_groups(rows).collect();
+            assert_eq!(groups.iter().map(|g| g.1).sum::<usize>(), rows);
+            assert!(groups.iter().all(|g| (1..=FEW_ROW_ROUTE_ROWS).contains(&g.1)));
+            assert!(groups.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0));
         }
     }
 }

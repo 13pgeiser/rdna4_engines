@@ -39,12 +39,35 @@ use std::sync::LazyLock;
 
 /// Largest column count of one launch.
 pub const LANE_ROWS_PM_MAX: usize = 8;
+/// Largest column count of one S2 wide launch (the `_wide_r{16,32}_pm` exports
+/// serve 9..=this; `<= LANE_ROWS_PM_MAX` keeps the narrow exports).
+pub const LANE_ROWS_PM_WIDE_MAX: usize = 32;
 
 const MODULE: &str = "qwen4_lane_rows_pm";
 const MQ6: &str = "gemv_mq6g256v2_xbatch_pm";
 const MQ6_X4: &str = "gemv_mq6g256v2_x4_xbatch_pm";
 const Q8_K8: &str = "gemv_q8_0_k8_xbatch_pm";
 const Q8_K320: &str = "gemv_q8_0_k320_xbatch_pm";
+
+// S2 exact-wide exports of the same module and image (`[r16, r32]`): block 256 with
+// eight weight rows per workgroup (HC k8: block 512, two rows). The activations
+// are staged in bounded row tiles, every column keeps the 1-row DAG.
+pub(crate) const MQ6_WIDE: [&str; 2] = ["gemv_mq6g256v2_xbatch_wide_r16_pm", "gemv_mq6g256v2_xbatch_wide_r32_pm"];
+pub(crate) const MQ6_X4_WIDE: [&str; 2] =
+    ["gemv_mq6g256v2_x4_xbatch_wide_r16_pm", "gemv_mq6g256v2_x4_xbatch_wide_r32_pm"];
+pub(crate) const Q8_K8_WIDE: [&str; 2] = ["gemv_q8_0_k8_xbatch_wide_r16_pm", "gemv_q8_0_k8_xbatch_wide_r32_pm"];
+pub(crate) const Q8_K320_WIDE: [&str; 2] = ["gemv_q8_0_k320_xbatch_wide_r16_pm", "gemv_q8_0_k320_xbatch_wide_r32_pm"];
+pub(crate) const Q8_K2560_WIDE: [&str; 2] = ["gemv_q8_0_k2560_xbatch_wide_r16_pm", "gemv_q8_0_k2560_xbatch_wide_r32_pm"];
+pub(crate) const Q8_SMALL_WIDE: [&str; 2] = ["gemv_q8_0_wide_xbatch_wide_r16_pm", "gemv_q8_0_wide_xbatch_wide_r32_pm"];
+pub(crate) const Q8_K2560_X2_WIDE: [&str; 2] =
+    ["gemv_q8_0_k2560_x2_xbatch_wide_r16_pm", "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm"];
+/// The MQ6 symbols of the module's wide exports, for route closure.
+pub(crate) const MQ6_WIDE_SYMBOLS: [&str; 4] = [MQ6_WIDE[0], MQ6_WIDE[1], MQ6_X4_WIDE[0], MQ6_X4_WIDE[1]];
+/// The Q8 symbols of the module's wide exports, for route closure.
+pub(crate) const Q8_WIDE_SYMBOLS: [&str; 10] = [
+    Q8_K8_WIDE[0], Q8_K8_WIDE[1], Q8_K320_WIDE[0], Q8_K320_WIDE[1], Q8_K2560_WIDE[0], Q8_K2560_WIDE[1],
+    Q8_SMALL_WIDE[0], Q8_SMALL_WIDE[1], Q8_K2560_X2_WIDE[0], Q8_K2560_X2_WIDE[1],
+];
 
 /// MQ6G256V2 bytes per 256-weight group.
 const MQ6_GROUP_BYTES: usize = 200;
@@ -79,10 +102,19 @@ fn fits_i32(n: usize) -> bool {
     n <= i32::MAX as usize
 }
 
-/// `gemv_mq6g256v2_xbatch_pm` admits `(m, k, batch)`.
-pub(crate) fn mq6_admits(m: usize, k: usize, batch: usize) -> bool {
+/// `batch` is a narrow-launch column count (`1..=`[`LANE_ROWS_PM_MAX`]).
+fn narrow(batch: usize) -> bool {
     (1..=LANE_ROWS_PM_MAX).contains(&batch)
-        && m > 0
+}
+
+/// `batch` is a wide-launch column count (`LANE_ROWS_PM_MAX + 1..=`[`LANE_ROWS_PM_WIDE_MAX`]).
+fn wide(batch: usize) -> bool {
+    (LANE_ROWS_PM_MAX + 1..=LANE_ROWS_PM_WIDE_MAX).contains(&batch)
+}
+
+/// Column-count-independent MQ6 shape rule.
+fn mq6_shape(m: usize, k: usize, batch: usize) -> bool {
+    m > 0
         && k > 0
         && k.is_multiple_of(256)
         && fits_i32(m)
@@ -92,20 +124,10 @@ pub(crate) fn mq6_admits(m: usize, k: usize, batch: usize) -> bool {
         && fits_u32(batch.checked_mul(m).and_then(|n| n.checked_mul(4)))
 }
 
-/// `gemv_mq6g256v2_x4_xbatch_pm` admits four matrices of heights `ms` (unused
-/// slots are 0) reading one `[batch, k]` x. At least one matrix is non-empty.
-pub(crate) fn mq6_x4_admits(ms: [usize; 4], k: usize, batch: usize) -> bool {
-    ms.iter().any(|&m| m > 0)
-        && ms.iter().all(|&m| m == 0 || mq6_admits(m, k, batch))
-        && ms.iter().try_fold(0usize, |acc, &m| acc.checked_add(m.div_ceil(4))).is_some_and(|g| g <= u32::MAX as usize)
-}
-
-/// `gemv_q8_0_k8_xbatch_pm` admits `(m, k, batch)`.
-pub(crate) fn q8_k8_admits(m: usize, k: usize, batch: usize) -> bool {
-    (1..=LANE_ROWS_PM_MAX).contains(&batch)
-        && m > 0
+/// Column-count-independent Q8_0 shape rule (m, k, 32-bit byte offsets).
+fn q8_shape(m: usize, k: usize, batch: usize) -> bool {
+    m > 0
         && k > 0
-        && k.is_multiple_of(K8_K_MULTIPLE)
         && fits_i32(m)
         && fits_i32(k)
         && fits_u32(m.checked_mul(k / 32 * Q8_BLOCK_BYTES))
@@ -113,15 +135,67 @@ pub(crate) fn q8_k8_admits(m: usize, k: usize, batch: usize) -> bool {
         && fits_u32(batch.checked_mul(m).and_then(|n| n.checked_mul(4)))
 }
 
+/// `ms` (unused slots are 0) are admitted MQ6 heights for `mq6_x4`'s shape rule.
+fn mq6_x4_shape(ms: [usize; 4], k: usize, batch: usize) -> bool {
+    ms.iter().any(|&m| m > 0)
+        && ms.iter().all(|&m| m == 0 || mq6_shape(m, k, batch))
+        && ms.iter().try_fold(0usize, |acc, &m| acc.checked_add(m.div_ceil(4))).is_some_and(|g| g <= u32::MAX as usize)
+}
+
+/// `gemv_mq6g256v2_xbatch_pm` admits `(m, k, batch)`.
+pub(crate) fn mq6_admits(m: usize, k: usize, batch: usize) -> bool {
+    narrow(batch) && mq6_shape(m, k, batch)
+}
+
+/// `gemv_mq6g256v2_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`.
+pub(crate) fn mq6_wide_admits(m: usize, k: usize, rows: usize) -> bool {
+    wide(rows) && mq6_shape(m, k, rows)
+}
+
+/// `gemv_mq6g256v2_x4_xbatch_pm` admits four matrices of heights `ms` (unused
+/// slots are 0) reading one `[batch, k]` x. At least one matrix is non-empty.
+pub(crate) fn mq6_x4_admits(ms: [usize; 4], k: usize, batch: usize) -> bool {
+    narrow(batch) && mq6_x4_shape(ms, k, batch)
+}
+
+/// `gemv_mq6g256v2_x4_xbatch_wide_r{16,32}_pm` admits `(ms, k, rows)`; the
+/// grid is `sum ceil(Mi / 8)`, so the 4-row bound of the narrow rule is
+/// only a sufficient 32-bit grid check.
+pub(crate) fn mq6_x4_wide_admits(ms: [usize; 4], k: usize, rows: usize) -> bool {
+    wide(rows) && mq6_x4_shape(ms, k, rows)
+}
+
+/// `gemv_q8_0_k8_xbatch_pm` admits `(m, k, batch)`.
+pub(crate) fn q8_k8_admits(m: usize, k: usize, batch: usize) -> bool {
+    narrow(batch) && k.is_multiple_of(K8_K_MULTIPLE) && q8_shape(m, k, batch)
+}
+
+/// `gemv_q8_0_k8_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`: `K % 256 == 0`
+/// (short final partition tiles included, as the HIP `gemv_q8_0_k8` singleton);
+/// the narrow export keeps `K % 2048`.
+pub(crate) fn q8_k8_wide_admits(m: usize, k: usize, rows: usize) -> bool {
+    wide(rows) && k.is_multiple_of(256) && q8_shape(m, k, rows)
+}
+
 /// `gemv_q8_0_k320_xbatch_pm` admits `(m, k, batch)`.
 pub(crate) fn q8_k320_admits(m: usize, k: usize, batch: usize) -> bool {
-    (1..=LANE_ROWS_PM_MAX).contains(&batch)
-        && k == K320
-        && m > 0
-        && fits_i32(m)
-        && fits_u32(m.checked_mul(K320 / 32 * Q8_BLOCK_BYTES))
-        && fits_u32(batch.checked_mul(K320 * 4))
-        && fits_u32(batch.checked_mul(m).and_then(|n| n.checked_mul(4)))
+    narrow(batch) && k == K320 && q8_shape(m, K320, batch)
+}
+
+/// `gemv_q8_0_k320_xbatch_wide_r{16,32}_pm` admits `(m, k, rows)`.
+pub(crate) fn q8_k320_wide_admits(m: usize, k: usize, rows: usize) -> bool {
+    wide(rows) && k == K320 && q8_shape(m, K320, rows)
+}
+
+/// `gemv_q8_0_k2560_xbatch_wide_r{16,32}_pm` and the x2 pair admit `(m, k, rows)`.
+pub(crate) fn q8_k2560_wide_admits(m: usize, k: usize, rows: usize) -> bool {
+    wide(rows) && k == 2560 && q8_shape(m, 2560, rows)
+}
+
+/// `gemv_q8_0_wide_xbatch_wide_r{16,32}_pm` (four-chain small K: every staged
+/// K <= 1536, K % 32 == 0 other than K = 320) admits `(m, k, rows)`.
+pub(crate) fn q8_small_wide_admits(m: usize, k: usize, rows: usize) -> bool {
+    wide(rows) && k != K320 && k <= 1536 && k.is_multiple_of(32) && q8_shape(m, k, rows)
 }
 
 fn need(name: &str, what: &str, tensor: &GpuTensor, bytes: usize) -> HipResult<()> {
@@ -148,8 +222,20 @@ impl Gpu {
             && !self.graphs.capture_mode
     }
 
+    /// Verify the pinned `qwen4_lane_rows_pm` image and load `symbol` (narrow or
+    /// S2 `_wide_r{16,32}_pm` export; exact gfx1151 only), so byte oracles can
+    /// launch any export by name with raw blobs.
+    pub fn ensure_lane_rows_pm_entry(&mut self, symbol: &str) -> HipResult<()> {
+        if !self.arch_caps.is_gfx1151() {
+            return Err(refuse(symbol, "the lane-rows PM kernels are exact gfx1151 only"));
+        }
+        VERIFIED.clone().map_err(|reason| HipError::new(0, &reason))?;
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(MODULE, kernels::QWEN4_LANE_ROWS_PM_GFX1151, symbol)
+    }
+
     /// Verify the pinned image and load `symbol` of the module.
-    fn ensure_lane_rows_pm(&mut self, name: &str, symbol: &'static str) -> HipResult<()> {
+    pub(crate) fn ensure_lane_rows_pm(&mut self, name: &str, symbol: &'static str) -> HipResult<()> {
         if !self.arch_caps.is_gfx1151() {
             return Err(refuse(name, "the lane-rows PM kernels are exact gfx1151 only"));
         }

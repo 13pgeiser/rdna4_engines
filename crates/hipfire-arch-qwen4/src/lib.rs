@@ -54,6 +54,8 @@ pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
 pub mod trunk_overlay;
+#[cfg(feature = "reference-parity")]
+pub mod wide_verify_oracle;
 pub mod weights;
 
 pub use admission::{

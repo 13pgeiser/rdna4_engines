@@ -1,0 +1,150 @@
+{
+  "schema": "hipfire.bf16_rows_wide.shape.v1",
+  "module": "bf16_rows_wide_pm_gfx1151",
+  "arch": "gfx1151",
+  "image": "kernels/bf16_rows_wide_pm_gfx1151.hxaco",
+  "image_sha256": "f1d14ba22190a6be4e85bc5905ed240d31395c51f7a3d9583d21fb09e55a4122",
+  "code_object_sha256": "64ca666c1d182e717cb465288a6a1493d6c450f5e678e73782f8eaa05a3a4f69",
+  "source_and_dag_receipt": "kernels/bf16_rows_wide_pm_gfx1151.decode.json",
+  "proof": "kernels/bf16_rows_wide_pm_gfx1151.proof.json",
+  "rows_domain": "1<=R<=compiled cap; no padded X/Y accesses",
+  "x4_domain": "K%8==0 uses eight BF16/f32 elements per lane, skipped partial vectors; K%8!=0 uses full scalar-domain K32 traversal. Mi>=0, X[R,K], Yi[R,Mi].",
+  "hc_domain": "K%32==0, M>=0, X[R,K], Y[R,M]; hc_act0 ignores scale, hc_act!=0 uses exact decode BF16/scale/exp/divide epilogue.",
+  "x4_kernarg_offsets": {
+    "A0": 0,
+    "A1": 8,
+    "A2": 16,
+    "A3": 24,
+    "X": 32,
+    "Y0": 40,
+    "Y1": 48,
+    "Y2": 56,
+    "Y3": 64,
+    "M0": 72,
+    "M1": 76,
+    "M2": 80,
+    "M3": 84,
+    "K": 88,
+    "R": 92
+  },
+  "hc_kernarg_offsets": {
+    "W": 0,
+    "X": 8,
+    "Y": 16,
+    "M": 24,
+    "K": 28,
+    "scale": 32,
+    "hc_act": 36,
+    "R": 40
+  },
+  "exports": [
+    {
+      "symbol": "gemv_bf16_xf32_x4_rows_wide_r16_pm_gfx1151",
+      "kernarg_bytes": 96,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "wavefront_size": 32,
+      "vgpr_count": 104,
+      "sgpr_count": 66,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "private_segment_fixed_bytes": 0,
+      "static_lds_bytes": 8192,
+      "dynamic_lds_bytes": 0,
+      "workgroup_processor_mode": 1,
+      "rows_cap": 16,
+      "grid": [
+        "sum_i ceil(M_i/8)",
+        1,
+        1
+      ]
+    },
+    {
+      "symbol": "gemv_bf16_xf32_x4_rows_wide_r32_pm_gfx1151",
+      "kernarg_bytes": 96,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "wavefront_size": 32,
+      "vgpr_count": 168,
+      "sgpr_count": 66,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "private_segment_fixed_bytes": 0,
+      "static_lds_bytes": 8192,
+      "dynamic_lds_bytes": 0,
+      "workgroup_processor_mode": 1,
+      "rows_cap": 32,
+      "grid": [
+        "sum_i ceil(M_i/8)",
+        1,
+        1
+      ]
+    },
+    {
+      "symbol": "gemv_bf16_xf32_k4_rows_wide_r16_pm_gfx1151",
+      "kernarg_bytes": 48,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "wavefront_size": 32,
+      "vgpr_count": 104,
+      "sgpr_count": 82,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "private_segment_fixed_bytes": 0,
+      "static_lds_bytes": 16384,
+      "dynamic_lds_bytes": 0,
+      "workgroup_processor_mode": 1,
+      "rows_cap": 16,
+      "grid": [
+        "ceil(M/2)",
+        1,
+        1
+      ]
+    },
+    {
+      "symbol": "gemv_bf16_xf32_k4_rows_wide_r32_pm_gfx1151",
+      "kernarg_bytes": 48,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "wavefront_size": 32,
+      "vgpr_count": 168,
+      "sgpr_count": 82,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "private_segment_fixed_bytes": 0,
+      "static_lds_bytes": 16384,
+      "dynamic_lds_bytes": 0,
+      "workgroup_processor_mode": 1,
+      "rows_cap": 32,
+      "grid": [
+        "ceil(M/2)",
+        1,
+        1
+      ]
+    }
+  ],
+  "code_end_tail": {
+    "dword": "0xbf9f0000",
+    "count": 96,
+    "verified": true
+  },
+  "cpu_lds_barrier_audit": {
+    "modules": 1,
+    "kernels": 4,
+    "barriers": 88,
+    "lds_store_unwaited_at_barrier": 0
+  },
+  "hardware_verification": "NOT RUN; byte/state/performance admission belongs to lead"
+}

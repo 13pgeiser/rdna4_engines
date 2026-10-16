@@ -1428,6 +1428,11 @@ pub struct Gpu {
     /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
     /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
     pub prefill_invariant_scope: bool,
+    /// Row-exact rows of the verify forward in flight (`0` = not a verify
+    /// forward). Widens the few-row routes (`Gpu::few_row_limit`) so an
+    /// n-row verify is bitwise the sequential decode rows; prefill and every
+    /// non-verify forward keep it `0`.
+    pub wide_verify_rows: usize,
     /// SKU-emulation state (`HIPFIRE_EMU`): profile, host facts and the
     /// installed budget id. `None` when emulation is off (the default).
     pub(crate) emu: Option<crate::emu::EmuGpuState>,
@@ -2271,6 +2276,7 @@ impl Gpu {
             qwen4_scope: false,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            wide_verify_rows: 0,
             emu,
             qwen4_append_f16_moe_scope: false,
         })

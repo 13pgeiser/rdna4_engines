@@ -964,6 +964,26 @@ name = "mq4_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "bf16_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_wide_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_lm_head_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_rows_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "q8_wide_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "draft_overwrite_gfx12_oracle"
 required-features = ["lab"]
 

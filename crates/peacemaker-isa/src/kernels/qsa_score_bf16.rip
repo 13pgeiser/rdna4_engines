@@ -1,5 +1,8 @@
 // QSA selector scores, BF16-pooled (gfx1151): standalone RIP, evaluated without rustc.
-// The twin of `qsa_score.rip.rs` `emit_bf16`: `indexed_attention_select_scores_rows16_bf16_pm_gfx1151`.
+// The twin of `qsa_score.rip.rs` `emit_bf16`: `indexed_attention_select_scores_rows16_bf16_pm_gfx1151`
+// (variant `score-bf16`) and, with the row tile parameterized 16 -> 32 (first row `32 * wg_y`,
+// row clamp 32, nothing else), `indexed_attention_select_scores_rows32_bf16_pm_gfx1151`
+// (variant `score-bf16-rows32`).
 // Every lane loads its whole pooled key row (128 BF16, 256 bytes) once as 16
 // `buffer_load_b128` into the upper 64 key VGPRs; after `vmcnt(0)` an ascending
 // in-place unpack (low half `v_lshlrev_b32 16`, high half `v_and_b32 0xffff0000`)
@@ -14,8 +17,20 @@
 
 /// `sqrtf(128.0f)` correctly rounded.
 const SQRT_INDEX_DIM: u32 = 0x4135_04f3;
-/// Query rows per workgroup.
-const ROWS: i32 = 16;
+/// Query rows per workgroup: the only geometry that differs between the R16
+/// and R32 symbols.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Tile { R16, R32 }
+impl Tile {
+    fn rows(self) -> i32 { match self { Self::R16 => 16, Self::R32 => 32 } }
+    /// `log2(rows)`: the shift from `wg_y` to the tile's first row.
+    fn shift(self) -> u32 { match self { Self::R16 => 4, Self::R32 => 5 } }
+    /// Assembler labels are module-global: the R16 labels are the incumbent's,
+    /// the R32 kernels (same module) carry their own.
+    fn end_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_end", Self::R32 => ".Lqsc32_end" } }
+    fn rows_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows", Self::R32 => ".Lqsc32_rows" } }
+    fn done_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows_done", Self::R32 => ".Lqsc32_rows_done" } }
+}
 /// Index heads and dims per head (the host contract).
 const HEADS: usize = 4;
 const DIM: usize = 128;
@@ -45,6 +60,7 @@ const KEYS: u8 = 8; // key[d] = v(8 + d)
 const DT: u8 = 136; // division temporaries: ns, ds, rc, e, q per interleaved pair half
 
 pub fn symbol(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_bf16_pm_{}", arch.name()) }
+pub fn symbol_rows32(arch: Arch) -> String { format!("indexed_attention_select_scores_rows32_bf16_pm_{}", arch.name()) }
 
 fn kernargs() -> KernargLayout {
     KernargLayout::new(52).pointer("query", 0).pointer("pooled", 8).pointer("scores", 16)
@@ -81,15 +97,19 @@ fn plan() -> Result<RegPlan, String> {
 
 pub fn emit(arch: Arch, variant: &str) -> Result<Emitted, String> {
     if arch != Arch::Gfx1151 { return Err("qsa_score: built for gfx1151 only".into()) }
-    if variant != "score-bf16" { return Err(format!("qsa_score: unknown variant `{variant}` (score-bf16)")) }
+    let (tile, sym) = match variant {
+        "score-bf16" => (Tile::R16, symbol(arch)),
+        "score-bf16-rows32" => (Tile::R32, symbol_rows32(arch)),
+        _ => return Err(format!("qsa_score: unknown variant `{variant}` (score-bf16|score-bf16-rows32)")),
+    };
     let spec = KernelSpec {
-        kernel_id: "qsa_select".into(), variant: "score-bf16".into(), arch, symbol: symbol(arch),
+        kernel_id: "qsa_select".into(), variant: variant.into(), arch, symbol: sym,
         kernargs: kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
         workgroup_size: 256, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut b = Builder::new(spec, plan()?);
     let mut wg = Workgroup::new(&mut b, arch)?;
-    author(&mut wg)?;
+    author(&mut wg, tile)?;
     b.finish()
 }
 
@@ -97,8 +117,8 @@ fn scmp(w: &mut Wg, text: String, uses: &[u8]) -> Result<Cond, String> {
     w.scmp(Instruction::new(text, vec![], uses.iter().map(|&n| s(n)).collect()))
 }
 
-fn author(wg: &mut Wg) -> Result<(), String> {
-    let end = wg.exit(".Lqsc_end")?;
+fn author(wg: &mut Wg, tile: Tile) -> Result<(), String> {
+    let end = wg.exit(tile.end_label())?;
     let b = wg.isa();
     smem(b, A0, 8, KARG, 0)?;
     smem(b, A1, 4, KARG, 0x20)?;
@@ -112,13 +132,13 @@ fn author(wg: &mut Wg) -> Result<(), String> {
     sop(b, format!("s_lshl_b32 s{BLK0}, s{WGX}, 8"), &[BLK0], &[WGX])?;
     sop(b, format!("s_lshl_b32 s{T0}, s{WAVE}, 5"), &[T0], &[WAVE])?;
     sop(b, format!("s_add_i32 s{T0}, s{T0}, s{BLK0}"), &[T0], &[T0, BLK0])?;
-    sop(b, format!("s_lshl_b32 s{ROW0}, s{WGY}, 4"), &[ROW0], &[WGY])?;
+    sop(b, format!("s_lshl_b32 s{ROW0}, s{WGY}, {}", tile.shift()), &[ROW0], &[WGY])?;
     // A wave entirely past block_count, or a row tile past the rows, returns.
     let live = scmp(wg, format!("s_cmp_lt_i32 s{T0}, s{BLOCK_COUNT}"), &[T0, BLOCK_COUNT])?;
     wg.wave_exit_unless(live, &end)?;
     let b = wg.isa();
     sop(b, format!("s_sub_i32 s{NROWS}, s{ROWS_ARG}, s{ROW0}"), &[NROWS], &[ROWS_ARG, ROW0])?;
-    sop(b, format!("s_min_i32 s{NROWS}, s{NROWS}, {ROWS}"), &[NROWS], &[NROWS])?;
+    sop(b, format!("s_min_i32 s{NROWS}, s{NROWS}, {}", tile.rows()), &[NROWS], &[NROWS])?;
     let some = scmp(wg, format!("s_cmp_gt_i32 s{NROWS}, 0"), &[NROWS])?;
     wg.wave_exit_unless(some, &end)?;
     let b = wg.isa();
@@ -167,7 +187,7 @@ fn author(wg: &mut Wg) -> Result<(), String> {
         op(b, format!("v_lshlrev_b32_e32 v{lo}, 16, v{packed}"), &[v(lo)], &[v(packed)])?;
         op(b, format!("v_and_b32_e32 v{hi}, 0xffff0000, v{packed}"), &[v(hi)], &[v(packed)])?;
     }
-    wg.loop_until(".Lqsc_rows", ".Lqsc_rows_done", |w, exit| {
+    wg.loop_until(tile.rows_label(), tile.done_label(), |w, exit| {
         row(w.isa())?;
         let b = w.isa();
         // Visible blocks of the next row: remainder + 1, carrying into the quotient.

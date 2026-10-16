@@ -132,15 +132,90 @@ pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item 
 /// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
 pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
 
-/// The rows a verify/takeover forward on `gpu` carries on the decode-shaped
-/// route, where every row is bitwise the single-row decode (Q8 decode copy,
-/// K1 lane-union MoE, rows_x4 GEMV, k4 HC gate, QSA prologue, fused
-/// router+shared). A forward of more rows runs prefill kernels that are not
-/// row-exact. The n-gram copy lane takes at most this minus the seed row.
+/// Rows a verify forward on this GPU runs row-exact (each row bitwise the
+/// sequential single-row decode): the per-arch value of
+/// [`rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`] (the
+/// historic few-row limit 8 until the oracle proves the arch wider, or the
+/// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` developer override). The single per-GPU
+/// value the verify scope and the n-gram copy lane read.
 pub(crate) fn qwen4_row_exact_verify_rows(gpu: &Gpu) -> usize {
     rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&gpu.arch)
 }
 
+/// How a plain one-row autoregressive (AR) decode of this process launches
+/// its body, as far as arithmetic is concerned.
+///
+/// Qwen4 production has exactly two modes: ordinary eager HIP launches, and the
+/// retained Redline body (`ReplayController`: the first eligible plain-AR
+/// forward is *recorded*, later ones replay the PM4/AQL tape of that record).
+/// A recorded launch runs with `Gpu::replay.is_recording()`, so every
+/// "not recorded / not captured" route (QSA split-K decode attention above all)
+/// is closed in it and in its replays. No Qwen4 production path opens a
+/// hipGraph capture (`graphs.capture_mode` is set only by oracle examples);
+/// it is folded into [`Self::Recorded`] because it closes the same routes.
+/// A verify forward (2+ rows) is never a retained candidate
+/// (`n == 1` in the `eligible` predicate of `forward_chunk_scoped`), so it
+/// always launches eager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4ArLaunch {
+    /// Eager HIP launches (retained backend off or poisoned, or the bundle is
+    /// never a retained candidate).
+    Eager,
+    /// Recorded into, or replayed from, a retained body (or hipGraph-captured).
+    Recorded,
+}
+
+/// The AR decode launch mode from the controller's actual state.
+///
+/// `retained_candidate` is the bundle-level part of `forward_chunk_scoped`'s
+/// `eligible` predicate (no EP, Flash-Next profile, no lane scope, no QSA tap,
+/// no QSA projection hook); the per-call parts (`n == 1`, no wide-hidden
+/// capture, no invariant scope) are assumed to hold for the AR forward this
+/// verify is compared against. Only [`ReplayState::Hip`] /
+/// [`ReplayState::Fallback`] (the `hip_body` states) or `request == Hip` run AR
+/// eager; every other state (`Armed`: the next eligible forward records;
+/// `RecordingWarmup`, `Captured`, `ShadowValidated`, `Ready`) records or
+/// replays. `Shadow` requests are classed `Recorded` conservatively (the
+/// capture forward records; the route after validation is a developer
+/// selection).
+pub(crate) fn qwen4_ar_launch(
+    retained_candidate: bool,
+    request: rdna_compute::replay::ReplayBackendRequest,
+    state: ReplayState,
+    graph_capture: bool,
+) -> Qwen4ArLaunch {
+    use rdna_compute::replay::ReplayBackendRequest;
+    if graph_capture {
+        return Qwen4ArLaunch::Recorded;
+    }
+    if !retained_candidate
+        || request == ReplayBackendRequest::Hip
+        || matches!(state, ReplayState::Hip | ReplayState::Fallback)
+    {
+        return Qwen4ArLaunch::Eager;
+    }
+    Qwen4ArLaunch::Recorded
+}
+
+/// Verify rows a forward may run row-exact given the AR launch mode: rows
+/// above the historic `FEW_ROW_ROUTE_ROWS` (8) stay at it when the one-row AR
+/// decode is recorded/captured while its eager launch takes a different QSA
+/// attention arithmetic (`attention_eager_differs`: eager split-K versus the
+/// per-head kernel a recorded launch keeps). A wide verify is always eager, so
+/// widening there would compare eager split-K rows against recorded per-head
+/// AR rows. `attention_eager_differs` is evaluated only when it can matter.
+pub(crate) fn qwen4_wide_verify_rows_guard(
+    requested: usize,
+    ar: Qwen4ArLaunch,
+    attention_eager_differs: impl FnOnce() -> bool,
+) -> usize {
+    let historic = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+    if requested > historic && ar == Qwen4ArLaunch::Recorded && attention_eager_differs() {
+        historic
+    } else {
+        requested
+    }
+}
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
 }
@@ -650,15 +725,19 @@ pub(crate) const DECODE_Q8_PER_LAYER: usize = 7;
 
 /// A decode-shaped forward's projection (one token, or the few rows of a
 /// speculative verify, which must match it bitwise): its Q8_0 decode copy
-/// (`Qwen4GpuForward::decode_q8`) when one exists.
+/// (`Qwen4GpuForward::decode_q8`) when one exists. `rows` is the routing row
+/// count (`Gpu::route_rows`) and `few_row_limit` the architecture's admitted
+/// exact cap (`Gpu::few_row_limit`): the existing copy binds exactly while
+/// `rows <= few_row_limit`; nothing is allocated or requantized per call.
 pub(crate) fn decode_copy<'a>(
     copies: &'a [GpuTensor],
     index: usize,
     rows: usize,
+    few_row_limit: usize,
     source: WeightRef<'a>,
 ) -> WeightRef<'a> {
     match copies.get(index) {
-        Some(buf) if rows <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS => WeightRef {
+        Some(buf) if rows <= few_row_limit => WeightRef {
             buf,
             dtype: DType::Q8_0,
             row_stride: row_stride(DType::Q8_0, source.k),
@@ -767,7 +846,8 @@ pub(crate) fn qwen4_ple_rows_f16(
 }
 
 /// `decode_q8` / `rows`: the forward's Q8_0 decode copies and row count; a
-/// one-row forward binds this layer's shared-expert copies.  `moe` is the
+/// forward of at most `few_row_limit` rows (`Gpu::few_row_limit`) binds this
+/// layer's shared-expert copies.  `moe` is the
 /// layer's MoE runtime and is `Some` exactly for a MoE FFN.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn layer_desc<'a>(
@@ -777,6 +857,7 @@ pub(crate) fn layer_desc<'a>(
     config: &Qwen4Config,
     decode_q8: &'a [GpuTensor],
     rows: usize,
+    few_row_limit: usize,
     stage: Option<&'a Qwen4ExpertStage>,
 ) -> Result<Qwen4LayerDescription<'a>, Qwen4GpuForwardError> {
     let attention = match layer.kind {
@@ -811,6 +892,7 @@ pub(crate) fn layer_desc<'a>(
                     decode_q8,
                     layer.layer * DECODE_Q8_PER_LAYER + slot,
                     rows,
+                    few_row_limit,
                     source.dispatch_ref(),
                 )
             };
@@ -6353,6 +6435,47 @@ impl Qwen4GpuForward {
         final_chunk
     }
 
+    /// [`qwen4_row_exact_verify_rows`] guarded by the bundle's actual AR launch
+    /// mode ([`qwen4_ar_launch`]) and the QSA attention policy of this bundle's
+    /// K/V format
+    /// ([`rdna_compute::tensor_ops::qsa_decode_attention_eager_differs_from_recorded`],
+    /// evaluated at the shortest and the full selected length so the LDS fit of
+    /// either end counts). gfx1201 resolves to per-head attention in both modes,
+    /// so it keeps the table value; gfx1151 F32 splits eagerly only.
+    pub(crate) fn guarded_wide_verify_rows(&self, bundle: &Qwen4Bundle, gpu: &Gpu) -> usize {
+        let requested = qwen4_row_exact_verify_rows(gpu);
+        if requested <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS {
+            return requested;
+        }
+        let config = &bundle.config;
+        let retained_candidate = self.ep.is_none()
+            && config.profile.is_flash_next()
+            && !self.lane_scope
+            && self.qsa_tap.is_none()
+            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+        let ar = qwen4_ar_launch(
+            retained_candidate,
+            gpu.replay.request(),
+            gpu.replay.state(),
+            gpu.graphs.capture_mode,
+        );
+        qwen4_wide_verify_rows_guard(requested, ar, || {
+            let full = config.qsa_selected_capacity();
+            bundle.state.qsa.iter().any(|qsa| {
+                [1, full].into_iter().any(|max_selected| {
+                    rdna_compute::tensor_ops::qsa_decode_attention_eager_differs_from_recorded(
+                        gpu,
+                        qsa.format,
+                        config.head_dim,
+                        config.num_attention_heads,
+                        config.num_key_value_heads,
+                        max_selected,
+                    )
+                })
+            })
+        })
+    }
+
     /// Every forward runs with [`Gpu::qwen4_scope`] set, which admits the
     /// Qwen4-only MQ6 X-LDS defaults (U2/U3); the previous value is restored.
     #[allow(clippy::too_many_arguments)]
@@ -6412,6 +6535,20 @@ impl Qwen4GpuForward {
         let prior_ragged = std::mem::replace(
             &mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope,
         );
+        // A verify forward (not a prefill tile, 2+ rows) runs row-exact up to
+        // the arch's proven limit: the few-row decode-twin routes widen to it
+        // (`Gpu::few_row_limit`), so each row is bitwise the sequential decode
+        // row. A one-row forward is the decode itself; prefill keeps the
+        // historic limit. Rows above the historic 8 additionally require that
+        // the AR decode they reproduce takes the same QSA attention arithmetic
+        // as this eager verify (`guarded_wide_verify_rows`). Restored below on
+        // the single return path.
+        let wide_verify = if !self.prefill_scope && tokens.len() >= 2 {
+            self.guarded_wide_verify_rows(bundle, gpu)
+        } else {
+            0
+        };
+        let prior_wide_verify = gpu.set_wide_verify_rows(wide_verify);
         let result = self.forward_chunk_scoped(
             bundle,
             gpu,
@@ -6426,6 +6563,7 @@ impl Qwen4GpuForward {
         gpu.prefill_invariant_scope = prior_invariant;
         gpu.qwen4_append_f16_moe_scope = prior_f16_moe;
         gpu.qwen4_trunk_iu4_prefill_scope = prior_ragged;
+        gpu.set_wide_verify_rows(prior_wide_verify);
         result
     }
 
@@ -6647,6 +6785,9 @@ impl Qwen4GpuForward {
         // The row count every routing decision below sees (`n` unless the
         // invariant prefill profile is on); launch extents keep `n`.
         let route_n = gpu.route_rows(n);
+        // Largest row count of a few-row (decode-exact) route in this forward:
+        // the historic 8, or the verify scope's row-exact rows.
+        let few_row_limit = gpu.few_row_limit();
         // Expert parallelism picks the MoE table per forward by routing row
         // count, identically on every rank: one row, or a few-row forward
         // (`2..=QWEN4_EP_GATHER_MAX_ROWS` rows that are also the routing rows:
@@ -6878,6 +7019,7 @@ impl Qwen4GpuForward {
                 &config,
                 &self.decode_q8,
                 route_n,
+                few_row_limit,
                 // Staged expert tables never replace the live table.
                 expert_stage.filter(|_| balanced_live.is_none()),
             )?;
@@ -6916,12 +7058,14 @@ impl Qwen4GpuForward {
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER,
                     route_n,
+                    few_row_limit,
                     attn_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 1,
                     route_n,
+                    few_row_limit,
                     attn_read.input_mix_up,
                 ),
                 normalized: &self.scratch.hc_normalized,
@@ -7083,12 +7227,14 @@ impl Qwen4GpuForward {
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 2,
                     route_n,
+                    few_row_limit,
                     mlp_read.input_mix_down,
                 ),
                 input_mix_up: decode_copy(
                     &self.decode_q8,
                     layer_index * DECODE_Q8_PER_LAYER + 3,
                     route_n,
+                    few_row_limit,
                     mlp_read.input_mix_up,
                 ),
                 normalized: &self.scratch.hc_normalized,
@@ -8155,6 +8301,74 @@ mod capture_census_tests {
         assert_eq!(gate_capture_census(&mut replay, 5, 5), Ok(()));
         assert_eq!(replay.state(), ReplayState::RecordingWarmup);
         assert!(replay.fallback_reason().is_none());
+    }
+}
+
+#[cfg(test)]
+mod wide_verify_guard_tests {
+    use super::{qwen4_ar_launch, qwen4_wide_verify_rows_guard, Qwen4ArLaunch};
+    use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
+    use rdna_compute::replay::{ReplayBackendRequest as Request, ReplayState as State};
+
+    #[test]
+    fn ar_launch_truth_table() {
+        use Qwen4ArLaunch::{Eager, Recorded};
+        // Retained backend off, or poisoned: AR is ordinary HIP.
+        assert_eq!(qwen4_ar_launch(true, Request::Hip, State::Hip, false), Eager);
+        assert_eq!(qwen4_ar_launch(true, Request::Auto, State::Fallback, false), Eager);
+        assert_eq!(qwen4_ar_launch(true, Request::Auto, State::Hip, false), Eager);
+        // Not a retained candidate (EP, lane scope, tap, non Flash-Next): eager
+        // whatever the controller holds.
+        for state in [State::Armed, State::RecordingWarmup, State::Ready] {
+            assert_eq!(qwen4_ar_launch(false, Request::Auto, state, false), Eager);
+        }
+        // Every live retained state records or replays AR.
+        for state in [
+            State::Armed,
+            State::RecordingWarmup,
+            State::Captured,
+            State::ShadowValidated,
+            State::Ready,
+        ] {
+            assert_eq!(qwen4_ar_launch(true, Request::Auto, state, false), Recorded);
+        }
+        assert_eq!(qwen4_ar_launch(true, Request::Shadow, State::Armed, false), Recorded);
+        // A hipGraph capture closes the same routes, even on a non-candidate.
+        assert_eq!(qwen4_ar_launch(false, Request::Hip, State::Hip, true), Recorded);
+    }
+
+    #[test]
+    fn guard_keeps_eight_only_when_recorded_ar_differs() {
+        use Qwen4ArLaunch::{Eager, Recorded};
+        for requested in [FEW_ROW_ROUTE_ROWS, 16, WIDE_VERIFY_MAX_ROWS] {
+            // Eager AR: eager verify and eager AR share every route.
+            assert_eq!(qwen4_wide_verify_rows_guard(requested, Eager, || true), requested);
+            assert_eq!(qwen4_wide_verify_rows_guard(requested, Eager, || false), requested);
+            // Recorded AR on a per-head arch (gfx1201): both modes agree.
+            assert_eq!(qwen4_wide_verify_rows_guard(requested, Recorded, || false), requested);
+        }
+        // Recorded AR whose eager launch splits (gfx1151 F32): stay at 8.
+        for requested in [16, WIDE_VERIFY_MAX_ROWS] {
+            assert_eq!(
+                qwen4_wide_verify_rows_guard(requested, Recorded, || true),
+                FEW_ROW_ROUTE_ROWS
+            );
+        }
+        assert_eq!(
+            qwen4_wide_verify_rows_guard(FEW_ROW_ROUTE_ROWS, Recorded, || true),
+            FEW_ROW_ROUTE_ROWS
+        );
+    }
+
+    #[test]
+    fn guard_evaluates_attention_policy_only_when_it_matters() {
+        use Qwen4ArLaunch::{Eager, Recorded};
+        let panics = || -> bool { panic!("attention policy evaluated needlessly") };
+        assert_eq!(
+            qwen4_wide_verify_rows_guard(FEW_ROW_ROUTE_ROWS, Recorded, panics),
+            FEW_ROW_ROUTE_ROWS
+        );
+        assert_eq!(qwen4_wide_verify_rows_guard(32, Eager, panics), 32);
     }
 }
 

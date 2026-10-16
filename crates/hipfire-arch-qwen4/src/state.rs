@@ -584,10 +584,23 @@ pub(crate) fn context_arena_bytes_through(
     (tensor.byte_size() / capacity) as u64 * rows.min(capacity) as u64
 }
 
+/// Draft rows a decode request must map ahead for: the widest verify window
+/// the scheduler can actually issue, not the configured MTP depth alone. A
+/// window of `rows` rows (`1 + drafts`: wide verify, copy and n-gram windows
+/// may be wider than `configured_draft_rows`) started at the last budgeted
+/// position ends `rows - 1` positions past the budget. Mapping is capacity
+/// only; no length, position or watermark advances with it.
+pub(crate) fn map_ahead_draft_rows(
+    configured_draft_rows: usize,
+    widest_window_rows: usize,
+) -> usize {
+    configured_draft_rows.max(widest_window_rows.saturating_sub(1))
+}
+
 /// Tokens a decode request maps ahead of its position so per-token growth
 /// checks never remap: the remaining new-token budget plus `max_draft_rows`
-/// speculative rows, clamped to `capacity`. A missing or zero budget
-/// (unbounded or finished request) maps nothing ahead.
+/// ([`map_ahead_draft_rows`]) speculative rows, clamped to `capacity`. A
+/// missing or zero budget (unbounded or finished request) maps nothing ahead.
 pub(crate) fn decode_map_ahead_tokens(
     position: usize,
     remaining_new_tokens: Option<usize>,
@@ -3406,6 +3419,21 @@ mod tests {
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 1),
             Some(0)
         );
+    }
+
+    #[test]
+    fn map_ahead_draft_rows_cover_the_widest_scheduled_window() {
+        // A window wider than the configured depth sets the bound.
+        assert_eq!(map_ahead_draft_rows(3, 32), 31);
+        assert_eq!(map_ahead_draft_rows(10, 9), 10);
+        // No wider window: the configured depth (an AR lane has none).
+        assert_eq!(map_ahead_draft_rows(0, 0), 0);
+        assert_eq!(map_ahead_draft_rows(0, 1), 0);
+        assert_eq!(map_ahead_draft_rows(7, 8), 7);
+        // The widest window's end stays inside the mapped target.
+        let rows = map_ahead_draft_rows(3, 32);
+        let target = decode_map_ahead_tokens(100, Some(64), rows, 4096).unwrap();
+        assert!(target >= 100 + 64 - 1 + 32);
     }
 
     #[test]

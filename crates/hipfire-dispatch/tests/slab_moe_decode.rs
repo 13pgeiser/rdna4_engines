@@ -342,10 +342,10 @@ fn planner_refuses_out_of_bounds_routes() {
     let good = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     assert_eq!(LaneUnionPlan::build(&codecs, &[]), Err(SlabMoeError::InvalidLaneCount { c: 0 }));
     assert_eq!(
-        LaneUnionPlan::build(&codecs, &vec![good; 9]),
-        Err(SlabMoeError::InvalidLaneCount { c: 9 })
+        LaneUnionPlan::build(&codecs, &vec![good; 33]),
+        Err(SlabMoeError::InvalidLaneCount { c: 33 })
     );
-    assert!(LaneUnionPlan::build(&codecs, &vec![good; 8]).is_ok());
+    assert!(LaneUnionPlan::build(&codecs, &vec![good; 32]).is_ok());
     let mut high = good;
     high[3] = 512;
     assert_eq!(
@@ -405,6 +405,7 @@ fn layout_validation_catches_corrupt_descriptors() {
     mutate(&ok, |l| l.buckets[0].expert_count = 0);
     mutate(&ok, |l| l.u_total += 1);
     mutate(&ok, |l| l.c = 9);
+    mutate(&ok, |l| l.c = 33);
     mutate(&ok, |l| l.c = 0);
     mutate(&ok, |l| l.buckets.clear());
     assert!(ok.validate().is_ok());
@@ -622,4 +623,323 @@ fn descriptor_bytes_are_little_endian_u32_arrays() {
     for (i, w) in plan.slot_ids.iter().enumerate() {
         assert_eq!(u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()), *w);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-capacity device planner model (`qwen4_slab_union_plan`), C1..=C32
+// ---------------------------------------------------------------------------
+
+fn flat(top: &[[u32; TOP_K]]) -> Vec<u32> {
+    top.iter().flatten().copied().collect()
+}
+
+/// Independent first-occurrence construction of the `6 S + 2` words (no shared
+/// code with the thread model): experts per bucket in the order their first slot
+/// appears, slots ascending inside an expert, tails 0 / `n_b`.
+fn reference_words(topk: &[u32], bucket_of: &dyn Fn(u32) -> usize) -> Vec<u32> {
+    let s = topk.len();
+    let mut out = vec![0u32; 6 * s + 2];
+    for b in 0..2 {
+        let mut experts: Vec<u32> = Vec::new();
+        for &id in topk {
+            if bucket_of(id) == b && !experts.contains(&id) {
+                experts.push(id);
+            }
+        }
+        let mut n = 0usize;
+        for (e, &id) in experts.iter().enumerate() {
+            out[b * s + e] = id;
+            out[2 * s + b * (s + 1) + e] = n as u32;
+            for (slot, &x) in topk.iter().enumerate() {
+                if x == id {
+                    out[2 * s + 2 * (s + 1) + b * s + n] = slot as u32;
+                    n += 1;
+                }
+            }
+        }
+        for e in experts.len()..=s {
+            out[2 * s + b * (s + 1) + e] = n as u32;
+        }
+    }
+    out
+}
+
+/// Model the planner, assert single ownership of every word, equality with the
+/// independent reference and (canonicalized) with the sorted compact plan.
+fn check_fixed(codecs: &[Option<Codec>], top: &[[u32; TOP_K]], uniform: Option<Codec>) -> FixedUnion {
+    let c = top.len();
+    let m = FixedUnion::from_routes(codecs, top, uniform).unwrap();
+    assert_eq!(m.s, TOP_K * c);
+    assert_eq!(m.words.len(), fixed_union_words(c).unwrap());
+    assert!(m.writes.iter().all(|&w| w == 1), "every one of the 6S+2 words has exactly one owner");
+    m.validate().unwrap();
+    let bucket_of = |id: u32| match uniform {
+        Some(k) => k.order_index(),
+        None => codecs[id as usize].unwrap().order_index(),
+    };
+    assert_eq!(m.words, reference_words(&flat(top), &bucket_of));
+    let effective: Vec<Option<Codec>> = match uniform {
+        Some(k) => vec![Some(k); MAX_EXPERTS],
+        None => codecs.to_vec(),
+    };
+    let compact = LaneUnionPlan::build(&effective, top).unwrap();
+    assert_eq!(m.canonical(), flatten(&compact));
+    for bucket in &compact.layout.buckets {
+        let idx = bucket.codec.order_index();
+        assert_eq!(m.expert_count(idx), bucket.expert_count);
+        assert_eq!(m.slot_count(idx), bucket.slot_count);
+    }
+    assert_eq!(
+        m.expert_count(0) + m.expert_count(1),
+        compact.layout.u_total,
+        "empty buckets contribute no experts"
+    );
+    m
+}
+
+#[test]
+fn kernel_source_constants_match_the_cpu_model() {
+    let src = include_str!("../../../kernels/src/qwen4_slab_union_plan.hip");
+    let define = |name: &str| -> usize {
+        let pat = format!("#define {name} ");
+        let at = src.find(&pat).unwrap_or_else(|| panic!("{name} not defined")) + pat.len();
+        src[at..].split_whitespace().next().unwrap().parse().unwrap()
+    };
+    assert_eq!(define("SLAB_PLAN_MAX_SLOTS"), PLAN_MAX_SLOTS);
+    assert_eq!(define("SLAB_PLAN_THREADS"), PLAN_THREADS);
+    assert!(src.contains("__launch_bounds__(SLAB_PLAN_THREADS)"));
+    assert_eq!(PLAN_MAX_SLOTS, 320);
+    assert_eq!(PLAN_THREADS, 512);
+}
+
+#[test]
+fn fixed_descriptor_extents_c16_c32_and_refusals() {
+    assert_eq!(fixed_union_words(1), Ok(62));
+    assert_eq!(fixed_union_bytes(8), Ok(1928));
+    assert_eq!(fixed_union_bytes(16), Ok(3848));
+    assert_eq!(fixed_union_bytes(32), Ok(7688));
+    assert_eq!(fixed_union_words(0), Err(SlabMoeError::InvalidLaneCount { c: 0 }));
+    assert_eq!(fixed_union_words(33), Err(SlabMoeError::InvalidLaneCount { c: 33 }));
+    assert_eq!(fixed_union_bytes(usize::MAX), Err(SlabMoeError::InvalidLaneCount { c: usize::MAX }));
+    // Extent refusals: exact fits pass, one word short refuses, before any launch.
+    assert_eq!(check_plan_extents(32, 320 * 4, 7688), Ok(1922));
+    assert!(matches!(check_plan_extents(32, 320 * 4 - 4, 7688), Err(SlabMoeError::Operand { name: "topk", .. })));
+    assert!(matches!(
+        check_plan_extents(32, 320 * 4, 7688 - 4),
+        Err(SlabMoeError::Operand { name: "union scratch", .. })
+    ));
+    assert_eq!(check_plan_extents(0, 1 << 20, 1 << 20), Err(SlabMoeError::InvalidLaneCount { c: 0 }));
+    assert_eq!(check_plan_extents(33, 1 << 20, 1 << 20), Err(SlabMoeError::InvalidLaneCount { c: 33 }));
+    // A C16-sized reservation is too small for C32.
+    assert!(check_plan_extents(32, 320 * 4, 3848).is_err());
+    assert!(check_plan_extents(16, 160 * 4, 3848).is_ok());
+}
+
+#[test]
+fn fixed_planner_refuses_invalid_c_and_inputs() {
+    let ids = vec![0i32; 400];
+    let table = vec![0u8; MAX_EXPERTS];
+    assert_eq!(FixedUnion::model(&ids, 0, Some(&table), -1), Err(SlabMoeError::InvalidLaneCount { c: 0 }));
+    assert_eq!(FixedUnion::model(&ids, 33, Some(&table), -1), Err(SlabMoeError::InvalidLaneCount { c: 33 }));
+    assert!(matches!(
+        FixedUnion::model(&ids[..99], 10, Some(&table), -1),
+        Err(SlabMoeError::Operand { name: "topk", .. })
+    ));
+    assert!(matches!(FixedUnion::model(&ids, 4, None, -1), Err(SlabMoeError::Operand { name: "codec", .. })));
+    assert!(matches!(
+        FixedUnion::model(&ids, 4, Some(&table[..511]), -1),
+        Err(SlabMoeError::Operand { name: "codec", .. })
+    ));
+    assert!(matches!(FixedUnion::model(&ids, 4, Some(&table), 2), Err(SlabMoeError::Layout(_))));
+    // A uniform bucket needs no codec table.
+    assert!(FixedUnion::model(&ids, 4, None, 1).is_ok());
+    assert!(FixedUnion::model(&ids, 32, None, 0).is_ok());
+    assert!(matches!(
+        FixedUnion::from_routes(&alternating(), &[[0, 1, 2, 3, 4, 5, 6, 7, 8, 512]], None),
+        Err(SlabMoeError::ExpertOutOfRange { lane: 0, rank: 9, id: 512 })
+    ));
+    let mut codecs = alternating();
+    codecs[7] = None;
+    assert_eq!(
+        FixedUnion::from_routes(&codecs, &[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]], None),
+        Err(SlabMoeError::MissingCodec { expert: 7 })
+    );
+    // The uniform route never consults the table.
+    assert!(FixedUnion::from_routes(&codecs, &[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]], Some(Codec::Mq4Sym)).is_ok());
+}
+
+#[test]
+fn fixed_planner_matches_reference_for_every_c_1_to_32() {
+    for c in 1..=MAX_LANES {
+        for (codecs, seed) in [(alternating(), 1u32), (scrambled(), 2), (alternating(), 3)] {
+            let top = lanes(c, seed.wrapping_mul(0x9e37_79b9).wrapping_add(c as u32));
+            let m = check_fixed(&codecs, &top, None);
+            assert!(m.expert_count(0) + m.expert_count(1) >= TOP_K);
+            check_fixed(&codecs, &top, Some(Codec::Mq3I4));
+            check_fixed(&codecs, &top, Some(Codec::Mq4Sym));
+        }
+    }
+}
+
+#[test]
+fn fixed_planner_identical_sets_have_n_equals_c() {
+    for c in 1..=MAX_LANES {
+        // Every token selects the same ten experts, rank order rotated per lane.
+        let top: Vec<[u32; TOP_K]> = (0..c)
+            .map(|lane| {
+                let mut ids = [3u32, 14, 15, 92, 65, 35, 89, 79, 32, 38];
+                ids.rotate_left(lane % TOP_K);
+                ids
+            })
+            .collect();
+        let m = check_fixed(&alternating(), &top, None);
+        assert_eq!(m.expert_count(0) + m.expert_count(1), TOP_K, "U = 10");
+        for b in 0..2 {
+            let u = m.expert_count(b);
+            for e in 0..u {
+                let run = &m.slots(b)[m.offsets(b)[e] as usize..m.offsets(b)[e + 1] as usize];
+                assert_eq!(run.len(), c, "n = C slots per expert");
+                for (lane, &s) in run.iter().enumerate() {
+                    assert_eq!(s as usize / TOP_K, lane, "one slot per token, token order");
+                }
+            }
+        }
+        // First-occurrence order is lane 0's rank order inside each bucket.
+        let lane0: Vec<u32> = top[0].to_vec();
+        for b in 0..2 {
+            let want: Vec<u32> =
+                lane0.iter().copied().filter(|&id| alternating()[id as usize].unwrap().order_index() == b).collect();
+            assert_eq!(&m.ids(b)[..want.len()], &want[..]);
+        }
+    }
+}
+
+#[test]
+fn fixed_planner_maximally_disjoint_reaches_u_equals_10c() {
+    for c in 1..=MAX_LANES {
+        let top: Vec<[u32; TOP_K]> =
+            (0..c as u32).map(|l| core::array::from_fn(|r| l * 10 + r as u32)).collect();
+        let m = check_fixed(&alternating(), &top, None);
+        assert_eq!(m.expert_count(0) + m.expert_count(1), TOP_K * c);
+        assert_eq!(m.expert_count(0) + m.expert_count(1), max_union(c));
+        for b in 0..2 {
+            let n = m.slot_count(b);
+            assert_eq!(m.expert_count(b), n, "every expert has exactly one slot");
+            assert!(m.offsets(b)[..=n].iter().enumerate().all(|(i, &o)| o as usize == i));
+        }
+        // The compact plan accepts the same union.
+        let plan = check_plan(&alternating(), &top);
+        assert_eq!(plan.layout.u_total, TOP_K * c);
+        // One-codec twin: a single full bucket with U = S and an empty tail-only twin.
+        let q = check_fixed(&alternating(), &top, Some(Codec::Mq4Sym));
+        assert_eq!(q.expert_count(1), TOP_K * c);
+        assert_eq!(q.slot_count(1), TOP_K * c);
+        assert_eq!(q.offsets(1)[TOP_K * c], (TOP_K * c) as u32, "offs[S] = n_b is written by thread 0");
+        assert_eq!(q.expert_count(0), 0);
+    }
+}
+
+#[test]
+fn fixed_planner_single_and_empty_buckets_initialize_every_word() {
+    let top = lanes(32, 0xC0FFEE);
+    for (codec, full, empty) in [(Codec::Mq3I4, 0usize, 1usize), (Codec::Mq4Sym, 1, 0)] {
+        let table = vec![Some(codec); MAX_EXPERTS];
+        let m = check_fixed(&table, &top, None);
+        let s = m.s;
+        assert_eq!(m.slot_count(full), s);
+        assert_eq!(m.slot_count(empty), 0);
+        assert_eq!(m.expert_count(empty), 0);
+        assert!(m.ids(empty).iter().all(|&w| w == 0));
+        assert!(m.slots(empty).iter().all(|&w| w == 0));
+        assert!(m.offsets(empty).iter().all(|&w| w == 0), "empty bucket: all S+1 offsets are 0");
+        // Same descriptor via the uniform-bucket path.
+        let u = check_fixed(&alternating(), &top, Some(codec));
+        assert_eq!(u.words, m.words);
+        // Raw codec bytes: `1` selects bucket 0 (W3), any other byte bucket 1.
+        let ids: Vec<i32> = top.iter().flatten().map(|&x| x as i32).collect();
+        let bytes = vec![if full == 0 { 1u8 } else { 0u8 }; MAX_EXPERTS];
+        let by_table = FixedUnion::model(&ids, 32, Some(&bytes), -1).unwrap();
+        assert_eq!(by_table.words, m.words);
+    }
+}
+
+#[test]
+fn fixed_planner_adjacent_expert_boundaries_are_single_owner() {
+    // Experts with one slot each in consecutive bucket positions: the end of
+    // expert e is the start of expert e + 1 and used to be written twice.
+    for c in [1usize, 2, 9, 16, 17, 31, 32] {
+        let top: Vec<[u32; TOP_K]> =
+            (0..c as u32).map(|l| core::array::from_fn(|r| l * 10 + r as u32)).collect();
+        let m = check_fixed(&vec![Q4; MAX_EXPERTS], &top, Some(Codec::Mq4Sym));
+        assert_eq!(m.writes.len(), 6 * TOP_K * c + 2);
+        assert!(m.writes.iter().all(|&w| w == 1));
+        // Offsets words that sit on an expert boundary or the end of the live run.
+        let u = m.expert_count(1);
+        assert_eq!(m.offsets(1)[u], (TOP_K * c) as u32);
+    }
+}
+
+#[test]
+fn fixed_planner_expert_511_token_31_rank_9_and_first_occurrence_order() {
+    // Token 0 holds 511 at rank 0 and expert 5 at rank 1; token 31 repeats 511
+    // at rank 9 (slot 319, the last slot) and lists expert ids descending so
+    // that first-occurrence order is not ascending-id order.
+    let mut top: Vec<[u32; TOP_K]> = lanes(32, 0xABCDEF);
+    top[0] = [511, 5, 100, 101, 102, 103, 104, 105, 106, 107];
+    top[31] = [9, 8, 7, 6, 4, 3, 2, 1, 0, 511];
+    let codecs = alternating();
+    let m = check_fixed(&codecs, &top, None);
+    let b = codecs[511].unwrap().order_index();
+    let ids = m.ids(b);
+    let e = ids.iter().position(|&i| i == 511).unwrap();
+    assert!(e < m.expert_count(b), "511 is a live expert, not a tail zero");
+    let run = &m.slots(b)[m.offsets(b)[e] as usize..m.offsets(b)[e + 1] as usize];
+    assert_eq!(run.first(), Some(&0), "slot 0 (token 0 rank 0) owns 511 first");
+    assert_eq!(run.last(), Some(&319), "token 31 rank 9 is slot 319");
+    assert!(run.windows(2).all(|w| w[0] < w[1]));
+    // Slot 319 is the largest slot id and appears exactly once in the descriptor.
+    let all: Vec<u32> = m.slots(0)[..m.slot_count(0)].iter().chain(&m.slots(1)[..m.slot_count(1)]).copied().collect();
+    assert_eq!(all.iter().filter(|&&s| s == 319).count(), 1);
+    assert_eq!(all.len(), 320);
+    // Experts of the last token that are new appear in token order, not id order.
+    let mut seen_before: Vec<u32> = flat(&top[..31]);
+    seen_before.sort_unstable();
+    let fresh: Vec<u32> = top[31].iter().copied().filter(|id| seen_before.binary_search(id).is_err()).collect();
+    for b in 0..2 {
+        let order: Vec<u32> = m.ids(b)[..m.expert_count(b)]
+            .iter()
+            .copied()
+            .filter(|id| fresh.contains(id))
+            .collect();
+        let want: Vec<u32> = fresh.iter().copied().filter(|&id| codecs[id as usize].unwrap().order_index() == b).collect();
+        assert_eq!(order, want, "first-occurrence order of the last token's new experts");
+    }
+    // Pure first-occurrence order test with a deliberately descending route.
+    let desc = [[9u32, 8, 7, 6, 5, 4, 3, 2, 1, 0]];
+    let d = check_fixed(&vec![W3; MAX_EXPERTS], &desc, None);
+    assert_eq!(&d.ids(0)[..10], &[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    assert_ne!(&d.ids(0)[..10], &{ let mut s = [9u32, 8, 7, 6, 5, 4, 3, 2, 1, 0]; s.sort_unstable(); s });
+}
+
+#[test]
+fn fixed_planner_clamps_out_of_range_ids_like_the_kernel_and_stays_single_owner() {
+    // Invalid routes are refused on the host; the kernel still must not write
+    // outside the 6S+2 words or leave one unowned. Expert 0 absorbs the clamp.
+    let s = 20;
+    let mut ids = vec![0i32; s];
+    for (i, id) in ids.iter_mut().enumerate() {
+        *id = match i % 5 {
+            0 => -1,
+            1 => 512,
+            2 => i32::MAX,
+            3 => 7,
+            _ => 0,
+        };
+    }
+    let table = vec![1u8; MAX_EXPERTS];
+    let m = FixedUnion::model(&ids, 2, Some(&table), -1).unwrap();
+    assert!(m.writes.iter().all(|&w| w == 1));
+    assert!(!m.words.contains(&0xDEAD_BEEF));
+    let clamped: Vec<u32> = ids.iter().map(|&i| if (i as u32) < 512 { i as u32 } else { 0 }).collect();
+    assert_eq!(m.words, reference_words(&clamped, &|_| 0));
 }

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! QSA selector pair builder module (gfx1151): rows16 F32 score + top-k select.
+//! QSA selector pair builder module (gfx1151): rows16 and rows32 F32 scores + top-k select.
 use peacemaker_isa::Arch;
 use peacemaker_isa::kernels::{qsa_score, qsa_select::{self, Kind, Spec}, qsa_topk};
 #[macro_use]
@@ -12,11 +12,21 @@ mod rocm;
 const ARCH: Arch = Arch::Gfx1151;
 
 fn symbol(kind: Kind) -> String {
-    match kind { Kind::Score => qsa_score::symbol(ARCH), Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => qsa_topk::symbol(ARCH) }
+    match kind {
+        Kind::Score => qsa_score::symbol(ARCH),
+        Kind::Score32 => qsa_score::symbol32(ARCH),
+        Kind::ScoreBf16 | Kind::ScoreBf16Rows32 => unreachable!("F32 module test"),
+        Kind::Select => qsa_topk::symbol(ARCH),
+    }
 }
 
 fn tag(kind: Kind) -> &'static str {
-    match kind { Kind::Score => "score", Kind::ScoreBf16 => unreachable!("F32 module test"), Kind::Select => "select" }
+    match kind {
+        Kind::Score => "score",
+        Kind::Score32 => "score32",
+        Kind::ScoreBf16 | Kind::ScoreBf16Rows32 => unreachable!("F32 module test"),
+        Kind::Select => "select",
+    }
 }
 
 #[test]
@@ -26,23 +36,23 @@ fn entries_are_deterministic_and_target_only_gfx1151() {
         let (a, b) = (qsa_select::emit(spec).unwrap(), qsa_select::emit(spec).unwrap());
         assert_eq!(a.s_text, b.s_text, "{spec:?}");
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
-        // The score kernel has no LDS and so no barrier.
-        if kind == Kind::Score { assert_eq!(a.shape.barriers, 0) } else { assert!(a.shape.barriers > 0) }
+        // The score kernels have no LDS and so no barrier.
+        if matches!(kind, Kind::Score | Kind::Score32) { assert_eq!(a.shape.barriers, 0) } else { assert!(a.shape.barriers > 0) }
         assert!(a.s_text.contains(&format!("{}:", symbol(kind))));
     }
     for arch in [Arch::Gfx1100, Arch::Gfx1201] {
         for kind in Kind::ALL { assert!(qsa_select::emit(Spec { arch, kind }).is_err(), "{arch:?} {kind:?}") }
-        assert!(qsa_score::emit(arch).is_err() && qsa_topk::emit(arch).is_err());
+        assert!(qsa_score::emit(arch).is_err() && qsa_score::emit32(arch).is_err() && qsa_topk::emit(arch).is_err());
         assert!(qsa_select::emit_module(arch).is_err());
     }
     let (emitted, text, _) = qsa_select::emit_module(ARCH).unwrap();
-    assert_eq!(emitted.len(), 2);
-    let (s, t) = (text.find(&format!("{}:", symbol(Kind::Score))).unwrap(), text.find(&format!("{}:", symbol(Kind::Select))).unwrap());
-    assert!(s < t, "module order is score then select");
+    assert_eq!(emitted.len(), 3);
+    let at = |kind| text.find(&format!("{}:", symbol(kind))).unwrap();
+    assert!(at(Kind::Score) < at(Kind::Score32) && at(Kind::Score32) < at(Kind::Select), "module order is score, score32, select");
     assert_eq!(qsa_select::module(ARCH), "qsa_select_pm_gfx1151");
 }
 
-/// Kernarg ABI: the hipcc pair's pointer/scalar offsets, 52 / 56 meaningful bytes.
+/// Kernarg ABI: the hipcc pair's pointer/scalar offsets, 52 / 52 / 56 meaningful bytes.
 #[test]
 fn kernarg_layouts_match_the_hipcc_pair() {
     let text = qsa_select::emit_module(ARCH).unwrap().1;
@@ -51,8 +61,8 @@ fn kernarg_layouts_match_the_hipcc_pair() {
     let offsets: Vec<u32> = metadata.lines().filter_map(args).collect();
     let score = [0, 8, 16, 24, 28, 32, 36, 40, 44, 48];
     let select = [0, 8, 16, 24, 28, 32, 36, 40, 44, 48];
-    assert_eq!(offsets, [&score[..], &select[..]].concat());
-    for (kind, size) in [(Kind::Score, 52), (Kind::Select, 56)] {
+    assert_eq!(offsets, [&score[..], &score[..], &select[..]].concat());
+    for (kind, size) in [(Kind::Score, 52), (Kind::Score32, 52), (Kind::Select, 56)] {
         let e = qsa_select::emit(Spec { arch: ARCH, kind }).unwrap();
         assert!(e.s_text.contains(&format!(".amdhsa_kernarg_size {size}\n")), "{kind:?}: kernarg size");
     }
@@ -60,6 +70,23 @@ fn kernarg_layouts_match_the_hipcc_pair() {
         let at = metadata.find(&format!(".name: {name}\n")).unwrap();
         assert!(metadata[at..].lines().nth(2).unwrap().trim() == format!(".size: {size}"), "{name}");
     }
+}
+
+/// The rows32 symbol is the rows16 emission with the row tile changed and
+/// nothing else: after the symbol name is normalized, the texts differ exactly
+/// in the workgroup-y shift (4 -> 5) and the row clamp (16 -> 32).
+#[test]
+fn rows32_differs_from_rows16_only_in_row_geometry() {
+    let a = qsa_select::emit(Spec { arch: ARCH, kind: Kind::Score }).unwrap();
+    let b = qsa_select::emit(Spec { arch: ARCH, kind: Kind::Score32 }).unwrap();
+    // Symbols (and the `.L<symbol>_end` labels derived from them) and the module-global
+    // `.Lqsc32_*` loop/exit labels are the only names that differ from rows16.
+    let b_as_16 = b.s_text.replace(&qsa_score::symbol32(ARCH), &qsa_score::symbol(ARCH)).replace(".Lqsc32_", ".Lqsc_");
+    let diff: Vec<(&str, &str)> = a.s_text.lines().zip(b_as_16.lines()).filter(|(x, y)| x != y).collect();
+    assert_eq!(a.s_text.lines().count(), b_as_16.lines().count());
+    assert_eq!(diff, [("\ts_lshl_b32 s27, s3, 4", "\ts_lshl_b32 s27, s3, 5"), ("\ts_min_i32 s28, s28, 16", "\ts_min_i32 s28, s28, 32")]);
+    assert_eq!((a.shape.instructions, a.shape.vopd_pairs, a.shape.vmem, a.shape.waits, a.shape.next_free_vgpr, a.shape.next_free_sgpr),
+        (b.shape.instructions, b.shape.vopd_pairs, b.shape.vmem, b.shape.waits, b.shape.next_free_vgpr, b.shape.next_free_sgpr));
 }
 #[test]
 fn committed_bundle_equals_fresh_emission() {
@@ -143,7 +170,9 @@ mod toolchain {
         let e = qsa_select::emit(Spec { arch: ARCH, kind: Kind::Select }).unwrap();
         let end = pm_check::lds_bounds(&e.s_text, &symbol(Kind::Select), 8, qsa_topk::STATIC_LDS).unwrap();
         assert!(end <= qsa_topk::STATIC_LDS, "static end {end}");
-        let e = qsa_select::emit(Spec { arch: ARCH, kind: Kind::Score }).unwrap();
-        assert!(!e.s_text.lines().any(|l| l.trim_start().starts_with("ds_")), "score uses no LDS");
+        for kind in [Kind::Score, Kind::Score32] {
+            let e = qsa_select::emit(Spec { arch: ARCH, kind }).unwrap();
+            assert!(!e.s_text.lines().any(|l| l.trim_start().starts_with("ds_")), "{kind:?} uses no LDS");
+        }
     }
 }

@@ -1,0 +1,1463 @@
+{
+  "module": "qwen4_lane_rows_pm",
+  "arch": "gfx1151",
+  "image": "kernels/qwen4_lane_rows_pm_gfx1151.hxaco",
+  "image_sha256": "8ea2cac1b40aae940b26da08348d28db6f2fb67cc4797aeda6347499303be945",
+  "module_s_text_sha256": "9f973787c0579ad14f32c4256ffd5e116462c0ae9bc5023d9b86d73b980f8a5f",
+  "code_end_guard": {
+    "alignment_bytes": 128,
+    "dwords": 96,
+    "word": "0xbf9f0000",
+    "count": 1
+  },
+  "claim_scope": {
+    "cpu_emitter_build": "passed",
+    "native_assembly_and_m7": "all 18 exports byte-exact lift, no obligations, no ambiguous delays",
+    "lds_barrier_audit": "18 kernels lifted; 16 with barriers; 978 static barriers; 0 lds_store_unwaited_at_barrier; 0 unchecked objects",
+    "narrow_export_text": "all four historical SHA256 hashes unchanged",
+    "gpu_byte_oracle": "not run",
+    "end_to_end_state_oracle": "not run",
+    "timing": "not run",
+    "lds_bounds": "M7 reports unknown-address LDS accesses; no independent complete LDS address-range proof claimed"
+  },
+  "schedule": {
+    "ordinary": "one wave per output column; M_BLOCK=8; each group weight vector is reconstructed once and retained across every 8-row X tile; publish/drain full-workgroup barriers; invalid output waves still produce X and participate",
+    "hc_k8": "16 waves: two output columns times eight K/8 partitions; two-row partition tile; reuse LDS for partial[2][RCAP][8] after X drain"
+  },
+  "arithmetic_contracts": {
+    "mq6": "fma_mix(sc,q,zp); RN(w1*x1), fma(w0,x0), j=2..7; separate acc[g&3]+dot; (a0+a1)+(a3+a2); swizzle16, own-clamped bpermute8/4/2/1, own+other",
+    "q8_single_chain": "fma_mix(scale,f32(i8),-0); FMA(x,dq,sum) ascending blocks from +0, including HC short-partition tails",
+    "q8_four_chain_generic": "quad blocks FMA(dq,x,a[b&3]); remainder blocks RN(x*dq), separate acc+product; fold a1+a0, a3+a2, then second+first",
+    "q8_four_chain_k640": "separate runtime K640 recipe: FMA(x,dq,a[b&3]); fold (a0+a1)+(a2+a3)",
+    "q8_hc": "fixed eight-part fold; BF16 RNE roundtrip, scale*value, BF16 roundtrip, unchanged existing PM exact exp/div Silu expansion, BF16 roundtrip"
+  },
+  "exports": [
+    {
+      "symbol": "gemv_mq6g256v2_xbatch_pm",
+      "vgpr_count": 255,
+      "sgpr_count": 45,
+      "group_segment_fixed_size": 0,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 32,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "5859a235e4ca897446ac65f257679b0088d0b7d904db9a3b995452858665f16f",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 0,
+        "clauses": 0,
+        "delays": 4745,
+        "instructions": 21178,
+        "lds_accesses": 720,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 720,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 43,
+        "table": "gfx1151",
+        "vgpr_high_water": 255,
+        "wait_facts": 1536
+      },
+      "narrow_text_unchanged": true
+    },
+    {
+      "symbol": "gemv_mq6g256v2_x4_xbatch_pm",
+      "vgpr_count": 255,
+      "sgpr_count": 85,
+      "group_segment_fixed_size": 0,
+      "kernarg_segment_size": 96,
+      "max_flat_workgroup_size": 32,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A0",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "A1",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "A2",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "A3",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "y0",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "y1",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "y2",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "y3",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "M0",
+          "offset": 72,
+          "size": 4
+        },
+        {
+          "name": "M1",
+          "offset": 76,
+          "size": 4
+        },
+        {
+          "name": "M2",
+          "offset": 80,
+          "size": 4
+        },
+        {
+          "name": "M3",
+          "offset": 84,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 88,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 92,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "a3bf1c1dae4e5a912b1a3081cb7c7bf9f3213a1b8f77a0980e5625ca18568e70",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 0,
+        "clauses": 0,
+        "delays": 4745,
+        "instructions": 21217,
+        "lds_accesses": 720,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 720,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 83,
+        "table": "gfx1151",
+        "vgpr_high_water": 255,
+        "wait_facts": 1535
+      },
+      "narrow_text_unchanged": true
+    },
+    {
+      "symbol": "gemv_q8_0_k8_xbatch_pm",
+      "vgpr_count": 157,
+      "sgpr_count": 33,
+      "group_segment_fixed_size": 1024,
+      "kernarg_segment_size": 44,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 32,
+          "size": 4
+        },
+        {
+          "name": "scale",
+          "offset": 36,
+          "size": 4
+        },
+        {
+          "name": "hc_act",
+          "offset": 40,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "3e9b52d257e8f97c1295d059efcfef2e1f5013b74a41f5dd0548f97bade39fce",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 16,
+        "clauses": 0,
+        "delays": 1043,
+        "instructions": 8220,
+        "lds_accesses": 880,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 160,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 31,
+        "table": "gfx1151",
+        "vgpr_high_water": 157,
+        "wait_facts": 1545
+      },
+      "narrow_text_unchanged": true
+    },
+    {
+      "symbol": "gemv_q8_0_k320_xbatch_pm",
+      "vgpr_count": 184,
+      "sgpr_count": 27,
+      "group_segment_fixed_size": 1536,
+      "kernarg_segment_size": 32,
+      "max_flat_workgroup_size": 64,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 28,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "a53772ff34a7dbcffdbeedf77ffc83384f9ce7b984f88a1c71b55dcad76520ad",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 72,
+        "clauses": 0,
+        "delays": 3129,
+        "instructions": 15681,
+        "lds_accesses": 2912,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 1680,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 25,
+        "table": "gfx1151",
+        "vgpr_high_water": 184,
+        "wait_facts": 2408
+      },
+      "narrow_text_unchanged": true
+    },
+    {
+      "symbol": "gemv_mq6g256v2_xbatch_wide_r16_pm",
+      "vgpr_count": 104,
+      "sgpr_count": 62,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "409f15dc9049f406ae0d71cc66b65157ca4144bf8026c9ca4b2fcabd135e9be3",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 16,
+        "clauses": 0,
+        "delays": 545,
+        "instructions": 3105,
+        "lds_accesses": 656,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 80,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 58,
+        "table": "gfx1151",
+        "vgpr_high_water": 104,
+        "wait_facts": 622
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; x4 permits empty matrix slots",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_mq6g256v2 (independent matrix launches for x4)"
+    },
+    {
+      "symbol": "gemv_mq6g256v2_xbatch_wide_r32_pm",
+      "vgpr_count": 168,
+      "sgpr_count": 62,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "fad6a9f80e9dcf41cab2c37a2316e9a271de250025941686ba9488a6b73fc2f1",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 32,
+        "clauses": 0,
+        "delays": 1077,
+        "instructions": 6000,
+        "lds_accesses": 1312,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 160,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 60,
+        "table": "gfx1151",
+        "vgpr_high_water": 168,
+        "wait_facts": 1239
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; x4 permits empty matrix slots",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_mq6g256v2 (independent matrix launches for x4)"
+    },
+    {
+      "symbol": "gemv_mq6g256v2_x4_xbatch_wide_r16_pm",
+      "vgpr_count": 104,
+      "sgpr_count": 62,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 96,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A0",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "A1",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "A2",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "A3",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "y0",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "y1",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "y2",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "y3",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "M0",
+          "offset": 72,
+          "size": 4
+        },
+        {
+          "name": "M1",
+          "offset": 76,
+          "size": 4
+        },
+        {
+          "name": "M2",
+          "offset": 80,
+          "size": 4
+        },
+        {
+          "name": "M3",
+          "offset": 84,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 88,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 92,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "74e2536dfe2361b703e55c3742c4987ffeadfd21508f52b618917abcc34d01aa",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 16,
+        "clauses": 0,
+        "delays": 545,
+        "instructions": 3129,
+        "lds_accesses": 656,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 80,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 58,
+        "table": "gfx1151",
+        "vgpr_high_water": 104,
+        "wait_facts": 622
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; x4 permits empty matrix slots",
+      "grid": "sum_i ceil(max(M_i,0)/8)",
+      "decode_reference": "gemv_mq6g256v2 (independent matrix launches for x4)"
+    },
+    {
+      "symbol": "gemv_mq6g256v2_x4_xbatch_wide_r32_pm",
+      "vgpr_count": 168,
+      "sgpr_count": 62,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 96,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A0",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "A1",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "A2",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "A3",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "y0",
+          "offset": 40,
+          "size": 8
+        },
+        {
+          "name": "y1",
+          "offset": 48,
+          "size": 8
+        },
+        {
+          "name": "y2",
+          "offset": 56,
+          "size": 8
+        },
+        {
+          "name": "y3",
+          "offset": 64,
+          "size": 8
+        },
+        {
+          "name": "M0",
+          "offset": 72,
+          "size": 4
+        },
+        {
+          "name": "M1",
+          "offset": 76,
+          "size": 4
+        },
+        {
+          "name": "M2",
+          "offset": 80,
+          "size": 4
+        },
+        {
+          "name": "M3",
+          "offset": 84,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 88,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 92,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "7f4632524af285af383c8776f39e97701188f1354ac321104d505b490fdd0ace",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 32,
+        "clauses": 0,
+        "delays": 1077,
+        "instructions": 6024,
+        "lds_accesses": 1312,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 160,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 60,
+        "table": "gfx1151",
+        "vgpr_high_water": 168,
+        "wait_facts": 1239
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; x4 permits empty matrix slots",
+      "grid": "sum_i ceil(max(M_i,0)/8)",
+      "decode_reference": "gemv_mq6g256v2 (independent matrix launches for x4)"
+    },
+    {
+      "symbol": "gemv_q8_0_k8_xbatch_wide_r16_pm",
+      "vgpr_count": 56,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 16384,
+      "kernarg_segment_size": 44,
+      "max_flat_workgroup_size": 512,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 32,
+          "size": 4
+        },
+        {
+          "name": "scale",
+          "offset": 36,
+          "size": 4
+        },
+        {
+          "name": "hc_act",
+          "offset": 40,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "290dd14a147b2edbec1ace1f7864c26f871525365d321d1d39eca7a3bf9121d2",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 129,
+        "clauses": 0,
+        "delays": 545,
+        "instructions": 4751,
+        "lds_accesses": 962,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 322,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 56,
+        "wait_facts": 1085
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 2,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; final partition tile skips absent blocks",
+      "grid": "ceil(M/2)",
+      "decode_reference": "gemv_q8_0_k8"
+    },
+    {
+      "symbol": "gemv_q8_0_k8_xbatch_wide_r32_pm",
+      "vgpr_count": 72,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 16384,
+      "kernarg_segment_size": 44,
+      "max_flat_workgroup_size": 512,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "B",
+          "offset": 32,
+          "size": 4
+        },
+        {
+          "name": "scale",
+          "offset": 36,
+          "size": 4
+        },
+        {
+          "name": "hc_act",
+          "offset": 40,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "8c5980714cc49e07479cd144dbfc9ee3460aeb1d91b1673567abba780fbb38fb",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 257,
+        "clauses": 0,
+        "delays": 993,
+        "instructions": 9031,
+        "lds_accesses": 1922,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 642,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 72,
+        "wait_facts": 2093
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 2,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K%256==0; final partition tile skips absent blocks",
+      "grid": "ceil(M/2)",
+      "decode_reference": "gemv_q8_0_k8"
+    },
+    {
+      "symbol": "gemv_q8_0_k320_xbatch_wide_r16_pm",
+      "vgpr_count": 56,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "dd8e7f8521835988e51f2beedc55ab878ef52f05b587cbbcb2eae5bfe2896d86",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 32,
+        "clauses": 0,
+        "delays": 492,
+        "instructions": 3499,
+        "lds_accesses": 728,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 88,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 56,
+        "wait_facts": 819
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K=320",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_k320_staged"
+    },
+    {
+      "symbol": "gemv_q8_0_k320_xbatch_wide_r32_pm",
+      "vgpr_count": 72,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "f3cf052a073e89eeab01d5caad0eebd9832ad1aaf4488da2fa64b50c715dbc18",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 64,
+        "clauses": 0,
+        "delays": 940,
+        "instructions": 6681,
+        "lds_accesses": 1456,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 176,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 72,
+        "wait_facts": 1565
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K=320",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_k320_staged"
+    },
+    {
+      "symbol": "gemv_q8_0_k2560_xbatch_wide_r16_pm",
+      "vgpr_count": 56,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "34a41b49594ed158e2120bbaf2215b7bab4259e004bd43154847767f34c95048",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 32,
+        "clauses": 0,
+        "delays": 492,
+        "instructions": 3499,
+        "lds_accesses": 728,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 88,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 56,
+        "wait_facts": 819
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K=2560",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_k2560_staged"
+    },
+    {
+      "symbol": "gemv_q8_0_k2560_xbatch_wide_r32_pm",
+      "vgpr_count": 72,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "e297c38886d61596b2ab357ac6ed043d0020c1f027fe80a3771101545aac6e03",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 64,
+        "clauses": 0,
+        "delays": 940,
+        "instructions": 6681,
+        "lds_accesses": 1456,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 176,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 72,
+        "wait_facts": 1565
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K=2560",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_k2560_staged"
+    },
+    {
+      "symbol": "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm",
+      "vgpr_count": 56,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 56,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A0",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "A1",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "y0",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "y1",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "M0",
+          "offset": 40,
+          "size": 4
+        },
+        {
+          "name": "M1",
+          "offset": 44,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 52,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "01fd0da1853466a581e524ee3e0c5fc0566b6902cb09c41cd76e69d1bca9d507",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 32,
+        "clauses": 0,
+        "delays": 492,
+        "instructions": 3511,
+        "lds_accesses": 728,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 88,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 56,
+        "wait_facts": 819
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "K=2560; each M_i>=0; at least one nonempty matrix",
+      "grid": "ceil(M0/8)+ceil(M1/8)",
+      "decode_reference": "gemv_q8_0_k2560_staged (independent matrix launches)"
+    },
+    {
+      "symbol": "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
+      "vgpr_count": 72,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 56,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A0",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "A1",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "y0",
+          "offset": 24,
+          "size": 8
+        },
+        {
+          "name": "y1",
+          "offset": 32,
+          "size": 8
+        },
+        {
+          "name": "M0",
+          "offset": 40,
+          "size": 4
+        },
+        {
+          "name": "M1",
+          "offset": 44,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 48,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 52,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "179ef648d7f820f542b7038df7a996973f908594fad4133bc07e39132faa2a02",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 64,
+        "clauses": 0,
+        "delays": 940,
+        "instructions": 6693,
+        "lds_accesses": 1456,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 176,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 72,
+        "wait_facts": 1565
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "K=2560; each M_i>=0; at least one nonempty matrix",
+      "grid": "ceil(M0/8)+ceil(M1/8)",
+      "decode_reference": "gemv_q8_0_k2560_staged (independent matrix launches)"
+    },
+    {
+      "symbol": "gemv_q8_0_wide_xbatch_wide_r16_pm",
+      "vgpr_count": 104,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "14b970c135d16fc10a40e6410514452f2e89ebd5d745630ed4894030e29ba83d",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 40,
+        "clauses": 0,
+        "delays": 408,
+        "instructions": 4929,
+        "lds_accesses": 1024,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 128,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 104,
+        "wait_facts": 1145
+      },
+      "row_capacity": 16,
+      "rows": "1..=16",
+      "production_rows": "9..=16",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K<=1536, K%32==0, K!=320",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_wide_k640_staged when K=640; gemv_q8_0_wide otherwise"
+    },
+    {
+      "symbol": "gemv_q8_0_wide_xbatch_wide_r32_pm",
+      "vgpr_count": 168,
+      "sgpr_count": 51,
+      "group_segment_fixed_size": 8192,
+      "kernarg_segment_size": 36,
+      "max_flat_workgroup_size": 256,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "kernargs": [
+        {
+          "name": "A",
+          "offset": 0,
+          "size": 8
+        },
+        {
+          "name": "x",
+          "offset": 8,
+          "size": 8
+        },
+        {
+          "name": "y",
+          "offset": 16,
+          "size": 8
+        },
+        {
+          "name": "M",
+          "offset": 24,
+          "size": 4
+        },
+        {
+          "name": "K",
+          "offset": 28,
+          "size": 4
+        },
+        {
+          "name": "R",
+          "offset": 32,
+          "size": 4
+        }
+      ],
+      "s_text_sha256": "43818bb8d7f7dd25c076cd56a9e2fb33bc4026e9da6bd8737bd8134e503bc1fa",
+      "wavefront_size": 32,
+      "cu_mode": false,
+      "m7": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 80,
+        "clauses": 0,
+        "delays": 760,
+        "instructions": 9449,
+        "lds_accesses": 2048,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 256,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 49,
+        "table": "gfx1151",
+        "vgpr_high_water": 168,
+        "wait_facts": 2193
+      },
+      "row_capacity": 32,
+      "rows": "1..=32",
+      "production_rows": "17..=32",
+      "x_rows_tile": 8,
+      "k_tile": 256,
+      "domain": "M>0, K>0, K<=1536, K%32==0, K!=320",
+      "grid": "ceil(M/8)",
+      "decode_reference": "gemv_q8_0_wide_k640_staged when K=640; gemv_q8_0_wide otherwise"
+    }
+  ],
+  "oracle_commands": [
+    "cargo run --release -p rdna-compute --example lane_rows_pm_oracle",
+    "cargo run --release -p rdna-compute --example lane_rows_pm_oracle -- --wide-cap 16",
+    "cargo run --release -p rdna-compute --example lane_rows_pm_oracle -- --wide-cap 32"
+  ]
+}

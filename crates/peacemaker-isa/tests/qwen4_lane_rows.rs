@@ -16,12 +16,13 @@ fn field(text: &str, key: &str) -> Vec<u32> {
 }
 
 #[test]
-fn module_exports_are_the_four_frozen_symbols_in_order() {
+fn module_exports_keep_narrow_prefix_and_append_wide_twins() {
     assert_eq!(MODULE, "qwen4_lane_rows_pm");
     assert_eq!(
-        SYMBOLS,
+        SYMBOLS[..4],
         ["gemv_mq6g256v2_xbatch_pm", "gemv_mq6g256v2_x4_xbatch_pm", "gemv_q8_0_k8_xbatch_pm", "gemv_q8_0_k320_xbatch_pm"]
     );
+    assert_eq!(SYMBOLS.len(), 18);
     assert_eq!(qwen4_lane_rows::bundle_name(), "qwen4_lane_rows_pm_gfx1151.hxaco");
     let (emitted, text, proof) = qwen4_lane_rows::emit_module().unwrap();
     assert_eq!(emitted.len(), SYMBOLS.len());
@@ -51,6 +52,7 @@ fn every_export_is_exact_gfx1151_wave32_without_scratch() {
         assert!(e.s_text.contains(".sgpr_spill_count: 0\n") && e.s_text.contains(".vgpr_spill_count: 0\n"), "{symbol}: spills");
     }
     assert!(text.contains("amdgcn-amd-amdhsa--gfx1151"));
+    assert_eq!(text.matches(".fill 96, 4, 3214868480").count(), 1, "one module s_code_end guard");
 }
 
 /// The kernarg block, per-argument offsets/sizes and the launch bound of every
@@ -69,9 +71,41 @@ fn kernarg_abi_and_launch_bounds_match_the_contract() {
         let (last_off, last_size) = *KERNARGS[i].last().unwrap();
         assert_eq!(last_off + last_size, size, "{symbol}: arguments cover the kernarg block");
     }
-    // The frozen table itself: 36 / 96 / 44 / 32 bytes; 32 / 32 / 256 / 64 threads.
-    assert_eq!(KERNARG_BYTES, [36, 96, 44, 32]);
-    assert_eq!(WORKGROUP_SIZE, [32, 32, 256, 64]);
+    assert_eq!(KERNARG_BYTES[..4], [36, 96, 44, 32]);
+    assert_eq!(WORKGROUP_SIZE[..4], [32, 32, 256, 64]);
+}
+
+/// Historical emitted-text hashes, captured before adding any wide export.
+#[test]
+fn narrow_emitted_text_is_unchanged() {
+    let want = [
+        "5859a235e4ca897446ac65f257679b0088d0b7d904db9a3b995452858665f16f",
+        "a3bf1c1dae4e5a912b1a3081cb7c7bf9f3213a1b8f77a0980e5625ca18568e70",
+        "3e9b52d257e8f97c1295d059efcfef2e1f5013b74a41f5dd0548f97bade39fce",
+        "a53772ff34a7dbcffdbeedf77ffc83384f9ce7b984f88a1c71b55dcad76520ad",
+    ];
+    let (_, _, proof) = qwen4_lane_rows::emit_module().unwrap();
+    for (kernel, hash) in proof.kernels.iter().take(4).zip(want) {
+        assert_eq!(kernel.s_text_sha256, hash, "{}", kernel.variant);
+    }
+}
+
+#[test]
+fn wide_entries_keep_resource_and_barrier_contract() {
+    let (emitted, _, _) = qwen4_lane_rows::emit_module().unwrap();
+    for (i, e) in emitted.iter().enumerate().skip(4) {
+        let symbol = SYMBOLS[i];
+        let hc = symbol.starts_with("gemv_q8_0_k8_");
+        assert_eq!(field(&e.s_text, ".group_segment_fixed_size:"), [if hc { 16384 } else { 8192 }], "{symbol}");
+        assert!(e.s_text.contains(".amdhsa_workgroup_processor_mode 1"), "{symbol}: WGP mode");
+        assert!(e.s_text.contains("s_barrier"), "{symbol}: cooperative X staging");
+        let ceiling = if symbol.contains("mq6") || symbol.contains("gemv_q8_0_wide_") {
+            if symbol.contains("_r16_") { 128 } else { 192 }
+        } else { 80 };
+        let vgpr = field(&e.s_text, ".vgpr_count:");
+        assert_eq!(vgpr.len(), 1, "{symbol}");
+        assert!(vgpr[0] <= ceiling, "{symbol}: {} VGPR > {ceiling}", vgpr[0]);
+    }
 }
 
 /// The native writer assembles the module and bundles it for the gfx1151 host entry.

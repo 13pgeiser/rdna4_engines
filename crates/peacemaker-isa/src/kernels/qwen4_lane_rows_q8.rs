@@ -53,6 +53,60 @@
 //!
 //! B is specialized (one straight-line path per column count, selected once
 //! from the kernarg); `B` outside `1..=8` exits without storing.
+//!
+//! # Wide entries ([`build_wide_gfx1151`])
+//! Ten separate exact twins for R = 9..=32 activation rows (runtime `R` in
+//! `1..=cap`, `cap` 16 or 32; any other `R` returns before any store), in
+//! frozen order k8, k320, k2560, k2560_x2, wide, each r16 then r32:
+//! `gemv_q8_0_{k8,k320,k2560,k2560_x2,wide}_xbatch_wide_r{16,32}_pm`. The
+//! narrow exports above keep their text. x row stride K, y row stride M;
+//! `M * (K/32) * 34`, `R * K * 4` and `R * M * 4` stay below 2^32 (32-bit
+//! VGPR offsets from the kernarg bases). `cu_mode = false`, wave32.
+//!  * ABIs: k8 the narrow 44 B (`A@0 x@8 y@16 M@24 K@28 B(=R)@32 scale@36
+//!    hc_act@40`); k320 / k2560 / wide 36 B (`A@0 x@8 y@16 M@24 K@28 R@32`);
+//!    k2560_x2 56 B (`A0@0 A1@8 x@16 y0@24 y1@32 M0@40 M1@44 K@48 R@52`), grid
+//!    `ceil(M0/8) + ceil(M1/8)`: blocks below `ceil(M0/8)` run matrix 0, the
+//!    rest matrix 1 with matrix-local columns (M0 = 0 or M1 = 0 is an empty
+//!    slot); no workgroup spans two matrices.
+//!  * Ordinary (k320, k2560, x2, wide): grid `ceil(M/8)`, block 256, LDS
+//!    8192 B. Wave `v` owns column `8w + v` for every row. Per K tile of eight
+//!    Q8 blocks (the tail tile: `nblk % 8` blocks, a compile-time variant per
+//!    count, so no block past the row is loaded or consumed) a live wave
+//!    loads and dequantizes its blocks once (`dq[j]`), then for row tiles
+//!    `rb = 0, 8, ..` (`rb < R`) producer wave `v` stores x row `rb + v`
+//!    (`k0 + 32j + lane`, unchanged bits) to LDS word `(v*8 + j)*32 + lane`,
+//!    barrier, every live wave consumes rows `rb..min(rb+8, R)`, barrier.
+//!    K % 32 == 0 (else no store).
+//!  * k8 (HC): grid `ceil(M/2)`, block 512 (16 waves), LDS 16384 B; wave
+//!    `ml*8 + part` owns partition `part` (K/8 contiguous elements, K/256
+//!    blocks, K % 256 == 0 and K > 0, so short final partition tiles are
+//!    exact) of column `2w + ml` for every row. Stage = two rows x eight
+//!    partitions: wave `(ml, part)` stores x row `rb + ml`, partition `part`
+//!    at stage row `wave`; consumer `(ml, part)` reads stage rows
+//!    `(r2, part)`. After the K sweep the dead X tile becomes
+//!    `partial[2][cap][8]`; lane 0 parks each partition's tree result,
+//!    barrier, thread `t < 2*cap` folds column `t >> log2(cap)`, row
+//!    `t & (cap-1)` with the narrow k8 fold and HC epilogue (same
+//!    `bf16_round` / `scale` / `silu` sequence).
+//!  * Dead waves (column >= M) produce X and keep every barrier; they skip
+//!    weights, arithmetic and stores. Only a workgroup without any column, or
+//!    an out-of-domain `R` / `K`, returns, uniformly and before the first
+//!    barrier.
+//!  * Arithmetic, pinned to the gfx1151 decode object `Gpu::gemv_q8_0`
+//!    selects (hipcc -O3 asm): one chain (`gemv_q8_0_row`:
+//!    `gemv_q8_0_k320_staged`, `_k2560_staged`, every `gemv_q8_0_k8`
+//!    partition including its tail loop) `dq = fma_mix(d, f32(q), -0.0)`,
+//!    `sum = v_fmac_f32(sum, x, dq)` from +0 for every block, ascending. Four
+//!    chains (`wide`): block `b` into chain `b & 3`; `gemv_q8_0_wide` (every
+//!    K but 640) spells quad blocks `v_fmac_f32(acc, dq, x)`, the remainder
+//!    blocks `b >= 4*floor(nblk/4)` `p = v_mul_f32(x, dq)` then
+//!    `acc = v_add_f32(acc, p)`, and folds `t1 = a1 + a0`, `t2 = a3 + a2`,
+//!    `t2 + t1`; at K = 640 (`gemv_q8_0_wide_k640_staged`, 20 blocks, no
+//!    remainder) a separate path spells `v_fmac_f32(acc, x, dq)` and folds
+//!    `(a0 + a1) + (a2 + a3)`. Then the shared swizzle-16 / bpermute 8/4/2/1
+//!    own+other tree; lane 0 stores `y[r*M + m]`.
+//!  * Registers: VGPR high water `40 + accumulators` (one chain / HC: 56 /
+//!    72 of 80; four chains: 104 of 128 / 168 of 192), SGPR 49 of 56.
 use crate::insn::{Instruction, MemoryClass};
 use crate::ledger::Counter;
 use crate::kernels::common::{lit, mem, op, s, smem, sop, sr, v, vr};
@@ -732,6 +786,638 @@ pub fn build_gfx1151() -> Result<Vec<Emitted>, String> {
     Ok(vec![k8()?, k320()?])
 }
 
+// ================================================================= wide
+// Exact WIDE twins (R = 9..=32 activation rows; see the module doc's
+// "Wide entries"). Separate symbols: the narrow exports above keep their
+// bytes and their register allocation.
+
+/// Row capacities of the wide entries.
+pub const WIDE_CAPS: [u8; 2] = [16, 32];
+/// SGPR budget of every wide entry (the plan's high water is 49).
+pub const WIDE_SGPRS: u16 = 56;
+/// Ordinary wide entries: eight output columns (waves) x one 8-row x 256-K
+/// X tile in LDS. HC k8: two columns x eight partitions, a 2-row x 8-part x
+/// 256-K tile.
+pub const WIDE_LDS_BYTES: u32 = 8 * 8 * 32 * 4;
+pub const WIDE_K8_LDS_BYTES: u32 = 2 * 8 * 8 * 32 * 4;
+
+/// Which incumbent recipe (and ABI) a wide entry reproduces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideKind {
+    /// HC read down `gemv_q8_0_k8`: eight single-chain K/8 partitions, fixed fold, HC epilogue.
+    K8,
+    /// Single-chain `gemv_q8_0_row` recipe, bound for K = 320 (`gemv_q8_0_k320_staged`).
+    K320,
+    /// Single-chain `gemv_q8_0_row` recipe, bound for K = 2560 (`gemv_q8_0_k2560_staged`).
+    K2560,
+    /// Two K = 2560 single-chain matrices of one activation (shared gate/up).
+    K2560X2,
+    /// Four-chain small-K `gemv_q8_0_wide` (and, at K = 640, `gemv_q8_0_wide_k640_staged`).
+    Wide,
+}
+
+/// One wide entry: recipe and compiled row capacity (16 or 32).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WideSpec { pub kind: WideKind, pub cap: u8 }
+
+impl WideSpec {
+    fn tag(&self) -> &'static str {
+        match self.kind { WideKind::K8 => "k8", WideKind::K320 => "k320", WideKind::K2560 => "k2560", WideKind::K2560X2 => "k2560_x2", WideKind::Wide => "wide" }
+    }
+    pub fn symbol(&self) -> String { format!("gemv_q8_0_{}_xbatch_wide_r{}_pm", self.tag(), self.cap) }
+    fn hc(&self) -> bool { self.kind == WideKind::K8 }
+    fn four(&self) -> bool { self.kind == WideKind::Wide }
+    fn x2(&self) -> bool { self.kind == WideKind::K2560X2 }
+    pub fn kernarg_bytes(&self) -> u32 { match self.kind { WideKind::K8 => 44, WideKind::K2560X2 => 56, _ => 36 } }
+    pub fn workgroup_size(&self) -> u16 { if self.hc() { 512 } else { 256 } }
+    pub fn lds_bytes(&self) -> u32 { if self.hc() { WIDE_K8_LDS_BYTES } else { WIDE_LDS_BYTES } }
+    /// Declared VGPR budget (design ceilings): 80 for one chain per row
+    /// (ordinary and HC), 128 / 192 for four chains per row.
+    pub fn vgpr_budget(&self) -> u16 { if self.four() { if self.cap == 16 { 128 } else { 192 } } else { 80 } }
+    /// Persistent accumulator VGPRs per lane.
+    pub fn accumulators(&self) -> usize { usize::from(self.cap) * if self.four() { 4 } else { 1 } }
+    /// VGPR high water (`WV_ACC + accumulators`), in usize arithmetic.
+    pub fn vgpr_high_water(&self) -> usize { usize::from(WV_ACC) + self.accumulators() }
+    /// Activation rows per X stage.
+    fn rows_per_tile(&self) -> u32 { if self.hc() { 2 } else { 8 } }
+    fn tiles(&self) -> u32 { u32::from(self.cap) / self.rows_per_tile() }
+    fn label(&self) -> String { format!(".Lq8w_{}r{}", self.tag(), self.cap) }
+}
+
+/// The wide exports, in frozen return order of [`build_wide_gfx1151`].
+pub const WIDE_EXPORTS: [WideSpec; 10] = [
+    WideSpec { kind: WideKind::K8, cap: 16 }, WideSpec { kind: WideKind::K8, cap: 32 },
+    WideSpec { kind: WideKind::K320, cap: 16 }, WideSpec { kind: WideKind::K320, cap: 32 },
+    WideSpec { kind: WideKind::K2560, cap: 16 }, WideSpec { kind: WideKind::K2560, cap: 32 },
+    WideSpec { kind: WideKind::K2560X2, cap: 16 }, WideSpec { kind: WideKind::K2560X2, cap: 32 },
+    WideSpec { kind: WideKind::Wide, cap: 16 }, WideSpec { kind: WideKind::Wide, cap: 32 },
+];
+
+/// Operand spelling of the four-chain recipe, pinned to the decode object
+/// that `Gpu::gemv_q8_0` selects on gfx1151 (one-chain kernels have one
+/// spelling, `Generic` is passed for them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Order {
+    /// `gemv_q8_0_wide` (every K but 640): quad blocks `fmac(acc, dq, x)`;
+    /// remainder blocks `p = x * dq`, `acc = acc + p`; fold
+    /// `(a3 + a2) + (a1 + a0)` spelled `t1 = a1 + a0`, `t2 = a3 + a2`, `t2 + t1`.
+    Generic,
+    /// `gemv_q8_0_wide_k640_staged` (K = 640, no remainder blocks): quad
+    /// blocks `fmac(acc, x, dq)`; fold `(a0 + a1) + (a2 + a3)`.
+    K640,
+}
+
+// SGPRs (`S_KARG` = 0, `S_WG` = 2 as the narrow entries).
+/// `A` at s[4:5], `x` at s[6:7] (one b128 load), `y` at s[8:9]; `M`, `K`, `R`.
+/// For the x2 entry these are the workgroup's selected matrix.
+const WS_A: u8 = 4;
+const WS_X: u8 = 6;
+const WS_Y: u8 = 8;
+const WS_M: u8 = 10;
+const WS_K: u8 = 11;
+const WS_R: u8 = 12;
+const WS_SCALE: u8 = 13;
+const WS_HC: u8 = 14;
+const WS_WAVE: u8 = 15;
+/// First matrix-local output column of the workgroup.
+const WS_MBASE: u8 = 16;
+/// This wave's output column, and whether it exists (`COL < M`).
+const WS_COL: u8 = 17;
+const WS_LIVE: u8 = 18;
+/// Weight bytes of one row (ordinary) or one K/8 partition (HC).
+const WS_ROWB: u8 = 19;
+/// Q8 blocks per row (ordinary) or partition (HC); its full 8-block tiles and the tail tile's blocks.
+const WS_NBLK: u8 = 20;
+const WS_NFULL: u8 = 21;
+const WS_TAIL: u8 = 22;
+const WS_IT: u8 = 23;
+/// x2 raw kernargs: A0/A1, x/y0, y1, M0/M1, K/R.
+const WS_RA: u8 = 24;
+const WS_RXY: u8 = 28;
+const WS_RY1: u8 = 32;
+const WS_RM: u8 = 34;
+const WS_RKR: u8 = 36;
+const WS_T0: u8 = 38;
+const WS_T1: u8 = 39;
+const WS_LANE0: u8 = 40;
+/// `M * 4` and `COL * 4` (ordinary y offsets).
+const WS_MB: u8 = 41;
+const WS_COL4: u8 = 42;
+const WS_KX4: u8 = 43;
+/// Producer X byte offset of this wave's row/partition in row tile 0.
+const WS_XTB: u8 = 44;
+/// Producer row within a tile: the wave (ordinary) or the column half `ml` (HC).
+const WS_PROW: u8 = 45;
+const WS_MASK: u8 = 46;
+/// HC partition (`wave & 7`).
+const WS_PART: u8 = 47;
+/// Byte offset of this wave's weight row (partition) from `A`.
+const WS_ROWOFF: u8 = 48;
+
+// VGPRs (`V_TID` = 0, `V_LANE` = 1).
+const WV_ADDR: u8 = 2;
+/// LDS producer store address `wave*1024 + lane*4`, consumer read base.
+const WV_LDST: u8 = 6;
+const WV_LDRD: u8 = 7;
+/// `lane*4 + k0*4`: the current K tile's lane offset into an activation row (partition).
+const WV_XOFF: u8 = 8;
+const WV_XADDR: u8 = 9;
+const WV_WOFFD: u8 = 10;
+const WV_WOFFQ: u8 = 11;
+/// The remainder blocks' rounded product (four chains).
+const WV_TMP: u8 = 12;
+const WV_VT: u8 = 13;
+/// HC: lane 0's partial store base `(ml*cap*8 + part)*4`.
+const WV_PST: u8 = 14;
+const WV_EY: u8 = 15;
+/// `dq[j]` of the current K tile (HC epilogue: the eight partials).
+const WV_DQ: u8 = 16;
+/// `q[j]` (ordinary epilogue: store addresses; HC epilogue: scratch).
+const WV_Q: u8 = 24;
+/// X values (producer staging, consumer row vector, lane-tree temporaries).
+const WV_XS: u8 = 32;
+const WV_ACC: u8 = 40;
+
+/// Accumulator of activation row `row`, chain `chain` (`0` for one chain).
+fn wacc(w: WideSpec, row: u32, chain: u8) -> u8 {
+    let n = usize::from(WV_ACC) + if w.four() { 4 * row as usize + usize::from(chain) } else { row as usize };
+    u8::try_from(n).expect("accumulator index validated by wide_plan")
+}
+
+fn wide_plan(w: WideSpec) -> Result<RegPlan, String> {
+    if !WIDE_CAPS.contains(&w.cap) { return Err(format!("q8 wide capacity {} is not 16 or 32", w.cap)) }
+    let hw = w.vgpr_high_water();
+    if hw > 256 { return Err(format!("{} needs {hw} VGPRs (> 256)", w.symbol())) }
+    if hw > usize::from(w.vgpr_budget()) { return Err(format!("{} needs {hw} VGPRs (> budget {})", w.symbol(), w.vgpr_budget())) }
+    let mut p = RegPlan::new(w.vgpr_budget(), WIDE_SGPRS)?;
+    for (name, base, len) in [("kernarg_ptr", S_KARG, 2), ("wg_x", S_WG, 1), ("a_x_ptrs", WS_A, 4), ("y_ptr", WS_Y, 2), ("m_k", WS_M, 2)] {
+        declare(&mut p, name, Kind::S, base, len)?;
+    }
+    if w.hc() {
+        declare(&mut p, "r_scale", Kind::S, WS_R, 2)?;
+        declare(&mut p, "hc_act", Kind::S, WS_HC, 1)?;
+    } else {
+        declare(&mut p, "r", Kind::S, WS_R, 1)?;
+    }
+    for n in WS_WAVE..=WS_IT { declare(&mut p, "scalar", Kind::S, n, 1)?; }
+    if w.x2() {
+        for (name, base, len) in [("x2_a", WS_RA, 4), ("x2_x_y0", WS_RXY, 4), ("x2_y1", WS_RY1, 2), ("x2_m", WS_RM, 2), ("x2_k_r", WS_RKR, 2)] {
+            declare(&mut p, name, Kind::S, base, len)?;
+        }
+    }
+    for n in WS_T0..=WS_ROWOFF { declare(&mut p, "scalar", Kind::S, n, 1)?; }
+    let acc = u8::try_from(w.accumulators()).map_err(|_| "accumulator count past 255".to_string())?;
+    for (name, base, len) in [
+        ("tid", V_TID, 1), ("lane", V_LANE, 1), ("bpermute_addr", WV_ADDR, 4), ("lds_store", WV_LDST, 1), ("lds_read", WV_LDRD, 1),
+        ("x_offset", WV_XOFF, 1), ("x_addr", WV_XADDR, 1), ("w_offset_d", WV_WOFFD, 1), ("w_offset_q", WV_WOFFQ, 1),
+        ("product", WV_TMP, 1), ("temp", WV_VT, 1), ("partial_store", WV_PST, 1), ("y_offset", WV_EY, 1),
+        ("dq", WV_DQ, 8), ("q", WV_Q, 8), ("x_slots", WV_XS, 8), ("accumulators", WV_ACC, acc),
+    ] { declare(&mut p, name, Kind::V, base, len)?; }
+    Ok(p)
+}
+
+fn wide_kspec(w: WideSpec) -> KernelSpec {
+    let kernargs = match w.kind {
+        WideKind::K8 => KernargLayout::new(44).pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("B", 32, 4, "by_value")
+            .hidden("scale", 36, 4, "by_value").hidden("hc_act", 40, 4, "by_value"),
+        WideKind::K2560X2 => KernargLayout::new(56).pointer_access("A0", 0, Access::ReadOnly)
+            .pointer_access("A1", 8, Access::ReadOnly).pointer_access("x", 16, Access::ReadOnly)
+            .pointer_access("y0", 24, Access::WriteOnly).pointer_access("y1", 32, Access::WriteOnly)
+            .hidden("M0", 40, 4, "by_value").hidden("M1", 44, 4, "by_value")
+            .hidden("K", 48, 4, "by_value").hidden("R", 52, 4, "by_value"),
+        _ => KernargLayout::new(36).pointer_access("A", 0, Access::ReadOnly)
+            .pointer_access("x", 8, Access::ReadOnly).pointer_access("y", 16, Access::WriteOnly)
+            .hidden("M", 24, 4, "by_value").hidden("K", 28, 4, "by_value").hidden("R", 32, 4, "by_value"),
+    };
+    KernelSpec {
+        kernel_id: "qwen4_lane_rows_q8".into(), variant: format!("wide_{}_r{}", w.tag(), w.cap), arch: Arch::Gfx1151, symbol: w.symbol(),
+        kernargs, user_sgpr_count: 2, system_sgpr_workgroup_id_y: false, workgroup_size: w.workgroup_size(),
+        group_segment_fixed_size: w.lds_bytes(), wave32: true, cu_mode: false,
+    }
+}
+
+fn wide(w: WideSpec) -> Result<Emitted, String> {
+    let mut b = Builder::new(wide_kspec(w), wide_plan(w)?);
+    b.enable_delay_alu();
+    let slot = b.lds_slot("x_tile", 0, w.lds_bytes())?;
+    let lbl = w.label();
+    let end = format!("{lbl}_end");
+    wide_prologue(&mut b, w, &end)?;
+    // +0 accumulators (the incumbents' `0.0f`); rows >= R are never stored.
+    for i in 0..w.accumulators() {
+        let a = WV_ACC + i as u8;
+        vop(&mut b, format!("v_mov_b32_e32 v{a}, 0"), &[a], &[], &[])?;
+    }
+    let tails: Vec<u8> = (1..8).collect();
+    match w.kind {
+        WideKind::Wide => {
+            let k640 = format!("{lbl}_k640");
+            sop(&mut b, format!("s_cmp_eq_u32 s{WS_K}, {}", lit(640)), &[], &[WS_K])?;
+            op(&mut b, format!("s_cbranch_scc1 {k640}"), &[], &[])?;
+            let g = format!("{lbl}_g");
+            wide_traverse(&mut b, w, slot, Order::Generic, &tails, &g)?;
+            wide_epilogue(&mut b, w, Order::Generic, &g, &end)?;
+            op(&mut b, format!("s_branch {end}"), &[], &[])?;
+            // K = 640: 20 blocks, two full tiles and a 4-block (all-quad) tail tile.
+            b.label(&k640)?;
+            let k = format!("{lbl}_k");
+            wide_traverse(&mut b, w, slot, Order::K640, &[4], &k)?;
+            wide_epilogue(&mut b, w, Order::K640, &k, &end)?;
+        }
+        WideKind::K8 => {
+            wide_traverse(&mut b, w, slot, Order::Generic, &tails, &lbl)?;
+            wide_hc_epilogue(&mut b, w, &lbl, &end)?;
+        }
+        _ => {
+            wide_traverse(&mut b, w, slot, Order::Generic, &tails, &lbl)?;
+            wide_epilogue(&mut b, w, Order::Generic, &lbl, &end)?;
+        }
+    }
+    b.label(&end)?;
+    op(&mut b, "s_endpgm", &[], &[])?;
+    b.finish()
+}
+
+/// Kernarg loads, lane/wave constants; the uniform refusals (before any
+/// barrier); the x2 matrix selection; the wave's column, weight and X
+/// offsets, the tile counts and the LDS addresses.
+fn wide_prologue(b: &mut Builder, w: WideSpec, end: &str) -> R {
+    match w.kind {
+        WideKind::K2560X2 => {
+            smem(b, WS_RA, 4, S_KARG, 0)?;
+            smem(b, WS_RXY, 4, S_KARG, 0x10)?;
+            smem(b, WS_RY1, 2, S_KARG, 0x20)?;
+            smem(b, WS_RM, 2, S_KARG, 0x28)?;
+            smem(b, WS_RKR, 2, S_KARG, 0x30)?;
+        }
+        WideKind::K8 => {
+            smem(b, WS_A, 4, S_KARG, 0)?;
+            smem(b, WS_Y, 2, S_KARG, 0x10)?;
+            smem(b, WS_M, 2, S_KARG, 0x18)?;
+            smem(b, WS_R, 2, S_KARG, 0x20)?;
+            smem(b, WS_HC, 1, S_KARG, 0x28)?;
+        }
+        _ => {
+            smem(b, WS_A, 4, S_KARG, 0)?;
+            smem(b, WS_Y, 2, S_KARG, 0x10)?;
+            smem(b, WS_M, 2, S_KARG, 0x18)?;
+            smem(b, WS_R, 1, S_KARG, 0x20)?;
+        }
+    }
+    vop(b, format!("v_and_b32_e32 v{V_LANE}, 31, v{V_TID}"), &[V_LANE], &[V_TID], &[])?;
+    vop(b, format!("v_lshrrev_b32_e32 v{WV_VT}, 5, v{V_TID}"), &[WV_VT], &[V_TID], &[])?;
+    op(b, format!("v_readfirstlane_b32 s{WS_WAVE}, v{WV_VT}"), &[s(WS_WAVE)], &[v(WV_VT)])?;
+    bpermute_addresses(b, WV_ADDR, V_LANE)?;
+    vop(b, format!("v_cmp_eq_u32_e32 vcc_lo, 0, v{V_LANE}"), &[], &[V_LANE], &[])?;
+    op(b, format!("s_mov_b32 s{WS_LANE0}, vcc_lo"), &[s(WS_LANE0)], &[])?;
+    b.wait_all()?;
+    let wg = if w.x2() {
+        // Blocks [0, ceil(M0/8)) run matrix 0, the rest matrix 1 with the
+        // matrix-local block index; M0 = 0 routes every block to matrix 1.
+        sop(b, format!("s_add_i32 s{WS_T1}, s{WS_RM}, 7"), &[WS_T1], &[WS_RM])?;
+        sop(b, format!("s_lshr_b32 s{WS_T1}, s{WS_T1}, 3"), &[WS_T1], &[WS_T1])?;
+        sop(b, format!("s_cmp_ge_u32 s{S_WG}, s{WS_T1}"), &[], &[S_WG, WS_T1])?;
+        op(b, format!("s_cselect_b64 s[{WS_A}:{}], s[{}:{}], s[{WS_RA}:{}]", WS_A + 1, WS_RA + 2, WS_RA + 3, WS_RA + 1),
+            &[sr(WS_A, 2)], &[sr(WS_RA + 2, 2), sr(WS_RA, 2)])?;
+        op(b, format!("s_cselect_b64 s[{WS_Y}:{}], s[{WS_RY1}:{}], s[{}:{}]", WS_Y + 1, WS_RY1 + 1, WS_RXY + 2, WS_RXY + 3),
+            &[sr(WS_Y, 2)], &[sr(WS_RY1, 2), sr(WS_RXY + 2, 2)])?;
+        sop(b, format!("s_cselect_b32 s{WS_M}, s{}, s{WS_RM}", WS_RM + 1), &[WS_M], &[WS_RM + 1, WS_RM])?;
+        sop(b, format!("s_cselect_b32 s{WS_T1}, s{WS_T1}, 0"), &[WS_T1], &[WS_T1])?;
+        sop(b, format!("s_sub_i32 s{WS_T0}, s{S_WG}, s{WS_T1}"), &[WS_T0], &[S_WG, WS_T1])?;
+        op(b, format!("s_mov_b64 s[{WS_X}:{}], s[{WS_RXY}:{}]", WS_X + 1, WS_RXY + 1), &[sr(WS_X, 2)], &[sr(WS_RXY, 2)])?;
+        sop(b, format!("s_mov_b32 s{WS_K}, s{WS_RKR}"), &[WS_K], &[WS_RKR])?;
+        sop(b, format!("s_mov_b32 s{WS_R}, s{}", WS_RKR + 1), &[WS_R], &[WS_RKR + 1])?;
+        WS_T0
+    } else { S_WG };
+    // Uniform refusals (no store): R outside 1..=cap, K outside the domain
+    // (ordinary K % 32, HC K % 256 and K > 0), a workgroup without columns.
+    sop(b, format!("s_cmp_eq_u32 s{WS_R}, 0"), &[], &[WS_R])?;
+    op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    sop(b, format!("s_cmp_gt_u32 s{WS_R}, {}", w.cap), &[], &[WS_R])?;
+    op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    sop(b, format!("s_and_b32 s{WS_T1}, s{WS_K}, {}", lit(if w.hc() { 255 } else { 31 })), &[WS_T1], &[WS_K])?;
+    sop(b, format!("s_cmp_lg_u32 s{WS_T1}, 0"), &[], &[WS_T1])?;
+    op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    if w.hc() {
+        sop(b, format!("s_cmp_eq_u32 s{WS_K}, 0"), &[], &[WS_K])?;
+        op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    }
+    sop(b, format!("s_lshl_b32 s{WS_MBASE}, s{wg}, {}", if w.hc() { 1 } else { 3 }), &[WS_MBASE], &[wg])?;
+    sop(b, format!("s_cmp_ge_i32 s{WS_MBASE}, s{WS_M}"), &[], &[WS_MBASE, WS_M])?;
+    op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    // Column, liveness, weight row (HC: row-major partitions `(m*8 + part)`).
+    if w.hc() {
+        sop(b, format!("s_lshr_b32 s{WS_PROW}, s{WS_WAVE}, 3"), &[WS_PROW], &[WS_WAVE])?;
+        sop(b, format!("s_and_b32 s{WS_PART}, s{WS_WAVE}, 7"), &[WS_PART], &[WS_WAVE])?;
+    } else {
+        sop(b, format!("s_mov_b32 s{WS_PROW}, s{WS_WAVE}"), &[WS_PROW], &[WS_WAVE])?;
+    }
+    sop(b, format!("s_add_i32 s{WS_COL}, s{WS_MBASE}, s{WS_PROW}"), &[WS_COL], &[WS_MBASE, WS_PROW])?;
+    sop(b, format!("s_cmp_lt_i32 s{WS_COL}, s{WS_M}"), &[], &[WS_COL, WS_M])?;
+    sop(b, format!("s_cselect_b32 s{WS_LIVE}, 1, 0"), &[WS_LIVE], &[])?;
+    sop(b, format!("s_lshr_b32 s{WS_NBLK}, s{WS_K}, {}", if w.hc() { 8 } else { 5 }), &[WS_NBLK], &[WS_K])?;
+    sop(b, format!("s_mul_i32 s{WS_ROWB}, s{WS_NBLK}, 34"), &[WS_ROWB], &[WS_NBLK])?;
+    if w.hc() {
+        sop(b, format!("s_lshl_b32 s{WS_ROWOFF}, s{WS_COL}, 3"), &[WS_ROWOFF], &[WS_COL])?;
+        sop(b, format!("s_add_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_PART}"), &[WS_ROWOFF], &[WS_ROWOFF, WS_PART])?;
+        sop(b, format!("s_mul_i32 s{WS_ROWOFF}, s{WS_ROWOFF}, s{WS_ROWB}"), &[WS_ROWOFF], &[WS_ROWOFF, WS_ROWB])?;
+    } else {
+        sop(b, format!("s_mul_i32 s{WS_ROWOFF}, s{WS_COL}, s{WS_ROWB}"), &[WS_ROWOFF], &[WS_COL, WS_ROWB])?;
+    }
+    vop(b, format!("v_mov_b32_e32 v{WV_WOFFD}, s{WS_ROWOFF}"), &[WV_WOFFD], &[], &[WS_ROWOFF])?;
+    vop(b, format!("v_add_nc_u32_e32 v{WV_WOFFQ}, s{WS_ROWOFF}, v{V_LANE}"), &[WV_WOFFQ], &[V_LANE], &[WS_ROWOFF])?;
+    // Producer row of tile 0: x row `PROW` (HC: plus partition `part*K/8`).
+    sop(b, format!("s_lshl_b32 s{WS_KX4}, s{WS_K}, 2"), &[WS_KX4], &[WS_K])?;
+    sop(b, format!("s_mul_i32 s{WS_XTB}, s{WS_PROW}, s{WS_KX4}"), &[WS_XTB], &[WS_PROW, WS_KX4])?;
+    if w.hc() {
+        sop(b, format!("s_lshr_b32 s{WS_T1}, s{WS_K}, 1"), &[WS_T1], &[WS_K])?;
+        sop(b, format!("s_mul_i32 s{WS_T1}, s{WS_T1}, s{WS_PART}"), &[WS_T1], &[WS_T1, WS_PART])?;
+        sop(b, format!("s_add_i32 s{WS_XTB}, s{WS_XTB}, s{WS_T1}"), &[WS_XTB], &[WS_XTB, WS_T1])?;
+    }
+    sop(b, format!("s_lshr_b32 s{WS_NFULL}, s{WS_NBLK}, 3"), &[WS_NFULL], &[WS_NBLK])?;
+    sop(b, format!("s_and_b32 s{WS_TAIL}, s{WS_NBLK}, 7"), &[WS_TAIL], &[WS_NBLK])?;
+    // LDS word (stage row v, block j, lane l) = (v*8 + j)*32 + l; the
+    // producer wave (HC: (ml, part) = wave) owns stage row `wave`.
+    vop(b, format!("v_lshlrev_b32_e32 v{WV_XOFF}, 2, v{V_LANE}"), &[WV_XOFF], &[V_LANE], &[])?;
+    sop(b, format!("s_lshl_b32 s{WS_T1}, s{WS_WAVE}, 10"), &[WS_T1], &[WS_WAVE])?;
+    vop(b, format!("v_add_nc_u32_e32 v{WV_LDST}, s{WS_T1}, v{WV_XOFF}"), &[WV_LDST], &[WV_XOFF], &[WS_T1])?;
+    if w.hc() {
+        // Consumer (ml, part) reads stage rows (r2, part), r2 = 0, 1; lane 0
+        // parks partial[ml][r][part] at ((ml*cap + r)*8 + part)*4.
+        sop(b, format!("s_lshl_b32 s{WS_T1}, s{WS_PART}, 10"), &[WS_T1], &[WS_PART])?;
+        vop(b, format!("v_add_nc_u32_e32 v{WV_LDRD}, s{WS_T1}, v{WV_XOFF}"), &[WV_LDRD], &[WV_XOFF], &[WS_T1])?;
+        sop(b, format!("s_mul_i32 s{WS_T1}, s{WS_PROW}, {}", lit(32 * u32::from(w.cap))), &[WS_T1], &[WS_PROW])?;
+        sop(b, format!("s_lshl_b32 s{WS_T0}, s{WS_PART}, 2"), &[WS_T0], &[WS_PART])?;
+        sop(b, format!("s_add_i32 s{WS_T1}, s{WS_T1}, s{WS_T0}"), &[WS_T1], &[WS_T1, WS_T0])?;
+        vop(b, format!("v_mov_b32_e32 v{WV_PST}, s{WS_T1}"), &[WV_PST], &[], &[WS_T1])
+    } else {
+        vop(b, format!("v_mov_b32_e32 v{WV_LDRD}, v{WV_XOFF}"), &[WV_LDRD], &[WV_XOFF], &[])?;
+        sop(b, format!("s_lshl_b32 s{WS_MB}, s{WS_M}, 2"), &[WS_MB], &[WS_M])?;
+        sop(b, format!("s_lshl_b32 s{WS_COL4}, s{WS_COL}, 2"), &[WS_COL4], &[WS_COL])
+    }
+}
+
+/// The whole K sweep: the full 8-block tiles in a loop, then the tail tile
+/// of `TAIL` (1..=7) blocks through a compile-time variant per listed
+/// count, so no block past the row (partition) is loaded or consumed.
+fn wide_traverse(b: &mut Builder, w: WideSpec, slot: usize, order: Order, tails: &[u8], lbl: &str) -> R {
+    let tail_lbl = format!("{lbl}_tails");
+    let kdone = format!("{lbl}_kdone");
+    sop(b, format!("s_mov_b32 s{WS_IT}, s{WS_NFULL}"), &[WS_IT], &[WS_NFULL])?;
+    sop(b, format!("s_cmp_eq_u32 s{WS_IT}, 0"), &[], &[WS_IT])?;
+    op(b, format!("s_cbranch_scc1 {tail_lbl}"), &[], &[])?;
+    let head = format!("{lbl}_kloop");
+    let full = format!("{lbl}_full");
+    b.loop_(&head, |b| {
+        wide_pass(b, w, slot, order, 8, &full)?;
+        vop(b, format!("v_add_nc_u32_e32 v{WV_XOFF}, {}, v{WV_XOFF}", lit(8 * 128)), &[WV_XOFF], &[WV_XOFF], &[])?;
+        for r in [WV_WOFFD, WV_WOFFQ] {
+            vop(b, format!("v_add_nc_u32_e32 v{r}, {}, v{r}", lit(8 * 34)), &[r], &[r], &[])?;
+        }
+        sop(b, format!("s_add_i32 s{WS_IT}, s{WS_IT}, -1"), &[WS_IT], &[WS_IT])?;
+        sop(b, format!("s_cmp_lg_u32 s{WS_IT}, 0"), &[], &[WS_IT])?;
+        op(b, format!("s_cbranch_scc1 {head}"), &[], &[])
+    })?;
+    b.label(&tail_lbl)?;
+    for &nb in tails {
+        sop(b, format!("s_cmp_eq_u32 s{WS_TAIL}, {nb}"), &[], &[WS_TAIL])?;
+        op(b, format!("s_cbranch_scc1 {lbl}_tail{nb}"), &[], &[])?;
+    }
+    op(b, format!("s_branch {kdone}"), &[], &[])?;
+    let part = format!("{lbl}_part");
+    for &nb in tails {
+        b.label(&format!("{lbl}_tail{nb}"))?;
+        wide_pass(b, w, slot, order, nb, &part)?;
+        op(b, format!("s_branch {kdone}"), &[], &[])?;
+    }
+    b.label(&kdone)
+}
+
+/// One K tile of `nb` blocks: the live wave's weights once, then every row tile.
+fn wide_pass(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, lbl: &str) -> R {
+    let lbl = format!("{lbl}{nb}");
+    wide_weights(b, nb, &lbl)?;
+    for t in 0..w.tiles() { wide_tile(b, w, slot, order, nb, t, &lbl)?; }
+    Ok(())
+}
+
+/// Live waves: `q[j]` / `d[j]` of the tile's `nb` blocks and
+/// `dq[j] = fma_mix(d_f16, f32(q), -0.0)`, held until every row consumed them.
+fn wide_weights(b: &mut Builder, nb: u8, lbl: &str) -> R {
+    let done = format!("{lbl}_wdone");
+    sop(b, format!("s_cmp_eq_u32 s{WS_LIVE}, 0"), &[], &[WS_LIVE])?;
+    op(b, format!("s_cbranch_scc1 {done}"), &[], &[])?;
+    for j in 0..nb {
+        gload(b, "global_load_i8", WV_Q + j, WV_WOFFQ, WS_A, 34 * u32::from(j) + 2)?;
+        gload(b, "global_load_u16", WV_DQ + j, WV_WOFFD, WS_A, 34 * u32::from(j))?;
+    }
+    for j in 0..nb { dequant(b, WV_DQ + j, WV_Q + j)?; }
+    b.label(&done)
+}
+
+/// Row tile `t` of one K tile: producer fill, barrier, every live wave
+/// consumes the tile's rows `< R`, barrier. Rows past `R` are neither loaded
+/// nor consumed; dead waves produce and keep every barrier.
+fn wide_tile(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, t: u32, lbl: &str) -> R {
+    let rows = w.rows_per_tile();
+    let rb = rows * t;
+    let tag = format!("{lbl}_t{t}");
+    let done = format!("{tag}_done");
+    if t > 0 {
+        sop(b, format!("s_cmp_le_u32 s{WS_R}, {rb}"), &[], &[WS_R])?;
+        op(b, format!("s_cbranch_scc1 {done}"), &[], &[])?;
+    }
+    let nofill = format!("{tag}_nofill");
+    if t == 0 {
+        sop(b, format!("s_cmp_ge_u32 s{WS_PROW}, s{WS_R}"), &[], &[WS_PROW, WS_R])?;
+    } else {
+        sop(b, format!("s_add_i32 s{WS_T0}, s{WS_PROW}, {rb}"), &[WS_T0], &[WS_PROW])?;
+        sop(b, format!("s_cmp_ge_u32 s{WS_T0}, s{WS_R}"), &[], &[WS_T0, WS_R])?;
+    }
+    op(b, format!("s_cbranch_scc1 {nofill}"), &[], &[])?;
+    if t == 0 {
+        vop(b, format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_XTB}, v{WV_XOFF}"), &[WV_XADDR], &[WV_XOFF], &[WS_XTB])?;
+    } else {
+        sop(b, format!("s_mul_i32 s{WS_T0}, s{WS_KX4}, {}", lit(rb)), &[WS_T0], &[WS_KX4])?;
+        sop(b, format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_XTB}"), &[WS_T0], &[WS_T0, WS_XTB])?;
+        vop(b, format!("v_add_nc_u32_e32 v{WV_XADDR}, s{WS_T0}, v{WV_XOFF}"), &[WV_XADDR], &[WV_XOFF], &[WS_T0])?;
+    }
+    for j in 0..nb { gload(b, "global_load_b32", WV_XS + j, WV_XADDR, WS_X, 128 * u32::from(j))?; }
+    for j in 0..nb { ds_st(b, slot, WV_LDST, WV_XS + j, 128 * u32::from(j))?; }
+    b.label(&nofill)?;
+    b.barrier(&[Transition::Ready(slot)])?;
+    let cdone = format!("{tag}_cdone");
+    sop(b, format!("s_cmp_eq_u32 s{WS_LIVE}, 0"), &[], &[WS_LIVE])?;
+    op(b, format!("s_cbranch_scc1 {cdone}"), &[], &[])?;
+    for r in 0..rows {
+        if r > 0 {
+            sop(b, format!("s_cmp_le_u32 s{WS_R}, {}", rb + r), &[], &[WS_R])?;
+            op(b, format!("s_cbranch_scc1 {cdone}"), &[], &[])?;
+        }
+        wide_consume(b, w, slot, order, nb, r, rb + r)?;
+    }
+    b.label(&cdone)?;
+    b.barrier(&[Transition::Retire(slot)])?;
+    b.label(&done)
+}
+
+/// Stage row `r_local` of the tile into activation row `row`'s chain(s):
+/// blocks ascending. One chain (ordinary, HC): `sum = fma(x, dq, sum)`
+/// (`v_fmac_f32 sum, x, dq`). Four chains: block `j` (global block
+/// `8k + j`, chain `j & 3`) is a quad block when `j < 4*floor(nb/4)` (the
+/// whole tile when `nb = 8`): `Order` spelling of the fused update; else
+/// a remainder block: `p = RN(x * dq)`, `acc = acc + p`.
+fn wide_consume(b: &mut Builder, w: WideSpec, slot: usize, order: Order, nb: u8, r_local: u32, row: u32) -> R {
+    let base = r_local * if w.hc() { 8 * 1024 } else { 1024 };
+    for j in 0..nb { ds_ld(b, slot, "ds_load_b32", WV_XS + j, WV_LDRD, base + 128 * u32::from(j), false)?; }
+    let quad_left = if nb == 8 { 8 } else { nb & !3 };
+    for j in 0..nb {
+        let (x, d) = (WV_XS + j, WV_DQ + j);
+        if !w.four() {
+            let a = wacc(w, row, 0);
+            vop(b, format!("v_fmac_f32_e32 v{a}, v{x}, v{d}"), &[a], &[a, x, d], &[])?;
+            continue;
+        }
+        let a = wacc(w, row, j & 3);
+        if j < quad_left {
+            let (s0, s1) = match order { Order::Generic => (d, x), Order::K640 => (x, d) };
+            vop(b, format!("v_fmac_f32_e32 v{a}, v{s0}, v{s1}"), &[a], &[a, s0, s1], &[])?;
+        } else {
+            vop(b, format!("v_mul_f32_e32 v{WV_TMP}, v{x}, v{d}"), &[WV_TMP], &[x, d], &[])?;
+            vop(b, format!("v_add_f32_e32 v{a}, v{a}, v{WV_TMP}"), &[a], &[a, WV_TMP], &[])?;
+        }
+    }
+    Ok(())
+}
+
+/// Four-chain fold of row `row` into chain 0 in the selected object's operand order.
+fn wide_fold(b: &mut Builder, w: WideSpec, order: Order, row: u32) -> R {
+    let a = |c: u8| wacc(w, row, c);
+    let steps = match order {
+        Order::Generic => [(a(1), a(1), a(0)), (a(3), a(3), a(2)), (a(0), a(3), a(1))],
+        Order::K640 => [(a(0), a(0), a(1)), (a(2), a(2), a(3)), (a(0), a(0), a(2))],
+    };
+    for (d, x, y) in steps { vop(b, format!("v_add_f32_e32 v{d}, v{x}, v{y}"), &[d], &[x, y], &[])?; }
+    Ok(())
+}
+
+/// Ordinary epilogue: dead waves leave (no barrier follows); per batch of
+/// eight rows `< R`: (four chains) the fold, the lane tree, lane 0 stores
+/// `y[r*M + m]`.
+fn wide_epilogue(b: &mut Builder, w: WideSpec, order: Order, lbl: &str, end: &str) -> R {
+    sop(b, format!("s_cmp_eq_u32 s{WS_LIVE}, 0"), &[], &[WS_LIVE])?;
+    op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+    for batch in 0..u32::from(w.cap) / 8 {
+        let r0 = 8 * batch;
+        if batch > 0 {
+            sop(b, format!("s_cmp_le_u32 s{WS_R}, {r0}"), &[], &[WS_R])?;
+            op(b, format!("s_cbranch_scc1 {end}"), &[], &[])?;
+        }
+        let rows: Vec<u32> = (r0..r0 + 8).collect();
+        if w.four() { for &r in &rows { wide_fold(b, w, order, r)?; } }
+        let values: Vec<u8> = rows.iter().map(|&r| wacc(w, r, 0)).collect();
+        lane_tree(b, &values, WV_XS, WV_ADDR)?;
+        for (i, &r) in rows.iter().enumerate() {
+            let a = WV_Q + i as u8;
+            if r == 0 {
+                vop(b, format!("v_mov_b32_e32 v{a}, s{WS_COL4}"), &[a], &[], &[WS_COL4])?;
+            } else {
+                sop(b, format!("s_mul_i32 s{WS_T0}, s{WS_MB}, {r}"), &[WS_T0], &[WS_MB])?;
+                sop(b, format!("s_add_i32 s{WS_T0}, s{WS_T0}, s{WS_COL4}"), &[WS_T0], &[WS_T0, WS_COL4])?;
+                vop(b, format!("v_mov_b32_e32 v{a}, s{WS_T0}"), &[a], &[], &[WS_T0])?;
+            }
+        }
+        op(b, format!("s_mov_b32 exec_lo, s{WS_LANE0}"), &[], &[s(WS_LANE0)])?;
+        let stored = format!("{lbl}_stored{batch}");
+        for (i, &r) in rows.iter().enumerate() {
+            if i > 0 {
+                sop(b, format!("s_cmp_le_u32 s{WS_R}, {r}"), &[], &[WS_R])?;
+                op(b, format!("s_cbranch_scc1 {stored}"), &[], &[])?;
+            }
+            let (a, val) = (WV_Q + i as u8, wacc(w, r, 0));
+            mem(b, format!("global_store_b32 v{a}, v{val}, s[{WS_Y}:{}]", WS_Y + 1), &[], &[v(a), v(val), sr(WS_Y, 2)], MemoryClass::VmemStore)?;
+        }
+        b.label(&stored)?;
+        op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        b.wait_all()?;
+    }
+    Ok(())
+}
+
+/// HC epilogue: the X tile is dead (its last readers retired by the final
+/// tile barrier) and its bytes become `partial[2][cap][8]`. Lane 0 of each
+/// live wave parks its rows' partition sums; barrier; thread
+/// `t < 2*cap` folds column `t >> log2(cap)`, row `t & (cap-1)` (when the row
+/// is `< R` and the column `< M`) exactly as the narrow k8 entry does.
+fn wide_hc_epilogue(b: &mut Builder, w: WideSpec, lbl: &str, end: &str) -> R {
+    let cap = u32::from(w.cap);
+    b.lds_relayout()?;
+    let pslot = b.lds_slot("partials", 0, 2 * cap * 8 * 4)?;
+    let parked = format!("{lbl}_parked");
+    sop(b, format!("s_cmp_eq_u32 s{WS_LIVE}, 0"), &[], &[WS_LIVE])?;
+    op(b, format!("s_cbranch_scc1 {parked}"), &[], &[])?;
+    for batch in 0..cap / 8 {
+        let r0 = 8 * batch;
+        if batch > 0 {
+            sop(b, format!("s_cmp_le_u32 s{WS_R}, {r0}"), &[], &[WS_R])?;
+            op(b, format!("s_cbranch_scc1 {parked}"), &[], &[])?;
+        }
+        let values: Vec<u8> = (r0..r0 + 8).map(|r| wacc(w, r, 0)).collect();
+        lane_tree(b, &values, WV_XS, WV_ADDR)?;
+        op(b, format!("s_mov_b32 exec_lo, s{WS_LANE0}"), &[], &[s(WS_LANE0)])?;
+        for r in r0..r0 + 8 { ds_st(b, pslot, WV_PST, wacc(w, r, 0), 32 * r)?; }
+        op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+    }
+    b.label(&parked)?;
+    let (e_addr, e_r, e_m2) = (WV_XADDR, WV_TMP, WV_VT);
+    vop(b, format!("v_and_b32_e32 v{e_r}, {}, v{V_TID}", cap - 1), &[e_r], &[V_TID], &[])?;
+    vop(b, format!("v_lshrrev_b32_e32 v{e_m2}, {}, v{V_TID}", cap.trailing_zeros()), &[e_m2], &[V_TID], &[])?;
+    vop(b, format!("v_add_nc_u32_e32 v{e_m2}, s{WS_MBASE}, v{e_m2}"), &[e_m2], &[e_m2], &[WS_MBASE])?;
+    vop(b, format!("v_lshlrev_b32_e32 v{e_addr}, 5, v{V_TID}"), &[e_addr], &[V_TID], &[])?;
+    op(b, format!("v_mul_lo_u32 v{WV_EY}, v{e_r}, s{WS_M}"), &[v(WV_EY)], &[v(e_r), s(WS_M)])?;
+    vop(b, format!("v_add_nc_u32_e32 v{WV_EY}, v{e_m2}, v{WV_EY}"), &[WV_EY], &[e_m2, WV_EY], &[])?;
+    vop(b, format!("v_lshlrev_b32_e32 v{WV_EY}, 2, v{WV_EY}"), &[WV_EY], &[WV_EY], &[])?;
+    b.barrier(&[Transition::Ready(pslot)])?;
+    vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, {}, v{V_TID}", 2 * cap), &[], &[V_TID], &[])?;
+    op(b, format!("s_mov_b32 s{WS_MASK}, vcc_lo"), &[s(WS_MASK)], &[])?;
+    vop(b, format!("v_cmp_gt_u32_e32 vcc_lo, s{WS_R}, v{e_r}"), &[], &[e_r], &[WS_R])?;
+    sop(b, format!("s_and_b32 s{WS_MASK}, s{WS_MASK}, vcc_lo"), &[WS_MASK], &[WS_MASK])?;
+    vop(b, format!("v_cmp_gt_i32_e32 vcc_lo, s{WS_M}, v{e_m2}"), &[], &[e_m2], &[WS_M])?;
+    op(b, format!("s_and_b32 exec_lo, s{WS_MASK}, vcc_lo"), &[], &[s(WS_MASK)])?;
+    op(b, format!("s_cbranch_execz {end}"), &[], &[])?;
+    for half in 0..2u8 {
+        b.ds_load(pslot, Instruction::new(format!("ds_load_b128 {}, v{e_addr}{}", vrange(WV_DQ + 4 * half, 4), off(16 * u32::from(half))),
+            vec![vr(WV_DQ + 4 * half, 4)], vec![v(e_addr)]).memory(MemoryClass::DsLoad))?;
+    }
+    let p = |n: u8| WV_DQ + n;
+    // ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)), the narrow k8 spelling.
+    for (dst, a, c) in [(0u8, 0u8, 1u8), (2, 2, 3), (4, 4, 5), (6, 6, 7), (0, 0, 2), (4, 4, 6), (0, 0, 4)] {
+        vop(b, format!("v_add_f32_e32 v{}, v{}, v{}", p(dst), p(a), p(c)), &[p(dst)], &[p(a), p(c)], &[])?;
+    }
+    let x = p(0);
+    let store = format!("{lbl}_store");
+    sop(b, format!("s_cmp_eq_u32 s{WS_HC}, 0"), &[], &[WS_HC])?;
+    op(b, format!("s_cbranch_scc1 {store}"), &[], &[])?;
+    let e = |n: u8| WV_Q + n;
+    bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
+    vop(b, format!("v_mul_f32_e32 v{x}, s{WS_SCALE}, v{x}"), &[x], &[x], &[WS_SCALE])?;
+    bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
+    silu(b, x, [e(0), e(1), e(2), e(3), e(4), e(5)])?;
+    bf16_round(b, x, [e(0), e(1), e(2), e(3)])?;
+    b.label(&store)?;
+    mem(b, format!("global_store_b32 v{WV_EY}, v{x}, s[{WS_Y}:{}]", WS_Y + 1), &[], &[v(WV_EY), v(x), sr(WS_Y, 2)], MemoryClass::VmemStore)?;
+    b.wait_all()
+}
+
+/// The ten wide Q8 exports in frozen order: k8 r16/r32, k320 r16/r32,
+/// k2560 r16/r32, k2560_x2 r16/r32, wide (four-chain) r16/r32. Callable
+/// separately from [`build_gfx1151`], whose exports and text are unchanged.
+pub fn build_wide_gfx1151() -> Result<Vec<Emitted>, String> {
+    WIDE_EXPORTS.iter().map(|&w| wide(w).map_err(|e| format!("{}: {e}", w.symbol()))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +1470,101 @@ mod tests {
         assert!(k320.proof.loop_fixpoints.is_empty());
     }
 
+    #[test]
+    fn wide_exports_build_in_frozen_order_with_declared_budgets() {
+        let emitted = build_wide_gfx1151().expect("q8 wide");
+        let symbols: Vec<String> = WIDE_EXPORTS.iter().map(|w| w.symbol()).collect();
+        assert_eq!(symbols, [
+            "gemv_q8_0_k8_xbatch_wide_r16_pm", "gemv_q8_0_k8_xbatch_wide_r32_pm",
+            "gemv_q8_0_k320_xbatch_wide_r16_pm", "gemv_q8_0_k320_xbatch_wide_r32_pm",
+            "gemv_q8_0_k2560_xbatch_wide_r16_pm", "gemv_q8_0_k2560_xbatch_wide_r32_pm",
+            "gemv_q8_0_k2560_x2_xbatch_wide_r16_pm", "gemv_q8_0_k2560_x2_xbatch_wide_r32_pm",
+            "gemv_q8_0_wide_xbatch_wide_r16_pm", "gemv_q8_0_wide_xbatch_wide_r32_pm",
+        ]);
+        assert_eq!(emitted.len(), WIDE_EXPORTS.len());
+        let high_water: Vec<u16> = WIDE_EXPORTS.iter().map(|w| w.vgpr_high_water() as u16).collect();
+        assert_eq!(high_water, [56, 72, 56, 72, 56, 72, 56, 72, 104, 168]);
+        for (e, w) in emitted.iter().zip(WIDE_EXPORTS) {
+            let symbol = w.symbol();
+            assert!(e.s_text.contains(&format!(".amdhsa_kernel {symbol}")), "{symbol}");
+            assert_eq!(e.shape.next_free_vgpr, w.vgpr_high_water() as u16, "{symbol}");
+            assert!(e.shape.next_free_vgpr <= w.vgpr_budget(), "{symbol}");
+            assert!(e.shape.next_free_sgpr <= WIDE_SGPRS, "{symbol}");
+            assert!(e.s_text.contains(&format!(".amdhsa_group_segment_fixed_size {}", w.lds_bytes())), "{symbol}");
+            assert!(!e.s_text.contains("scratch_"), "{symbol}");
+            assert!(e.s_text.contains("s_barrier"), "{symbol}");
+            // dq = fma_mix(d, q, -0.0) once per block; the swizzle/bpermute tree.
+            assert!(e.s_text.contains("v_fma_mix_f32") && e.s_text.contains("neg(0) op_sel_hi:[1,0,0]"), "{symbol}");
+            assert!(e.s_text.contains("ds_swizzle_b32") && e.s_text.contains("ds_bpermute_b32"), "{symbol}");
+            // The full-tile K loop converged.
+            assert!(!e.proof.loop_fixpoints.is_empty(), "{symbol}");
+        }
+        // HC: the X tile retired, then the partial layout.
+        assert_eq!(emitted[0].proof.lds_slots.len(), 2);
+        assert_eq!(emitted[2].proof.lds_slots.len(), 1);
+        assert_eq!(WIDE_EXPORTS[0].kernarg_bytes(), 44);
+        assert_eq!(WIDE_EXPORTS[2].kernarg_bytes(), 36);
+        assert_eq!(WIDE_EXPORTS[6].kernarg_bytes(), 56);
+        assert_eq!(WIDE_EXPORTS[0].workgroup_size(), 512);
+        assert_eq!(WIDE_EXPORTS[8].workgroup_size(), 256);
+    }
+
+    /// Weight loads are emitted once per K tile shape (full loop body plus the
+    /// tail variants), never per row: the count does not depend on the capacity.
+    #[test]
+    fn wide_weight_loads_do_not_scale_with_rows() {
+        let emitted = build_wide_gfx1151().expect("q8 wide");
+        let count = |e: &Emitted, m: &str| e.s_text.lines().filter(|l| l.trim_start().starts_with(m)).count();
+        for pair in emitted.chunks(2) {
+            assert_eq!(count(&pair[0], "global_load_i8 "), count(&pair[1], "global_load_i8 "));
+            assert_eq!(count(&pair[0], "global_load_u16 "), count(&pair[1], "global_load_u16 "));
+        }
+        // 8 (full tile) + 1 + .. + 7 (tail variants); four chains add the K = 640 path (8 + 4).
+        for (e, w) in emitted.iter().zip(WIDE_EXPORTS) {
+            let want = if w.kind == WideKind::Wide { 36 + 12 } else { 36 };
+            assert_eq!(count(e, "global_load_i8 "), want, "{}", w.symbol());
+        }
+    }
+
+    /// Each entry spells the selected decode object's operations (`DAG.md`
+    /// receipts; asm of `gemv_q8_0_k320_staged` / `_k2560_staged` / `_k8`,
+    /// `gemv_q8_0_wide`, `gemv_q8_0_wide_k640_staged` on gfx1151).
+    #[test]
+    fn wide_entries_pin_the_selected_decode_dags() {
+        let emitted = build_wide_gfx1151().expect("q8 wide");
+        let (acc0, x0, dq0) = (WV_ACC, WV_XS, WV_DQ);
+        for (e, w) in emitted.iter().zip(WIDE_EXPORTS) {
+            let t = &e.s_text;
+            if w.four() {
+                // Generic quad: fmac(acc, dq, x); K = 640: fmac(acc, x, dq).
+                assert!(t.contains(&format!("v_fmac_f32_e32 v{acc0}, v{dq0}, v{x0}")));
+                assert!(t.contains(&format!("v_fmac_f32_e32 v{acc0}, v{x0}, v{dq0}")));
+                // Remainder block: RN(x * dq), then acc + p (no contraction).
+                assert!(t.contains(&format!("v_mul_f32_e32 v{WV_TMP}, v{x0}, v{dq0}")));
+                assert!(t.contains(&format!("v_add_f32_e32 v{acc0}, v{acc0}, v{WV_TMP}")));
+                // Folds: generic (a3 + a2) + (a1 + a0); K = 640 (a0 + a1) + (a2 + a3).
+                let a = |c: u8| acc0 + c;
+                for line in [format!("v_add_f32_e32 v{}, v{}, v{}", a(1), a(1), a(0)), format!("v_add_f32_e32 v{}, v{}, v{}", a(3), a(3), a(2)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(3), a(1)), format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(1)),
+                    format!("v_add_f32_e32 v{}, v{}, v{}", a(2), a(2), a(3)), format!("v_add_f32_e32 v{}, v{}, v{}", a(0), a(0), a(2))] {
+                    assert!(t.contains(&line), "{line}");
+                }
+                assert!(t.contains("s_cmp_eq_u32 s11, 0x280"));
+            } else {
+                // One chain: every block fused, fmac(sum, x, dq), no unfused product.
+                assert!(t.contains(&format!("v_fmac_f32_e32 v{acc0}, v{x0}, v{dq0}")));
+                assert!(!t.contains(&format!("v_fmac_f32_e32 v{acc0}, v{dq0}, v{x0}")));
+                assert!(!t.contains(&format!("v_mul_f32_e32 v{WV_TMP},")));
+            }
+            if w.hc() {
+                assert!(t.contains("v_div_fixup_f32") && t.contains("v_div_fmas_f32") && t.contains("v_exp_f32_e32"));
+                assert!(t.contains(&format!("v_mul_f32_e32 v{dq0}, s{WS_SCALE}, v{dq0}")));
+            } else {
+                assert!(!t.contains("v_div_fixup_f32"));
+            }
+        }
+    }
+
     #[cfg(feature = "toolchain")]
     #[test]
     fn q8_lane_rows_m7() {
@@ -795,6 +1576,24 @@ mod tests {
             let co = dir.join(format!("{symbol}.test.co"));
             std::fs::write(&co, &elf).unwrap();
             let report = crate::pm_check::m7(&co, "gfx1151", symbol).expect("M7");
+            println!("{symbol}: {report}");
+            assert_eq!(report["obligations"], serde_json::json!({}), "{report}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "toolchain")]
+    #[test]
+    fn q8_lane_rows_wide_m7() {
+        let dir = std::env::temp_dir().join(format!("peacemaker-isa-lane-rows-q8-wide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (emitted, w) in build_wide_gfx1151().expect("q8 wide").into_iter().zip(WIDE_EXPORTS) {
+            let symbol = w.symbol();
+            let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
+            std::fs::write(dir.join(format!("{symbol}.test.s")), &emitted.s_text).unwrap();
+            let co = dir.join(format!("{symbol}.test.co"));
+            std::fs::write(&co, &elf).unwrap();
+            let report = crate::pm_check::m7(&co, "gfx1151", &symbol).expect("M7");
             println!("{symbol}: {report}");
             assert_eq!(report["obligations"], serde_json::json!({}), "{report}");
         }

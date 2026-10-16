@@ -545,7 +545,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "6f21ff296378b7b4855275e2460cdbd0844c5eb1e3bdcd83221899241c82068e",
+      "sha256": "a93dfdbcfeb46ebae8641177984abc1074eabe161041729b498dc5f18ac91abe",
       "symbols": [
         "gemm_mq6g256v2_f32_rows_r3",
         "gemm_mq6g256v2_f32_rows_r4",
@@ -1632,7 +1632,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b",
+      "sha256": "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25",
       "symbols": [
         "gemv_bf16_xf32_bf16_scaled_add",
         "gemv_bf16_xf32_k4",
@@ -1881,7 +1881,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "049125a4483a2f9a81178a58fc7b3243ad769cb85fddcb10f9b66d9ef3c34ac2",
+      "sha256": "fb1fcae98660e1bad807d9fda24de3bab45a8cb0c5b951da9d1e4fd67e4c8b25",
       "symbols": [
         "topk8_partial_f32"
       ],
@@ -2250,7 +2250,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "85e70890cc7658d6390374eb9e61977253ef066cc06e34d2de6e9ab8a5c15459",
+      "sha256": "1420f04ed87c085346d76efb35d31c76cb72a3212c8d7f5420182d03397522b6",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -4026,7 +4026,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b",
+          "sha256": "995b0bb6355dedc7edca0660c95cf9a39ede8441d2d31855f39f5a7614faed25",
           "symbols": [
             "gemv_bf16_xf32_bf16_scaled_add",
             "gemv_bf16_xf32_k4",
@@ -4480,7 +4480,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "85e70890cc7658d6390374eb9e61977253ef066cc06e34d2de6e9ab8a5c15459",
+          "sha256": "1420f04ed87c085346d76efb35d31c76cb72a3212c8d7f5420182d03397522b6",
           "symbols": [
             "argmax_f32",
             "bf16_scaled_add_batched_f32",

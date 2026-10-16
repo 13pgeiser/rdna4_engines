@@ -29,9 +29,12 @@
 //!     `lane * 10 + rank` (stable original order inside every expert).
 //!   * `weight_ptrs[512]` u64 per projection tensor: the expert's code-plane
 //!     base, indexed by **expert id**. There is no uniform stride.
-//! * Buckets use the fixed codec order [`Codec::ORDER`]; within a bucket expert
-//!   ids strictly increase. Buckets partition the `10 C` original slots.
-//!   `U <= min(10 C, 512)`, `C in 1..=8`, ids in `0..512`, unique per lane.
+//! * Buckets use the fixed codec order [`Codec::ORDER`]; the sorted compact
+//!   [`LaneUnionPlan`] lists expert ids strictly increasing inside a bucket,
+//!   whereas the production device planner (modelled by [`FixedUnion`]) lists
+//!   them in first-occurrence order in fixed-capacity `6 S + 2` word arrays.
+//!   Both partition the `10 C` original slots. `U <= min(10 C, 512)`,
+//!   `C in 1..=32` (`S = 10 C <= 320`), ids in `0..512`, unique per lane.
 //! * Outputs are indexed by the **original slot**. Down writes the unweighted
 //!   `Y0 [C, 10, 2560]`; the existing combine stage alone applies the route
 //!   weights. `X` row is `slot / x_row_div` (gate 10, down 1).
@@ -50,8 +53,10 @@ use std::fmt;
 
 /// Routed experts per lane (token).
 pub const TOP_K: usize = 10;
-/// Largest lane count of the decode union.
-pub const MAX_LANES: usize = 8;
+/// Largest lane count of the decode union (`C32`: wide verify). Capacity and
+/// CPU validation only: per-architecture admission of `C > 8` is a separate
+/// route decision.
+pub const MAX_LANES: usize = 32;
 /// Exclusive upper bound of expert ids (`0..512`).
 pub const MAX_EXPERTS: usize = 512;
 /// Gate/up output rows of the fused projection (gate `640` + up `640`).
@@ -280,7 +285,7 @@ pub const SYMBOLS: [&str; 4] = [
 /// Planner, admission and launch refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlabMoeError {
-    /// Lane count outside `1..=8`.
+    /// Lane count outside `1..=32`.
     InvalidLaneCount { c: usize },
     /// Top-k id outside `0..512`.
     ExpertOutOfRange { lane: usize, rank: usize, id: u32 },
@@ -345,7 +350,8 @@ fn hip_err(e: SlabMoeError) -> HipError {
 pub struct MoeGemvKernargs {
     /// `@0` per-projection table of expert code-plane bases, indexed by expert id.
     pub expert_weight_ptrs: u64,
-    /// `@8` u32 expert ids of this bucket (increasing).
+    /// `@8` u32 expert ids of this bucket (distinct; order is the producer's:
+    /// ascending in the compact CPU plan, first-occurrence on device).
     pub expert_ids: u64,
     /// `@16` u32 offsets, `U + 1` entries spanning only this bucket's slots.
     pub expert_offsets: u64,
@@ -455,7 +461,7 @@ pub struct Bucket {
 /// routing data. Both gate/up and down launches of one step share it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnionLayout {
-    /// Lanes `C in 1..=8`.
+    /// Lanes `C in 1..=32`.
     pub c: usize,
     /// Total distinct experts `U <= min(10 C, 512)`.
     pub u_total: usize,
@@ -632,6 +638,318 @@ impl LaneUnionPlan {
     pub fn expert_slots(&self, b: usize, u: usize) -> &[u32] {
         let off = self.bucket_offsets(b);
         &self.bucket_slots(b)[off[u] as usize..off[u + 1] as usize]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPU model of the production fixed-capacity device planner
+// ---------------------------------------------------------------------------
+
+/// Threads of the device planner launch (one workgroup, one thread per slot;
+/// `kernels/src/qwen4_slab_union_plan.hip` `SLAB_PLAN_THREADS`).
+pub const PLAN_THREADS: usize = 512;
+/// Most slots (`10 * MAX_LANES`) the device planner stores (`SLAB_PLAN_MAX_SLOTS`).
+pub const PLAN_MAX_SLOTS: usize = TOP_K * MAX_LANES;
+/// Device planner buckets (fixed codec order, see [`Codec::ORDER`]).
+pub const PLAN_BUCKETS: usize = 2;
+
+const _: () = assert!(PLAN_MAX_SLOTS <= PLAN_THREADS);
+
+/// Words of the fixed-capacity descriptor for `c` lanes (`S = 10 c`):
+/// ids `2 S`, offsets `2 (S + 1)`, slots `2 S` = `6 S + 2`. Refuses `c`
+/// outside `1..=MAX_LANES` (C16 = 962 words = 3848 B, C32 = 1922 words =
+/// 7688 B).
+pub fn fixed_union_words(c: usize) -> Result<usize, SlabMoeError> {
+    if !(1..=MAX_LANES).contains(&c) {
+        return Err(SlabMoeError::InvalidLaneCount { c });
+    }
+    Ok(6 * TOP_K * c + 2)
+}
+
+/// Bytes of [`fixed_union_words`].
+pub fn fixed_union_bytes(c: usize) -> Result<usize, SlabMoeError> {
+    Ok(fixed_union_words(c)? * U32_BYTES)
+}
+
+/// Host-side extent check before a planner launch: `c` must be `1..=32`, the
+/// routed-id buffer must hold `10 c` i32 words and the descriptor buffer
+/// `6 * 10 c + 2` u32 words. Returns the descriptor word count.
+pub fn check_plan_extents(c: usize, topk_bytes: usize, union_bytes: usize) -> Result<usize, SlabMoeError> {
+    let words = fixed_union_words(c)?;
+    if topk_bytes < TOP_K * c * U32_BYTES {
+        return Err(SlabMoeError::Operand { name: "topk", reason: "allocation smaller than 10 * lanes ids" });
+    }
+    if union_bytes < words * U32_BYTES {
+        return Err(SlabMoeError::Operand { name: "union scratch", reason: "allocation smaller than 6 * 10 * lanes + 2 words" });
+    }
+    Ok(words)
+}
+
+/// Sentinel of a descriptor word no thread has written.
+const UNWRITTEN: u32 = 0xDEAD_BEEF;
+
+/// Thread-faithful CPU model of `qwen4_slab_union_plan`: the production
+/// **first-occurrence** fixed-capacity layout (distinct from the sorted compact
+/// [`LaneUnionPlan`]), computed phase by phase over all [`PLAN_THREADS`]
+/// threads with a write log, so tests can assert that every one of the
+/// `6 S + 2` words has exactly one owner. Use [`FixedUnion::canonical`] to
+/// compare with the sorted representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixedUnion {
+    /// Slots `S = 10 c`.
+    pub s: usize,
+    /// The `6 S + 2` descriptor words (`ids | offsets | slots`).
+    pub words: Vec<u32>,
+    /// Number of thread writes each word received (must all be `1`).
+    pub writes: Vec<u8>,
+}
+
+impl FixedUnion {
+    /// Models the device planner for the first `10 * lanes` entries of `topk`.
+    /// `uniform_bucket >= 0` puts every slot in that bucket (`0` or `1`) and
+    /// ignores `codec`; otherwise `codec[id] == 1` selects bucket 0 (W3) and
+    /// any other byte bucket 1, exactly as the kernel does. Out-of-range ids
+    /// are clamped to expert 0 like the kernel.
+    pub fn model(
+        topk: &[i32],
+        lanes: usize,
+        codec: Option<&[u8]>,
+        uniform_bucket: i32,
+    ) -> Result<Self, SlabMoeError> {
+        let words_len = fixed_union_words(lanes)?;
+        let s = TOP_K * lanes;
+        if topk.len() < s {
+            return Err(SlabMoeError::Operand { name: "topk", reason: "fewer than 10 * lanes ids" });
+        }
+        if uniform_bucket >= PLAN_BUCKETS as i32 {
+            return Err(SlabMoeError::Layout("uniform bucket must be 0 or 1"));
+        }
+        if uniform_bucket < 0 && !codec.is_some_and(|t| t.len() >= MAX_EXPERTS) {
+            return Err(SlabMoeError::Operand { name: "codec", reason: "table shorter than 512 bytes" });
+        }
+
+        let mut words = vec![UNWRITTEN; words_len];
+        let mut writes = vec![0u8; words_len];
+        let mut put = |at: usize, v: u32| {
+            assert!(at < words_len, "planner write {at} outside the 6 S + 2 words");
+            words[at] = v;
+            writes[at] += 1;
+        };
+
+        // Workgroup-shared state (LDS) and per-thread registers.
+        let mut s_id = [0i32; PLAN_MAX_SLOTS];
+        let mut s_b = [0usize; PLAN_MAX_SLOTS];
+        let mut s_first = [false; PLAN_MAX_SLOTS];
+        let mut s_total = [0usize; PLAN_MAX_SLOTS];
+        let mut s_eidx = [0usize; PLAN_MAX_SLOTS];
+        let mut rank = [0usize; PLAN_THREADS];
+        let mut first = [0usize; PLAN_THREADS];
+
+        // Phase 1: stage ids and buckets (threads t >= S are inactive).
+        for t in 0..s {
+            let id = topk[t];
+            let id = if (id as u32) < MAX_EXPERTS as u32 { id } else { 0 };
+            s_id[t] = id;
+            s_b[t] = if uniform_bucket >= 0 {
+                uniform_bucket as usize
+            } else if codec.expect("checked above")[id as usize] == 1 {
+                0
+            } else {
+                1
+            };
+        }
+        // barrier
+        // Phase 2: per-slot first-occurrence scan.
+        for t in 0..s {
+            let id = s_id[t];
+            let (mut r, mut total, mut f) = (0usize, 0usize, None::<usize>);
+            for j in 0..s {
+                if s_id[j] == id {
+                    f.get_or_insert(j);
+                    total += 1;
+                    if j < t {
+                        r += 1;
+                    }
+                }
+            }
+            rank[t] = r;
+            first[t] = f.expect("a slot matches itself");
+            s_first[t] = r == 0;
+            s_total[t] = total;
+        }
+        // barrier
+        // Phase 3: expert index of each first occurrence inside its bucket.
+        for t in 0..s {
+            if rank[t] == 0 {
+                let b = s_b[t];
+                s_eidx[t] = (0..t).filter(|&j| s_first[j] && s_b[j] == b).count();
+            }
+        }
+        // barrier
+        // Phase 4: exclusive-owner writes. Every thread re-derives the bucket
+        // totals (U_b, n_b) from the shared state.
+        let (mut ub, mut nb) = ([0usize; PLAN_BUCKETS], [0usize; PLAN_BUCKETS]);
+        for j in 0..s {
+            if s_first[j] {
+                ub[s_b[j]] += 1;
+                nb[s_b[j]] += s_total[j];
+            }
+        }
+        let offs_base = 2 * s;
+        let slots_base = 2 * s + 2 * (s + 1);
+        for t in 0..PLAN_THREADS {
+            if t < s {
+                let b = s_b[t];
+                let e = s_eidx[first[t]];
+                let start: usize =
+                    (0..s).filter(|&j| s_first[j] && s_b[j] == b && s_eidx[j] < e).map(|j| s_total[j]).sum();
+                put(slots_base + b * s + start + rank[t], t as u32);
+                if rank[t] == 0 {
+                    put(b * s + e, s_id[t] as u32);
+                    put(offs_base + b * (s + 1) + e, start as u32);
+                }
+                for bk in 0..PLAN_BUCKETS {
+                    if t >= ub[bk] {
+                        put(bk * s + t, 0);
+                        put(offs_base + bk * (s + 1) + t, nb[bk] as u32);
+                    }
+                    if t >= nb[bk] {
+                        put(slots_base + bk * s + t, 0);
+                    }
+                }
+            }
+            if t == 0 {
+                for bk in 0..PLAN_BUCKETS {
+                    put(offs_base + bk * (s + 1) + s, nb[bk] as u32);
+                }
+            }
+        }
+        Ok(Self { s, words, writes })
+    }
+
+    /// Models the planner for `top` lanes of ten ids. `codecs[e]` is expert
+    /// `e`'s declared codec; a selected undeclared expert is refused. With
+    /// `uniform`, every slot goes in that codec's bucket and `codecs` is not
+    /// consulted (a layer whose experts all share one codec).
+    pub fn from_routes(
+        codecs: &[Option<Codec>],
+        top: &[[u32; TOP_K]],
+        uniform: Option<Codec>,
+    ) -> Result<Self, SlabMoeError> {
+        let mut table = vec![0u8; MAX_EXPERTS];
+        let mut topk = Vec::with_capacity(top.len() * TOP_K);
+        for (lane, ids) in top.iter().enumerate() {
+            for (rank, &id) in ids.iter().enumerate() {
+                if id as usize >= MAX_EXPERTS {
+                    return Err(SlabMoeError::ExpertOutOfRange { lane, rank, id });
+                }
+                if uniform.is_none() {
+                    match codecs.get(id as usize).copied().flatten() {
+                        Some(Codec::Mq3I4) => table[id as usize] = 1,
+                        Some(Codec::Mq4Sym) => table[id as usize] = 0,
+                        None => return Err(SlabMoeError::MissingCodec { expert: id }),
+                    }
+                }
+                topk.push(id as i32);
+            }
+        }
+        let ub = uniform.map_or(-1, |c| c.order_index() as i32);
+        Self::model(&topk, top.len(), Some(&table), ub)
+    }
+
+    /// `ids` of bucket `b` (`S` words, first-occurrence order, tail 0).
+    pub fn ids(&self, b: usize) -> &[u32] {
+        &self.words[b * self.s..(b + 1) * self.s]
+    }
+
+    /// `offsets` of bucket `b` (`S + 1` words, `0 ..= n_b`, tail `n_b`).
+    pub fn offsets(&self, b: usize) -> &[u32] {
+        let base = 2 * self.s + b * (self.s + 1);
+        &self.words[base..base + self.s + 1]
+    }
+
+    /// `slot_ids` of bucket `b` (`S` words, grouped by expert, tail 0).
+    pub fn slots(&self, b: usize) -> &[u32] {
+        let base = 2 * self.s + 2 * (self.s + 1) + b * self.s;
+        &self.words[base..base + self.s]
+    }
+
+    /// Distinct experts `U_b` of bucket `b`.
+    pub fn expert_count(&self, b: usize) -> usize {
+        self.offsets(b).windows(2).filter(|w| w[1] > w[0]).count()
+    }
+
+    /// Slots `n_b` of bucket `b`.
+    pub fn slot_count(&self, b: usize) -> usize {
+        self.offsets(b)[self.s] as usize
+    }
+
+    /// Structural contract of the device descriptor: every word has exactly one
+    /// owner and is initialized; per bucket offsets start at 0, rise strictly
+    /// over the `U_b` live experts and stay at `n_b` afterwards; ids are
+    /// distinct, tail ids and tail slots are 0; per-expert slots ascend and
+    /// belong to the expert's own run; experts are in first-occurrence order;
+    /// the two buckets partition the original slots exactly once.
+    pub fn validate(&self) -> Result<(), SlabMoeError> {
+        if self.words.len() != 6 * self.s + 2 || self.writes.len() != self.words.len() {
+            return Err(SlabMoeError::Layout("descriptor is not 6 S + 2 words"));
+        }
+        if self.writes.iter().any(|&n| n != 1) || self.words.contains(&UNWRITTEN) {
+            return Err(SlabMoeError::Layout("a descriptor word has zero or several owners"));
+        }
+        let mut seen = vec![false; self.s];
+        for b in 0..PLAN_BUCKETS {
+            let (ids, offs, slots) = (self.ids(b), self.offsets(b), self.slots(b));
+            let (u, n) = (self.expert_count(b), self.slot_count(b));
+            if offs[0] != 0 || offs.windows(2).any(|w| w[1] < w[0]) || n > self.s || u > n {
+                return Err(SlabMoeError::Layout("offsets are not monotonic from 0 to n_b"));
+            }
+            if offs[..=u].windows(2).any(|w| w[1] <= w[0]) || offs[u..].iter().any(|&o| o as usize != n) {
+                return Err(SlabMoeError::Layout("live offsets must rise strictly, tail must equal n_b"));
+            }
+            if ids[u..].iter().any(|&i| i != 0) || slots[n..].iter().any(|&p| p != 0) {
+                return Err(SlabMoeError::Layout("unused ids/slots tail is not zero"));
+            }
+            let mut prev_first = None::<u32>;
+            for e in 0..u {
+                if ids[..e].contains(&ids[e]) || ids[e] as usize >= MAX_EXPERTS {
+                    return Err(SlabMoeError::Layout("expert ids repeat or exceed 511"));
+                }
+                let run = &slots[offs[e] as usize..offs[e + 1] as usize];
+                if run.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(SlabMoeError::Layout("slots of an expert do not ascend"));
+                }
+                if prev_first.is_some_and(|p| run[0] <= p) {
+                    return Err(SlabMoeError::Layout("experts are not in first-occurrence order"));
+                }
+                prev_first = Some(run[0]);
+                for &slot in run {
+                    if slot as usize >= self.s || std::mem::replace(&mut seen[slot as usize], true) {
+                        return Err(SlabMoeError::Layout("a slot is out of range or listed twice"));
+                    }
+                }
+            }
+        }
+        if seen.iter().any(|&x| !x) {
+            return Err(SlabMoeError::Layout("buckets do not partition the 10 C slots"));
+        }
+        Ok(())
+    }
+
+    /// The descriptor as `(codec, expert, slots)` sorted by bucket then expert
+    /// id: the order of the sorted compact [`LaneUnionPlan`] representation,
+    /// independent of first-occurrence order.
+    pub fn canonical(&self) -> Vec<(Codec, u32, Vec<u32>)> {
+        let mut out = Vec::new();
+        for b in 0..PLAN_BUCKETS {
+            let (ids, offs, slots) = (self.ids(b), self.offsets(b), self.slots(b));
+            let mut rows: Vec<(Codec, u32, Vec<u32>)> = (0..self.expert_count(b))
+                .map(|e| (Codec::ORDER[b], ids[e], slots[offs[e] as usize..offs[e + 1] as usize].to_vec()))
+                .collect();
+            rows.sort_by_key(|r| r.1);
+            out.extend(rows);
+        }
+        out
     }
 }
 

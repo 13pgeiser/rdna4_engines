@@ -4279,8 +4279,12 @@ pub fn generate_spec(
 
     // Once per request, after prefill and before the first decode window
     // (and any decode capture/record): map the target's context for the
-    // whole `max_tokens` budget plus the speculator's draft rows. Best
-    // effort; the target logs and swallows a failure (on-demand growth).
+    // whole `max_tokens` budget plus the widest window's draft rows.
+    // `block_size()` is the speculator's live proposal ceiling (for Qwen4
+    // MTP `proposal_capacity`: the n-gram `n_max` when `configure_request`
+    // armed it, else the head's `max_k`), so copy/n-gram windows wider than
+    // the configured MTP k are covered. Best effort; the target logs and
+    // swallows a failure (on-demand growth at each forward's actual end).
     slot.map_ahead_for_decode(gpu, prompt_tokens.len(), max_tokens, spec.block_size());
     let t_prefill = Instant::now();
 

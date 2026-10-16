@@ -16,6 +16,7 @@
 //!   gfx1151 its hipcc twin `qwen4_slab_tile_mask` (same law, same ids out).
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
+use crate::gemv::WideTwinFamily;
 use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -32,6 +33,18 @@ pub const MQ_I4_MOE_GEMV_SYMBOLS: [[&str; 2]; 2] = [
     ["mq_i4_moe_gemv_mq4sym_r256_gate_up", "mq_i4_moe_gemv_mq4sym_r128_down"],
 ];
 
+/// Wide K1 entries, `[capacity (16/32)][codec][kind]`; the 88-byte ABI is unchanged.
+pub const MQ_I4_MOE_GEMV_WIDE_SYMBOLS: [[[&str; 2]; 2]; 2] = [
+    [
+        ["mq_i4_moe_gemv_mq3i4_r256_gate_up_c16", "mq_i4_moe_gemv_mq3i4_r128_down_c16"],
+        ["mq_i4_moe_gemv_mq4sym_r256_gate_up_c16", "mq_i4_moe_gemv_mq4sym_r128_down_c16"],
+    ],
+    [
+        ["mq_i4_moe_gemv_mq3i4_r256_gate_up_c32", "mq_i4_moe_gemv_mq3i4_r128_down_c32"],
+        ["mq_i4_moe_gemv_mq4sym_r256_gate_up_c32", "mq_i4_moe_gemv_mq4sym_r128_down_c32"],
+    ],
+];
+
 const PLAN_SYMBOL: &str = "qwen4_slab_union_plan";
 const PLAN_MODULE: &str = "qwen4_slab_union_plan";
 const MASK_SYMBOL: &str = "qwen4_slab_tile_mask";
@@ -39,8 +52,10 @@ const MASK_MODULE: &str = "qwen4_slab_tile_mask";
 /// Threads (tiles) per workgroup of the gfx1151 mask kernel.
 const MASK_BLOCK: u32 = 256;
 
-/// Most decode lanes the lane-union admits (`C8`).
-pub const SLAB_MAX_LANES: usize = 8;
+/// Descriptor/allocation capacity, not the architecture's row admission.
+pub const SLAB_MAX_LANES: usize = 32;
+/// Capacity of the unchanged decode K1 entries and S1 fallback groups.
+pub const SLAB_NARROW_MAX_LANES: usize = 8;
 /// Routed experts per lane.
 pub const SLAB_TOP_K: usize = 10;
 /// Experts per layer.
@@ -86,6 +101,12 @@ impl Gpu {
         self.slab_arch_index().is_some()
     }
 
+    /// Whether a wide K1 launch is admitted and the developer opt-in is enabled.
+    /// Allocation capacity alone never widens the shared row-exact admission.
+    pub fn qwen4_slab_wide_twin(&self, lanes: usize) -> bool {
+        self.wide_twin_cap(WideTwinFamily::K1, lanes).is_some()
+    }
+
     /// Load the planner, the mask (gfx1151) and the four K1 symbols (call before graph capture).
     pub fn ensure_qwen4_slab_kernels(&mut self) -> HipResult<()> {
         let arch = self.slab_require_arch("ensure_qwen4_slab_kernels")?;
@@ -96,6 +117,11 @@ impl Gpu {
         }
         for symbol in MQ_I4_MOE_GEMV_SYMBOLS.iter().flatten() {
             self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], symbol)?;
+        }
+        if WideTwinFamily::K1.enabled() {
+            for symbol in MQ_I4_MOE_GEMV_WIDE_SYMBOLS.iter().flatten().flatten() {
+                self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], symbol)?;
+            }
         }
         Ok(())
     }
@@ -149,7 +175,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.slab_require_arch("qwen4_slab_union_plan")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
-            return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: lanes must be 1..=8"));
+            return Err(hip_bridge::HipError::new(0, "qwen4_slab_union_plan: lanes must be 1..=32"));
         }
         let slots = SLAB_TOP_K * lanes;
         if topk.buf.size() < slots * 4 {
@@ -169,7 +195,9 @@ impl Gpu {
         };
         self.bind_thread()?;
         self.ensure_kernel(PLAN_MODULE, kernels::QWEN4_SLAB_UNION_PLAN_SRC, PLAN_SYMBOL)?;
-        if self.scratch.qwen4_slab_union_scratch.is_none() {
+        if self.scratch.qwen4_slab_union_scratch_bytes < crate::scratch::qwen4_slab_union_words(SLAB_MAX_LANES) * 4
+            || self.scratch.qwen4_slab_union_scratch.is_none()
+        {
             self.reserve_qwen4_slab(0)?;
         }
         let out = self.slab_union_base()?;
@@ -182,7 +210,7 @@ impl Gpu {
             &sv as *const _ as *mut c_void,
             &uniform as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(PLAN_SYMBOL, [1, 1, 1], [128, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(PLAN_SYMBOL, [1, 1, 1], [512, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(tp);
             b.push_ptr(codec_ptr);
@@ -214,7 +242,14 @@ impl Gpu {
     ) -> HipResult<()> {
         let arch = self.slab_require_arch("mq_i4_moe_gemv_slab")?;
         if lanes == 0 || lanes > SLAB_MAX_LANES {
-            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: lanes must be 1..=8"));
+            return Err(hip_bridge::HipError::new(0, "mq_i4_moe_gemv_slab: lanes must be 1..=32"));
+        }
+        let wide = self.qwen4_slab_wide_twin(lanes);
+        if lanes > SLAB_NARROW_MAX_LANES && !wide {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mq_i4_moe_gemv_slab: wide lanes require the K1 opt-in and shared architecture admission",
+            ));
         }
         let slots = SLAB_TOP_K * lanes;
         let (m, k, x_row_div, x_src_rows, y_stride) = if down {
@@ -253,7 +288,11 @@ impl Gpu {
             if !present {
                 continue;
             }
-            let func = MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize];
+            let func = if wide {
+                MQ_I4_MOE_GEMV_WIDE_SYMBOLS[usize::from(lanes > 16)][bucket][down as usize]
+            } else {
+                MQ_I4_MOE_GEMV_SYMBOLS[bucket][down as usize]
+            };
             self.ensure_embedded_kernel(MQ_I4_MOE_GEMV_MODULES[arch], MQ_I4_MOE_GEMV_IMAGES[arch], func)?;
             let ids = (union + bucket * s * 4) as *mut c_void;
             let offs = (union + (2 * s + bucket * (s + 1)) * 4) as *mut c_void;
@@ -277,7 +316,8 @@ impl Gpu {
                 &xs as *const _ as *mut c_void,
                 &ys as *const _ as *mut c_void,
             ];
-            self.launch_maybe_blob(func, [mv, uv, 1], [32, 1, 1], 0, &mut params, || {
+            let (grid_m, block) = if wide { (mv.div_ceil(8), 256) } else { (mv, 32) };
+            self.launch_maybe_blob(func, [grid_m, uv, 1], [block, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(wp);
                 b.push_ptr(ids);

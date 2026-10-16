@@ -8,7 +8,7 @@
 //! The layer's experts live in one slab arena and carry a codec each (MQ4
 //! symmetric or MQ3-I4). Two kernel families serve them:
 //!
-//! * `route_rows <= 8` (decode, MTP verify, a one-row forward): the K1 lane-union
+//! * `route_rows <= Gpu::few_row_limit()` (decode, MTP verify, a one-row forward): the K1 lane-union
 //!   GEMV over codec buckets ([`rdna_compute::slab_moe`]). The layer sits in the
 //!   path-1 stage shape (gate/up F32 rows, SwiGLU activation + 128-wide
 //!   rotation, unweighted F32 down rows, top-10 combine); only the two GEMVs
@@ -25,11 +25,12 @@
 use super::layer_ops::hip;
 use crate::families::moe::MoeDtypes;
 use crate::types::DispatchError;
-use rdna_compute::slab_moe::{SlabBuckets, SLAB_EXPERTS, SLAB_MAX_LANES};
+use rdna_compute::slab_moe::{SlabBuckets, SLAB_EXPERTS, SLAB_NARROW_MAX_LANES, SLAB_TOP_K};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Largest `route_rows` served by the K1 decode GEMV.
-pub const K1_MAX_ROWS: usize = SLAB_MAX_LANES;
+/// Lanes of one unchanged narrow K1 launch; wider admitted calls either select
+/// an opted-in C16/C32 twin or retain exact groups of this size.
+pub const K1_MAX_ROWS: usize = SLAB_NARROW_MAX_LANES;
 /// Bytes of the u8 codec table.
 pub const CODEC_U8_BYTES: usize = SLAB_EXPERTS;
 /// Bytes of the whole codec-tag allocation: u8 table, then i32 table.
@@ -73,9 +74,40 @@ pub(crate) fn codec_i32(tags: &GpuTensor) -> Result<GpuTensor, DispatchError> {
     })
 }
 
-/// K1 gate/up of `lanes` lanes: plans the lane union of `topk` and launches
-/// every non-empty bucket. `xr` `[lanes, 2560]` F32 rotated activations;
-/// `gate_out`/`up_out` `[lanes * 10, 640]` F32.
+/// One K1 launch group of a wide call: `n` lanes (`<= K1_MAX_ROWS`) starting at
+/// lane `first`.
+fn k1_groups(lanes: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..lanes)
+        .step_by(K1_MAX_ROWS)
+        .map(move |first| (first, K1_MAX_ROWS.min(lanes - first)))
+}
+
+fn k1_check_lanes(gpu: &Gpu, what: &str, lanes: usize) -> Result<(), DispatchError> {
+    let limit = gpu.few_row_limit();
+    if lanes == 0 || lanes > limit {
+        return Err(refuse(&format!("{what}: lanes must be 1..={limit}")));
+    }
+    Ok(())
+}
+
+/// The `[n * 10]` id view of lanes `first..first + n` of `topk` (slot = lane * 10
+/// + rank, i32 words).
+fn topk_group(topk: &GpuTensor, first: usize, n: usize) -> GpuTensor {
+    GpuTensor {
+        buf: topk.buf.byte_view(first * SLAB_TOP_K * 4, n * SLAB_TOP_K * 4),
+        shape: vec![n * SLAB_TOP_K],
+        dtype: topk.dtype,
+    }
+}
+
+/// K1 gate/up of `lanes` lanes (up to the shared per-architecture exact cap):
+/// union of `topk` and launches every non-empty bucket. `xr` `[lanes, 2560]`
+/// F32 rotated activations; `gate_out`/`up_out` `[lanes * 10, 640]` F32.
+///
+/// The K1 opt-in selects one C16/C32 union and launch for wider admitted calls.
+/// Otherwise consecutive <=8-lane groups retain S1's exact fallback, with a
+/// separate union plan immediately before each launch. The scratch then holds
+/// only the last group's plan on return (see [`k1_down`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_gate_up(
     gpu: &mut Gpu,
@@ -87,27 +119,89 @@ pub(crate) fn k1_gate_up(
     up_out: &GpuTensor,
     lanes: usize,
 ) -> Result<(), DispatchError> {
-    hip(gpu.qwen4_slab_union_plan(topk, buckets, lanes))?;
-    hip(gpu.mq_i4_moe_gemv_slab(false, buckets, gate_up_ptrs, xr, gate_out, Some(up_out), lanes))
+    k1_check_lanes(gpu, "k1_gate_up", lanes)?;
+    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes) {
+        hip(gpu.qwen4_slab_union_plan(topk, buckets, lanes))?;
+        return hip(gpu.mq_i4_moe_gemv_slab(
+            false,
+            buckets,
+            gate_up_ptrs,
+            xr,
+            gate_out,
+            Some(up_out),
+            lanes,
+        ));
+    }
+    const GATE_UP_K: usize = rdna_compute::slab_moe::SLAB_GATE_UP_K;
+    const GATE_UP_HALF: usize = rdna_compute::slab_moe::SLAB_GATE_UP_M / 2;
+    for (first, n) in k1_groups(lanes) {
+        let ids = topk_group(topk, first, n);
+        let slots = (first * SLAB_TOP_K, n * SLAB_TOP_K);
+        let x = xr.sub_offset(first * GATE_UP_K, n * GATE_UP_K);
+        let gate = gate_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
+        let up = up_out.sub_offset(slots.0 * GATE_UP_HALF, slots.1 * GATE_UP_HALF);
+        hip(gpu.qwen4_slab_union_plan(&ids, buckets, n))?;
+        hip(gpu.mq_i4_moe_gemv_slab(false, buckets, gate_up_ptrs, &x, &gate, Some(&up), n))?;
+    }
+    Ok(())
 }
 
-/// K1 down of `lanes` lanes over the union the same call's gate/up planned:
-/// `xrot` `[lanes * 10, 640]` F32, `y0` `[lanes * 10, 2560]` F32 unweighted.
+/// K1 down of `lanes` lanes (up to the shared per-architecture exact cap): `xrot`
+/// `[lanes * 10, 640]` F32, `y0` `[lanes * 10, 2560]` F32 unweighted.
+///
+/// Narrow and opted-in C16/C32 calls use the union gate/up planned.
+/// Otherwise a wider call runs 8-lane groups like [`k1_gate_up`]; the union
+/// scratch holds only the last gate/up group's plan (the SwiGLU stage sits
+/// between the two calls), so each group re-plans its own `topk` ids
+/// immediately before its launch, which makes every group's down read exactly
+/// the union its gate/up read.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn k1_down(
     gpu: &mut Gpu,
     buckets: SlabBuckets<'_>,
+    topk: &GpuTensor,
     down_ptrs: &GpuTensor,
     xrot: &GpuTensor,
     y0: &GpuTensor,
     lanes: usize,
 ) -> Result<(), DispatchError> {
-    hip(gpu.mq_i4_moe_gemv_slab(true, buckets, down_ptrs, xrot, y0, None, lanes))
+    k1_check_lanes(gpu, "k1_down", lanes)?;
+    if lanes <= K1_MAX_ROWS || gpu.qwen4_slab_wide_twin(lanes) {
+        return hip(gpu.mq_i4_moe_gemv_slab(true, buckets, down_ptrs, xrot, y0, None, lanes));
+    }
+    const DOWN_K: usize = rdna_compute::slab_moe::SLAB_DOWN_K;
+    const DOWN_M: usize = rdna_compute::slab_moe::SLAB_DOWN_M;
+    for (first, n) in k1_groups(lanes) {
+        let ids = topk_group(topk, first, n);
+        let (slot0, slots) = (first * SLAB_TOP_K, n * SLAB_TOP_K);
+        let x = xrot.sub_offset(slot0 * DOWN_K, slots * DOWN_K);
+        let y = y0.sub_offset(slot0 * DOWN_M, slots * DOWN_M);
+        hip(gpu.qwen4_slab_union_plan(&ids, buckets, n))?;
+        hip(gpu.mq_i4_moe_gemv_slab(true, buckets, down_ptrs, &x, &y, None, n))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::slab_moe_decode::{self as k1, BucketKey, Codec, Kind};
     use rdna_compute::slab_moe as gpu;
+    use super::{k1_groups, K1_MAX_ROWS};
+
+    #[test]
+    fn capacity_does_not_widen_narrow_fallback_groups() {
+        assert_eq!(gpu::SLAB_MAX_LANES, 32);
+        assert_eq!(K1_MAX_ROWS, 8);
+        for lanes in 1..=gpu::SLAB_MAX_LANES {
+            let mut next = 0;
+            for (first, n) in k1_groups(lanes) {
+                assert_eq!(first, next);
+                assert!((1..=8).contains(&n));
+                next += n;
+            }
+            assert_eq!(next, lanes);
+        }
+    }
 
     /// The launcher's constants are the certified K1 contract's: symbols in
     /// bucket order (W3 first), geometry, lanes, and the codec byte mapping.
@@ -120,6 +214,16 @@ mod tests {
                     gpu::MQ_I4_MOE_GEMV_SYMBOLS[bucket][down],
                     BucketKey::new(codec, kind).symbol()
                 );
+            }
+        }
+        for (cap_index, capacity) in [16, 32].into_iter().enumerate() {
+            for bucket in 0..2 {
+                for kind in 0..2 {
+                    assert_eq!(
+                        gpu::MQ_I4_MOE_GEMV_WIDE_SYMBOLS[cap_index][bucket][kind],
+                        format!("{}_c{capacity}", gpu::MQ_I4_MOE_GEMV_SYMBOLS[bucket][kind])
+                    );
+                }
             }
         }
         assert_eq!(gpu::SLAB_MAX_LANES, k1::MAX_LANES);

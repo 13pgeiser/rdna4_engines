@@ -637,10 +637,15 @@ impl Qwen4LaneExecutor<'_> {
     /// Per-request decode map-ahead for a Decoding lane, once, before its
     /// first draft/decode step: map the lane's QSA arenas (an MTP lane's head
     /// arenas too, unless retired) through `min(position +
-    /// remaining_new_tokens + k, admitted context)`, so `provision_step`
-    /// never remaps on the steady path. Best effort: a failure (or an
-    /// expert-parallel bundle, an unknown / non-Decoding lane, a zero budget)
-    /// is logged / skipped and `provision_step` grows on demand as before.
+    /// remaining_new_tokens + draft rows, admitted context)`, so
+    /// `provision_step` never remaps on the steady path. The draft rows are
+    /// those of the widest Verify window the plan validator admits
+    /// ([`LANE_MAX_ROWS`] rows), or the configured `k` if larger, not `k`
+    /// alone. Mapping only grows capacity (no position or length commits) and
+    /// `provision_step` still maps the actual step end on demand. Best effort:
+    /// a failure (or an expert-parallel bundle, an unknown / non-Decoding
+    /// lane, a zero budget) is logged / skipped and `provision_step` grows on
+    /// demand as before.
     pub fn map_ahead_decode(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, remaining_new_tokens: usize) {
         if refuse_expert_parallel(self.bundle).is_err() {
             return;
@@ -648,7 +653,9 @@ impl Qwen4LaneExecutor<'_> {
         let Some(store) = self.bundle.lanes.as_mut() else {
             return;
         };
-        let draft_rows = store.spec().map_or(0, |spec| spec.k);
+        let draft_rows = store.spec().map_or(0, |spec| {
+            crate::state::map_ahead_draft_rows(spec.k, LANE_MAX_ROWS)
+        });
         let Some(lane) = store
             .lane_mut(epoch)
             .filter(|lane| lane.host.status == LaneStatus::Decoding)

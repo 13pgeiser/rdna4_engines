@@ -1374,13 +1374,17 @@ pub struct HyperNextGates<'a> {
     pub quarters: &'a GpuTensor,
 }
 
-/// [`hyper_write`] of up to eight F32 token rows (`hidden == 2560`, four
-/// branches; rows = `input` elements / width) followed by [`hyper_norm`] of
-/// the written streams with `norm_weight` into `normalized`, one launch;
-/// bitwise the two launches. `quarters_in` (16 per row, from a previous
-/// call's `next`) replaces `p.gates` as the gate source; `next` also computes
-/// the next hyper write's gate quarters (its norm and k4 gate GEMV of these
-/// streams, bitwise); `clear` is zero-filled (a `zero_f32`).
+/// [`hyper_write`] of up to [`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]
+/// F32 token rows (`hidden == 2560`, four branches; rows = `input` elements /
+/// width) followed by [`hyper_norm`] of the written streams with
+/// `norm_weight` into `normalized`, one launch; bitwise the two launches.
+/// Block `(branch, row)` is the whole computation of its row (no state shared
+/// across `blockIdx.y`), so every row is bitwise the one-row launch whatever
+/// the row count and no row-group loop is needed. `quarters_in` (16 per row,
+/// from a previous call's `next`) replaces `p.gates` as the gate source;
+/// `next` also computes the next hyper write's gate quarters (its norm and k4
+/// gate GEMV of these streams, bitwise); `clear` is zero-filled (a
+/// `zero_f32`).
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
@@ -1401,7 +1405,7 @@ pub fn hyper_write_norm(
         || p.branches != 4
         || p.hidden != 2560
         || rows == 0
-        || rows > 8
+        || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
         || norm_weight.dtype != DType::BF16
         || p.input.numel() != rows * wide
         || p.output.numel() != rows * wide
@@ -4844,6 +4848,90 @@ pub fn indexed_attention_select_batch_pm_arm(
     indexed_attention_select_rows8(gpu, p, mirror, arm)
 }
 
+/// Whether an `rows`-row QSA call is an exact-wide verify call: more rows than
+/// the historic few-row limit, admitted by the shared [`Gpu::few_row_limit`]
+/// (eager verify only, `FEW_ROW_ROUTE_ROWS` while recording / capturing /
+/// outside verify) and not under the prefill invariant profile (whose
+/// `route_rows` is the canonical chunk, far above any limit). With the limit
+/// at 8 this is never true, so prefill and every non-verify route are
+/// unchanged.
+fn qsa_exact_wide_rows(gpu: &Gpu, rows: usize) -> bool {
+    let limit = gpu.few_row_limit();
+    rows > crate::prefill_invariant::FEW_ROW_ROUTE_ROWS && rows <= limit && gpu.route_rows(rows) <= limit
+}
+
+/// Score implementation of a QSA select call, for [`qsa_select_score_symbol`].
+#[derive(Clone, Copy)]
+enum QsaScoreArm {
+    PmBf16,
+    PmF32,
+    HipF32,
+    HipBf16,
+}
+
+/// `HIPFIRE_QWEN4_QSA_SCORE_ROWS32` (developer, default off, `1` on): score
+/// admitted exact-wide verify calls of 17..=32 rows ([`qsa_exact_wide_rows`])
+/// with ONE rows32 tile (`indexed_attention_select_scores_rows32_*`, one pooled
+/// read per 32 rows) instead of two rows16 tiles. Same score bits either way;
+/// a performance choice kept unmeasured and off until the rows32 tile is shown
+/// to beat two rows16 tiles at the claimed depths. Index width 4 x 128 only.
+/// Read once.
+static QWEN4_QSA_SCORE_ROWS32: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_ROWS32", false)
+});
+
+/// Whether a `rows`-row select call of `index_heads x index_dim` takes the
+/// rows32 score symbols: the flag, 17..=few_row_limit admitted rows (never
+/// prefill, recording or capture) and the only geometry the symbols implement.
+fn qsa_score_rows32(gpu: &Gpu, rows: usize, index_heads: usize, index_dim: usize) -> bool {
+    *QWEN4_QSA_SCORE_ROWS32
+        && rows > 16
+        && qsa_exact_wide_rows(gpu, rows)
+        && index_heads == 4
+        && index_dim == 128
+}
+
+/// Score kernel of a QSA select route: its rows per workgroup (the grid-y
+/// divisor, ALWAYS the symbol's own tile) and whether its pooled read is
+/// guarded by the tile's live block count (extent hooks).
+struct QsaScoreSymbol {
+    kernel: &'static str,
+    rows: usize,
+    /// The kernel returns a workgroup past `min(block_count, (position_start
+    /// + row0 + nrows) / compress)` and loads no pooled key past it; false:
+    /// every lane `< block_count` of the tile reads its key (old PM and hipcc
+    /// F32 rows8/16 read B blocks, even where no row sees them).
+    pooled_live_guarded: bool,
+}
+
+/// Score kernel and rows per score workgroup of a QSA select route.
+/// `many_rows` is `route_rows > 8`: the PM arms are rows16 for every admitted
+/// call, the hipcc arms rows16 above eight route rows else rows8. `rows32`
+/// ([`qsa_score_rows32`]) selects the rows32 twin of the arm (PM: reads B
+/// like rows16; hipcc: live-guarded).
+///
+/// Without rows32 every admitted call of 9..=32 rows is tiled by the rows16
+/// symbols (9..=16 rows one tile, 17..=32 rows two tiles). Both the live
+/// PM/F32 route and the gfx1201 BF16 split route
+/// ([`indexed_attention_select_bf16_split`]) take symbol and tile rows from
+/// this function and carry them into the grid, so symbol and divisor never
+/// diverge.
+fn qsa_select_score_symbol(arm: QsaScoreArm, many_rows: bool, rows32: bool) -> QsaScoreSymbol {
+    let (kernel, rows, pooled_live_guarded) = match (arm, rows32, many_rows) {
+        (QsaScoreArm::PmBf16, true, _) => ("indexed_attention_select_scores_rows32_bf16_pm_gfx1151", 32, false),
+        (QsaScoreArm::PmF32, true, _) => ("indexed_attention_select_scores_rows32_f32_pm_gfx1151", 32, false),
+        (QsaScoreArm::HipF32, true, _) => ("indexed_attention_select_scores_rows32_f32", 32, true),
+        (QsaScoreArm::HipBf16, true, _) => ("indexed_attention_select_scores_rows32_bf16", 32, true),
+        (QsaScoreArm::PmBf16, false, _) => ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16, false),
+        (QsaScoreArm::PmF32, false, _) => ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16, false),
+        (QsaScoreArm::HipF32, false, true) => ("indexed_attention_select_scores_rows16_f32", 16, false),
+        (QsaScoreArm::HipF32, false, false) => ("indexed_attention_select_scores_rows8_f32", 8, false),
+        (QsaScoreArm::HipBf16, false, true) => ("indexed_attention_select_scores_rows16_bf16", 16, true),
+        (QsaScoreArm::HipBf16, false, false) => ("indexed_attention_select_scores_rows8_bf16", 8, true),
+    };
+    QsaScoreSymbol { kernel, rows, pooled_live_guarded }
+}
+
 /// Live score/select route: F32 uses hipcc rows8/16 or PM rows16 scores.
 /// BF16 requires the PM rows16 score from `qsa_select_bf16_pm_gfx1151`;
 /// there is no hipcc BF16 rows score. Both dtypes select using hipcc or the
@@ -4880,8 +4968,9 @@ fn indexed_attention_select_rows8_core(
         qsa_filter_cfg_check(knobs)?;
     }
     let stride = p.block_count;
-    // PM scores sixteen rows for every admitted call. The hipcc fallback
-    // retains eight-row scoring for decode and few-row verify.
+    // PM scores sixteen rows per tile for every admitted call (thirty-two with
+    // `HIPFIRE_QWEN4_QSA_SCORE_ROWS32` on 17..=32 verify rows). The hipcc
+    // fallback retains eight-row scoring for decode and few-row verify.
     // A BF16 copy of an F32 pooled arena feeds the BF16 PM score when the call
     // would run the PM F32 score; it is never read otherwise.
     let bf16_copy = p.pooled_bf16.filter(|m| {
@@ -4892,15 +4981,19 @@ fn indexed_attention_select_rows8_core(
                 .checked_mul(p.index_dim)
                 .is_some_and(|elements| m.numel() >= elements)
     });
-    let (score_kernel, score_rows) = if p.pooled.dtype == DType::BF16 || bf16_copy.is_some() {
-        ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
-    } else if pm.score() {
-        ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
-    } else if gpu.route_rows(p.rows) > 8 {
-        ("indexed_attention_select_scores_rows16_f32", 16)
-    } else {
-        ("indexed_attention_select_scores_rows8_f32", 8)
-    };
+    let many_rows = gpu.route_rows(p.rows) > 8;
+    let score_sym = qsa_select_score_symbol(
+        if p.pooled.dtype == DType::BF16 || bf16_copy.is_some() {
+            QsaScoreArm::PmBf16
+        } else if pm.score() {
+            QsaScoreArm::PmF32
+        } else {
+            QsaScoreArm::HipF32
+        },
+        many_rows,
+        qsa_score_rows32(gpu, p.rows, p.index_heads, p.index_dim),
+    );
+    let (score_kernel, score_rows) = (score_sym.kernel, score_sym.rows);
     let select_kernel = if pm.select() {
         "indexed_attention_select_from_scores_pm_gfx1151"
     } else {
@@ -4980,7 +5073,7 @@ fn indexed_attention_select_rows8_core(
                     g0,
                     n,
                     bf16_copy.unwrap_or(p.pooled),
-                    false,
+                    score_sym.pooled_live_guarded,
                     scores,
                     "fp16_x_scratch",
                     p.block_count,
@@ -5007,7 +5100,7 @@ fn indexed_attention_select_rows8_core(
                     g0,
                     n,
                     bf16_copy.unwrap_or(p.pooled),
-                    false,
+                    score_sym.pooled_live_guarded,
                     scores,
                     "fp16_x_scratch",
                     p.block_count,
@@ -5362,11 +5455,12 @@ fn indexed_attention_select_bf16_split(
             base.add(layout.ctl_off) as *mut std::ffi::c_void,
         )
     };
-    let (score_kernel, score_rows) = if gpu.route_rows(p.rows) > 8 {
-        ("indexed_attention_select_scores_rows16_bf16", 16)
-    } else {
-        ("indexed_attention_select_scores_rows8_bf16", 8)
-    };
+    let score_sym = qsa_select_score_symbol(
+        QsaScoreArm::HipBf16,
+        gpu.route_rows(p.rows) > 8,
+        qsa_score_rows32(gpu, p.rows, p.index_heads, p.index_dim),
+    );
+    let (score_kernel, score_rows) = (score_sym.kernel, score_sym.rows);
     let select_kernel = "indexed_attention_select_from_scores";
     gpu.ensure_kernel_public("qsa_bf16_scores", crate::kernels::QSA_BF16_SCORES_SRC, score_kernel)?;
     if filter.is_some() {
@@ -5425,7 +5519,7 @@ fn indexed_attention_select_bf16_split(
                 g0,
                 n,
                 p.pooled,
-                true,
+                score_sym.pooled_live_guarded,
                 scores,
                 "qsa_select_scores",
                 bound,
@@ -5448,7 +5542,7 @@ fn indexed_attention_select_bf16_split(
                 g0,
                 n,
                 p.pooled,
-                true,
+                score_sym.pooled_live_guarded,
                 scores,
                 "qsa_select_scores",
                 bound,
@@ -5573,6 +5667,16 @@ const QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS: usize = 24576;
 const QSA_FILTER_MIN_BLOCKS_PM: usize = 49152;
 /// Calls of at most this many rows (decode, verify) use the few-row crossover.
 const QSA_FILTER_FEW_ROWS: usize = 16;
+/// `HIPFIRE_QWEN4_QSA_FILTER_FEW_ROWS32` (developer, default off, `1` on):
+/// candidate crossover admission. Exact-wide verify calls of 17..=32 rows
+/// ([`qsa_exact_wide_rows`]) use the few-row PM crossover
+/// ([`QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS`]) instead of the many-row one. Exact
+/// either way (every row selects over its own block count); a performance
+/// choice to keep unmeasured until the PM-select versus filter crossover at
+/// 16/32 rows is compared. Read once.
+static QWEN4_QSA_FILTER_FEW_ROWS32: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_FILTER_FEW_ROWS32", false)
+});
 /// `HIPFIRE_QWEN4_QSA_FILTER_SELECT` routes eager gfx11+ calls of more than
 /// [`qsa_filter_min_blocks`] blocks and at most
 /// [`QSA_SELECT_FROM_SCORES_MAX_BUDGET`] budget blocks through the filter
@@ -5619,12 +5723,19 @@ fn qsa_filter_cfg_check(k: QsaFilterCfg) -> HipResult<()> {
     Ok(())
 }
 
-fn qsa_filter_min_blocks(rows: usize, pm_select: bool) -> usize {
-    match (pm_select, rows <= QSA_FILTER_FEW_ROWS) {
+fn qsa_filter_min_blocks(few_rows: bool, pm_select: bool) -> usize {
+    match (pm_select, few_rows) {
         (false, _) => QSA_FILTER_MIN_BLOCKS,
         (true, true) => QSA_FILTER_MIN_BLOCKS_PM_FEW_ROWS,
         (true, false) => QSA_FILTER_MIN_BLOCKS_PM,
     }
+}
+
+/// Whether `rows` use the few-row crossover: at most [`QSA_FILTER_FEW_ROWS`]
+/// rows, or (candidate, default off) an exact-wide call under
+/// [`QWEN4_QSA_FILTER_FEW_ROWS32`].
+fn qsa_filter_few_rows(gpu: &Gpu, rows: usize) -> bool {
+    rows <= QSA_FILTER_FEW_ROWS || (*QWEN4_QSA_FILTER_FEW_ROWS32 && qsa_exact_wide_rows(gpu, rows))
 }
 
 /// Production admission of the filter route for a call the score/select
@@ -5640,7 +5751,7 @@ fn qsa_filter_production(
         && gpu.arch_caps.has_gfx11_plus_simt()
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
-        && p.block_count > qsa_filter_min_blocks(p.rows, pm.select())
+        && p.block_count > qsa_filter_min_blocks(qsa_filter_few_rows(gpu, p.rows), pm.select())
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
         && qsa_filter_score_group(p.block_count).is_some())
         .then_some(QSA_FILTER_PRODUCTION)
@@ -7260,7 +7371,14 @@ fn indexed_attention_attention_batch_arena(
     .checked_add(p.compress - 1)
     .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
     let max_selected = end_position.min(p.capacity).min(selected_bound);
-    if allow_fast && qsa_dense_wmma_applies(gpu, p, end_position) {
+    // Admitted decode (1..=few_row_limit rows: AR, MTP, exact-wide verify) takes
+    // ONE implementation, chosen by `qsa_decode_attention_policy` from the
+    // architecture, flag, format, shape, context and launch mode and never
+    // from the row count: split-K or the per-head kernels, never hg4 / hg12 /
+    // dense or gathered WMMA. Only calls past the limit are row-routed.
+    let policy = qsa_decode_attention_policy(gpu, p);
+    let decode = policy.is_some();
+    if allow_fast && !decode && qsa_dense_wmma_applies(gpu, p, end_position) {
         return qsa_dense_wmma(gpu, p, end_position);
     }
     // Shape bound, not active length: the LDS reservation and symbol are what
@@ -7277,18 +7395,12 @@ fn indexed_attention_attention_batch_arena(
         ));
     }
     // Split-K decode, default on (exact gfx1151; HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0
-    // kill switch): eager gfx1151 F32 hd256 launches of 1..8 rows only;
-    // KLD-gated, not bit-exact.
-    if qsa_decode_splitk_applies(gpu, p, allow_fast, max_selected) {
-        return qsa_decode_splitk_launch(
-            gpu,
-            p,
-            max_selected,
-            QSA_DECODE_SPLITK_SPLITS,
-            QSA_DECODE_SPLITK_SCORING_LAYOUT,
-        );
+    // kill switch): eager gfx1151 F32 hd256 admitted decode calls; KLD-gated,
+    // not bit-exact. The reference entry (`allow_fast = false`) stays per-head.
+    if let (true, Some(QsaDecodeAttentionPolicy::SplitK { splits, layout })) = (allow_fast, policy) {
+        return qsa_decode_splitk_launch(gpu, p, max_selected, splits, layout);
     }
-    if allow_fast && qsa_gathered_wmma_applies(gpu, p) {
+    if allow_fast && !decode && qsa_gathered_wmma_applies(gpu, p) {
         return qsa_gathered_wmma(gpu, p, end_position, max_selected, arena);
     }
     // Live (unrecorded) launches reserve LDS for this chunk's longest row
@@ -7309,13 +7421,14 @@ fn indexed_attention_attention_batch_arena(
     let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
     let hg12 = allow_fast
+        && !decode
         && p.format == QsaKvFormat::F32
         && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && p.head_dim == 256
         && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
         && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
         && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
-    let hg4_bytes = (allow_fast && !hg12)
+    let hg4_bytes = (allow_fast && !decode && !hg12)
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
         .flatten();
     let (kernel_name, grid, shared_mem) = if hg12 {
@@ -7463,9 +7576,12 @@ pub const QSA_DECODE_SPLITK_SPLITS: usize = 32;
 /// through the direct test entry. Chosen from the same R9700 sweep as
 /// `QSA_DECODE_SPLITK_SPLITS`, pending Strix Halo KLD and performance.
 pub const QSA_DECODE_SPLITK_SCORING_LAYOUT: usize = 2;
-/// Rows and splits the fixed workspace bound covers (`MAX_SPLITS` is the
-/// tuning ceiling; the workspace is always reserved at this bound).
-const QSA_DECODE_SPLITK_MAX_ROWS: usize = 8;
+/// Rows and splits the fixed workspace reserve covers (`MAX_SPLITS` is the
+/// tuning ceiling; the workspace is reserved at this bound, and a launch maps
+/// only the bytes it touches). `MAX_ROWS` is the widest exact verify block
+/// (`WIDE_VERIFY_MAX_ROWS`); admission is `few_row_limit` alone (it never
+/// exceeds this bound, and a larger launch would only raise the mapped bytes).
+const QSA_DECODE_SPLITK_RESERVE_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 const QSA_DECODE_SPLITK_MAX_SPLITS: usize = 48;
 /// Highest scoring layout the partial kernel implements: 0 = one thread per
 /// token, 1 = eight wave32 token groups per head, 2 = KV-group layout (one
@@ -7512,50 +7628,140 @@ fn qsa_decode_splitk_lds_bytes(
         .then_some(bytes as u32)
 }
 
-/// Whether `scoring_layout` fits `p`: layout 2 scores whole KV groups of
+/// Whether `scoring_layout` fits the shape: layout 2 scores whole KV groups of
 /// `QSA_ATTENTION_HG12_HEADS` query heads at head_dim 256; layouts 0 and 1 take
 /// any grouping.
-fn qsa_decode_splitk_layout_fits(p: &IndexedAttentionAttentionBatch<'_>, scoring_layout: usize) -> bool {
+fn qsa_decode_splitk_layout_fits(
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    scoring_layout: usize,
+) -> bool {
     scoring_layout <= QSA_DECODE_SPLITK_MAX_LAYOUT
         && (scoring_layout < 2
-            || (p.head_dim == 256
-                && p.n_kv_heads.checked_mul(QSA_ATTENTION_HG12_HEADS) == Some(p.n_heads)))
+            || (head_dim == 256 && n_kv_heads.checked_mul(QSA_ATTENTION_HG12_HEADS) == Some(n_heads)))
 }
 
-/// Whether the opt-in split-K decode route takes this launch: the flag
-/// (exact gfx1151), the fast routes allowed, F32 K/V, head_dim 256, 1..8
-/// route rows and actual rows, no recorder or capture, and a slice that fits
-/// the LDS. Everything else keeps the ordinary routes.
-fn qsa_decode_splitk_applies(
+/// Whether an `rows`-row QSA attention call is an admitted decode call: `1..=`
+/// the shared [`Gpu::few_row_limit`] (8, or the exact-wide verify rows, eager
+/// only), both as launched and as routed (`route_rows`; the prefill invariant
+/// profile routes at the canonical chunk, far above any limit). This is the
+/// ONLY row-count term of [`qsa_decode_attention_policy`].
+fn qsa_decode_rows_admitted(gpu: &Gpu, rows: usize) -> bool {
+    let limit = gpu.few_row_limit();
+    (1..=limit).contains(&rows) && gpu.route_rows(rows) <= limit
+}
+
+/// Attention implementation of an admitted QSA decode call (1..=`few_row_limit`
+/// rows): the SAME choice for every row count, so n rows reproduce n one-row
+/// decodes of the same architecture, format, flags and launch mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QsaDecodeAttentionPolicy {
+    /// `qsa_decode_splitk_{partial,combine}_f32`; every row partitions its own
+    /// selected length `ell_r` into `splits` slices.
+    SplitK { splits: usize, layout: usize },
+    /// The one-row per-head kernels (`indexed_attention_attention_*_batched`
+    /// / `_serial`), grid z = rows. Never hg4, hg12 or WMMA.
+    PerHead,
+}
+
+/// The policy proper. Inputs only: the architecture and flag (gfx1151 +
+/// `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`), K/V format, head_dim, head grouping, the
+/// context-derived `max_selected` (LDS fit of the slice) and the launch mode
+/// (`eager`: no recorder or capture armed; split-K bakes its grid, LDS and
+/// position into the launch and is eager only). No row count.
+fn qsa_decode_attention_policy_for(
     gpu: &Gpu,
-    p: &IndexedAttentionAttentionBatch<'_>,
-    allow_fast: bool,
+    format: QsaKvFormat,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
     max_selected: usize,
-) -> bool {
-    allow_fast
+    eager: bool,
+) -> QsaDecodeAttentionPolicy {
+    let split_k = eager
         && gpu.flags.qwen4_qsa_decode_splitk_enabled()
-        && p.format == QsaKvFormat::F32
         && gpu.arch_caps.is_gfx1151()
-        && p.head_dim == 256
-        && (1..=QSA_DECODE_SPLITK_MAX_ROWS).contains(&gpu.route_rows(p.rows))
-        && p.rows <= QSA_DECODE_SPLITK_MAX_ROWS
-        && qsa_decode_splitk_eager(gpu)
-        && qsa_decode_splitk_layout_fits(p, QSA_DECODE_SPLITK_SCORING_LAYOUT)
+        && format == QsaKvFormat::F32
+        && head_dim == 256
+        && qsa_decode_splitk_layout_fits(head_dim, n_heads, n_kv_heads, QSA_DECODE_SPLITK_SCORING_LAYOUT)
         && qsa_decode_splitk_lds_bytes(
             max_selected,
             QSA_DECODE_SPLITK_SPLITS,
             QSA_DECODE_SPLITK_SCORING_LAYOUT,
         )
-        .is_some()
+        .is_some();
+    if split_k {
+        QsaDecodeAttentionPolicy::SplitK {
+            splits: QSA_DECODE_SPLITK_SPLITS,
+            layout: QSA_DECODE_SPLITK_SCORING_LAYOUT,
+        }
+    } else {
+        QsaDecodeAttentionPolicy::PerHead
+    }
+}
+
+/// Longest selected list of `p`'s chunk (saturating twin of the checked value
+/// the production entry validates before it asks for the policy).
+fn qsa_attention_max_selected(p: &IndexedAttentionAttentionBatch<'_>) -> usize {
+    let bound = p
+        .budget_blocks
+        .saturating_mul(p.compress)
+        .saturating_add(p.compress.saturating_sub(1));
+    p.position_start.saturating_add(p.rows).min(p.capacity).min(bound)
+}
+
+/// Attention policy of `p` under the current launch mode: `Some` for an
+/// admitted decode call (`1..=few_row_limit` rows; see
+/// [`qsa_decode_rows_admitted`]), which MUST take exactly the returned
+/// implementation - no hg4 / hg12 / dense or gathered WMMA, whatever the row
+/// count - so the verify block is the n-fold one-row decode. `None`: not a
+/// decode call (more rows than the limit, prefill profile); the row-routed
+/// prefill and few-row selection applies.
+fn qsa_decode_attention_policy(
+    gpu: &Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+) -> Option<QsaDecodeAttentionPolicy> {
+    qsa_decode_rows_admitted(gpu, p.rows).then(|| {
+        qsa_decode_attention_policy_for(
+            gpu,
+            p.format,
+            p.head_dim,
+            p.n_heads,
+            p.n_kv_heads,
+            qsa_attention_max_selected(p),
+            qsa_decode_splitk_eager(gpu),
+        )
+    })
+}
+
+/// Whether the eager decode policy differs from the recorded / captured one
+/// for this shape on `gpu` (all else equal, fast routes allowed, rows
+/// irrelevant). True means AR decode in a replay or graph and eager verify
+/// are different attention arithmetic. Reads the flags and architecture only,
+/// not the Gpu's current launch mode.
+pub fn qsa_decode_attention_eager_differs_from_recorded(
+    gpu: &Gpu,
+    format: QsaKvFormat,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_selected: usize,
+) -> bool {
+    qsa_decode_attention_policy_for(gpu, format, head_dim, n_heads, n_kv_heads, max_selected, true)
+        != qsa_decode_attention_policy_for(gpu, format, head_dim, n_heads, n_kv_heads, max_selected, false)
 }
 
 /// The split-K partial + combine launches. `p` is already shape-validated
 /// (the production arena checks or `qsa_decode_splitk_validate`);
 /// `max_selected` is the chunk's longest selected list. The F32 partials live
 /// in the QSA per-launch scratch ([`Gpu::qsa_gather_scratch`], not the F16
-/// arena), reserved once at the fixed bound of `QSA_DECODE_SPLITK_MAX_ROWS`
+/// arena), reserved once at the fixed bound of `QSA_DECODE_SPLITK_RESERVE_ROWS`
 /// rows x `QSA_DECODE_SPLITK_MAX_SPLITS` splits and kept if a larger buffer
-/// is already held; both kernels run on the same stream back to back.
+/// is already held; only the launch's actual `rows x heads x splits` records
+/// are mapped. Every row partitions its own selected length (the kernels
+/// derive `ell_r` from `position_start + row`); both kernels run on the same
+/// stream back to back.
 fn qsa_decode_splitk_launch(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
@@ -7565,9 +7771,9 @@ fn qsa_decode_splitk_launch(
 ) -> HipResult<()> {
     if splits == 0
         || splits > QSA_DECODE_SPLITK_MAX_SPLITS
-        || !qsa_decode_splitk_layout_fits(p, scoring_layout)
+        || !qsa_decode_splitk_layout_fits(p.head_dim, p.n_heads, p.n_kv_heads, scoring_layout)
         || p.rows == 0
-        || p.rows > QSA_DECODE_SPLITK_MAX_ROWS
+        || p.rows > gpu.few_row_limit()
         || p.head_dim != 256
         || p.format != QsaKvFormat::F32
     {
@@ -7601,14 +7807,19 @@ fn qsa_decode_splitk_launch(
     let combine_head_grid = checked_u32(p.n_heads, "QSA split-K combine head grid")?;
     let split_grid = checked_u32(splits, "QSA split-K split grid")?;
     let row_grid = checked_u32(p.rows, "QSA split-K row grid")?;
-    // Fixed bound: max rows x n_heads x max splits records of (head_dim + 2)
-    // F32 (m, l, acc[head_dim]).
-    let workspace_bytes = QSA_DECODE_SPLITK_MAX_ROWS
-        .checked_mul(p.n_heads)
-        .and_then(|value| value.checked_mul(QSA_DECODE_SPLITK_MAX_SPLITS))
-        .and_then(|value| value.checked_mul(p.head_dim + 2))
-        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| HipError::new(0, "QSA split-K workspace size overflows"))?;
+    // Actual demand: rows x n_heads x splits records of (head_dim + 2) F32
+    // (m, l, acc[head_dim]); the reservation is the fixed max-rows x
+    // max-splits bound, so one slot serves every admitted row count and a
+    // wider launch never moves it.
+    let record_bytes = |rows: usize, splits: usize| {
+        rows.checked_mul(p.n_heads)
+            .and_then(|value| value.checked_mul(splits))
+            .and_then(|value| value.checked_mul(p.head_dim + 2))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| HipError::new(0, "QSA split-K workspace size overflows"))
+    };
+    let workspace_bytes = record_bytes(p.rows, splits)?;
+    let reserve_bytes = record_bytes(QSA_DECODE_SPLITK_RESERVE_ROWS, QSA_DECODE_SPLITK_MAX_SPLITS)?;
     for kernel in [QSA_DECODE_SPLITK_PARTIAL, QSA_DECODE_SPLITK_COMBINE] {
         gpu.ensure_kernel_public(
             QSA_DECODE_SPLITK_MODULE,
@@ -7616,7 +7827,7 @@ fn qsa_decode_splitk_launch(
             kernel,
         )?;
     }
-    let workspace = gpu.qsa_gather_scratch(workspace_bytes, workspace_bytes)?;
+    let workspace = gpu.qsa_gather_scratch(workspace_bytes, reserve_bytes)?;
     let mut partial = KernargBlob::new();
     for ptr in [
         p.q_with_gate.buf.as_ptr(),
@@ -7713,7 +7924,7 @@ fn qsa_decode_splitk_launch(
 /// Every shape, type and scalar check of the direct split-K entry; returns
 /// the chunk's longest selected length. Stricter than the production route's
 /// inline checks: all tensors' dtypes and byte extents, the full cache
-/// capacities and lengths, the 1..8 row and 1..48 split limits, layouts 0..2
+/// capacities and lengths, the 1..=few_row_limit (<= 32) row and 1..48 split limits, layouts 0..2
 /// (layout 2 needs `n_heads == 12 * n_kv_heads`), a gfx11/gfx12
 /// wave32 device, and no recorder or capture.
 #[cfg(any(test, feature = "lab"))]
@@ -7732,9 +7943,9 @@ fn qsa_decode_splitk_validate(
     }
     if splits == 0
         || splits > QSA_DECODE_SPLITK_MAX_SPLITS
-        || !qsa_decode_splitk_layout_fits(p, scoring_layout)
+        || !qsa_decode_splitk_layout_fits(p.head_dim, p.n_heads, p.n_kv_heads, scoring_layout)
         || p.rows == 0
-        || p.rows > QSA_DECODE_SPLITK_MAX_ROWS
+        || p.rows > gpu.few_row_limit()
         || p.format != QsaKvFormat::F32
         || p.head_dim != 256
     {
@@ -7806,7 +8017,7 @@ fn qsa_decode_splitk_validate(
 /// Direct test route to the split-K partial + combine kernels with an explicit
 /// `splits` (1..=48) and `scoring_layout` (0, 1, or the KV-group layout 2), bypassing the knob and the
 /// route predicates: the full validation of [`qsa_decode_splitk_validate`], then
-/// the production launch pair. F32 K/V, head_dim 256, 1..8 rows, eager only;
+/// the production launch pair. F32 K/V, head_dim 256, 1..=few_row_limit (<= 32) rows, eager only;
 /// gfx11/gfx12 wave32. Gated behind `lab` (or test) like
 /// [`indexed_attention_attention_batch_exact`].
 #[cfg(any(test, feature = "lab"))]
@@ -9549,15 +9760,19 @@ mod tests {
     }
 
     /// The few-row BF16 K4 GEMV (Qwen4 HC write gates and read down in a
-    /// 2..=8-row MTP verify) must give every row bitwise the single-row decode
+    /// 2..=32-row verify) must give every row bitwise the single-row decode
     /// kernel's value, with and without the HC activation epilogue: greedy
-    /// MTP == AR rests on a verify row reproducing its decode row.
+    /// MTP == AR rests on a verify row reproducing its decode row. The verify
+    /// gate is opened to 32 rows, so with `HIPFIRE_QWEN4_WIDE_TWIN_BF16=1`
+    /// rows 9..=32 run the `gemv_bf16_xf32_k4_rows_wide_r{16,32}` twins; the
+    /// full row/guard/graph matrix is `examples/bf16_rows_oracle.rs`.
     #[test]
     fn gemv_bf16_k4_rows_are_bit_identical_to_single_row() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
         };
+        gpu.set_wide_verify_rows(32);
         let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
             (0..n)
                 .map(|i| {
@@ -9582,10 +9797,10 @@ mod tests {
             let mut weight = gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight");
             weight.dtype = DType::BF16;
             weight.shape = vec![m * k];
-            let x = gpu.upload_f32(&wave(2, 8 * k, 1.5), &[8 * k]).expect("x");
+            let x = gpu.upload_f32(&wave(2, 32 * k, 1.5), &[32 * k]).expect("x");
             for act in [None, Some(0.25f32)] {
-                let single = gpu.zeros(&[8 * m], DType::F32).expect("single");
-                for row in 0..8 {
+                let single = gpu.zeros(&[32 * m], DType::F32).expect("single");
+                for row in 0..32 {
                     gpu.gemv_bf16_xf32_k4(
                         &weight,
                         &x.sub_offset(row * k, k),
@@ -9598,7 +9813,7 @@ mod tests {
                 }
                 let expected = bits(&gpu, &single);
                 assert!(expected.iter().any(|v| *v != 0), "single-row output is all zero");
-                for rows in 2..=8usize {
+                for rows in 2..=32usize {
                     let multi = gpu.zeros(&[rows * m], DType::F32).expect("multi");
                     gpu.gemv_bf16_xf32_k4_rows(&weight, &x, &multi, m, k, act, rows)
                         .expect("k4 rows");
@@ -10071,7 +10286,7 @@ mod tests {
     }
 
     /// Verify capture and rollback on a Q8 state are token-exact: from a
-    /// nonzero seed state at a nonzero absolute position, a 2..8-row captured
+    /// nonzero seed state at a nonzero absolute position, a 2..32-row captured
     /// window's recurrence output and its ring slot, and every kept prefix's
     /// rollback state and output, equal repeated single-row decode (AR) at
     /// the same positions bit for bit; the live state and the rollback's
@@ -10083,7 +10298,8 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 8usize);
+        // 32 = WIDE_VERIFY_MAX_ROWS: the wide verify window serves up to 32 rows.
+        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 32usize);
         // Nonzero: every Q8 rounding is seeded by the absolute position.
         let start = 1157usize;
         let qk = key_heads * dim;
@@ -14548,7 +14764,8 @@ mod tests {
 
     /// Exact-gfx1151 decode/verify coverage of the F32 builder pair. `Both`
     /// (PM rows16 score + PM select) must reproduce the hipcc pair's selected
-    /// indices, tails, `-1` fill and mirror bytes for 1..=8 rows over block
+    /// indices, tails, `-1` fill and mirror bytes for 1..=32 rows (and every row of
+    /// a batch must equal the one-row call at its own position, bitwise) over block
     /// counts spanning the empty route, partial and full 256-block score
     /// tiles, the 511/512/513 boundary around the 512 budget blocks, and the
     /// 2047/8192 contexts. Geometry is the real Qwen4 decode call of
@@ -14559,7 +14776,7 @@ mod tests {
     /// empty route (fused) under both arms.
     #[test]
     #[ignore = "needs an exact gfx1151 GPU: cargo test -p rdna-compute --lib --features lab qsa_f32_decode_pm_both_matches_hipcc -- --ignored --nocapture"]
-    fn qsa_f32_decode_pm_both_matches_hipcc_for_one_to_eight_rows() {
+    fn qsa_f32_decode_pm_both_matches_hipcc_for_one_to_thirty_two_rows() {
         const HEADS: usize = 4;
         const DIM: usize = 128;
         const BUDGET: usize = 2048;
@@ -14567,7 +14784,7 @@ mod tests {
         const BUDGET_BLOCKS: usize = BUDGET / COMPRESS;
         const CAPACITY: usize = BUDGET + COMPRESS - 1;
         const STRIDE: usize = HEADS * DIM;
-        const MAX_ROWS: usize = 8;
+        const MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
         const MAX_BLOCKS: usize = 8192;
         const POISON: u8 = 0xa5;
         const CANARY: usize = 4096;
@@ -14608,6 +14825,13 @@ mod tests {
             }
         }
         let query_t = gpu.upload_f32(&query, &[query.len()]).expect("query upload");
+        // Row r of the batch as its own tensor: the one-row call at position_start + r.
+        let row_q: Vec<GpuTensor> = (0..MAX_ROWS)
+            .map(|r| {
+                gpu.upload_f32(&query[r * STRIDE..(r + 1) * STRIDE], &[STRIDE])
+                    .expect("row query upload")
+            })
+            .collect();
         let pooled = gpu.upload_f32(&keys, &[keys.len()]).expect("pooled upload");
         let selected_len = MAX_ROWS * CAPACITY * 4 + CANARY;
         let mirror_len = CAPACITY * 4 + CANARY;
@@ -14625,6 +14849,9 @@ mod tests {
             arm: QsaSelectPmArm,
             with_mirror: bool,
         ) -> (bool, Vec<u8>, Vec<u8>) {
+            // A verify forward of two or more rows runs row-exact to the widest
+            // rows; a one-row call is the decode itself.
+            gpu.set_wide_verify_rows(if p.rows >= 2 { MAX_ROWS } else { 0 });
             for t in [p.selected, mirror] {
                 gpu.hip
                     .memset(&t.buf, POISON as i32, t.byte_size())
@@ -14639,11 +14866,13 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("{arm:?} rows={} blocks={} ps={}: {e}", p.rows, p.block_count, p.position_start)
             });
-            (
+            let out = (
                 persisted,
                 gpu.download_raw_bytes(p.selected).expect("selected download"),
                 gpu.download_raw_bytes(mirror).expect("mirror download"),
-            )
+            );
+            gpu.set_wide_verify_rows(0);
+            out
         }
 
         let mut cases = 0usize;
@@ -14708,6 +14937,43 @@ mod tests {
                     assert!(got_selected == ref_selected, "Both selection differs from hipcc: {ctx}");
                     assert!(got_mirror == ref_mirror, "Both mirror differs from hipcc: {ctx}");
 
+                    // Wide verify: row r of the batch is bitwise the one-row call of
+                    // the same arm at `position_start + r` (its own block count).
+                    if blocks > 0 {
+                        for (arm, batch_selected, batch_mirror) in [
+                            (QsaSelectPmArm::Hipcc, &ref_selected, &ref_mirror),
+                            (QsaSelectPmArm::Both, &got_selected, &got_mirror),
+                        ] {
+                            for r in 0..rows {
+                                let p1 = IndexedAttentionSelectBatch {
+                                    query: &row_q[r],
+                                    rows: 1,
+                                    block_count: (position_start + r + 1) / COMPRESS,
+                                    position_start: position_start + r,
+                                    ..p
+                                };
+                                let (one_persisted, one_selected, one_mirror) =
+                                    run(&mut gpu, &p1, &mirror, arm, true);
+                                assert!(one_persisted, "{arm:?} one-row call {r} did not persist: {ctx}");
+                                assert!(
+                                    one_selected[..CAPACITY * 4]
+                                        == batch_selected[r * CAPACITY * 4..(r + 1) * CAPACITY * 4],
+                                    "{arm:?} row {r} differs from its one-row call: {ctx}"
+                                );
+                                assert!(
+                                    one_selected[CAPACITY * 4..].iter().all(|b| *b == POISON),
+                                    "{arm:?} one-row call {r} wrote past its row: {ctx}"
+                                );
+                                if r + 1 == rows {
+                                    assert!(
+                                        one_mirror[..CAPACITY * 4] == batch_mirror[..CAPACITY * 4],
+                                        "{arm:?} batch mirror differs from the last one-row call: {ctx}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // No mirror given: same selection, nothing persisted, the
                     // mirror buffer is untouched (every byte still the sentinel).
                     for arm in [QsaSelectPmArm::Hipcc, QsaSelectPmArm::Both] {
@@ -14724,7 +14990,7 @@ mod tests {
             }
         }
         eprintln!("qsa_f32_decode_pm_both: {cases} cases identical");
-        for t in [query_t, pooled, selected, mirror] {
+        for t in [query_t, pooled, selected, mirror].into_iter().chain(row_q) {
             gpu.free_tensor(t).expect("free");
         }
     }
@@ -14753,6 +15019,507 @@ mod tests {
         assert!(!plain.persisted);
         assert!(plain.selected == reference.selected, "default BF16 selection without a mirror differs");
         case.free(&mut gpu);
+    }
+
+    /// Wide-verify oracle of the gfx1151 BF16 PM arms and the default mirrored
+    /// route: for n = 1..=32 rows at end positions straddling the compress-4
+    /// boundaries (E = 8000/4000/1030 minus 0..3), each arm's batched call
+    /// equals the fused hipcc arm and, row by row, the one-row call of the same
+    /// arm at `position_start + r` (selection row bytes, final mirror). The wide
+    /// gate is set through `Gpu::set_wide_verify_rows` (32 for n >= 2, else 0).
+    #[test]
+    #[ignore = "needs an exact gfx1151 GPU: cargo test -p rdna-compute --lib --features lab qsa_bf16_pm_wide_rows -- --ignored --nocapture"]
+    fn qsa_bf16_pm_wide_rows_match_one_row_calls() {
+        const WIDE: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        const CAP: usize = BF16_PM_CAPACITY;
+        #[derive(Clone, Copy, Debug)]
+        enum Arm {
+            Pm(QsaSelectPmArm),
+            Default,
+        }
+        fn run(
+            gpu: &mut Gpu,
+            p: &IndexedAttentionSelectBatch<'_>,
+            mirror: &GpuTensor,
+            arm: Arm,
+        ) -> (bool, Vec<u8>, Vec<u8>) {
+            for t in [p.selected, mirror] {
+                gpu.hip
+                    .memset(&t.buf, BF16_PM_POISON as i32, t.byte_size())
+                    .expect("poison outputs");
+            }
+            gpu.set_wide_verify_rows(if p.rows >= 2 { WIDE } else { 0 });
+            let persisted = match arm {
+                Arm::Pm(a) => indexed_attention_select_batch_pm_arm(gpu, p, Some(mirror), a),
+                Arm::Default => indexed_attention_select_batch_mirrored(gpu, p, mirror),
+            }
+            .unwrap_or_else(|e| {
+                panic!("BF16 {arm:?} rows={} blocks={} ps={}: {e}", p.rows, p.block_count, p.position_start)
+            });
+            gpu.set_wide_verify_rows(0);
+            (
+                persisted,
+                gpu.download_raw_bytes(p.selected).expect("selected download"),
+                gpu.download_raw_bytes(mirror).expect("mirror download"),
+            )
+        }
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let case = Bf16PmSelect::new(&mut gpu);
+        let host_query = gpu.download_f32(&case.query).expect("query download");
+        let row_q: Vec<GpuTensor> = (0..WIDE)
+            .map(|r| {
+                gpu.upload_f32(
+                    &host_query[r * BF16_PM_QUERY_STRIDE..(r + 1) * BF16_PM_QUERY_STRIDE],
+                    &[BF16_PM_QUERY_STRIDE],
+                )
+                .expect("row query upload")
+            })
+            .collect();
+        let one_selected_len = CAP * 4 + BF16_PM_CANARY;
+        let selected1 = gpu
+            .upload_raw(&vec![BF16_PM_POISON; one_selected_len], &[one_selected_len])
+            .expect("one-row selected upload");
+        let mirror1 = gpu
+            .upload_raw(&vec![BF16_PM_POISON; one_selected_len], &[one_selected_len])
+            .expect("one-row mirror upload");
+        let arms = [
+            Arm::Pm(QsaSelectPmArm::Hipcc),
+            Arm::Pm(QsaSelectPmArm::ScoreOnly),
+            Arm::Pm(QsaSelectPmArm::Both),
+            Arm::Default,
+        ];
+        let mut cases = 0usize;
+        for base in [8000usize, 4000, 1030] {
+            for disp in 0..BF16_PM_COMPRESS {
+                let end = base - disp;
+                for n in 1..=WIDE {
+                    let ps = end - n;
+                    let p = IndexedAttentionSelectBatch {
+                        pooled_bf16: None,
+                        pooled_bf16_valid_blocks: 0,
+                        query: &case.query,
+                        pooled: &case.pooled,
+                        selected: &case.selected,
+                        rows: n,
+                        query_row_stride: BF16_PM_QUERY_STRIDE,
+                        block_count: end / BF16_PM_COMPRESS,
+                        index_heads: BF16_PM_HEADS,
+                        index_dim: BF16_PM_DIM,
+                        budget_blocks: BF16_PM_BUDGET,
+                        compress: BF16_PM_COMPRESS,
+                        position_start: ps,
+                        capacity: CAP,
+                        shape_blocks: BF16_PM_BLOCKS,
+                    };
+                    let reference = run(&mut gpu, &p, &case.mirror, Arm::Pm(QsaSelectPmArm::Hipcc));
+                    assert!(reference.0, "fused BF16 arm did not persist: E={end} n={n}");
+                    for arm in arms {
+                        let ctx = format!("{arm:?} E={end} n={n}");
+                        let got = run(&mut gpu, &p, &case.mirror, arm);
+                        assert!(got.0, "{ctx}: mirror not persisted");
+                        assert!(got.1 == reference.1, "{ctx}: selection differs from the fused BF16 arm");
+                        assert!(got.2 == reference.2, "{ctx}: mirror differs from the fused BF16 arm");
+                        for r in 0..n {
+                            let p1 = IndexedAttentionSelectBatch {
+                                query: &row_q[r],
+                                selected: &selected1,
+                                rows: 1,
+                                block_count: (ps + r + 1) / BF16_PM_COMPRESS,
+                                position_start: ps + r,
+                                ..p
+                            };
+                            let one = run(&mut gpu, &p1, &mirror1, arm);
+                            assert!(one.0, "{ctx}: one-row call {r} did not persist");
+                            assert!(
+                                one.1[..CAP * 4] == got.1[r * CAP * 4..(r + 1) * CAP * 4],
+                                "{ctx}: row {r} differs from its one-row call"
+                            );
+                            assert!(
+                                one.1[CAP * 4..].iter().all(|b| *b == BF16_PM_POISON),
+                                "{ctx}: one-row call {r} wrote past its row"
+                            );
+                            if r + 1 == n {
+                                assert!(
+                                    one.2[..CAP * 4] == got.2[..CAP * 4],
+                                    "{ctx}: batch mirror differs from the last one-row call"
+                                );
+                            }
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("qsa_bf16_pm_wide_rows: {cases} cases identical");
+        for t in row_q.into_iter().chain([selected1, mirror1]) {
+            gpu.free_tensor(t).expect("free");
+        }
+        case.free(&mut gpu);
+    }
+
+    fn upload_bf16_values(gpu: &mut Gpu, values: &[f32]) -> GpuTensor {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect();
+        let mut tensor = gpu.upload_raw(&bytes, &[bytes.len()]).expect("bf16 upload");
+        tensor.dtype = DType::BF16;
+        tensor.shape = vec![values.len()];
+        tensor
+    }
+
+    /// Wide-verify oracle of the QSA decode prologue (`indexed_attention_decode_prologue`,
+    /// grid.y = rows) for F32 and every quantized cache format of the device: a
+    /// batch of n = 1..=32 rows at position P writes, bit for bit, what n one-row
+    /// prologues at P + r write (normalized index query, Q with the untouched gate,
+    /// normalized K, the V source, every K/V cache byte of rows P..P+n and the raw
+    /// index keys), the poisoned rows just before and after the window stay
+    /// poisoned. End depths 8192 / 32768 / 131072 / 262144 minus displacement
+    /// 0..3 (RoPE positions straddling compress-4 boundaries); every n at
+    /// displacement 0, ragged n elsewhere. One cache of 262144 rows per format
+    /// (about 1.1 GiB for F32).
+    #[test]
+    #[ignore = "needs a GPU with ~1.2 GiB free: cargo test -p rdna-compute --lib --features lab qsa_prologue_wide_rows -- --ignored --nocapture"]
+    fn qsa_prologue_wide_rows_equal_one_row_calls() {
+        const WIDE: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs a gfx11/gfx12 GPU");
+            return;
+        }
+        let (heads, kv_heads, head_dim) = (24usize, 2usize, 256usize);
+        let (index_heads, index_dim, index_kv_width) = (4usize, 128usize, 128usize);
+        let index_width = index_heads * index_dim + index_kv_width;
+        let kv_width = kv_heads * head_dim;
+        let q_width = 2 * heads * head_dim;
+        // 262144 rows plus the canary row after a window that ends at the deepest end.
+        let full_cap = 262_144usize + 1;
+        let mut formats = vec![QsaKvFormat::F32];
+        formats.extend(quantized_qsa_formats(&gpu));
+        let norm_values = |len: usize, seed: usize| -> Vec<f32> {
+            qsa_lcg(seed, len).into_iter().map(|v| 0.5 + 0.25 * v).collect()
+        };
+        let to_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        for format in formats {
+            let row_units = format.kv_row_units(kv_heads, head_dim);
+            let row_bytes = format.kv_row_bytes(kv_heads, head_dim);
+            let raw_bytes = index_kv_width * format.index_dtype().size();
+            let k_cache = gpu.zeros(&[full_cap * row_units], format.kv_dtype()).expect("K cache");
+            let v_cache = gpu.zeros(&[full_cap * row_units], format.kv_dtype()).expect("V cache");
+            let raw = gpu
+                .zeros(&[full_cap * index_kv_width], format.index_dtype())
+                .expect("raw index keys");
+            let index_norm = upload_bf16_values(&mut gpu, &norm_values(index_dim, 101));
+            let q_norm = upload_bf16_values(&mut gpu, &norm_values(head_dim, 103));
+            let k_norm = upload_bf16_values(&mut gpu, &norm_values(head_dim, 107));
+            // Branch A (one batched call) and branch B (n one-row calls on views).
+            let alloc = |gpu: &mut Gpu, elems: usize| gpu.zeros(&[elems], DType::F32).expect("input");
+            let a = [
+                alloc(&mut gpu, WIDE * index_width),
+                alloc(&mut gpu, WIDE * q_width),
+                alloc(&mut gpu, WIDE * kv_width),
+                alloc(&mut gpu, WIDE * kv_width),
+            ];
+            let b = [
+                alloc(&mut gpu, WIDE * index_width),
+                alloc(&mut gpu, WIDE * q_width),
+                alloc(&mut gpu, WIDE * kv_width),
+                alloc(&mut gpu, WIDE * kv_width),
+            ];
+            let run = |gpu: &mut Gpu, t: [&GpuTensor; 4], position: usize, rows: usize| {
+                gpu.set_wide_verify_rows(if rows >= 2 { WIDE } else { 0 });
+                let result = indexed_attention_decode_prologue(
+                    gpu,
+                    &IndexedAttentionDecodePrologue {
+                        index_row: t[0],
+                        qgate: t[1],
+                        keys: t[2],
+                        values: t[3],
+                        full_keys: &k_cache,
+                        full_values: &v_cache,
+                        raw_index_keys: &raw,
+                        index_q_norm: &index_norm,
+                        q_norm: &q_norm,
+                        k_norm: &k_norm,
+                        index_heads,
+                        index_dim,
+                        index_kv_width,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        position,
+                        rows,
+                        format,
+                        yarn: crate::rope::RopeYarn::OFF,
+                    },
+                );
+                gpu.set_wide_verify_rows(0);
+                result.expect("QSA prologue");
+            };
+            let name = format.name();
+            let mut window = 0usize;
+            let mut cases = 0usize;
+            for depth in [8192usize, 32768, 131072, 262144] {
+                for disp in 0..4usize {
+                    let end = depth - disp;
+                    let ns: Vec<usize> = if disp == 0 {
+                        (1..=WIDE).collect()
+                    } else {
+                        vec![1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32]
+                    };
+                    for n in ns {
+                        window += 1;
+                        let ps = end - n;
+                        let seed = 31 * window + n;
+                        let host = [
+                            qsa_lcg(seed + 3, n * index_width),
+                            qsa_lcg(seed + 5, n * q_width),
+                            qsa_lcg(seed + 7, n * kv_width),
+                            qsa_lcg(seed + 11, n * kv_width),
+                        ];
+                        for branch in [&a, &b] {
+                            for (t, h) in branch.iter().zip(&host) {
+                                gpu.hip.memcpy_htod(&t.buf, &to_bytes(h)).expect("input upload");
+                            }
+                        }
+                        // Rows ps-1 ..= ps+n are poisoned: the window plus one canary row each side.
+                        let poison = |gpu: &Gpu| {
+                            for (cache, unit) in [(&k_cache, row_bytes), (&v_cache, row_bytes), (&raw, raw_bytes)] {
+                                gpu.hip
+                                    .memcpy_htod_offset(&cache.buf, (ps - 1) * unit, &vec![0xA5u8; (n + 2) * unit])
+                                    .expect("poison cache rows");
+                            }
+                        };
+                        let observe = |gpu: &Gpu, t: &[GpuTensor; 4]| -> Vec<Vec<u8>> {
+                            let mut out = Vec::new();
+                            for (tensor, len) in [
+                                (&t[0], n * index_width * 4),
+                                (&t[1], n * q_width * 4),
+                                (&t[2], n * kv_width * 4),
+                                (&t[3], n * kv_width * 4),
+                            ] {
+                                out.push(download_bytes(gpu, tensor)[..len].to_vec());
+                            }
+                            for (cache, unit) in [(&k_cache, row_bytes), (&v_cache, row_bytes), (&raw, raw_bytes)] {
+                                let mut rows = vec![0u8; (n + 2) * unit];
+                                gpu.hip
+                                    .memcpy_dtoh_at(&mut rows, &cache.buf, (ps - 1) * unit)
+                                    .expect("read cache rows");
+                                out.push(rows);
+                            }
+                            out
+                        };
+                        poison(&gpu);
+                        run(&mut gpu, [&a[0], &a[1], &a[2], &a[3]], ps, n);
+                        gpu.hip.device_synchronize().expect("sync");
+                        let batched = observe(&gpu, &a);
+                        poison(&gpu);
+                        for r in 0..n {
+                            let views = [
+                                b[0].sub_offset(r * index_width, index_width),
+                                b[1].sub_offset(r * q_width, q_width),
+                                b[2].sub_offset(r * kv_width, kv_width),
+                                b[3].sub_offset(r * kv_width, kv_width),
+                            ];
+                            run(&mut gpu, [&views[0], &views[1], &views[2], &views[3]], ps + r, 1);
+                        }
+                        gpu.hip.device_synchronize().expect("sync");
+                        let one_row = observe(&gpu, &b);
+                        for (i, what) in [
+                            "index_row", "qgate", "keys", "values", "K cache rows", "V cache rows", "raw index key rows",
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            assert!(
+                                batched[i] == one_row[i],
+                                "{name} E={end} n={n}: {what} of the batch differ from the n one-row prologues"
+                            );
+                        }
+                        // The V source is never normalized; the poisoned rows around the window stay.
+                        assert_eq!(batched[3], to_bytes(&host[3]), "{name} E={end} n={n}: values were modified");
+                        for (i, unit) in [(4usize, row_bytes), (5, row_bytes), (6, raw_bytes)] {
+                            assert!(
+                                batched[i][..unit].iter().all(|b| *b == 0xA5)
+                                    && batched[i][(n + 1) * unit..].iter().all(|b| *b == 0xA5),
+                                "{name} E={end} n={n}: wrote outside rows [P, P+n) (cache {i})"
+                            );
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+            eprintln!("qsa_prologue_wide_rows {name}: {cases} windows identical");
+            for t in [k_cache, v_cache, raw, index_norm, q_norm, k_norm].into_iter().chain(a).chain(b) {
+                gpu.free_tensor(t).expect("free");
+            }
+        }
+    }
+
+    /// Wide-verify oracle of the split-K partial/combine pair at the production
+    /// geometry (compress 4, budget 512, capacity 2051, S = 32, layout 2, F32
+    /// K/V): for n = 1..=32 rows (end depths 8192 and 262144 minus 0..3, so the
+    /// active lengths 2048..2051 occur in every tail phase) every row's whole
+    /// workspace region (`[m, l, acc[256]]` per (head, split), sentinel records of
+    /// empty slices included) and attention output equal the one-row launch at
+    /// `position_start + r`, bit for bit. The wide gate is set through
+    /// `Gpu::set_wide_verify_rows`.
+    #[test]
+    #[ignore = "needs a gfx11/gfx12 GPU with ~1.2 GiB free: cargo test -p rdna-compute --lib --features lab qsa_splitk_wide_workspace -- --ignored --nocapture"]
+    fn qsa_splitk_wide_workspace_records_equal_one_row_records() {
+        const WIDE: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        const H: usize = 24;
+        const HKV: usize = 2;
+        const D: usize = 256;
+        const COMPRESS: usize = 4;
+        const BUDGET: usize = 512;
+        const CAP: usize = 2051;
+        const RECORD_BYTES: usize = (D + 2) * 4;
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs a gfx11/gfx12 GPU");
+            return;
+        }
+        let (splits, layout) = (QSA_DECODE_SPLITK_SPLITS, QSA_DECODE_SPLITK_SCORING_LAYOUT);
+        let region = H * splits * RECORD_BYTES;
+        let reserve = QSA_DECODE_SPLITK_RESERVE_ROWS * H * QSA_DECODE_SPLITK_MAX_SPLITS * RECORD_BYTES;
+        let to_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        // Production-shaped selection of `visible` keys: `min(512, blocks)` pseudo-random
+        // blocks in token order, the causal tail, -1 padding.
+        let selection = |seed: usize, visible: usize| -> Vec<i32> {
+            let blocks = visible / COMPRESS;
+            let mut row = vec![-1i32; CAP];
+            let mut state = (seed as u32).wrapping_mul(2_654_435_761) | 1;
+            let mut i = 0usize;
+            for _ in 0..BUDGET.min(blocks) {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let block = (state >> 8) as usize % blocks;
+                for j in 0..COMPRESS {
+                    row[i] = (block * COMPRESS + j) as i32;
+                    i += 1;
+                }
+            }
+            for t in blocks * COMPRESS..visible {
+                row[i] = t as i32;
+                i += 1;
+            }
+            row
+        };
+        for depth in [8192usize, 262_144] {
+            let row_f32 = HKV * D;
+            let make_cache = |gpu: &mut Gpu, seed: usize| {
+                let t = gpu.alloc_tensor(&[depth * row_f32], DType::F32).expect("K/V alloc");
+                let chunk = 8192usize;
+                let mut first = 0usize;
+                while first < depth {
+                    let rows = chunk.min(depth - first);
+                    let bytes = to_bytes(&qsa_lcg(seed + first / chunk, rows * row_f32));
+                    gpu.hip
+                        .memcpy_htod_offset(&t.buf, first * row_f32 * 4, &bytes)
+                        .expect("K/V chunk upload");
+                    first += rows;
+                }
+                t
+            };
+            let keys = make_cache(&mut gpu, 13);
+            let values = make_cache(&mut gpu, 29);
+            let launch = |gpu: &mut Gpu, q: &GpuTensor, sel: &GpuTensor, out: &GpuTensor, rows: usize, ps: usize| {
+                gpu.set_wide_verify_rows(if rows >= 2 { WIDE } else { 0 });
+                let result = indexed_attention_attention_splitk_for_test(
+                    gpu,
+                    &IndexedAttentionAttentionBatch {
+                        q_with_gate: q,
+                        full_keys: &keys,
+                        full_values: &values,
+                        selected: sel,
+                        output: out,
+                        rows,
+                        position_start: ps,
+                        n_heads: H,
+                        n_kv_heads: HKV,
+                        head_dim: D,
+                        budget_blocks: BUDGET,
+                        compress: COMPRESS,
+                        capacity: CAP,
+                        full_capacity: depth,
+                        format: QsaKvFormat::F32,
+                        shape_selected: CAP,
+                    },
+                    splits,
+                    layout,
+                );
+                gpu.set_wide_verify_rows(0);
+                result.expect("split-K launch");
+                gpu.hip.device_synchronize().expect("sync");
+                // The launch's own workspace slot (same size arguments, so the same mapping).
+                let bytes = rows * region;
+                let ptr = gpu.qsa_gather_scratch(bytes, reserve).expect("workspace slot");
+                // SAFETY: a non-owning view of the mapped scratch prefix, read once.
+                let view = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, bytes) };
+                let mut records = vec![0u8; bytes];
+                gpu.hip.memcpy_dtoh(&mut records, &view).expect("workspace download");
+                (records, gpu.download_f32(out).expect("output download"))
+            };
+            let mut cases = 0usize;
+            for disp in 0..COMPRESS {
+                let end = depth - disp;
+                let ns: Vec<usize> = if depth == 8192 && disp == 0 {
+                    (1..=WIDE).collect()
+                } else {
+                    vec![1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32]
+                };
+                for n in ns {
+                    let ps = end - n;
+                    let q = qsa_lcg(5 + n + end % 977, n * 2 * H * D);
+                    let sel: Vec<Vec<i32>> = (0..n).map(|r| selection(end + r, ps + r + 1)).collect();
+                    let q_t = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+                    let sel_bytes: Vec<u8> = sel.iter().flatten().flat_map(|t| t.to_le_bytes()).collect();
+                    let sel_t = gpu.upload_raw(&sel_bytes, &[sel_bytes.len()]).expect("selected upload");
+                    let out = gpu.zeros(&[n * H * D], DType::F32).expect("output");
+                    let (ws, got) = launch(&mut gpu, &q_t, &sel_t, &out, n, ps);
+                    for r in 0..n {
+                        let q1 = gpu
+                            .upload_f32(&q[r * 2 * H * D..(r + 1) * 2 * H * D], &[2 * H * D])
+                            .expect("row q upload");
+                        let s1_bytes: Vec<u8> = sel[r].iter().flat_map(|t| t.to_le_bytes()).collect();
+                        let s1 = gpu.upload_raw(&s1_bytes, &[s1_bytes.len()]).expect("row selected upload");
+                        let o1 = gpu.zeros(&[H * D], DType::F32).expect("row output");
+                        let (ws1, got1) = launch(&mut gpu, &q1, &s1, &o1, 1, ps + r);
+                        assert!(
+                            ws[r * region..(r + 1) * region] == ws1[..region],
+                            "depth {depth} E={end} n={n}: row {r} workspace records differ from the one-row launch"
+                        );
+                        assert!(
+                            got[r * H * D..(r + 1) * H * D]
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .eq(got1.iter().map(|v| v.to_bits())),
+                            "depth {depth} E={end} n={n}: row {r} attention output differs from the one-row launch"
+                        );
+                        for t in [q1, s1, o1] {
+                            gpu.free_tensor(t).expect("free");
+                        }
+                    }
+                    for t in [q_t, sel_t, out] {
+                        gpu.free_tensor(t).expect("free");
+                    }
+                    cases += 1;
+                }
+            }
+            eprintln!("qsa_splitk_wide_workspace depth {depth}: {cases} windows identical");
+            gpu.free_tensor(keys).expect("free");
+            gpu.free_tensor(values).expect("free");
+        }
     }
 }
 

@@ -1537,15 +1537,18 @@ impl Qwen4Bundle {
         .map_err(BundleError::Hip)
     }
 
-    /// The rows a 2+ row eager verify forward of this bundle runs row-exact
-    /// right now. On this branch that is the unguarded per-GPU value; the
-    /// wide-verify branch narrows it by the AR launch guard
-    /// (`guarded_wide_verify_rows`), which is a no-op at or below
-    /// `FEW_ROW_ROUTE_ROWS`.
+    /// Rows a 2+ row eager verify would admit as row-exact right now: the
+    /// per-GPU proven rows ([`crate::gpu_forward::qwen4_row_exact_verify_rows`])
+    /// guarded by this bundle's AR launch mode and QSA attention policy
+    /// (`Qwen4GpuForward::guarded_wide_verify_rows`), or the historic
+    /// [`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`] without forward
+    /// resources. The n-gram copy lane caps a window's take at this minus one.
     pub(crate) fn row_exact_verify_rows(&self, gpu: &Gpu) -> usize {
-        crate::gpu_forward::qwen4_row_exact_verify_rows(gpu)
+        self.execution.as_ref().map_or(
+            rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+            |forward| forward.guarded_wide_verify_rows(self, gpu),
+        )
     }
-
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
     /// active snapshot ticket brackets, without re-running them; the ticket
     /// stays active for the caller's commit or restore.
@@ -2567,9 +2570,17 @@ impl Qwen4Bundle {
     /// capacity)` once, after prefill and before the first decode, so
     /// per-token growth checks never remap and no growth reaches a decode
     /// capture or record. Uses the forward's own growth path, with session
-    /// snapshots yielding first. `max_draft_rows == 0` (AR) leaves the MTP
-    /// head unmapped. A failure is logged and swallowed: growth then happens
-    /// on demand as before. Expert-parallel bundles and a zero
+    /// snapshots yielding first. `max_draft_rows` is the most drafts any
+    /// scheduled verify window carries (its rows are the seed plus those
+    /// drafts, so it ends that many positions past the seed): the drafter's
+    /// `proposal_capacity`, which is the native `max_k` or, with the n-gram
+    /// pool armed, the wider `n_max` (a window `k > max_k` is a copy
+    /// takeover verify; `mtp_step` refuses `k > proposal_capacity`). It must
+    /// not be the configured MTP `k`. Mapping only grows capacity: no
+    /// position, length or watermark commits, and the forward still maps its
+    /// actual end on demand. `max_draft_rows == 0` (AR) leaves the MTP head
+    /// unmapped. A failure is logged and swallowed: growth then happens on
+    /// demand as before. Expert-parallel bundles and a zero
     /// `remaining_new_tokens` map nothing.
     pub fn map_ahead_for_decode(
         &mut self,

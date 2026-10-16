@@ -12,7 +12,7 @@
 //!                      (`hyper_read_projected_rotate_f32` when the next mixer
 //!                      consumes `mixed` through the read's rotation scratch)
 //!   - HC write         `hyper_norm_f32` + BF16 gate projection + `hyper_write_f32`
-//!   - decode write+read `hyper_write_norm_f32` (rows 1..=8, F32 streams)
+//!   - decode write+read `hyper_write_norm_f32` (rows 1..=32, F32 streams)
 //!   - final HC read    `execute_final_hyper` == the HC read above
 //! `has_gfx11_plus_simt()` is false on gfx942, so `state_bf16` is false for the
 //! whole forward and every `hc_activation_fused_f32` / `hyper_norm_gate*` /
@@ -55,9 +55,12 @@ const HC_LOW: usize = 320;
 /// Row counts for the element-wise / row-grid HC kernels: decode, small
 /// prefill, a tail-y count, and the default non-gfx1151 prefill chunk.
 const HC_ROWS: [usize; 4] = [1, 7, 33, 1536];
-/// Rows the decode-fused `hyper_write_norm_f32` accepts (`rows <= 8`,
-/// `tensor_ops.rs hyper_write_norm`; the route gates on `route_rows <= 8`).
-const DECODE_ROWS: [usize; 3] = [1, 7, 8];
+/// Rows the decode-fused `hyper_write_norm_f32` accepts (`rows <=
+/// WIDE_VERIFY_MAX_ROWS` = 32: block `(branch, row)` is the whole computation
+/// of its row, so the one-row decode and every wider verify block run the same
+/// per-row chain; the route gates on `route_rows <= Gpu::few_row_limit()`):
+/// the decode and 8-row shapes, the wide-verify widths 9/15/16/17/31/32.
+const DECODE_ROWS: [usize; 9] = [1, 7, 8, 9, 15, 16, 17, 31, 32];
 const EPS: f32 = 1.0e-6;
 
 pub const CASES: &[Q4Case] = &[

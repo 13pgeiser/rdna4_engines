@@ -191,7 +191,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("qsa_filter_select", kernels::QSA_FILTER_SELECT_SRC,
             ["qsa_filter_threshold", "qsa_filter_compact", "qsa_filter_finish"]);
         add!("qsa_bf16_scores", kernels::QSA_BF16_SCORES_SRC,
-            ["indexed_attention_select_scores_rows8_bf16", "indexed_attention_select_scores_rows16_bf16"]);
+            ["indexed_attention_select_scores_rows8_bf16", "indexed_attention_select_scores_rows16_bf16",
+             "indexed_attention_select_scores_rows32_bf16"]);
     }
 
     // Common Qwen3.5 kernels (historical whole-model precompile set).
@@ -585,6 +586,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_mq6g256v2_f32_rows_r6", "gemm_mq6g256v2_f32_rows_r7", "gemm_mq6g256v2_f32_rows_r8", "gemm_mq6g256v2_f32_rows_x4_r2",
             "gemm_mq6g256v2_f32_rows_x4_r3", "gemm_mq6g256v2_f32_rows_x4_r4", "gemm_mq6g256v2_f32_rows_x4_r5", "gemm_mq6g256v2_f32_rows_x4_r6",
             "gemm_mq6g256v2_f32_rows_x4_r7", "gemm_mq6g256v2_f32_rows_x4_r8",
+            "gemm_mq6g256v2_f32_rows_wide_r16", "gemm_mq6g256v2_f32_rows_wide_r32",
+            "gemm_mq6g256v2_f32_rows_x4_wide_r16", "gemm_mq6g256v2_f32_rows_x4_wide_r32",
         ]);
         add!("gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded", kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC, [
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
@@ -619,7 +622,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_bf16_xf32_k4_rows_tiled_r7", "gemv_bf16_xf32_k4_rows_tiled_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2",
             "gemv_bf16_xf32_x4_rows_r3",
             "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
-            "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
+            "gemv_bf16_xf32_x4_rows_r8", "gemv_bf16_xf32_x4_rows_wide_r16", "gemv_bf16_xf32_x4_rows_wide_r32",
+            "gemv_bf16_xf32_k4_rows_wide_r16", "gemv_bf16_xf32_k4_rows_wide_r32", "hyper_write_norm_f32",
         ]);
         add!("qwen4_gemv_mq4g256", kernels::QWEN4_GEMV_MQ4G256_SRC, ["hyper_read_projected_rotate_f32", "mq_rotate_x_bf16_f16", "mq_rotate_x_f16"]);
         add!("qwen4_gemv_mq6g256v2", kernels::QWEN4_GEMV_MQ6G256V2_SRC, ["gemv_mq6g256v2", "gemv_mq6g256v2_x4"]);
@@ -630,6 +634,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_q8_0_k320_staged_rows", "gemv_q8_0_k8", "gemv_q8_0_k8_rows_r2", "gemv_q8_0_k8_rows_r3", "gemv_q8_0_k8_rows_r4",
             "gemv_q8_0_k8_rows_r5", "gemv_q8_0_k8_rows_r6", "gemv_q8_0_k8_rows_r7", "gemv_q8_0_k8_rows_r8", "quantize_bf16_q8_0",
             "topk8_partial_f32", "topk8_rescore_q8_0_k2560",
+            "gemv_q8_0_k2560_staged_rows_wide_r16", "gemv_q8_0_k2560_staged_rows_wide_r32",
+            "gemv_q8_0_k320_staged_rows_wide_r16", "gemv_q8_0_k320_staged_rows_wide_r32",
+            "gemv_q8_0_k2560_staged_rows_x2_wide_r16", "gemv_q8_0_k2560_staged_rows_x2_wide_r32",
+            "gemv_q8_0_k8_rows_wide_r16", "gemv_q8_0_k8_rows_wide_r32",
         ]);
         add!("qwen4_hc_streams_init_from_embed_batched", kernels::QWEN4_HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC, ["hc_streams_init_from_embed_batched_bf16"]);
         add!("qwen4_silu_mul", kernels::QWEN4_SILU_MUL_SRC, ["shared_expert_activation_bf16_f32", "silu_mul_bf16_rt_f32"]);
@@ -723,10 +731,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "indexed_attention_reuse_selection", "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial",
             "indexed_attention_select_f32", "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial",
             "indexed_attention_select_f32_serial", "indexed_attention_select_from_scores", "indexed_attention_select_scores_rows16_f32",
-            "indexed_attention_select_scores_rows8_f32", "scale_f32",
+            "indexed_attention_select_scores_rows32_f32", "indexed_attention_select_scores_rows8_f32", "scale_f32",
         ]);
     }
     if arch == "gfx1201" {
+        // S2 exact-wide verify twins: the Q8 small-K recipe's wide entries run on
+        // gfx1201 too (raw Q8 oracle; production Q8 copies stay gfx1151-only).
+        add!("qwen4_gemv_q8_0_wide", kernels::QWEN4_GEMV_Q8_0_WIDE_SRC, [
+            "gemv_q8_0_wide_k640_staged", "gemv_q8_0_wide_rows", "gemv_q8_0_wide_rows_wide_r16", "gemv_q8_0_wide_rows_wide_r32",
+        ]);
         add!("gemm_mq4g256v2_moe_grouped_wmma_gfx12", kernels::GEMM_MQ4G256V2_MOE_GROUPED_WMMA_GFX12_SRC, ["gemm_mq4g256v2_moe_grouped_wmma_gfx12"]);
         add!("gemm_mq6g256v2_residual_wmma_gfx12_bt12_mq5v2", kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC, [
             "gemm_mq6g256v2_residual_wmma_gfx12_bt12", "gemm_mq6g256v2_residual_wmma_gfx12_bt4", "gemm_mq6g256v2_residual_wmma_gfx12_bt8",
@@ -770,7 +783,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "indexed_attention_select_bf16_batched", "indexed_attention_select_bf16_batched_serial", "indexed_attention_select_f32",
             "indexed_attention_select_f32_batched", "indexed_attention_select_f32_batched_serial", "indexed_attention_select_f32_serial",
             "indexed_attention_select_from_scores", "indexed_attention_select_scores_rows16_f32",
-            "indexed_attention_select_scores_rows8_f32",
+            "indexed_attention_select_scores_rows32_f32", "indexed_attention_select_scores_rows8_f32",
             "scale_f32",
         ]);
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
@@ -917,10 +930,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemv_bf16_xf32_k4_rows_tiled_r7", "gemv_bf16_xf32_k4_rows_tiled_r8", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_x4_rows_r2",
             "gemv_bf16_xf32_x4_rows_r3",
             "gemv_bf16_xf32_x4_rows_r4", "gemv_bf16_xf32_x4_rows_r5", "gemv_bf16_xf32_x4_rows_r6", "gemv_bf16_xf32_x4_rows_r7",
-            "gemv_bf16_xf32_x4_rows_r8", "hyper_write_norm_f32",
+            "gemv_bf16_xf32_x4_rows_r8", "gemv_bf16_xf32_x4_rows_wide_r16", "gemv_bf16_xf32_x4_rows_wide_r32",
+            "gemv_bf16_xf32_k4_rows_wide_r16", "gemv_bf16_xf32_k4_rows_wide_r32", "hyper_write_norm_f32",
         ]);
         add!("mq_rotate_x_i4", kernels::MQ_ROTATE_X_I4_SRC, ["mq_rotate_x_i4"]);
-        add!("qwen4_gemv_q8_0_wide", kernels::QWEN4_GEMV_Q8_0_WIDE_SRC, ["gemv_q8_0_wide_k640_staged", "gemv_q8_0_wide_rows"]);
+        add!("qwen4_gemv_q8_0_wide", kernels::QWEN4_GEMV_Q8_0_WIDE_SRC, [
+            "gemv_q8_0_wide_k640_staged", "gemv_q8_0_wide_rows", "gemv_q8_0_wide_rows_wide_r16", "gemv_q8_0_wide_rows_wide_r32",
+        ]);
         add!("qwen4_moe_iu4_sym_gfx1151", kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC, [
             "qwen4_moe_down_iu4_sym_gfx1151", "qwen4_moe_down_iu4_sym_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_gfx1151",
             "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4", "qwen4_moe_sym_check_gfx1151",
@@ -1901,6 +1917,7 @@ fn walked_embedded_image(
             ("qwen4_moe_iu4_sym_pm_gfx1201", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201),
             ("qwen4_moe_iu4_sym_w3_pm_gfx1201", kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201),
             ("qsa_gather_pm_gfx1201", kernels::QSA_GATHER_PM_GFX1201),
+            ("mq4_rows_x4_pm_gfx1201", kernels::MQ4_ROWS_X4_PM_GFX1201),
         ];
         if let Some(&(name, image)) = QWEN4_GFX1201.iter().find(|(name, _)| *name == module) {
             return Some((name, image, None));
@@ -1991,7 +2008,197 @@ fn walked_route_entries(input: &RouteKernelInput<'_>) -> Result<Option<RouteKern
             scheduler_profile: found.scheduler_profile.clone(),
         }));
     }
+    add_wide_twin_entries(input.arch, &inventory, &mut planned)?;
     Ok(Some(RouteKernelPlan { entries: planned }))
+}
+
+// ── S2 exact-wide verify twins ──────────────────────────────────────────
+//
+// The walked plan above is generated with every `gemv::WideTwinFamily`
+// switch off. With a family's developer switch on (default off, read once)
+// the wide entries its launchers bind are added to the closed route here, so
+// a sealed route never refuses them: the HIP modules gain the wide symbols
+// (or the module joins the route from the installer inventory when the walk
+// never bound it) and the MQ4 PM image gains its `_wide_r{16,32}` symbols.
+// K1 (`mq_i4_moe_gemv_pm_<arch>` `_c16/_c32`) is planned by `slab_moe.rs`.
+
+use crate::gemv::WideTwinFamily;
+
+/// HIP modules that carry wide twins, with the symbols their launchers bind.
+const WIDE_TWIN_HIP: &[(WideTwinFamily, &str, &[&str])] = &[
+    (WideTwinFamily::Mq6, "gemm_mq6g256v2_f32_rows", &[
+        "gemm_mq6g256v2_f32_rows_wide_r16", "gemm_mq6g256v2_f32_rows_wide_r32",
+        "gemm_mq6g256v2_f32_rows_x4_wide_r16", "gemm_mq6g256v2_f32_rows_x4_wide_r32",
+    ]),
+    (WideTwinFamily::Bf16, "qwen4_gemv_bf16_xf32", &[
+        "gemv_bf16_xf32_x4_rows_wide_r16", "gemv_bf16_xf32_x4_rows_wide_r32",
+        "gemv_bf16_xf32_k4_rows_wide_r16", "gemv_bf16_xf32_k4_rows_wide_r32",
+    ]),
+    (WideTwinFamily::Q8, "qwen4_gemv_q8_0", &[
+        "gemv_q8_0_k2560_staged_rows_wide_r16", "gemv_q8_0_k2560_staged_rows_wide_r32",
+        "gemv_q8_0_k320_staged_rows_wide_r16", "gemv_q8_0_k320_staged_rows_wide_r32",
+        "gemv_q8_0_k2560_staged_rows_x2_wide_r16", "gemv_q8_0_k2560_staged_rows_x2_wide_r32",
+        "gemv_q8_0_k8_rows_wide_r16", "gemv_q8_0_k8_rows_wide_r32",
+    ]),
+    (WideTwinFamily::Q8, "qwen4_gemv_q8_0_wide", &[
+        "gemv_q8_0_wide_rows_wide_r16", "gemv_q8_0_wide_rows_wide_r32",
+    ]),
+];
+
+/// The MQ4 PM image of `arch`: merge-cell slot, module, image and wide symbols.
+fn wide_twin_mq4_image(
+    arch: &str,
+) -> Option<(usize, &'static str, &'static [u8], &'static [&'static str])> {
+    match arch {
+        "gfx1151" => Some((
+            0,
+            "mq4_rows_x4_pm_gfx1151",
+            kernels::MQ4_ROWS_X4_PM_GFX1151,
+            &["gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1151", "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1151"],
+        )),
+        "gfx1201" => Some((
+            1,
+            "mq4_rows_x4_pm_gfx1201",
+            kernels::MQ4_ROWS_X4_PM_GFX1201,
+            &["gemv_mq4g256v2_rows_x4_wide_r16_pm_gfx1201", "gemv_mq4g256v2_rows_x4_wide_r32_pm_gfx1201"],
+        )),
+        _ => None,
+    }
+}
+
+/// `base` plus the `extra` symbols it lacks (`base` itself when it has them
+/// all). The merged list is owned by `cell` (one per planned module; the
+/// switches and the walked plan are process constants).
+fn with_wide_twin_symbols(
+    cell: &'static std::sync::OnceLock<Vec<&'static str>>,
+    base: &'static [&'static str],
+    extra: &'static [&'static str],
+) -> &'static [&'static str] {
+    if extra.iter().all(|symbol| base.contains(symbol)) {
+        return base;
+    }
+    cell.get_or_init(|| {
+        base.iter()
+            .chain(extra.iter().filter(|symbol| !base.contains(symbol)))
+            .copied()
+            .collect()
+    })
+}
+
+/// Merged symbol lists of [`add_wide_twin_entries`]: one cell per
+/// [`WIDE_TWIN_HIP`] row and one per MQ4 image arch.
+static WIDE_TWIN_HIP_MERGED: [std::sync::OnceLock<Vec<&'static str>>; WIDE_TWIN_HIP.len()] =
+    [const { std::sync::OnceLock::new() }; WIDE_TWIN_HIP.len()];
+static WIDE_TWIN_MQ4_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
+/// Merged lists of the gfx1151 PM modules: `qwen4_lane_rows_pm`, `bf16_rows_wide_pm_gfx1151`.
+static WIDE_TWIN_PM_MERGED: [std::sync::OnceLock<Vec<&'static str>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
+/// The `qwen4_lane_rows_pm` wide exports of the switched-on MQ6 / Q8 families.
+static LANE_ROWS_WIDE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    let mut symbols = Vec::new();
+    if WideTwinFamily::Mq6.enabled() {
+        symbols.extend(crate::lane_rows_pm::MQ6_WIDE_SYMBOLS);
+    }
+    if WideTwinFamily::Q8.enabled() {
+        symbols.extend(crate::lane_rows_pm::Q8_WIDE_SYMBOLS);
+    }
+    symbols
+});
+
+/// Add `extra` to the embedded `module`'s planned symbols, or plan the module.
+fn plan_wide_embedded(
+    planned: &mut Vec<PlannedKernel>,
+    cell: &'static std::sync::OnceLock<Vec<&'static str>>,
+    module: &'static str,
+    image: &'static [u8],
+    extra: &'static [&'static str],
+) {
+    let present = planned
+        .iter()
+        .position(|entry| matches!(entry, PlannedKernel::Embedded { module: m, .. } if *m == module));
+    match present {
+        Some(index) => {
+            if let PlannedKernel::Embedded { symbols, .. } = &mut planned[index] {
+                *symbols = with_wide_twin_symbols(cell, *symbols, extra);
+            }
+        }
+        None => planned.push(PlannedKernel::Embedded { module, image, radiowave_json: None, symbols: extra }),
+    }
+}
+
+/// Add the wide-twin entries of every switched-on family to a walked route.
+fn add_wide_twin_entries(
+    arch: &str,
+    inventory: &[KernelEntry],
+    planned: &mut Vec<PlannedKernel>,
+) -> Result<(), RegistryError> {
+    if !matches!(arch, "gfx1151" | "gfx1201") {
+        return Ok(());
+    }
+    for (slot, &(family, module, extra)) in WIDE_TWIN_HIP.iter().enumerate() {
+        if !family.enabled() {
+            continue;
+        }
+        let present = planned
+            .iter()
+            .position(|entry| matches!(entry, PlannedKernel::Hip(hip) if hip.module == module));
+        if let Some(index) = present {
+            if let PlannedKernel::Hip(hip) = &mut planned[index] {
+                hip.symbols = with_wide_twin_symbols(&WIDE_TWIN_HIP_MERGED[slot], hip.symbols, extra);
+            }
+            continue;
+        }
+        let mut matches = inventory.iter().filter(|entry| entry.module == module);
+        let found = matches.next().ok_or_else(|| RegistryError::UnsupportedModule {
+            arch: arch.to_owned(),
+            module: module.to_owned(),
+        })?;
+        if matches.next().is_some() {
+            return Err(RegistryError::ConflictingPlan(format!("module {module} has two registry recipes")));
+        }
+        if let Some(symbol) = extra.iter().find(|symbol| !found.symbols.contains(symbol)) {
+            return Err(RegistryError::ConflictingPlan(format!(
+                "packaged {module} does not export wide symbol {symbol}"
+            )));
+        }
+        planned.push(PlannedKernel::Hip(KernelEntry {
+            arch: found.arch,
+            module: found.module,
+            symbols: extra,
+            source: found.source.clone(),
+            flags: found.flags.clone(),
+            scheduler_profile: found.scheduler_profile.clone(),
+        }));
+    }
+    if WideTwinFamily::Mq4.enabled() {
+        if let Some((slot, module, image, extra)) = wide_twin_mq4_image(arch) {
+            plan_wide_embedded(planned, &WIDE_TWIN_MQ4_MERGED[slot], module, image, extra);
+        }
+    }
+    if arch == "gfx1151" {
+        // PM primary on gfx1151: the lane-rows module (MQ6, Q8) and the BF16 wide module.
+        let lane = std::sync::LazyLock::force(&LANE_ROWS_WIDE_SYMBOLS).as_slice();
+        if !lane.is_empty() {
+            plan_wide_embedded(
+                planned,
+                &WIDE_TWIN_PM_MERGED[0],
+                "qwen4_lane_rows_pm",
+                kernels::QWEN4_LANE_ROWS_PM_GFX1151,
+                lane,
+            );
+        }
+        if WideTwinFamily::Bf16.enabled() {
+            plan_wide_embedded(
+                planned,
+                &WIDE_TWIN_PM_MERGED[1],
+                crate::gemv::BF16_ROWS_WIDE_PM_MODULE,
+                kernels::BF16_ROWS_WIDE_PM_GFX1151,
+                &crate::gemv::BF16_ROWS_WIDE_PM_SYMBOLS,
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2133,9 +2340,11 @@ mod tests {
         // `attention_flash_q8_0_tile_swa` / `attention_flash_q8_0_reduce_skip`
         // and the exact sampled-filter QSA module `qsa_filter_select`, plus the
         // portable BF16 rows8/rows16 QSA score module `qsa_bf16_scores`
-        // and the Flash-Next expert-slab K1 lane-union planner `qwen4_slab_union_plan`
+        // and the Flash-Next expert-slab K1 lane-union planner `qwen4_slab_union_plan`,
+        // plus the Q8 small-K wide module `qwen4_gemv_q8_0_wide` (S2 exact-wide twin
+        // on the raw gfx1201 Q8 oracle; gfx1151 already packaged it)
         // are additional to P0's 92.
-        assert_eq!(registry.len(), count + 154, "unexpected gfx1201 inventory size");
+        assert_eq!(registry.len(), count + 155, "unexpected gfx1201 inventory size");
         let default_prefill = by_name.get("attention_q8_0_flash_prefill_br8_bc16").unwrap();
         assert_eq!(default_prefill.symbols, ["attention_q8_0_flash_prefill"]);
         assert!(default_prefill.source().starts_with(

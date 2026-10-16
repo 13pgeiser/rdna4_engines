@@ -400,6 +400,350 @@ GEMV_Q8_0_K8_ROWS(7)
 GEMV_Q8_0_K8_ROWS(8)
 #undef GEMV_Q8_0_K8_ROWS
 
+// ===========================================================================
+// Exact wide twins: R = 16 / 32 activation rows per launch (`_wide_r16` /
+// `_wide_r32`; x row stride K, y row stride M, runtime `R` in 1..=RCAP).
+// The <= 8-row kernels above are untouched. Every (row, column) output is
+// bitwise the decode object's single-row result:
+//
+//   gemv_q8_0_k2560_staged_rows_wide / _x2_wide   K = 2560 recipe: ONE running
+//   gemv_q8_0_k320_staged_rows_wide               sum per lane, blocks in
+//                                                 increasing order, every block
+//                                                 `sum = fma(RN(d*q), x, sum)`
+//                                                 (gemv_q8_0_row; == the K = 320
+//                                                 staged kernel's ten-block chain).
+//   gemv_q8_0_k8_rows_wide                        HC k8: eight single-chain K/8
+//                                                 partitions, fixed fold, HC
+//                                                 epilogue (gemv_q8_0_k8).
+//   (four-chain small-K recipe: qwen4_gemv_q8_0_wide.hip)
+//
+// Schedule (design WideTwinGemvSol section 2.2): one wave32 per output column
+// owns all R accumulators for the whole K traversal. Per 256-element K tile
+// (eight Q8 blocks) each live wave loads its blocks' (scale, quant) once as
+// dq[j] = RN(float(scale_j) * float(q_j)) (an exact product: 11-bit f16
+// significand x 8-bit int) and keeps them in registers while the workgroup
+// walks the activation rows eight at a time: producer wave w loads row rb+w
+// for the tile (lane map g*256 + 32*j + lane, the Q8 map) into LDS
+// xs[w][j][lane], full barrier, every live wave folds the eight rows into its
+// accumulators, barrier before the tile is overwritten. Tail waves (column
+// >= M) skip weights/math/stores but execute every barrier. Chain order per
+// (row, column) is therefore unchanged: tiles ascend, blocks ascend inside a
+// tile, rows never interact.
+//
+// Contraction is pinned, not left to `+=`: main-path blocks use
+// __builtin_fmaf(dq, x, acc) (what the incumbent single-chain and four-chain
+// quad loops compile to on gfx1151 and gfx1201: v_fmac_f32 of the
+// v_fma_mix_f32 product); the four-chain tail blocks use an unfused RN(dq*x)
+// then add (the incumbent's `contrib` multi-use path compiles to v_mul_f32 +
+// v_add_f32, checked on both architectures).
+// ---------------------------------------------------------------------------
+
+// Producer phase: wave `wave` stores row rb+wave of the K tile starting at
+// element k0 (nb of 8 blocks live) as xs[(wave*8 + j)*32 + lane]. Bits are the
+// input's; rows >= R and blocks >= nb are neither loaded nor stored.
+static __device__ __forceinline__ void q8w_fill_x(
+    float* xs, const float* __restrict__ x, int K, int R, int rb, int k0, int nb,
+    int wave, int lane
+) {
+    const int row = rb + wave;
+    if (row < R) {
+        const float* xr = x + (size_t)row * K + k0 + lane;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if (j < nb) xs[(wave * 8 + j) * 32 + lane] = xr[32 * j];
+    }
+}
+
+// This lane's dequantized product for each of the tile's nb blocks.
+static __device__ __forceinline__ void q8w_load_dq(
+    float (&dq)[8], const unsigned char* wrow, int b0, int nb, int lane
+) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        dq[j] = 0.0f;
+        if (j < nb) {
+            const unsigned char* bp = wrow + (size_t)(b0 + j) * 34;
+            const float d = (float)*((const _Float16*)bp);
+            const signed char q = (signed char)bp[2 + lane];
+            dq[j] = d * (float)q;
+        }
+    }
+}
+
+// Single-chain recipe, one K tile: acc[r] = fma(dq[j], x[r][j], acc[r]) for
+// j ascending. FULL: nb == 8 (no per-block guard).
+template <int RCAP, bool FULL>
+static __device__ __forceinline__ void q8w_single_tile(
+    float (&acc)[RCAP], const float (&dq)[8], float* xs, const float* __restrict__ x,
+    int K, int R, int k0, int nb, bool live, int wave, int lane
+) {
+#pragma unroll
+    for (int rbi = 0; rbi < RCAP / 8; ++rbi) {
+        const int rb = rbi * 8;
+        if (rb < R) {
+            __syncthreads();
+            q8w_fill_x(xs, x, K, R, rb, k0, FULL ? 8 : nb, wave, lane);
+            __syncthreads();
+            if (live) {
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    if (rb + r < R) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            if (FULL || j < nb)
+                                acc[rb + r] = __builtin_fmaf(dq[j], xs[(r * 8 + j) * 32 + lane], acc[rb + r]);
+                        }
+                        // Scheduling hint only (no arithmetic effect): keep this
+                        // row's eight LDS values from being hoisted across rows.
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One output column per wave, 8 columns per block, block 256, grid ceil(M/8).
+// `xs` is the kernel's 8 KiB __shared__ X tile (declared in the kernel so a
+// two-matrix entry shares one allocation); `m_base` is the matrix-local first
+// column of this block.
+template <int RCAP>
+static __device__ __forceinline__ void q8w_single_chain_body(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y,
+    int M, int K, int R, int m_base, float* xs
+) {
+    // wave-uniform by construction (block of whole wave32s): readfirstlane keeps
+    // wave/live/row predicates scalar so no exec-mask accumulator copies appear.
+    const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
+    const int lane = threadIdx.x & 31;
+    const int m = m_base + wave;
+    const bool live = m < M;
+    const int nblk = K >> 5;
+    const unsigned char* wrow = A_q8 + (size_t)(live ? m : 0) * nblk * 34;
+    float acc[RCAP];
+#pragma unroll
+    for (int r = 0; r < RCAP; ++r) acc[r] = 0.0f;
+    // Full 8-block tiles in the loop (one code path over the accumulators),
+    // then at most one partial tile peeled after it.
+    const int nfull = nblk >> 3;
+    for (int t = 0; t < nfull; ++t) {
+        const int b0 = t * 8;
+        float dq[8];
+        if (live) {
+            q8w_load_dq(dq, wrow, b0, 8, lane);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dq[j] = 0.0f;
+        }
+        q8w_single_tile<RCAP, true>(acc, dq, xs, x, K, R, b0 * 32, 8, live, wave, lane);
+    }
+    const int ntail = nblk & 7;
+    if (ntail != 0) {
+        const int b0 = nfull * 8;
+        float dq[8];
+        if (live) {
+            q8w_load_dq(dq, wrow, b0, ntail, lane);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dq[j] = 0.0f;
+        }
+        q8w_single_tile<RCAP, false>(acc, dq, xs, x, K, R, b0 * 32, ntail, live, wave, lane);
+    }
+    if (live) {
+#pragma unroll
+        for (int r = 0; r < RCAP; ++r) {
+            if (r < R) {
+                float sum = acc[r];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    sum += __shfl_down(sum, offset);
+                if (lane == 0) y[(size_t)r * M + m] = sum;
+            }
+        }
+    }
+}
+
+// gemv_q8_0 K = 2560 (gfx1151 gemv_q8_0_k2560_staged / gemv_q8_0_row) and
+// K = 320 (gemv_q8_0_k320_staged) over R rows: (A, X, Y, M, K, R), pointers at
+// 0, 8, 16, ints at 24, 28, 32. The two tags are the same single-chain recipe;
+// they are separate symbols so each shape binds the entry named for the
+// decode object it reproduces.
+#define GEMV_Q8_0_WIDE_SINGLE(NAME, RCAP)                                             \
+    __launch_bounds__(256) extern "C" __global__ void NAME(                           \
+        const unsigned char* __restrict__ A_q8, const float* __restrict__ x,          \
+        float* __restrict__ y, int M, int K, int R) {                                 \
+        __shared__ __align__(16) float xs[8 * 8 * 32];                                \
+        q8w_single_chain_body<RCAP>(A_q8, x, y, M, K, R, (int)blockIdx.x * 8, xs);    \
+    }
+GEMV_Q8_0_WIDE_SINGLE(gemv_q8_0_k2560_staged_rows_wide_r16, 16)
+GEMV_Q8_0_WIDE_SINGLE(gemv_q8_0_k2560_staged_rows_wide_r32, 32)
+GEMV_Q8_0_WIDE_SINGLE(gemv_q8_0_k320_staged_rows_wide_r16, 16)
+GEMV_Q8_0_WIDE_SINGLE(gemv_q8_0_k320_staged_rows_wide_r32, 32)
+#undef GEMV_Q8_0_WIDE_SINGLE
+
+// Two K = 2560 matrices over the same R activation rows (shared gate/up):
+// (A0, A1, X, Y0, Y1, M0, M1, K, R), pointers at 0, 8, 16, 24, 32, ints at 40,
+// 44, 48, 52. Grid ceil(M0/8) + ceil(M1/8): blocks [0, ceil(M0/8)) run matrix
+// 0, the rest matrix 1, each with its own matrix-local column base and M
+// stride; no block spans two matrices. Same body, so every output is bitwise
+// the single-matrix entry's.
+#define GEMV_Q8_0_WIDE_X2(NAME, RCAP)                                                 \
+    __launch_bounds__(256) extern "C" __global__ void NAME(                           \
+        const unsigned char* __restrict__ A0, const unsigned char* __restrict__ A1,   \
+        const float* __restrict__ x, float* __restrict__ y0, float* __restrict__ y1,  \
+        int M0, int M1, int K, int R) {                                               \
+        __shared__ __align__(16) float xs[8 * 8 * 32];                                \
+        const int g0 = (M0 + 7) >> 3;                                                 \
+        const bool second = (int)blockIdx.x >= g0;                                    \
+        q8w_single_chain_body<RCAP>(                                                  \
+            second ? A1 : A0, x, second ? y1 : y0, second ? M1 : M0, K, R,            \
+            (second ? (int)blockIdx.x - g0 : (int)blockIdx.x) * 8, xs);               \
+    }
+GEMV_Q8_0_WIDE_X2(gemv_q8_0_k2560_staged_rows_x2_wide_r16, 16)
+GEMV_Q8_0_WIDE_X2(gemv_q8_0_k2560_staged_rows_x2_wide_r32, 32)
+#undef GEMV_Q8_0_WIDE_X2
+
+// HC k8 (gemv_q8_0_k8): block 512 = 16 waves, two output columns per block,
+// wave = ml*8 + part owns partition `part` (K/8 contiguous elements) of
+// column m = 2*blockIdx.x + ml, all R rows, single-chain DAG per partition.
+// X stage: two activation rows x eight partitions x 256 elements = 16 KiB;
+// wave w produces row rb + (w >> 3), partition (w & 7), so both columns read
+// each published vector. After the last K tile the LDS is reused as
+// partial[2][RCAP][8]; thread t < 2R then folds
+// ((p0+p1)+(p2+p3))+((p4+p5)+(p6+p7)) and applies the HC epilogue.
+static __device__ __forceinline__ float q8w_k8_hc_epilogue(float value, float scale, int hc_act) {
+    if (hc_act) {
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value *= scale;
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+        value = value / (1.0f + expf(-value));
+        value = static_cast<float>(static_cast<hip_bfloat16>(value));
+    }
+    return value;
+}
+
+template <int RCAP, bool FULL>
+static __device__ __forceinline__ void q8w_k8_tile(
+    float (&acc)[RCAP], const float (&dq)[8], float* lds, const float* __restrict__ x,
+    int K, int pk, int R, int k0, int nb, bool live, int ml, int part, int lane
+) {
+    // R and K are wave-uniform kernel arguments; re-materialize them per tile so
+    // the per-row predicates and 64-bit row bases (16 of each at R32) are
+    // recomputed here instead of being hoisted into the SGPR file for the whole
+    // K loop (which overflowed it). Not a numeric operation.
+    int Rl = R, Kl = K;
+    asm volatile("" : "+s"(Rl), "+s"(Kl));
+#pragma unroll
+    for (int rbi = 0; rbi < RCAP / 2; ++rbi) {
+        const int rb = rbi * 2;
+        if (rb < Rl) {
+            __syncthreads();
+            const int row = rb + ml;
+            if (row < Rl) {
+                const float* xr = x + (size_t)row * Kl + part * pk + k0 + lane;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if (FULL || j < nb) lds[((ml * 8 + part) * 8 + j) * 32 + lane] = xr[32 * j];
+            }
+            __syncthreads();
+            if (live) {
+#pragma unroll
+                for (int r2 = 0; r2 < 2; ++r2) {
+                    if (rb + r2 < Rl) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            if (FULL || j < nb)
+                                acc[rb + r2] = __builtin_fmaf(
+                                    dq[j], lds[((r2 * 8 + part) * 8 + j) * 32 + lane], acc[rb + r2]);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <int RCAP>
+static __device__ __forceinline__ void q8w_k8_body(
+    const unsigned char* __restrict__ A_q8, const float* __restrict__ x, float* __restrict__ y,
+    int M, int K, float scale, int hc_act, int R, float* lds
+) {
+    const int wave = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 5));
+    const int lane = threadIdx.x & 31;
+    const int ml = wave >> 3;
+    const int part = wave & 7;
+    const int m = (int)blockIdx.x * 2 + ml;
+    const bool live = m < M;
+    const int pk = K / 8;
+    const int nblk = pk / 32;
+    const unsigned char* wrow = A_q8 + ((size_t)(live ? m : 0) * 8 + part) * nblk * 34;
+    float acc[RCAP];
+#pragma unroll
+    for (int r = 0; r < RCAP; ++r) acc[r] = 0.0f;
+    const int nfull = nblk >> 3;
+    for (int t = 0; t < nfull; ++t) {
+        const int b0 = t * 8;
+        float dq[8];
+        if (live) {
+            q8w_load_dq(dq, wrow, b0, 8, lane);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dq[j] = 0.0f;
+        }
+        q8w_k8_tile<RCAP, true>(acc, dq, lds, x, K, pk, R, b0 * 32, 8, live, ml, part, lane);
+    }
+    const int ntail = nblk & 7;
+    if (ntail != 0) {
+        const int b0 = nfull * 8;
+        float dq[8];
+        if (live) {
+            q8w_load_dq(dq, wrow, b0, ntail, lane);
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) dq[j] = 0.0f;
+        }
+        q8w_k8_tile<RCAP, false>(acc, dq, lds, x, K, pk, R, b0 * 32, ntail, live, ml, part, lane);
+    }
+    // Final drain: every X read is complete before partial[] overwrites the tile.
+    __syncthreads();
+    if (live) {
+#pragma unroll
+        for (int r = 0; r < RCAP; ++r) {
+            if (r < R) {
+                float sum = acc[r];
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    sum += __shfl_down(sum, offset);
+                if (lane == 0) lds[(ml * RCAP + r) * 8 + part] = sum;
+            }
+        }
+    }
+    __syncthreads();
+    if ((int)threadIdx.x < 2 * R) {
+        const int ml2 = (int)threadIdx.x / R;
+        const int r = (int)threadIdx.x - ml2 * R;
+        const int m2 = (int)blockIdx.x * 2 + ml2;
+        if (m2 < M) {
+            const float* p = lds + (ml2 * RCAP + r) * 8;
+            const float value = q8w_k8_hc_epilogue(
+                ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7])), scale, hc_act);
+            y[(size_t)r * M + m2] = value;
+        }
+    }
+}
+
+// (W, X, Y, M, K, scale, hc_act, R): pointers at 0, 8, 16; M@24, K@28,
+// scale@32 (f32), hc_act@36, R@40. Grid ceil(M/2), block 512, K % 256 == 0.
+#define GEMV_Q8_0_K8_ROWS_WIDE(NAME, RCAP)                                            \
+    __launch_bounds__(512) extern "C" __global__ void NAME(                           \
+        const unsigned char* __restrict__ A_q8, const float* __restrict__ x,          \
+        float* __restrict__ y, int M, int K, float scale, int hc_act, int R) {        \
+        __shared__ __align__(16) float lds[2 * 8 * 8 * 32];                           \
+        q8w_k8_body<RCAP>(A_q8, x, y, M, K, scale, hc_act, R, lds);                   \
+    }
+GEMV_Q8_0_K8_ROWS_WIDE(gemv_q8_0_k8_rows_wide_r16, 16)
+GEMV_Q8_0_K8_ROWS_WIDE(gemv_q8_0_k8_rows_wide_r32, 32)
+#undef GEMV_Q8_0_K8_ROWS_WIDE
+
 // Requantize BF16 to Q8_0, one thread per 32-block: scale = f16(amax / 127),
 // q = round(w / scale) with the stored (f16) scale.
 extern "C" __global__ void quantize_bf16_q8_0(

@@ -10,6 +10,13 @@
 //! (host contract: `index_heads = 4`, `index_dim = 128`):
 //! The BF16-pooled variant (`indexed_attention_select_scores_rows16_bf16_pm_gfx1151`)
 //! has the same ABI and arithmetic, with exact BF16-to-F32 bit widening.
+//! The R32 twins (`indexed_attention_select_scores_rows32_{f32,bf16}_pm_gfx1151`)
+//! are the same builder with the row tile parameterized: the workgroup's
+//! first row is `32 * wg_y` (not `16 * wg_y`), its row count clamps to 32
+//! (not 16), and the grid is `[ceil(block_count/256), ceil(rows/32), 1]`.
+//! The key load, four-chain `row()` body, division sequence, query lookahead,
+//! store descriptor and resources are unchanged, so a row's score bits do not
+//! depend on the tile size.
 //!
 //! ```text
 //! scores[(row0 + r) * score_stride + block] =
@@ -19,8 +26,8 @@
 //! ```
 //!
 //! for `block = 256 * wg_x + tid < min(block_count, (position_start + row0 +
-//! r + 1) / compress)` and `r < min(16, rows - row0)`; every other score is
-//! never touched.
+//! r + 1) / compress)` and `r < min(R, rows - row0)` (`R` = 16, or 32 for the
+//! rows32 symbols); every other score is never touched.
 //!
 //! Schedule (the incumbent is LDS-bound: one broadcast `ds_load_b128` per four
 //! FMAs and 188 VGPRs). This port keeps no LDS at all:
@@ -53,7 +60,7 @@
 //!   no lane masks or branches are needed. `visible_blocks(r)` is tracked
 //!   incrementally from one scalar `n / compress` at entry (`n % compress`
 //!   plus one per row), exact for `n >= 1`, `compress >= 1`;
-//! - rows are a wave-uniform loop over `nrows = min(16, rows - row0)` (no
+//! - rows are a wave-uniform loop over `nrows = min(R, rows - row0)` (no
 //!   unrolling: ragged row tiles read no query memory beyond their rows; the
 //!   one-row-ahead stage fetch of the last row re-reads the row it is on). A
 //!   wave whose first block is at or past `block_count` returns before any
@@ -76,6 +83,8 @@ use peacemaker_author::{Gfx1151, Wave, Workgroup};
 
 pub fn symbol(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_f32_pm_{}", arch.name()) }
 pub fn symbol_bf16(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_bf16_pm_{}", arch.name()) }
+pub fn symbol32(arch: Arch) -> String { format!("indexed_attention_select_scores_rows32_f32_pm_{}", arch.name()) }
+pub fn symbol_bf16_rows32(arch: Arch) -> String { format!("indexed_attention_select_scores_rows32_bf16_pm_{}", arch.name()) }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Pooled { F32, Bf16 }
@@ -87,8 +96,20 @@ impl Pooled {
 
 /// `sqrtf(128.0f)` correctly rounded (`128f32.sqrt().to_bits()`).
 const SQRT_INDEX_DIM: u32 = 0x4135_04f3;
-/// Query rows per workgroup.
-const ROWS: i32 = 16;
+/// Query rows per workgroup: the only geometry that differs between the R16
+/// and R32 symbols.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Tile { R16, R32 }
+impl Tile {
+    fn rows(self) -> i32 { match self { Self::R16 => 16, Self::R32 => 32 } }
+    /// `log2(rows)`: the shift from `wg_y` to the tile's first row.
+    fn shift(self) -> u32 { match self { Self::R16 => 4, Self::R32 => 5 } }
+    /// Assembler labels are module-global: the R16 labels are the incumbent's,
+    /// the R32 kernels (same module) carry their own.
+    fn end_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_end", Self::R32 => ".Lqsc32_end" } }
+    fn rows_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows", Self::R32 => ".Lqsc32_rows" } }
+    fn done_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows_done", Self::R32 => ".Lqsc32_rows_done" } }
+}
 /// Index heads and dims per head (the host contract).
 const HEADS: usize = 4;
 const DIM: usize = 128;
@@ -151,24 +172,38 @@ fn plan() -> Result<RegPlan, String> {
 }
 
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
-    emit_pooled(arch, Pooled::F32)
+    emit_pooled(arch, Pooled::F32, Tile::R16)
 }
 
 pub fn emit_bf16(arch: Arch) -> Result<Emitted, String> {
-    emit_pooled(arch, Pooled::Bf16)
+    emit_pooled(arch, Pooled::Bf16, Tile::R16)
 }
 
-fn emit_pooled(arch: Arch, pooled: Pooled) -> Result<Emitted, String> {
+/// The rows32 F32-pooled twin of [`emit`].
+pub fn emit32(arch: Arch) -> Result<Emitted, String> {
+    emit_pooled(arch, Pooled::F32, Tile::R32)
+}
+
+/// The rows32 BF16-pooled twin of [`emit_bf16`].
+pub fn emit_bf16_rows32(arch: Arch) -> Result<Emitted, String> {
+    emit_pooled(arch, Pooled::Bf16, Tile::R32)
+}
+
+fn emit_pooled(arch: Arch, pooled: Pooled, tile: Tile) -> Result<Emitted, String> {
     if arch != Arch::Gfx1151 { return Err("qsa_score: built for gfx1151 only".into()) }
+    let (variant, symbol) = match (pooled, tile) {
+        (Pooled::F32, Tile::R16) => ("score", symbol(arch)),
+        (Pooled::Bf16, Tile::R16) => ("score-bf16", symbol_bf16(arch)),
+        (Pooled::F32, Tile::R32) => ("score32", symbol32(arch)),
+        (Pooled::Bf16, Tile::R32) => ("score-bf16-rows32", symbol_bf16_rows32(arch)),
+    };
     let spec = KernelSpec {
-        kernel_id: "qsa_select".into(),
-        variant: if pooled == Pooled::F32 { "score" } else { "score-bf16" }.into(), arch,
-        symbol: if pooled == Pooled::F32 { symbol(arch) } else { symbol_bf16(arch) },
+        kernel_id: "qsa_select".into(), variant: variant.into(), arch, symbol,
         kernargs: kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
         workgroup_size: 256, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
     };
     let mut b = Builder::new(spec, plan()?);
-    author(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, pooled)?;
+    author(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, pooled, tile)?;
     b.finish()
 }
 
@@ -178,8 +213,8 @@ fn scmp(w: &mut Wave<'_, Gfx1151, Builder>, text: String, uses: &[u8]) -> Result
     w.scmp(Instruction::new(text, vec![], uses.iter().map(|&n| s(n)).collect()))
 }
 
-fn author(wg: Wg, pooled: Pooled) -> Result<(), String> {
-    let end = wg.exit(".Lqsc_end")?;
+fn author(wg: Wg, pooled: Pooled, tile: Tile) -> Result<(), String> {
+    let end = wg.exit(tile.end_label())?;
     let b = wg.isa();
     smem(b, A0, 8, KARG, 0)?;
     smem(b, A1, 4, KARG, 0x20)?;
@@ -193,13 +228,13 @@ fn author(wg: Wg, pooled: Pooled) -> Result<(), String> {
     sop(b, format!("s_lshl_b32 s{BLK0}, s{WGX}, 8"), &[BLK0], &[WGX])?;
     sop(b, format!("s_lshl_b32 s{T0}, s{WAVE}, 5"), &[T0], &[WAVE])?;
     sop(b, format!("s_add_i32 s{T0}, s{T0}, s{BLK0}"), &[T0], &[T0, BLK0])?;
-    sop(b, format!("s_lshl_b32 s{ROW0}, s{WGY}, 4"), &[ROW0], &[WGY])?;
+    sop(b, format!("s_lshl_b32 s{ROW0}, s{WGY}, {}", tile.shift()), &[ROW0], &[WGY])?;
     // A wave entirely past block_count, or a row tile past the rows, returns.
     let live = scmp(wg, format!("s_cmp_lt_i32 s{T0}, s{BLOCK_COUNT}"), &[T0, BLOCK_COUNT])?;
     Wave::<Gfx1151, Builder>::exit_unless(wg, live, &end)?;
     let b = wg.isa();
     sop(b, format!("s_sub_i32 s{NROWS}, s{ROWS_ARG}, s{ROW0}"), &[NROWS], &[ROWS_ARG, ROW0])?;
-    sop(b, format!("s_min_i32 s{NROWS}, s{NROWS}, {ROWS}"), &[NROWS], &[NROWS])?;
+    sop(b, format!("s_min_i32 s{NROWS}, s{NROWS}, {}", tile.rows()), &[NROWS], &[NROWS])?;
     let some = scmp(wg, format!("s_cmp_gt_i32 s{NROWS}, 0"), &[NROWS])?;
     Wave::<Gfx1151, Builder>::exit_unless(wg, some, &end)?;
     let b = wg.isa();
@@ -250,7 +285,7 @@ fn author(wg: Wg, pooled: Pooled) -> Result<(), String> {
             op(b, format!("v_and_b32_e32 v{hi}, 0xffff0000, v{packed}"), &[v(hi)], &[v(packed)])?;
         }
     }
-    wg.loop_until(".Lqsc_rows", ".Lqsc_rows_done", |w, exit| {
+    wg.loop_until(tile.rows_label(), tile.done_label(), |w, exit| {
         row(w.isa())?;
         let b = w.isa();
         // Visible blocks of the next row: remainder + 1, carrying into the quotient.

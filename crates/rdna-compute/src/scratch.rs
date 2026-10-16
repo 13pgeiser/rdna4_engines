@@ -3683,7 +3683,8 @@ mod prefill_workspace_tests {
         assert_eq!(qwen4_moe_group_layout_checked(usize::MAX, 512), None);
         assert_eq!(qwen4_grouped_rows_bound(40960, 512), Some(48_640));
         assert_eq!(qwen4_slab_tiles_bytes(3040), Some(24_320));
-        assert_eq!(qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES), Some(1928));
+        assert_eq!(qwen4_slab_union_bytes(16), Some(3848));
+        assert_eq!(qwen4_slab_union_bytes(crate::slab_moe::SLAB_MAX_LANES), Some(7688));
         assert_eq!(qwen4_slab_union_bytes(usize::MAX), None);
         assert_eq!(fp16_x_bytes(4096 * 10240), Some(83_886_080));
         assert_eq!(fp16_x_bytes(usize::MAX), None);
@@ -3707,15 +3708,15 @@ mod prefill_workspace_tests {
         assert_eq!(
             values,
             [
-                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 1_928, 167_424,
+                83_886_080, 20_971_520, 5_898_240, 821_248, 14_745_600, 24_320, 7_688, 167_424,
                 25_165_824, 1_572_864, 1_024,
             ]
         );
-        assert_eq!(sum(terms), 153_256_072);
+        assert_eq!(sum(terms), 153_261_832);
         let no_tails = qwen4_prefill_workspace_terms(4096, &flash_next(true, false)).unwrap();
-        assert_eq!(sum(no_tails), 153_255_048);
+        assert_eq!(sum(no_tails), 153_260_808);
         let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(false, false)).unwrap();
-        assert_eq!(sum(no_gdn), 153_255_048 - 25_165_824 - 1_572_864);
+        assert_eq!(sum(no_gdn), 153_260_808 - 25_165_824 - 1_572_864);
     }
 
     #[test]

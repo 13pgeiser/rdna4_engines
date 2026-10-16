@@ -42,6 +42,27 @@
 //!   below and above the crossover.
 //! * `#[ignore]`d `qsa_bf16_split_crossover_table`: graph-replayed GPU time of
 //!   the fused incumbent, split select and split filter.
+//! * Wide verify (n <= 32 rows, design `wide-qsa-few-row-design.md` 7B), tests
+//!   `qsa_bf16_wide_rows_*`: the batched n-row select (every arm: fused
+//!   incumbent, public mirrored route, split select, split filter, hipcc-score
+//!   filter, PM-score filter on gfx1151) must write, for each row r, exactly the
+//!   bytes of the n independent one-row calls of the same arm at
+//!   `position_start + r` (selection row, final mirror, filter stats), and the
+//!   bytes of the fused incumbent. Every n = 1..=32 at end depths 8192 / 32768 /
+//!   131072 / 262144 tokens (2048..65536 blocks), ragged 9/15/17/31 and exact
+//!   16/32, end displacements 0..3 (windows straddling compress-4 boundaries),
+//!   tie vectors (all +0, all equal, signed zero, 1-BF16-ulp near ties,
+//!   cancellation-heavy dots, ties spanning the 31|32, 255|256 and 4095|4096
+//!   selection boundaries), the filter block-count thresholds (2047..65536),
+//!   forced repair (`cap = 16`) and `target = 1`. Pooled blocks at or past the
+//!   window's end block are HOT, and perturbing the not-yet-visible blocks must
+//!   leave the earlier rows unchanged. The wide gate is set through
+//!   `Gpu::set_wide_verify_rows` inside the tests (never by env): 32 for a
+//!   batched n >= 2 call, 0 for the one-row calls (a one-row forward is the
+//!   decode itself). The raw-score kernel test and the filter / split sweeps
+//!   also cover rows 9/15/16/17/31/32(/33) and `..._rows32_bf16`.
+//!
+//!   cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture qsa_bf16_wide_rows
 //!
 //! Every GPU test skips without a gfx11+/gfx12 device.
 //!
@@ -59,11 +80,13 @@ use rdna_compute::tensor_ops::{
     QsaFilterRowStat, QsaSelectPmArm,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 const SCORES_SRC: &str = include_str!("../../../kernels/src/qsa_bf16_scores.hip");
 const SCORES_MODULE: &str = "qsa_bf16_scores_test";
 const ROWS8: &str = "indexed_attention_select_scores_rows8_bf16";
 const ROWS16: &str = "indexed_attention_select_scores_rows16_bf16";
+const ROWS32: &str = "indexed_attention_select_scores_rows32_bf16";
 
 const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -104,7 +127,11 @@ struct Geometry {
 const SMALL: Geometry = Geometry { budget: 128, capacity: 528 };
 /// The production Qwen4 selector geometry.
 const PRODUCTION: Geometry = Geometry { budget: 512, capacity: 2051 };
-const MAX_ROWS: usize = 17;
+/// Fixture row capacity: the widest verify block.
+const MAX_ROWS: usize = WIDE_VERIFY_MAX_ROWS;
+/// Row counts of the existing end-to-end sweeps: the one-row and 8-row decode
+/// shapes, the first wide counts, the 16-row tile edge and the 32-row maximum.
+const ROWS_SWEEP: [usize; 8] = [1, 8, 9, 15, 16, 17, 31, 32];
 const POISON: u8 = 0xa5;
 const POISON_WORD: u32 = 0xa5a5_a5a5;
 const CANARY: usize = 4096;
@@ -193,7 +220,27 @@ enum Keys {
     /// Dense with a per-block power-of-two scale (-3..=4): exercises BF16
     /// exponents and product rounding. Raw-score test only.
     Wide,
+    /// Every key +0: every score canonical +0 (an all-way tie).
+    Zero,
+    /// One constant positive key in every block: every score equal.
+    Const,
+    /// Half the blocks hold -0.0 keys, half +0.0: every score canonical +0.
+    SignedZero,
+    /// Even blocks all 0.5, odd blocks the same with element 0 one BF16 ulp up.
+    NearTie,
+    /// Alternating-sign elements at mixed exponents: cancellation-heavy dots
+    /// whose value depends on the accumulation order.
+    Cancel,
+    /// Selection boundary inside a tie group: blocks below the tie group hold
+    /// +0, `highs` distinct high blocks end `HIGHS_END_MARGIN` blocks before the
+    /// arena end, every other block holds one constant key, and the tie group
+    /// starts so that exactly the `512 - highs` lowest tie block ids win and
+    /// the first loser is block `end_id` (budget 512 blocks).
+    Boundary { end_id: usize, highs: usize },
 }
+
+/// Blocks between the high blocks of [`Keys::Boundary`] and the arena end.
+const HIGHS_END_MARGIN: usize = 32;
 
 fn keys_f32(kind: Keys, blocks: usize) -> Vec<f32> {
     let mut rng = Lcg(0x7d3b_91a5 ^ blocks as u32);
@@ -228,6 +275,46 @@ fn keys_f32(kind: Keys, blocks: usize) -> Vec<f32> {
                     0..=3 => row.copy_from_slice(&palette[((h >> 8) % 4) as usize]),
                     4 => row.iter_mut().for_each(|v| *v = -rng.unit() - 0.01),
                     _ => row.iter_mut().for_each(|v| *v = rng.unit() - 0.25),
+                }
+            }
+        }
+        Keys::Zero => {}
+        Keys::Const => keys.fill(0.5),
+        Keys::SignedZero => {
+            for block in (0..blocks).filter(|b| mix(*b) & 1 == 1) {
+                keys[block * DIM..(block + 1) * DIM].fill(-0.0);
+            }
+        }
+        Keys::NearTie => {
+            for block in 0..blocks {
+                let row = &mut keys[block * DIM..(block + 1) * DIM];
+                row.fill(0.5);
+                if block % 2 == 1 {
+                    // 0.5 * (1 + 2^-7): the next BF16 above 0.5.
+                    row[0] = 0.503_906_25;
+                }
+            }
+        }
+        Keys::Cancel => {
+            for block in 0..blocks {
+                for d in 0..DIM {
+                    let magnitude = (1.0 + rng.unit()) * 2f32.powi(((d * 7 + block) & 7) as i32 - 3);
+                    keys[block * DIM + d] = if d % 2 == 0 { magnitude } else { -magnitude };
+                }
+            }
+        }
+        Keys::Boundary { end_id, highs } => {
+            let tie_selected = 512usize.saturating_sub(highs);
+            let start = end_id.checked_sub(tie_selected).expect("boundary: tie group start below block 0");
+            let highs_end = blocks.checked_sub(HIGHS_END_MARGIN).expect("boundary: arena too short");
+            let highs_start = highs_end.checked_sub(highs).expect("boundary: highs below block 0");
+            assert!(end_id < highs_start, "boundary: the first loser must lie inside the tie group");
+            for block in start..blocks {
+                let row = &mut keys[block * DIM..(block + 1) * DIM];
+                if (highs_start..highs_end).contains(&block) {
+                    row.iter_mut().for_each(|v| *v = 0.8 + 0.2 * rng.unit());
+                } else {
+                    row.fill(0.5);
                 }
             }
         }
@@ -321,7 +408,7 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
     oracle_src.push('\n');
     oracle_src.push_str(ORACLE_KERNEL);
     gpu.ensure_kernel_public(ORACLE_MODULE, &oracle_src, ORACLE).expect("load fused score oracle");
-    for name in [ROWS8, ROWS16] {
+    for name in [ROWS8, ROWS16, ROWS32] {
         gpu.ensure_kernel_public(SCORES_MODULE, SCORES_SRC, name).expect("load bf16 score kernel");
     }
     let mut cells_checked = 0usize;
@@ -329,7 +416,7 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
     for blocks in [255usize, 257, 2048, 8192, 32768, 65536] {
         for kind in [Keys::Dense, Keys::Ties, Keys::Wide] {
             let pooled = upload_bf16(&mut gpu, &keys_bf16(kind, blocks, blocks));
-            for rows in [1usize, 8, 17] {
+            for rows in [1usize, 8, 9, 15, 16, 17, 31, 32, 33] {
                 for qstride in [QUERY_STRIDE, QUERY_STRIDE + 128] {
                     let q = query_padded(rows, qstride);
                     let query = gpu.upload_f32(&q, &[q.len()]).expect("query upload");
@@ -366,7 +453,7 @@ fn qsa_bf16_score_kernels_match_fused_scores_bit_for_bit() {
                         assert_eq!(written, expected_cells, "{label}: oracle wrote the visible cells");
                         assert!(all_poison(&want[rows * stride * 4..]), "{label}: oracle canary");
 
-                        for (name, tile_rows) in [(ROWS8, 8usize), (ROWS16, 16usize)] {
+                        for (name, tile_rows) in [(ROWS8, 8usize), (ROWS16, 16usize), (ROWS32, 32usize)] {
                             // `extra` > 0: the fixed grid is wider than the live count.
                             for extra in [0usize, 700] {
                                 poison(&gpu, &scores);
@@ -616,7 +703,8 @@ fn qsa_bf16_filter_arm_end_to_end() {
         for kind in [Keys::Dense, Keys::Ties] {
             for cover in [Cover::Full(0), Cover::Full(3), Cover::Partial(1)] {
                 let pooled = upload_bf16(&mut gpu, &keys_bf16(kind, blocks, cover.hot_from(blocks)));
-                for rows in [1usize, 8, 17] {
+                for rows in ROWS_SWEEP {
+                    let gates: &[usize] = if rows > 8 { &[0, WIDE_VERIFY_MAX_ROWS] } else { &[0] };
                     let ps = cover.position_start(blocks, rows);
                     // The live count is `(position_start + rows) / compress`; a
                     // partial cover's pooled arena is longer (blocks past it are hot).
@@ -625,11 +713,13 @@ fn qsa_bf16_filter_arm_end_to_end() {
                     let without = run_reference(&mut gpu, &fx, &p, false);
                     assert!(with.persisted && !without.persisted);
                     assert!(with.selected == without.selected, "reference differs with a mirror");
+                    for &gate in gates {
+                    gpu.set_wide_verify_rows(gate);
                     for &score_pm in &arms {
                         for (knob_name, knobs) in knob_sets {
                             for with_mirror in [true, false] {
                                 let label = format!(
-                                    "blocks={blocks} keys={kind:?} {cover:?} rows={rows} pm_score={score_pm} knobs={knob_name} mirror={with_mirror}"
+                                    "blocks={blocks} keys={kind:?} {cover:?} rows={rows} gate={gate} pm_score={score_pm} knobs={knob_name} mirror={with_mirror}"
                                 );
                                 let reference = if with_mirror { &with } else { &without };
                                 let out = run_filter(&mut gpu, &fx, &p, with_mirror, score_pm, knobs);
@@ -652,6 +742,8 @@ fn qsa_bf16_filter_arm_end_to_end() {
                             }
                         }
                     }
+                    }
+                    gpu.set_wide_verify_rows(0);
                 }
                 gpu.free_tensor(pooled).expect("free pooled");
             }
@@ -680,7 +772,8 @@ fn qsa_bf16_split_arms_and_shape_bounds_end_to_end() {
         for kind in [Keys::Dense, Keys::Ties] {
             for cover in [Cover::Full(0), Cover::Full(3), Cover::Partial(1)] {
                 let pooled = upload_bf16(&mut gpu, &keys_bf16(kind, blocks, cover.hot_from(blocks)));
-                for rows in [1usize, 8, 17] {
+                for rows in ROWS_SWEEP {
+                    let gates: &[usize] = if rows > 8 { &[0, WIDE_VERIFY_MAX_ROWS] } else { &[0] };
                     let ps = cover.position_start(blocks, rows);
                     let live = (ps + rows) / COMPRESS;
                     let p = fx.params_shaped(&pooled, live, blocks, rows, ps);
@@ -691,12 +784,14 @@ fn qsa_bf16_split_arms_and_shape_bounds_end_to_end() {
                     let mut shapes = vec![(false, blocks)];
                     shapes.push((true, blocks));
                     shapes.push((true, CAPACITY_BLOCKS.max(blocks) + 777));
+                    for &gate in gates {
+                    gpu.set_wide_verify_rows(gate);
                     for (arm_name, arm) in arms {
                         for &(bounded, shape) in &shapes {
                             let q = fx.params_shaped(&pooled, live, shape, rows, ps);
                             for with_mirror in [true, false] {
                                 let label = format!(
-                                    "blocks={blocks} keys={kind:?} {cover:?} rows={rows} arm={arm_name} bounded={bounded} shape={shape} mirror={with_mirror}"
+                                    "blocks={blocks} keys={kind:?} {cover:?} rows={rows} gate={gate} arm={arm_name} bounded={bounded} shape={shape} mirror={with_mirror}"
                                 );
                                 let reference = if with_mirror { &with } else { &without };
                                 let out = run_split(&mut gpu, &fx, &q, with_mirror, arm, bounded);
@@ -711,6 +806,8 @@ fn qsa_bf16_split_arms_and_shape_bounds_end_to_end() {
                             }
                         }
                     }
+                    }
+                    gpu.set_wide_verify_rows(0);
                 }
                 gpu.free_tensor(pooled).expect("free pooled");
             }
@@ -720,23 +817,407 @@ fn qsa_bf16_split_arms_and_shape_bounds_end_to_end() {
     // rows, so 17 rows run as two groups with grouped position addends.
     for blocks in [2048usize, 8192] {
         let pooled = upload_bf16(&mut gpu, &keys_bf16(Keys::Ties, blocks, blocks));
-        for rows in [17usize] {
+        for rows in [17usize, 32] {
+          for gate in [0usize, WIDE_VERIFY_MAX_ROWS] {
+            gpu.set_wide_verify_rows(gate);
             let ps = Cover::Full(2).position_start(blocks, rows);
             let p = fx.params(&pooled, blocks, rows, ps);
             let with = run_reference(&mut gpu, &fx, &p, true);
             let q = fx.params_shaped(&pooled, blocks, 1_000_000, rows, ps);
             for (arm_name, arm) in arms {
-                let label = format!("multi-group blocks={blocks} rows={rows} arm={arm_name}");
+                let label = format!("multi-group blocks={blocks} rows={rows} gate={gate} arm={arm_name}");
                 let out = run_split(&mut gpu, &fx, &q, true, arm, true);
                 let stats = matches!(arm, QsaBf16SplitArm::Filter(_)).then_some(rows);
                 check_against(&label, &out, &with, PRODUCTION, rows, true, stats);
                 cases += 1;
             }
+            gpu.set_wide_verify_rows(0);
+          }
         }
         gpu.free_tensor(pooled).expect("free pooled");
     }
     fx.free(&mut gpu);
     println!("{cases} BF16 split cases exact");
+}
+
+// ---------------------------------------------------------------------------
+// wide verify (n <= 32 rows): batched == n independent one-row calls
+
+/// Verify windows end at these token depths (compress 4: 2048 / 8192 / 32768 /
+/// 65536 pooled blocks).
+const END_DEPTHS: [usize; 4] = [8192, 32768, 131072, 262144];
+/// Pooled arena blocks above a depth's top block: always HOT.
+const ARENA_SLACK: usize = 16;
+/// Ragged and exact-tile row counts of the reduced sweeps.
+const ROWS_RAGGED: [usize; 12] = [1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 31, 32];
+/// The filter's block-count thresholds (PM few-row 24576, many-row 49152,
+/// radix/filter 2048/4096) and their neighbours, up to the 256K-token maximum.
+const THRESHOLD_BLOCKS: [usize; 14] =
+    [2047, 2048, 2049, 4095, 4096, 4097, 24575, 24576, 24577, 49151, 49152, 49153, 65535, 65536];
+/// Longest context in tokens.
+const MAX_CONTEXT: usize = 262_144;
+
+#[derive(Clone, Copy, Debug)]
+enum WideArm {
+    /// The fused hipcc incumbent (`QsaSelectPmArm::Hipcc`).
+    Fused,
+    /// The public mirrored route (whatever the arch and env pick).
+    Production,
+    SplitSelect,
+    SplitFilter(QsaFilterKnobs),
+    /// Filter arm with hipcc block scores.
+    FilterHipcc(QsaFilterKnobs),
+    /// Filter arm with PM block scores (gfx1151).
+    FilterPm(QsaFilterKnobs),
+}
+
+fn arm_knobs(arm: WideArm) -> Option<QsaFilterKnobs> {
+    match arm {
+        WideArm::SplitFilter(k) | WideArm::FilterHipcc(k) | WideArm::FilterPm(k) => Some(k),
+        _ => None,
+    }
+}
+
+fn arm_has_stats(arm: WideArm) -> bool {
+    arm_knobs(arm).is_some()
+}
+
+/// One call of `arm` under the gate a verify forward would set: the widest
+/// row-exact rows for a batched (n >= 2) call, the historic limit for a
+/// one-row call (a one-row forward is the decode itself).
+fn run_wide_arm(gpu: &mut Gpu, fx: &Fixture, p: &IndexedAttentionSelectBatch<'_>, arm: WideArm) -> Out {
+    gpu.set_wide_verify_rows(if p.rows >= 2 { WIDE_VERIFY_MAX_ROWS } else { 0 });
+    let out = match arm {
+        WideArm::Fused => run_reference(gpu, fx, p, true),
+        WideArm::Production => {
+            fx.poison(gpu);
+            let persisted = indexed_attention_select_batch_mirrored(gpu, p, &fx.mirror).unwrap_or_else(|e| {
+                panic!("production select rows={} blocks={} ps={}: {e}", p.rows, p.block_count, p.position_start)
+            });
+            fx.download(gpu, persisted, Vec::new())
+        }
+        WideArm::SplitSelect => run_split(gpu, fx, p, true, QsaBf16SplitArm::Select, false),
+        WideArm::SplitFilter(k) => run_split(gpu, fx, p, true, QsaBf16SplitArm::Filter(k), false),
+        WideArm::FilterHipcc(k) => run_filter(gpu, fx, p, true, false, k),
+        WideArm::FilterPm(k) => run_filter(gpu, fx, p, true, true, k),
+    };
+    gpu.set_wide_verify_rows(0);
+    out
+}
+
+fn wide_arms(gpu: &Gpu, knobs: QsaFilterKnobs) -> Vec<WideArm> {
+    let mut arms = vec![
+        WideArm::Fused,
+        WideArm::Production,
+        WideArm::SplitSelect,
+        WideArm::SplitFilter(knobs),
+        WideArm::FilterHipcc(knobs),
+    ];
+    if gpu.arch_caps.is_gfx1151() {
+        arms.push(WideArm::FilterPm(knobs));
+    }
+    arms
+}
+
+fn selection_words(bytes: &[u8]) -> Vec<i32> {
+    bytes.chunks_exact(4).map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect()
+}
+
+/// All-way tie vectors (every score equal): the first `budget` blocks win in
+/// ascending order, each expanded in token order, then the causal tail, then -1.
+fn assert_all_tie_order(label: &str, out: &Out, rows: usize, ps: usize, geo: Geometry) {
+    let cap = geo.capacity;
+    for r in 0..rows {
+        let visible = ps + r + 1;
+        let blocks = visible / COMPRESS;
+        let chosen = geo.budget.min(blocks);
+        let mut want: Vec<i32> = Vec::with_capacity(cap);
+        for block in 0..chosen {
+            want.extend((0..COMPRESS).map(|t| (block * COMPRESS + t) as i32));
+        }
+        want.extend((blocks * COMPRESS..visible).map(|t| t as i32));
+        want.resize(cap, -1);
+        let got = selection_words(&out.selected[r * cap * 4..(r + 1) * cap * 4]);
+        assert!(got == want, "{label}: row {r}/{rows} (ps={ps}) is not the first-{chosen}-blocks ascending selection");
+    }
+}
+
+/// The fixture's query rows (positive: an all-negative block scores 0); the
+/// LCG is sequential, so every row count is a prefix of every larger one.
+fn fixture_query(rows: usize) -> Vec<f32> {
+    let mut rng = Lcg(0x51ca_17b3);
+    (0..rows * QUERY_STRIDE).map(|_| rng.unit()).collect()
+}
+
+struct Wide<'a> {
+    /// Batched fixture (`WIDE_VERIFY_MAX_ROWS` rows).
+    fx: &'a Fixture,
+    /// One-row fixture (one selection row, one mirror).
+    fx1: &'a Fixture,
+    /// Row r of the batched query as its own tensor.
+    rowq: &'a [GpuTensor],
+}
+
+fn upload_row_queries(gpu: &mut Gpu) -> Vec<GpuTensor> {
+    let q = fixture_query(WIDE_VERIFY_MAX_ROWS);
+    (0..WIDE_VERIFY_MAX_ROWS)
+        .map(|r| gpu.upload_f32(&q[r * QUERY_STRIDE..(r + 1) * QUERY_STRIDE], &[QUERY_STRIDE]).expect("row query"))
+        .collect()
+}
+
+/// Rewrites the arena: `base` keys, blocks at or past `b_end` HOT.
+fn upload_window_arena(gpu: &Gpu, pooled: &GpuTensor, base: &[u16], b_end: usize) {
+    let mut bits = base.to_vec();
+    bits[b_end * DIM..].fill(HOT);
+    let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+    gpu.hip.memcpy_htod(&pooled.buf, &bytes).expect("rewrite arena");
+}
+
+/// One verify window `[e_end - n, e_end)`: every arm's batched call against the
+/// fused incumbent and against the n one-row calls of the same arm, plus the
+/// future-block perturbation. The arena must hold `base_bits` below the
+/// window's end block and HOT from it. Returns the number of arm cases.
+#[allow(clippy::too_many_arguments)]
+fn wide_window(
+    gpu: &mut Gpu,
+    w: &Wide<'_>,
+    pooled: &GpuTensor,
+    base_bits: &[u16],
+    arena_blocks: usize,
+    e_end: usize,
+    n: usize,
+    arms: &[WideArm],
+    tie_order: bool,
+    label: &str,
+) -> usize {
+    let geo = w.fx.geo;
+    let cap = geo.capacity;
+    let ps = e_end - n;
+    let b_end = e_end / COMPRESS;
+    let p = w.fx.params_shaped(pooled, b_end, arena_blocks, n, ps);
+    let reference = run_wide_arm(gpu, w.fx, &p, WideArm::Fused);
+    assert!(reference.persisted, "{label}: the fused reference did not persist the mirror");
+    if tie_order {
+        assert_all_tie_order(&format!("{label} fused"), &reference, n, ps, geo);
+    }
+    let mut cases = 0usize;
+    for &arm in arms {
+        let label = format!("{label} n={n} E={e_end} arm={arm:?}");
+        let out = run_wide_arm(gpu, w.fx, &p, arm);
+        check_against(&label, &out, &reference, geo, n, true, arm_has_stats(arm).then_some(n));
+        if tie_order {
+            assert_all_tie_order(&label, &out, n, ps, geo);
+        }
+        if arm_knobs(arm).is_some_and(|k| k.cap == 16) && b_end >= 1024 {
+            for (row, stat) in out.stats.iter().enumerate() {
+                assert!(stat.repaired, "{label}: row {row} was not reported repaired");
+            }
+        }
+        for r in 0..n {
+            let p1 = IndexedAttentionSelectBatch {
+                query: &w.rowq[r],
+                ..w.fx1.params_shaped(pooled, (ps + r + 1) / COMPRESS, arena_blocks, 1, ps + r)
+            };
+            let one = run_wide_arm(gpu, w.fx1, &p1, arm);
+            assert!(one.persisted, "{label}: one-row call {r} did not persist the mirror");
+            assert!(all_poison(&one.selected[cap * 4..]), "{label}: one-row call {r} wrote past its row");
+            assert!(
+                out.selected[r * cap * 4..(r + 1) * cap * 4] == one.selected[..cap * 4],
+                "{label}: row {r} of the batch differs from its one-row call"
+            );
+            if r + 1 == n {
+                assert!(
+                    out.mirror[..cap * 4] == one.mirror[..cap * 4],
+                    "{label}: the batch's mirror differs from the last one-row call's"
+                );
+            }
+            if arm_has_stats(arm) {
+                assert_eq!(
+                    stat_tuples(&out.stats)[r],
+                    stat_tuples(&one.stats)[0],
+                    "{label}: row {r} filter stats differ from its one-row call"
+                );
+            }
+        }
+        cases += 1;
+    }
+    // Pooled blocks no earlier row can see: rows before the first row that
+    // sees block `b0` must not change when blocks `[b0, b_end)` become huge.
+    let b0 = (ps + 1) / COMPRESS;
+    if n >= 2 && b0 < b_end {
+        let first_seeing = (COMPRESS * (b0 + 1)).saturating_sub(ps + 1);
+        let view = pooled.sub_offset(b0 * DIM, (b_end - b0) * DIM);
+        let hot: Vec<u8> = (0..(b_end - b0) * DIM).flat_map(|_| HOT.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&view.buf, &hot).expect("perturb future blocks");
+        let perturbed = run_wide_arm(gpu, w.fx, &p, WideArm::SplitSelect);
+        let restore: Vec<u8> = base_bits[b0 * DIM..b_end * DIM].iter().flat_map(|b| b.to_le_bytes()).collect();
+        gpu.hip.memcpy_htod(&view.buf, &restore).expect("restore blocks");
+        for r in 0..first_seeing.min(n) {
+            assert!(
+                perturbed.selected[r * cap * 4..(r + 1) * cap * 4] == reference.selected[r * cap * 4..(r + 1) * cap * 4],
+                "{label} n={n} E={e_end}: row {r} changed when only not-yet-visible blocks changed"
+            );
+        }
+        cases += 1;
+    }
+    cases
+}
+
+/// (key kind, sweep every n at displacement 0). Boundary kinds only where the
+/// first loser and the high blocks fit below the arena end.
+fn wide_kinds(top_blocks: usize) -> Vec<(Keys, bool)> {
+    let mut kinds = vec![
+        (Keys::Dense, true),
+        (Keys::Ties, true),
+        (Keys::Wide, false),
+        (Keys::Zero, false),
+        (Keys::Const, false),
+        (Keys::SignedZero, false),
+        (Keys::NearTie, false),
+        (Keys::Cancel, false),
+    ];
+    let arena = top_blocks + ARENA_SLACK;
+    for (end_id, highs) in [(32usize, 480usize), (256, 256), (4096, 128)] {
+        if end_id + 1 < arena - HIGHS_END_MARGIN - highs {
+            kinds.push((Keys::Boundary { end_id, highs }, false));
+        }
+    }
+    kinds
+}
+
+fn wide_depth_oracle(depth: usize) {
+    let Some(mut gpu) = gpu_or_skip() else { return };
+    let fx = Fixture::with_max_rows(&mut gpu, PRODUCTION, WIDE_VERIFY_MAX_ROWS);
+    let fx1 = Fixture::with_max_rows(&mut gpu, PRODUCTION, 1);
+    let rowq = upload_row_queries(&mut gpu);
+    let w = Wide { fx: &fx, fx1: &fx1, rowq: &rowq };
+    let arms = wide_arms(&gpu, QsaFilterKnobs::default());
+    let top_blocks = depth / COMPRESS;
+    let arena = top_blocks + ARENA_SLACK;
+    let (mut windows, mut cases) = (0usize, 0usize);
+    for (kind, sweep) in wide_kinds(top_blocks) {
+        let base = keys_bf16(kind, arena, arena);
+        let pooled = upload_bf16(&mut gpu, &base);
+        let tie_order = matches!(kind, Keys::Zero | Keys::Const);
+        for disp in 0..COMPRESS {
+            let e_end = depth - disp;
+            upload_window_arena(&gpu, &pooled, &base, e_end / COMPRESS);
+            let ns: Vec<usize> = if sweep && disp == 0 { (1..=WIDE_VERIFY_MAX_ROWS).collect() } else { ROWS_RAGGED.to_vec() };
+            for n in ns {
+                let label = format!("depth={depth} keys={kind:?} disp={disp}");
+                cases += wide_window(&mut gpu, &w, &pooled, &base, arena, e_end, n, &arms, tie_order, &label);
+                windows += 1;
+            }
+        }
+        gpu.free_tensor(pooled).expect("free pooled");
+    }
+    for t in rowq {
+        gpu.free_tensor(t).expect("free row query");
+    }
+    fx.free(&mut gpu);
+    fx1.free(&mut gpu);
+    println!("depth {depth}: {windows} windows, {cases} arm cases bit-exact vs one-row calls");
+}
+
+#[test]
+fn qsa_bf16_wide_rows_equal_one_row_calls_depth_8k() {
+    wide_depth_oracle(END_DEPTHS[0]);
+}
+
+#[test]
+fn qsa_bf16_wide_rows_equal_one_row_calls_depth_32k() {
+    wide_depth_oracle(END_DEPTHS[1]);
+}
+
+#[test]
+fn qsa_bf16_wide_rows_equal_one_row_calls_depth_128k() {
+    wide_depth_oracle(END_DEPTHS[2]);
+}
+
+#[test]
+fn qsa_bf16_wide_rows_equal_one_row_calls_depth_256k() {
+    wide_depth_oracle(END_DEPTHS[3]);
+}
+
+/// The filter's block-count thresholds with the window ending exactly at (or
+/// three tokens past) `B` blocks: rows of one window straddle the threshold.
+#[test]
+fn qsa_bf16_wide_rows_filter_thresholds_equal_one_row_calls() {
+    let Some(mut gpu) = gpu_or_skip() else { return };
+    let fx = Fixture::with_max_rows(&mut gpu, PRODUCTION, WIDE_VERIFY_MAX_ROWS);
+    let fx1 = Fixture::with_max_rows(&mut gpu, PRODUCTION, 1);
+    let rowq = upload_row_queries(&mut gpu);
+    let w = Wide { fx: &fx, fx1: &fx1, rowq: &rowq };
+    let arms = wide_arms(&gpu, QsaFilterKnobs::default());
+    let mut cases = 0usize;
+    for blocks in THRESHOLD_BLOCKS {
+        let arena = blocks + ARENA_SLACK;
+        for kind in [Keys::Dense, Keys::Ties] {
+            let base = keys_bf16(kind, arena, arena);
+            let pooled = upload_bf16(&mut gpu, &base);
+            for tail in [0usize, 3] {
+                let e_end = blocks * COMPRESS + tail;
+                if e_end > MAX_CONTEXT {
+                    continue;
+                }
+                upload_window_arena(&gpu, &pooled, &base, blocks);
+                for n in ROWS_RAGGED {
+                    let label = format!("B={blocks} keys={kind:?} tail={tail}");
+                    cases += wide_window(&mut gpu, &w, &pooled, &base, arena, e_end, n, &arms, false, &label);
+                }
+            }
+            gpu.free_tensor(pooled).expect("free pooled");
+        }
+    }
+    for t in rowq {
+        gpu.free_tensor(t).expect("free row query");
+    }
+    fx.free(&mut gpu);
+    fx1.free(&mut gpu);
+    println!("{cases} threshold arm cases bit-exact vs one-row calls");
+}
+
+/// Forced repair (`cap = 16`: every row repaired) and `target = 1` (underfilled
+/// candidates) must stay exact and per-row independent at wide row counts.
+#[test]
+fn qsa_bf16_wide_rows_forced_repair_equal_one_row_calls() {
+    let Some(mut gpu) = gpu_or_skip() else { return };
+    let fx = Fixture::with_max_rows(&mut gpu, PRODUCTION, WIDE_VERIFY_MAX_ROWS);
+    let fx1 = Fixture::with_max_rows(&mut gpu, PRODUCTION, 1);
+    let rowq = upload_row_queries(&mut gpu);
+    let w = Wide { fx: &fx, fx1: &fx1, rowq: &rowq };
+    let default_knobs = QsaFilterKnobs::default();
+    let mut arms = Vec::new();
+    for knobs in [
+        QsaFilterKnobs { cap: 16, ..default_knobs },
+        QsaFilterKnobs { target: 1, ..default_knobs },
+    ] {
+        arms.push(WideArm::SplitFilter(knobs));
+        arms.push(WideArm::FilterHipcc(knobs));
+        if gpu.arch_caps.is_gfx1151() {
+            arms.push(WideArm::FilterPm(knobs));
+        }
+    }
+    let mut cases = 0usize;
+    for depth in [32768usize, MAX_CONTEXT] {
+        let arena = depth / COMPRESS + ARENA_SLACK;
+        for kind in [Keys::Dense, Keys::Ties] {
+            let base = keys_bf16(kind, arena, arena);
+            let pooled = upload_bf16(&mut gpu, &base);
+            upload_window_arena(&gpu, &pooled, &base, depth / COMPRESS);
+            for n in ROWS_RAGGED {
+                let label = format!("depth={depth} keys={kind:?}");
+                cases += wide_window(&mut gpu, &w, &pooled, &base, arena, depth, n, &arms, false, &label);
+            }
+            gpu.free_tensor(pooled).expect("free pooled");
+        }
+    }
+    for t in rowq {
+        gpu.free_tensor(t).expect("free row query");
+    }
+    fx.free(&mut gpu);
+    fx1.free(&mut gpu);
+    println!("{cases} forced-repair arm cases bit-exact vs one-row calls");
 }
 
 // ---------------------------------------------------------------------------

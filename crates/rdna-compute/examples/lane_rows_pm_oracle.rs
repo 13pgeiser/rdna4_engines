@@ -3,50 +3,134 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle and timing for the gfx1151 lane-rows PM kernels
-//! (`qwen4_lane_rows_pm`, `rdna_compute::lane_rows_pm`).
+//! (`qwen4_lane_rows_pm`, `rdna_compute::lane_rows_pm`), narrow (`B <= 8`) and
+//! exact-wide (`B <= 32`).
 //!
-//! `lane_rows_pm_oracle [--bench N]`: for each export and every column count
-//! `B` in `1..=8`, on seeded random weights and activations (random packed
+//! `lane_rows_pm_oracle [--wide-cap 16|32] [--bench N]`
+//!
+//! Every shape runs on seeded random weights and activations (random packed
 //! payloads, finite f16 headers incl. zero and subnormal scales, x columns of
-//! very different magnitudes with `+-0` and F32 subnormals, one all-zero
-//! column and one column large enough to reach the k8 `hc_act` exp guards),
-//! the PM launcher's whole `y` allocation (guards and unused columns
-//! included) must equal the expectation built from
+//! very different magnitudes with `+-0` and F32 subnormals, all-zero columns
+//! and columns large enough to reach the k8 `hc_act` exp guards, 32 columns in
+//! all). The reference of every case is `MAXB = 32` launches of the 1-row
+//! incumbent, one per column:
 //!
-//! 1. `B` launches of the 1-row incumbent (`gemv_mq6g256v2`,
-//!    `gemv_mq6g256v2` per matrix for the x4 form, `gemv_q8_0_k8`,
-//!    `gemv_q8_0` at K = 320), one per column, and
-//! 2. the incumbent rows kernel at `rows = B` (`gemm_mq6g256v2_f32_rows`,
-//!    `gemm_mq6g256v2_f32_rows_x4`, `gemv_q8_0_k8_rows`,
-//!    `gemv_q8_0_staged_rows`; `B >= 2`).
+//! | family | 1-row reference |
+//! |---|---|
+//! | MQ6G256V2 single / x4 | `Gpu::gemv_mq6g256v2` (per matrix) |
+//! | Q8 K = 320 / 640 / small K / 2560, single and x2 | `Gpu::gemv_q8_0` (per matrix); the launched symbol is asserted to be the shape-selected decode object (`gemv_q8_0_k320_staged`, `gemv_q8_0_wide_k640_staged`, `gemv_q8_0_wide`, `gemv_q8_0_k2560_staged`) |
+//! | Q8 HC k8 | `Gpu::gemv_q8_0_k8` |
+//!
+//! ## Narrow PM (`B = 1..=8`, existing cases only)
+//!
+//! The PM launcher's whole `y` allocation (guards and unused columns included)
+//! must equal the expectation built from the 1-row reference and from the
+//! incumbent rows kernel at `rows = B` (`gemm_mq6g256v2_f32_rows`,
+//! `gemm_mq6g256v2_f32_rows_x4`, `gemv_q8_0_k8_rows`,
+//! `gemv_q8_0_staged_rows`; `B >= 2`). The rows kernels are never consulted
+//! above `B = 8`.
+//!
+//! ## Wide PM (`B = 1..=32`, every case)
+//!
+//! The wide symbols are launched directly from the embedded image
+//! [`kernels::QWEN4_LANE_ROWS_PM_GFX1151`] (its SHA-256 pin is checked first),
+//! with hand-built kernarg blobs, so no admission flag, route or launcher is
+//! involved:
+//!
+//! | symbol (`r` = 16 or 32) | kernarg | grid x block |
+//! |---|---|---|
+//! | `gemv_mq6g256v2_xbatch_wide_r{r}_pm` | 36 B `A0 X8 Y16 M24 K28 B32` | `ceil(M/8)` x 256 |
+//! | `gemv_mq6g256v2_x4_xbatch_wide_r{r}_pm` | 96 B `A0..A3@0,8,16,24 X32 Y0..Y3@40..64 M0..M3@72..84 K88 B92` | `sum ceil(Mi/8)` x 256 |
+//! | `gemv_q8_0_{k320,k2560,wide}_xbatch_wide_r{r}_pm` | 36 B `A0 X8 Y16 M24 K28 B32` | `ceil(M/8)` x 256 |
+//! | `gemv_q8_0_k2560_x2_xbatch_wide_r{r}_pm` | 56 B ptrs `A0 A1 X Y0 Y1 @0,8,16,24,32`, `M0@40 M1@44 K48 B52` | `ceil(M0/8)+ceil(M1/8)` x 256 |
+//! | `gemv_q8_0_k8_xbatch_wide_r{r}_pm` | 44 B `A0 X8 Y16 M24 K28 B32 scale36 hc_act40` | `ceil(M/2)` x 512 |
+//!
+//! Without `--wide-cap` the production cap selection is exercised: `_r16` for
+//! `B <= 16`, `_r32` for `B = 17..=32`, so every `B` in `1..=32` is launched
+//! once. `--wide-cap C` launches only `_r{C}` and at every `B <= C` (`16`:
+//! `B = 1..=16`; `32`: `B = 1..=32`), only that cap's symbols being required
+//! in the image. Every wide launch writes into a sentinel-prefilled,
+//! guard-bracketed allocation holding all 32 columns: guards, inactive
+//! columns (`B..32`) and inactive weight rows must keep the sentinel and
+//! every active byte must equal the reference.
+//!
+//! Q8 fixtures: K = 320 (ten blocks, single chain), K = 2560 single and x2
+//! (single chain), K = 640 and `K = 96, 160, 192, 224, 352, 480, 1248, 1344`
+//! (the four-chain small-K recipe; the latter leave 3 / 1 / 2 tail blocks for
+//! chains `a0..a2`), HC k8 at `K % 2048 == 0` and at `K` whose `K/8`
+//! partitions end in a short tile (`2304`, `2560`).
 //!
 //! The first differing byte is reported as guard / (column, row, byte). The
-//! process exits 0 only if every byte of every case matches.
+//! process exits 0 only if every byte of every case matches, 2 on a launch /
+//! image / reference-symbol error.
 //!
 //! `--bench N`: after the oracle, median HIP-event microseconds (5 warmups, N
-//! samples) of one PM launch vs one incumbent rows launch at the C8 lane-step
-//! shapes (`fn-batch/s7/DAG.md` §5) at `B = 4` and `B = 8`, plus the weight
-//! bytes per PM launch as GB/s.
+//! samples) of one narrow PM launch vs one incumbent rows launch at the C8
+//! lane-step shapes (`fn-batch/s7/DAG.md` §5) at `B = 4` and `B = 8`, plus the
+//! weight bytes per PM launch as GB/s.
 //!
 //! The incumbents run with `lane_rows_scope = false`, so they are always the
 //! hipcc kernels whatever `HIPFIRE_FN_LANE_PM_ROWS` says.
 
-use rdna_compute::{DType, Gpu, GpuTensor};
+use hip_bridge::KernargBlob;
+use rdna_compute::{kernels, DType, Gpu, GpuTensor};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 type Result<T, E = String> = std::result::Result<T, E>;
 
-const MAXB: usize = 8;
+/// Columns of every case: the exact-wide cap.
+const MAXB: usize = 32;
+/// Largest narrow column count.
+const NARROW_MAX: usize = 8;
 /// Guard floats on each side of every output allocation.
 const GUARD: usize = 64;
 const SENTINEL: u8 = 0x7f;
 const HC_SCALE: f32 = 0.25;
-/// Column magnitudes: `0.0` is the all-zero (+-0) column, `1024` reaches the
-/// k8 `hc_act` exp guards.
-const AMPS: [f32; MAXB] = [1.0, 1.0 / 1024.0, 1.0 / 16.0, 4.0, 64.0, 0.5, 0.0, 1024.0];
+/// Column magnitudes: `0.0` is an all-zero (+-0) column, `1024` reaches the
+/// k8 `hc_act` exp guards. Columns 0..8 are the narrow oracle's.
+const AMPS: [f32; MAXB] = [
+    1.0,
+    1.0 / 1024.0,
+    1.0 / 16.0,
+    4.0,
+    64.0,
+    0.5,
+    0.0,
+    1024.0,
+    2.0,
+    1.0 / 256.0,
+    8.0,
+    1.0 / 4096.0,
+    128.0,
+    0.25,
+    32.0,
+    1.0 / 64.0,
+    0.0,
+    0.75,
+    16.0,
+    1024.0,
+    1.0 / 32.0,
+    256.0,
+    3.0,
+    1.0 / 8.0,
+    1.0 / 2048.0,
+    48.0,
+    1.5,
+    512.0,
+    1.0 / 512.0,
+    12.0,
+    0.0,
+    1024.0,
+];
 
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 struct Rng(u64);
@@ -181,19 +265,112 @@ impl Out {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wide image: direct module / blob launches.
+// ---------------------------------------------------------------------------
+
+/// Exact-wide symbol of `stem` at capacity `cap`.
+fn wide_symbol(stem: &str, cap: usize) -> String {
+    format!("{stem}_wide_r{cap}_pm")
+}
+
+const MQ6_STEM: &str = "gemv_mq6g256v2_xbatch";
+const MQ6_X4_STEM: &str = "gemv_mq6g256v2_x4_xbatch";
+const Q8_K8_STEM: &str = "gemv_q8_0_k8_xbatch";
+const Q8_K320_STEM: &str = "gemv_q8_0_k320_xbatch";
+const Q8_K2560_STEM: &str = "gemv_q8_0_k2560_xbatch";
+const Q8_WIDE_STEM: &str = "gemv_q8_0_wide_xbatch";
+const Q8_K2560_X2_STEM: &str = "gemv_q8_0_k2560_x2_xbatch";
+
+const STEMS: [&str; 7] =
+    [MQ6_STEM, MQ6_X4_STEM, Q8_K8_STEM, Q8_K320_STEM, Q8_K2560_STEM, Q8_WIDE_STEM, Q8_K2560_X2_STEM];
+
+/// The embedded `qwen4_lane_rows_pm` image, loaded as a private module with
+/// every wide symbol of the selected caps resolved up front.
+struct WideImage {
+    _module: hip_bridge::Module,
+    funcs: HashMap<String, hip_bridge::Function>,
+}
+
+impl WideImage {
+    fn load(gpu: &Gpu, caps: &[usize]) -> Result<Self> {
+        let want = kernels::QWEN4_LANE_ROWS_PM_GFX1151_SHA256;
+        let got = sha256_hex(kernels::QWEN4_LANE_ROWS_PM_GFX1151);
+        if want.is_empty() {
+            return Err("QWEN4_LANE_ROWS_PM_GFX1151_SHA256 is not pinned".into());
+        }
+        if got != want {
+            return Err(format!("embedded qwen4_lane_rows_pm image sha256 {got} is not the pinned {want}"));
+        }
+        gpu.bind_thread().map_err(err)?;
+        let module = gpu.hip.module_load_data(kernels::QWEN4_LANE_ROWS_PM_GFX1151).map_err(err)?;
+        let mut funcs = HashMap::new();
+        let mut missing = Vec::new();
+        for &cap in caps {
+            for stem in STEMS {
+                let symbol = wide_symbol(stem, cap);
+                match gpu.hip.module_get_function(&module, &symbol) {
+                    Ok(f) => {
+                        funcs.insert(symbol, f);
+                    }
+                    Err(e) => missing.push(format!("{symbol} ({e})")),
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Err(format!("embedded image {got} lacks wide symbols: {}", missing.join(", ")));
+        }
+        Ok(Self { _module: module, funcs })
+    }
+
+    /// One launch of `symbol` over `kb` (whose length must be the symbol's ABI
+    /// size `abi`), 1-D grid `grid` x `block`.
+    fn launch(&self, gpu: &Gpu, symbol: &str, grid: usize, block: u32, mut kb: KernargBlob, abi: usize) -> Result<()> {
+        if kb.len() != abi {
+            return Err(format!("{symbol}: kernarg is {} bytes, ABI is {abi}", kb.len()));
+        }
+        if grid == 0 || grid > u32::MAX as usize {
+            return Err(format!("{symbol}: grid {grid} out of range"));
+        }
+        let func = self.funcs.get(symbol).ok_or_else(|| format!("{symbol}: not loaded"))?;
+        gpu.bind_thread().map_err(err)?;
+        // The raw launch is not ordered against the Gpu's own stream.
+        gpu.hip.device_synchronize().map_err(err)?;
+        // SAFETY: the blob follows the symbol's ABI and addresses live allocations.
+        unsafe { gpu.hip.launch_kernel_blob(func, [grid as u32, 1, 1], [block, 1, 1], 0, None, kb.as_mut_slice()) }.map_err(err)
+    }
+}
+
+/// The wide capacity a launch of `b` columns uses: with an explicit `--wide-cap`
+/// that cap at every `b <= cap` (none above), else production's selection
+/// (16 for `b <= 16`, 32 otherwise).
+fn wide_cap_for(flag: Option<usize>, b: usize) -> Option<usize> {
+    match flag {
+        Some(cap) => (b <= cap).then_some(cap),
+        None => Some(if b <= 16 { 16 } else { 32 }),
+    }
+}
+
 type Launch = Box<dyn Fn(&mut Gpu, usize) -> Result<()>>;
+/// `wide(gpu, image, cap, b)`.
+type WideLaunch = Box<dyn Fn(&mut Gpu, &WideImage, usize, usize) -> Result<()>>;
 
 /// One shape: `single(gpu, c)` is the 1-row incumbent on column `c` writing
 /// column `c` of every output, `rows(gpu, b)` the incumbent rows kernel (b >=
-/// 2), `pm(gpu, b)` the PM launcher.
+/// 2, `b <= 8`), `pm(gpu, b)` the narrow PM launcher (`b <= 8`), `wide(gpu,
+/// image, cap, b)` the direct wide launch. Cases without a narrow PM / rows
+/// route have `pm` / `rows` = `None`.
 struct Case {
     name: String,
     outs: Vec<Out>,
     /// Packed weight bytes one launch reads.
     weight_bytes: usize,
+    /// Symbol the 1-row reference must launch (checked when known).
+    ref_symbol: Option<&'static str>,
     single: Launch,
-    rows: Launch,
-    pm: Launch,
+    rows: Option<Launch>,
+    pm: Option<Launch>,
+    wide: WideLaunch,
 }
 
 impl Case {
@@ -214,15 +391,27 @@ fn mq6_case(gpu: &mut Gpu, m: usize, k: usize, rng: &mut Rng) -> Result<Case> {
     let y = Rc::new(out.view());
     let (w1, x1, y1) = (w.clone(), x.clone(), y.clone());
     let (w2, x2, y2) = (w.clone(), x.clone(), y.clone());
+    let (w3, x3, y3) = (w.clone(), x.clone(), y.clone());
     Ok(Case {
         name: format!("mq6 m={m} k={k}"),
         outs: vec![out],
         weight_bytes: weights.len(),
+        ref_symbol: None,
         single: Box::new(move |gpu, c| {
             gpu.gemv_mq6g256v2(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k).map_err(err)
         }),
-        rows: Box::new(move |gpu, b| gpu.gemm_mq6g256v2_f32_rows(&w2, &x2, &y2, m, k, b).map_err(err)),
-        pm: Box::new(move |gpu, b| gpu.gemv_mq6g256v2_xbatch_pm(&w, &x, &y, m, k, b).map_err(err)),
+        rows: Some(Box::new(move |gpu, b| gpu.gemm_mq6g256v2_f32_rows(&w2, &x2, &y2, m, k, b).map_err(err))),
+        pm: Some(Box::new(move |gpu, b| gpu.gemv_mq6g256v2_xbatch_pm(&w, &x, &y, m, k, b).map_err(err))),
+        wide: Box::new(move |gpu, img, cap, b| {
+            let mut kb = KernargBlob::new();
+            kb.push_ptr(w3.buf.as_ptr());
+            kb.push_ptr(x3.buf.as_ptr());
+            kb.push_ptr(y3.buf.as_ptr());
+            kb.push_i32(m as i32);
+            kb.push_i32(k as i32);
+            kb.push_i32(b as i32);
+            img.launch(gpu, &wide_symbol(MQ6_STEM, cap), m.div_ceil(8), 256, kb, 36)
+        }),
     })
 }
 
@@ -242,10 +431,12 @@ fn mq6_x4_case(gpu: &mut Gpu, ms: [usize; 4], k: usize, rng: &mut Rng) -> Result
     let ys: Vec<Rc<GpuTensor>> = outs.iter().map(|o| Rc::new(o.view())).collect();
     let (ws1, ys1, x1) = (ws.clone(), ys.clone(), x.clone());
     let (ws2, ys2, x2) = (ws.clone(), ys.clone(), x.clone());
+    let (ws3, ys3, x3) = (ws.clone(), ys.clone(), x.clone());
     Ok(Case {
         name: format!("mq6 x4 ms={ms:?} k={k}"),
         outs,
         weight_bytes,
+        ref_symbol: None,
         single: Box::new(move |gpu, c| {
             for i in 0..4 {
                 if ms[i] > 0 {
@@ -255,17 +446,37 @@ fn mq6_x4_case(gpu: &mut Gpu, ms: [usize; 4], k: usize, rng: &mut Rng) -> Result
             }
             Ok(())
         }),
-        rows: Box::new(move |gpu, b| {
+        rows: Some(Box::new(move |gpu, b| {
             let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|i| (&*ws2[i], &*ys2[i], ms[i]));
             gpu.gemm_mq6g256v2_f32_rows_x4(parts, &x2, k, b).map_err(err)
-        }),
-        pm: Box::new(move |gpu, b| {
+        })),
+        pm: Some(Box::new(move |gpu, b| {
             let parts: [(&GpuTensor, &GpuTensor, usize); 4] = std::array::from_fn(|i| (&*ws[i], &*ys[i], ms[i]));
             gpu.gemv_mq6g256v2_x4_xbatch_pm(parts, &x, k, b).map_err(err)
+        })),
+        wide: Box::new(move |gpu, img, cap, b| {
+            let mut kb = KernargBlob::new();
+            for w in &ws3 {
+                kb.push_ptr(w.buf.as_ptr());
+            }
+            kb.push_ptr(x3.buf.as_ptr());
+            for y in &ys3 {
+                kb.push_ptr(y.buf.as_ptr());
+            }
+            for m in ms {
+                kb.push_i32(m as i32);
+            }
+            kb.push_i32(k as i32);
+            kb.push_i32(b as i32);
+            let grid: usize = ms.iter().map(|m| m.div_ceil(8)).sum();
+            img.launch(gpu, &wide_symbol(MQ6_X4_STEM, cap), grid, 256, kb, 96)
         }),
     })
 }
 
+/// `Gpu::gemv_q8_0_k8` is launched for the HC k8 projection at `K % 256 == 0`;
+/// the narrow PM launcher (and the rows incumbent compared against it) is
+/// admitted at `K % 2048 == 0` only.
 fn q8_k8_case(gpu: &mut Gpu, m: usize, k: usize, hc_act: bool, rng: &mut Rng) -> Result<Case> {
     let weights = gen_q8(m, k, rng);
     let w = Rc::new(gpu.upload_raw(&weights, &[weights.len()]).map_err(err)?);
@@ -274,39 +485,175 @@ fn q8_k8_case(gpu: &mut Gpu, m: usize, k: usize, hc_act: bool, rng: &mut Rng) ->
     let out = Out::new(gpu, m)?;
     let y = Rc::new(out.view());
     let scale = hc_act.then_some(HC_SCALE);
+    let narrow = k.is_multiple_of(2048);
     let (w1, x1, y1) = (w.clone(), x.clone(), y.clone());
     let (w2, x2, y2) = (w.clone(), x.clone(), y.clone());
+    let (w3, x3, y3) = (w.clone(), x.clone(), y.clone());
+    let rows: Option<Launch> = narrow
+        .then(|| Box::new(move |gpu: &mut Gpu, b: usize| gpu.gemv_q8_0_k8_rows(&w2, &x2, &y2, m, k, scale, b).map_err(err)) as Launch);
+    let pm: Option<Launch> = narrow
+        .then(|| Box::new(move |gpu: &mut Gpu, b: usize| gpu.gemv_q8_0_k8_xbatch_pm(&w, &x, &y, m, k, scale, b).map_err(err)) as Launch);
     Ok(Case {
         name: format!("q8 k8 m={m} k={k} hc_act={}", u8::from(hc_act)),
         outs: vec![out],
         weight_bytes: weights.len(),
+        ref_symbol: Some("gemv_q8_0_k8"),
         single: Box::new(move |gpu, c| {
             gpu.gemv_q8_0_k8(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k, scale).map_err(err)
         }),
-        rows: Box::new(move |gpu, b| gpu.gemv_q8_0_k8_rows(&w2, &x2, &y2, m, k, scale, b).map_err(err)),
-        pm: Box::new(move |gpu, b| gpu.gemv_q8_0_k8_xbatch_pm(&w, &x, &y, m, k, scale, b).map_err(err)),
+        rows,
+        pm,
+        wide: Box::new(move |gpu, img, cap, b| {
+            let mut kb = KernargBlob::new();
+            kb.push_ptr(w3.buf.as_ptr());
+            kb.push_ptr(x3.buf.as_ptr());
+            kb.push_ptr(y3.buf.as_ptr());
+            kb.push_i32(m as i32);
+            kb.push_i32(k as i32);
+            kb.push_i32(b as i32);
+            kb.push_f32(scale.unwrap_or(1.0));
+            kb.push_i32(i32::from(scale.is_some()));
+            img.launch(gpu, &wide_symbol(Q8_K8_STEM, cap), m.div_ceil(2), 512, kb, 44)
+        }),
     })
 }
 
-fn q8_k320_case(gpu: &mut Gpu, m: usize, rng: &mut Rng) -> Result<Case> {
-    const K: usize = 320;
-    let weights = gen_q8(m, K, rng);
+/// Ordinary Q8_0 recipe of the wide symbol.
+#[derive(Clone, Copy)]
+enum Q8Kind {
+    /// K = 320, ten blocks, one chain.
+    K320,
+    /// K = 2560, one chain.
+    K2560,
+    /// Small K (`<= 1536`, not 320): four chains, tail blocks to `a0..a2`.
+    Wide,
+}
+
+impl Q8Kind {
+    fn stem(self) -> &'static str {
+        match self {
+            Self::K320 => Q8_K320_STEM,
+            Self::K2560 => Q8_K2560_STEM,
+            Self::Wide => Q8_WIDE_STEM,
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            Self::K320 => "k320",
+            Self::K2560 => "k2560",
+            Self::Wide => "wide",
+        }
+    }
+    fn admits(self, k: usize) -> bool {
+        match self {
+            Self::K320 => k == 320,
+            Self::K2560 => k == 2560,
+            Self::Wide => k != 320 && k.is_multiple_of(32) && (32..=1536).contains(&k),
+        }
+    }
+}
+
+/// The symbol `Gpu::gemv_q8_0` launches on gfx1151 at `k`.
+fn q8_decode_symbol(k: usize) -> &'static str {
+    match k {
+        320 => "gemv_q8_0_k320_staged",
+        640 => "gemv_q8_0_wide_k640_staged",
+        2560 => "gemv_q8_0_k2560_staged",
+        _ => "gemv_q8_0_wide",
+    }
+}
+
+fn q8_case(gpu: &mut Gpu, kind: Q8Kind, m: usize, k: usize, rng: &mut Rng) -> Result<Case> {
+    if !kind.admits(k) {
+        return Err(format!("q8 {} fixture does not take k={k}", kind.tag()));
+    }
+    let weights = gen_q8(m, k, rng);
     let w = Rc::new(gpu.upload_raw(&weights, &[weights.len()]).map_err(err)?);
-    let xs = gen_x(K, rng);
+    let xs = gen_x(k, rng);
     let x = Rc::new(gpu.upload_f32(&xs, &[xs.len()]).map_err(err)?);
     let out = Out::new(gpu, m)?;
     let y = Rc::new(out.view());
     let (w1, x1, y1) = (w.clone(), x.clone(), y.clone());
     let (w2, x2, y2) = (w.clone(), x.clone(), y.clone());
+    let (w3, x3, y3) = (w.clone(), x.clone(), y.clone());
+    let (rows, pm): (Option<Launch>, Option<Launch>) = if matches!(kind, Q8Kind::K320) {
+        (
+            Some(Box::new(move |gpu, b| gpu.gemv_q8_0_staged_rows(&w2, &x2, &y2, m, k, b).map_err(err))),
+            Some(Box::new(move |gpu, b| gpu.gemv_q8_0_k320_xbatch_pm(&w, &x, &y, m, b).map_err(err))),
+        )
+    } else {
+        (None, None)
+    };
     Ok(Case {
-        name: format!("q8 k320 m={m}"),
+        name: format!("q8 {} m={m} k={k}", kind.tag()),
         outs: vec![out],
         weight_bytes: weights.len(),
+        ref_symbol: Some(q8_decode_symbol(k)),
         single: Box::new(move |gpu, c| {
-            gpu.gemv_q8_0(&w1, &x1.sub_offset(c * K, K), &y1.sub_offset(c * m, m), m, K).map_err(err)
+            gpu.gemv_q8_0(&w1, &x1.sub_offset(c * k, k), &y1.sub_offset(c * m, m), m, k).map_err(err)
         }),
-        rows: Box::new(move |gpu, b| gpu.gemv_q8_0_staged_rows(&w2, &x2, &y2, m, K, b).map_err(err)),
-        pm: Box::new(move |gpu, b| gpu.gemv_q8_0_k320_xbatch_pm(&w, &x, &y, m, b).map_err(err)),
+        rows,
+        pm,
+        wide: Box::new(move |gpu, img, cap, b| {
+            let mut kb = KernargBlob::new();
+            kb.push_ptr(w3.buf.as_ptr());
+            kb.push_ptr(x3.buf.as_ptr());
+            kb.push_ptr(y3.buf.as_ptr());
+            kb.push_i32(m as i32);
+            kb.push_i32(k as i32);
+            kb.push_i32(b as i32);
+            img.launch(gpu, &wide_symbol(kind.stem(), cap), m.div_ceil(8), 256, kb, 36)
+        }),
+    })
+}
+
+/// Two K = 2560 Q8_0 matrices (shared gate/up) reading one `x`; an unused slot
+/// carries `m = 0`.
+fn q8_x2_case(gpu: &mut Gpu, ms: [usize; 2], rng: &mut Rng) -> Result<Case> {
+    const K: usize = 2560;
+    let mut ws = Vec::new();
+    let mut outs = Vec::new();
+    let mut weight_bytes = 0;
+    for &m in &ms {
+        let bytes = if m == 0 { vec![0u8; 256] } else { gen_q8(m, K, rng) };
+        weight_bytes += if m == 0 { 0 } else { bytes.len() };
+        ws.push(Rc::new(gpu.upload_raw(&bytes, &[bytes.len()]).map_err(err)?));
+        outs.push(Out::new(gpu, m)?);
+    }
+    let xs = gen_x(K, rng);
+    let x = Rc::new(gpu.upload_f32(&xs, &[xs.len()]).map_err(err)?);
+    let ys: Vec<Rc<GpuTensor>> = outs.iter().map(|o| Rc::new(o.view())).collect();
+    let (ws1, ys1, x1) = (ws.clone(), ys.clone(), x.clone());
+    Ok(Case {
+        name: format!("q8 k2560 x2 ms={ms:?}"),
+        outs,
+        weight_bytes,
+        ref_symbol: Some(q8_decode_symbol(K)),
+        single: Box::new(move |gpu, c| {
+            for i in 0..2 {
+                if ms[i] > 0 {
+                    let (m, yv) = (ms[i], &ys1[i]);
+                    gpu.gemv_q8_0(&ws1[i], &x1.sub_offset(c * K, K), &yv.sub_offset(c * m, m), m, K).map_err(err)?;
+                }
+            }
+            Ok(())
+        }),
+        rows: None,
+        pm: None,
+        wide: Box::new(move |gpu, img, cap, b| {
+            let mut kb = KernargBlob::new();
+            kb.push_ptr(ws[0].buf.as_ptr());
+            kb.push_ptr(ws[1].buf.as_ptr());
+            kb.push_ptr(x.buf.as_ptr());
+            kb.push_ptr(ys[0].buf.as_ptr());
+            kb.push_ptr(ys[1].buf.as_ptr());
+            kb.push_i32(ms[0] as i32);
+            kb.push_i32(ms[1] as i32);
+            kb.push_i32(K as i32);
+            kb.push_i32(b as i32);
+            let grid = ms[0].div_ceil(8) + ms[1].div_ceil(8);
+            img.launch(gpu, &wide_symbol(Q8_K2560_X2_STEM, cap), grid, 256, kb, 56)
+        }),
     })
 }
 
@@ -327,14 +674,16 @@ fn diff(a: &[u8], b: &[u8]) -> (usize, Option<usize>) {
 struct Tally {
     cases: usize,
     launches: usize,
+    wide_launches: usize,
     pm_vs_single: usize,
     pm_vs_rows: usize,
     rows_vs_single: usize,
+    wide_vs_single: usize,
 }
 
 impl Tally {
     fn failed(&self) -> bool {
-        self.pm_vs_single + self.pm_vs_rows + self.rows_vs_single > 0
+        self.pm_vs_single + self.pm_vs_rows + self.rows_vs_single + self.wide_vs_single > 0
     }
 }
 
@@ -352,48 +701,88 @@ fn compare(case: &Case, got: &[Vec<u8>], want: &[Vec<u8>]) -> (usize, Option<Str
     (bad, first)
 }
 
-fn verify(gpu: &mut Gpu, case: &Case, tally: &mut Tally) -> Result<()> {
+fn verify(gpu: &mut Gpu, img: &WideImage, wide_flag: Option<usize>, case: &Case, tally: &mut Tally) -> Result<()> {
     case.reset(gpu)?;
+    let mut ref_symbol = String::from("<none>");
     for c in 0..MAXB {
         (case.single)(gpu, c)?;
+        if c == 0 {
+            ref_symbol = gpu.last_launched_kernel().unwrap_or("<none>").to_string();
+        }
+    }
+    if let Some(want) = case.ref_symbol {
+        if ref_symbol != want {
+            return Err(format!("{}: the 1-row reference launched {ref_symbol}, not the decode object {want}", case.name));
+        }
     }
     let reference = case.download(gpu)?;
     let mut line = format!("{:<44}", case.name);
     let mut bad_case = 0;
+
+    // Narrow PM (and the incumbent rows kernel) over B = 1..=8.
+    if let Some(pm) = &case.pm {
+        for b in 1..=NARROW_MAX {
+            let expected: Vec<Vec<u8>> = case.outs.iter().zip(&reference).map(|(o, r)| o.expected(r, b)).collect();
+            case.reset(gpu)?;
+            pm(gpu, b)?;
+            let got_pm = case.download(gpu)?;
+            let (bad, first) = compare(case, &got_pm, &expected);
+            tally.pm_vs_single += bad;
+            tally.launches += 1;
+            let mut note = String::new();
+            if let Some(first) = first {
+                note.push_str(&format!(" B={b}: PM differs from 1-row incumbent at {first};"));
+            }
+            if let (true, Some(rows)) = (b >= 2, &case.rows) {
+                case.reset(gpu)?;
+                rows(gpu, b)?;
+                let got_rows = case.download(gpu)?;
+                let (rows_bad, rows_first) = compare(case, &got_rows, &expected);
+                let (pm_rows_bad, pm_rows_first) = compare(case, &got_pm, &got_rows);
+                tally.rows_vs_single += rows_bad;
+                tally.pm_vs_rows += pm_rows_bad;
+                tally.launches += 1;
+                if let Some(first) = rows_first {
+                    note.push_str(&format!(" B={b}: incumbent rows differs from 1-row incumbent at {first};"));
+                }
+                if let Some(first) = pm_rows_first {
+                    note.push_str(&format!(" B={b}: PM differs from incumbent rows at {first};"));
+                }
+                bad_case += rows_bad + pm_rows_bad;
+            }
+            bad_case += bad;
+            line.push_str(&note);
+        }
+    }
+
+    // Exact-wide PM over every B the cap selection admits.
+    let mut wide_launches = 0;
     for b in 1..=MAXB {
+        let Some(cap) = wide_cap_for(wide_flag, b) else { continue };
         let expected: Vec<Vec<u8>> = case.outs.iter().zip(&reference).map(|(o, r)| o.expected(r, b)).collect();
         case.reset(gpu)?;
-        (case.pm)(gpu, b)?;
-        let got_pm = case.download(gpu)?;
-        let (bad, first) = compare(case, &got_pm, &expected);
-        tally.pm_vs_single += bad;
+        (case.wide)(gpu, img, cap, b)?;
+        let got = case.download(gpu)?;
+        let (bad, first) = compare(case, &got, &expected);
+        tally.wide_vs_single += bad;
         tally.launches += 1;
-        let mut note = String::new();
-        if let Some(first) = first {
-            note.push_str(&format!(" B={b}: PM differs from 1-row incumbent at {first};"));
-        }
-        if b >= 2 {
-            case.reset(gpu)?;
-            (case.rows)(gpu, b)?;
-            let got_rows = case.download(gpu)?;
-            let (rows_bad, rows_first) = compare(case, &got_rows, &expected);
-            let (pm_rows_bad, pm_rows_first) = compare(case, &got_pm, &got_rows);
-            tally.rows_vs_single += rows_bad;
-            tally.pm_vs_rows += pm_rows_bad;
-            tally.launches += 1;
-            if let Some(first) = rows_first {
-                note.push_str(&format!(" B={b}: incumbent rows differs from 1-row incumbent at {first};"));
-            }
-            if let Some(first) = pm_rows_first {
-                note.push_str(&format!(" B={b}: PM differs from incumbent rows at {first};"));
-            }
-            bad_case += rows_bad + pm_rows_bad;
-        }
+        tally.wide_launches += 1;
+        wide_launches += 1;
         bad_case += bad;
-        line.push_str(&note);
+        if let Some(first) = first {
+            line.push_str(&format!(" B={b}: wide_r{cap} differs from 1-row incumbent at {first};"));
+        }
     }
     tally.cases += 1;
-    println!("{line} {}", if bad_case == 0 { "ok (B=1..8)".to_string() } else { format!("MISMATCH ({bad_case} bytes)") });
+    let mut scope = Vec::new();
+    if case.pm.is_some() {
+        scope.push(format!("narrow B=1..{NARROW_MAX}"));
+    }
+    scope.push(format!("wide {wide_launches} launches"));
+    println!(
+        "{line} [ref {ref_symbol}] {}",
+        if bad_case == 0 { format!("ok ({})", scope.join(", ")) } else { format!("MISMATCH ({bad_case} bytes)") }
+    );
     Ok(())
 }
 
@@ -422,9 +811,12 @@ fn time_us(gpu: &mut Gpu, n: usize, f: &dyn Fn(&mut Gpu) -> Result<()>) -> Resul
 }
 
 fn bench(gpu: &mut Gpu, case: &Case, n: usize) -> Result<()> {
+    let (Some(pm_launch), Some(rows_launch)) = (&case.pm, &case.rows) else {
+        return Err(format!("{}: bench needs the narrow PM and rows routes", case.name));
+    };
     for b in [4, 8] {
-        let pm = time_us(gpu, n, &|g| (case.pm)(g, b))?;
-        let rows = time_us(gpu, n, &|g| (case.rows)(g, b))?;
+        let pm = time_us(gpu, n, &|g| pm_launch(g, b))?;
+        let rows = time_us(gpu, n, &|g| rows_launch(g, b))?;
         println!(
             "{:<44} B={b} PM {pm:>9.1} us  incumbent rows {rows:>9.1} us  x{:.2}  PM weights {:.0} GB/s",
             case.name,
@@ -443,30 +835,69 @@ fn verify_cases(gpu: &mut Gpu) -> Result<Vec<Case>> {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         Rng(seed | 1)
     };
-    for (m, k) in [(1, 256), (5, 2560), (13, 2560), (2560, 6144), (4099, 2560)] {
+    // MQ6: odd M, M = 48, K tails mod four groups (K/256 = 1, 2, 3, 5, 10, 24).
+    for (m, k) in [
+        (1, 256),
+        (5, 2560),
+        (13, 2560),
+        (2560, 6144),
+        (4099, 2560),
+        (9, 768),
+        (17, 1280),
+        (33, 512),
+        (48, 2560),
+    ] {
         cases.push(mq6_case(gpu, m, k, &mut next_rng())?);
     }
-    for ms in [[10240, 6144, 48, 48], [12288, 640, 512, 512], [3, 0, 5, 0]] {
+    for ms in [[10240, 6144, 48, 48], [12288, 640, 512, 512], [3, 0, 5, 0], [7, 9, 15, 33], [0, 17, 0, 1]] {
         cases.push(mq6_x4_case(gpu, ms, 2560, &mut next_rng())?);
     }
-    for (m, k) in [(320, 10240), (7, 2048)] {
+    cases.push(mq6_x4_case(gpu, [17, 5, 48, 9], 1280, &mut next_rng())?);
+    // Q8 HC k8: K % 2048 == 0 (narrow PM too) and K/8 partitions with a short final tile.
+    for (m, k) in [(320, 10240), (7, 2048), (7, 2304), (5, 2560), (13, 512)] {
         for hc_act in [false, true] {
             cases.push(q8_k8_case(gpu, m, k, hc_act, &mut next_rng())?);
         }
     }
-    for m in [10240, 17, 1] {
-        cases.push(q8_k320_case(gpu, m, &mut next_rng())?);
+    // Q8 K = 320 (narrow PM too).
+    for m in [10240, 17, 1, 9, 33] {
+        cases.push(q8_case(gpu, Q8Kind::K320, m, 320, &mut next_rng())?);
+    }
+    // Q8 K = 2560, single chain.
+    for m in [1, 13, 17, 2560, 4099] {
+        cases.push(q8_case(gpu, Q8Kind::K2560, m, 2560, &mut next_rng())?);
+    }
+    for ms in [[2560, 2560], [7, 9], [17, 1], [8, 9], [7, 0]] {
+        cases.push(q8_x2_case(gpu, ms, &mut next_rng())?);
+    }
+    // Q8 four-chain small K: K = 640 (shared-expert down) and block tails.
+    for m in [2560, 17, 1, 9] {
+        cases.push(q8_case(gpu, Q8Kind::Wide, m, 640, &mut next_rng())?);
+    }
+    for k in [96, 160, 192, 224, 352, 480, 1248, 1344] {
+        for m in [13, 9] {
+            cases.push(q8_case(gpu, Q8Kind::Wide, m, k, &mut next_rng())?);
+        }
     }
     Ok(cases)
 }
 
 fn run() -> Result<bool> {
+    const USAGE: &str = "usage: lane_rows_pm_oracle [--wide-cap 16|32] [--bench N]";
     let mut bench_n = None;
+    let mut wide_flag = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--bench" => bench_n = Some(args.next().ok_or("--bench needs N")?.parse::<usize>().map_err(err)?),
-            other => return Err(format!("unknown argument {other} (usage: lane_rows_pm_oracle [--bench N])")),
+            "--wide-cap" => {
+                wide_flag = match args.next().ok_or("--wide-cap needs 16 or 32")?.as_str() {
+                    "16" => Some(16),
+                    "32" => Some(32),
+                    other => return Err(format!("--wide-cap takes 16 or 32, got {other} ({USAGE})")),
+                }
+            }
+            other => return Err(format!("unknown argument {other} ({USAGE})")),
         }
     }
     let mut gpu = Gpu::init().map_err(err)?;
@@ -477,13 +908,26 @@ fn run() -> Result<bool> {
     if gpu.lane_rows_pm_enabled() {
         return Err("the incumbents must run unrouted (lane_rows_scope is off)".into());
     }
+    let caps: Vec<usize> = wide_flag.map_or_else(|| vec![16, 32], |c| vec![c]);
+    let img = WideImage::load(&gpu, &caps)?;
+    println!(
+        "wide image: {} symbols; selection: {}",
+        img.funcs.len(),
+        wide_flag.map_or("production (r16 for B<=16, r32 for B=17..=32)".to_string(), |c| format!("--wide-cap {c} (r{c} at B=1..={c})"))
+    );
     let mut tally = Tally::default();
     for case in verify_cases(&mut gpu)? {
-        verify(&mut gpu, &case, &mut tally)?;
+        verify(&mut gpu, &img, wide_flag, &case, &mut tally)?;
     }
     println!(
-        "{} cases, {} launches: PM vs 1-row incumbent {} bad bytes, PM vs incumbent rows {} bad bytes, incumbent rows vs 1-row {} bad bytes",
-        tally.cases, tally.launches, tally.pm_vs_single, tally.pm_vs_rows, tally.rows_vs_single
+        "{} cases, {} launches ({} wide): wide vs 1-row incumbent {} bad bytes, PM vs 1-row incumbent {} bad bytes, PM vs incumbent rows {} bad bytes, incumbent rows vs 1-row {} bad bytes",
+        tally.cases,
+        tally.launches,
+        tally.wide_launches,
+        tally.wide_vs_single,
+        tally.pm_vs_single,
+        tally.pm_vs_rows,
+        tally.rows_vs_single
     );
     if let Some(n) = bench_n.filter(|&n| n > 0) {
         let mut rng = Rng(0x00c8_0c8c_8c8c_8c8d);
@@ -498,7 +942,7 @@ fn run() -> Result<bool> {
         bench(&mut gpu, &case, n)?;
         let case = q8_k8_case(&mut gpu, 320, 10240, true, &mut rng)?;
         bench(&mut gpu, &case, n)?;
-        let case = q8_k320_case(&mut gpu, 10240, &mut rng)?;
+        let case = q8_case(&mut gpu, Q8Kind::K320, 10240, 320, &mut rng)?;
         bench(&mut gpu, &case, n)?;
     }
     Ok(!tally.failed())
