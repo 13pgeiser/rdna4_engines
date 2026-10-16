@@ -21,9 +21,11 @@ use std::time::Instant;
 use clap::Parser;
 use hipfire_arch_qwen4::artifact::{admit_hfqm_artifact, Qwen4ArtifactError};
 use hipfire_arch_qwen4::expert_slab_table::{
-    build_expert_slab_table, validate_expert_slab_scales, ExpertSlabCounts, ExpertSlabTable,
+    build_expert_slab_table_with_keep, validate_expert_slab_scales, ExpertSlabCounts,
+    ExpertSlabTable,
 };
 use hipfire_arch_qwen4::expert_slabs::{self, ExpertFormat, EXPERTS_PER_LAYER};
+use hipfire_arch_qwen4::ExpertKeep;
 use hipfire_runtime::hfq::HfqFile;
 
 #[derive(Parser, Debug)]
@@ -59,6 +61,10 @@ fn codec_counts_json(table: &ExpertSlabTable) -> serde_json::Value {
         .map(|(layer, slabs)| {
             let mut counts = ExpertSlabCounts::default();
             for slab in slabs {
+                // Absent (pruned) original ids hold zero payload bytes and are in no codec's count.
+                if slab.gate_up.len == 0 && slab.down.len == 0 {
+                    continue;
+                }
                 match slab.format {
                     ExpertFormat::Mq4Xts => counts.mq4 += 1,
                     ExpertFormat::Mq3I4 => counts.w3 += 1,
@@ -90,7 +96,28 @@ fn main() -> ExitCode {
         Ok(None) => return fail("metadata", "no qwen4.expert_slabs key"),
         Err(error) => return fail("metadata", error),
     };
-    let table = match build_expert_slab_table(&metadata, hfq.tensors()) {
+    let json: serde_json::Value = match serde_json::from_str(&hfq.metadata_json) {
+        Ok(v) => v,
+        Err(error) => return fail("keep metadata", error),
+    };
+    let keep = match ExpertKeep::from_metadata(&json) {
+        Ok(keep) => keep,
+        Err(error) => return fail("keep metadata", error),
+    };
+    for info in hfq.tensors() {
+        if let Some((layer, expert, _)) = expert_slabs::parse_expert_entry_name(&info.name) {
+            if keep.as_ref().is_some_and(|k| !k.is_kept(layer, expert)) {
+                return fail("absent expert", format!("unexpected tensor {}", info.name));
+            }
+        }
+    }
+    let routed_bytes: usize = hfq.tensors().iter()
+        .filter(|t| expert_slabs::parse_expert_entry_name(&t.name).is_some())
+        .map(|t| t.data_size).sum();
+    let non_expert_bytes: usize = hfq.tensors().iter()
+        .filter(|t| expert_slabs::parse_expert_entry_name(&t.name).is_none())
+        .map(|t| t.data_size).sum();
+    let table = match build_expert_slab_table_with_keep(&metadata, hfq.tensors(), keep.as_ref()) {
         Ok(table) => table,
         Err(error) => return fail("span table", error),
     };
@@ -110,6 +137,11 @@ fn main() -> ExitCode {
     }
     let validate_s = start.elapsed().as_secs_f64() - table_s;
     let counts = table.counts();
+    if keep.as_ref().is_some_and(|k| {
+        counts.w3 + counts.w2 + counts.e8p + counts.mq4 != k.total_kept()
+    }) {
+        return fail("keep counts", "table count differs from keep total");
+    }
     match admit_hfqm_artifact(&hfq) {
         Err(Qwen4ArtifactError::ExpertSlabKernelsUnavailable { w3, w2, e8p, mq4 })
             if (w3, w2, e8p, mq4) == (counts.w3, counts.w2, counts.e8p, counts.mq4) =>
@@ -121,6 +153,9 @@ fn main() -> ExitCode {
                 "expert_slabs": metadata.to_json_value(),
                 "counts": {"w3": w3, "w2": w2, "e8p": e8p, "mq4": mq4},
                 "codec_counts": codec_counts_json(&table),
+                "expert_keep": keep.as_ref().map(ExpertKeep::to_metadata_value),
+                "kept_experts": keep.as_ref().map_or(48 * 512, ExpertKeep::total_kept),
+                "bytes": {"routed_experts": routed_bytes, "non_expert": non_expert_bytes, "total_base": hfq.file_len()},
                 "payload_validation": "every W3/W2 projection decoded: exact length, codes <= L, finite non-negative f16 scales, no -0, zero-scale groups at the midpoint code; E8P-I4 (codec 3, qt=135/136) and MQ4 records are span-checked only here (exact index/offset/length by the span-table builder); E8P and MQ4 payload bytes are NOT decoded or validated by this tool",
                 "admission": "refused (fail-closed)",
                 "refusal": refusal.to_string(),
@@ -145,6 +180,7 @@ mod tests {
     use super::*;
     use hipfire_arch_qwen4::artifact::admit_inventory_headers;
     use hipfire_arch_qwen4::config::ARCH_ID;
+    use hipfire_arch_qwen4::expert_slab_table::build_expert_slab_table;
     use hipfire_arch_qwen4::expert_slabs::{
         expert_entry_name, ExpertFormat, ExpertProj, ExpertSlabsV1, EXPERT_SLABS_METADATA_KEY,
     };
