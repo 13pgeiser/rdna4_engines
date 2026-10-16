@@ -157,10 +157,12 @@ MTP are bit-identical across processes.
   committed 8.2K-token prompt, 2026-10-12: prompt throughput went from
   3,809 to 4,921 tok/s (+29%).* See the
   [paired DFlash default](docs/CONFIG.md#qwen38-27b-paired-dflash-default).
-- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolves to 4 for
-  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else.
+- **MTP draft cap 4 on Halo.** `speculation.mtp_k = auto` resolved to 4 for
+  native Qwen3.8-Flash MTP on gfx1151 and to 3 everywhere else in 0.4.2.
   *Measured on gfx1151, pinned Qwen3.8-Flash XTS, code prompts (Rust/Go/Java),
-  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).*
+  2026-10-12: geomean decode went from 67.9 to 70.5 tok/s (+3.8%).* Since
+  0.4.3 `auto` drafts up to 7 on gfx1151 and the adaptive depth chooser picks
+  each window's depth; see the [CHANGELOG](CHANGELOG.md).
 - **Also in 0.4.2:**
   - a faster Qwen35 MTP prompt fill
   - gfx1201 batched MTP fill for Qwen3.8-Flash
