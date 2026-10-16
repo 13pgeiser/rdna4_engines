@@ -42,11 +42,10 @@ pub fn parse_job_override(name: &str, value: Option<&str>) -> Result<Option<usiz
     }).transpose()
 }
 
+/// `MemAvailable - CmaFree` from `/proc/meminfo` text; the shared rule in
+/// [`crate::uma_memory::meminfo_available_bytes`].
 pub fn available_memory(text: &str) -> Option<u64> {
-    text.lines().find_map(|line| {
-        let rest = line.strip_prefix("MemAvailable:")?;
-        rest.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
-    })
+    crate::uma_memory::meminfo_available_bytes(text)
 }
 
 fn memory_remaining(limit: &str, current: &str) -> Option<u64> {
@@ -73,8 +72,7 @@ fn tighter_memory(host: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
 /// Host availability clamped to known cgroup-v2 limits, including ancestors.
 /// Each limit is reduced by that cgroup's current usage, not just ours.
 pub fn host_available_memory() -> Option<u64> {
-    let host = std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|text| available_memory(&text));
+    let host = crate::uma_memory::mem_available_bytes();
     let groups = std::fs::read_to_string("/proc/self/cgroup").ok();
     let relative = groups.as_deref().and_then(|text| text.lines()
         .find_map(|line| line.strip_prefix("0::")));
@@ -176,5 +174,7 @@ mod tests {
         assert_eq!(memory_remaining("4096", "invalid"), None);
         assert_eq!(available_memory("MemFree: 1 kB\nMemAvailable: 3145728 kB\n"), Some(2 * BYTES_PER_JOB));
         assert_eq!(available_memory("MemFree: 100 kB\n"), None);
+        let cma = "MemAvailable: 3145728 kB\nCmaFree: 1048576 kB\n";
+        assert_eq!(available_memory(cma), Some(2 << 30));
     }
 }

@@ -1789,7 +1789,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_HOT_STORE_BYTES",
-        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
+        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus CmaFree (free CMA pages serve only movable allocations) minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
     ),
     process_field!(
         "memory.ple_format",
@@ -1812,7 +1812,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_PREWARM_BYTES",
-        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus CmaFree minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
     ),
     process_field!(
         "memory.ple_load_fill_bytes",
@@ -1825,7 +1825,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_LOAD_FILL_BYTES",
-        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable minus CmaFree, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
     ),
     process_field!(
         "memory.session_cache_disk_bytes",
@@ -7745,7 +7745,7 @@ pub mod memory {
     /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PleHotStoreBudget {
-        /// `auto`: the carrier picks the budget from `MemAvailable` when the
+        /// `auto`: the carrier picks the budget from `MemAvailable` minus `CmaFree` when the
         /// device, model, sidecar and pack allow it.
         Auto,
         /// An explicit byte budget; `0` (the default) is off.
@@ -7878,7 +7878,7 @@ pub mod memory {
 
     /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
     /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
-    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus 8 GiB at ready
+    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus `CmaFree` minus 8 GiB at ready
     /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
     pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
         parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())

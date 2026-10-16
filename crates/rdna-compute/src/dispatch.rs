@@ -1695,8 +1695,8 @@ impl Gpu {
 
     /// `(free, total)` device bytes for sizing allocations: `hipMemGetInfo`,
     /// with the free figure of a GTT-backed unified-memory APU clamped to
-    /// the host RAM a GTT allocation can take (`MemAvailable` plus TTM's
-    /// page pool estimate); see [`crate::uma_memory::device_free_from`].
+    /// the host RAM a GTT allocation can take (`MemAvailable - CmaFree` plus
+    /// TTM's page pool estimate); see [`crate::uma_memory::device_free_from`].
     /// Discrete GPUs and carve-out APUs get `hipMemGetInfo` unchanged. Every
     /// free-memory sizing site uses this, not `hip.get_vram_info` directly.
     ///

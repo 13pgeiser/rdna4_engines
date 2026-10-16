@@ -6574,14 +6574,11 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
         return Ok(());
     };
     let need = meta.len();
-    // Available physical memory (`MemAvailable` on Linux); no host memory
-    // source means no check.
-    let Some(host) = hipfire_config::host_memory() else {
+    // No host memory source means no check.
+    let Some(avail) = sweep_available_bytes() else {
         return Ok(());
     };
-    let avail = host.available_physical_bytes;
-    // 20% headroom over the raw weight bytes for KV arenas and scratch.
-    let want = need + need / 5;
+    let want = sweep_headroom_want_bytes(need);
     if avail < want {
         bail!(
             "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
@@ -6592,6 +6589,25 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Host memory available for sweep sizing. Linux nets `CmaFree` out of
+/// `MemAvailable` (`rdna_compute::uma_memory`): the CMA pool is counted as
+/// available but is unusable for the unmovable allocations a model load makes.
+/// Other platforms keep the raw host snapshot.
+#[cfg(target_os = "linux")]
+fn sweep_available_bytes() -> Option<u64> {
+    rdna_compute::uma_memory::mem_available_bytes()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sweep_available_bytes() -> Option<u64> {
+    hipfire_config::host_memory().map(|host| host.available_physical_bytes)
+}
+
+/// Raw weight bytes plus 20% headroom for KV arenas and scratch.
+fn sweep_headroom_want_bytes(need: u64) -> u64 {
+    need + need / 5
 }
 
 /// `open_bench_engine`, loading the VMM continuous-batching route the way
@@ -17254,6 +17270,12 @@ mod tests {
             "above the memory.max_seq maximum"
         );
         assert!(parse("8k").is_err());
+    }
+
+    #[test]
+    fn sweep_headroom_want_is_weights_plus_a_fifth() {
+        assert_eq!(sweep_headroom_want_bytes(0), 0);
+        assert_eq!(sweep_headroom_want_bytes(10_000_000_000), 12_000_000_000);
     }
 
     #[test]

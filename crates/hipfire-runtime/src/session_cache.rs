@@ -60,11 +60,11 @@ mod disk;
 
 /// Byte alignment of each part inside a stored snapshot.
 const PART_ALIGN: usize = 256;
-/// Free device memory a snapshot, and the live state's context growth it
-/// must leave room for, keep untouched. Unified memory (an APU's carve-out or
-/// GTT): an overshoot can reach the global OOM killer, so it keeps more.
-const UMA_DEVICE_HEADROOM: u64 = 1 << 30;
-/// Discrete GPUs: an overshoot fails one allocation.
+/// Free device memory a discrete GPU's snapshot, and the live state's context
+/// growth it must leave room for, keep untouched: an overshoot fails one
+/// allocation. Unified memory (an APU's carve-out or GTT) sizes its headroom
+/// from host RAM instead ([`uma_headroom`]): an overshoot can reach the
+/// global OOM killer, so it keeps more.
 const VRAM_HEADROOM: u64 = 256 << 20;
 
 /// Which decode route the snapshot serves. Routes own different state (MTP
@@ -319,18 +319,85 @@ fn restore_resident(
     state.finish_restore(gpu, route, &resident.meta)
 }
 
-/// Whether `need` more device bytes leave the guard's headroom free, in the
-/// pool the device allocates from (`Gpu::device_mem_info`: VRAM, a
-/// unified-memory APU's carve-out, or its GTT clamped to `MemAvailable` plus
-/// TTM's page pool); `None` when the free-memory query itself fails.
-fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
-    let (free, _) = gpu.device_mem_info().ok()?;
-    let headroom = if gpu.is_uma() {
-        UMA_DEVICE_HEADROOM
+/// Lower bound of the unified-memory headroom.
+const UMA_HEADROOM_MIN: u64 = 2 << 30;
+/// Upper bound of the unified-memory headroom, and the value taken when host
+/// RAM cannot be read: the larger guard is the conservative one, and the cache
+/// is opportunistic, so an over-cautious guard only skips a snapshot.
+const UMA_HEADROOM_MAX: u64 = 8 << 30;
+/// Unified-memory headroom is this fraction (`1 / UMA_HEADROOM_DIVISOR`) of
+/// host RAM.
+const UMA_HEADROOM_DIVISOR: u64 = 16;
+
+/// Headroom of a unified-memory device: `MemTotal / 16` clamped to
+/// `[2, 8]` GiB; [`UMA_HEADROOM_MAX`] when `MemTotal` is unreadable.
+fn uma_headroom(mem_total: Option<u64>) -> u64 {
+    mem_total.map_or(UMA_HEADROOM_MAX, |total| {
+        (total / UMA_HEADROOM_DIVISOR).clamp(UMA_HEADROOM_MIN, UMA_HEADROOM_MAX)
+    })
+}
+
+/// Headroom of the pool the device allocates from: [`uma_headroom`] on
+/// unified memory, the fixed [`VRAM_HEADROOM`] on a discrete GPU.
+fn headroom_for(uma: bool, mem_total: Option<u64>) -> u64 {
+    if uma {
+        uma_headroom(mem_total)
     } else {
         VRAM_HEADROOM
+    }
+}
+
+/// Whether `free` bytes hold `need` plus the live state's `growth` reserve
+/// plus `headroom`. A sum that overflows `u64` never fits.
+fn fits_with_headroom(free: u64, need: u64, growth: u64, headroom: u64) -> bool {
+    need.checked_add(growth)
+        .and_then(|bytes| bytes.checked_add(headroom))
+        .is_some_and(|required| free >= required)
+}
+
+/// Sum of `bytes`, saturating at `u64::MAX` (which never fits).
+fn saturating_total(bytes: impl IntoIterator<Item = u64>) -> u64 {
+    bytes.into_iter().fold(0, u64::saturating_add)
+}
+
+/// Whether `need` more device bytes, with `growth` more for the live state,
+/// leave the guard's headroom free in the pool the device allocates from
+/// (`Gpu::device_mem_info`: VRAM, a unified-memory APU's carve-out, or its GTT
+/// clamped to `MemAvailable` minus `CmaFree` plus TTM's page pool); `None`
+/// when the free-memory query itself fails. A caller allocates only right
+/// after `Some(true)`.
+fn memory_fits(gpu: &mut Gpu, need: u64, growth: u64) -> Option<bool> {
+    let (free, _) = gpu.device_mem_info().ok()?;
+    let uma = gpu.is_uma();
+    let mem_total = if uma {
+        rdna_compute::uma_memory::host_total_bytes()
+    } else {
+        None
     };
-    Some(free as u64 >= need.saturating_add(headroom))
+    Some(fits_with_headroom(
+        free as u64,
+        need,
+        growth,
+        headroom_for(uma, mem_total),
+    ))
+}
+
+/// Whether the disk tier's host bounce buffer of `bytes` may be allocated now:
+/// host `MemAvailable` (less `CmaFree`, no TTM credit: pageable memory is not
+/// GTT) must hold it plus the headroom and, on unified memory where the live
+/// state's `growth` comes out of the same RAM, that reserve. An unreadable
+/// `MemAvailable` refuses.
+fn host_staging_fits(gpu: &Gpu, bytes: u64, growth: u64) -> bool {
+    let uma = gpu.is_uma();
+    let mem_total = if uma {
+        rdna_compute::uma_memory::host_total_bytes()
+    } else {
+        None
+    };
+    let growth = if uma { growth } else { 0 };
+    rdna_compute::uma_memory::mem_available_bytes().is_some_and(|available| {
+        fits_with_headroom(available, bytes, growth, headroom_for(uma, mem_total))
+    })
 }
 
 impl SessionCache {
@@ -474,12 +541,12 @@ impl SessionCache {
     /// A published device snapshot leaves the device tier: demote it to disk
     /// when there is a disk tier (or drop its disk descendants when that
     /// fails), then free it.
-    fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot) {
+    fn evict_device(&mut self, gpu: &mut Gpu, key: Key, snapshot: StoredSnapshot, growth: u64) {
         if let Some(parent) = &snapshot.parent {
             self.unlink(parent);
         }
         if let Some(disk) = &mut self.disk {
-            if let Err(reason) = disk.demote(gpu, &key, &snapshot) {
+            if let Err(reason) = disk.demote(gpu, &key, &snapshot, growth) {
                 eprintln!(
                     "  session cache: dropped {}-token snapshot instead of demoting it ({reason})",
                     key.1
@@ -495,10 +562,14 @@ impl SessionCache {
     fn make_room(&mut self, gpu: &mut Gpu, bytes: u64, growth: u64) -> Result<(), &'static str> {
         let pending_bytes: u64 = self.pending.iter().map(|entry| entry.1.bytes).sum();
         loop {
-            let over_budget =
-                self.pool.total_bytes() + pending_bytes + bytes > self.pool.max_bytes();
+            let over_budget = self
+                .pool
+                .total_bytes()
+                .saturating_add(pending_bytes)
+                .saturating_add(bytes)
+                > self.pool.max_bytes();
             if !over_budget {
-                match memory_fits(gpu, bytes + growth) {
+                match memory_fits(gpu, bytes, growth) {
                     Some(true) => return Ok(()),
                     Some(false) => {}
                     // Evicting cannot help a query that fails.
@@ -506,7 +577,7 @@ impl SessionCache {
                 }
             }
             match self.pool.pop_lru() {
-                Some((key, evicted)) => self.evict_device(gpu, key, evicted),
+                Some((key, evicted)) => self.evict_device(gpu, key, evicted, growth),
                 None => {
                     return Err(if over_budget {
                         "budget"
@@ -818,14 +889,20 @@ impl SessionCache {
                 .disk
                 .as_mut()
                 .expect("a link off the device is on disk");
-            if temps.is_empty() {
-                let need: u64 = keys[i..]
+            // The host bounce buffer is committed first, so the device
+            // free-memory query below already counts it.
+            disk.reserve_staging(gpu, growth)
+                .map_err(|e| format!("session cache: no memory to stage disk snapshot: {e}"))?;
+            // Checked right before every staging allocation: the remaining
+            // chain (this link included) plus the context growth must still
+            // leave the headroom free, counting the temps already staged.
+            let need = saturating_total(
+                keys[i..]
                     .iter()
-                    .filter_map(|key| disk.peek(key).map(|s| s.bytes))
-                    .sum();
-                if memory_fits(gpu, need + growth) != Some(true) {
-                    return Err("session cache: no memory to stage disk snapshot".into());
-                }
+                    .filter_map(|key| disk.peek(key).map(|s| s.bytes)),
+            );
+            if memory_fits(gpu, need, growth) != Some(true) {
+                return Err("session cache: no memory to stage disk snapshot".into());
             }
             let buf = gpu
                 .bind_thread()
@@ -927,6 +1004,12 @@ impl SessionCache {
         growth: u64,
     ) -> Result<bool, String> {
         if !self.pool.can_afford(key, bytes) {
+            return Ok(false);
+        }
+        // The disk read bounces through host staging memory: refuse, with
+        // the snapshot still on disk, when that allocation would not fit.
+        let disk = self.disk.as_mut().expect("promoting from disk");
+        if disk.reserve_staging(gpu, growth).is_err() {
             return Ok(false);
         }
         // The parent is on the device (I2 for the first disk link, promoted
@@ -1175,7 +1258,7 @@ impl SessionCache {
         let buf = match pending.take() {
             Some(resident) if resident.buf.size() == total => resident.buf,
             previous => {
-                if memory_fits(gpu, total as u64 + growth) != Some(true) {
+                if memory_fits(gpu, total as u64, growth) != Some(true) {
                     eprintln!(
                         "  session cache: skipped {}-token resident snapshot (memory guard)",
                         key.1
@@ -1282,7 +1365,7 @@ impl SessionCache {
             }
             // Leaves first: each demotion unpins its parent.
             while let Some((key, snapshot)) = self.pool.pop_lru() {
-                self.evict_device(gpu, key, snapshot);
+                self.evict_device(gpu, key, snapshot, 0);
             }
         }
         let pooled = self.pool.drain_blobs();
@@ -1324,7 +1407,7 @@ impl SessionCache {
         let mut freed = 0;
         loop {
             // A failed query cannot be helped by evicting.
-            if memory_fits(gpu, need) != Some(false) {
+            if memory_fits(gpu, need, 0) != Some(false) {
                 break;
             }
             if let Some(buf) = self.release_bufs.pop() {
@@ -1341,7 +1424,7 @@ impl SessionCache {
                 None => match self.pool.pop_lru() {
                     Some((key, snapshot)) => {
                         freed += snapshot.bytes;
-                        self.evict_device(gpu, key, snapshot);
+                        self.evict_device(gpu, key, snapshot, need);
                         continue;
                     }
                     None => self.pending.pop().map(|entry| entry.1),
@@ -1628,6 +1711,80 @@ impl SessionDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn uma_headroom_scales_with_host_ram_inside_the_clamp() {
+        // MemTotal / 16, clamped to [2, 8] GiB.
+        assert_eq!(uma_headroom(Some(32 * GIB)), 2 * GIB);
+        assert_eq!(uma_headroom(Some(64 * GIB)), 4 * GIB);
+        assert_eq!(uma_headroom(Some(128 * GIB)), 8 * GIB);
+        // Below 32 GiB the floor holds; above 128 GiB the cap holds.
+        assert_eq!(uma_headroom(Some(8 * GIB)), 2 * GIB);
+        assert_eq!(uma_headroom(Some(0)), 2 * GIB);
+        assert_eq!(uma_headroom(Some(256 * GIB)), 8 * GIB);
+        assert_eq!(uma_headroom(Some(u64::MAX)), 8 * GIB);
+    }
+
+    #[test]
+    fn unreadable_host_total_takes_the_conservative_cap() {
+        assert_eq!(uma_headroom(None), UMA_HEADROOM_MAX);
+        assert_eq!(UMA_HEADROOM_MAX, 8 * GIB);
+    }
+
+    #[test]
+    fn discrete_headroom_ignores_host_ram() {
+        for total in [None, Some(0), Some(32 * GIB), Some(128 * GIB)] {
+            assert_eq!(headroom_for(false, total), VRAM_HEADROOM);
+        }
+        assert_eq!(VRAM_HEADROOM, 256 << 20);
+        assert_eq!(headroom_for(true, Some(64 * GIB)), 4 * GIB);
+        assert_eq!(headroom_for(true, None), 8 * GIB);
+    }
+
+    #[test]
+    fn fits_decides_exactly_at_need_growth_and_headroom() {
+        let (need, growth, headroom) = (3 * GIB, 5 * GIB, 2 * GIB);
+        let free = need + growth + headroom;
+        assert!(fits_with_headroom(free, need, growth, headroom));
+        assert!(!fits_with_headroom(free - 1, need, growth, headroom));
+        assert!(fits_with_headroom(free + 1, need, growth, headroom));
+    }
+
+    #[test]
+    fn fits_counts_each_term() {
+        let free = 10 * GIB;
+        // Each term alone leaves room; together they do not.
+        assert!(fits_with_headroom(free, 4 * GIB, 0, 2 * GIB));
+        assert!(fits_with_headroom(free, 0, 4 * GIB, 2 * GIB));
+        assert!(fits_with_headroom(free, 4 * GIB, 4 * GIB, 2 * GIB));
+        assert!(!fits_with_headroom(free, 4 * GIB, 4 * GIB + 1, 2 * GIB));
+        // Growth reserve alone can refuse an otherwise small snapshot.
+        assert!(!fits_with_headroom(free, 1, 8 * GIB, 2 * GIB));
+        // Headroom alone refuses even a zero-byte need.
+        assert!(!fits_with_headroom(GIB, 0, 0, 2 * GIB));
+        assert!(fits_with_headroom(2 * GIB, 0, 0, 2 * GIB));
+    }
+
+    #[test]
+    fn fits_refuses_instead_of_overflowing() {
+        assert!(!fits_with_headroom(u64::MAX, u64::MAX, 1, 0));
+        assert!(!fits_with_headroom(u64::MAX, 1, u64::MAX, 0));
+        assert!(!fits_with_headroom(u64::MAX, 0, 1, u64::MAX));
+        assert!(!fits_with_headroom(u64::MAX, u64::MAX, u64::MAX, u64::MAX));
+        assert!(!fits_with_headroom(0, u64::MAX, u64::MAX, 8 * GIB));
+        // The largest representable sum still fits exactly.
+        assert!(fits_with_headroom(u64::MAX, u64::MAX - 3, 2, 1));
+        assert!(!fits_with_headroom(u64::MAX - 1, u64::MAX - 3, 2, 1));
+    }
+
+    #[test]
+    fn staged_need_sums_without_overflow() {
+        assert_eq!(saturating_total([1, 2, 3]), 6);
+        assert_eq!(saturating_total([u64::MAX, 1]), u64::MAX);
+        assert_eq!(saturating_total([]), 0);
+    }
 
     #[test]
     fn boundary_lookahead_does_not_consume_the_capture_cursor() {

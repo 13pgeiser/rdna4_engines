@@ -13,7 +13,7 @@
 //! [`device_free_from`] is the one rule every free-memory sizing site uses
 //! (through `Gpu::device_mem_info`): a discrete GPU, or an APU whose device
 //! pool is its carve-out, keeps `hipMemGetInfo`'s figure; a GTT-backed APU
-//! takes `min(hipMemGetInfo free, MemAvailable + TTM pool estimate)`.
+//! takes `min(hipMemGetInfo free, MemAvailable - CmaFree + TTM pool estimate)`.
 
 use std::path::Path;
 
@@ -59,8 +59,32 @@ const MEMINFO_TRACKED: &[&str] = &[
 pub fn meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
         let rest = line.strip_prefix(key)?.strip_prefix(':')?;
-        Some(rest.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
+        rest.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)
     })
+}
+
+/// Host bytes available to unmovable allocations, including pinned GTT.
+///
+/// `MemAvailable` includes free CMA pages, but `CmaFree` counts free pages in
+/// `MIGRATE_CMA` pageblocks, which only serve movable allocations. Subtract it
+/// even when `CmaTotal` (pages reserved for CMA) is zero: the free pageblock
+/// type, not the reservation total, determines allocation eligibility.
+/// Missing `CmaFree` counts as zero; missing `MemAvailable` returns `None`.
+pub fn meminfo_available_bytes(meminfo: &str) -> Option<u64> {
+    Some(
+        meminfo_field(meminfo, "MemAvailable")?
+            .saturating_sub(meminfo_field(meminfo, "CmaFree").unwrap_or(0)),
+    )
+}
+
+/// Live host RAM available to unmovable allocations, without TTM pool credit.
+pub fn mem_available_bytes() -> Option<u64> {
+    meminfo_available_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Total host RAM from `/proc/meminfo`, in bytes.
+pub fn host_total_bytes() -> Option<u64> {
+    meminfo_field(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal")
 }
 
 /// A sysfs integer.
@@ -127,10 +151,10 @@ pub fn ttm_pool_bytes() -> u64 {
     estimate().unwrap_or(0)
 }
 
-/// Host RAM a GTT allocation can still take: `MemAvailable` plus TTM's pool
-/// estimate. `None` when `/proc/meminfo` has no `MemAvailable`.
+/// Host RAM a GTT allocation can still take: `MemAvailable - CmaFree` plus
+/// TTM's pool estimate. `None` when `/proc/meminfo` has no `MemAvailable`.
 pub fn host_available_from(meminfo: &str, gtt_used: u64, pool_size_pages: u64) -> Option<u64> {
-    let available = meminfo_field(meminfo, "MemAvailable")?;
+    let available = meminfo_available_bytes(meminfo)?;
     let pool = ttm_pool_estimate_from(meminfo, gtt_used, pool_size_pages).unwrap_or(0);
     Some(available.saturating_add(pool))
 }
@@ -167,7 +191,7 @@ pub struct DeviceMemory {
     pub uma: bool,
     /// The carve-out (`mem_info_vram_total`), when sysfs exposes it.
     pub carveout_total: Option<u64>,
-    /// `MemAvailable` plus TTM's pool estimate ([`host_available_from`]).
+    /// `MemAvailable - CmaFree` plus TTM's pool estimate ([`host_available_from`]).
     pub host_available: Option<u64>,
 }
 
@@ -180,7 +204,7 @@ pub fn gtt_backed(device_total: u64, carveout_total: Option<u64>) -> bool {
 
 /// Free bytes a device allocation can take. Discrete GPUs and carve-out
 /// APUs: `hipMemGetInfo`'s free figure. GTT-backed APUs:
-/// `min(hipMemGetInfo free, MemAvailable + TTM pool)`; `None` when the host
+/// `min(hipMemGetInfo free, MemAvailable - CmaFree + TTM pool)`; `None` when the host
 /// side is unreadable there (callers refuse rather than size blind).
 pub fn device_free_from(memory: DeviceMemory) -> Option<u64> {
     if !memory.uma || !gtt_backed(memory.device_total, memory.carveout_total) {
@@ -239,6 +263,36 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn meminfo_available_excludes_cma_even_without_a_reservation() {
+        let host = "MemAvailable: 81450396 kB\nCmaTotal: 0 kB\nCmaFree: 13858816 kB\n";
+        let expected = (81_450_396 - 13_858_816) * 1024;
+        assert_eq!(meminfo_available_bytes(host), Some(expected));
+        assert_eq!(host_available_from(host, 0, 0), Some(expected));
+    }
+
+    #[test]
+    fn meminfo_available_missing_cma_is_unchanged() {
+        assert_eq!(
+            meminfo_available_bytes("MemAvailable: 4096 kB\n"),
+            Some(4 << 20)
+        );
+        assert_eq!(meminfo_available_bytes("CmaFree: 4096 kB\n"), None);
+    }
+
+    #[test]
+    fn meminfo_available_saturates_when_cma_exceeds_available() {
+        assert_eq!(
+            meminfo_available_bytes("MemAvailable: 1024 kB\nCmaFree: 2048 kB\n"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn meminfo_available_rejects_byte_count_overflow() {
+        assert_eq!(meminfo_available_bytes("MemAvailable: 18446744073709551615 kB\n"), None);
+    }
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
     fn meminfo(fields: &[(&str, u64)]) -> String {

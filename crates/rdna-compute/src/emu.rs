@@ -206,9 +206,7 @@ pub(crate) fn install_for_device(
         .map_err(|error| {
             HipError::new(0, &format!("HIPFIRE_EMU: raw device memory query failed: {error}"))
         })?;
-    let host_total_bytes = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|meminfo| crate::uma_memory::meminfo_field(&meminfo, "MemTotal"));
+    let host_total_bytes = crate::uma_memory::host_total_bytes();
     let facts = HostFacts {
         pci_bdf: pci_bdf.clone(),
         detected_gfx: detected_arch.to_owned(),
@@ -269,8 +267,8 @@ impl Gpu {
     }
 
     /// Preflight a managed host allocation against the ledger (shared-host /
-    /// GTT room). Call ALONGSIDE the real host checks (MemAvailable, TTM,
-    /// GTT cap), never instead of them. Off: `Ok`. A refusal is a normal
+    /// GTT room). Call ALONGSIDE the real host checks (`MemAvailable - CmaFree`,
+    /// TTM, GTT cap), never instead of them. Off: `Ok`. A refusal is a normal
     /// out-of-memory (`hipErrorOutOfMemory`). Zero bytes hold no capacity.
     pub fn emu_check_host_allocation(&self, bytes: u64, gtt_backed: bool) -> HipResult<()> {
         let Some(state) = self.emu.as_ref() else {
@@ -288,7 +286,9 @@ impl Gpu {
     /// The budget owner's own device goes through [`Gpu::device_mem_info`]
     /// (UMA-safe clamp, then the emu cap). Another device under emu is
     /// refused. Off-state, another device keeps the loader's historic raw
-    /// behavior: switch with raw HIP setters, query, and restore the previous
+    /// behavior: switch with raw HIP setters, query (free clamped like
+    /// `device_mem_info` from that device's own integrated attribute, BDF and
+    /// carve-out; no emu cap), and restore the previous
     /// ACTUAL current device on every return path (`bind_thread`'s cache can
     /// disagree with it, so the cache is neither consulted nor updated).
     pub fn device_mem_info_for(&self, device_id: i32) -> HipResult<(usize, usize)> {
@@ -308,10 +308,40 @@ impl Gpu {
             ));
         }
         let previous = self.hip.current_device()?;
-        let queried = self
-            .hip
-            .set_device(device_id)
-            .and_then(|_| self.hip.get_vram_info());
+        let queried = self.hip.set_device(device_id).and_then(|_| {
+            let (free, total) = self.hip.get_vram_info()?;
+            // Same UMA-safe clamp as `Gpu::device_mem_info`, fed the queried
+            // device's own attribute/BDF/carve-out. An unreadable attribute
+            // counts as UMA (`Gpu::is_uma`'s conservative answer).
+            let uma = self
+                .hip
+                .get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)
+                .map_or(true, |value| value != 0);
+            if !uma {
+                return Ok((free, total));
+            }
+            let carveout_total = self
+                .hip
+                .device_pci_bus_id(device_id)
+                .ok()
+                .and_then(|bdf| crate::uma_memory::carveout_total_bytes(&bdf));
+            let memory = crate::uma_memory::DeviceMemory {
+                device_free: free as u64,
+                device_total: total as u64,
+                uma: true,
+                carveout_total,
+                host_available: crate::uma_memory::gtt_backed(total as u64, carveout_total)
+                    .then(crate::uma_memory::host_available_bytes)
+                    .flatten(),
+            };
+            let free = crate::uma_memory::device_free_from(memory).ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "unified-memory free bytes: /proc/meminfo has no readable MemAvailable",
+                )
+            })?;
+            Ok((free.min(usize::MAX as u64) as usize, total))
+        });
         let restored = self.hip.set_device(previous);
         match (queried, restored) {
             (Ok(info), Ok(())) => Ok(info),
