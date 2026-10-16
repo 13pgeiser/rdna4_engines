@@ -149,6 +149,8 @@ set(R4D_UNITS
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
   "r4d_expert_scale_bf16|"
+  # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot; scalar f32 v1.
+  "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because

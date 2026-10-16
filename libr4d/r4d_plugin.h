@@ -128,6 +128,9 @@ int     r4d_rad_norm_add_norm_bf16      (const RadArgs*, RadStream);
 int     r4d_rad_norm_add_norm_route_bf16(const RadArgs*, RadStream);
 int     r4d_rad_join_add_scale_bf16     (const RadArgs*, RadStream);
 int     r4d_rad_expert_scale_bf16       (const RadArgs*, RadStream);
+/* Runtime LoRA's two halves, each row's adapter named by its slot (r4d_lora_bf16.hip). */
+int     r4d_rad_lora_shrink             (const RadArgs*, RadStream);
+int     r4d_rad_lora_expand             (const RadArgs*, RadStream);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
 int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);

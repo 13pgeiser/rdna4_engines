@@ -12464,6 +12464,153 @@ static void ngram_ahead_case(const Plugin& pl) {
     ok("ngram_ids_i32 ahead: the ids ahead are the ones the next step computes", ahd1 == ids2);
 }
 
+/* ---- RUNTIME LoRA: lora_shrink then lora_expand, against an f64 host sum and libref's bytes.
+ *
+ * Both rows in one case, because expand reads the `t` shrink wrote -- the order the engine issues
+ * them in. Slots mix -1, 0..3 and 4 (= S): a base row keeps the 0xFF fill of `t` and every byte of
+ * `y` (a -0 included), and the column slices' neighbours are untouched. Adapter rows: shrink
+ * within (K + 2) 2^-24 sum|terms| of the f64 sum (an f32 dot's worst case in any order); expand
+ * exactly the bytes of libref's f32 order (j ascending, sum then scale then add, one RTNE) over
+ * the `t` the device wrote. `a` bf16 or E4M3 with a scale every 128 columns; `y` bf16 and f32;
+ * M = 1 (decode), 17 and 130 (prefill-like), K = 1000 (a partial scale group). */
+static void lora_case(const Plugin& pl) {
+    if (!(sel("lora_shrink_scalar") || sel("lora_expand_scalar"))) return;
+    const RadKernelInfo* rs = find(pl, "lora_shrink_scalar");
+    const RadKernelInfo* re = find(pl, "lora_expand_scalar");
+    if (!rs || !re) { ok("lora rows", false, "row absent"); return; }
+    static const int32_t kSlot[] = { -1, 0, 1, 2, 3, 4, 2, -5, 1 };
+    const int S = 4;
+    struct Shape { int M, R, K, N; bool fp8, f32y; };
+    const Shape shapes[] = { { 1, 16, 1000, 640, false, false }, { 17, 48, 1000, 300, true, false },
+                             { 130, 32, 256, 1000, true, true }, { 130, 16, 64, 64, false, true } };
+    for (const Shape& sh : shapes) {
+        const int M = sh.M, R = sh.R, K = sh.K, N = sh.N, group = 128;
+        const int groups = (K + group - 1) / group, lda = K + 8, lds = groups + 4, ldy = N + 6;
+        const size_t ea = sh.fp8 ? 1 : 2, ey = sh.f32y ? 4 : 2;
+        uint32_t st = 0x2545f491u;
+        auto rnd = [&]() {                       /* uniform in [-1, 1) */
+            st = st * 1664525u + 1013904223u;
+            return (float)((int32_t)(st >> 8) - (1 << 23)) / (float)(1 << 23);
+        };
+        std::vector<uint8_t> a((size_t)M * lda * ea);
+        for (size_t i = 0; i < (size_t)M * lda; ++i) {
+            if (sh.fp8) a[i] = rad_f32_to_fp8e4m3(8.0f * rnd());
+            else { const uint16_t b = rad_f32_to_bf16(2.0f * rnd()); std::memcpy(&a[2 * i], &b, 2); }
+        }
+        std::vector<float> as((size_t)M * lds);
+        for (float& v : as) v = 0.01f + 0.02f * (rnd() + 1.0f);
+        std::vector<int32_t> slot((size_t)M);
+        for (int m = 0; m < M; ++m) slot[(size_t)m] = kSlot[(m * 7 + 2) % 9];
+        std::vector<uint16_t> la((size_t)S * R * K), lb((size_t)S * N * R);
+        for (uint16_t& v : la) v = rad_f32_to_bf16(0.1f * rnd());
+        for (uint16_t& v : lb) v = rad_f32_to_bf16(0.1f * rnd());
+        std::vector<float> sc((size_t)S * N);
+        for (float& v : sc) v = 1.0f + 0.5f * rnd();
+        std::vector<uint8_t> y0((size_t)M * ldy * ey);
+        for (size_t i = 0; i < (size_t)M * ldy; ++i) {
+            const float v = i % 3 == 0 ? -0.0f : rnd();
+            if (sh.f32y) std::memcpy(&y0[4 * i], &v, 4);
+            else { const uint16_t b = rad_f32_to_bf16(v); std::memcpy(&y0[2 * i], &b, 2); }
+        }
+
+        void* d_a = dalloc(a.size());   st_memcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
+        void* d_as = dalloc(as.size() * 4);
+        st_memcpy(d_as, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+        void* d_sl = dalloc(slot.size() * 4);
+        st_memcpy(d_sl, slot.data(), slot.size() * 4, hipMemcpyHostToDevice);
+        void* d_la = dalloc(la.size() * 2);
+        st_memcpy(d_la, la.data(), la.size() * 2, hipMemcpyHostToDevice);
+        void* d_lb = dalloc(lb.size() * 2);
+        st_memcpy(d_lb, lb.data(), lb.size() * 2, hipMemcpyHostToDevice);
+        void* d_sc = dalloc(sc.size() * 4);
+        st_memcpy(d_sc, sc.data(), sc.size() * 4, hipMemcpyHostToDevice);
+        void* d_t = dalloc((size_t)M * R * 4);
+        st_memset(d_t, 0xFF, (size_t)M * R * 4);            /* a base row keeps this */
+        void* d_y = dalloc(y0.size());  st_memcpy(d_y, y0.data(), y0.size(), hipMemcpyHostToDevice);
+
+        /* `a` columns [0, K) of [M, lda]; its scale [M, groups] of [M, lds]; `y` columns [3, 3+N). */
+        RadTensor ta = T(d_a, sh.fp8 ? RAD_F8E4M3 : RAD_BF16, { M, K });
+        ta.stride[0] = lda;
+        RadTensor ts = T(sh.fp8 ? d_as : nullptr, RAD_F32, { M, groups });
+        ts.stride[0] = lds;
+        RadTensor ty = T((uint8_t*)d_y + 3 * ey, sh.f32y ? RAD_F32 : RAD_BF16, { M, N });
+        ty.stride[0] = ldy;
+        std::vector<RadTensor> t1 = { ta, ts, T(d_sl, RAD_I32, { M }), T(d_la, RAD_BF16, { S, R, K }),
+                                      T(d_t, RAD_F32, { M, R }) };
+        std::vector<RadParam> p1 = { PI("M", M), PI("K", K), PI("R", R), PI("S", S),
+                                     PI("group", sh.fp8 ? group : 0),
+                                     PS("dtype", sh.fp8 ? "fp8_e4m3" : "bf16") };
+        std::vector<RadTensor> t2 = { T(d_t, RAD_F32, { M, R }), T(d_sl, RAD_I32, { M }),
+                                      T(d_lb, RAD_BF16, { S, N, R }), T(d_sc, RAD_F32, { S, N }), ty };
+        std::vector<RadParam> p2 = { PI("M", M), PI("N", N), PI("R", R), PI("S", S),
+                                     PS("dtype", sh.f32y ? "f32" : "bf16") };
+        RadArgs a1, a2;
+        std::memset(&a1, 0, sizeof(a1)); std::memset(&a2, 0, sizeof(a2));
+        a1.t = t1.data(); a1.n_t = (int)t1.size(); a1.p = p1.data(); a1.n_p = (int)p1.size();
+        a2.t = t2.data(); a2.n_t = (int)t2.size(); a2.p = p2.data(); a2.n_p = (int)p2.size();
+        const int rc1 = rs->launch(&a1, nullptr);
+        const int rc2 = re->launch(&a2, nullptr);
+        st_stream_sync(nullptr);
+        std::vector<float> t((size_t)M * R);
+        st_memcpy(t.data(), d_t, t.size() * 4, hipMemcpyDeviceToHost);
+        std::vector<uint8_t> y(y0.size());
+        st_memcpy(y.data(), d_y, y.size(), hipMemcpyDeviceToHost);
+
+        int64_t bad_base = 0, bad_t = 0, bad_y = 0;
+        double worst = 0;
+        for (int m = 0; m < M; ++m) {
+            const int32_t s = slot[(size_t)m];
+            const bool base = s < 0 || s >= S;
+            for (int j = 0; j < R; ++j) {
+                const float v = t[(size_t)m * R + j];
+                uint32_t bits; std::memcpy(&bits, &v, 4);
+                if (base) { bad_base += bits != 0xFFFFFFFFu; continue; }
+                double sum = 0, mag = 0;
+                for (int k = 0; k < K; ++k) {
+                    const size_t ai = (size_t)m * lda + k;
+                    float x;
+                    if (sh.fp8) x = rad_fp8e4m3_to_f32(a[ai]) * as[(size_t)m * lds + k / group];
+                    else { uint16_t b; std::memcpy(&b, &a[2 * ai], 2); x = rad_bf16_to_f32(b); }
+                    const double term = (double)x * rad_bf16_to_f32(la[((size_t)s * R + j) * K + k]);
+                    sum += term; mag += std::fabs(term);
+                }
+                const double tol = (K + 2) * std::ldexp(1.0, -24) * mag + 1e-30;
+                worst = std::max(worst, std::fabs(v - sum) / tol);
+                bad_t += !(std::fabs(v - sum) <= tol);
+            }
+            for (int c = 0; c < ldy; ++c) {
+                const size_t i = (size_t)m * ldy + c;
+                const int n = c - 3;
+                if (base || n < 0 || n >= N) {
+                    bad_base += std::memcmp(&y[i * ey], &y0[i * ey], ey) != 0;
+                    continue;
+                }
+                float acc = 0.0f;                  /* libref's order over the device's t */
+                for (int j = 0; j < R; ++j)
+                    acc += t[(size_t)m * R + j] * rad_bf16_to_f32(lb[((size_t)s * N + n) * R + j]);
+                const float d = sc[(size_t)s * N + n] * acc;
+                uint8_t want[4];
+                if (sh.f32y) {
+                    float yv; std::memcpy(&yv, &y0[4 * i], 4);
+                    const float w = yv + d; std::memcpy(want, &w, 4);
+                } else {
+                    uint16_t yb; std::memcpy(&yb, &y0[2 * i], 2);
+                    const uint16_t w = rad_f32_to_bf16(rad_bf16_to_f32(yb) + d);
+                    std::memcpy(want, &w, 2);
+                }
+                bad_y += std::memcmp(&y[i * ey], want, ey) != 0;
+            }
+        }
+        ok(fmt("lora M %d R %d K %d N %d %s / %s y", M, R, K, N, sh.fp8 ? "e4m3+scale" : "bf16",
+               sh.f32y ? "f32" : "bf16").c_str(),
+           rc1 == RAD_OK && rc2 == RAD_OK && !bad_base && !bad_t && !bad_y,
+           fmt("rc %d/%d, %lld base-row bytes touched, %lld t outside the bound (worst %.3f), "
+               "%lld y not libref's bytes", rc1, rc2, (long long)bad_base, (long long)bad_t, worst,
+               (long long)bad_y));
+        dfree_all();
+    }
+}
+
 static void device_phase(const Plugin& pl) {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n < 1) {
@@ -12487,6 +12634,7 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     embed_lookup_q_case(pl);
+    lora_case(pl);
 
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");
