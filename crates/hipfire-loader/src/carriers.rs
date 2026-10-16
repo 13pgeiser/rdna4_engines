@@ -802,7 +802,12 @@ impl Carrier for Qwen4Carrier {
                         config.n_match,
                         config.n_min,
                         config.n_max,
-                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(&config)
+                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
+                            &config,
+                            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(
+                                &ctx.gpu.arch,
+                            ),
+                        )
                     );
                     Some(config)
                 }

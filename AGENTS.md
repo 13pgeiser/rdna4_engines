@@ -888,11 +888,14 @@ Caveats that are part of the fixture, not trivia:
   (provisional constants) **and** the last shadow observation having accepted
   its first candidate (`ngram_last_first_accepted`, so a divergence costs at
   most one blind window) runs with no head row-0 step.
-  `take_cap = min(n_max, QWEN4_ROW_EXACT_VERIFY_ROWS - 1)` = 7: a verify
-  forward is row-exact against single-row decode (Q8 decode copy, K1
-  lane-union MoE, rows_x4 GEMV, k4 HC gate, QSA prologue, fused
-  router+shared) only up to 8 rows; 9 or more run prefill kernels, which
-  break greedy byte-identity. Raising the one constant raises the cap.
+  `take_cap = min(n_max, row-exact verify rows - 1)`, where the rows are the
+  per-GPU `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows` (8
+  on every GPU today, so 7) narrowed per window by
+  `Qwen4Bundle::row_exact_verify_rows`: a verify forward is row-exact against
+  single-row decode (Q8 decode copy, K1 lane-union MoE, rows_x4 GEMV, k4 HC
+  gate, QSA prologue, fused router+shared) only up to those rows; more run
+  prefill kernels, which break greedy byte-identity. Raising the one per-GPU
+  value raises the cap.
   Admission sizes the verify rows and the GDN row capture for `take_cap + 1`
   rows when the n-gram source arms (`native_mtp_proposal_drafts`, which the
   loader passes to `native_mtp_device_bytes` / `native_mtp_request_bytes`),

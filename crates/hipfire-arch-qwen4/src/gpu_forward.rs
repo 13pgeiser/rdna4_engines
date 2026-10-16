@@ -132,13 +132,14 @@ pub(crate) fn qwen4_prefill_chunk_rungs(requested: usize) -> impl Iterator<Item 
 /// chunk-sized buffer cost `vocab * 4` bytes per chunk row.
 pub(crate) const QWEN4_SPEC_VERIFY_ROWS: usize = 64;
 
-/// The most rows a verify/takeover forward carries on the decode-shaped
+/// The rows a verify/takeover forward on `gpu` carries on the decode-shaped
 /// route, where every row is bitwise the single-row decode (Q8 decode copy,
 /// K1 lane-union MoE, rows_x4 GEMV, k4 HC gate, QSA prologue, fused
 /// router+shared). A forward of more rows runs prefill kernels that are not
 /// row-exact. The n-gram copy lane takes at most this minus the seed row.
-/// Raising it, once wider rows are proven exact, raises the cap.
-pub(crate) const QWEN4_ROW_EXACT_VERIFY_ROWS: usize = 8;
+pub(crate) fn qwen4_row_exact_verify_rows(gpu: &Gpu) -> usize {
+    rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&gpu.arch)
+}
 
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
@@ -657,7 +658,7 @@ pub(crate) fn decode_copy<'a>(
     source: WeightRef<'a>,
 ) -> WeightRef<'a> {
     match copies.get(index) {
-        Some(buf) if rows <= QWEN4_ROW_EXACT_VERIFY_ROWS => WeightRef {
+        Some(buf) if rows <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS => WeightRef {
             buf,
             dtype: DType::Q8_0,
             row_stride: row_stride(DType::Q8_0, source.k),

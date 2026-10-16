@@ -1537,6 +1537,15 @@ impl Qwen4Bundle {
         .map_err(BundleError::Hip)
     }
 
+    /// The rows a 2+ row eager verify forward of this bundle runs row-exact
+    /// right now. On this branch that is the unguarded per-GPU value; the
+    /// wide-verify branch narrows it by the AR launch guard
+    /// (`guarded_wide_verify_rows`), which is a no-op at or below
+    /// `FEW_ROW_ROUTE_ROWS`.
+    pub(crate) fn row_exact_verify_rows(&self, gpu: &Gpu) -> usize {
+        crate::gpu_forward::qwen4_row_exact_verify_rows(gpu)
+    }
+
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
     /// active snapshot ticket brackets, without re-running them; the ticket
     /// stays active for the caller's commit or restore.

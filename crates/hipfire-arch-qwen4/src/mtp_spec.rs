@@ -16,7 +16,7 @@
 //! consumed-row count, which adds the seed.
 
 use crate::bundle::{penalty_prepass_enabled, BundleError, Qwen4Bundle};
-use crate::gpu_forward::{QWEN4_ROW_EXACT_VERIFY_ROWS, QWEN4_SPEC_VERIFY_ROWS};
+use crate::gpu_forward::QWEN4_SPEC_VERIFY_ROWS;
 use crate::mtp_gpu::{
     mtp_append_det_enabled, mtp_append_det_requested, prompt_fill_uses_rows, MtpAppendScratch,
     MtpFillContext, MtpGpuStateSnapshot, MTP_FILL_ROWS,
@@ -3016,6 +3016,11 @@ fn terminal_repair_replay(
 pub struct Qwen4MtpDrafter {
     max_k: usize,
     ctx_capacity: usize,
+    /// Rows a 2+ row verify forward of the target runs row-exact on this GPU
+    /// ([`Qwen4Bundle::row_exact_verify_rows`]); the n-gram take cap is one
+    /// below it. Starts at the few-row limit and is refreshed at every
+    /// window entry that has the GPU and the target.
+    row_exact_rows: usize,
     request: SpecRequestConfig,
     scratch: Option<Box<dyn SpecScratch>>,
     pending_hidden: Option<GpuTensor>,
@@ -3179,6 +3184,7 @@ impl Qwen4MtpDrafter {
             append_scratch: None,
             end_of_turn,
             ngram_config: None,
+            row_exact_rows: rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
             ngram: None,
             ngram_active: false,
             ngram_candidates: Vec::new(),
@@ -3236,6 +3242,7 @@ impl Qwen4MtpDrafter {
         target: &mut dyn SpecTarget,
     ) -> Result<(), String> {
         self.bind_arch(gpu);
+        self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
         let width = {
             let bundle = Self::bundle(target)?;
             bundle.mtp_position().map_err(|error| error.to_string())?;
@@ -3639,11 +3646,11 @@ impl Qwen4MtpDrafter {
         best
     }
 
-    /// Candidates a takeover may take at most ([`qwen4_ngram_take_cap`]);
-    /// 0 with no pool configured.
+    /// Candidates a takeover may take at most ([`qwen4_ngram_take_cap`] at
+    /// this GPU's row-exact verify rows); 0 with no pool configured.
     fn ngram_take_cap(&self) -> usize {
         self.ngram_config
-            .map_or(0, |config| qwen4_ngram_take_cap(&config))
+            .map_or(0, |config| qwen4_ngram_take_cap(&config, self.row_exact_rows))
     }
 
     /// Window cost of a takeover of `d` candidates in AR-step units: the
@@ -6203,6 +6210,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         // The floor's n-gram pricing and decay read the arch before the
         // window's resource pass sets them again (to the same values).
         self.bind_arch(gpu);
+        self.row_exact_rows = Self::bundle(target)?.row_exact_verify_rows(gpu);
         let mut plan = self.plan_window(emitted, k)?;
         if !ep {
             return self.run_window(gpu, target, position, seed, emitted, eos, &plan);
@@ -6497,17 +6505,18 @@ pub fn qwen4_ngram_mod_config(
 
 /// Candidates a takeover takes at most for `config`: its `n_max`, and never
 /// more rows (the seed included) than a verify forward runs bitwise like
-/// the single-row decode ([`QWEN4_ROW_EXACT_VERIFY_ROWS`]).
-pub fn qwen4_ngram_take_cap(config: &NgramModConfig) -> usize {
-    config.n_max.min(QWEN4_ROW_EXACT_VERIFY_ROWS - 1)
+/// the single-row decode (`row_exact_rows`,
+/// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`).
+pub fn qwen4_ngram_take_cap(config: &NgramModConfig, row_exact_rows: usize) -> usize {
+    config.n_max.min(row_exact_rows.saturating_sub(1))
 }
 
 /// The most drafts any window of a native MTP request on `gpu_arch` verifies
 /// (the seed row excluded): the head's `max_k`, or the n-gram copy lane's
-/// take cap ([`qwen4_ngram_take_cap`]) where the n-gram source arms
-/// (`hipfire_config::mtp_ngram_enabled_for_arch`). Admission sizes the
-/// verify rows and the GDN row capture by it: on gfx1201 (K=3) an armed
-/// takeover verifies 8 rows where native windows verify 4.
+/// take cap ([`qwen4_ngram_take_cap`] at the arch's row-exact verify rows)
+/// where the n-gram source arms (`hipfire_config::mtp_ngram_enabled_for_arch`).
+/// Admission sizes the verify rows and the GDN row capture by it: on gfx1201
+/// (K=3) an armed takeover verifies 8 rows where native windows verify 4.
 pub fn native_mtp_proposal_drafts(max_k: usize, gpu_arch: &str) -> usize {
     if !hipfire_config::mtp_ngram_enabled_for_arch(crate::ARCH_ID, gpu_arch) {
         return max_k;
@@ -6516,7 +6525,12 @@ pub fn native_mtp_proposal_drafts(max_k: usize, gpu_arch: &str) -> usize {
         crate::ARCH_ID,
         gpu_arch,
     ))
-    .map_or(max_k, |config| max_k.max(qwen4_ngram_take_cap(&config)))
+    .map_or(max_k, |config| {
+        max_k.max(qwen4_ngram_take_cap(
+            &config,
+            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch),
+        ))
+    })
 }
 
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`: the batched prompt-fill Append pass is on
@@ -9324,7 +9338,28 @@ mod tests {
         accept: impl Fn(usize) -> f32,
         head_follows_pool: bool,
     ) -> CopyRun {
+        copy_run_at(
+            prompt,
+            out,
+            ngram,
+            accept,
+            head_follows_pool,
+            rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS,
+        )
+    }
+
+    /// [`copy_run_with`] on a drafter whose verify forward runs
+    /// `row_exact_rows` rows row-exact.
+    fn copy_run_at(
+        prompt: &[u32],
+        out: &[u32],
+        ngram: bool,
+        accept: impl Fn(usize) -> f32,
+        head_follows_pool: bool,
+        row_exact_rows: usize,
+    ) -> CopyRun {
         let mut drafter = copy_drafter(prompt, ngram);
+        drafter.row_exact_rows = row_exact_rows;
         let mut draws = Draws(0x9E37_79B9);
         let mut emitted = vec![out[0]];
         let mut run = CopyRun {
@@ -9431,6 +9466,44 @@ mod tests {
     }
 
     #[test]
+    fn ngram_take_cap_is_one_below_the_row_exact_rows() {
+        let config = qwen4_ngram_mod_config((5, 1, 63)).expect("copy-lane triple");
+        for (rows, cap) in [(8usize, 7usize), (16, 15), (32, 31)] {
+            assert_eq!(qwen4_ngram_take_cap(&config, rows), cap, "rows={rows}");
+        }
+        let short = NgramModConfig {
+            n_max: 5,
+            ..config
+        };
+        assert_eq!(qwen4_ngram_take_cap(&short, 32), 5);
+        assert_eq!(qwen4_ngram_take_cap(&config, 0), 0);
+    }
+
+    #[test]
+    fn drafter_take_cap_and_capacity_follow_its_row_exact_rows() {
+        let mut drafter = armed_ngram_drafter(1, 63);
+        assert_eq!(
+            drafter.row_exact_rows,
+            rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS
+        );
+        assert_eq!(drafter.ngram_take_cap(), 7);
+        drafter.row_exact_rows = 16;
+        assert_eq!(drafter.ngram_take_cap(), 15);
+        assert!(MtpDrafter::proposal_capacity(&drafter) >= 15);
+    }
+
+    #[test]
+    fn copy_stream_takes_past_seven_when_more_rows_are_row_exact() {
+        let span = random_tokens(11, 1_000, 600);
+        let prompt = prompt_around(&span);
+        let out = span[..500].to_vec();
+        let wide = copy_run_at(&prompt, &out, true, |_| NATIVE_ACCEPT, false, 32);
+        let takes: Vec<usize> = wide.takeovers().iter().map(|t| t.1).collect();
+        assert!(takes.iter().any(|&take| take > 7), "{takes:?}");
+        assert!(takes.iter().all(|&take| take <= 31), "{takes:?}");
+    }
+
+    #[test]
     fn copy_stream_takes_the_cap_and_accepts_long_runs() {
         let span = random_tokens(11, 1_000, 600);
         let prompt = prompt_around(&span);
@@ -9438,9 +9511,11 @@ mod tests {
         let run = copy_run(&prompt, &out, true);
         let native = copy_run(&prompt, &out, false);
         let cap = qwen4_ngram_mod_config((5, 1, 63))
-            .map(|c| qwen4_ngram_take_cap(&c))
+            .map(|c| {
+                qwen4_ngram_take_cap(&c, rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+            })
             .unwrap();
-        assert_eq!(cap, QWEN4_ROW_EXACT_VERIFY_ROWS - 1);
+        assert_eq!(cap, rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1);
 
         let takeovers = run.takeovers();
         let late = &run.windows[20..];
@@ -9543,7 +9618,8 @@ mod tests {
         for n_max in [3usize, 7, 63] {
             for k in 0..=10usize {
                 let mut drafter = armed_ngram_drafter(1, n_max);
-                let take_cap = n_max.min(QWEN4_ROW_EXACT_VERIFY_ROWS - 1);
+                let take_cap =
+                    n_max.min(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1);
                 assert_eq!(drafter.ngram_take_cap(), take_cap);
                 assert_eq!(
                     MtpDrafter::proposal_capacity(&drafter),
@@ -9556,7 +9632,7 @@ mod tests {
                     let take = drafter.ngram_candidates.len();
                     assert!(take <= k, "n_max={n_max} k={k} take={take}");
                     assert!(
-                        take <= QWEN4_ROW_EXACT_VERIFY_ROWS - 1,
+                        take <= rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS - 1,
                         "n_max={n_max} k={k}"
                     );
                     assert!(take <= take_cap, "n_max={n_max} k={k}");

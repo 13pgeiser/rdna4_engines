@@ -27,6 +27,19 @@ use std::sync::LazyLock;
 /// Row count every routing predicate sees under the invariant profile.
 pub const QWEN4_PREFILL_CANON_ROWS: usize = 8192;
 
+/// The historic few-row limit: routes gated on `route_rows <= 8` are the per-row
+/// twins of the decode GEMV (each output row runs the decode kernel's lane->K
+/// map, FMA chain and reduction tree).
+pub const FEW_ROW_ROUTE_ROWS: usize = 8;
+
+/// The rows a Qwen4 verify forward on `arch` runs row-exact (each row bitwise
+/// the sequential single-row decode). Every arch is at [`FEW_ROW_ROUTE_ROWS`]
+/// until the wide-verify row-exactness oracle proves one wider; the verify
+/// scope and the n-gram copy lane read this single value.
+pub fn qwen4_row_exact_verify_rows(_arch: &str) -> usize {
+    FEW_ROW_ROUTE_ROWS
+}
+
 static PREFILL_PM_INVARIANT: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_PREFILL_PM_INVARIANT", false));
 
@@ -189,5 +202,12 @@ mod tests {
         assert!(QWEN4_APPEND_WMMA_DEFAULT);
         assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT >= 2);
         assert!(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT < QWEN4_F16_WMMA_MIN_TOKENS);
+    }
+
+    #[test]
+    fn every_arch_is_at_the_few_row_limit() {
+        for arch in ["gfx1151", "gfx1201", "gfx1100"] {
+            assert_eq!(qwen4_row_exact_verify_rows(arch), 8, "{arch}");
+        }
     }
 }
