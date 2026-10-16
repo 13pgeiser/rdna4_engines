@@ -81,6 +81,7 @@ extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
     __shared__ __align__(16) _Float16 kdT[128][16];    // (k e^{GL-G})^T
     __shared__ float vb_s[16][132];                    // v beta rows (F32)
     __shared__ __align__(16) _Float16 t_s[16][16];
+    __shared__ float l_s[16][16];                      // L (F32) for the T forward substitution
     __shared__ __align__(16) _Float16 p_s[16][16];
     __shared__ float g_s[16], bt_s[16], inv_s[16];
     __shared__ __align__(16) unsigned short out_s[16][136];
@@ -217,35 +218,26 @@ extern "C" __global__ void gated_delta_chunk_gate_q8_wmma(
 #pragma unroll
             for (int s = 0; s < 8; ++s)
                 c = GC_WMMA(*(const gc_h16*)&k_s[l16][16 * s], *(const gc_h16*)&k_s[l16][16 * s], c);
-            // L strictly lower; T = (I - L)^-1 = (I + L)(I + L^2)(I + L^4)(I + L^8).
-            gc_f8 T, P;
+            // L strictly lower, F32, staged through LDS.  T = (I - L)^-1 by F32 forward
+            // substitution T_i = e_i + sum_{m<i} L_im T_m, m ascending (T_m[j] = 0 for
+            // m < j); lane l16 owns column j, both half-waves compute it and store the
+            // rows of their parity.  The F16 WMMA product form overflowed F16 partial
+            // products when k_i . k_j ~ 1 (repeated tokens).
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int i = 2 * r + hi, j = l16;
-                P[r] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
-                T[r] = P[r] + (i == j ? 1.f : 0.f);
+                l_s[i][j] = j < i ? -bt_s[i] * c[r] * expf(g_s[i] - g_s[j]) : 0.f;
             }
+            GC_WAVE_SYNC();
+            float Tc[16];
 #pragma unroll
-            for (int s = 0; s < 3; ++s) {
-                // P as A: rows via LDS (t_s scratch), as B: half-wave swap.
+            for (int i = 0; i < 16; ++i) {
+                float acc = i == l16 ? 1.f : 0.f;
 #pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)P[r];
-                GC_WAVE_SYNC();
-                const gc_h16 pa = *(const gc_h16*)&t_s[l16][0];
-                const gc_h16 pbv = gc_c_to_b(P, hi);
-                GC_WAVE_SYNC();
-#pragma unroll
-                for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
-                GC_WAVE_SYNC();
-                const gc_h16 ta = *(const gc_h16*)&t_s[l16][0];
-                gc_f8 P2 = {0, 0, 0, 0, 0, 0, 0, 0};
-                P2 = GC_WMMA(pa, pbv, P2);
-                T = GC_WMMA(ta, gc_c_to_b(P2, hi), T);
-                P = P2;
-                GC_WAVE_SYNC();
+                for (int m = 0; m < i; ++m) acc = fmaf(l_s[i][m], Tc[m], acc);
+                Tc[i] = acc;
+                if ((i & 1) == hi) t_s[i][l16] = (_Float16)acc;
             }
-#pragma unroll
-            for (int r = 0; r < 8; ++r) t_s[2 * r + hi][l16] = (_Float16)T[r];
         } else if (wave == 1) {
             gc_f8 c = {0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
