@@ -2163,11 +2163,11 @@ impl ServeRuntime {
                 .into());
             }
             crate::ple::ensure_ple_sidecar(
-                &self.registry,
                 entry,
                 tag.as_deref(),
                 &path,
                 crate::ple::request_from_config(&resolved),
+                &crate::ple::load_target_arch(&resolved),
                 origin != ModelOrigin::Request || self.request_policy.allow_pull,
             )?;
             let max_tokens = config_u64(&resolved, "generation.max_tokens")?;

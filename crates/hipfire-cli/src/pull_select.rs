@@ -19,7 +19,9 @@ use crate::ple::{self, PleSelection};
 use crate::Paths;
 use anyhow::{bail, Result};
 use hipfire_config::memory::{PleFormat, PleFormatRequest};
-use hipfire_registry::{ExpertHotsetPin, ModelEntry, RegistryV1, Sidecar, TrunkOverlayPin};
+use hipfire_registry::{
+    ExpertHotsetPin, GrandfatheredMonolithic, ModelEntry, RegistryV1, Sidecar, TrunkOverlayPin,
+};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -86,9 +88,9 @@ pub(crate) struct Tier<'a> {
 ///
 /// A tier is a tag `<root>-<suffix>` with the root's `arch_id` (which keeps
 /// drafts such as `<root>-draft` out) and a download repo. Tags naming the
-/// same artifact as an earlier tier (same SHA-256, else same file) and the
-/// grandfathered monolithic sibling of a split entry are dropped: they are the
-/// same weights under another name. Aliases resolve to their tag before this
+/// same artifact as an earlier tier (same SHA-256, else same file) are
+/// dropped: they are the same weights under another name (the four Flash-Next
+/// MQ4 tags are one split base). Aliases resolve to their tag before this
 /// runs, so `qwen3.8:flash` offers the tiers of `qwen3.8:flash-next`.
 pub(crate) fn family_tiers<'a>(registry: &'a RegistryV1, root: &str) -> Vec<Tier<'a>> {
     let Some((root_tag, root_entry)) = registry.models.get_key_value(root) else {
@@ -101,15 +103,9 @@ pub(crate) fn family_tiers<'a>(registry: &'a RegistryV1, root: &str) -> Vec<Tier
         .filter(|(tag, _)| tag.starts_with(&prefix))
         .map(|(tag, entry)| (tag.as_str(), entry))
         .collect();
-    let siblings: Vec<&str> = std::iter::once(root_entry)
-        .chain(members.iter().map(|(_, entry)| *entry))
-        .filter_map(|entry| registry.monolithic_sibling(entry).map(|(tag, _)| tag))
-        .collect();
     let mut others: Vec<(&'a str, &'a ModelEntry)> = members
         .into_iter()
-        .filter(|(tag, entry)| {
-            !entry.repo.is_empty() && entry.arch_id == root_entry.arch_id && !siblings.contains(tag)
-        })
+        .filter(|(_, entry)| !entry.repo.is_empty() && entry.arch_id == root_entry.arch_id)
         .collect();
     others.sort_by(|(a_tag, a), (b_tag, b)| {
         b.size_gb
@@ -173,8 +169,9 @@ fn entry_bytes(entry: &ModelEntry) -> u64 {
 /// What the questions need to know about this machine.
 #[derive(Clone, Debug)]
 pub(crate) struct HostFacts {
-    /// First detected GPU arch; empty when none is detected.
-    pub gpu_arch: String,
+    /// Every detected GPU arch (sorted, deduplicated); empty when none is
+    /// detected.
+    pub gpu_arches: Vec<String>,
     /// Largest amdgpu `mem_info_vram_total` (the carve-out on an APU).
     pub vram_bytes: Option<u64>,
     /// Installed host memory (`MemTotal`).
@@ -188,7 +185,7 @@ pub(crate) struct HostFacts {
 impl HostFacts {
     pub(crate) fn detect(paths: &Paths) -> Self {
         Self {
-            gpu_arch: ple::local_gpu_arch(),
+            gpu_arches: ple::local_gpu_arches(),
             vram_bytes: largest_vram_bytes(Path::new("/sys/class/drm")),
             ram_bytes: hipfire_config::host_memory::host_memory()
                 .map(|memory| memory.total_physical_bytes),
@@ -234,10 +231,10 @@ fn host_line(host: &HostFacts) -> String {
             |bytes| format!("{:.1} GiB", bytes as f64 / GIB),
         )
     };
-    let arch = if host.gpu_arch.is_empty() {
-        "GPU unknown"
+    let arch = if host.gpu_arches.is_empty() {
+        "GPU unknown".to_owned()
     } else {
-        host.gpu_arch.as_str()
+        host.gpu_arches.join("+")
     };
     format!(
         "this machine: {arch}, VRAM {}, RAM {}",
@@ -333,6 +330,9 @@ pub(crate) struct PullContext<'r, 'c> {
     pub host: &'c HostFacts,
     pub overlay_pins: &'c [TrunkOverlayPin],
     pub hotset_pins: &'c [ExpertHotsetPin],
+    /// Monoliths a verified local copy of which serves a split entry without
+    /// the base download.
+    pub grandfather_pins: &'c [GrandfatheredMonolithic],
     /// Whether `file` (of the given size, when known) is already in the
     /// models directory. The pull itself still verifies the digest.
     pub present: &'c dyn Fn(&str, Option<u64>) -> bool,
@@ -429,35 +429,46 @@ fn ask_tier(
     choose(prompt, "tier", tiers.len(), 0)
 }
 
-/// The PLE format the question preselects, and why.
+/// The PLE selection the question preselects, and why.
 ///
 /// It is what `--ple auto` fetches ([`ple::plan_pull`] with
-/// `memory.ple_format` and the GPU arch: q4 on gfx1151, q8 elsewhere, or the
-/// published slot when the preferred one is not), except that an `auto`
-/// request picks q4 instead of q8 when host RAM cannot hold the base plus the
-/// q8 rows. The non-interactive default stays plain `auto`.
-pub(crate) fn default_ple(entry: &ModelEntry, host: &HostFacts) -> (PleFormat, &'static str) {
-    let plan = ple::plan_pull(entry, PleSelection::Auto, host.ple_request, &host.gpu_arch);
-    let format = plan
-        .sidecars
-        .first()
-        .map_or(PleFormat::Q8, |(format, _)| *format);
+/// `memory.ple_format` over every detected GPU arch: q4 on gfx1151, q8
+/// elsewhere, the union on a mixed host, or the published slot when the
+/// preferred one is not), except that an `auto` request picks q4 instead of q8
+/// when host RAM cannot hold the base plus the q8 rows. The non-interactive
+/// default stays plain `auto`.
+pub(crate) fn default_ple(entry: &ModelEntry, host: &HostFacts) -> (PleSelection, &'static str) {
+    let plan = ple::plan_pull(
+        entry,
+        PleSelection::Auto,
+        host.ple_request,
+        &host.gpu_arches,
+    );
+    let formats: Vec<PleFormat> = plan.sidecars.iter().map(|(format, _)| *format).collect();
+    let selection = match formats.as_slice() {
+        [PleFormat::Q4] => PleSelection::Q4,
+        [] | [PleFormat::Q8] => PleSelection::Q8,
+        _ => PleSelection::All,
+    };
     if host.ple_request != PleFormatRequest::Auto {
-        return (format, "memory.ple_format");
+        return (selection, "memory.ple_format");
     }
-    if format == PleFormat::Q4 {
-        return (format, "gfx1151");
+    if selection == PleSelection::All {
+        return (selection, "each GPU's default");
     }
-    let small_ram = match (host.ram_bytes, entry.ple_q8.as_ref()) {
+    if selection == PleSelection::Q4 {
+        return (selection, "gfx1151");
+    }
+    let small_ram = match (host.ram_bytes, ple::ple_slot(entry, PleFormat::Q8)) {
         (Some(ram), Some(q8)) => q8
             .size_bytes
             .is_some_and(|rows| ram < entry_bytes(entry).saturating_add(rows)),
         _ => false,
     };
-    if small_ram && entry.ple_q4.is_some() {
-        return (PleFormat::Q4, "small RAM");
+    if small_ram && ple::ple_slot(entry, PleFormat::Q4).is_some() {
+        return (PleSelection::Q4, "small RAM");
     }
-    (format, "exact")
+    (selection, "exact")
 }
 
 fn ask_ple(
@@ -466,10 +477,9 @@ fn ask_ple(
     tag: &str,
     entry: &ModelEntry,
 ) -> Result<PleSelection> {
-    let (default_format, reason) = default_ple(entry, host);
+    let (default_selection, reason) = default_ple(entry, host);
     let mut options: Vec<(PleSelection, String)> = Vec::new();
     let mut both = Some(0_u64);
-    let mut default = 0;
     for (format, selection, what) in [
         (PleFormat::Q4, PleSelection::Q4, "4-bit Lloyd-Max rows"),
         (PleFormat::Q8, PleSelection::Q8, "exact Q8F16 rows"),
@@ -479,9 +489,6 @@ fn ask_ple(
             continue;
         };
         both = both.zip(sidecar.size_bytes).map(|(sum, size)| sum + size);
-        if format == default_format {
-            default = options.len();
-        }
         options.push((
             selection,
             format!(
@@ -501,6 +508,10 @@ fn ask_ple(
         PleSelection::Skip,
         format!("none  {:>9}  fetched on first load", ""),
     ));
+    let default = options
+        .iter()
+        .position(|(selection, _)| *selection == default_selection)
+        .unwrap_or(0);
     prompt.say(&format!(
         "{tag}: PLE rows for the split base ({})",
         host_line(host)
@@ -565,21 +576,47 @@ pub(crate) fn plan_items(
         download: force || !(ctx.present)(file, size),
     };
     let mut base = item("model".to_owned(), &entry.file, entry.size_bytes);
-    if base.download && !force && entry.is_flash_next_xts() {
-        // The pull migrates a verified legacy spelling instead of downloading.
-        base.download = !(ctx.present)(
-            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
-            entry.size_bytes,
-        );
+    // A local monolithic of the right size that serves the split entry: the
+    // pull verifies its bytes before it relies on it.
+    let mut served: Option<&GrandfatheredMonolithic> = None;
+    if base.download && !force {
+        if entry.is_flash_next_xts() {
+            // The pull migrates a verified legacy spelling instead of downloading.
+            base.download = !(ctx.present)(
+                hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+                entry.size_bytes,
+            );
+        } else if let Some(pin) =
+            hipfire_registry::grandfathered_monolithic_in(entry, ctx.grandfather_pins)
+        {
+            let local = [pin.canonical_file, pin.legacy_file]
+                .into_iter()
+                .find(|file| (ctx.present)(file, Some(pin.size_bytes)));
+            if let Some(file) = local {
+                base = PlanItem {
+                    label: "model".to_owned(),
+                    file: file.to_owned(),
+                    size: Some(pin.size_bytes),
+                    download: false,
+                };
+                served = Some(pin);
+            }
+        }
     }
+    // The file the loader opens: the served monolithic, else the split base.
+    let model_file = base.file.clone();
     let mut items = vec![base];
     let request = if choice.ple == PleSelection::Auto {
         ctx.host.ple_request
     } else {
         PleFormatRequest::Auto
     };
-    for (format, sidecar) in ple::plan_pull(entry, choice.ple, request, &ctx.host.gpu_arch).sidecars
-    {
+    let mut ple_plan = ple::plan_pull(entry, choice.ple, request, &ctx.host.gpu_arches);
+    // The exact q8 rows are embedded in a served monolithic.
+    if served.is_some() {
+        ple::drop_embedded_exact(&mut ple_plan, &model_file);
+    }
+    for (format, sidecar) in ple_plan.sidecars {
         items.push(item(
             format!("ple-{}", format.name()),
             &sidecar.file,
@@ -593,20 +630,37 @@ pub(crate) fn plan_items(
             sidecar.sidecar.size_bytes,
         ));
     }
-    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, ctx.overlay_pins) {
+    // A served monolithic is a different artifact from the split base: its
+    // overlay and hot set are looked up by its own identity.
+    let identity = served.map(|pin| ModelEntry {
+        file: pin.canonical_file.to_owned(),
+        sha256: Some(pin.sha256.to_owned()),
+        size_bytes: Some(pin.size_bytes),
+        ple: std::collections::BTreeMap::new(),
+        ..entry.clone()
+    });
+    let identity = identity.as_ref().unwrap_or(entry);
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, ctx.overlay_pins) {
+        let local = if served.is_some() {
+            format!(
+                "{model_file}{}",
+                hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX
+            )
+        } else {
+            overlay.sidecar.file.clone()
+        };
         items.push(item(
             "overlay".to_owned(),
-            &overlay.sidecar.file,
+            &local,
             overlay.sidecar.size_bytes,
         ));
     }
     if choice.expert_hotset {
-        if let Some(hotset) = hipfire_registry::expert_hotset_in(entry, ctx.hotset_pins) {
+        if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, ctx.hotset_pins) {
             // The pull installs it beside the selected base file, whatever
             // the pin's remote name is.
             let local = format!(
-                "{}{}",
-                entry.file,
+                "{model_file}{}",
                 hipfire_config::memory::EXPERT_HOTSET_SIDECAR_SUFFIX
             );
             items.push(item(
@@ -780,8 +834,10 @@ mod tests {
                     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "min_vram_gb": 72.0, "arch_id": 16,
                     "desc": "Best quality. Canonical rung.",
-                    "ple_q4": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q4", "size_bytes": 28_800_000_000_u64},
-                    "ple_q8": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q8", "size_bytes": 54_400_000_000_u64},
+                    "ple": {
+                        "q4": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q4", "size_bytes": 28_800_000_000_u64},
+                        "q8": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q8", "size_bytes": 54_400_000_000_u64}
+                    },
                     "mtp": {"file": "qwen3.8-flash-next.mtp", "size_bytes": 400_000_000_u64}
                 },
                 "qwen3.8:flash-next-mq3-xts": {
@@ -790,7 +846,7 @@ mod tests {
                     "size_gb": 55.0, "size_bytes": 55_000_000_000_u64,
                     "min_vram_gb": 56.0, "arch_id": 16,
                     "desc": "Balanced",
-                    "ple_q8": {"file": "qwen3.8-flash-next-base.mq3-xts.ple-q8", "size_bytes": 54_400_000_000_u64}
+                    "ple": {"q8": {"file": "qwen3.8-flash-next-base.mq3-xts.ple-q8", "size_bytes": 54_400_000_000_u64}}
                 },
                 "qwen3.8:flash-next-mq2-xts": {
                     "repo": "hipfire-models/qwen3.8-flash-next",
@@ -804,11 +860,11 @@ mod tests {
                     "file": "qwen3.8-flash-next-base.mq4-xts",
                     "size_gb": 70.9, "min_vram_gb": 72.0, "arch_id": 16, "desc": "dup"
                 },
-                // The root's grandfathered monolithic sibling.
-                "qwen3.8:flash-next-mq4-xts": {
+                // A second stock tag of the root's split base.
+                "qwen3.8:flash-next-mq4": {
                     "repo": "hipfire-models/qwen3.8-flash-next",
-                    "file": "qwen3.8-flash-next.mq4-xts",
-                    "size_gb": 125.3, "min_vram_gb": 128.0, "arch_id": 16, "desc": "mono"
+                    "file": "qwen3.8-flash-next-base.mq4-xts",
+                    "size_gb": 70.9, "min_vram_gb": 72.0, "arch_id": 16, "desc": "dup"
                 },
                 "qwen3.8:flash-next-draft": {
                     "repo": "hipfire-models/qwen3.8-flash-next",
@@ -835,7 +891,7 @@ mod tests {
 
     fn host() -> HostFacts {
         HostFacts {
-            gpu_arch: "gfx1201".into(),
+            gpu_arches: vec!["gfx1201".into()],
             vram_bytes: Some(96 << 30),
             ram_bytes: Some(256 << 30),
             free_disk_bytes: Some(500 * GB),
@@ -880,15 +936,15 @@ mod tests {
             registry: &registry,
             host,
             overlay_pins: &[],
+            grandfather_pins: &[],
             hotset_pins,
             present: &absent,
         };
         let mut output = Vec::new();
         let result = {
             let mut prompt = LinePrompt::new(Cursor::new(answers.as_bytes()), &mut output);
-            select_pull(&ctx, tag, entry, &flags, &mut prompt).map(|choice| {
-                choice.map(|c| (c.tag.to_owned(), c.ple, c.draft, c.expert_hotset))
-            })
+            select_pull(&ctx, tag, entry, &flags, &mut prompt)
+                .map(|choice| choice.map(|c| (c.tag.to_owned(), c.ple, c.draft, c.expert_hotset)))
         };
         (result, String::from_utf8(output).unwrap())
     }
@@ -901,8 +957,8 @@ mod tests {
             .iter()
             .map(|tier| (tier.label.as_str(), tier.tag))
             .collect();
-        // Root first; then largest first. Same-artifact tags, the monolithic
-        // sibling, drafts (other arch), local-only entries and the
+        // Root first; then largest first. Same-artifact tags (every stock MQ4
+        // tag is the one split base), drafts (other arch), local-only entries and the
         // `flash-nextgen` prefix lookalike are not tiers.
         assert_eq!(
             shape,
@@ -1019,7 +1075,7 @@ mod tests {
     #[test]
     fn gfx1151_and_small_ram_preselect_q4() {
         let halo = HostFacts {
-            gpu_arch: "gfx1151".into(),
+            gpu_arches: vec!["gfx1151".into()],
             ..host()
         };
         let (result, transcript) = run(
@@ -1037,18 +1093,27 @@ mod tests {
         };
         let registry = registry();
         let entry = &registry.models["qwen3.8:flash-next"];
-        assert_eq!(default_ple(entry, &small), (PleFormat::Q4, "small RAM"));
+        assert_eq!(default_ple(entry, &small), (PleSelection::Q4, "small RAM"));
         let configured = HostFacts {
             ple_request: PleFormatRequest::Q8,
             ..small
         };
         assert_eq!(
             default_ple(entry, &configured),
-            (PleFormat::Q8, "memory.ple_format")
+            (PleSelection::Q8, "memory.ple_format")
         );
         // A tier without q4 rows falls back to the published slot.
         let mq3 = &registry.models["qwen3.8:flash-next-mq3-xts"];
-        assert_eq!(default_ple(mq3, &halo).0, PleFormat::Q8);
+        assert_eq!(default_ple(mq3, &halo).0, PleSelection::Q8);
+        // A mixed host (a gfx1100 next to the gfx1151) preselects both formats.
+        let hipx = HostFacts {
+            gpu_arches: vec!["gfx1100".into(), "gfx1151".into()],
+            ..host()
+        };
+        assert_eq!(
+            default_ple(entry, &hipx),
+            (PleSelection::All, "each GPU's default")
+        );
     }
 
     #[test]
@@ -1200,6 +1265,7 @@ mod tests {
             registry: &registry,
             host: &host,
             overlay_pins: &[],
+            grandfather_pins: &[],
             hotset_pins: HOTSET_PINS,
             present: &absent,
         };
@@ -1304,6 +1370,7 @@ mod tests {
             registry: &registry,
             host: &host,
             overlay_pins: &[],
+            grandfather_pins: &[],
             hotset_pins: &[],
             present: &present,
         };
@@ -1397,6 +1464,402 @@ mod tests {
         assert_eq!(
             pull(&["--ple", "q4"]),
             (Some(PleSelection::Q4), None, false)
+        );
+    }
+
+    const STOCK_TAGS: [&str; 5] = [
+        "qwen3.8:flash-next",
+        "qwen3.8:flash-next-mq4",
+        "qwen3.8:flash-next-gptq3",
+        "qwen3.8:flash-next-mq4-xts",
+        "qwen3.8:flash",
+    ];
+    const STOCK_BASE: &str = "qwen3.8-flash-next-base.mq4-xts";
+    const STOCK_BASE_SIZE: u64 = 70_888_270_360;
+    const STOCK_BASE_SHA: &str = "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45";
+    const STOCK_Q4_SIZE: u64 = 29_120_146_432;
+    const STOCK_Q8_SIZE: u64 = 54_400_269_312;
+
+    /// The four stock MQ4 tags and the `qwen3.8:flash` alias: one split base
+    /// on the shared PLE pair, exactly as the bundled registry publishes them.
+    fn stock_registry() -> RegistryV1 {
+        let entry = serde_json::json!({
+            "repo": "hipfire-models/qwen3.8-flash-next",
+            "file": STOCK_BASE,
+            "size_gb": 70.9, "min_vram_gb": 72.0, "arch_id": 16, "quant": "mq4",
+            "desc": "Qwen3.8-Flash-Next MQ4 XTS split base",
+            "sha256": STOCK_BASE_SHA, "size_bytes": STOCK_BASE_SIZE,
+            "ple": {
+                "q4": {
+                    "file": "qwen3.8-flash-next.ple-q4",
+                    "sha256": "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+                    "size_bytes": STOCK_Q4_SIZE
+                },
+                "q8": {
+                    "file": "qwen3.8-flash-next.ple-q8",
+                    "sha256": "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+                    "size_bytes": STOCK_Q8_SIZE
+                }
+            }
+        });
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "qwen3.8:flash-next": entry,
+                "qwen3.8:flash-next-mq4": entry,
+                "qwen3.8:flash-next-gptq3": entry,
+                "qwen3.8:flash-next-mq4-xts": entry
+            },
+            "aliases": {"qwen3.8:flash": "qwen3.8:flash-next"}
+        });
+        RegistryV1::parse(&value.to_string(), "stock registry").unwrap()
+    }
+
+    fn host_with_arch(arch: &str) -> HostFacts {
+        HostFacts {
+            gpu_arches: if arch.is_empty() {
+                Vec::new()
+            } else {
+                vec![arch.into()]
+            },
+            vram_bytes: None,
+            ram_bytes: None,
+            free_disk_bytes: None,
+            ple_request: PleFormatRequest::Auto,
+        }
+    }
+
+    #[test]
+    fn stock_mq4_tags_plan_q4_on_strix_halo_and_q8_elsewhere() {
+        let registry = stock_registry();
+        let models = Path::new("models");
+        for input in STOCK_TAGS {
+            let (tag, entry) = registry.model(input).unwrap();
+            assert_eq!(entry.file, STOCK_BASE, "{input}");
+            // gfx1151 prefers q4; RDNA4, other arches and an unknown arch get q8.
+            for (arch, format, ple_bytes) in [
+                ("gfx1151", PleFormat::Q4, STOCK_Q4_SIZE),
+                ("gfx1201", PleFormat::Q8, STOCK_Q8_SIZE),
+                ("gfx1100", PleFormat::Q8, STOCK_Q8_SIZE),
+                ("", PleFormat::Q8, STOCK_Q8_SIZE),
+            ] {
+                let host = host_with_arch(arch);
+                let plan = ple::plan_pull(
+                    entry,
+                    PleSelection::Auto,
+                    host.ple_request,
+                    &host.gpu_arches,
+                );
+                assert_eq!(plan.sidecars.len(), 1, "{input} {arch}");
+                let (planned, sidecar) = plan.sidecars[0];
+                assert_eq!(planned, format, "{input} {arch}");
+                assert_eq!(sidecar.size_bytes, Some(ple_bytes));
+                // The shared file is linked under the name the loader opens.
+                assert!(ple::is_shared_slot(entry, planned.name(), sidecar));
+                assert_eq!(
+                    hipfire_config::memory::ple_sidecar_path(&models.join(&entry.file), planned),
+                    models.join(format!("{STOCK_BASE}.ple-{}", planned.name()))
+                );
+
+                let ctx = PullContext {
+                    registry: &registry,
+                    host: &host,
+                    overlay_pins: &[],
+                    hotset_pins: &[],
+                    grandfather_pins: &[],
+                    present: &absent,
+                };
+                let choice = PullChoice::defaults(tag, entry, &PullFlags::default());
+                let items = plan_items(&ctx, &choice, false);
+                let files: Vec<&str> = items.iter().map(|item| item.file.as_str()).collect();
+                assert_eq!(files, [STOCK_BASE, sidecar.file.as_str()], "{input} {arch}");
+                assert_eq!(
+                    download_total(&items),
+                    (STOCK_BASE_SIZE + ple_bytes, 0),
+                    "{input} {arch}"
+                );
+            }
+            // The exact sums a pull reports.
+            let q4 = plan_items(
+                &PullContext {
+                    registry: &registry,
+                    host: &host_with_arch("gfx1151"),
+                    overlay_pins: &[],
+                    hotset_pins: &[],
+                    grandfather_pins: &[],
+                    present: &absent,
+                },
+                &PullChoice::defaults(tag, entry, &PullFlags::default()),
+                false,
+            );
+            assert_eq!(download_total(&q4), (100_008_416_792, 0));
+        }
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let rdna4 = plan_items(
+            &PullContext {
+                registry: &registry,
+                host: &host_with_arch("gfx1201"),
+                overlay_pins: &[],
+                hotset_pins: &[],
+                grandfather_pins: &[],
+                present: &absent,
+            },
+            &PullChoice::defaults(tag, entry, &PullFlags::default()),
+            false,
+        );
+        assert_eq!(download_total(&rdna4), (125_288_539_672, 0));
+        // The four stock MQ4 tags are one tier of the family (other rungs may exist).
+        let tiers = family_tiers(&registry, "qwen3.8:flash-next");
+        let mq4_tiers = tiers
+            .iter()
+            .filter(|tier| tier.entry.file == STOCK_BASE)
+            .count();
+        assert_eq!(mq4_tiers, 1);
+    }
+
+    #[test]
+    fn stock_pull_plan_carries_the_split_base_overlay_and_hot_set() {
+        let registry = stock_registry();
+        let host = host_with_arch("gfx1151");
+        let (tag, entry) = registry.model("qwen3.8:flash").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: hipfire_registry::TRUNK_OVERLAY_PINS,
+            hotset_pins: hipfire_registry::EXPERT_HOTSET_PINS,
+            grandfather_pins: hipfire_registry::GRANDFATHERED_MONOLITHICS,
+            present: &absent,
+        };
+        let items = plan_items(
+            &ctx,
+            &PullChoice::defaults(tag, entry, &PullFlags::default()),
+            false,
+        );
+        let overlay = items.iter().find(|item| item.label == "overlay").unwrap();
+        assert_eq!(overlay.file, format!("{STOCK_BASE}.trunk-overlay"));
+        assert_eq!(overlay.size, Some(305_543_168));
+        let hotset = items
+            .iter()
+            .find(|item| item.label == "Expert hot set")
+            .unwrap();
+        assert_eq!(hotset.file, format!("{STOCK_BASE}.expert-hotset"));
+        assert_eq!(hotset.size, Some(217_675));
+    }
+
+    const GF_MONO: &str = "qwen3.8-flash-next.mq4-xts";
+    const GF_LEGACY: &str = "qwen3.8-flash-next-gptq3.mq4";
+    const GF_MONO_SIZE: u64 = 1000;
+    const GF_MONO_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A small-sized stand-in for the compiled grandfather pin of [`stock_registry`].
+    const GF_PINS: &[GrandfatheredMonolithic] = &[GrandfatheredMonolithic {
+        repo: "hipfire-models/qwen3.8-flash-next",
+        split_file: STOCK_BASE,
+        split_sha256: STOCK_BASE_SHA,
+        split_size_bytes: STOCK_BASE_SIZE,
+        canonical_file: GF_MONO,
+        legacy_file: GF_LEGACY,
+        sha256: GF_MONO_SHA,
+        size_bytes: GF_MONO_SIZE,
+    }];
+    const GF_OVERLAY_PINS: &[TrunkOverlayPin] = &[
+        TrunkOverlayPin {
+            base_sha256: GF_MONO_SHA,
+            base_size: GF_MONO_SIZE,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            sha256: "2222222222222222222222222222222222222222222222222222222222222222",
+            size_bytes: 300,
+        },
+        TrunkOverlayPin {
+            base_sha256: STOCK_BASE_SHA,
+            base_size: STOCK_BASE_SIZE,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+            sha256: "3333333333333333333333333333333333333333333333333333333333333333",
+            size_bytes: 301,
+        },
+    ];
+    const GF_HOTSET_PINS: &[ExpertHotsetPin] = &[
+        ExpertHotsetPin {
+            base_sha256: GF_MONO_SHA,
+            base_size: GF_MONO_SIZE,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
+            sha256: "4444444444444444444444444444444444444444444444444444444444444444",
+            size_bytes: 20,
+        },
+        ExpertHotsetPin {
+            base_sha256: STOCK_BASE_SHA,
+            base_size: STOCK_BASE_SIZE,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+            sha256: "5555555555555555555555555555555555555555555555555555555555555555",
+            size_bytes: 21,
+        },
+    ];
+
+    fn gf_plan(
+        arch: &str,
+        present: &dyn Fn(&str, Option<u64>) -> bool,
+        force: bool,
+    ) -> Vec<PlanItem> {
+        let registry = stock_registry();
+        let host = host_with_arch(arch);
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: GF_OVERLAY_PINS,
+            hotset_pins: GF_HOTSET_PINS,
+            grandfather_pins: GF_PINS,
+            present,
+        };
+        plan_items(
+            &ctx,
+            &PullChoice::defaults(tag, entry, &PullFlags::default()),
+            force,
+        )
+    }
+
+    #[test]
+    fn a_local_grandfathered_monolithic_replaces_the_base_download_in_the_plan() {
+        let on_disk = |files: &'static [&'static str]| {
+            move |file: &str, size: Option<u64>| {
+                files.contains(&file) && (size.is_none() || size == Some(GF_MONO_SIZE))
+            }
+        };
+        // The canonical monolithic is present: no base, no q8; q4 is still a download;
+        // overlay and hot set come from the monolithic's pins, beside the monolithic.
+        let present = on_disk(&[GF_MONO]);
+        let items = gf_plan("gfx1151", &present, false);
+        let shape: Vec<(&str, &str, bool)> = items
+            .iter()
+            .map(|item| (item.label.as_str(), item.file.as_str(), item.download))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("model", GF_MONO, false),
+                ("ple-q4", "qwen3.8-flash-next.ple-q4", true),
+                ("overlay", "qwen3.8-flash-next.mq4-xts.trunk-overlay", true),
+                (
+                    "Expert hot set",
+                    "qwen3.8-flash-next.mq4-xts.expert-hotset",
+                    true
+                ),
+            ]
+        );
+        assert_eq!(items[0].size, Some(GF_MONO_SIZE));
+        assert_eq!(
+            download_total(&items),
+            (STOCK_Q4_SIZE + 300 + 20, 0),
+            "the base is not counted"
+        );
+        // RDNA4 wants q8, which the monolithic embeds: nothing PLE to fetch.
+        let items = gf_plan("gfx1201", &present, false);
+        assert!(items.iter().all(|item| !item.label.starts_with("ple-")));
+        assert!(!items[0].download);
+        // The legacy spelling alone serves too.
+        let legacy = on_disk(&[GF_LEGACY]);
+        let items = gf_plan("gfx1151", &legacy, false);
+        assert_eq!(
+            (items[0].file.as_str(), items[0].download),
+            (GF_LEGACY, false)
+        );
+        // A wrong-size monolithic is not counted as present: the normal split plan.
+        let wrong = |file: &str, size: Option<u64>| file == GF_MONO && size != Some(GF_MONO_SIZE);
+        let items = gf_plan("gfx1151", &wrong, false);
+        assert_eq!(
+            (items[0].file.as_str(), items[0].download),
+            (STOCK_BASE, true)
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.file.as_str())
+                .collect::<Vec<_>>(),
+            [
+                STOCK_BASE,
+                "qwen3.8-flash-next.ple-q4",
+                "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+                "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+            ]
+        );
+        // --force pulls the split base whatever is on disk.
+        let items = gf_plan("gfx1151", &present, true);
+        assert_eq!(
+            (items[0].file.as_str(), items[0].download),
+            (STOCK_BASE, true)
+        );
+        assert!(items.iter().all(|item| item.download));
+        // The split base wins over the monolithic when it is installed.
+        let both = |file: &str, _: Option<u64>| file == STOCK_BASE || file == GF_MONO;
+        let items = gf_plan("gfx1151", &both, false);
+        assert_eq!(
+            (items[0].file.as_str(), items[0].download),
+            (STOCK_BASE, false)
+        );
+    }
+
+    /// hipx (a gfx1100 next to a gfx1151): the summary lists the union of what
+    /// each card defaults to; a local monolithic trims it to q4 (q8 is embedded).
+    #[test]
+    fn a_mixed_gpu_host_summary_lists_both_formats_and_a_monolithic_trims_it_to_q4() {
+        let registry = stock_registry();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let hipx = HostFacts {
+            gpu_arches: vec!["gfx1100".into(), "gfx1151".into()],
+            ..host_with_arch("")
+        };
+        let plan = |present: &dyn Fn(&str, Option<u64>) -> bool| {
+            plan_items(
+                &PullContext {
+                    registry: &registry,
+                    host: &hipx,
+                    overlay_pins: GF_OVERLAY_PINS,
+                    hotset_pins: GF_HOTSET_PINS,
+                    grandfather_pins: GF_PINS,
+                    present,
+                },
+                &PullChoice::defaults(tag, entry, &PullFlags::default()),
+                false,
+            )
+        };
+        let labels = |items: &[PlanItem]| -> Vec<String> {
+            items.iter().map(|item| item.label.clone()).collect()
+        };
+        let items = plan(&absent);
+        assert_eq!(
+            labels(&items),
+            ["model", "ple-q4", "ple-q8", "overlay", "Expert hot set"]
+        );
+        assert_eq!(
+            download_total(&items),
+            (
+                STOCK_BASE_SIZE + STOCK_Q4_SIZE + STOCK_Q8_SIZE + 301 + 21,
+                0
+            )
+        );
+        let mono = |file: &str, size: Option<u64>| {
+            file == GF_MONO && (size.is_none() || size == Some(GF_MONO_SIZE))
+        };
+        let items = plan(&mono);
+        assert_eq!(
+            labels(&items),
+            ["model", "ple-q4", "overlay", "Expert hot set"]
+        );
+        assert_eq!(
+            (items[0].file.as_str(), items[0].download),
+            (GF_MONO, false)
+        );
+        assert_eq!(download_total(&items), (STOCK_Q4_SIZE + 300 + 20, 0));
+        // The host line names every GPU.
+        assert!(
+            host_line(&hipx).contains("gfx1100+gfx1151"),
+            "{}",
+            host_line(&hipx)
         );
     }
 }

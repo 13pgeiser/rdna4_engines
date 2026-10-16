@@ -135,9 +135,13 @@ KNOWN_KV_MODES = {
     "legacy-asym3",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
-# Flash-Next split-base PLE row slots (`ple_q4` / `ple_q8`): live-annotated from
-# the HF tree like every other sidecar, and digest-pinned (LFS oid required).
-PLE_SLOT_KINDS = ("ple_q4", "ple_q8")
+# Flash-Next split-base PLE row sidecars (the `ple` map, keyed by format token
+# `q4`, `q8`, ...): live-annotated from the HF tree like every other sidecar, and
+# digest-pinned (LFS oid required). Mirrors hipfire-registry's `ple` validation.
+PLE_FORMAT_KEY = re.compile(r"^[a-z0-9]+$")
+# Stem (before `-base`) of the one split-base family whose PLE row files are
+# shared between bases (`qwen3.8-flash-next.ple-<key>`).
+SHARED_PLE_FAMILY = "qwen3.8-flash-next"
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
@@ -453,6 +457,63 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
                 errors.append(f"{tag}: published XTS filename has a different content pin")
 
 
+def split_base_stem(file: str) -> str | None:
+    """`<stem>` of a bare split-base file name `<stem>-base.<ext>`, else None."""
+    if "/" in file or "\\" in file:
+        return None
+    stem = file.rsplit(".", 1)[0] if "." in file else file
+    if not stem.endswith("-base") or stem == "-base":
+        return None
+    return stem[: -len("-base")]
+
+
+def validate_ple_sidecar(
+    tag: str, file: str, key: str, sidecar: dict, errors: list[str]
+) -> None:
+    """Fail-closed mirror of the registry's `ple` map rules for one sidecar."""
+    kind = f"ple.{key}"
+    if not PLE_FORMAT_KEY.fullmatch(key):
+        errors.append(
+            f"{tag}: invalid PLE format key {key!r} (expected lowercase letters and digits)"
+        )
+        return
+    family = split_base_stem(file)
+    if family is None:
+        errors.append(
+            f"{tag}: {kind} requires a split base file (<name>-base.<ext>), got {file!r}"
+        )
+        return
+    own = f"{file}.ple-{key}"
+    shared = f"{SHARED_PLE_FAMILY}.ple-{key}" if family == SHARED_PLE_FAMILY else None
+    if sidecar.get("file") not in (own, shared):
+        errors.append(
+            f"{tag}: {kind} file {sidecar.get('file')!r} must be {own!r}"
+            + (f" or the shared {shared!r}" if shared else "")
+        )
+
+
+def validate_shared_ple_pins(models: dict, errors: list[str]) -> None:
+    """Every entry naming a shared PLE file must pin the same bytes."""
+    pins: dict[str, tuple[str, tuple]] = {}
+    for tag, entry in models.items():
+        ple = entry.get("ple")
+        if not isinstance(ple, dict):
+            continue
+        for key, sidecar in ple.items():
+            if not isinstance(sidecar, dict):
+                continue
+            file = sidecar.get("file", "")
+            if "/" in file or file != f"{SHARED_PLE_FAMILY}.ple-{key}":
+                continue
+            pin = (sidecar.get("sha256"), sidecar.get("size_bytes"))
+            first_tag, first = pins.setdefault(file, (tag, pin))
+            if pin != first:
+                errors.append(
+                    f"{tag}: ple.{key} shared file {file!r} is pinned differently "
+                    f"than by {first_tag}"
+                )
+
+
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
@@ -594,11 +655,22 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
             for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
-            for kind in PLE_SLOT_KINDS:
-                if isinstance(entry.get(kind), dict):
-                    new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
-                    if not new_entry[kind].get("sha256"):
-                        errors.append(f"{tag}: {kind} sidecar has no LFS sha256 pin")
+            ple = entry.get("ple")
+            if ple is not None:
+                if not isinstance(ple, dict):
+                    errors.append(f"{tag}: ple must be an object keyed by format token")
+                else:
+                    new_entry["ple"] = {}
+                    for key, sidecar in ple.items():
+                        kind = f"ple.{key}"
+                        if not isinstance(sidecar, dict):
+                            errors.append(f"{tag}: {kind} must be a sidecar object")
+                            continue
+                        validate_ple_sidecar(tag, entry["file"], key, sidecar, errors)
+                        annotated = annotate_sidecar(sidecar, tree, tag, kind, errors)
+                        if not annotated.get("sha256"):
+                            errors.append(f"{tag}: {kind} sidecar has no LFS sha256 pin")
+                        new_entry["ple"][key] = annotated
             # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
             # single one — same annotation, once per entry, so a head that is
             # missing from the repo fails the run like any other sidecar.
@@ -633,6 +705,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
     validate_flash_next_xts(out_models, errors)
+    validate_shared_ple_pins(out_models, errors)
 
     if errors:
         return None, errors

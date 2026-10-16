@@ -40,7 +40,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
 
-Optional split-base PLE fields (`ple_q4`, `ple_q8`, each `{file, sha256, size_bytes}`) name the PLE row sidecars of a split entry; `registry_gen.py` pins them from the live Hugging Face tree. A slot's `file` is either the per-base `<file>.ple-q4` / `<file>.ple-q8` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-q4` / `.ple-q8`. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-q4` / `.ple-q8` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without PLE fields are unchanged.
+Optional split-base PLE map (`ple`, an object keyed by format token: lowercase letters and digits such as `q4` = 4-bit Lloyd-Max rows and `q8` = the exact Q8F16 rows; each value is `{file, sha256, size_bytes}`) names the PLE row sidecars of a split entry; `registry_gen.py` pins every one from the live Hugging Face tree (an LFS sha256 is required). The entry's `file` must be a split base (`<name>-base.<ext>`). A sidecar's `file` is either the per-base `<file>.ple-<key>` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-<key>`, which every entry naming it must pin identically. An unknown key (a future `q2`) parses and validates, so a newer registry stays readable; a client plans only the formats it can load (today `q4` and `q8`) and ignores the rest with a note. `q8` is the exact reference: a verified grandfathered monolithic embeds it, and it is the fallback when a lossy format a client wants is unpublished; an explicit `--ple q8` never falls back. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-<key>` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without a `ple` map are unchanged. (This replaces the earlier fixed `ple_q4` / `ple_q8` fields.)
 
 ### Qwen 3.5 dense / hybrid
 
@@ -150,7 +150,9 @@ Other Flash-Next registry entries, retained for provenance and not the default:
 16,839 of the 24,576 trunk routed experts are 3-bit GPTQ (W3), and the other
 7,737 experts and every other tensor are the MQ4 XTS bytes. Sidecars use the
 existing `hipfire pull <tag> --ple q4|q8|auto` pick: a plain pull follows
-`memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere), `--ple q4` pulls
+`memory.ple_format` (`auto` = q4 on gfx1151, q8 elsewhere; on a host with
+several GPU archs, such as a gfx1100 next to a gfx1151, `--ple auto` fetches
+the union of what each card defaults to, here q4 and q8), `--ple q4` pulls
 the q4 rows explicitly, and `--ple q8` opts in to the exact Q8 rows, which
 `memory.ple_format = q8` then requires. The MQ4 XTS tags above are unchanged.
 Split bases share one published pair of row files in
@@ -164,6 +166,19 @@ external). Loader gates on hipfire a6f241ce2's split-base loader: greedy AR
 token ids equal the `qwen4_kld` reference on 8 prompts, MTP output equals AR,
 and the q4 and q8 sidecars both load.
 Row-table semantics: [`CONFIG.md`](CONFIG.md#qwen4-ple-row-tables).
+
+**Grandfathered monolithics (client support, inert until the registry switches).**
+The client carries a compiled-in pin for the Flash-Next MQ4 XTS split base
+(`qwen3.8-flash-next-base.mq4-xts`, sha256 `eafaff94…`, 70,888,270,360 B), a
+byte-exact `hipfire ple split` of the monolithic MQ4 XTS file (sha256
+`8b15b6fe…`, 125,288,544,792 B): when a registry entry carries that split
+identity, a verified local monolithic (canonical or `-gptq3.mq4` name) keeps
+serving its tags, `hipfire pull` downloads no base for it, and the exact q8 rows
+it embeds satisfy `q8`. The published MQ4 tags are still the monolithic entries
+until the registry switches, so nothing changes for a stock install today. A
+resolved monolithic is hashed once: the result is cached by path, device,
+inode, size and mtime in `<HIPFIRE_HOME>/cache/verified-artifacts.json`, so
+later loads skip the 125 GB read until the file changes.
 
 ### DFlash draft artifacts (registry)
 

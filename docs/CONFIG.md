@@ -956,9 +956,15 @@ two interchangeable row files, chosen by `memory.ple_format`:
 `memory.ple_format` (env `HIPFIRE_PLE_FORMAT`):
 
 - `auto` (default) — q4 on gfx1151 (the unified-memory Strix Halo), q8
-  elsewhere. `auto` never derives and never downloads: when the preferred
-  file is absent it uses the other available format and prints a note on
-  stderr naming how to get the preferred one.
+  elsewhere. `auto` never derives and never downloads at load: when the
+  preferred file is absent it uses the other available format and prints a
+  note on stderr naming how to get the preferred one. The on-demand download
+  of a missing sidecar resolves `auto` with the arch of the card the load
+  targets (`hardware.devices`, else `ROCR_VISIBLE_DEVICES`, else ROCr agent
+  order; the first detected GPU when the CLI cannot tell), while
+  `hipfire pull --ple auto` fetches the union of every detected GPU arch's
+  default, so a gfx1100 + gfx1151 host gets both q4 and q8 (q4 only when a
+  verified grandfathered monolithic already embeds the q8 rows).
 - `q4` — always 4-bit rows. A load never derives `<model>.ple-q4`: when it is
   missing the load is refused with both searched locations and the remedies
   `hipfire pull <tag> --ple q4` or `hipfire ple derive --format q4 <model>`
@@ -1015,8 +1021,12 @@ does not change which format a later load selects, so with both files present
 pull. Shared row files: the split bases of the Flash-Next family share one
 published pair of row files in `hipfire-models/qwen3.8-flash-next`,
 `qwen3.8-flash-next.ple-q4` (28,800,142,336 B) and
-`qwen3.8-flash-next.ple-q8` (54,400,269,312 B). A split entry may name these
-shared file names. The CLI then downloads each shared file once and gives
+`qwen3.8-flash-next.ple-q8` (54,400,269,312 B). A split registry entry names
+its row files in the `ple` map (`"ple": {"q4": {...}, "q8": {...}}`, keyed by
+format token; this replaces the fixed `ple_q4` / `ple_q8` fields, and an
+unknown key such as a future `q2` parses and is ignored by a client that
+cannot load it) and may name these shared file names. The CLI then downloads
+each shared file once and gives
 every base a hardlink alias at that base's `<base>.ple-q4` / `<base>.ple-q8`
 path, which is what the loader reads. A split base binds a sidecar by the base
 marker's row geometry and the SHA-256 of the q8 source rows, not by the base's

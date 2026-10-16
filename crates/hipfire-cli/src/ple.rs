@@ -16,7 +16,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use hipfire_config::memory::{ple_sidecar_path, PleFormat, PleFormatRequest};
 use hipfire_registry::{
-    ModelEntry, RegistryV1, Sidecar, FLASH_NEXT_XTS_CANONICAL_FILE, FLASH_NEXT_XTS_LEGACY_FILE,
+    GrandfatheredMonolithic, ModelEntry, Sidecar, FLASH_NEXT_XTS_CANONICAL_FILE,
+    FLASH_NEXT_XTS_LEGACY_FILE, PLE_EXACT_FORMAT,
 };
 use hipfire_runtime::ple_convert::{self, DeriveReport, PleProgress, SplitReport};
 use std::fs;
@@ -26,14 +27,16 @@ use std::time::{Duration, Instant};
 /// Minimum spacing of two progress lines inside one conversion phase.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Suffixes of files that belong to a model but are never models themselves.
-const PLE_SIDECAR_SUFFIXES: [&str; 4] = [".ple-q4", ".ple-q8", ".plehot", ".plehotrows"];
+/// Suffixes of PLE-adjacent files that belong to a model but are never models
+/// themselves (besides the `.ple-<key>` row files, see [`is_ple_sidecar_name`]).
+const PLE_AUX_SUFFIXES: [&str; 2] = [".plehot", ".plehotrows"];
 
 /// `hipfire pull --ple` selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PleSelection {
-    /// The format `memory.ple_format` and the local GPU arch prefer (q4 on
-    /// gfx1151, q8 elsewhere); unknown arch means q8.
+    /// The formats `memory.ple_format` and every detected GPU arch prefer (q4
+    /// on gfx1151, q8 elsewhere; the union on a mixed host); no GPU or an
+    /// unknown arch means q8.
     Auto,
     /// The 4-bit Lloyd-Max rows.
     Q4,
@@ -123,82 +126,134 @@ pub(crate) fn ple_command(paths: &Paths, args: PleArgs) -> Result<()> {
 // Pure decisions
 // ---------------------------------------------------------------------------
 
-/// The registry slot of `format`.
+/// The PLE formats this client can load (`hipfire_config` [`PleFormat`]), in
+/// download order. A registry entry may publish other keys (a future q2); they
+/// are ignored with a note ([`unloadable_formats`]).
+pub(crate) const LOADABLE_FORMATS: [PleFormat; 2] = [PleFormat::Q4, PleFormat::Q8];
+
+/// The registry sidecar of `format`.
 pub(crate) fn ple_slot(entry: &ModelEntry, format: PleFormat) -> Option<&Sidecar> {
-    match format {
-        PleFormat::Q4 => entry.ple_q4.as_ref(),
-        PleFormat::Q8 => entry.ple_q8.as_ref(),
-    }
+    entry.ple_sidecar(format.name())
 }
 
-fn other_format(format: PleFormat) -> PleFormat {
-    match format {
-        PleFormat::Q4 => PleFormat::Q8,
-        PleFormat::Q8 => PleFormat::Q4,
-    }
+/// True for the exact reference format (`q8`): never derived, never lossy.
+fn is_exact(format: PleFormat) -> bool {
+    format.name() == PLE_EXACT_FORMAT
+}
+
+/// Keys of `entry.ple` this client cannot load, in key order.
+pub(crate) fn unloadable_formats(entry: &ModelEntry) -> Vec<&str> {
+    entry
+        .ple
+        .keys()
+        .map(String::as_str)
+        .filter(|key| PleFormat::from_name(key).is_none())
+        .collect()
+}
+
+/// The published format a wanted-but-unpublished `wanted` falls back to when
+/// the selection allows it. The exact format (q8) is the reference every lossy
+/// format derives from, so an unpublished lossy format falls back to it; an
+/// unpublished exact format falls back to the first published lossy format
+/// this client can load (a request that resolved to q8 on its own, never an
+/// explicit `--ple q8`, which does not fall back at all).
+fn fallback_format(entry: &ModelEntry, wanted: PleFormat) -> Option<PleFormat> {
+    LOADABLE_FORMATS.into_iter().find(|candidate| {
+        *candidate != wanted
+            && is_exact(*candidate) != is_exact(wanted)
+            && ple_slot(entry, *candidate).is_some()
+    })
 }
 
 /// Sidecars a pull downloads next to the base, in download order.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct PlePullPlan<'a> {
     pub sidecars: Vec<(PleFormat, &'a Sidecar)>,
-    /// Why the plan differs from the request (missing registry slot).
+    /// Why the plan differs from the request (missing registry slot, or a
+    /// published format this client cannot load).
     pub notes: Vec<String>,
+}
+
+/// The formats `request` defaults to on every arch in `gpu_arches` (the union,
+/// in download order). No GPU resolves with an empty arch: q8 under `auto`.
+pub(crate) fn formats_for_arches(
+    request: PleFormatRequest,
+    gpu_arches: &[String],
+) -> Vec<PleFormat> {
+    let resolved: Vec<PleFormat> = if gpu_arches.is_empty() {
+        vec![request.resolve("")]
+    } else {
+        gpu_arches
+            .iter()
+            .map(|arch| request.resolve(arch))
+            .collect()
+    };
+    LOADABLE_FORMATS
+        .into_iter()
+        .filter(|format| resolved.contains(format))
+        .collect()
 }
 
 /// Choose the sidecars `hipfire pull --ple <selection>` downloads.
 ///
-/// `Auto` follows `request` (the `memory.ple_format` config) resolved with the
-/// local GPU arch. A missing preferred slot falls back to the other published
-/// format for `Auto` and `Q4` (a q8 file lets the loader derive q4); an
-/// explicit `Q8` never falls back, since q4 cannot produce exact rows.
+/// `Auto` fetches the union of the formats `request` (the `memory.ple_format`
+/// config) resolves to on every detected GPU arch (a mixed gfx1100 + gfx1151
+/// host plans q4 and q8; no GPU plans q8). A missing wanted slot falls back
+/// ([`fallback_format`]) for `Auto` and `Q4`; an explicit `Q8` never falls
+/// back, since lossy rows cannot produce exact ones. `All` plans every
+/// published format this client can load. Published formats it cannot load are
+/// ignored with a note.
 pub(crate) fn plan_pull<'a>(
     entry: &'a ModelEntry,
     selection: PleSelection,
     request: PleFormatRequest,
-    gpu_arch: &str,
+    gpu_arches: &[String],
 ) -> PlePullPlan<'a> {
     let (wanted, fallback): (Vec<PleFormat>, bool) = match selection {
         PleSelection::Skip => (Vec::new(), false),
         PleSelection::Q4 => (vec![PleFormat::Q4], true),
         PleSelection::Q8 => (vec![PleFormat::Q8], false),
-        PleSelection::All => (vec![PleFormat::Q4, PleFormat::Q8], false),
-        PleSelection::Auto => (vec![request.resolve(gpu_arch)], true),
+        PleSelection::All => (LOADABLE_FORMATS.to_vec(), false),
+        PleSelection::Auto => (formats_for_arches(request, gpu_arches), true),
     };
     let mut plan = PlePullPlan::default();
     for format in wanted {
         let chosen = match ple_slot(entry, format) {
             Some(sidecar) => Some((format, sidecar)),
-            None => {
-                let other = other_format(format);
-                match ple_slot(entry, other).filter(|_| fallback) {
-                    Some(sidecar) => {
-                        let derive = if other == PleFormat::Q8 {
-                            " (derive q4 from it with `hipfire ple derive --format q4`)"
-                        } else {
-                            ""
-                        };
-                        plan.notes.push(format!(
-                            "registry publishes no ple-{} sidecar; fetching ple-{} instead{derive}",
-                            format.name(),
-                            other.name()
-                        ));
-                        Some((other, sidecar))
-                    }
-                    None => {
-                        plan.notes.push(format!(
-                            "registry publishes no ple-{} sidecar for this model",
-                            format.name()
-                        ));
-                        None
-                    }
+            None => match fallback_format(entry, format).filter(|_| fallback) {
+                Some(other) => {
+                    let derive = if is_exact(other) {
+                        " (derive q4 from it with `hipfire ple derive --format q4`)"
+                    } else {
+                        ""
+                    };
+                    plan.notes.push(format!(
+                        "registry publishes no ple-{} sidecar; fetching ple-{} instead{derive}",
+                        format.name(),
+                        other.name()
+                    ));
+                    ple_slot(entry, other).map(|sidecar| (other, sidecar))
                 }
-            }
+                None => {
+                    plan.notes.push(format!(
+                        "registry publishes no ple-{} sidecar for this model",
+                        format.name()
+                    ));
+                    None
+                }
+            },
         };
         if let Some((format, sidecar)) = chosen {
             if !plan.sidecars.iter().any(|(planned, _)| *planned == format) {
                 plan.sidecars.push((format, sidecar));
             }
+        }
+    }
+    if selection != PleSelection::Skip {
+        for key in unloadable_formats(entry) {
+            plan.notes.push(format!(
+                "registry publishes ple-{key}, which this client cannot load; ignoring it"
+            ));
         }
     }
     plan
@@ -218,18 +273,23 @@ impl PlePresence {
             PleFormat::Q8 => self.q8,
         }
     }
+
+    fn any(self) -> bool {
+        LOADABLE_FORMATS.into_iter().any(|format| self.has(format))
+    }
 }
 
-/// The sidecar a load must download first, if any.
+/// The sidecar a load must download first, if any. `gpu_arch` is the arch of
+/// the card the load targets ([`load_target_arch`]).
 ///
 /// * `q8`: download ple-q8 when absent.
 /// * `q4`: nothing when ple-q4 *or* ple-q8 is present (with only q8 the load
 ///   refuses until `hipfire ple derive --format q4` is run: a load never
 ///   derives); otherwise download ple-q4, or ple-q8 when the registry
 ///   publishes no q4.
-/// * `auto`: the arch's preferred format when present; else the other one when
-///   present (auto never downloads over an available file); with neither
-///   present, download the preferred format (or the other when unpublished).
+/// * `auto`: nothing when any loadable PLE file is present (auto never
+///   downloads over an available file); otherwise the arch's preferred format
+///   (or its [`fallback_format`] when unpublished).
 ///
 /// The result always names a registry slot; `None` also covers "the registry
 /// has nothing to offer", where the loader's own refusal explains it.
@@ -247,24 +307,22 @@ pub(crate) fn plan_on_demand(
             (PleFormat::Q8, false)
         }
         PleFormatRequest::Q4 => {
-            if present.q4 || present.q8 {
+            if present.any() {
                 return None;
             }
             (PleFormat::Q4, true)
         }
         PleFormatRequest::Auto => {
-            let preferred = request.resolve(gpu_arch);
-            if present.has(preferred) || present.has(other_format(preferred)) {
+            if present.any() {
                 return None;
             }
-            (preferred, true)
+            (request.resolve(gpu_arch), true)
         }
     };
     if ple_slot(entry, target).is_some() {
         return Some(target);
     }
-    let other = other_format(target);
-    (fallback && ple_slot(entry, other).is_some()).then_some(other)
+    fallback_format(entry, target).filter(|_| fallback)
 }
 
 /// How a resolved model file relates to a registry split entry.
@@ -272,25 +330,18 @@ pub(crate) fn plan_on_demand(
 pub(crate) enum ModelLayout {
     /// The split base itself (`entry.file`).
     SplitBase,
-    /// The grandfathered monolithic sibling (either legacy spelling).
+    /// The grandfathered monolithic (either pinned spelling).
     Monolithic,
     /// Anything else (a user path, a different artifact).
     Other,
 }
 
-pub(crate) fn classify_layout(
-    registry: &RegistryV1,
-    entry: &ModelEntry,
-    file_name: &str,
-) -> ModelLayout {
+pub(crate) fn classify_layout(entry: &ModelEntry, file_name: &str) -> ModelLayout {
     if file_name == entry.file {
         return ModelLayout::SplitBase;
     }
-    match registry.monolithic_sibling(entry) {
-        Some((_, sibling))
-            if file_name == sibling.file
-                || (sibling.is_flash_next_xts() && file_name == FLASH_NEXT_XTS_LEGACY_FILE) =>
-        {
+    match crate::grandfather_pin(entry) {
+        Some(pin) if file_name == pin.canonical_file || file_name == pin.legacy_file => {
             ModelLayout::Monolithic
         }
         _ => ModelLayout::Other,
@@ -298,35 +349,56 @@ pub(crate) fn classify_layout(
 }
 
 /// Local file names that serve a split `entry`, best first: the split base,
-/// then its grandfathered monolithic sibling (and that pin's legacy spelling).
-/// This is what lets a user who never migrated keep using the local
-/// monolithic under the split tag instead of re-downloading.
-pub(crate) fn split_model_files(registry: &RegistryV1, entry: &ModelEntry) -> Vec<String> {
+/// then its grandfathered monolithic (both pinned spellings). This is what
+/// lets a user who never migrated keep using the local monolithic under the
+/// split tag instead of re-downloading.
+pub(crate) fn split_model_files(entry: &ModelEntry) -> Vec<String> {
     let mut files = vec![entry.file.clone()];
-    if let Some((_, sibling)) = registry.monolithic_sibling(entry) {
-        files.push(sibling.file.clone());
-        if sibling.is_flash_next_xts() {
-            files.push(FLASH_NEXT_XTS_LEGACY_FILE.to_owned());
-        }
+    if let Some(pin) = crate::grandfather_pin(entry) {
+        files.push(pin.canonical_file.to_owned());
+        files.push(pin.legacy_file.to_owned());
     }
     files
 }
 
 /// True for files that belong to a model without being one: the PLE row
-/// sidecars, the hot-rank file and the hot-row packs.
+/// sidecars of any format key (`.ple-q4`, `.ple-q8`, a future `.ple-q2`), the
+/// hot-rank file and the hot-row packs.
 pub(crate) fn is_ple_sidecar_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    PLE_SIDECAR_SUFFIXES
+    PLE_AUX_SUFFIXES
         .iter()
         .any(|suffix| lower.ends_with(suffix))
+        || lower.rsplit_once(".ple-").is_some_and(|(stem, key)| {
+            !stem.is_empty() && hipfire_registry::is_ple_format_token(key)
+        })
+}
+
+/// Path of the PLE sidecar of format `key` beside `model`
+/// (`<model file name>.ple-<key>`): [`ple_sidecar_path`] for any key, including
+/// ones this client cannot load.
+pub(crate) fn ple_sidecar_path_for_key(model: &Path, key: &str) -> PathBuf {
+    let mut path = model.as_os_str().to_owned();
+    path.push(hipfire_registry::ple_sidecar_suffix(key));
+    PathBuf::from(path)
 }
 
 /// The PLE row sidecars of `model` and their hot-row packs; `rm` removes the
-/// ones that exist.
-pub(crate) fn ple_sidecar_paths(model: &Path) -> Vec<PathBuf> {
+/// ones that exist. Covers every format this client can load plus every key the
+/// registry `entry` (when given) publishes.
+pub(crate) fn ple_sidecar_paths(model: &Path, entry: Option<&ModelEntry>) -> Vec<PathBuf> {
+    let mut keys: Vec<&str> = LOADABLE_FORMATS
+        .iter()
+        .map(|format| format.name())
+        .collect();
+    for key in entry.iter().flat_map(|entry| entry.ple.keys()) {
+        if !keys.contains(&key.as_str()) {
+            keys.push(key);
+        }
+    }
     let mut paths = Vec::new();
-    for format in [PleFormat::Q4, PleFormat::Q8] {
-        let sidecar = ple_sidecar_path(model, format);
+    for key in keys {
+        let sidecar = ple_sidecar_path_for_key(model, key);
         let mut hot = sidecar.as_os_str().to_owned();
         hot.push(".plehotrows");
         paths.push(sidecar);
@@ -464,7 +536,7 @@ fn split_summary(report: &SplitReport) -> Vec<String> {
 /// Other hard links of the pinned monolithic (the canonical and legacy
 /// spellings share one inode after a pull): removing only the named one would
 /// not free the disk.
-fn monolithic_twins(model: &Path) -> Vec<PathBuf> {
+pub(crate) fn monolithic_twins(model: &Path) -> Vec<PathBuf> {
     let Some(dir) = model.parent() else {
         return Vec::new();
     };
@@ -492,13 +564,107 @@ fn plehot_siblings(model: &Path) -> Vec<PathBuf> {
 // Environment-dependent helpers
 // ---------------------------------------------------------------------------
 
-/// The GPU arch the format preference is resolved with; empty when none is
-/// detected (unknown arch resolves to q8).
-pub(crate) fn local_gpu_arch() -> String {
-    crate::detect_gpu_arches()
-        .into_iter()
-        .next()
-        .unwrap_or_default()
+#[cfg(test)]
+thread_local! {
+    /// Tests pin the GPU arches of the pull plan (the real ones are read from sysfs).
+    static GPU_ARCH_OVERRIDE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test guard: `local_gpu_arches()` returns `arches` on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct GpuArchOverride;
+
+#[cfg(test)]
+impl GpuArchOverride {
+    pub(crate) fn set(arches: &[&str]) -> Self {
+        GPU_ARCH_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = Some(arches.iter().map(|arch| (*arch).to_owned()).collect());
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for GpuArchOverride {
+    fn drop(&mut self) {
+        GPU_ARCH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// Every GPU arch detected on this host, sorted and deduplicated (the order is
+/// stable, unlike the KFD node order); empty when none is detected (an unknown
+/// arch resolves to q8).
+pub(crate) fn local_gpu_arches() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(arches) = GPU_ARCH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return arches;
+    }
+    let mut arches = crate::detect_gpu_arches();
+    arches.sort();
+    arches.dedup();
+    arches
+}
+
+/// Arch of the card behind logical device 0 of a load with the `hardware.devices`
+/// selector `spec` (`HIPFIRE_DEVICES`), else the inherited `ROCR_VISIBLE_DEVICES`
+/// filter `rocr_visible`, else ROCr agent order (the lowest ROCr ordinal): the
+/// card a single-GPU `run`/`serve`/`bench` load lands on. Reads only the KFD
+/// topology under `nodes_dir`; nothing is claimed. `None` when the topology is
+/// unreadable or a selector names no GPU.
+pub(crate) fn device_arch_in(
+    nodes_dir: &Path,
+    spec: Option<&str>,
+    rocr_visible: Option<&str>,
+) -> Option<String> {
+    use hipfire_config::devices::{enumerate_gpus, resolve_device_selectors, Claim, GpuDevice};
+    let gpus = enumerate_gpus(nodes_dir).ok()?;
+    if let Some(spec) = spec.map(str::trim).filter(|spec| !spec.is_empty()) {
+        let mut no_claim = |_: &GpuDevice| Ok(Claim::Claimed);
+        let chosen = resolve_device_selectors(spec, &gpus, &mut no_claim).ok()?;
+        return chosen.into_iter().next().map(|gpu| gpu.arch);
+    }
+    if let Some(filter) = rocr_visible
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+    {
+        let token = filter.split(',').next().unwrap_or_default().trim();
+        return gpus
+            .iter()
+            .find(|gpu| match token.parse::<usize>() {
+                Ok(ordinal) => gpu.rocr_index == ordinal,
+                Err(_) => gpu
+                    .uuid()
+                    .is_some_and(|uuid| uuid.eq_ignore_ascii_case(token)),
+            })
+            .map(|gpu| gpu.arch.clone());
+    }
+    gpus.iter()
+        .min_by_key(|gpu| gpu.rocr_index)
+        .map(|gpu| gpu.arch.clone())
+}
+
+/// The GPU arch the load-time on-demand PLE download resolves its format with:
+/// the arch of the device the load targets ([`device_arch_in`] over the
+/// resolved `hardware.devices`, else `ROCR_VISIBLE_DEVICES`, else ROCr agent
+/// order), so a mixed gfx1100 + gfx1151 host fetches what the card it loads on
+/// prefers.
+pub(crate) fn load_target_arch(resolved: &hipfire_config::ResolvedConfig) -> String {
+    let spec = hipfire_config::ProcessConfig::from_resolved(resolved)
+        .ok()
+        .and_then(|config| config.legacy_value("HIPFIRE_DEVICES"));
+    let rocr_visible = std::env::var("ROCR_VISIBLE_DEVICES").ok();
+    device_arch_in(
+        Path::new("/sys/class/kfd/kfd/topology/nodes"),
+        spec.as_deref(),
+        rocr_visible.as_deref(),
+    )
+    // The CLI cannot tell which card the load targets (no readable KFD
+    // topology, as on WSL2 / native Windows, or a selector it cannot resolve
+    // without the daemon's claim step): keep the original rule, the first
+    // detected arch; empty (q8) when there is none.
+    .or_else(|| local_gpu_arches().into_iter().next())
+    .unwrap_or_default()
 }
 
 /// `memory.ple_format` from a resolved config; `auto` when absent or invalid.
@@ -517,30 +683,96 @@ pub(crate) fn request_from_global(paths: &Paths) -> PleFormatRequest {
         .unwrap_or(PleFormatRequest::Auto)
 }
 
-/// Print the pull plan for a split entry and return the sidecars to fetch.
-pub(crate) fn announce_pull_plan<'a>(
-    paths: &Paths,
-    registry: &RegistryV1,
+/// How the base of a split pull is satisfied.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PullBase<'a> {
+    /// The split base is downloaded. `monolithic` is the pin of a monolithic a
+    /// local file may exist for (not served: absent, unverified or `--force`).
+    Download {
+        monolithic: Option<&'a GrandfatheredMonolithic>,
+    },
+    /// The split base is already installed and verified.
+    Present,
+    /// A verified local monolithic at `path` serves the tags; no base download.
+    Served {
+        pin: &'a GrandfatheredMonolithic,
+        path: &'a Path,
+    },
+}
+
+/// Drop a planned exact (q8) sidecar when a served monolithic embeds the exact
+/// rows: nothing is fetched for it and a note says why. A planned lossy format
+/// stays (it is linked beside the monolithic).
+pub(crate) fn drop_embedded_exact(plan: &mut PlePullPlan<'_>, model_file: &str) {
+    let planned = plan.sidecars.len();
+    plan.sidecars.retain(|(format, _)| !is_exact(*format));
+    if plan.sidecars.len() != planned {
+        plan.notes.push(format!(
+            "ple-{PLE_EXACT_FORMAT} is not fetched: the exact {PLE_EXACT_FORMAT} rows are \
+             embedded in the monolithic {model_file}"
+        ));
+    }
+}
+
+/// The sidecars a pull of `selection` fetches next to `base`: [`plan_pull`]
+/// over every GPU arch in `gpu_arches`, minus the exact rows a served
+/// monolithic embeds. `model_file` is the file the loader opens.
+pub(crate) fn plan_for_base<'a>(
     entry: &'a ModelEntry,
     selection: PleSelection,
-    base_present: bool,
+    request: PleFormatRequest,
+    gpu_arches: &[String],
+    base: PullBase<'_>,
+    model_file: &str,
+) -> PlePullPlan<'a> {
+    let mut plan = plan_pull(entry, selection, request, gpu_arches);
+    if let PullBase::Served { .. } = base {
+        drop_embedded_exact(&mut plan, model_file);
+    }
+    plan
+}
+
+/// Print the pull plan for a split entry and return the sidecars to fetch.
+///
+/// `--ple auto` plans the union of the formats every detected GPU arch
+/// defaults to. For a served monolithic the exact q8 rows are embedded in it,
+/// so a planned q8 is dropped with a note; a planned q4 stays (it is linked
+/// beside the monolithic).
+pub(crate) fn announce_pull_plan<'a>(
+    paths: &Paths,
+    entry: &'a ModelEntry,
+    selection: PleSelection,
+    base: PullBase<'_>,
 ) -> PlePullPlan<'a> {
     let request = if selection == PleSelection::Auto {
         request_from_global(paths)
     } else {
         PleFormatRequest::Auto
     };
-    let arch = local_gpu_arch();
-    let plan = plan_pull(entry, selection, request, &arch);
+    let arches = local_gpu_arches();
+    // The file the loader opens: its `<file>.ple-qN` names the links.
+    let model_file = match base {
+        PullBase::Served { path, .. } => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&entry.file),
+        _ => &entry.file,
+    };
+    let plan = plan_for_base(entry, selection, request, &arches, base, model_file);
     eprintln!("Pull plan (--ple {}):", selection_name(selection));
     eprintln!(
         "{}",
-        plan_line(
-            "base",
-            &entry.file,
-            entry.size_bytes,
-            if base_present { "present" } else { "download" }
-        )
+        match base {
+            PullBase::Served { pin, .. } => plan_line(
+                "base",
+                model_file,
+                Some(pin.size_bytes),
+                "present (already satisfied by the monolithic; no base download)"
+            ),
+            PullBase::Present => plan_line("base", &entry.file, entry.size_bytes, "present"),
+            PullBase::Download { .. } =>
+                plan_line("base", &entry.file, entry.size_bytes, "download"),
+        }
     );
     for (format, sidecar) in &plan.sidecars {
         let state = if paths.models.join(&sidecar.file).is_file() {
@@ -548,12 +780,9 @@ pub(crate) fn announce_pull_plan<'a>(
         } else {
             "download"
         };
-        let state = if is_shared_slot(entry, *format, sidecar) {
-            format!(
-                "{state}, shared; linked as {}.{}",
-                entry.file,
-                format.sidecar_suffix()
-            )
+        let own_name = format!("{model_file}.{}", format.sidecar_suffix());
+        let state = if sidecar.file != own_name {
+            format!("{state}, shared; linked as {own_name}")
         } else {
             state.to_owned()
         };
@@ -576,22 +805,17 @@ pub(crate) fn announce_pull_plan<'a>(
     if selection == PleSelection::Skip {
         eprintln!("  (the selected sidecar is fetched on first load)");
     }
-    if !base_present {
-        let local_monolithic = registry
-            .monolithic_sibling(entry)
+    if let PullBase::Download {
+        monolithic: Some(pin),
+    } = base
+    {
+        let local_monolithic = [pin.canonical_file, pin.legacy_file]
             .into_iter()
-            .flat_map(|(_, sibling)| {
-                std::iter::once(sibling.file.as_str()).chain(
-                    sibling
-                        .is_flash_next_xts()
-                        .then_some(FLASH_NEXT_XTS_LEGACY_FILE),
-                )
-            })
             .find(|file| paths.models.join(file).is_file());
         if let Some(file) = local_monolithic {
             eprintln!(
-                "  note: the local monolithic {file} already loads under this tag; \
-                 `hipfire ple split` converts it in place without downloading the base"
+                "  note: a local monolithic {file} is present; `hipfire ple split` converts it \
+                 in place without downloading the base"
             );
         }
     }
@@ -612,8 +836,8 @@ fn selection_name(selection: PleSelection) -> &'static str {
 /// (`qwen3.8-flash-next.ple-q4`) rather than the per-base `<base file>.ple-q4`.
 /// The runtime loader only ever opens `<base file>.ple-qN`, so a shared slot is
 /// installed as a link under that name ([`install_shared_alias`]).
-pub(crate) fn is_shared_slot(entry: &ModelEntry, format: PleFormat, sidecar: &Sidecar) -> bool {
-    sidecar.file != format!("{}.{}", entry.file, format.sidecar_suffix())
+pub(crate) fn is_shared_slot(entry: &ModelEntry, key: &str, sidecar: &Sidecar) -> bool {
+    sidecar.file != format!("{}.ple-{key}", entry.file)
 }
 
 /// Make `alias` (`<base file>.ple-qN`, the name the loader opens) a link to the
@@ -731,20 +955,23 @@ fn fetch_verified_slot(
 }
 
 /// Install one PLE sidecar of `entry` into `models` unless a verified copy
-/// exists. A per-base slot is the file the loader opens. A shared slot is
-/// fetched once under its family name, then linked as `<base file>.ple-qN`
-/// once the canonical file has verified.
+/// exists. The file is fetched once under its registry name, then, when the
+/// loader's name for `model_path` (`<model file>.ple-qN`) differs (a shared
+/// slot, or a served grandfathered monolithic), linked there once the
+/// canonical file has verified.
 pub(crate) fn fetch_ple_sidecar(
     entry: &ModelEntry,
     format: PleFormat,
     sidecar: &Sidecar,
     models: &Path,
+    model_path: &Path,
     force: bool,
 ) -> Result<()> {
-    fetch_verified_slot(entry, format, sidecar, &models.join(&sidecar.file), force)?;
-    if is_shared_slot(entry, format, sidecar) {
-        let alias = ple_sidecar_path(&models.join(&entry.file), format);
-        install_shared_alias(&models.join(&sidecar.file), &alias, sidecar, format)?;
+    let canonical = models.join(&sidecar.file);
+    fetch_verified_slot(entry, format, sidecar, &canonical, force)?;
+    let alias = ple_sidecar_path(model_path, format);
+    if alias != canonical {
+        install_shared_alias(&canonical, &alias, sidecar, format)?;
     }
     Ok(())
 }
@@ -755,14 +982,16 @@ pub(crate) fn fetch_ple_sidecar(
 /// a split entry served from its grandfathered monolithic (one note), and for
 /// paths that are not the registry artifact.
 ///
+/// `gpu_arch` is the arch of the device the load targets
+/// ([`load_target_arch`]); it resolves `memory.ple_format = auto`.
 /// `allow_download = false` (a serve request with downloads disabled) turns a
 /// needed download into an error naming the pull command.
 pub(crate) fn ensure_ple_sidecar(
-    registry: &RegistryV1,
     entry: Option<&ModelEntry>,
     tag: Option<&str>,
     model_path: &Path,
     request: PleFormatRequest,
+    gpu_arch: &str,
     allow_download: bool,
 ) -> Result<()> {
     let Some(entry) = entry.filter(|entry| entry.has_ple_sidecars()) else {
@@ -773,7 +1002,7 @@ pub(crate) fn ensure_ple_sidecar(
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let label = tag.unwrap_or(&entry.file);
-    match classify_layout(registry, entry, file_name) {
+    match classify_layout(entry, file_name) {
         ModelLayout::SplitBase => {}
         ModelLayout::Monolithic => {
             note_monolithic(label, file_name);
@@ -792,12 +1021,12 @@ pub(crate) fn ensure_ple_sidecar(
         q4: sidecar_present(PleFormat::Q4),
         q8: sidecar_present(PleFormat::Q8),
     };
-    let Some(format) = plan_on_demand(entry, request, &local_gpu_arch(), present) else {
+    let Some(format) = plan_on_demand(entry, request, gpu_arch, present) else {
         return Ok(());
     };
     let sidecar = ple_slot(entry, format)
         .ok_or_else(|| anyhow!("registry slot ple-{} vanished", format.name()))?;
-    let shared = is_shared_slot(entry, format, sidecar);
+    let shared = is_shared_slot(entry, format.name(), sidecar);
     let alias = ple_sidecar_path(model_path, format);
     let destination = if shared {
         model_path
@@ -863,7 +1092,8 @@ fn note_monolithic(label: &str, file: &str) {
     NOTED.call_once(|| {
         eprintln!(
             "note: serving the local monolithic {file} for {label}; `hipfire ple split {label}` \
-             or `hipfire pull {label}` gets the split PLE layout (base + swappable PLE rows)"
+             or `hipfire pull {label} --force` gets the split PLE layout (base + swappable PLE \
+             rows)"
         );
     });
 }
@@ -982,6 +1212,7 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands};
     use clap::Parser;
+    use hipfire_registry::RegistryV1;
 
     fn sidecar(file: &str) -> Sidecar {
         Sidecar {
@@ -995,14 +1226,34 @@ mod tests {
         ModelEntry {
             repo: "hipfire-models/qwen3.8-flash-next".into(),
             file: "qwen3.8-flash-next-base.mq4-xts".into(),
-            ple_q4: q4.then(|| sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q4")),
-            ple_q8: q8.then(|| sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q8")),
+            ple: [
+                (
+                    "q4",
+                    q4.then(|| sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q4")),
+                ),
+                (
+                    "q8",
+                    q8.then(|| sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q8")),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(key, sidecar)| Some((key.to_owned(), sidecar?)))
+            .collect(),
             ..Default::default()
         }
     }
 
     fn formats(plan: &PlePullPlan<'_>) -> Vec<PleFormat> {
         plan.sidecars.iter().map(|(format, _)| *format).collect()
+    }
+
+    /// The detected arches of a one-GPU host (none for an unknown arch).
+    fn arches(arch: &str) -> Vec<String> {
+        if arch.is_empty() {
+            Vec::new()
+        } else {
+            vec![arch.to_owned()]
+        }
     }
 
     const NONE: PlePresence = PlePresence {
@@ -1022,8 +1273,9 @@ mod tests {
     #[test]
     fn pull_selection_picks_files_per_flag_and_arch() {
         let entry = split_entry(true, true);
-        let pick =
-            |selection, request, arch: &str| formats(&plan_pull(&entry, selection, request, arch));
+        let pick = |selection, request, arch: &str| {
+            formats(&plan_pull(&entry, selection, request, &arches(arch)))
+        };
         let auto = PleFormatRequest::Auto;
         assert_eq!(pick(PleSelection::Auto, auto, "gfx1151"), [PleFormat::Q4]);
         assert_eq!(pick(PleSelection::Auto, auto, "gfx1100"), [PleFormat::Q8]);
@@ -1049,7 +1301,7 @@ mod tests {
             [PleFormat::Q4, PleFormat::Q8]
         );
         assert!(pick(PleSelection::Skip, auto, "gfx1151").is_empty());
-        let plan = plan_pull(&entry, PleSelection::All, auto, "gfx1100");
+        let plan = plan_pull(&entry, PleSelection::All, auto, &arches("gfx1100"));
         assert_eq!(
             plan.sidecars[1].1.file,
             "qwen3.8-flash-next-base.mq4-xts.ple-q8"
@@ -1063,7 +1315,7 @@ mod tests {
         let auto = PleFormatRequest::Auto;
         // q4 falls back to q8 (`hipfire ple derive` makes q4 from it), with a note.
         for selection in [PleSelection::Q4, PleSelection::Auto] {
-            let plan = plan_pull(&q8_only, selection, auto, "gfx1151");
+            let plan = plan_pull(&q8_only, selection, auto, &arches("gfx1151"));
             assert_eq!(formats(&plan), [PleFormat::Q8], "{selection:?}");
             assert!(
                 plan.notes[0].contains("hipfire ple derive --format q4"),
@@ -1072,24 +1324,26 @@ mod tests {
             );
         }
         // `all` takes what exists and explains what does not.
-        let plan = plan_pull(&q8_only, PleSelection::All, auto, "gfx1151");
+        let plan = plan_pull(&q8_only, PleSelection::All, auto, &arches("gfx1151"));
         assert_eq!(formats(&plan), [PleFormat::Q8]);
         assert_eq!(plan.notes.len(), 1);
 
         let q4_only = split_entry(true, false);
         // An explicit q8 never degrades to q4.
-        let plan = plan_pull(&q4_only, PleSelection::Q8, auto, "gfx1151");
+        let plan = plan_pull(&q4_only, PleSelection::Q8, auto, &arches("gfx1151"));
         assert!(plan.sidecars.is_empty());
         assert!(plan.notes[0].contains("no ple-q8"));
         // Auto prefers q8 off gfx1151 but takes the published q4.
-        let plan = plan_pull(&q4_only, PleSelection::Auto, auto, "gfx1100");
+        let plan = plan_pull(&q4_only, PleSelection::Auto, auto, &arches("gfx1100"));
         assert_eq!(formats(&plan), [PleFormat::Q4]);
         assert_eq!(plan.notes.len(), 1);
 
         let bare = split_entry(false, false);
-        assert!(plan_pull(&bare, PleSelection::Auto, auto, "gfx1151")
-            .sidecars
-            .is_empty());
+        assert!(
+            plan_pull(&bare, PleSelection::Auto, auto, &arches("gfx1151"))
+                .sidecars
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1164,15 +1418,308 @@ mod tests {
         );
     }
 
-    fn registry_with_split() -> RegistryV1 {
-        let pinned = |file: &str| {
-            serde_json::json!({
-                "repo": "hipfire-models/qwen3.8-flash-next", "file": file, "size_gb": 125.29,
-                "min_vram_gb": 8.0, "desc": "pin",
-                "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-                "size_bytes": 125288544792_u64
-            })
+    fn many(arches: &[&str]) -> Vec<String> {
+        arches.iter().map(|arch| (*arch).to_owned()).collect()
+    }
+
+    #[test]
+    fn auto_plans_the_union_of_every_gpu_archs_default_format() {
+        let entry = split_entry(true, true);
+        let auto = PleFormatRequest::Auto;
+        let plan = |selection, request, arches: &[&str]| {
+            formats(&plan_pull(&entry, selection, request, &many(arches)))
         };
+        // hipx: a gfx1100 (q8) next to a gfx1151 (q4) plans both, q4 first.
+        assert_eq!(
+            plan(PleSelection::Auto, auto, &["gfx1100", "gfx1151"]),
+            [PleFormat::Q4, PleFormat::Q8]
+        );
+        assert_eq!(
+            plan(PleSelection::Auto, auto, &["gfx1151", "gfx1100"]),
+            [PleFormat::Q4, PleFormat::Q8],
+            "arch order does not matter"
+        );
+        assert_eq!(
+            plan(PleSelection::Auto, auto, &["gfx1151", "gfx1151"]),
+            [PleFormat::Q4]
+        );
+        assert_eq!(
+            plan(PleSelection::Auto, auto, &["gfx1100", "gfx1201"]),
+            [PleFormat::Q8]
+        );
+        assert_eq!(plan(PleSelection::Auto, auto, &[]), [PleFormat::Q8]);
+        assert_eq!(
+            plan(PleSelection::Auto, auto, &["gfx9999"]),
+            [PleFormat::Q8],
+            "unknown arch is q8"
+        );
+        // A configured request resolves identically on every arch.
+        assert_eq!(
+            plan(
+                PleSelection::Auto,
+                PleFormatRequest::Q8,
+                &["gfx1100", "gfx1151"]
+            ),
+            [PleFormat::Q8]
+        );
+        assert_eq!(
+            plan(
+                PleSelection::Auto,
+                PleFormatRequest::Q4,
+                &["gfx1100", "gfx1151"]
+            ),
+            [PleFormat::Q4]
+        );
+        // Explicit selections ignore the arches.
+        assert_eq!(
+            plan(PleSelection::Q8, auto, &["gfx1100", "gfx1151"]),
+            [PleFormat::Q8]
+        );
+        assert_eq!(
+            plan(PleSelection::Q4, auto, &["gfx1100", "gfx1201"]),
+            [PleFormat::Q4]
+        );
+        assert_eq!(
+            formats_for_arches(auto, &many(&["gfx1100", "gfx1151"])),
+            [PleFormat::Q4, PleFormat::Q8]
+        );
+
+        // One published format: the union collapses onto it, with a note.
+        let q8_only = split_entry(false, true);
+        let plan = plan_pull(
+            &q8_only,
+            PleSelection::Auto,
+            auto,
+            &many(&["gfx1100", "gfx1151"]),
+        );
+        assert_eq!(formats(&plan), [PleFormat::Q8]);
+        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        let q4_only = split_entry(true, false);
+        let plan = plan_pull(
+            &q4_only,
+            PleSelection::Auto,
+            auto,
+            &many(&["gfx1100", "gfx1151"]),
+        );
+        assert_eq!(formats(&plan), [PleFormat::Q4]);
+    }
+
+    #[test]
+    fn q8_is_the_exact_reference_and_the_lossy_fallback() {
+        let q8_only = split_entry(false, true);
+        let plan = plan_pull(
+            &q8_only,
+            PleSelection::Q4,
+            PleFormatRequest::Auto,
+            &many(&["gfx1151"]),
+        );
+        assert_eq!(formats(&plan), [PleFormat::Q8]);
+        assert!(
+            plan.notes[0].contains("fetching ple-q8 instead"),
+            "{:?}",
+            plan.notes
+        );
+        assert_eq!(
+            fallback_format(&q8_only, PleFormat::Q4),
+            Some(PleFormat::Q8)
+        );
+        assert_eq!(fallback_format(&q8_only, PleFormat::Q8), None);
+        let q4_only = split_entry(true, false);
+        assert_eq!(fallback_format(&q4_only, PleFormat::Q4), None);
+        assert_eq!(
+            fallback_format(&q4_only, PleFormat::Q8),
+            Some(PleFormat::Q4)
+        );
+        // An explicit q8 never falls back to lossy rows.
+        let plan = plan_pull(
+            &q4_only,
+            PleSelection::Q8,
+            PleFormatRequest::Auto,
+            &many(&["gfx1151"]),
+        );
+        assert!(plan.sidecars.is_empty());
+    }
+
+    #[test]
+    fn formats_this_client_cannot_load_are_ignored_with_a_note() {
+        let mut entry = split_entry(true, true);
+        entry.ple.insert(
+            "q2".into(),
+            sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q2"),
+        );
+        assert_eq!(unloadable_formats(&entry), ["q2"]);
+        assert_eq!(
+            unloadable_formats(&split_entry(true, true)),
+            Vec::<&str>::new()
+        );
+        for (selection, expected) in [
+            (PleSelection::All, vec![PleFormat::Q4, PleFormat::Q8]),
+            (PleSelection::Auto, vec![PleFormat::Q8]),
+            (PleSelection::Q4, vec![PleFormat::Q4]),
+            (PleSelection::Q8, vec![PleFormat::Q8]),
+        ] {
+            let plan = plan_pull(
+                &entry,
+                selection,
+                PleFormatRequest::Auto,
+                &many(&["gfx1100"]),
+            );
+            assert_eq!(formats(&plan), expected, "{selection:?}");
+            assert!(
+                plan.notes
+                    .iter()
+                    .any(|note| note.contains("ple-q2") && note.contains("cannot load")),
+                "{selection:?}: {:?}",
+                plan.notes
+            );
+        }
+        // `--ple none` fetches and says nothing.
+        let skip = plan_pull(&entry, PleSelection::Skip, PleFormatRequest::Auto, &[]);
+        assert!(skip.sidecars.is_empty() && skip.notes.is_empty());
+        // Only an unloadable format published: nothing to fetch, loader refuses.
+        let mut only_q2 = split_entry(false, false);
+        only_q2.ple.insert(
+            "q2".into(),
+            sidecar("qwen3.8-flash-next-base.mq4-xts.ple-q2"),
+        );
+        let plan = plan_pull(&only_q2, PleSelection::Auto, PleFormatRequest::Auto, &[]);
+        assert!(plan.sidecars.is_empty());
+        assert_eq!(
+            plan_on_demand(&only_q2, PleFormatRequest::Auto, "gfx1100", NONE),
+            None
+        );
+    }
+
+    #[test]
+    fn a_served_monolithic_embeds_q8_so_only_lossy_rows_are_planned() {
+        let entry = split_entry(true, true);
+        let pin = GrandfatheredMonolithic {
+            repo: "hipfire-models/qwen3.8-flash-next",
+            split_file: "qwen3.8-flash-next-base.mq4-xts",
+            split_sha256: "e",
+            split_size_bytes: 1,
+            canonical_file: "qwen3.8-flash-next.mq4-xts",
+            legacy_file: FLASH_NEXT_XTS_LEGACY_FILE,
+            sha256: "f",
+            size_bytes: 2,
+        };
+        let served = PullBase::Served {
+            pin: &pin,
+            path: Path::new("/m/qwen3.8-flash-next.mq4-xts"),
+        };
+        let auto = PleFormatRequest::Auto;
+        let plan_for = |selection, arches: &[&str], base| {
+            plan_for_base(
+                &entry,
+                selection,
+                auto,
+                &many(arches),
+                base,
+                "qwen3.8-flash-next.mq4-xts",
+            )
+        };
+        // hipx with the monolithic: only q4 (gfx1151); q8 is embedded.
+        let plan = plan_for(PleSelection::Auto, &["gfx1100", "gfx1151"], served);
+        assert_eq!(formats(&plan), [PleFormat::Q4]);
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("embedded in the monolithic")));
+        // gfx1100 only (q8 by default) with the monolithic: nothing to fetch.
+        assert!(plan_for(PleSelection::Auto, &["gfx1100"], served)
+            .sidecars
+            .is_empty());
+        // An explicit q8 on Halo is satisfied by the monolithic as well.
+        assert!(plan_for(PleSelection::Q8, &["gfx1151"], served)
+            .sidecars
+            .is_empty());
+        // `--ple all` still links q4 beside the monolithic.
+        assert_eq!(
+            formats(&plan_for(PleSelection::All, &["gfx1151"], served)),
+            [PleFormat::Q4]
+        );
+        // Without the monolithic the same hipx host plans both.
+        let download = PullBase::Download {
+            monolithic: Some(&pin),
+        };
+        assert_eq!(
+            formats(&plan_for(
+                PleSelection::Auto,
+                &["gfx1100", "gfx1151"],
+                download
+            )),
+            [PleFormat::Q4, PleFormat::Q8]
+        );
+    }
+
+    /// A fixture KFD topology: (node, gfx_target_version, location_id, unique_id).
+    fn kfd_fixture(label: &str, nodes: &[(u32, u32, u32, u64)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-kfd-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (node, version, location, unique) in nodes {
+            let dir = root.join(node.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 96\nlocation_id {location}\ndomain 0\n\
+                     gfx_target_version {version}\nunique_id {unique}\n"
+                ),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn the_load_target_arch_follows_devices_then_rocr_then_agent_order() {
+        // Node 0 = gfx1151 at bus 7, node 1 = gfx1100 at bus 3 (BDF order is
+        // the reverse of ROCr order).
+        let root = kfd_fixture(
+            "load-arch",
+            &[(0, 110501, 0x0700, 0x1111), (1, 110000, 0x0300, 0x2222)],
+        );
+        let arch = |spec, rocr| device_arch_in(&root, spec, rocr);
+        // No filter: ROCr agent 0 (the lowest ordinal) is HIP device 0.
+        assert_eq!(arch(None, None).as_deref(), Some("gfx1151"));
+        assert_eq!(arch(Some(""), Some("")).as_deref(), Some("gfx1151"));
+        // `hardware.devices`: an arch, a BDF-order index or a UUID.
+        assert_eq!(arch(Some("gfx1100"), None).as_deref(), Some("gfx1100"));
+        assert_eq!(arch(Some("0"), None).as_deref(), Some("gfx1100"));
+        assert_eq!(arch(Some("1"), None).as_deref(), Some("gfx1151"));
+        assert_eq!(arch(Some("1,0"), None).as_deref(), Some("gfx1151"));
+        assert_eq!(
+            arch(Some("GPU-0000000000002222"), None).as_deref(),
+            Some("gfx1100")
+        );
+        // It wins over an inherited ROCR_VISIBLE_DEVICES.
+        assert_eq!(arch(Some("gfx1100"), Some("0")).as_deref(), Some("gfx1100"));
+        // ROCR_VISIBLE_DEVICES: ROCr ordinal or UUID, first entry.
+        assert_eq!(arch(None, Some("1")).as_deref(), Some("gfx1100"));
+        assert_eq!(arch(None, Some("1,0")).as_deref(), Some("gfx1100"));
+        assert_eq!(arch(None, Some("0")).as_deref(), Some("gfx1151"));
+        assert_eq!(
+            arch(None, Some("GPU-0000000000002222")).as_deref(),
+            Some("gfx1100")
+        );
+        // Unresolvable selectors and an unreadable topology are unknown.
+        assert_eq!(arch(Some("gfx9999"), None), None);
+        assert_eq!(arch(Some("7"), None), None);
+        assert_eq!(arch(None, Some("5")), None);
+        assert_eq!(arch(None, Some("-1")), None);
+        assert_eq!(device_arch_in(&root.join("missing"), None, None), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn registry_with_split() -> RegistryV1 {
+        // The published MQ4 XTS split base: its identity is the compiled-in
+        // grandfather pin's, so the pinned monolithic serves it.
         let value = serde_json::json!({
             "schema_version": 1,
             "generated_at": "2099-01-01T00:00:00Z",
@@ -1181,9 +1728,10 @@ mod tests {
                     "repo": "hipfire-models/qwen3.8-flash-next",
                     "file": "qwen3.8-flash-next-base.mq4-xts",
                     "size_gb": 70.9, "min_vram_gb": 8.0, "desc": "split",
-                    "ple_q8": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q8"}
+                    "sha256": "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45",
+                    "size_bytes": 70888270360_u64,
+                    "ple": {"q8": {"file": "qwen3.8-flash-next-base.mq4-xts.ple-q8"}}
                 },
-                "qwen3.8:flash-next-mq4-xts": pinned("qwen3.8-flash-next.mq4-xts"),
                 "unrelated": {"repo": "x/y", "file": "plain.mq4", "size_gb": 1, "min_vram_gb": 1, "desc": "d"}
             },
             "aliases": {}
@@ -1196,31 +1744,28 @@ mod tests {
         let registry = registry_with_split();
         let split = &registry.models["qwen3.8:flash-next"];
         assert_eq!(
-            classify_layout(&registry, split, "qwen3.8-flash-next-base.mq4-xts"),
+            classify_layout(split, "qwen3.8-flash-next-base.mq4-xts"),
             ModelLayout::SplitBase
         );
         for name in ["qwen3.8-flash-next.mq4-xts", FLASH_NEXT_XTS_LEGACY_FILE] {
             assert_eq!(
-                classify_layout(&registry, split, name),
+                classify_layout(split, name),
                 ModelLayout::Monolithic,
                 "{name}"
             );
         }
+        assert_eq!(classify_layout(split, "plain.mq4"), ModelLayout::Other);
         assert_eq!(
-            classify_layout(&registry, split, "plain.mq4"),
-            ModelLayout::Other
-        );
-        assert_eq!(
-            split_model_files(&registry, split),
+            split_model_files(split),
             [
                 "qwen3.8-flash-next-base.mq4-xts",
                 "qwen3.8-flash-next.mq4-xts",
                 FLASH_NEXT_XTS_LEGACY_FILE
             ]
         );
-        // An entry without a catalogued sibling serves only its own file.
+        // An entry without a pin serves only its own file.
         let plain = &registry.models["unrelated"];
-        assert_eq!(split_model_files(&registry, plain), ["plain.mq4"]);
+        assert_eq!(split_model_files(plain), ["plain.mq4"]);
     }
 
     #[test]
@@ -1229,40 +1774,40 @@ mod tests {
         let request = PleFormatRequest::Q8;
         // No entry, a plain entry, and the monolithic fallback never download.
         ensure_ple_sidecar(
-            &registry,
             None,
             None,
             Path::new("/nonexistent/x.mq4"),
             request,
+            "gfx1151",
             true,
         )
         .unwrap();
         let plain = &registry.models["unrelated"];
         ensure_ple_sidecar(
-            &registry,
             Some(plain),
             None,
             Path::new("/nonexistent/plain.mq4"),
             request,
+            "gfx1151",
             true,
         )
         .unwrap();
         let split = &registry.models["qwen3.8:flash-next"];
         ensure_ple_sidecar(
-            &registry,
             Some(split),
             Some("qwen3.8:flash-next"),
             Path::new("/nonexistent/qwen3.8-flash-next.mq4-xts"),
             request,
+            "gfx1151",
             false,
         )
         .unwrap();
         ensure_ple_sidecar(
-            &registry,
             Some(split),
             None,
             Path::new("/nonexistent/other.mq4"),
             request,
+            "gfx1151",
             false,
         )
         .unwrap();
@@ -1273,11 +1818,11 @@ mod tests {
         let registry = registry_with_split();
         let split = &registry.models["qwen3.8:flash-next"];
         let error = ensure_ple_sidecar(
-            &registry,
             Some(split),
             Some("qwen3.8:flash-next"),
             Path::new("/nonexistent/qwen3.8-flash-next-base.mq4-xts"),
             PleFormatRequest::Q8,
+            "gfx1151",
             false,
         )
         .unwrap_err()
@@ -1289,11 +1834,11 @@ mod tests {
         assert!(error.contains("serve.allow_request_pull"), "{error}");
         // q4 with nothing local and a q8-only registry points at the q8 file.
         let error = ensure_ple_sidecar(
-            &registry,
             Some(split),
             Some("qwen3.8:flash-next"),
             Path::new("/nonexistent/qwen3.8-flash-next-base.mq4-xts"),
             PleFormatRequest::Q4,
+            "gfx1151",
             false,
         )
         .unwrap_err()
@@ -1319,11 +1864,11 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let ensure = || {
             ensure_ple_sidecar(
-                &registry,
                 Some(split),
                 Some("qwen3.8:flash-next"),
                 &link,
                 PleFormatRequest::Q8,
+                "gfx1151",
                 false,
             )
         };
@@ -1342,6 +1887,8 @@ mod tests {
             "m.mq4-xts.ple-q4",
             "m.mq4-xts.ple-q8",
             "M.MQ4-XTS.PLE-Q8",
+            "m.mq4-xts.ple-q2",
+            "m.mq4-xts.ple-nf4",
             "m.mq4-xts.plehot",
             "m.mq4-xts.plehotrows",
             "m.mq4-xts.ple-q4.plehotrows",
@@ -1355,6 +1902,9 @@ mod tests {
             "qwen3.8-flash-next.mq4",
             "m.q8",
             "ple-q8.mq4",
+            "m.ple-",
+            "m.ple-q_2",
+            ".ple-q8",
         ] {
             assert!(!is_ple_sidecar_name(name), "{name}");
         }
@@ -1362,7 +1912,7 @@ mod tests {
 
     #[test]
     fn sidecar_paths_name_rows_and_their_hot_packs() {
-        let paths = ple_sidecar_paths(Path::new("/m/x-base.mq4-xts"));
+        let paths = ple_sidecar_paths(Path::new("/m/x-base.mq4-xts"), None);
         let names: Vec<_> = paths
             .iter()
             .map(|path| path.display().to_string())
@@ -1376,6 +1926,22 @@ mod tests {
                 "/m/x-base.mq4-xts.ple-q8.plehotrows",
                 "/m/x-base.mq4-xts.plehot",
             ]
+        );
+        // A key this client cannot load is still removed with its model.
+        let mut entry = split_entry(true, true);
+        entry
+            .ple
+            .insert("q2".into(), sidecar("qwen3.8-flash-next.ple-q2"));
+        let names: Vec<_> = ple_sidecar_paths(Path::new("/m/x-base.mq4-xts"), Some(&entry))
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        assert_eq!(names.len(), 7);
+        assert!(names.contains(&"/m/x-base.mq4-xts.ple-q2".to_owned()));
+        assert!(names.contains(&"/m/x-base.mq4-xts.ple-q2.plehotrows".to_owned()));
+        assert_eq!(
+            ple_sidecar_path_for_key(Path::new("/m/x-base.mq4-xts"), "q2"),
+            Path::new("/m/x-base.mq4-xts.ple-q2")
         );
     }
 

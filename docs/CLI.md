@@ -14,7 +14,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag> --force` | Replace an existing target after downloading and verifying a new copy. |
 | `hipfire pull <tag>` (on a terminal) | Asks only what the registry leaves open, then confirms: (1) the **tier**, when the registry has other tags `<tag>-<suffix>` of the same `arch_id` (aliases resolve first, so `qwen3.8:flash` offers the `qwen3.8:flash-next` tiers; same-artifact tags, a split entry's monolithic sibling, drafts and local-only entries are not tiers), each with its size, the first sentence of its `desc` and whether `min_vram_gb` fits the detected VRAM or VRAM+RAM; (2) the **PLE rows** of a split entry (published q4/q8, both, or none; preselected: what `--ple auto` fetches, or q4 when host RAM cannot hold the base plus the q8 rows); (3) the registry's **draft/MTP sidecars** (MTP, DSpark, DFlash; default yes); (4) a **summary** with every file, the total download and the free disk space (default no when it does not fit). Enter takes the default. A flag skips its question: name the tier's tag, `--ple`, `--draft` / `--no-draft`. A single-variant model with nothing to ask pulls without a prompt. `-y` / `--yes`, or a stdin that is not a terminal, asks nothing and takes the registry defaults (the tag as given, `--ple auto`, every declared sidecar), so scripts and CI are unchanged. |
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
-| `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
+| `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
 | `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default in the CLI and as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice in the TUI, from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
@@ -52,11 +52,16 @@ decode to the q4 `hipfire ple derive` makes locally from the q8 rows).
 - **Pull.** `hipfire pull <tag> [--ple auto|q4|q8|all|none]` downloads the base
   plus the chosen sidecar(s) after printing the plan (files, sizes). `auto`
   (default) follows `memory.ple_format` (`HIPFIRE_PLE_FORMAT`), whose own `auto`
-  is q4 on gfx1151 and q8 elsewhere; an unknown GPU arch resolves to q8. `none`
-  fetches the base only. All files are SHA-256 verified; a failed sidecar fails
-  the pull. Without `--ple`, a pull on a terminal asks which rows to fetch
-  (preselecting what `auto` fetches, or q4 when host RAM cannot hold the base
-  plus the q8 rows); `--yes` or a non-terminal stdin takes `auto`.
+  is q4 on gfx1151 and q8 elsewhere; an unknown GPU arch (or no GPU) resolves to
+  q8. On a host with several GPU archs `auto` fetches the union of every
+  detected arch's default (a gfx1100 + gfx1151 host plans q4 and q8). Unknown
+  registry formats (a future `q2`) are ignored with a note; an unpublished
+  lossy format falls back to the published q8, an explicit `--ple q8` never
+  falls back. `none` fetches the base only. All files are SHA-256 verified; a
+  failed sidecar fails the pull. Without `--ple`, a pull on a terminal asks
+  which rows to fetch (preselecting what `auto` fetches, both on a mixed host,
+  or q4 when host RAM cannot hold the base plus the q8 rows); `--yes` or a
+  non-terminal stdin takes `auto`.
 - **On-demand.** `run`, `bench` and `serve` download a missing sidecar before
   loading (`ple: downloading <file> (<GB>) for memory.ple_format=<..>`): q8 when
   q8 is requested; q4 only when neither `<base>.ple-q4` nor `<base>.ple-q8` is on
@@ -66,11 +71,20 @@ decode to the q4 `hipfire ple derive` makes locally from the q8 rows).
   serve *request* naming such a model downloads only when
   `serve.allow_request_pull` is on; otherwise the load is refused with the pull
   command.
-- **No forced migration.** A user who already has the monolithic
-  `qwen3.8-flash-next.mq4-xts` (or its legacy `…-gptq3.mq4` name) keeps serving
-  it under `qwen3.8:flash-next`: while the split base is absent the tag resolves
-  to the local monolithic (SHA-verified as before) and one note says
-  `hipfire ple split <tag>` or `hipfire pull <tag>` gets the split layout.
+- **No forced migration (grandfathered monolithic).** A user who already has the
+  monolithic `qwen3.8-flash-next.mq4-xts` (or its legacy `…-gptq3.mq4` name)
+  keeps serving it under the split tags: a compiled-in pin (the split base's
+  identity, sha256 `eafaff94…`) lets a SHA-verified local monolithic serve the
+  tag while the split base is absent, so `hipfire pull <tag>` downloads no base
+  (`Already satisfied (monolithic): <path> (serves <tag> without the split base)`,
+  plan line `present (already satisfied by the monolithic; no base download)`).
+  The exact q8 rows are embedded in it, so q8 is never fetched for it; a planned
+  q4 is linked beside it, and the monolith-bound overlay and hot set are
+  fetched when missing. One note says `hipfire ple split <tag>` or
+  `hipfire pull <tag> --force` gets the split layout. Verification is cached
+  (`<HIPFIRE_HOME>/cache/verified-artifacts.json`: path, device, inode, size,
+  mtime, sha256): an unchanged file is not hashed again on later loads. The pin
+  matches no registry entry until the registry publishes that split base.
 - **`hipfire ple derive [--format q4] [--rank PATH] <model>`** writes
   `<model>.ple-q4` from the model's Q8 rows (`<model>.ple-q8` when present, else
   the embedded rows), ordered by `--rank` (default `<model>.plehot` when present,

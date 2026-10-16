@@ -35,10 +35,34 @@ const FLASH_NEXT_XTS_SIZE: u64 = 125288544792;
 const FLASH_NEXT_XTS_SHA256: &str =
     "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972";
 
-/// Suffix appended to a split base's file name for its exact Q8F16 PLE rows.
-pub const PLE_Q8_SIDECAR_SUFFIX: &str = ".ple-q8";
-/// Suffix appended to a split base's file name for its 4-bit Lloyd-Max PLE rows.
-pub const PLE_Q4_SIDECAR_SUFFIX: &str = ".ple-q4";
+/// The Flash-Next MQ4 XTS split base every stock MQ4 tag publishes: the
+/// PLE-less base of `hipfire ple split` over the monolithic
+/// [`FLASH_NEXT_XTS_CANONICAL_FILE`].
+pub const FLASH_NEXT_XTS_SPLIT_BASE_FILE: &str = "qwen3.8-flash-next-base.mq4-xts";
+const FLASH_NEXT_XTS_SPLIT_BASE_SIZE: u64 = 70_888_270_360;
+const FLASH_NEXT_XTS_SPLIT_BASE_SHA256: &str =
+    "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45";
+
+/// PLE format key of the exact Q8F16 rows: the reference every lossy format is
+/// derived from. A grandfathered monolithic embeds it, and it is the fallback
+/// when a lossy format a client wants is unpublished.
+pub const PLE_EXACT_FORMAT: &str = "q8";
+
+/// True for a PLE format token (a key of [`ModelEntry::ple`]): non-empty,
+/// lowercase ASCII letters and digits.
+pub fn is_ple_format_token(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// Suffix appended to a split base's file name for its PLE rows of format
+/// `key` (`.ple-q4`).
+pub fn ple_sidecar_suffix(key: &str) -> String {
+    format!(".ple-{key}")
+}
+
 /// Marker inserted before the extension of a split base's file name
 /// (`qwen3.8-flash-next.mq4-xts` -> `qwen3.8-flash-next-base.mq4-xts`); the
 /// mirror of `hipfire_runtime::ple_convert::default_split_base_path`.
@@ -76,18 +100,21 @@ pub fn monolithic_file_for_split_base(file: &str) -> Option<String> {
 const SHARED_PLE_FAMILY: &str = "qwen3.8-flash-next";
 
 /// The family-wide PLE row file a split base may name instead of its own
-/// `<file><suffix>` (`qwen3.8-flash-next-base.mq3-xts` + `.ple-q4` ->
+/// `<file>.ple-<key>` (`qwen3.8-flash-next-base.mq3-xts` + `q4` ->
 /// `qwen3.8-flash-next.ple-q4`). `None` unless `base_file` is a Flash-Next
-/// split base; `suffix` is [`PLE_Q4_SIDECAR_SUFFIX`] or [`PLE_Q8_SIDECAR_SUFFIX`].
+/// split base and `key` a [`is_ple_format_token`].
 ///
 /// The rows are bound to the base by the row table, not by the file name, so
-/// one shared pair serves every split base of the family; consumers install
-/// `<base file><suffix>` as a link to it for the runtime loader.
-pub fn shared_ple_file(base_file: &str, suffix: &str) -> Option<String> {
+/// one shared set serves every split base of the family; consumers install
+/// `<base file>.ple-<key>` as a link to it for the runtime loader.
+pub fn shared_ple_file(base_file: &str, key: &str) -> Option<String> {
     monolithic_file_for_split_base(base_file)?;
+    if !is_ple_format_token(key) {
+        return None;
+    }
     let stem = Path::new(base_file).file_stem()?.to_str()?;
     (stem.strip_suffix(SPLIT_BASE_STEM_SUFFIX)? == SHARED_PLE_FAMILY)
-        .then(|| format!("{SHARED_PLE_FAMILY}{suffix}"))
+        .then(|| format!("{SHARED_PLE_FAMILY}{}", ple_sidecar_suffix(key)))
 }
 
 #[derive(Debug, Error)]
@@ -154,14 +181,26 @@ pub struct TrunkOverlayPin {
 }
 
 /// Trunk overlays known to this client, keyed by exact base artifact identity.
-pub const TRUNK_OVERLAY_PINS: &[TrunkOverlayPin] = &[TrunkOverlayPin {
-    base_sha256: FLASH_NEXT_XTS_SHA256,
-    base_size: FLASH_NEXT_XTS_SIZE,
-    repo: FLASH_NEXT_XTS_REPO,
-    file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
-    sha256: "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd",
-    size_bytes: 305_543_168,
-}];
+pub const TRUNK_OVERLAY_PINS: &[TrunkOverlayPin] = &[
+    // The grandfathered monolithic (a verified local install keeps its overlay).
+    TrunkOverlayPin {
+        base_sha256: FLASH_NEXT_XTS_SHA256,
+        base_size: FLASH_NEXT_XTS_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+        sha256: "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd",
+        size_bytes: 305_543_168,
+    },
+    // The split base (the overlay payload is re-bound to its tensor index).
+    TrunkOverlayPin {
+        base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+        sha256: "e3e352ca7fdcb0890fb0c6ddc07903cbbd9ceab65ad24ed5af0637e7dd92e4a6",
+        size_bytes: 305_543_168,
+    },
+];
 
 /// A resolved trunk overlay: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
@@ -211,14 +250,26 @@ pub struct ExpertHotsetPin {
 }
 
 /// Expert hotsets known to this client, keyed by exact base artifact identity.
-pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
-    base_sha256: FLASH_NEXT_XTS_SHA256,
-    base_size: FLASH_NEXT_XTS_SIZE,
-    repo: FLASH_NEXT_XTS_REPO,
-    file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
-    sha256: "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
-    size_bytes: 217_676,
-}];
+pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
+    // The grandfathered monolithic (a verified local install keeps its hot set).
+    ExpertHotsetPin {
+        base_sha256: FLASH_NEXT_XTS_SHA256,
+        base_size: FLASH_NEXT_XTS_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
+        sha256: "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086",
+        size_bytes: 217_676,
+    },
+    // The split base (the hot set is re-bound to its tensor index).
+    ExpertHotsetPin {
+        base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+        sha256: "911430746607f0a15f388594302304d1ce0283f1787e3f3d6aa32005d0a067a1",
+        size_bytes: 217_675,
+    },
+];
 
 /// A resolved expert hotset: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
@@ -243,6 +294,67 @@ pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<
                 size_bytes: Some(pin.size_bytes),
             },
         })
+}
+
+/// A monolithic artifact a published split base was cut from, pinned in the
+/// client so a verified local copy keeps serving the split tags without the
+/// base download.
+///
+/// The published split base is a byte-exact `hipfire ple split` of the
+/// monolithic: everything but the 128 PLE shards is byte-identical, and the
+/// split base's PLE rows are bound to the monolithic's by source rows. A local
+/// monolithic whose bytes verify against [`Self::sha256`] / [`Self::size_bytes`]
+/// is therefore the same model and serves the split tags directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrandfatheredMonolithic {
+    /// Hugging Face repo of both the split base and the monolithic.
+    pub repo: &'static str,
+    /// File name of the split base this monolithic serves.
+    pub split_file: &'static str,
+    /// SHA-256 of the split base (the registry entry's `sha256`).
+    pub split_sha256: &'static str,
+    /// Size in bytes of the split base (the registry entry's `size_bytes`).
+    pub split_size_bytes: u64,
+    /// Canonical monolithic file name.
+    pub canonical_file: &'static str,
+    /// Legacy monolithic file name (the same bytes under the old spelling).
+    pub legacy_file: &'static str,
+    /// SHA-256 of the monolithic.
+    pub sha256: &'static str,
+    /// Size in bytes of the monolithic.
+    pub size_bytes: u64,
+}
+
+/// Monolithics the compiled client keeps serving under their split tags.
+pub const GRANDFATHERED_MONOLITHICS: &[GrandfatheredMonolithic] = &[GrandfatheredMonolithic {
+    repo: FLASH_NEXT_XTS_REPO,
+    split_file: FLASH_NEXT_XTS_SPLIT_BASE_FILE,
+    split_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+    split_size_bytes: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+    canonical_file: FLASH_NEXT_XTS_CANONICAL_FILE,
+    legacy_file: FLASH_NEXT_XTS_LEGACY_FILE,
+    sha256: FLASH_NEXT_XTS_SHA256,
+    size_bytes: FLASH_NEXT_XTS_SIZE,
+}];
+
+/// The pin in `pins` whose split-base identity equals `entry` (repo, file,
+/// `sha256`, `size_bytes`) while the entry publishes PLE slots. An entry
+/// without a pinned digest and size never matches.
+pub fn grandfathered_monolithic_in<'a>(
+    entry: &ModelEntry,
+    pins: &'a [GrandfatheredMonolithic],
+) -> Option<&'a GrandfatheredMonolithic> {
+    if !entry.has_ple_sidecars() {
+        return None;
+    }
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter().find(|pin| {
+        entry.repo == pin.repo
+            && entry.file == pin.split_file
+            && pin.split_size_bytes == size_bytes
+            && pin.split_sha256.eq_ignore_ascii_case(sha256)
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -398,16 +510,16 @@ pub struct ModelEntry {
     /// trunk; sha256/size_bytes stay absent until the pack ships.
     #[serde(default)]
     pub vision: Option<Sidecar>,
-    /// Exact Q8F16 PLE n-gram rows of a Flash-Next split base
-    /// (`<file>.ple-q8`). Only valid on an entry whose `file` is a split base
-    /// (`<name>-base.<ext>`); the file name must be exactly `<file>.ple-q8`.
-    #[serde(default)]
-    pub ple_q8: Option<Sidecar>,
-    /// 4-bit Lloyd-Max PLE rows of a Flash-Next split base (`<file>.ple-q4`),
-    /// bit-identical in decode to the q4 `hipfire ple derive` makes locally from the q8 rows.
-    /// Same placement rules as `ple_q8`.
-    #[serde(default)]
-    pub ple_q4: Option<Sidecar>,
+    /// PLE n-gram row sidecars of a Flash-Next split base, keyed by format
+    /// token (lowercase `[a-z0-9]+`: `q4` = 4-bit Lloyd-Max rows, `q8` = exact
+    /// Q8F16 rows; future formats such as `q2` parse and validate too). Only
+    /// valid on an entry whose `file` is a split base (`<name>-base.<ext>`);
+    /// the file name is `<file>.ple-<key>`, or, for the Flash-Next family
+    /// only, the shared `qwen3.8-flash-next.ple-<key>` pinned identically by
+    /// every entry that names it ([`shared_ple_file`]). A client plans only
+    /// the formats it can load and ignores the rest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ple: BTreeMap<String, Sidecar>,
     /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
     ///
     /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
@@ -453,6 +565,14 @@ impl ModelEntry {
             )
     }
 
+    /// The pinned monolithic this split base was cut from, from the compiled-in
+    /// [`GRANDFATHERED_MONOLITHICS`]; `Some` only for the published MQ4 XTS
+    /// split base. A verified local copy of it serves this entry's tags without
+    /// the base download. `None` for every other entry.
+    pub fn grandfathered_monolithic(&self) -> Option<&'static GrandfatheredMonolithic> {
+        grandfathered_monolithic_in(self, GRANDFATHERED_MONOLITHICS)
+    }
+
     /// The Flash-Next trunk overlay sidecar of this entry's base artifact, from
     /// the compiled-in [`TRUNK_OVERLAY_PINS`]; `None` for every other entry.
     pub fn trunk_overlay(&self) -> Option<TrunkOverlay> {
@@ -467,28 +587,30 @@ impl ModelEntry {
 
     /// True when this entry is a split base that publishes PLE row sidecars.
     pub fn has_ple_sidecars(&self) -> bool {
-        self.ple_q4.is_some() || self.ple_q8.is_some()
+        !self.ple.is_empty()
+    }
+
+    /// The PLE row sidecar of format `key` (`q4`, `q8`, ...), if published.
+    pub fn ple_sidecar(&self, key: &str) -> Option<&Sidecar> {
+        self.ple.get(key)
     }
 
     /// True when this split base is published split-only: there is no
-    /// monolithic artifact it is a view of, so it has no monolithic sibling.
-    /// Derived from the entry's shape, not a flag: every published PLE slot
+    /// monolithic artifact it is a view of, so no monolithic can be
+    /// grandfathered for it.
+    /// Derived from the entry's shape, not a flag: every published PLE sidecar
     /// names the Flash-Next family's shared rows-bound file
     /// ([`shared_ple_file`]), and the name without `-base` is not the
-    /// published MQ4 XTS monolithic, whose split views must keep it
-    /// catalogued. A split base naming its own `<file>.ple-q*` rows is a view
-    /// of a monolithic.
+    /// published MQ4 XTS monolithic, whose split views must keep a compiled-in
+    /// pin ([`ModelEntry::grandfathered_monolithic`]). A split base naming its
+    /// own `<file>.ple-<key>` rows is a view of a monolithic.
     pub fn is_split_only(&self) -> bool {
-        let slot_is_shared = |slot: Option<&Sidecar>, suffix: &str| {
-            slot.is_none_or(|sidecar| {
-                shared_ple_file(&self.file, suffix).as_deref() == Some(sidecar.file.as_str())
-            })
-        };
         self.has_ple_sidecars()
             && monolithic_file_for_split_base(&self.file)
                 .is_some_and(|monolithic| monolithic != FLASH_NEXT_XTS_CANONICAL_FILE)
-            && slot_is_shared(self.ple_q4.as_ref(), PLE_Q4_SIDECAR_SUFFIX)
-            && slot_is_shared(self.ple_q8.as_ref(), PLE_Q8_SIDECAR_SUFFIX)
+            && self.ple.iter().all(|(key, sidecar)| {
+                shared_ple_file(&self.file, key).as_deref() == Some(sidecar.file.as_str())
+            })
     }
 
     /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
@@ -659,25 +781,25 @@ impl RegistryV1 {
                 &entry.clip,
                 &entry.qwen3,
                 &entry.vae,
-                &entry.ple_q4,
-                &entry.ple_q8,
             ]
             .into_iter()
             .flatten()
             .chain(entry.heads.values())
+            .chain(entry.ple.values())
             {
                 if sidecar.file.trim().is_empty() {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
                 }
                 validate_digest(sidecar.sha256.as_deref(), tag).map_err(fail)?;
             }
-            for (slot, suffix, sidecar) in [
-                ("ple_q4", PLE_Q4_SIDECAR_SUFFIX, &entry.ple_q4),
-                ("ple_q8", PLE_Q8_SIDECAR_SUFFIX, &entry.ple_q8),
-            ] {
-                let Some(sidecar) = sidecar else {
-                    continue;
-                };
+            for (key, sidecar) in &entry.ple {
+                let slot = format!("ple.{key}");
+                if !is_ple_format_token(key) {
+                    return Err(fail(format!(
+                        "model '{tag}' has invalid PLE format key '{key}' (expected lowercase \
+                         letters and digits, e.g. q4)"
+                    )));
+                }
                 if !is_split_base_file(&entry.file) {
                     return Err(fail(format!(
                         "model '{tag}' declares {slot} but its file '{}' is not a split base \
@@ -685,12 +807,12 @@ impl RegistryV1 {
                         entry.file
                     )));
                 }
-                let own = format!("{}{suffix}", entry.file);
+                let own = format!("{}{}", entry.file, ple_sidecar_suffix(key));
                 if sidecar.file == own {
                     continue;
                 }
                 let Some(shared) =
-                    shared_ple_file(&entry.file, suffix).filter(|shared| *shared == sidecar.file)
+                    shared_ple_file(&entry.file, key).filter(|shared| *shared == sidecar.file)
                 else {
                     return Err(fail(format!(
                         "model '{tag}' {slot} file '{}' must be '{own}'",
@@ -799,25 +921,6 @@ impl RegistryV1 {
         self.models
             .get_key_value(&tag)
             .map(|(tag, entry)| (tag.as_str(), entry))
-    }
-
-    /// The monolithic (PLE embedded) entry a split `entry` was cut from: the
-    /// entry of the same repo whose file is `entry.file` without the `-base`
-    /// marker and that has no PLE sidecars itself. `None` for an entry that is
-    /// not a split base or whose monolithic sibling is not catalogued. Lets a
-    /// user who still has the grandfathered monolithic keep serving it under
-    /// the split tag instead of being forced to re-download.
-    pub fn monolithic_sibling(&self, entry: &ModelEntry) -> Option<(&str, &ModelEntry)> {
-        if !entry.has_ple_sidecars() {
-            return None;
-        }
-        let file = monolithic_file_for_split_base(&entry.file)?;
-        self.models
-            .iter()
-            .find(|(_, other)| {
-                other.repo == entry.repo && other.file == file && !other.has_ple_sidecars()
-            })
-            .map(|(tag, other)| (tag.as_str(), other))
     }
 }
 
@@ -1278,6 +1381,43 @@ mod tests {
         }
     }
 
+    const STOCK_PLE_Q4: (&str, &str, u64) = (
+        "qwen3.8-flash-next.ple-q4",
+        "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e",
+        29_120_146_432,
+    );
+    const STOCK_PLE_Q8: (&str, &str, u64) = (
+        "qwen3.8-flash-next.ple-q8",
+        "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c",
+        54_400_269_312,
+    );
+
+    /// The published MQ4 XTS split base with the shared PLE pair: the entry
+    /// every stock MQ4 tag carries.
+    fn stock_split_base_entry() -> ModelEntry {
+        let slot = |(file, sha256, size_bytes): (&str, &str, u64)| Sidecar {
+            file: file.into(),
+            sha256: Some(sha256.into()),
+            size_bytes: Some(size_bytes),
+        };
+        ModelEntry {
+            repo: FLASH_NEXT_XTS_REPO.into(),
+            file: FLASH_NEXT_XTS_SPLIT_BASE_FILE.into(),
+            size_gb: 70.89,
+            min_vram_gb: 8.0,
+            desc: "Qwen3.8-Flash-Next MQ4 XTS split base".into(),
+            sha256: Some(FLASH_NEXT_XTS_SPLIT_BASE_SHA256.into()),
+            size_bytes: Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE),
+            arch_id: Some(16),
+            quant: Some("mq4".into()),
+            ple: BTreeMap::from([
+                ("q4".to_owned(), slot(STOCK_PLE_Q4)),
+                ("q8".to_owned(), slot(STOCK_PLE_Q8)),
+            ]),
+            ..Default::default()
+        }
+    }
+
     /// The pinned monolithic stays catalogued under its own tag whatever the
     /// canonical `qwen3.8:flash-next` tag maps to (the pinned monolithic, or the
     /// split base once the registry switches).
@@ -1315,6 +1455,39 @@ mod tests {
             parsed.models["qwen3.8:flash-next-rtn-asym"].file,
             "qwen3.8-flash-next.mq4"
         );
+    }
+
+    /// The bundled registry (the monolithic MQ4 tags plus the split-only MQ3
+    /// base on the shared PLE pair) keeps its split invariants: no entry is a
+    /// grandfather candidate without a compiled-in pin, and every PLE map key
+    /// is a loadable-or-forward-compatible format token.
+    #[test]
+    fn bundled_registry_split_entries_are_split_only_and_use_valid_ple_keys() {
+        let parsed = bundled().unwrap();
+        let mq3 = &parsed.models["qwen3.8:flash-next-mq3-xts"];
+        assert!(mq3.has_ple_sidecars());
+        assert!(mq3.is_split_only());
+        assert_eq!(
+            mq3.ple.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["q4", "q8"]
+        );
+        assert_eq!(mq3.ple["q4"].file, "qwen3.8-flash-next.ple-q4");
+        assert_eq!(mq3.ple["q8"].file, "qwen3.8-flash-next.ple-q8");
+        for (tag, entry) in &parsed.models {
+            assert!(
+                entry.ple.keys().all(|key| is_ple_format_token(key)),
+                "{tag}"
+            );
+            if tag != "qwen3.8:flash-next-mq3-xts" {
+                assert!(
+                    !entry.has_ple_sidecars(),
+                    "{tag}: only the MQ3 base is split"
+                );
+            }
+            // Pins keyed by the split MQ4 identity stay inert until a registry
+            // entry names that base.
+            assert!(entry.grandfathered_monolithic().is_none(), "{tag}");
+        }
     }
 
     #[test]
@@ -1376,7 +1549,7 @@ mod tests {
 
     #[test]
     fn trunk_overlay_pin_names_the_canonical_base_file_plus_the_suffix() {
-        assert_eq!(TRUNK_OVERLAY_PINS.len(), 1);
+        assert_eq!(TRUNK_OVERLAY_PINS.len(), 2);
         let pin = &TRUNK_OVERLAY_PINS[0];
         assert_eq!(
             pin.file,
@@ -1482,11 +1655,63 @@ mod tests {
         assert_eq!(aliased.trunk_overlay().as_ref(), Some(&first));
     }
 
+    const SPLIT_TRUNK_OVERLAY_FILE: &str = "qwen3.8-flash-next-base.mq4-xts.trunk-overlay";
+
+    #[test]
+    fn split_base_trunk_overlay_pin_is_rebound_and_keyed_by_the_base_identity() {
+        let pin = &TRUNK_OVERLAY_PINS[1];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{FLASH_NEXT_XTS_SPLIT_BASE_FILE}{}",
+                hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(pin.file, SPLIT_TRUNK_OVERLAY_FILE);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SPLIT_BASE_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "e3e352ca7fdcb0890fb0c6ddc07903cbbd9ceab65ad24ed5af0637e7dd92e4a6"
+        );
+        assert_eq!(pin.size_bytes, 305_543_168);
+        assert_ne!(pin.base_sha256, TRUNK_OVERLAY_PINS[0].base_sha256);
+        assert_ne!(pin.sha256, TRUNK_OVERLAY_PINS[0].sha256);
+
+        let split = stock_split_base_entry();
+        let overlay = split.trunk_overlay().unwrap();
+        assert_eq!(overlay.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            overlay.sidecar,
+            Sidecar {
+                file: SPLIT_TRUNK_OVERLAY_FILE.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(305_543_168),
+            }
+        );
+        // The monolithic keeps its own overlay; neither pin binds the other base.
+        let monolithic = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE)
+            .trunk_overlay()
+            .unwrap();
+        assert_eq!(monolithic.sidecar.file, TRUNK_OVERLAY_FILE);
+        assert_eq!(
+            monolithic.sidecar.sha256.as_deref(),
+            Some(TRUNK_OVERLAY_PINS[0].sha256)
+        );
+        let mut other = split.clone();
+        other.size_bytes = Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE - 1);
+        assert!(other.trunk_overlay().is_none());
+        let mut other = split;
+        other.sha256 = Some(digest('a'));
+        assert!(other.trunk_overlay().is_none());
+    }
+
     const EXPERT_HOTSET_FILE: &str = "qwen3.8-flash-next.mq4-xts.expert-hotset";
 
     #[test]
     fn expert_hotset_pin_has_exact_metadata_and_canonical_name() {
-        assert_eq!(EXPERT_HOTSET_PINS.len(), 1);
+        assert_eq!(EXPERT_HOTSET_PINS.len(), 2);
         let pin = &EXPERT_HOTSET_PINS[0];
         assert_eq!(
             pin.file,
@@ -1596,6 +1821,50 @@ mod tests {
     }
 
     #[test]
+    fn split_base_expert_hotset_pin_is_rebound_and_keyed_by_the_base_identity() {
+        let pin = &EXPERT_HOTSET_PINS[1];
+        assert_eq!(
+            pin.file,
+            format!("{FLASH_NEXT_XTS_SPLIT_BASE_FILE}.expert-hotset")
+        );
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SPLIT_BASE_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "911430746607f0a15f388594302304d1ce0283f1787e3f3d6aa32005d0a067a1"
+        );
+        assert_eq!(pin.size_bytes, 217_675);
+        assert_ne!(pin.sha256, EXPERT_HOTSET_PINS[0].sha256);
+
+        let split = stock_split_base_entry();
+        let hotset = split.expert_hotset().unwrap();
+        assert_eq!(hotset.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            hotset.sidecar,
+            Sidecar {
+                file: "qwen3.8-flash-next-base.mq4-xts.expert-hotset".into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(217_675),
+            }
+        );
+        let monolithic = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE)
+            .expert_hotset()
+            .unwrap();
+        assert_eq!(monolithic.sidecar.file, EXPERT_HOTSET_FILE);
+        assert_eq!(
+            monolithic.sidecar.sha256.as_deref(),
+            Some(EXPERT_HOTSET_PINS[0].sha256)
+        );
+        let mut other = split.clone();
+        other.size_bytes = Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE - 1);
+        assert!(other.expert_hotset().is_none());
+        let mut other = split;
+        other.sha256 = None;
+        assert!(other.expert_hotset().is_none());
+    }
+
+    #[test]
     fn the_wire_registry_has_no_trunk_overlay_field() {
         // The overlay pin is compiled into the client; the registry schema is
         // unchanged so older clients' strict v1 parser keeps accepting it.
@@ -1643,17 +1912,19 @@ mod tests {
                     "desc": "Qwen3.8-Flash-Next MQ4 XTS split base",
                     "arch_id": 16,
                     "quant": "mq4",
-                    "sha256": digest('a'),
-                    "size_bytes": 70_900_000_000_u64,
-                    "ple_q8": {
-                        "file": format!("{SPLIT_BASE_FILE}.ple-q8"),
-                        "sha256": digest('b'),
-                        "size_bytes": 54_400_000_000_u64
-                    },
-                    "ple_q4": {
-                        "file": format!("{SPLIT_BASE_FILE}.ple-q4"),
-                        "sha256": digest('c'),
-                        "size_bytes": 28_800_000_000_u64
+                    "sha256": FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+                    "size_bytes": FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+                    "ple": {
+                        "q8": {
+                            "file": format!("{SPLIT_BASE_FILE}.ple-q8"),
+                            "sha256": digest('b'),
+                            "size_bytes": 54_400_000_000_u64
+                        },
+                        "q4": {
+                            "file": format!("{SPLIT_BASE_FILE}.ple-q4"),
+                            "sha256": digest('c'),
+                            "size_bytes": 28_800_000_000_u64
+                        }
                     }
                 },
                 "qwen3.8:flash-next-mq4": serde_json::to_value(
@@ -1681,12 +1952,12 @@ mod tests {
             "the split base is not the pinned monolithic"
         );
         assert_eq!(
-            split.ple_q8.as_ref().unwrap().file,
-            format!("{SPLIT_BASE_FILE}{PLE_Q8_SIDECAR_SUFFIX}")
+            split.ple["q8"].file,
+            format!("{SPLIT_BASE_FILE}{}", ple_sidecar_suffix("q8"))
         );
         assert_eq!(
-            split.ple_q4.as_ref().unwrap().file,
-            format!("{SPLIT_BASE_FILE}{PLE_Q4_SIDECAR_SUFFIX}")
+            split.ple["q4"].file,
+            format!("{SPLIT_BASE_FILE}{}", ple_sidecar_suffix("q4"))
         );
         // The pinned monolithic still normalizes to the canonical file under its tags.
         assert_flash_next_xts(
@@ -1706,19 +1977,31 @@ mod tests {
 
     #[test]
     fn split_base_without_slots_or_with_one_slot_is_valid() {
-        for keep in [None, Some("ple_q8"), Some("ple_q4")] {
+        for keep in [None, Some("q8"), Some("q4")] {
             let mut value = split_registry_json();
-            let entry = value["models"]["qwen3.8:flash-next"]
+            let ple = value["models"]["qwen3.8:flash-next"]["ple"]
                 .as_object_mut()
                 .unwrap();
-            for slot in ["ple_q8", "ple_q4"] {
+            for slot in ["q8", "q4"] {
                 if Some(slot) != keep {
-                    entry.remove(slot);
+                    ple.remove(slot);
                 }
+            }
+            if keep.is_none() {
+                value["models"]["qwen3.8:flash-next"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ple");
             }
             let registry = parse_split(&value).unwrap();
             assert_eq!(
                 registry.models["qwen3.8:flash-next"].has_ple_sidecars(),
+                keep.is_some()
+            );
+            // An empty map is never written back.
+            let written = serde_json::to_value(&registry).unwrap();
+            assert_eq!(
+                written["models"]["qwen3.8:flash-next"].get("ple").is_some(),
                 keep.is_some()
             );
         }
@@ -1731,50 +2014,50 @@ mod tests {
                 "slot on a monolithic file",
                 Box::new(|entry: &mut serde_json::Value| {
                     entry["file"] = "qwen3.8-flash-next.mq4-xts".into();
-                    entry["ple_q8"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q8".into();
-                    entry["ple_q4"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q4".into();
+                    entry["ple"]["q8"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q8".into();
+                    entry["ple"]["q4"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q4".into();
                 }),
                 "not a split base",
             ),
             (
                 "q8 file does not follow the base",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q8"]["file"] = "other.ple-q8".into()
+                    entry["ple"]["q8"]["file"] = "other.ple-q8".into()
                 }),
                 "must be",
             ),
             (
                 "q4 slot names the q8 file",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q4"]["file"] = format!("{SPLIT_BASE_FILE}.ple-q8").into();
+                    entry["ple"]["q4"]["file"] = format!("{SPLIT_BASE_FILE}.ple-q8").into();
                 }),
                 "must be",
             ),
             (
                 "sidecar in a subdirectory",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q4"]["file"] = format!("sub/{SPLIT_BASE_FILE}.ple-q4").into();
+                    entry["ple"]["q4"]["file"] = format!("sub/{SPLIT_BASE_FILE}.ple-q4").into();
                 }),
                 "must be",
             ),
             (
                 "bad q8 digest",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q8"]["sha256"] = "8b15b6".into()
+                    entry["ple"]["q8"]["sha256"] = "8b15b6".into()
                 }),
                 "invalid SHA-256",
             ),
             (
                 "empty q4 file",
-                Box::new(|entry: &mut serde_json::Value| entry["ple_q4"]["file"] = "  ".into()),
+                Box::new(|entry: &mut serde_json::Value| entry["ple"]["q4"]["file"] = "  ".into()),
                 "empty sidecar file",
             ),
             (
                 "empty stem before -base",
                 Box::new(|entry: &mut serde_json::Value| {
                     entry["file"] = "-base.mq4-xts".into();
-                    entry["ple_q8"]["file"] = "-base.mq4-xts.ple-q8".into();
-                    entry["ple_q4"]["file"] = "-base.mq4-xts.ple-q4".into();
+                    entry["ple"]["q8"]["file"] = "-base.mq4-xts.ple-q8".into();
+                    entry["ple"]["q4"]["file"] = "-base.mq4-xts.ple-q4".into();
                 }),
                 "not a split base",
             ),
@@ -1786,7 +2069,7 @@ mod tests {
             assert!(error.contains(needle), "{name}: {error}");
         }
         let mut value = split_registry_json();
-        value["models"]["qwen3.8:flash-next"]["ple_q8"]["unknown"] = 1.into();
+        value["models"]["qwen3.8:flash-next"]["ple"]["q8"]["unknown"] = 1.into();
         assert!(
             parse_split(&value).is_err(),
             "sidecar slots stay deny_unknown_fields"
@@ -1805,8 +2088,8 @@ mod tests {
         mq3["file"] = "qwen3.8-flash-next-base.mq3-xts".into();
         models.insert("qwen3.8:flash-next-mq3".into(), mq3);
         for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
-            models[tag]["ple_q4"]["file"] = SHARED_Q4.into();
-            models[tag]["ple_q8"]["file"] = SHARED_Q8.into();
+            models[tag]["ple"]["q4"]["file"] = SHARED_Q4.into();
+            models[tag]["ple"]["q8"]["file"] = SHARED_Q8.into();
         }
         value
     }
@@ -1816,20 +2099,20 @@ mod tests {
         let registry = parse_split(&shared_pair_registry_json()).unwrap();
         for tag in ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"] {
             let entry = &registry.models[tag];
-            assert_eq!(entry.ple_q4.as_ref().unwrap().file, SHARED_Q4, "{tag}");
-            assert_eq!(entry.ple_q8.as_ref().unwrap().file, SHARED_Q8, "{tag}");
+            assert_eq!(entry.ple["q4"].file, SHARED_Q4, "{tag}");
+            assert_eq!(entry.ple["q8"].file, SHARED_Q8, "{tag}");
         }
         // Own per-base names stay valid next to the shared ones (mixed slots).
         let mut mixed = shared_pair_registry_json();
-        mixed["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+        mixed["models"]["qwen3.8:flash-next-mq3"]["ple"]["q8"]["file"] =
             "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
         parse_split(&mixed).unwrap();
         assert_eq!(
-            shared_ple_file("qwen3.8-flash-next-base.mq3-xts", PLE_Q4_SIDECAR_SUFFIX).as_deref(),
+            shared_ple_file("qwen3.8-flash-next-base.mq3-xts", "q4").as_deref(),
             Some(SHARED_Q4)
         );
         assert_eq!(
-            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", PLE_Q8_SIDECAR_SUFFIX).as_deref(),
+            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", "q8").as_deref(),
             Some(SHARED_Q8)
         );
         for (file, why) in [
@@ -1838,11 +2121,7 @@ mod tests {
             ("Qwen3.8-Flash-Next-base.mq4-xts", "case"),
             ("dir/qwen3.8-flash-next-base.mq4-xts", "path"),
         ] {
-            assert_eq!(
-                shared_ple_file(file, PLE_Q4_SIDECAR_SUFFIX),
-                None,
-                "{file}: {why}"
-            );
+            assert_eq!(shared_ple_file(file, "q4"), None, "{file}: {why}");
         }
     }
 
@@ -1866,28 +2145,28 @@ mod tests {
             (
                 "q4 slot names the shared q8",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q4"]["file"] = SHARED_Q8.into();
+                    entry["ple"]["q4"]["file"] = SHARED_Q8.into();
                 }),
                 "must be",
             ),
             (
                 "arbitrary family file",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q4"]["file"] = "qwen3.8-flash-next.other-q4".into();
+                    entry["ple"]["q4"]["file"] = "qwen3.8-flash-next.other-q4".into();
                 }),
                 "must be",
             ),
             (
                 "shared name in a subdirectory",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q8"]["file"] = format!("sub/{SHARED_Q8}").into();
+                    entry["ple"]["q8"]["file"] = format!("sub/{SHARED_Q8}").into();
                 }),
                 "must be",
             ),
             (
                 "different case",
                 Box::new(|entry: &mut serde_json::Value| {
-                    entry["ple_q8"]["file"] = "Qwen3.8-Flash-Next.ple-q8".into();
+                    entry["ple"]["q8"]["file"] = "Qwen3.8-Flash-Next.ple-q8".into();
                 }),
                 "must be",
             ),
@@ -1907,10 +2186,102 @@ mod tests {
             ("size_bytes", serde_json::Value::from(1_u64)),
         ] {
             let mut value_json = shared_pair_registry_json();
-            value_json["models"]["qwen3.8:flash-next-mq3"]["ple_q4"][field] = value;
+            value_json["models"]["qwen3.8:flash-next-mq3"]["ple"]["q4"][field] = value;
             let error = parse_split(&value_json).unwrap_err().to_string();
             assert!(error.contains("pinned differently"), "{field}: {error}");
         }
+    }
+
+    #[test]
+    fn ple_map_keys_are_format_tokens_and_unknown_formats_parse_and_validate() {
+        for (key, ok) in [
+            ("q4", true),
+            ("q8", true),
+            ("q2", true),
+            ("nf4", true),
+            ("q10", true),
+            ("", false),
+            ("Q4", false),
+            ("q-4", false),
+            ("q_4", false),
+            ("q4 ", false),
+            ("q4.x", false),
+        ] {
+            assert_eq!(is_ple_format_token(key), ok, "{key:?}");
+        }
+        assert_eq!(ple_sidecar_suffix("q2"), ".ple-q2");
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", "q2").as_deref(),
+            Some("qwen3.8-flash-next.ple-q2")
+        );
+        assert_eq!(
+            shared_ple_file("qwen3.8-flash-next-base.mq4-xts", "Q2"),
+            None
+        );
+        assert_eq!(shared_ple_file("qwen3.8-flash-next-base.mq4-xts", ""), None);
+
+        // A key this client cannot load (q2) is valid, own-named or shared.
+        let mut own = shared_pair_registry_json();
+        own["models"]["qwen3.8:flash-next"]["ple"]["q2"] = serde_json::json!({
+            "file": format!("{SPLIT_BASE_FILE}.ple-q2"),
+            "sha256": digest('e'),
+            "size_bytes": 14_000_000_000_u64,
+        });
+        let registry = parse_split(&own).unwrap();
+        let entry = &registry.models["qwen3.8:flash-next"];
+        assert_eq!(
+            entry.ple.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["q2", "q4", "q8"]
+        );
+        assert_eq!(
+            entry.ple_sidecar("q2").unwrap().size_bytes,
+            Some(14_000_000_000)
+        );
+        assert!(entry.ple_sidecar("q3").is_none());
+        assert_eq!(PLE_EXACT_FORMAT, "q8");
+        // The MQ4 XTS split base is a view of the published monolithic (and its
+        // own-named q2 rows are not shared), so it needs a pin.
+        assert!(!entry.is_split_only());
+        let reparsed = parse_split(&serde_json::to_value(&registry).unwrap()).unwrap();
+        assert_eq!(registry, reparsed);
+
+        // The shared q2 file is pinned identically across entries, like q4/q8.
+        let mut shared = shared_pair_registry_json();
+        for (tag, sha) in [
+            ("qwen3.8:flash-next", digest('e')),
+            ("qwen3.8:flash-next-mq3", digest('e')),
+        ] {
+            shared["models"][tag]["ple"]["q2"] = serde_json::json!({
+                "file": "qwen3.8-flash-next.ple-q2",
+                "sha256": sha,
+                "size_bytes": 14_000_000_000_u64,
+            });
+        }
+        let registry = parse_split(&shared).unwrap();
+        assert!(registry.models["qwen3.8:flash-next-mq3"].is_split_only());
+        shared["models"]["qwen3.8:flash-next-mq3"]["ple"]["q2"]["sha256"] = digest('f').into();
+        let error = parse_split(&shared).unwrap_err().to_string();
+        assert!(error.contains("pinned differently"), "{error}");
+        assert!(error.contains("ple.q2"), "{error}");
+
+        // Invalid key spellings are refused with a clear message.
+        for key in ["Q4", "q-4", "q_4", ""] {
+            let mut bad = split_registry_json();
+            bad["models"]["qwen3.8:flash-next"]["ple"][key] = serde_json::json!({
+                "file": format!("{SPLIT_BASE_FILE}.ple-{key}"),
+            });
+            let error = parse_split(&bad).unwrap_err().to_string();
+            assert!(error.contains("invalid PLE format key"), "{key:?}: {error}");
+        }
+
+        // A shared unknown-key file outside the Flash-Next family stays refused.
+        let mut foreign = split_registry_json();
+        foreign["models"]["qwen3.8:flash-next"]["file"] = "other-model-base.mq4".into();
+        foreign["models"]["qwen3.8:flash-next"]["ple"]["q2"] = serde_json::json!({
+            "file": "qwen3.8-flash-next.ple-q2",
+        });
+        let error = parse_split(&foreign).unwrap_err().to_string();
+        assert!(error.contains("must be"), "{error}");
     }
 
     #[test]
@@ -1938,59 +2309,94 @@ mod tests {
     }
 
     #[test]
-    fn monolithic_sibling_maps_the_split_base_to_the_catalogued_pin() {
+    fn grandfather_pin_binds_exactly_the_published_mq4_xts_split_base() {
         let registry = parse_split(&split_registry_json()).unwrap();
         let split = &registry.models["qwen3.8:flash-next"];
-        let (_, sibling) = registry.monolithic_sibling(split).unwrap();
-        assert!(sibling.is_flash_next_xts());
-        assert_eq!(sibling.file, FLASH_NEXT_XTS_CANONICAL_FILE);
-        // A monolithic entry has no sibling of its own.
-        assert!(registry
-            .monolithic_sibling(&registry.models["qwen3.8:flash-next-mq4-xts"])
+        let pin = split.grandfathered_monolithic().unwrap();
+        assert_eq!(pin.canonical_file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        assert_eq!(pin.legacy_file, FLASH_NEXT_XTS_LEGACY_FILE);
+        assert_eq!(pin.sha256, FLASH_NEXT_XTS_SHA256);
+        assert_eq!(pin.size_bytes, FLASH_NEXT_XTS_SIZE);
+        assert_eq!(pin.size_bytes, 125_288_544_792);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(pin.split_file, FLASH_NEXT_XTS_SPLIT_BASE_FILE);
+        assert_eq!(pin.split_sha256, FLASH_NEXT_XTS_SPLIT_BASE_SHA256);
+        assert_eq!(pin.split_size_bytes, 70_888_270_360);
+        assert_eq!(
+            Some(pin.canonical_file.to_owned()),
+            monolithic_file_for_split_base(pin.split_file)
+        );
+        // The monolithic itself (no PLE slots) grandfathers nothing.
+        assert!(pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE)
+            .grandfathered_monolithic()
+            .is_none());
+        assert!(pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE)
+            .grandfathered_monolithic()
             .is_none());
 
-        let mut orphan = split_registry_json();
-        orphan["models"]
-            .as_object_mut()
-            .unwrap()
-            .remove("qwen3.8:flash-next-mq4");
-        orphan["models"]
-            .as_object_mut()
-            .unwrap()
-            .remove("qwen3.8:flash-next-mq4-xts");
-        let orphan = parse_split(&orphan).unwrap();
-        assert!(orphan
-            .monolithic_sibling(&orphan.models["qwen3.8:flash-next"])
-            .is_none());
-
-        let mut foreign = split_registry_json();
-        foreign["models"]["qwen3.8:flash-next-mq4"]["repo"] = "other/repo".into();
-        foreign["models"]["qwen3.8:flash-next-mq4-xts"]["repo"] = "other/repo".into();
-        let foreign = parse_split(&foreign).unwrap();
-        assert!(foreign
-            .monolithic_sibling(&foreign.models["qwen3.8:flash-next"])
-            .is_none());
+        // Every part of the split-base identity is required.
+        for mismatch in 0..7 {
+            let mut entry = stock_split_base_entry();
+            match mismatch {
+                0 => entry.repo = "other/qwen3.8-flash-next".into(),
+                1 => entry.file = "qwen3.8-flash-next-base.mq3-xts".into(),
+                2 => entry.size_bytes = Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE - 1),
+                3 => entry.sha256 = Some(digest('a')),
+                4 => entry.sha256 = None,
+                5 => entry.size_bytes = None,
+                6 => {
+                    entry.ple.clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(entry.grandfathered_monolithic().is_none(), "{mismatch}");
+        }
+        assert!(stock_split_base_entry()
+            .grandfathered_monolithic()
+            .is_some());
     }
 
-    /// Split tags that are views of a monolithic (not split-only) and whose
-    /// grandfathered monolithic is not catalogued.
-    fn missing_monolithic_siblings(registry: &RegistryV1) -> Vec<&str> {
+    #[test]
+    fn grandfathered_monolithic_in_uses_the_supplied_pin_table() {
+        let mut entry = stock_split_base_entry();
+        entry.file = "custom-base.mq4".into();
+        entry.sha256 = Some(digest('b'));
+        entry.size_bytes = Some(123);
+        assert!(grandfathered_monolithic_in(&entry, GRANDFATHERED_MONOLITHICS).is_none());
+        let pins = [GrandfatheredMonolithic {
+            repo: FLASH_NEXT_XTS_REPO,
+            split_file: "custom-base.mq4",
+            split_sha256: "B".repeat(64).leak(),
+            split_size_bytes: 123,
+            canonical_file: "custom.mq4",
+            legacy_file: "custom-old.mq4",
+            sha256: "c".repeat(64).leak(),
+            size_bytes: 7,
+        }];
+        let found = grandfathered_monolithic_in(&entry, &pins).unwrap();
+        assert_eq!(found.canonical_file, "custom.mq4");
+        assert!(grandfathered_monolithic_in(&entry, &[]).is_none());
+    }
+
+    /// Split tags that are views of a monolithic (not split-only) without a
+    /// compiled-in grandfather pin.
+    fn missing_grandfather_pins(registry: &RegistryV1) -> Vec<&str> {
         registry
             .models
             .iter()
             .filter(|(_, entry)| entry.has_ple_sidecars() && !entry.is_split_only())
-            .filter(|(_, entry)| registry.monolithic_sibling(entry).is_none())
+            .filter(|(_, entry)| entry.grandfathered_monolithic().is_none())
             .map(|(tag, _)| tag.as_str())
             .collect()
     }
 
     #[test]
-    fn bundled_split_entries_name_their_monolithic_sibling() {
+    fn bundled_split_entries_that_are_views_of_a_monolithic_have_a_grandfather_pin() {
         let registry = bundled().unwrap();
         assert_eq!(
-            missing_monolithic_siblings(&registry),
+            missing_grandfather_pins(&registry),
             Vec::<&str>::new(),
-            "a split view of a monolithic must keep its grandfathered monolithic catalogued"
+            "re-publishing a split view of a monolithic must update the compiled-in pin"
         );
     }
 
@@ -2004,22 +2410,28 @@ mod tests {
         // Both slots on the shared rows-bound pair and no published monolithic.
         assert!(registry.models["qwen3.8:flash-next-mq3"].is_split_only());
         // The MQ4 XTS split base is a view of the published monolithic even on
-        // the shared pair, so dropping that monolithic still fails.
+        // the shared pair; its compiled-in pin keeps that monolithic serving it.
         assert!(!registry.models["qwen3.8:flash-next"].is_split_only());
+        assert_eq!(missing_grandfather_pins(&registry), Vec::<&str>::new());
+
+        // Re-publishing the MQ4 XTS base (new bytes) without updating the pin fails.
+        let mut republished = value.clone();
+        republished["models"]["qwen3.8:flash-next"]["sha256"] = digest('d').into();
+        let republished = parse_split(&republished).unwrap();
         assert_eq!(
-            missing_monolithic_siblings(&registry),
+            missing_grandfather_pins(&republished),
             ["qwen3.8:flash-next"]
         );
 
         // Without the marker (one slot naming its own per-base rows) the MQ3
-        // split base is a view of an uncatalogued monolithic: it fails too.
-        value["models"]["qwen3.8:flash-next-mq3"]["ple_q8"]["file"] =
+        // split base is a view of an unpinned monolithic: it fails too.
+        value["models"]["qwen3.8:flash-next-mq3"]["ple"]["q8"]["file"] =
             "qwen3.8-flash-next-base.mq3-xts.ple-q8".into();
         let unmarked = parse_split(&value).unwrap();
         assert!(!unmarked.models["qwen3.8:flash-next-mq3"].is_split_only());
         assert_eq!(
-            missing_monolithic_siblings(&unmarked),
-            ["qwen3.8:flash-next", "qwen3.8:flash-next-mq3"]
+            missing_grandfather_pins(&unmarked),
+            ["qwen3.8:flash-next-mq3"]
         );
         // A monolithic entry is never split-only.
         let split = parse_split(&split_registry_json()).unwrap();

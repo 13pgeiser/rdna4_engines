@@ -20,8 +20,9 @@ use hipfire_config::{
     ConfigPaths, ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
-    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
-    ExpertHotsetPin, Sidecar, TrunkOverlayPin, EXPERT_HOTSET_PINS, TRUNK_OVERLAY_PINS,
+    load as load_registry, ExpertHotsetPin, GrandfatheredMonolithic, LoadedRegistry, ModelEntry,
+    RegistryPaths, RegistrySource, RegistryV1, Sidecar, TrunkOverlayPin, EXPERT_HOTSET_PINS,
+    GRANDFATHERED_MONOLITHICS, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
@@ -59,9 +60,11 @@ mod process_identity;
 mod pull_select;
 mod serve;
 mod setup;
+mod verified_cache;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
 use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
+use crate::verified_cache::VerifiedCache;
 use setup::setup_command;
 
 pub(crate) const MODEL_SUFFIXES: &[&str] = &[
@@ -415,7 +418,8 @@ pub(crate) struct PullArgs {
     #[arg(long)]
     force: bool,
     /// Which PLE row sidecar a split model pulls next to its base: `auto`
-    /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
+    /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere; the union over
+    /// every detected GPU arch), `q4`, `q8`,
     /// `all`, or `none` (fetched on first load). Omitted: asked on a terminal,
     /// else `auto`.
     #[arg(long, value_enum)]
@@ -1839,7 +1843,11 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
                     "name": entry.file,
                     "size_bytes": entry.size_bytes.unwrap_or_else(|| (entry.size_gb * 1e9).round() as u64),
                     "quant": entry.quant,
-                    "downloaded": local_files.contains(entry.file.as_str()),
+                    "downloaded": local_files.contains(entry.file.as_str())
+                        || grandfather_pin(entry).is_some_and(|pin| {
+                            local_files.contains(pin.canonical_file)
+                                || local_files.contains(pin.legacy_file)
+                        }),
                 })
             })
             .collect::<Vec<_>>();
@@ -1934,7 +1942,12 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
         let registry_tag = registry
             .models
             .iter()
-            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+            .find_map(|(tag, model)| {
+                (model.file == name
+                    || grandfather_pin(model)
+                        .is_some_and(|pin| name == pin.canonical_file || name == pin.legacy_file))
+                .then(|| tag.clone())
+            })
             .or_else(|| catalog_tags.get(&canonical).cloned());
         let created = metadata
             .modified()
@@ -2003,16 +2016,29 @@ pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<
 }
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
-    pull_with_sidecar_pins(paths, args, TRUNK_OVERLAY_PINS, EXPERT_HOTSET_PINS)
+    let pulled = pull_with_sidecar_pins(
+        paths,
+        args,
+        TRUNK_OVERLAY_PINS,
+        EXPERT_HOTSET_PINS,
+        &grandfather_table(),
+    )?;
+    if let Some(model) = pulled {
+        println!("{}", model.display());
+    }
+    Ok(())
 }
 
-/// [`pull_command`] with explicit client-side pin tables (tests inject fixture pins).
+/// [`pull_command`] with explicit client-side pin tables (tests inject fixture
+/// pins). Returns the path the loader opens (the split base, or the served
+/// grandfathered monolithic); `None` when the user cancelled.
 fn pull_with_sidecar_pins(
     paths: &Paths,
     args: PullArgs,
     overlay_pins: &[TrunkOverlayPin],
     hotset_pins: &[ExpertHotsetPin],
-) -> Result<()> {
+    grandfather_pins: &[GrandfatheredMonolithic],
+) -> Result<Option<PathBuf>> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
@@ -2042,6 +2068,7 @@ fn pull_with_sidecar_pins(
             host: &host,
             overlay_pins,
             hotset_pins,
+            grandfather_pins,
             present: &present,
         };
         let mut prompt = pull_select::LinePrompt::new(io::stdin().lock(), io::stderr());
@@ -2049,7 +2076,7 @@ fn pull_with_sidecar_pins(
             Some(choice) => choice,
             None => {
                 eprintln!("Pull cancelled.");
-                return Ok(());
+                return Ok(None);
             }
         }
     } else {
@@ -2062,25 +2089,51 @@ fn pull_with_sidecar_pins(
     } else {
         migrate_flash_next_xts(paths, entry)?
     };
+    // A verified local monolithic that serves this split entry (never under --force).
+    let mut grandfathered: Option<(&GrandfatheredMonolithic, PathBuf)> = None;
     let needs_base = if args.force {
         true
     } else if let Some(path) = migrated {
         eprintln!("Already downloaded: {}", path.display());
         false
-    } else if destination.exists() {
-        if existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes) {
-            eprintln!("Already downloaded: {}", destination.display());
+    } else if destination.exists()
+        && existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes)
+    {
+        eprintln!("Already downloaded: {}", destination.display());
+        false
+    } else {
+        grandfathered = grandfathered_local(paths, entry, grandfather_pins);
+        if let Some((_, served)) = &grandfathered {
+            eprintln!(
+                "Already satisfied (monolithic): {} (serves {tag} without the split base)",
+                served.display()
+            );
             false
         } else {
-            eprintln!("Refreshing stale artifact: {}", destination.display());
+            if destination.exists() {
+                eprintln!("Refreshing stale artifact: {}", destination.display());
+            }
             true
         }
-    } else {
-        true
     };
-    let ple_plan = entry
-        .has_ple_sidecars()
-        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, choice.ple, !needs_base));
+    // The artifact the loader opens: the served monolithic, else the split base.
+    let model_path = grandfathered
+        .as_ref()
+        .map(|(_, served)| served.clone())
+        .unwrap_or_else(|| destination.clone());
+    let ple_plan = entry.has_ple_sidecars().then(|| {
+        let base = match &grandfathered {
+            Some((pin, served)) => ple::PullBase::Served {
+                pin,
+                path: served.as_path(),
+            },
+            None if needs_base => ple::PullBase::Download {
+                monolithic: hipfire_registry::grandfathered_monolithic_in(entry, grandfather_pins),
+            },
+            None => ple::PullBase::Present,
+        };
+        ple::announce_pull_plan(paths, entry, choice.ple, base)
+    });
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -2100,6 +2153,7 @@ fn pull_with_sidecar_pins(
                 && !same_installed_file(&destination, &legacy)
             {
                 verified_metadata(
+                    &VerifiedCache::in_home(&paths.root),
                     &legacy,
                     entry.sha256.as_deref().expect("pinned digest"),
                     entry.size_bytes.expect("pinned size"),
@@ -2114,6 +2168,7 @@ fn pull_with_sidecar_pins(
                 *format,
                 sidecar,
                 &paths.models,
+                &model_path,
                 args.force,
             )?;
         }
@@ -2134,24 +2189,35 @@ fn pull_with_sidecar_pins(
             args.force,
         );
     }
-    // The trunk overlay is not a registry field: the client carries its pin,
-    // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
-    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+    // The trunk overlay and expert hot set are not registry fields: the client
+    // carries their pins, keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`,
+    // `EXPERT_HOTSET_PINS`). A served grandfathered monolithic is a different
+    // artifact from the split base, so its pins are looked up by its own identity
+    // and the files install beside it.
+    let served_identity = grandfathered.as_ref().map(|(pin, _)| ModelEntry {
+        file: pin.canonical_file.to_owned(),
+        sha256: Some(pin.sha256.to_owned()),
+        size_bytes: Some(pin.size_bytes),
+        ple: BTreeMap::new(),
+        ..entry.clone()
+    });
+    let identity = served_identity.as_ref().unwrap_or(entry);
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(identity, overlay_pins) {
         fetch_registry_sidecar(
             "Trunk overlay",
             overlay.repo,
             &overlay.sidecar,
-            &paths.models.join(&overlay.sidecar.file),
+            &hipfire_config::memory::trunk_overlay_sidecar_path(&model_path),
             args.force,
         );
     }
     if choice.expert_hotset {
-        if let Some(hotset) = hipfire_registry::expert_hotset_in(entry, hotset_pins) {
+        if let Some(hotset) = hipfire_registry::expert_hotset_in(identity, hotset_pins) {
             fetch_registry_sidecar(
                 "Expert hot set",
                 hotset.repo,
                 &hotset.sidecar,
-                &hipfire_config::memory::expert_hotset_sidecar_path(&destination),
+                &hipfire_config::memory::expert_hotset_sidecar_path(&model_path),
                 args.force,
             );
         }
@@ -2175,14 +2241,19 @@ fn pull_with_sidecar_pins(
             true,
         )?;
     }
-    println!("{}", paths.models.join(&entry.file).display());
-    Ok(())
+    Ok(Some(model_path))
 }
 
 /// Fetch one optional sidecar to its local destination: an existing valid file is
 /// kept, a stale one (or any under `force`) is refreshed through
 /// [`download_verified`]. A failed download only warns; the base stays usable.
-fn fetch_registry_sidecar(label: &str, repo: &str, sidecar: &Sidecar, destination: &Path, force: bool) {
+fn fetch_registry_sidecar(
+    label: &str,
+    repo: &str,
+    sidecar: &Sidecar,
+    destination: &Path,
+    force: bool,
+) {
     if destination.exists() && !force {
         if existing_artifact_valid(destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
             eprintln!("  {label} sidecar already present: {}", sidecar.file);
@@ -2376,7 +2447,13 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
 /// `qwen3.8-27b-vision.hfq`).
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
-    rm_with_sidecar_pins(paths, registry, TRUNK_OVERLAY_PINS, EXPERT_HOTSET_PINS, args)
+    rm_with_sidecar_pins(
+        paths,
+        registry,
+        TRUNK_OVERLAY_PINS,
+        EXPERT_HOTSET_PINS,
+        args,
+    )
 }
 
 /// [`rm_with_registry`] with explicit client-side pin tables (tests inject fixture pins).
@@ -2403,6 +2480,9 @@ fn rm_with_sidecar_pins(
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
+    // The other spelling of a pinned monolithic is a hard link of the same
+    // inode: leaving it would keep the tag resolving (and the disk full).
+    targets.extend(ple::monolithic_twins(&path));
     // A shared DFlash sidecar that must survive this removal: (file, keepers).
     let mut kept_sidecar: Option<(String, String)> = None;
     // A shared vision-tower sidecar under the same rule: every `qwen3.8:27b*`
@@ -2580,47 +2660,58 @@ fn rm_with_sidecar_pins(
     // The PLE row sidecars (and their hot-row packs) ride with the model file
     // that was resolved, whichever layout it is.
     targets.extend(
-        ple::ple_sidecar_paths(&path)
+        ple::ple_sidecar_paths(&path, resolved.map(|(_, entry)| entry))
             .into_iter()
             .filter(|sidecar| sidecar.is_file()),
     );
     // A family-shared PLE file (`qwen3.8-flash-next.ple-q4`) is the link target
-    // of every Flash-Next split base's `<base>.ple-qN`: it goes with the last
-    // base that still links it, like the other shared sidecars.
+    // of every Flash-Next split base's `<base>.ple-qN` (and of a served
+    // grandfathered monolithic's `<monolithic>.ple-q4`): it goes with the last
+    // file that still links it, like the other shared sidecars.
     let mut kept_ple: Vec<(String, String)> = Vec::new();
     if let Some((tag, entry)) = resolved.filter(|(_, entry)| {
-        path.file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new(&entry.file))
+        let name = path.file_name();
+        name.is_some_and(|name| name == std::ffi::OsStr::new(&entry.file))
+            || grandfather_pin(entry).is_some_and(|pin| {
+                name.is_some_and(|name| {
+                    name == std::ffi::OsStr::new(pin.canonical_file)
+                        || name == std::ffi::OsStr::new(pin.legacy_file)
+                })
+            })
     }) {
-        for format in [
-            hipfire_config::memory::PleFormat::Q4,
-            hipfire_config::memory::PleFormat::Q8,
-        ] {
-            let Some(sidecar) = ple::ple_slot(entry, format)
-                .filter(|sidecar| ple::is_shared_slot(entry, format, sidecar))
-            else {
+        for (key, sidecar) in &entry.ple {
+            if !ple::is_shared_slot(entry, key, sidecar) {
                 continue;
-            };
+            }
             let shared = paths.models.join(&sidecar.file);
             if !shared.is_file() {
                 continue;
             }
-            let keepers: Vec<&str> = registry
+            let mut keepers: Vec<&str> = registry
                 .models
                 .iter()
                 .filter(|(other_tag, other)| {
                     other_tag.as_str() != tag
                         && other.file != entry.file
-                        && ple::ple_slot(other, format)
+                        && other
+                            .ple_sidecar(key)
                             .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
-                        && hipfire_config::memory::ple_sidecar_path(
-                            &paths.models.join(&other.file),
-                            format,
-                        )
-                        .is_file()
+                        && ple::ple_sidecar_path_for_key(&paths.models.join(&other.file), key)
+                            .is_file()
                 })
                 .map(|(other_tag, _)| other_tag.as_str())
                 .collect();
+            // A served monolithic's own split base may be installed next to it.
+            let own_base = paths.models.join(&entry.file);
+            let removing_base = path
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(&entry.file));
+            if !removing_base
+                && own_base.is_file()
+                && ple::ple_sidecar_path_for_key(&own_base, key).is_file()
+            {
+                keepers.push(tag);
+            }
             if keepers.is_empty() {
                 targets.insert(shared);
             } else {
@@ -2782,11 +2873,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         );
     }
     ple::ensure_ple_sidecar(
-        registry,
         entry,
         canonical.as_deref(),
         &model_path,
         ple::request_from_config(&resolved),
+        &ple::load_target_arch(&resolved),
         true,
     )?;
 
@@ -3960,9 +4051,16 @@ pub(crate) fn registry_entry_for_path<'registry>(
             let legacy = paths
                 .models
                 .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            // A split entry also owns the verified monolithic it was cut from.
+            let grandfathered = grandfather_pin(entry).is_some_and(|pin| {
+                [pin.canonical_file, pin.legacy_file]
+                    .iter()
+                    .any(|file| same_installed_file(&paths.models.join(file), &canonical_input))
+            });
             (same_installed_file(&installed, &canonical_input)
-                || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input)))
-            .then(|| (tag.as_str(), entry))
+                || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input))
+                || grandfathered)
+                .then(|| (tag.as_str(), entry))
         });
     }
     registry.model(input)
@@ -4004,11 +4102,8 @@ pub(crate) fn resolve_model_path(
             // The split base is absent: verify (and link the legacy spelling of)
             // the pinned monolithic it was cut from, exactly as its own tag does.
             if entry.has_ple_sidecars() && !paths.models.join(&entry.file).is_file() {
-                if let Some((_, sibling)) = registry
-                    .monolithic_sibling(entry)
-                    .filter(|(_, sibling)| sibling.is_flash_next_xts())
-                {
-                    if let Some(path) = migrate_flash_next_xts(paths, sibling)? {
+                if let Some(pin) = grandfather_pin(entry) {
+                    if let Some(path) = migrate_grandfathered(paths, &pin)? {
                         return Ok(Some(path));
                     }
                 }
@@ -4023,6 +4118,7 @@ fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<Pa
         return Ok(None);
     }
     migrate_verified_artifact(
+        &VerifiedCache::in_home(&paths.root),
         &paths
             .models
             .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
@@ -4032,6 +4128,83 @@ fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<Pa
         entry.sha256.as_deref().expect("pinned digest"),
         entry.size_bytes.expect("pinned size"),
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static GRANDFATHER_OVERRIDE: std::cell::RefCell<Option<Vec<GrandfatheredMonolithic>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test guard: [`grandfather_table`] returns the fixture `pins` on this thread
+/// until dropped.
+#[cfg(test)]
+pub(crate) struct GrandfatherOverride;
+
+#[cfg(test)]
+impl GrandfatherOverride {
+    pub(crate) fn set(pins: &[GrandfatheredMonolithic]) -> Self {
+        GRANDFATHER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(pins.to_vec()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for GrandfatherOverride {
+    fn drop(&mut self) {
+        GRANDFATHER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// The monoliths this client keeps serving under their split tags: the compiled
+/// [`GRANDFATHERED_MONOLITHICS`] (tests substitute a small fixture pin).
+pub(crate) fn grandfather_table() -> std::borrow::Cow<'static, [GrandfatheredMonolithic]> {
+    #[cfg(test)]
+    if let Some(table) = GRANDFATHER_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return std::borrow::Cow::Owned(table);
+    }
+    std::borrow::Cow::Borrowed(GRANDFATHERED_MONOLITHICS)
+}
+
+/// The monolithic pin `entry` is grandfathered under, if any.
+pub(crate) fn grandfather_pin(entry: &ModelEntry) -> Option<GrandfatheredMonolithic> {
+    hipfire_registry::grandfathered_monolithic_in(entry, &grandfather_table()).copied()
+}
+
+/// Verify the local monolithic of `pin` (canonical spelling, else the legacy
+/// one, which gets a canonical hard link): `Ok(None)` when neither exists,
+/// `Err` when one exists but its bytes do not verify. A previously verified,
+/// unchanged file is not hashed again ([`VerifiedCache`]).
+fn migrate_grandfathered(paths: &Paths, pin: &GrandfatheredMonolithic) -> Result<Option<PathBuf>> {
+    migrate_verified_artifact(
+        &VerifiedCache::in_home(&paths.root),
+        &paths.models.join(pin.legacy_file),
+        &paths.models.join(pin.canonical_file),
+        pin.sha256,
+        pin.size_bytes,
+    )
+}
+
+/// The verified local monolithic that serves `entry` without its split base, and
+/// the pin it verified against. A monolithic that fails verification is not
+/// served: the pull falls back to the split base.
+fn grandfathered_local<'p>(
+    paths: &Paths,
+    entry: &ModelEntry,
+    pins: &'p [GrandfatheredMonolithic],
+) -> Option<(&'p GrandfatheredMonolithic, PathBuf)> {
+    let pin = hipfire_registry::grandfathered_monolithic_in(entry, pins)?;
+    match migrate_grandfathered(paths, pin) {
+        Ok(served) => served.map(|path| (pin, path)),
+        Err(error) => {
+            eprintln!(
+                "  note: the local {} does not verify as the pinned monolithic ({error:#}); \
+                 pulling the split base",
+                pin.canonical_file
+            );
+            None
+        }
+    }
 }
 
 fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
@@ -4050,12 +4223,30 @@ fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     }
 }
 
-fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, fs::Metadata)> {
+#[cfg(test)]
+thread_local! { static HASH_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+/// Open `path` and prove it is the artifact pinned by (`digest`, `size`). The
+/// full-file SHA-256 is skipped when `cache` holds a record whose stat equals
+/// the file's current stat and whose digest equals `digest`; otherwise the file
+/// is hashed (a 125 GB monolithic takes minutes) and the result recorded.
+fn verified_metadata(
+    cache: &VerifiedCache,
+    path: &Path,
+    digest: &str,
+    size: u64,
+) -> Result<(fs::File, fs::Metadata)> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let before = file.metadata()?;
     if !before.is_file() || before.len() != size {
         bail!("size mismatch: {}", path.display());
     }
+    let stat = verified_cache::StatKey::of(&before);
+    if cache.satisfies(path, &stat, digest) {
+        return Ok((file, before));
+    }
+    #[cfg(test)]
+    HASH_INVOCATIONS.with(|count| count.set(count.get() + 1));
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -4065,7 +4256,8 @@ fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, 
         }
         hasher.update(&buffer[..n]);
     }
-    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(digest) {
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(digest) {
         bail!("SHA-256 mismatch: {}", path.display());
     }
     let after = file.metadata()?;
@@ -4073,6 +4265,7 @@ fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, 
     if !same_artifact_metadata(&before, &after) || !same_artifact_metadata(&before, &current) {
         bail!("artifact changed during verification: {}", path.display());
     }
+    cache.remember(path, stat, &actual);
     Ok((file, before))
 }
 
@@ -4097,6 +4290,7 @@ fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
 }
 
 fn migrate_verified_artifact(
+    cache: &VerifiedCache,
     old: &Path,
     canonical: &Path,
     digest: &str,
@@ -4104,7 +4298,7 @@ fn migrate_verified_artifact(
 ) -> Result<Option<PathBuf>> {
     match fs::symlink_metadata(canonical) {
         Ok(_) => {
-            verified_metadata(canonical, digest, size)?;
+            verified_metadata(cache, canonical, digest, size)?;
             return Ok(Some(canonical.to_owned()));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4116,12 +4310,15 @@ fn migrate_verified_artifact(
         Err(error) => return Err(error.into()),
     }
     // Keep the opened inode alive until installation and stability checks finish.
-    let (_file, verified) = verified_metadata(old, digest, size)?;
+    let (_file, verified) = verified_metadata(cache, old, digest, size)?;
     if install_verified_link(old, canonical)? {
         let installed = fs::metadata(canonical)?;
-        if !same_artifact_metadata(&verified, &installed) {
+        if same_artifact_metadata(&verified, &installed) {
+            // The hard link is the same inode: the verification covers it.
+            cache.remember(canonical, verified_cache::StatKey::of(&installed), digest);
+        } else {
             // A concurrent installer won: verify its bytes, never clobber it.
-            verified_metadata(canonical, digest, size)?;
+            verified_metadata(cache, canonical, digest, size)?;
         }
         if !same_artifact_metadata(&verified, &fs::metadata(old)?) {
             bail!("artifact changed during migration: {}", old.display());
@@ -4191,7 +4388,7 @@ pub(crate) fn find_model_path(
     {
         // A split tag serves its base, else the grandfathered monolithic it was
         // cut from, so nobody is forced to re-download after the registry switch.
-        return ple::split_model_files(registry, entry)
+        return ple::split_model_files(entry)
             .iter()
             .map(|file| paths.models.join(file))
             .find(|path| path.is_file());
@@ -6663,11 +6860,11 @@ fn open_bench_engine(
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     ple::ensure_ple_sidecar(
-        &registry,
         entry.as_ref(),
         tag.as_deref(),
         &path,
         ple::request_from_config(&resolved),
+        &ple::load_target_arch(&resolved),
         true,
     )?;
     let run_need = (args.matrix || args.redline).then(|| {
@@ -9314,13 +9511,12 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vae.as_ref(),
                 entry.dflash.as_ref(),
                 entry.vision.as_ref(),
-                entry.ple_q4.as_ref(),
-                entry.ple_q8.as_ref(),
             ]
             .into_iter()
             .flatten()
             .map(|sidecar: &Sidecar| sidecar.file.as_str())
             .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
+            .chain(entry.ple.values().map(|sidecar| sidecar.file.as_str()))
         })
         .collect();
     // These sidecars are compiled-in pins, not registry fields.
@@ -9339,7 +9535,18 @@ pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool 
     !ple::is_ple_sidecar_name(name)
         && !is_trunk_overlay_name(name)
         && !is_expert_hotset_name(name)
-        && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
+        && (is_model_file(name) || names_registry_model(name, registry))
+}
+
+/// True when `name` is some registry entry's own `file`, or a spelling of the
+/// pinned monolithic a split entry is grandfathered with (a verified local
+/// install keeps serving, so its files are the registry's models).
+fn names_registry_model(name: &str, registry: &RegistryV1) -> bool {
+    registry.models.values().any(|entry| {
+        entry.file == name
+            || grandfather_pin(entry)
+                .is_some_and(|pin| name == pin.canonical_file || name == pin.legacy_file)
+    })
 }
 
 /// True for a Flash-Next trunk overlay sidecar (`<base>.trunk-overlay`): an
@@ -9386,7 +9593,7 @@ pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1
     if !is_listable_model_file(name, registry) {
         return false;
     }
-    if registry.models.values().any(|entry| entry.file == name) {
+    if names_registry_model(name, registry) {
         return true;
     }
     HfqFile::probe_arch_id(path).is_ok_and(|arch_id| SERVE_TRUNK_ARCH_IDS.contains(&arch_id))
@@ -9759,7 +9966,13 @@ mod tests {
             let (old, new, digest) = (old.clone(), new.clone(), digest.clone());
             joins.push(std::thread::spawn(move || {
                 DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
-                let result = migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64);
+                let result = migrate_verified_artifact(
+                    &VerifiedCache::disabled(),
+                    &old,
+                    &new,
+                    &digest,
+                    bytes.len() as u64,
+                );
                 DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 0));
                 result
             }));
@@ -9770,16 +9983,37 @@ mod tests {
         assert!(same_installed_file(&old, &new));
         assert_eq!(fs::read(&sidecar).unwrap(), b"preserved");
         assert_eq!(
-            migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(),
+            migrate_verified_artifact(
+                &VerifiedCache::disabled(),
+                &old,
+                &new,
+                &digest,
+                bytes.len() as u64
+            )
+            .unwrap(),
             Some(new.clone())
         );
         fs::remove_file(&new).unwrap();
         fs::write(&old, vec![b'x'; bytes.len()]).unwrap();
-        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        assert!(migrate_verified_artifact(
+            &VerifiedCache::disabled(),
+            &old,
+            &new,
+            &digest,
+            bytes.len() as u64
+        )
+        .is_err());
         assert!(!new.exists());
         fs::write(&old, bytes).unwrap();
         fs::write(&new, vec![b'x'; bytes.len()]).unwrap();
-        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        assert!(migrate_verified_artifact(
+            &VerifiedCache::disabled(),
+            &old,
+            &new,
+            &digest,
+            bytes.len() as u64
+        )
+        .is_err());
         fs::remove_dir_all(paths.root).unwrap();
     }
 
@@ -9795,7 +10029,7 @@ mod tests {
         std::os::unix::fs::symlink(&external, &old).unwrap();
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
         assert_eq!(
-            migrate_verified_artifact(&old, &new, &digest, 7).unwrap(),
+            migrate_verified_artifact(&VerifiedCache::disabled(), &old, &new, &digest, 7).unwrap(),
             Some(new.clone())
         );
         assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
@@ -9811,7 +10045,8 @@ mod tests {
         let unavailable = paths.root.join("missing-parent/canonical");
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
         assert_eq!(
-            migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(),
+            migrate_verified_artifact(&VerifiedCache::disabled(), &old, &unavailable, &digest, 7)
+                .unwrap(),
             Some(old.clone())
         );
         #[cfg(target_os = "linux")]
@@ -9819,7 +10054,8 @@ mod tests {
             // procfs does not permit arbitrary new links even for root.
             let read_only = Path::new("/proc").join(paths.root.file_name().unwrap());
             assert_eq!(
-                migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(),
+                migrate_verified_artifact(&VerifiedCache::disabled(), &old, &read_only, &digest, 7)
+                    .unwrap(),
                 Some(old.clone())
             );
             assert_eq!(fs::read(&old).unwrap(), b"fixture");
@@ -9830,6 +10066,9 @@ mod tests {
         let rtn = paths.models.join("qwen3.8-flash-next.mq4");
         fs::write(&rtn, b"historical RTN").unwrap();
         assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
+        // The compiled grandfather pin never selects the RTN file either.
+        let pin = hipfire_registry::GRANDFATHERED_MONOLITHICS[0];
+        assert_eq!(migrate_grandfathered(&paths, &pin).unwrap(), None);
         assert_eq!(
             resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
             None
@@ -9858,7 +10097,8 @@ mod tests {
         let canonical = shared.join(paths.root.file_name().unwrap());
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
         assert_eq!(
-            migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(),
+            migrate_verified_artifact(&VerifiedCache::disabled(), &old, &canonical, &digest, 7)
+                .unwrap(),
             Some(canonical.clone())
         );
         assert!(fs::symlink_metadata(&canonical)
@@ -18830,8 +19070,7 @@ mod tests {
     const PLE_Q8: &[u8] = b"q8-rows-bytes";
     const PLE_Q4: &[u8] = b"q4-rows";
 
-    /// `split-model` is the split entry (base + both slots); `split-model:mono`
-    /// is its non-pinned monolithic sibling.
+    /// `split-model` is the split entry (base + both slots).
     fn split_registry_raw() -> String {
         format!(
             r#"{{
@@ -18841,12 +19080,10 @@ mod tests {
                 "split-model":{{
                     "repo":"test/repo","file":"split-model-base.mq4","size_gb":0.001,
                     "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
-                    "ple_q8":{{"file":"split-model-base.mq4.ple-q8","sha256":"{}","size_bytes":{}}},
-                    "ple_q4":{{"file":"split-model-base.mq4.ple-q4","sha256":"{}","size_bytes":{}}}
-                }},
-                "split-model:mono":{{
-                    "repo":"test/repo","file":"split-model.mq4","size_gb":0.001,
-                    "min_vram_gb":1,"desc":"x"
+                    "ple":{{
+                        "q8":{{"file":"split-model-base.mq4.ple-q8","sha256":"{}","size_bytes":{}}},
+                        "q4":{{"file":"split-model-base.mq4.ple-q4","sha256":"{}","size_bytes":{}}}
+                    }}
                 }}
             }},
             "aliases":{{}}
@@ -19008,11 +19245,11 @@ mod tests {
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
         ple::ensure_ple_sidecar(
-            &registry,
             Some(entry),
             Some(tag),
             &model,
             hipfire_config::memory::PleFormatRequest::Q8,
+            "",
             true,
         )
         .unwrap();
@@ -19026,8 +19263,7 @@ mod tests {
             hipfire_config::memory::PleFormatRequest::Q4,
             hipfire_config::memory::PleFormatRequest::Auto,
         ] {
-            ple::ensure_ple_sidecar(&registry, Some(entry), Some(tag), &model, request, true)
-                .unwrap();
+            ple::ensure_ple_sidecar(Some(entry), Some(tag), &model, request, "", true).unwrap();
         }
         DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
         assert!(
@@ -19042,11 +19278,11 @@ mod tests {
         let (base, handle) = exact_http_server(files);
         let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         ple::ensure_ple_sidecar(
-            &registry,
             Some(entry),
             Some(tag),
             &model,
             hipfire_config::memory::PleFormatRequest::Q4,
+            "",
             true,
         )
         .unwrap();
@@ -19069,8 +19305,8 @@ mod tests {
     /// Two Flash-Next split bases (`flash-a`, `flash-b`) naming ONE shared pair.
     fn shared_registry_raw() -> String {
         let slots = format!(
-            r#""ple_q8":{{"file":"{SHARED_Q8_FILE}","sha256":"{}","size_bytes":{}}},
-               "ple_q4":{{"file":"{SHARED_Q4_FILE}","sha256":"{}","size_bytes":{}}}"#,
+            r#""ple":{{"q8":{{"file":"{SHARED_Q8_FILE}","sha256":"{}","size_bytes":{}}},
+               "q4":{{"file":"{SHARED_Q4_FILE}","sha256":"{}","size_bytes":{}}}}}"#,
             ple_sha(PLE_Q8),
             PLE_Q8.len(),
             ple_sha(PLE_Q4),
@@ -19105,7 +19341,11 @@ mod tests {
         a.dev() == b.dev() && a.ino() == b.ino()
     }
 
-    fn loader_path(paths: &Paths, base: &str, format: hipfire_config::memory::PleFormat) -> PathBuf {
+    fn loader_path(
+        paths: &Paths,
+        base: &str,
+        format: hipfire_config::memory::PleFormat,
+    ) -> PathBuf {
         hipfire_config::memory::ple_sidecar_path(&paths.models.join(base), format)
     }
 
@@ -19140,20 +19380,25 @@ mod tests {
         let canonical_q4 = paths.models.join(SHARED_Q4_FILE);
 
         // flash-a --ple q8: base + the shared q8; the loader's name is a link.
-        let (base, handle) = serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
+        let (base, handle) =
+            serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
         handle.join().unwrap();
         let a_q8 = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
         assert_eq!(fs::read(&canonical_q8).unwrap(), PLE_Q8);
         assert_eq!(fs::read(&a_q8).unwrap(), PLE_Q8);
-        assert!(same_inode(&a_q8, &canonical_q8), "alias is a hard link, not a copy");
+        assert!(
+            same_inode(&a_q8, &canonical_q8),
+            "alias is a hard link, not a copy"
+        );
         assert!(!canonical_q4.exists(), "--ple q8 leaves q4 alone");
         assert!(!loader_path(&paths, SHARED_FILE_A, PleFormat::Q4).exists());
         DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
 
         // flash-b --ple all: its base and the shared q4 download; the q8 is reused.
-        let (base, handle) = serve_files(&[(SHARED_FILE_B, SHARED_BASE_B), (SHARED_Q4_FILE, PLE_Q4)]);
+        let (base, handle) =
+            serve_files(&[(SHARED_FILE_B, SHARED_BASE_B), (SHARED_Q4_FILE, PLE_Q4)]);
         let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         pull_shared(&paths, "flash-b", ple::PleSelection::All).unwrap();
         handle.join().unwrap();
@@ -19187,7 +19432,8 @@ mod tests {
         write_test_registry_cache(&paths, &shared_registry_raw());
         let canonical = paths.models.join(SHARED_Q8_FILE);
         let alias = loader_path(&paths, SHARED_FILE_A, PleFormat::Q8);
-        let (base, handle) = serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
+        let (base, handle) =
+            serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q8_FILE, PLE_Q8)]);
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         pull_shared(&paths, "flash-a", ple::PleSelection::Q8).unwrap();
         handle.join().unwrap();
@@ -19278,11 +19524,11 @@ mod tests {
         let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
         ple::ensure_ple_sidecar(
-            &registry,
             Some(entry_a),
             Some(tag_a),
             &model_a,
             PleFormatRequest::Q8,
+            "",
             true,
         )
         .unwrap();
@@ -19295,11 +19541,11 @@ mod tests {
         // The second base only links: no server, downloads off.
         let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
         ple::ensure_ple_sidecar(
-            &registry,
             Some(entry_b),
             Some(tag_b),
             &model_b,
             PleFormatRequest::Q8,
+            "",
             false,
         )
         .unwrap();
@@ -19309,8 +19555,12 @@ mod tests {
         assert!(same_inode(&alias_b, &canonical));
 
         // Present aliases are a no-op for every request, q4 included.
-        for request in [PleFormatRequest::Q8, PleFormatRequest::Q4, PleFormatRequest::Auto] {
-            ple::ensure_ple_sidecar(&registry, Some(entry_b), Some(tag_b), &model_b, request, false)
+        for request in [
+            PleFormatRequest::Q8,
+            PleFormatRequest::Q4,
+            PleFormatRequest::Auto,
+        ] {
+            ple::ensure_ple_sidecar(Some(entry_b), Some(tag_b), &model_b, request, "", false)
                 .unwrap();
         }
 
@@ -19319,25 +19569,28 @@ mod tests {
         fs::remove_file(&canonical).unwrap();
         fs::write(&canonical, b"corrupt-rows").unwrap();
         let error = ple::ensure_ple_sidecar(
-            &registry,
             Some(entry_b),
             Some(tag_b),
             &model_b,
             PleFormatRequest::Q8,
+            "",
             false,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("fails verification"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("fails verification"),
+            "{error:#}"
+        );
         assert!(!alias_b.exists());
         // Downloads on: the stale canonical is refreshed and linked.
         let (base, handle) = serve_files(&[(SHARED_Q8_FILE, PLE_Q8)]);
         let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
         ple::ensure_ple_sidecar(
-            &registry,
             Some(entry_b),
             Some(tag_b),
             &model_b,
             PleFormatRequest::Q8,
+            "",
             true,
         )
         .unwrap();
@@ -19384,15 +19637,138 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!canonical.exists(), "the last base takes the shared file along");
+        assert!(
+            !canonical.exists(),
+            "the last base takes the shared file along"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
+    const GF_MONO_BYTES: &[u8] = b"grandfathered-monolithic";
+    const GF_MONO_SHA: &str = "deec35dcefcc729df481caa629f305913b5aa65b9319d5aef17f418887901acd";
+    const GF_OVERLAY_BYTES: &[u8] = b"overlay-bytes-mono";
+    const GF_OVERLAY_SHA: &str = "9cbb2a1860c1a0c022c617bd757e0fff4c93045dce1e9648f81976636ca29f7b";
+    const GF_HOTSET_BYTES: &[u8] = b"hotset-bytes-mono";
+    const GF_HOTSET_SHA: &str = "cdda2be78a526bc24a498f9ac6a977faa1a0bf0e03dc07a69c130c1652f9232a";
+    const GF_BASE_A_SHA: &str = "a752e8e68d16af0c8033e291afe95fb29c3fdee505374ef76fef735ab883746e";
+    const GF_CANONICAL: &str = "qwen3.8-flash-next.mq4-xts";
+    const GF_LEGACY: &str = "qwen3.8-flash-next-gptq3.mq4";
+    const GF_TAGS: [&str; 5] = [
+        "qwen3.8:flash-next",
+        "qwen3.8:flash-next-mq4",
+        "qwen3.8:flash-next-gptq3",
+        "qwen3.8:flash-next-mq4-xts",
+        "qwen3.8:flash",
+    ];
+
+    /// A small stand-in for the compiled grandfather pin of `split-model`.
+    fn split_model_pin() -> hipfire_registry::GrandfatheredMonolithic {
+        hipfire_registry::GrandfatheredMonolithic {
+            repo: "test/repo",
+            split_file: "split-model-base.mq4",
+            split_sha256: "137eeb8a7ecee9b04833bddde9f43959dffd7c6d78383b6d77eded45f843f0c8",
+            split_size_bytes: PLE_BASE.len() as u64,
+            canonical_file: "split-model.mq4",
+            legacy_file: "split-model-legacy.mq4",
+            sha256: GF_MONO_SHA,
+            size_bytes: GF_MONO_BYTES.len() as u64,
+        }
+    }
+
+    /// A small stand-in for the compiled grandfather pin of the Flash-Next MQ4
+    /// XTS split base (`SHARED_FILE_A`).
+    fn gf_pin() -> hipfire_registry::GrandfatheredMonolithic {
+        hipfire_registry::GrandfatheredMonolithic {
+            repo: "test/repo",
+            split_file: SHARED_FILE_A,
+            split_sha256: GF_BASE_A_SHA,
+            split_size_bytes: SHARED_BASE_A.len() as u64,
+            canonical_file: GF_CANONICAL,
+            legacy_file: GF_LEGACY,
+            sha256: GF_MONO_SHA,
+            size_bytes: GF_MONO_BYTES.len() as u64,
+        }
+    }
+
+    /// The four stock MQ4 tags (+ alias) on the split base `SHARED_FILE_A` with
+    /// the shared pair, and a second shared-pair base (`SHARED_FILE_B`).
+    fn gf_registry_raw() -> String {
+        let slots = format!(
+            r#""ple":{{"q8":{{"file":"{SHARED_Q8_FILE}","sha256":"{}","size_bytes":{}}},
+               "q4":{{"file":"{SHARED_Q4_FILE}","sha256":"{}","size_bytes":{}}}}}"#,
+            ple_sha(PLE_Q8),
+            PLE_Q8.len(),
+            ple_sha(PLE_Q4),
+            PLE_Q4.len(),
+        );
+        let stock = |file: &str, base: &[u8]| {
+            format!(
+                r#"{{"repo":"test/repo","file":"{file}","size_gb":0.001,"min_vram_gb":1,
+                   "desc":"MQ4 XTS split base","sha256":"{}","size_bytes":{},{slots}}}"#,
+                ple_sha(base),
+                base.len()
+            )
+        };
+        let a = stock(SHARED_FILE_A, SHARED_BASE_A);
+        let b = stock(SHARED_FILE_B, SHARED_BASE_B);
+        format!(
+            r#"{{"schema_version":1,"generated_at":"2099-01-01T00:00:00Z","models":{{
+                "qwen3.8:flash-next":{a},"qwen3.8:flash-next-mq4":{a},
+                "qwen3.8:flash-next-gptq3":{a},"qwen3.8:flash-next-mq4-xts":{a},
+                "qwen3.8:flash-next-mq3-xts":{b}
+            }},"aliases":{{"qwen3.8:flash":"qwen3.8:flash-next"}}}}"#
+        )
+    }
+
+    fn gf_overlay_pins() -> Vec<TrunkOverlayPin> {
+        vec![
+            TrunkOverlayPin {
+                base_sha256: GF_MONO_SHA,
+                base_size: GF_MONO_BYTES.len() as u64,
+                repo: "test/repo",
+                file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+                sha256: GF_OVERLAY_SHA,
+                size_bytes: GF_OVERLAY_BYTES.len() as u64,
+            },
+            // The split base's own overlay must NOT be fetched for a served monolithic.
+            TrunkOverlayPin {
+                base_sha256: GF_BASE_A_SHA,
+                base_size: SHARED_BASE_A.len() as u64,
+                repo: "test/repo",
+                file: "qwen3.8-flash-next-base.mq4-xts.trunk-overlay",
+                sha256: GF_OVERLAY_SHA,
+                size_bytes: GF_OVERLAY_BYTES.len() as u64,
+            },
+        ]
+    }
+
+    fn gf_hotset_pins() -> Vec<ExpertHotsetPin> {
+        vec![
+            ExpertHotsetPin {
+                base_sha256: GF_MONO_SHA,
+                base_size: GF_MONO_BYTES.len() as u64,
+                repo: "test/repo",
+                file: "qwen3.8-flash-next.mq4-xts.expert-hotset",
+                sha256: GF_HOTSET_SHA,
+                size_bytes: GF_HOTSET_BYTES.len() as u64,
+            },
+            ExpertHotsetPin {
+                base_sha256: GF_BASE_A_SHA,
+                base_size: SHARED_BASE_A.len() as u64,
+                repo: "test/repo",
+                file: "qwen3.8-flash-next-base.mq4-xts.expert-hotset",
+                sha256: GF_HOTSET_SHA,
+                size_bytes: GF_HOTSET_BYTES.len() as u64,
+            },
+        ]
+    }
+
     #[test]
-    fn split_tag_serves_a_local_monolithic_instead_of_forcing_a_download() {
+    fn split_tag_serves_a_verified_grandfathered_monolithic_instead_of_forcing_a_download() {
         let paths = test_paths("ple-tag-fallback");
         fs::create_dir_all(&paths.models).unwrap();
         let registry = RegistryV1::parse(&split_registry_raw(), "ple fallback").unwrap();
+        let _pins = GrandfatherOverride::set(&[split_model_pin()]);
         assert_eq!(
             resolve_model_path(&paths, &registry, "split-model").unwrap(),
             None
@@ -19400,15 +19776,14 @@ mod tests {
         assert_eq!(find_model_path(&paths, &registry, "split-model"), None);
 
         let mono = paths.models.join("split-model.mq4");
-        fs::write(&mono, b"monolithic").unwrap();
+        fs::write(&mono, GF_MONO_BYTES).unwrap();
         assert_eq!(
             resolve_model_path(&paths, &registry, "split-model").unwrap(),
             Some(mono.clone()),
-            "the split tag falls back to the local monolithic sibling"
+            "the split tag falls back to the verified local monolithic"
         );
-        // The sibling's own tag is unaffected.
         assert_eq!(
-            resolve_model_path(&paths, &registry, "split-model:mono").unwrap(),
+            find_model_path(&paths, &registry, "split-model"),
             Some(mono.clone())
         );
 
@@ -19435,59 +19810,849 @@ mod tests {
     }
 
     #[test]
-    fn split_tag_verifies_the_pinned_monolithic_like_its_own_tag() {
-        let paths = test_paths("ple-tag-fallback-pinned");
+    fn every_stock_tag_resolves_the_grandfathered_monolithic_in_both_spellings() {
+        let paths = test_paths("gf-resolve");
         fs::create_dir_all(&paths.models).unwrap();
-        let raw = r#"{
-            "schema_version":1,
-            "generated_at":"2099-01-01T00:00:00Z",
-            "models":{
-                "qwen3.8:flash-next":{
-                    "repo":"hipfire-models/qwen3.8-flash-next",
-                    "file":"qwen3.8-flash-next-base.mq4-xts","size_gb":70.9,"min_vram_gb":8,"desc":"split",
-                    "ple_q8":{"file":"qwen3.8-flash-next-base.mq4-xts.ple-q8"}
-                },
-                "qwen3.8:flash-next-mq4-xts":{
-                    "repo":"hipfire-models/qwen3.8-flash-next",
-                    "file":"qwen3.8-flash-next.mq4-xts","size_gb":125.29,"min_vram_gb":8,"desc":"pin",
-                    "sha256":"8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
-                    "size_bytes":125288544792
-                }
-            },
-            "aliases":{}
-        }"#;
-        let registry = RegistryV1::parse(raw, "ple pinned").unwrap();
+        let registry = RegistryV1::parse(&gf_registry_raw(), "gf").unwrap();
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let canonical = paths.models.join(GF_CANONICAL);
+        let legacy = paths.models.join(GF_LEGACY);
+        for tag in GF_TAGS {
+            assert_eq!(resolve_model_path(&paths, &registry, tag).unwrap(), None);
+            assert_eq!(find_model_path(&paths, &registry, tag), None);
+        }
+
+        // Canonical spelling.
+        fs::write(&canonical, GF_MONO_BYTES).unwrap();
+        for tag in GF_TAGS {
+            assert_eq!(
+                resolve_model_path(&paths, &registry, tag).unwrap(),
+                Some(canonical.clone()),
+                "{tag}"
+            );
+            assert_eq!(
+                find_model_path(&paths, &registry, tag),
+                Some(canonical.clone()),
+                "{tag}"
+            );
+        }
+        let (tag, entry) =
+            registry_entry_for_path(&paths, &registry, canonical.to_str().unwrap()).unwrap();
+        assert_eq!(tag, "qwen3.8:flash-next");
+        assert_eq!(entry.file, SHARED_FILE_A);
+        // The second base does not own the monolithic.
+        assert!(grandfather_pin(&registry.models["qwen3.8:flash-next-mq3-xts"]).is_none());
         assert_eq!(
-            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
-            None
+            ple::classify_layout(entry, GF_CANONICAL),
+            ple::ModelLayout::Monolithic
         );
-        // A wrong-size file under either grandfathered spelling is a verification
-        // error (never silently served), exactly as for the monolithic tag.
-        for name in [
-            "qwen3.8-flash-next.mq4-xts",
-            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
-        ] {
+
+        // Legacy spelling only: the first resolve verifies it and links the
+        // canonical name beside it (never copying the payload).
+        fs::remove_file(&canonical).unwrap();
+        fs::write(&legacy, GF_MONO_BYTES).unwrap();
+        assert_eq!(
+            find_model_path(&paths, &registry, "qwen3.8:flash-next"),
+            Some(legacy.clone())
+        );
+        assert_eq!(
+            registry_entry_for_path(&paths, &registry, legacy.to_str().unwrap())
+                .map(|(tag, _)| tag),
+            Some("qwen3.8:flash-next")
+        );
+        for tag in GF_TAGS {
+            assert_eq!(
+                resolve_model_path(&paths, &registry, tag).unwrap(),
+                Some(canonical.clone()),
+                "{tag}"
+            );
+        }
+        assert!(same_inode(&canonical, &legacy), "a link, not a copy");
+
+        // Bytes that do not verify are never served: the resolver refuses.
+        for name in [GF_CANONICAL, GF_LEGACY] {
+            fs::remove_file(&canonical).ok();
+            fs::remove_file(&legacy).ok();
             let path = paths.models.join(name);
-            fs::write(&path, b"not the pinned bytes").unwrap();
+            fs::write(&path, vec![b'x'; GF_MONO_BYTES.len()]).unwrap();
             let error = resolve_model_path(&paths, &registry, "qwen3.8:flash-next")
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("size mismatch"), "{name}: {error}");
+            assert!(error.contains("mismatch"), "{name}: {error}");
             fs::remove_file(&path).unwrap();
         }
         // With the split base installed the monolithic is never touched.
-        fs::write(
-            paths.models.join("qwen3.8-flash-next.mq4-xts"),
-            b"not the pinned bytes",
-        )
-        .unwrap();
-        let base = paths.models.join("qwen3.8-flash-next-base.mq4-xts");
-        fs::write(&base, b"base").unwrap();
+        fs::write(&canonical, b"not the pinned bytes").unwrap();
+        let base = paths.models.join(SHARED_FILE_A);
+        fs::write(&base, SHARED_BASE_A).unwrap();
         assert_eq!(
-            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            resolve_model_path(&paths, &registry, "qwen3.8:flash").unwrap(),
             Some(base)
         );
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_serves_a_verified_monolithic_without_downloading_the_base() {
+        use hipfire_config::memory::PleFormat;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        for legacy_spelling in [false, true] {
+            let paths = test_paths("gf-pull");
+            write_test_registry_cache(&paths, &gf_registry_raw());
+            fs::create_dir_all(&paths.models).unwrap();
+            let canonical = paths.models.join(GF_CANONICAL);
+            let legacy = paths.models.join(GF_LEGACY);
+            fs::write(
+                if legacy_spelling { &legacy } else { &canonical },
+                GF_MONO_BYTES,
+            )
+            .unwrap();
+            let overlay_pins = gf_overlay_pins();
+            let hotset_pins = gf_hotset_pins();
+            let pull = |paths: &Paths, tag: &str| {
+                pull_with_sidecar_pins(
+                    paths,
+                    PullArgs::defaults(tag),
+                    &overlay_pins,
+                    &hotset_pins,
+                    &grandfather_table(),
+                )
+            };
+
+            // gfx1151 prefers q4: the shared q4, the monolithic's overlay and hot
+            // set are fetched; the base never is.
+            let _arch = ple::GpuArchOverride::set(&["gfx1151"]);
+            let (base_url, handle) = serve_files(&[
+                (SHARED_Q4_FILE, PLE_Q4),
+                ("qwen3.8-flash-next.mq4-xts.trunk-overlay", GF_OVERLAY_BYTES),
+                ("qwen3.8-flash-next.mq4-xts.expert-hotset", GF_HOTSET_BYTES),
+            ]);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base_url);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            let served = pull(&paths, "qwen3.8:flash-next").unwrap().unwrap();
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3, "q4 + overlay + hot set"));
+            assert_eq!(
+                served, canonical,
+                "the served monolithic is the printed path"
+            );
+            assert!(
+                !paths.models.join(SHARED_FILE_A).exists(),
+                "no base download"
+            );
+            let shared_q4 = paths.models.join(SHARED_Q4_FILE);
+            let linked_q4 = hipfire_config::memory::ple_sidecar_path(&served, PleFormat::Q4);
+            assert_eq!(fs::read(&linked_q4).unwrap(), PLE_Q4);
+            assert!(same_inode(&linked_q4, &shared_q4), "linked, not copied");
+            assert!(
+                !paths.models.join(SHARED_Q8_FILE).exists(),
+                "q8 is embedded"
+            );
+            assert!(!hipfire_config::memory::ple_sidecar_path(&served, PleFormat::Q8).exists());
+            assert_eq!(
+                fs::read(hipfire_config::memory::trunk_overlay_sidecar_path(&served)).unwrap(),
+                GF_OVERLAY_BYTES
+            );
+            assert_eq!(
+                fs::read(hipfire_config::memory::expert_hotset_sidecar_path(&served)).unwrap(),
+                GF_HOTSET_BYTES
+            );
+            assert!(
+                !paths
+                    .models
+                    .join("qwen3.8-flash-next-base.mq4-xts.trunk-overlay")
+                    .exists(),
+                "the split base's overlay is not the served artifact's"
+            );
+
+            // Every other stock tag and the alias: nothing left to download.
+            let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+            for tag in GF_TAGS {
+                let again = pull(&paths, tag).unwrap().unwrap();
+                assert_eq!(again, canonical, "{tag}");
+            }
+            DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+            if legacy_spelling {
+                assert!(
+                    same_inode(&canonical, &legacy),
+                    "the legacy file is linked, not copied"
+                );
+            }
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pull_of_a_served_monolithic_skips_q8_and_fetches_nothing_on_rdna4() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let paths = test_paths("gf-pull-q8");
+        write_test_registry_cache(&paths, &gf_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let canonical = paths.models.join(GF_CANONICAL);
+        fs::write(&canonical, GF_MONO_BYTES).unwrap();
+        // No server is reachable: any download would fail the pull's PLE step.
+        let _dead = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:9");
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        for (arch, selection) in [
+            ("gfx1201", None),
+            ("", None),
+            ("gfx1151", Some(ple::PleSelection::Q8)),
+            ("gfx1151", Some(ple::PleSelection::Skip)),
+        ] {
+            let _arch = ple::GpuArchOverride::set(&[arch]);
+            let served = pull_with_sidecar_pins(
+                &paths,
+                PullArgs {
+                    ple: selection,
+                    ..PullArgs::defaults("qwen3.8:flash")
+                },
+                &[],
+                &[],
+                &grandfather_table(),
+            )
+            .unwrap();
+            assert_eq!(served, Some(canonical.clone()), "{arch} {selection:?}");
+        }
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 0));
+        assert!(!paths.models.join(SHARED_Q8_FILE).exists());
+        assert!(!paths.models.join(SHARED_Q4_FILE).exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_pulls_the_split_base_when_the_monolithic_does_not_verify_or_under_force() {
+        use hipfire_config::memory::PleFormat;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let _arch = ple::GpuArchOverride::set(&["gfx1151"]);
+        // (monolithic bytes, force): wrong bytes of the right size, then valid bytes + --force.
+        let cases: [(Vec<u8>, bool); 2] = [
+            (vec![b'x'; GF_MONO_BYTES.len()], false),
+            (GF_MONO_BYTES.to_vec(), true),
+        ];
+        for (index, (bytes, force)) in cases.into_iter().enumerate() {
+            let paths = test_paths(&format!("gf-pull-split-{index}"));
+            write_test_registry_cache(&paths, &gf_registry_raw());
+            fs::create_dir_all(&paths.models).unwrap();
+            let canonical = paths.models.join(GF_CANONICAL);
+            fs::write(&canonical, &bytes).unwrap();
+            let (base_url, handle) =
+                serve_files(&[(SHARED_FILE_A, SHARED_BASE_A), (SHARED_Q4_FILE, PLE_Q4)]);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base_url);
+            DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+            let served = pull_with_sidecar_pins(
+                &paths,
+                PullArgs {
+                    force,
+                    ..PullArgs::defaults("qwen3.8:flash-next")
+                },
+                &[],
+                &[],
+                &grandfather_table(),
+            )
+            .unwrap()
+            .unwrap();
+            handle.join().unwrap();
+            DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2, "base + shared q4"));
+            let base = paths.models.join(SHARED_FILE_A);
+            assert_eq!(served, base, "case {index}");
+            assert_eq!(fs::read(&base).unwrap(), SHARED_BASE_A);
+            let linked = hipfire_config::memory::ple_sidecar_path(&base, PleFormat::Q4);
+            assert_eq!(fs::read(&linked).unwrap(), PLE_Q4);
+            assert!(same_inode(&linked, &paths.models.join(SHARED_Q4_FILE)));
+            assert_eq!(
+                fs::read(&canonical).unwrap(),
+                bytes,
+                "the monolithic is untouched"
+            );
+            // The base now wins for every tag.
+            let registry = RegistryV1::parse(&gf_registry_raw(), "gf").unwrap();
+            for tag in GF_TAGS {
+                assert_eq!(
+                    resolve_model_path(&paths, &registry, tag).unwrap(),
+                    Some(base.clone())
+                );
+            }
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+    }
+
+    /// A local HTTP server that serves `files` for any number of requests and
+    /// records which file names were requested (404 for the rest).
+    struct RecordingServer {
+        base: String,
+        seen: std::sync::mpsc::Receiver<String>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RecordingServer {
+        fn spawn(files: std::collections::HashMap<String, Vec<u8>>) -> Self {
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let (seen_thread, seen) = std::sync::mpsc::channel::<String>();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_thread = stop.clone();
+            let handle = std::thread::spawn(move || {
+                while !stop_thread.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let target = request
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let _ = seen_thread.send(target.clone());
+                    match files.get(&target) {
+                        Some(data) => {
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(data);
+                        }
+                        None => {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                base,
+                seen,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        /// Stop serving; the sorted names of every requested file.
+        fn finish(mut self) -> Vec<String> {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.handle.take().unwrap().join().unwrap();
+            let mut seen: Vec<String> = self.seen.try_iter().collect();
+            seen.sort();
+            seen
+        }
+    }
+
+    /// Where the verified Flash-Next MQ4 XTS monolithic sits locally.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LocalMono {
+        /// `qwen3.8-flash-next.mq4-xts`.
+        Canonical,
+        /// Only the old `qwen3.8-flash-next-gptq3.mq4` spelling.
+        GptqAlias,
+        Nothing,
+    }
+
+    /// The CPU resolution matrix of `hipfire pull qwen3.8:flash-next` (a split
+    /// base grandfathering a monolithic) over local state x GPU arches x `--ple`:
+    /// whether the base downloads, which PLE rows are fetched (and their
+    /// sizes), which links are made, and what the monolithic-bound overlay and
+    /// hot set do.
+    #[test]
+    fn pull_resolution_matrix_over_local_monolithic_gpu_arches_and_ple_selection() {
+        use hipfire_config::memory::PleFormat;
+        use ple::PleSelection;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let overlay_pins = gf_overlay_pins();
+        let hotset_pins = gf_hotset_pins();
+        // (label, detected arches, --ple, the formats the plan wants).
+        type Row = (
+            &'static str,
+            &'static [&'static str],
+            Option<PleSelection>,
+            &'static [PleFormat],
+        );
+        let rows: [Row; 11] = [
+            ("gfx1151 auto", &["gfx1151"], None, &[PleFormat::Q4]),
+            ("gfx1201 auto", &["gfx1201"], None, &[PleFormat::Q8]),
+            ("gfx1100 auto", &["gfx1100"], None, &[PleFormat::Q8]),
+            (
+                "gfx1100+gfx1151 auto",
+                &["gfx1100", "gfx1151"],
+                None,
+                &[PleFormat::Q4, PleFormat::Q8],
+            ),
+            ("no gpu auto", &[], None, &[PleFormat::Q8]),
+            ("unknown arch auto", &["gfx906"], None, &[PleFormat::Q8]),
+            (
+                "gfx1151 --ple auto",
+                &["gfx1151"],
+                Some(PleSelection::Auto),
+                &[PleFormat::Q4],
+            ),
+            (
+                "gfx1151 --ple q8",
+                &["gfx1151"],
+                Some(PleSelection::Q8),
+                &[PleFormat::Q8],
+            ),
+            (
+                "gfx1151 --ple q4",
+                &["gfx1151"],
+                Some(PleSelection::Q4),
+                &[PleFormat::Q4],
+            ),
+            (
+                "gfx1201 --ple q4",
+                &["gfx1201"],
+                Some(PleSelection::Q4),
+                &[PleFormat::Q4],
+            ),
+            (
+                "gfx1100+gfx1151 --ple q4",
+                &["gfx1100", "gfx1151"],
+                Some(PleSelection::Q4),
+                &[PleFormat::Q4],
+            ),
+        ];
+        let shared_file = |format: PleFormat| match format {
+            PleFormat::Q4 => SHARED_Q4_FILE,
+            PleFormat::Q8 => SHARED_Q8_FILE,
+        };
+        let rows_bytes = |format: PleFormat| match format {
+            PleFormat::Q4 => PLE_Q4,
+            PleFormat::Q8 => PLE_Q8,
+        };
+        let overlay_mono = "qwen3.8-flash-next.mq4-xts.trunk-overlay";
+        let hotset_mono = "qwen3.8-flash-next.mq4-xts.expert-hotset";
+        let overlay_base = "qwen3.8-flash-next-base.mq4-xts.trunk-overlay";
+        let hotset_base = "qwen3.8-flash-next-base.mq4-xts.expert-hotset";
+        let everything: std::collections::HashMap<String, Vec<u8>> = [
+            (SHARED_FILE_A, SHARED_BASE_A),
+            (SHARED_Q4_FILE, PLE_Q4),
+            (SHARED_Q8_FILE, PLE_Q8),
+            (overlay_mono, GF_OVERLAY_BYTES),
+            (hotset_mono, GF_HOTSET_BYTES),
+            (overlay_base, GF_OVERLAY_BYTES),
+            (hotset_base, GF_HOTSET_BYTES),
+        ]
+        .into_iter()
+        .map(|(name, data)| (name.to_owned(), data.to_vec()))
+        .collect();
+
+        for local in [
+            LocalMono::Canonical,
+            LocalMono::GptqAlias,
+            LocalMono::Nothing,
+        ] {
+            for (label, arches, selection, wanted) in rows {
+                let case = format!("{local:?} / {label}");
+                let paths = test_paths("gf-matrix");
+                write_test_registry_cache(&paths, &gf_registry_raw());
+                fs::create_dir_all(&paths.models).unwrap();
+                let canonical = paths.models.join(GF_CANONICAL);
+                match local {
+                    LocalMono::Canonical => fs::write(&canonical, GF_MONO_BYTES).unwrap(),
+                    LocalMono::GptqAlias => {
+                        fs::write(paths.models.join(GF_LEGACY), GF_MONO_BYTES).unwrap()
+                    }
+                    LocalMono::Nothing => {}
+                }
+                let mono_present = local != LocalMono::Nothing;
+                let _arch = ple::GpuArchOverride::set(arches);
+                let server = RecordingServer::spawn(everything.clone());
+                let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &server.base);
+                DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+                let served = pull_with_sidecar_pins(
+                    &paths,
+                    PullArgs {
+                        ple: selection,
+                        ..PullArgs::defaults("qwen3.8:flash-next")
+                    },
+                    &overlay_pins,
+                    &hotset_pins,
+                    &grandfather_table(),
+                )
+                .unwrap()
+                .unwrap();
+                let seen = server.finish();
+                DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), seen.len(), "{case}"));
+
+                // The exact q8 rows are embedded in a present monolithic.
+                let fetched: Vec<PleFormat> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|format| !(mono_present && *format == PleFormat::Q8))
+                    .collect();
+                let mut expected: Vec<String> = fetched
+                    .iter()
+                    .map(|format| shared_file(*format).to_owned())
+                    .collect();
+                // The base downloads only with nothing local; the overlay and hot
+                // set are the ones bound to whichever artifact serves the tags.
+                if mono_present {
+                    expected.extend([overlay_mono.to_owned(), hotset_mono.to_owned()]);
+                } else {
+                    expected.extend([
+                        SHARED_FILE_A.to_owned(),
+                        overlay_base.to_owned(),
+                        hotset_base.to_owned(),
+                    ]);
+                }
+                expected.sort();
+                assert_eq!(seen, expected, "{case}");
+                assert_eq!(
+                    seen.iter().any(|name| name == SHARED_FILE_A),
+                    !mono_present,
+                    "{case}: base download"
+                );
+                let model = paths.models.join(if mono_present {
+                    GF_CANONICAL
+                } else {
+                    SHARED_FILE_A
+                });
+                assert_eq!(served, model, "{case}");
+                if mono_present {
+                    assert!(!paths.models.join(SHARED_FILE_A).exists(), "{case}");
+                    assert!(same_installed_file(&canonical, &model), "{case}");
+                } else {
+                    assert_eq!(fs::read(&model).unwrap(), SHARED_BASE_A, "{case}");
+                }
+
+                // The fetched rows: size, bytes and the link under the loader's name.
+                for format in [PleFormat::Q4, PleFormat::Q8] {
+                    let shared = paths.models.join(shared_file(format));
+                    let link = hipfire_config::memory::ple_sidecar_path(&model, format);
+                    if fetched.contains(&format) {
+                        let data = rows_bytes(format);
+                        assert_eq!(
+                            fs::metadata(&shared).unwrap().len(),
+                            data.len() as u64,
+                            "{case}"
+                        );
+                        assert_eq!(fs::read(&shared).unwrap(), data, "{case}");
+                        assert!(
+                            same_inode(&link, &shared),
+                            "{case}: {format:?} linked, not copied"
+                        );
+                    } else {
+                        assert!(!shared.exists(), "{case}: {format:?} must not be fetched");
+                        assert!(!link.exists(), "{case}: {format:?} must not be linked");
+                    }
+                }
+                if local == LocalMono::GptqAlias {
+                    assert!(
+                        same_inode(&canonical, &paths.models.join(GF_LEGACY)),
+                        "{case}: canonical name is a link of the legacy file"
+                    );
+                }
+                fs::remove_dir_all(&paths.root).unwrap();
+            }
+        }
+    }
+
+    /// A monolithic present with `--ple q8` on Halo: the exact rows are embedded,
+    /// so no PLE sidecar is fetched or linked at all.
+    #[test]
+    fn q8_on_halo_with_a_monolithic_fetches_no_ple_rows() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let paths = test_paths("gf-halo-q8");
+        write_test_registry_cache(&paths, &gf_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let canonical = paths.models.join(GF_CANONICAL);
+        fs::write(&canonical, GF_MONO_BYTES).unwrap();
+        let _arch = ple::GpuArchOverride::set(&["gfx1151"]);
+        let server = RecordingServer::spawn(Default::default());
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &server.base);
+        let served = pull_with_sidecar_pins(
+            &paths,
+            PullArgs {
+                ple: Some(ple::PleSelection::Q8),
+                ..PullArgs::defaults("qwen3.8:flash-next")
+            },
+            &[],
+            &[],
+            &grandfather_table(),
+        )
+        .unwrap();
+        assert_eq!(server.finish(), Vec::<String>::new());
+        assert_eq!(served, Some(canonical.clone()));
+        let leftovers: Vec<String> = fs::read_dir(&paths.models)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, [GF_CANONICAL]);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn hash_invocations() -> usize {
+        HASH_INVOCATIONS.with(|count| count.get())
+    }
+
+    /// Verification-cache record of `path` as written to the hipfire home.
+    fn cached_record(paths: &Paths, path: &Path) -> Option<serde_json::Value> {
+        let raw = fs::read(paths.root.join("cache/verified-artifacts.json")).ok()?;
+        let cache: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        cache["records"]
+            .get(path.to_string_lossy().as_ref())
+            .cloned()
+    }
+
+    #[test]
+    fn resolving_a_verified_monolithic_hashes_it_once_per_stat() {
+        let paths = test_paths("verify-cache");
+        fs::create_dir_all(&paths.models).unwrap();
+        let cache = VerifiedCache::in_home(&paths.root);
+        let canonical = paths.models.join("mono.mq4-xts");
+        let legacy = paths.models.join("mono-legacy.mq4");
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let bytes = b"pinned monolithic payload";
+        let pin = |bytes: &[u8]| (digest(bytes), bytes.len() as u64);
+        let resolve = |digest: &str, size: u64| {
+            migrate_verified_artifact(&cache, &legacy, &canonical, digest, size)
+        };
+        fs::write(&canonical, bytes).unwrap();
+        let (sha, size) = pin(bytes);
+        HASH_INVOCATIONS.with(|count| count.set(0));
+
+        // First resolve hashes and records dev/ino/size/mtime/sha/verified_at.
+        assert_eq!(resolve(&sha, size).unwrap(), Some(canonical.clone()));
+        assert_eq!(hash_invocations(), 1);
+        let record = cached_record(&paths, &canonical).expect("record written");
+        let metadata = fs::metadata(&canonical).unwrap();
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(record["dev"], metadata.dev());
+            assert_eq!(record["ino"], metadata.ino());
+            assert_eq!(record["mtime_sec"], metadata.mtime());
+            assert_eq!(record["mtime_nsec"], metadata.mtime_nsec());
+        }
+        assert_eq!(record["size"], size);
+        assert_eq!(record["sha256"], sha);
+        assert!(record["verified_at"].as_u64().unwrap() > 0);
+
+        // The second resolve (and every later load) does not hash again.
+        for _ in 0..3 {
+            assert_eq!(resolve(&sha, size).unwrap(), Some(canonical.clone()));
+        }
+        assert_eq!(hash_invocations(), 1, "a cache hit must not hash");
+
+        // mtime alone changes: re-hash, then hits again.
+        let original_mtime = metadata.modified().unwrap();
+        let set_mtime = |path: &Path, time: std::time::SystemTime| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        set_mtime(&canonical, original_mtime + Duration::from_secs(5));
+        assert_eq!(resolve(&sha, size).unwrap(), Some(canonical.clone()));
+        assert_eq!(hash_invocations(), 2, "a changed mtime re-hashes");
+        resolve(&sha, size).unwrap();
+        assert_eq!(hash_invocations(), 2);
+        let mtime = fs::metadata(&canonical).unwrap().modified().unwrap();
+
+        // Size alone changes (same inode, same mtime restored): re-hash.
+        let longer = b"pinned monolithic payload, longer";
+        fs::write(&canonical, longer).unwrap();
+        set_mtime(&canonical, mtime);
+        let (longer_sha, longer_size) = pin(longer);
+        assert_eq!(
+            resolve(&longer_sha, longer_size).unwrap(),
+            Some(canonical.clone())
+        );
+        assert_eq!(hash_invocations(), 3, "a changed size re-hashes");
+        resolve(&longer_sha, longer_size).unwrap();
+        assert_eq!(hash_invocations(), 3);
+        assert_eq!(
+            cached_record(&paths, &canonical).unwrap()["size"],
+            longer_size
+        );
+
+        // Inode alone changes (same bytes, size and mtime): re-hash.
+        let replacement = paths.models.join("replacement");
+        fs::write(&replacement, longer).unwrap();
+        set_mtime(
+            &replacement,
+            fs::metadata(&canonical).unwrap().modified().unwrap(),
+        );
+        let old_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&canonical).unwrap().ino()
+        };
+        fs::rename(&replacement, &canonical).unwrap();
+        let new_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&canonical).unwrap().ino()
+        };
+        assert_ne!(old_inode, new_inode);
+        resolve(&longer_sha, longer_size).unwrap();
+        assert_eq!(hash_invocations(), 4, "a changed inode re-hashes");
+        resolve(&longer_sha, longer_size).unwrap();
+        assert_eq!(hash_invocations(), 4);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn a_cache_record_for_another_sha_never_satisfies_and_a_corrupt_cache_is_tolerated() {
+        let paths = test_paths("verify-cache-sha");
+        fs::create_dir_all(&paths.models).unwrap();
+        let cache = VerifiedCache::in_home(&paths.root);
+        let canonical = paths.models.join("mono.mq4-xts");
+        let legacy = paths.models.join("mono-legacy.mq4");
+        let bytes = b"pinned monolithic payload";
+        let sha = format!("{:x}", Sha256::digest(bytes));
+        let size = bytes.len() as u64;
+        let other_sha = "b".repeat(64);
+        fs::write(&canonical, bytes).unwrap();
+        let resolve =
+            |digest: &str| migrate_verified_artifact(&cache, &legacy, &canonical, digest, size);
+        HASH_INVOCATIONS.with(|count| count.set(0));
+
+        // The cache says these exact bytes verified against OTHER_SHA: that is
+        // not the pin, so the file hashes (and now verifies for real).
+        let stat = verified_cache::StatKey::of(&fs::metadata(&canonical).unwrap());
+        cache.remember(&canonical, stat, &other_sha);
+        assert_eq!(resolve(&sha).unwrap(), Some(canonical.clone()));
+        assert_eq!(hash_invocations(), 1, "a record of another sha is no proof");
+        assert_eq!(cached_record(&paths, &canonical).unwrap()["sha256"], sha);
+        resolve(&sha).unwrap();
+        assert_eq!(hash_invocations(), 1);
+
+        // Asking for a different pin against the same bytes hashes, fails, and
+        // leaves the good record alone.
+        let error = resolve(&other_sha).unwrap_err().to_string();
+        assert!(error.contains("SHA-256 mismatch"), "{error}");
+        assert_eq!(hash_invocations(), 2);
+        assert_eq!(cached_record(&paths, &canonical).unwrap()["sha256"], sha);
+        resolve(&sha).unwrap();
+        assert_eq!(hash_invocations(), 2);
+
+        // A corrupt cache file is ignored, never fatal; the next verification
+        // replaces it with a valid one.
+        let cache_file = paths.root.join("cache/verified-artifacts.json");
+        for garbage in [&b"{not json"[..], b"", b"\x00\xff\xfe", b"[1,2,3]"] {
+            fs::write(&cache_file, garbage).unwrap();
+            let before = hash_invocations();
+            assert_eq!(resolve(&sha).unwrap(), Some(canonical.clone()));
+            assert_eq!(hash_invocations(), before + 1);
+            assert_eq!(cached_record(&paths, &canonical).unwrap()["sha256"], sha);
+            resolve(&sha).unwrap();
+            assert_eq!(hash_invocations(), before + 1);
+        }
+
+        // An unwritable cache location never fails the resolve either.
+        let blocker = paths.root.join("blocked-home");
+        fs::write(&blocker, b"a file, not a directory").unwrap();
+        let broken = VerifiedCache::in_home(&blocker);
+        let before = hash_invocations();
+        assert_eq!(
+            migrate_verified_artifact(&broken, &legacy, &canonical, &sha, size).unwrap(),
+            Some(canonical.clone())
+        );
+        assert_eq!(hash_invocations(), before + 1);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn a_pull_of_a_served_monolithic_does_not_rehash_it_on_the_next_resolve() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let paths = test_paths("gf-verify-cache");
+        write_test_registry_cache(&paths, &gf_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let legacy = paths.models.join(GF_LEGACY);
+        fs::write(&legacy, GF_MONO_BYTES).unwrap();
+        let registry = RegistryV1::parse(&gf_registry_raw(), "gf").unwrap();
+        HASH_INVOCATIONS.with(|count| count.set(0));
+        // Legacy spelling only: one hash verifies it and links the canonical name.
+        let first = resolve_model_path(&paths, &registry, "qwen3.8:flash-next")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, paths.models.join(GF_CANONICAL));
+        assert_eq!(hash_invocations(), 1);
+        // Every later resolve (any tag, canonical or legacy name) is a cache hit.
+        for tag in GF_TAGS {
+            assert_eq!(
+                resolve_model_path(&paths, &registry, tag).unwrap(),
+                Some(first.clone()),
+                "{tag}"
+            );
+        }
+        assert_eq!(
+            hash_invocations(),
+            1,
+            "the link covers the canonical name too"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_a_grandfathered_monolithic_with_its_twin_and_sidecars_but_not_a_shared_pair_another_base_links(
+    ) {
+        use hipfire_config::memory::PleFormat;
+        let _pins = GrandfatherOverride::set(&[gf_pin()]);
+        let registry = RegistryV1::parse(&gf_registry_raw(), "gf rm").unwrap();
+        for keep_second_base in [true, false] {
+            let paths = test_paths("gf-rm");
+            fs::create_dir_all(&paths.models).unwrap();
+            let canonical = paths.models.join(GF_CANONICAL);
+            let legacy = paths.models.join(GF_LEGACY);
+            fs::write(&canonical, GF_MONO_BYTES).unwrap();
+            fs::hard_link(&canonical, &legacy).unwrap();
+            let shared_q4 = paths.models.join(SHARED_Q4_FILE);
+            fs::write(&shared_q4, PLE_Q4).unwrap();
+            let mono_q4 = hipfire_config::memory::ple_sidecar_path(&canonical, PleFormat::Q4);
+            fs::hard_link(&shared_q4, &mono_q4).unwrap();
+            let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&canonical);
+            let hotset = hipfire_config::memory::expert_hotset_sidecar_path(&canonical);
+            fs::write(&overlay, GF_OVERLAY_BYTES).unwrap();
+            fs::write(&hotset, GF_HOTSET_BYTES).unwrap();
+            let second = paths.models.join(SHARED_FILE_B);
+            if keep_second_base {
+                fs::write(&second, SHARED_BASE_B).unwrap();
+                let second_q4 = hipfire_config::memory::ple_sidecar_path(&second, PleFormat::Q4);
+                fs::hard_link(&shared_q4, &second_q4).unwrap();
+            }
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: "qwen3.8:flash-next".into(),
+                    yes: true,
+                },
+            )
+            .unwrap();
+            for gone in [&canonical, &legacy, &mono_q4, &overlay, &hotset] {
+                assert!(!gone.exists(), "{} must be removed", gone.display());
+            }
+            assert_eq!(
+                shared_q4.exists(),
+                keep_second_base,
+                "the shared q4 stays only while another base links it"
+            );
+            assert_eq!(second.exists(), keep_second_base);
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
     }
 
     #[test]
@@ -19523,6 +20688,7 @@ mod tests {
         assert!(paths.models.join("untouched.mq4").exists());
 
         // A monolithic served under the split tag takes its derived q4 with it.
+        let _pins = GrandfatherOverride::set(&[split_model_pin()]);
         for file in ["split-model.mq4", "split-model.mq4.ple-q4"] {
             fs::write(paths.models.join(file), b"x").unwrap();
         }
@@ -19544,6 +20710,7 @@ mod tests {
         let paths = test_paths("ple-listing");
         fs::create_dir_all(&paths.models).unwrap();
         let registry = RegistryV1::parse(&split_registry_raw(), "ple listing").unwrap();
+        let _pins = GrandfatherOverride::set(&[split_model_pin()]);
         let sidecars = [
             "split-model-base.mq4.ple-q4",
             "split-model-base.mq4.ple-q8",
@@ -19630,6 +20797,7 @@ mod tests {
             },
             &overlay_pins(),
             &[],
+            &grandfather_table(),
         )
         .unwrap();
     }
@@ -19820,6 +20988,7 @@ mod tests {
             },
             &[],
             &hotset_pins(),
+            &grandfather_table(),
         )
         .unwrap();
     }

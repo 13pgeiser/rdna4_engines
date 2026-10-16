@@ -1301,11 +1301,13 @@
         "top_p": 0.95,
         "top_k": 20
       },
-      "ple_q4": {
-        "file": "qwen3.8-flash-next.ple-q4"
-      },
-      "ple_q8": {
-        "file": "qwen3.8-flash-next.ple-q8"
+      "ple": {
+        "q4": {
+          "file": "qwen3.8-flash-next.ple-q4"
+        },
+        "q8": {
+          "file": "qwen3.8-flash-next.ple-q8"
+        }
       }
     },
 

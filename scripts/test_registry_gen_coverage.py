@@ -60,6 +60,7 @@ def _trees_from(v1: dict) -> dict[str, dict[str, dict]]:
             tree[entry["file"]] = _tree_item(entry["file"], entry["sha256"], entry["size_bytes"])
         sidecars = [entry[k] for k in SIDECAR_KINDS if isinstance(entry.get(k), dict)]
         sidecars += [sc for sc in (entry.get("heads") or {}).values() if isinstance(sc, dict)]
+        sidecars += [sc for sc in (entry.get("ple") or {}).values() if isinstance(sc, dict)]
         for sc in sidecars:
             if "size_bytes" in sc:
                 tree[sc["file"]] = _tree_item(sc["file"], sc.get("sha256"), sc["size_bytes"])
