@@ -19,6 +19,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include <map>
 #include <set>
 #include "build/startup.h"
 #include "diag/diag.h"
@@ -140,15 +141,24 @@ private:
     int lora_start();
 public:
     int lora_load(const std::string& name, const std::string& dir, std::string* err);
-    /* RAD_OK with the slot and the uid of its load, RAD_E_NOTFOUND for a name no slot holds. */
-    int lora_resolve(const std::string& name, int32_t* slot, uint64_t* uid) const;
+    /* Unpublish an adapter. Refused (RAD_E_STATE) while a request holds it; its slot is reused
+     * only once the step loop has gone round three times since, so no step still on the card can
+     * read bytes a later load is writing (the next step is issued before the last is read back). */
+    int lora_unload(const std::string& name, std::string* err);
+    /* RAD_OK with the slot, the uid of its load and a HOLD -- the adapter cannot be unloaded while
+     * the hold lives (the server keeps it in the request's Generation, which outlives the request
+     * in the scheduler). RAD_E_NOTFOUND for a name no slot holds. */
+    int lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
+                     std::shared_ptr<void>* hold);
     std::vector<std::string> lora_names() const;
 private:
-    struct LoraSlotState { std::string name, dir; uint64_t uid = 0; };
+    struct LoraSlotState { std::string name, dir; uint64_t uid = 0; bool used = false; uint64_t freed_at = 0; };
     std::vector<LoraSlotState> lora_slots_;
     uint64_t                   lora_next_uid_ = 1;
+    std::map<uint64_t, int>    lora_refs_;
     mutable std::mutex         lora_mu_;
     std::set<std::string>      lora_targets_;
+    std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup

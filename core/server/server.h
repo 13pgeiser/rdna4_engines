@@ -121,8 +121,11 @@ struct ServerOptions {
     std::function<std::string()> diagnostics_json;
     /* RUNTIME LoRA (Engine::lora_resolve): a request's `model` naming a loaded adapter gets that
      * adapter's slot and load uid. Unset with LoRA off, and then any `model` is served by the base. */
-    std::function<int(const std::string&, int32_t*, uint64_t*)> lora_resolve;
+    std::function<int(const std::string&, int32_t*, uint64_t*, std::shared_ptr<void>*)> lora_acquire;
     std::function<std::vector<std::string>()>                  lora_names;
+    /* POST /v1/load_lora_adapter and /v1/unload_lora_adapter (vLLM's names and bodies). */
+    std::function<int(const std::string&, const std::string&, std::string*)> lora_load;
+    std::function<int(const std::string&, std::string*)>                    lora_unload;
 
     std::string api_key;
     bool        cors = true;
@@ -233,6 +236,7 @@ private:
     HttpResponse handle_tokenizer_info(const HttpRequest& req);
     HttpResponse handle_server_info(const HttpRequest& req);
     HttpResponse handle_diagnostics(const HttpRequest& req);
+    HttpResponse handle_lora_admin(const HttpRequest& req, bool load);
     /* What this deployment can do (chat, tools, reasoning, grammar, media, logprobs, reasoning
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
     json capabilities() const;

@@ -396,6 +396,7 @@ int Engine::step_loop() {
      * readback (Scheduler::step_next). */
     const RadBatch* ahead = nullptr;
     while (!stopping_.load(std::memory_order_acquire)) {
+        lora_epoch_.fetch_add(1, std::memory_order_acq_rel);
         phase_t_ = std::chrono::steady_clock::now();
         /* Encode media for waiting requests while nothing is in flight. The scheduler issues no
          * step ahead while a request waits, and a request with unencoded media waits. */
@@ -2077,10 +2078,15 @@ int Engine::run_server() {
     /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
     if (cfg_.lora.enabled()) {
-        o.lora_resolve = [this](const std::string& m, int32_t* slot, uint64_t* uid) {
-            return lora_resolve(m, slot, uid);
+        o.lora_acquire = [this](const std::string& m, int32_t* slot, uint64_t* uid,
+                                std::shared_ptr<void>* hold) {
+            return lora_acquire(m, slot, uid, hold);
         };
         o.lora_names = [this] { return lora_names(); };
+        o.lora_load = [this](const std::string& n, const std::string& d, std::string* e) {
+            return lora_load(n, d, e);
+        };
+        o.lora_unload = [this](const std::string& n, std::string* e) { return lora_unload(n, e); };
     }
 
     /* Media, when the program declared an encoder. The processor's geometry comes from the

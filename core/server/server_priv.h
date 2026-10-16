@@ -18,6 +18,8 @@ namespace server {
 
 struct Server::Generation {
     std::shared_ptr<Sink>         sink;
+    /* The runtime LoRA adapter this choice runs with, held so it cannot be unloaded under it. */
+    std::shared_ptr<void>         lora_hold;
     std::unique_ptr<IDetokenizer> detok;
     std::unique_ptr<ReplyStream> delta;   /* chat streaming only, in the request's API shape */
     uint64_t    id = 0;

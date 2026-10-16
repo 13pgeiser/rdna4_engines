@@ -2684,6 +2684,7 @@ static json model_card(const ModelCard& c) {
     m["owned_by"] = "radiance";
     if (c.max_model_len > 0) m["max_model_len"] = c.max_model_len;
     if (!c.root.empty()) m["root"] = c.root;
+    if (!c.parent.empty()) m["parent"] = c.parent;
     if (!c.capabilities.empty()) {
         json caps = json::parse(c.capabilities, nullptr, false);
         if (!caps.is_discarded() && caps.is_object()) m["capabilities"] = std::move(caps);
@@ -2695,6 +2696,14 @@ std::string models_body(const ModelCard& c) {
     json o;
     o["object"] = "list";
     o["data"] = json::array({model_card(c)});
+    return o.dump();
+}
+
+std::string models_body(const std::vector<ModelCard>& cards) {
+    json o;
+    o["object"] = "list";
+    o["data"] = json::array();
+    for (const ModelCard& c : cards) o["data"].push_back(model_card(c));
     return o.dump();
 }
 

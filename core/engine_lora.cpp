@@ -117,15 +117,22 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
     if (!cfg_.lora.enabled()) { *err = "the engine was started without adapters"; return RAD_E_STATE; }
     if (name.empty()) { *err = "an adapter needs a name"; return RAD_E_INVAL; }
     int slot = -1;
+    bool cooling = false;
+    const uint64_t now = lora_epoch_.load(std::memory_order_acquire);
     for (size_t i = 0; i < lora_slots_.size(); ++i) {
-        if (lora_slots_[i].uid != 0 && lora_slots_[i].name == name) {
+        const LoraSlotState& x = lora_slots_[i];
+        if (x.uid != 0 && x.name == name) {
             *err = "an adapter named '" + name + "' is already loaded";
             return RAD_E_INVAL;
         }
-        if (slot < 0 && lora_slots_[i].uid == 0) slot = (int)i;
+        if (x.uid != 0 || slot >= 0) continue;
+        if (x.used && now < x.freed_at + 3) { cooling = true; continue; }
+        slot = (int)i;
     }
     if (slot < 0) {
-        *err = fmt("all %zu adapter slots are in use (--max-loras)", lora_slots_.size());
+        *err = cooling ? std::string("the free slot was unloaded a moment ago and a step on the card "
+                                     "may still read it; retry")
+                       : fmt("all %zu adapter slots are in use (--max-loras)", lora_slots_.size());
         return RAD_E_FULL;
     }
 
@@ -201,6 +208,7 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
     ls.name = name;
     ls.dir = dir;
     ls.uid = lora_next_uid_++;
+    ls.used = true;
     const lora::AdapterInfo& a = infos[0];
     RAD_INFO("lora: '%s' in slot %d -- %zu modules, rank %lld, alpha %g%s, base %s", name.c_str(),
              slot, a.modules.size(), (long long)a.max_module_rank, a.alpha, a.rslora ? " (rsLoRA)" : "",
@@ -208,14 +216,42 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
     return RAD_OK;
 }
 
-int Engine::lora_resolve(const std::string& name, int32_t* slot, uint64_t* uid) const {
+int Engine::lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
+                         std::shared_ptr<void>* hold) {
     std::lock_guard<std::mutex> lk(lora_mu_);
     for (size_t i = 0; i < lora_slots_.size(); ++i)
         if (lora_slots_[i].uid != 0 && lora_slots_[i].name == name) {
+            const uint64_t u = lora_slots_[i].uid;
             *slot = (int32_t)i;
-            *uid = lora_slots_[i].uid;
+            *uid = u;
+            ++lora_refs_[u];
+            *hold = std::shared_ptr<void>(nullptr, [this, u](void*) {
+                std::lock_guard<std::mutex> g(lora_mu_);
+                auto it = lora_refs_.find(u);
+                if (it != lora_refs_.end() && --it->second <= 0) lora_refs_.erase(it);
+            });
             return RAD_OK;
         }
+    return RAD_E_NOTFOUND;
+}
+
+int Engine::lora_unload(const std::string& name, std::string* err) {
+    std::lock_guard<std::mutex> lk(lora_mu_);
+    for (LoraSlotState& x : lora_slots_) {
+        if (x.uid == 0 || x.name != name) continue;
+        auto it = lora_refs_.find(x.uid);
+        if (it != lora_refs_.end() && it->second > 0) {
+            *err = fmt("%d request%s still use%s '%s'", it->second, it->second == 1 ? "" : "s",
+                       it->second == 1 ? "s" : "", name.c_str());
+            return RAD_E_STATE;
+        }
+        RAD_INFO("lora: '%s' unloaded (uid %llu)", name.c_str(), (unsigned long long)x.uid);
+        x.uid = 0;
+        x.name.clear();
+        x.freed_at = lora_epoch_.load(std::memory_order_acquire);
+        return RAD_OK;
+    }
+    *err = "no adapter named '" + name + "' is loaded";
     return RAD_E_NOTFOUND;
 }
 
