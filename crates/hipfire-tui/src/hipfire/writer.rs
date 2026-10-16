@@ -18,9 +18,13 @@ use std::path::Path;
 pub enum FieldKind {
     Enum(&'static [&'static str]),
     Bool,
-    Float { min: f64, max: f64 },
-    Int { min: i64, max: i64 },
-    FreeStr { require_existing_file: bool },
+    /// Numeric kinds carry no bounds: `hipfire-config` is the sole validator,
+    /// and [`schema_range`] reads the schema's own range for display.
+    Float,
+    Int,
+    FreeStr {
+        require_existing_file: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,10 +56,9 @@ const AUTO_ON_OFF: &[&str] = &["off", "on", "auto"];
 const THINKING: &[&str] = &["on", "off"];
 const THINKING_BUDGET: &[&str] = &["low", "med", "high", "xhigh", "max", "uncapped"];
 const FLASH_MODE: &[&str] = &["auto", "always", "never"];
-const PREFILL_COMPRESSION: &[&str] = &["off", "auto", "always"];
 
-/// Curated display order. Bounds are descriptive only; `hipfire-config` is the
-/// sole validator.
+/// Curated display order. `hipfire-config` is the sole validator; deprecated
+/// CASK/PFlash keys are deliberately absent (read-only in the TUI).
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "kv_cache",
@@ -72,6 +75,17 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "dflash_mode",
         kind: FieldKind::Enum(AUTO_ON_OFF),
+    },
+    // The general speculative-decoding selector (`speculation.mode`, legacy flat
+    // name `speculation`); values come from the schema's own list.
+    FieldSpec {
+        key: "speculation",
+        kind: FieldKind::Enum(hipfire_config::SPECULATION_MODES),
+    },
+    // `memory.ple_format`, legacy flat name `ple_format`; schema list as above.
+    FieldSpec {
+        key: "ple_format",
+        kind: FieldKind::Enum(hipfire_config::PLE_FORMATS),
     },
     FieldSpec {
         key: "thinking",
@@ -96,47 +110,34 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         key: "temperature",
-        kind: FieldKind::Float { min: 0.0, max: 2.0 },
+        kind: FieldKind::Float,
     },
     FieldSpec {
         key: "top_p",
-        kind: FieldKind::Float { min: 0.0, max: 1.0 },
+        kind: FieldKind::Float,
     },
     FieldSpec {
         key: "max_tokens",
-        kind: FieldKind::Int {
-            min: 1,
-            max: 131072,
-        },
+        kind: FieldKind::Int,
     },
     FieldSpec {
         key: "max_seq",
-        kind: FieldKind::Int {
-            min: 512,
-            max: 524288,
-        },
+        kind: FieldKind::Int,
     },
     // Present in `config::easy_keys()`, so the Settings editor offers it as an
     // inline-editable row; without a spec here Enter falls through to "not
-    // editable from the TUI" and no value can be typed. `min: -1` matches the
-    // schema (negative is the reserved auto spelling). Clearing: the editor seeds
+    // editable from the TUI" and no value can be typed. Clearing: the editor seeds
     // its buffer from the *current* value, so an emptied buffer is the unset
     // spelling — `write_value` maps empty input on a nullable field to clear — and
     // a typed `null` is the config/CLI spelling rather than something the buffer
     // can reach once a value exists (typing appends to the seed).
     FieldSpec {
         key: "gpu_layer_budget",
-        kind: FieldKind::Int {
-            min: -1,
-            max: 65536,
-        },
+        kind: FieldKind::Int,
     },
     FieldSpec {
         key: "moe_expert_budget",
-        kind: FieldKind::Int {
-            min: -1,
-            max: 65536,
-        },
+        kind: FieldKind::Int,
     },
     // The one value list comes from the schema (`hipfire_config::OFFLOAD_EXECS`),
     // which is also what its own field validates against, so the two cannot drift.
@@ -162,32 +163,11 @@ pub const EDITABLE_FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Enum(AUTO_ON_OFF),
     },
     FieldSpec {
-        key: "prefill_compression",
-        kind: FieldKind::Enum(PREFILL_COMPRESSION),
-    },
-    FieldSpec {
-        key: "prefill_drafter",
-        kind: FieldKind::FreeStr {
-            require_existing_file: false,
-        },
-    },
-    FieldSpec {
-        key: "prefill_threshold",
-        kind: FieldKind::Int {
-            min: 0,
-            max: 524288,
-        },
-    },
-    FieldSpec {
         key: "mtp_k",
-        kind: FieldKind::Int { min: 1, max: 10 },
+        kind: FieldKind::Int,
     },
     FieldSpec {
         key: "dflash_adaptive_b",
-        kind: FieldKind::Bool,
-    },
-    FieldSpec {
-        key: "cask",
         kind: FieldKind::Bool,
     },
     FieldSpec {
@@ -204,6 +184,30 @@ pub fn field_spec(key: &str) -> Option<&'static FieldSpec> {
     EDITABLE_FIELDS
         .iter()
         .find(|candidate| candidate.key == key)
+}
+
+/// The accepted numeric range of `key`, read from the schema's `ValueRule` (the
+/// sole validator), as display text: `"1..=1048576"`, `"0..=2"`. `None` for keys
+/// whose rule has no numeric bounds.
+pub fn schema_range(key: &str) -> Option<String> {
+    use hipfire_config::ValueRule;
+    match field(key)?.rule {
+        ValueRule::Integer { min, max }
+        | ValueRule::NullableInteger { min, max }
+        | ValueRule::AutoInteger { min, max }
+        | ValueRule::NullableIntegerOrAuto { min, max } => Some(format!("{min}..={max}")),
+        ValueRule::Float {
+            min,
+            max,
+            min_inclusive,
+        } => Some(if min_inclusive {
+            format!("{min}..={max}")
+        } else {
+            format!(">{min}..={max}")
+        }),
+        ValueRule::NullableFloat { min, max } => Some(format!("{min}..={max}")),
+        _ => None,
+    }
 }
 
 pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteError> {
@@ -433,6 +437,94 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
         }
         assert!(write_value(&path, "offload_exec", "gpu").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// `ple_format` is editable and lands under its canonical schema key.
+    #[test]
+    fn ple_format_round_trips_under_the_schema_key() {
+        let (root, path) = temp_config();
+        let spec = field_spec("ple_format").expect("ple_format has a spec");
+        assert_eq!(spec.kind, FieldKind::Enum(hipfire_config::PLE_FORMATS));
+        assert_eq!(
+            write_value(&path, "ple_format", "q4").unwrap(),
+            Value::String("q4".into())
+        );
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("memory.ple_format"),
+            Some(&ConfigValue::String("q4".into()))
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("ple_format"), "{text}");
+        assert!(write_value(&path, "ple_format", "q5").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The `speculation` row offers exactly the schema's mode list.
+    #[test]
+    fn speculation_options_are_the_schema_values() {
+        let (root, path) = temp_config();
+        let spec = field_spec("speculation").expect("speculation has a spec");
+        let FieldKind::Enum(options) = spec.kind else {
+            panic!("speculation must be an enum row");
+        };
+        assert_eq!(options, hipfire_config::SPECULATION_MODES);
+        for value in options {
+            write_value(&path, "speculation", value)
+                .unwrap_or_else(|e| panic!("{value} must be writable: {e:?}"));
+        }
+        let loaded = load_global(&ConfigPaths::under(&root)).unwrap();
+        assert_eq!(
+            loaded.layer.get("speculation.mode"),
+            Some(&ConfigValue::String("dspark".into()))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Deprecated CASK/PFlash keys are not editable rows.
+    #[test]
+    fn deprecated_keys_have_no_field_spec() {
+        for spec in EDITABLE_FIELDS {
+            assert!(
+                !hipfire_config::is_deprecated_key(spec.key),
+                "{} is deprecated but editable",
+                spec.key
+            );
+        }
+        for key in [
+            "cask",
+            "prefill_compression",
+            "prefill_drafter",
+            "prefill_threshold",
+        ] {
+            assert!(field_spec(key).is_none(), "{key}");
+        }
+    }
+
+    /// Numeric ranges come from the schema, not a local copy: the old table said
+    /// 131072/524288 where the schema allows 393216/1048576.
+    #[test]
+    fn numeric_rows_report_the_schema_range() {
+        for spec in EDITABLE_FIELDS {
+            if matches!(spec.kind, FieldKind::Int | FieldKind::Float) {
+                assert!(
+                    schema_range(spec.key).is_some(),
+                    "numeric row {} has no schema range",
+                    spec.key
+                );
+            }
+        }
+        let rule = field("max_seq").unwrap().rule;
+        let hipfire_config::ValueRule::Integer { max, .. } = rule else {
+            panic!("max_seq rule is not an integer: {rule:?}");
+        };
+        assert!(schema_range("max_seq")
+            .unwrap()
+            .ends_with(&format!("..={max}")));
+        let (root, path) = temp_config();
+        assert!(write_value(&path, "max_seq", &(max + 1).to_string()).is_err());
+        assert!(write_value(&path, "max_seq", &max.to_string()).is_ok());
         let _ = fs::remove_dir_all(root);
     }
 

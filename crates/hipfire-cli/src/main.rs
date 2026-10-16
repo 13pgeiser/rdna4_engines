@@ -1059,7 +1059,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         return model_config_command(paths, &model, args.action);
     }
     let Some(action) = args.action else {
-        return launch_tui(paths, &[]);
+        // `hipfire config` is the config TUI: open it on the Settings tab.
+        return launch_tui(paths, &["--settings".to_owned()]);
     };
     match action {
         ConfigAction::List(output) => {
@@ -9857,6 +9858,34 @@ mod tests {
         let empty = gpu_memory_budget_text(7, Ok(&[])).join("\n");
         assert!(empty.contains("no hardware adapters reported"));
         assert!(empty.contains("software adapters are skipped"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_without_action_launches_the_tui_on_settings() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("config-tui-settings");
+        fs::create_dir_all(&paths.root).unwrap();
+        let record = paths.root.join("tui-args.txt");
+        let script = paths.root.join("fake-tui.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            record.display()
+        );
+        fs::write(&script, body).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _tui = EnvGuard::set("HIPFIRE_TUI_BIN", script.to_str().unwrap());
+        config_command(
+            &paths,
+            ConfigArgs {
+                model: None,
+                action: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&record).unwrap(), "--settings\n");
+        let _ = fs::remove_dir_all(&paths.root);
     }
 
     fn test_paths(label: &str) -> Paths {

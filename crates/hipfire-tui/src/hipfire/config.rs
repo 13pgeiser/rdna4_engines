@@ -149,51 +149,36 @@ impl ConfigState {
         ServiceEndpoint::local(&self.host, self.port, bearer).map_err(|error| error.to_string())
     }
 
+    /// The Advanced view's row order: every key in the config map, with the
+    /// deprecated CASK/PFlash keys after all the others (each group sorted).
+    pub fn advanced_keys(&self) -> Vec<&String> {
+        let (live, deprecated): (Vec<&String>, Vec<&String>) = self
+            .values
+            .keys()
+            .partition(|key| !hipfire_config::is_deprecated_key(key));
+        live.into_iter().chain(deprecated).collect()
+    }
+
     /// Config keys behind each easy-mode row, in display order. `None` marks a
     /// row that is composite/non-editable inline (e.g. the `host:port` serve
     /// row, or the Model row which is set from the Models tab). The TUI editor
     /// uses this to resolve a selected easy row to a writable config key.
     pub fn easy_keys(&self) -> Vec<Option<&'static str>> {
         vec![
-            None,            // Model (set via Models tab)
-            Some("max_seq"), // Context
-            Some("dflash_mode"),
-            Some("prefill_compression"), // Prefill (pflash)
+            None,                // Model (set via Models tab)
+            Some("max_seq"),     // Context
+            Some("speculation"), // Speculation (speculation.mode)
             Some("kv_cache"),
-            Some("gpu_layer_budget"),  // Offload
-            Some("moe_expert_budget"), // Offload (MoE experts)
-            Some("offload_exec"),      // Offload exec
+            Some("gpu_layer_budget"),       // Offload
+            Some("moe_expert_budget"),      // Offload (MoE experts)
+            Some("offload_exec"),           // Offload exec
             Some("offload_passback_share"), // Pass-back GPU share
+            Some("ple_format"),             // PLE format
             Some("thinking"),
             Some("reasoning_effort"),
             Some("thinking_budget"),
             None, // Serve host:port (composite)
         ]
-    }
-
-    /// True when prefill compression is requested (auto/always) but no
-    /// `prefill_drafter` is set — pflash then silently no-ops. Mirrors the bun
-    /// CLI warning (`prefill_compression=… but prefill_drafter is unset`). Surfaced
-    /// honestly in the easy row + as a toast when the user enables compression.
-    ///
-    /// Scope: this reflects the GLOBAL config (`~/.hipfire/config.toml`), which is
-    /// what the Settings tab edits — like every other row here. A per-model
-    /// override (`hipfire config <tag> set prefill_drafter …`, counted in
-    /// `per_model_count`) is resolved by the daemon at serve time and is NOT
-    /// layered in here; the daemon's own gate is the final word. Empty-string =
-    /// disabled matches the shared schema exactly (`"" disables`).
-    pub fn pflash_needs_drafter(&self) -> bool {
-        let compression = self
-            .values
-            .get("prefill_compression")
-            .map(String::as_str)
-            .unwrap_or("off");
-        let drafter_empty = self
-            .values
-            .get("prefill_drafter")
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
-        compression != "off" && drafter_empty
     }
 
     /// Per-easy-row override status, parallel to [`easy_rows`]/[`easy_keys`].
@@ -206,13 +191,13 @@ impl ConfigState {
         vec![
             self.is_override("default_model"),                    // Model
             self.is_override("max_seq"),                          // Context
-            self.is_override("dflash_mode"),                      // Spec decode
-            self.is_override("prefill_compression"),              // Prefill
+            self.is_override("speculation"),                      // Speculation
             self.is_override("kv_cache"),                         // KV cache
             self.is_override("gpu_layer_budget"),                 // Offload
             self.is_override("moe_expert_budget"),                // Offload (MoE experts)
             self.is_override("offload_exec"),                     // Offload exec
             self.is_override("offload_passback_share"),           // Pass-back GPU share
+            self.is_override("ple_format"),                       // PLE format
             self.is_override("thinking"),                         // Thinking
             self.is_override("reasoning_effort"),                 // Reasoning effort
             self.is_override("thinking_budget"),                  // Reasoning budget
@@ -226,19 +211,19 @@ impl ConfigState {
     /// something to show for every row.
     pub fn easy_help_keys(&self) -> Vec<&'static str> {
         vec![
-            "default_model",       // Model
-            "max_seq",             // Context
-            "dflash_mode",         // Spec decode
-            "prefill_compression", // Prefill
-            "kv_cache",            // KV cache
-            "gpu_layer_budget",    // Offload
-            "moe_expert_budget",   // Offload (MoE experts)
-            "offload_exec",        // Offload exec
+            "default_model",          // Model
+            "max_seq",                // Context
+            "speculation",            // Speculation
+            "kv_cache",               // KV cache
+            "gpu_layer_budget",       // Offload
+            "moe_expert_budget",      // Offload (MoE experts)
+            "offload_exec",           // Offload exec
             "offload_passback_share", // Pass-back GPU share
-            "thinking",            // Thinking
-            "reasoning_effort",    // Reasoning effort
-            "thinking_budget",     // Reasoning budget
-            "host",                // Serve
+            "ple_format",             // PLE format
+            "thinking",               // Thinking
+            "reasoning_effort",       // Reasoning effort
+            "thinking_budget",        // Reasoning budget
+            "host",                   // Serve
         ]
     }
 
@@ -258,29 +243,12 @@ impl ConfigState {
                 "KV cache capacity allocated at load.",
             ),
             (
-                "Spec decode",
+                "Speculation",
                 self.values
-                    .get("dflash_mode")
+                    .get("speculation")
                     .cloned()
-                    .unwrap_or_else(|| "off".into()),
-                "Spec decode: the model's attached drafter — its DFlash draft, else its MTP head.",
-            ),
-            (
-                "Prefill",
-                {
-                    let c = self
-                        .values
-                        .get("prefill_compression")
-                        .cloned()
-                        .unwrap_or_else(|| "off".into());
-                    // Honest: compression on without a drafter is a no-op.
-                    if self.pflash_needs_drafter() {
-                        format!("{c} (needs drafter)")
-                    } else {
-                        c
-                    }
-                },
-                "Prefill KV compression (pflash). Needs a prefill_drafter (.hfq) to engage.",
+                    .unwrap_or_else(|| "auto".into()),
+                "Which speculative-decoding mechanism drafts tokens: auto, a forced one, or off.",
             ),
             (
                 "KV cache",
@@ -370,6 +338,14 @@ impl ConfigState {
                 "Share of each spilled step's rows the GPU takes back, for the passback mode.",
             ),
             (
+                "PLE format",
+                self.values
+                    .get("ple_format")
+                    .cloned()
+                    .unwrap_or_else(|| "auto".into()),
+                "Qwen4 only: which PLE row table loads (q4 smaller, q8 exact; auto picks per GPU).",
+            ),
+            (
                 "Thinking",
                 self.values
                     .get("thinking")
@@ -403,12 +379,27 @@ impl ConfigState {
 }
 
 fn defaults() -> BTreeMap<String, String> {
-    resolve(Vec::<NamedLayer>::new())
-        .expect("shared built-in config schema validates")
-        .legacy_values()
-        .into_iter()
-        .map(|(key, value)| (key, value_to_string(&value)))
-        .collect()
+    default_map().clone()
+}
+
+/// The schema defaults, resolved once: the explainer reads them every frame.
+fn default_map() -> &'static BTreeMap<String, String> {
+    static DEFAULTS: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        resolve(Vec::<NamedLayer>::new())
+            .expect("shared built-in config schema validates")
+            .legacy_values()
+            .into_iter()
+            .map(|(key, value)| (key, value_to_string(&value)))
+            .collect()
+    })
+}
+
+/// The built-in default of `key` (canonical or legacy flat name), as display
+/// text; empty for an unset (null) default. `None` for an unknown key.
+pub fn default_value(key: &str) -> Option<String> {
+    let schema = field(key)?;
+    default_map().get(schema.legacy_key).cloned()
 }
 
 fn value_to_string(value: &ConfigValue) -> String {
@@ -479,70 +470,75 @@ mod tests {
             .service_endpoint()
             .unwrap_err()
             .contains("absolute path"));
-        let missing = std::env::temp_dir().join(format!(
-            "hipfire-tui-key-missing-{}", std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("hipfire-tui-key-missing-{}", std::process::id()));
         assert!(state_with(&[("api_key_file", missing.to_str().unwrap())])
             .service_endpoint()
             .is_err());
     }
 
     #[test]
-    fn pflash_needs_drafter_logic() {
-        // 5d honest state: compression on + no drafter -> warns; with a drafter,
-        // or compression off, -> fine.
-        assert!(
-            !state_with(&[]).pflash_needs_drafter(),
-            "off by default = fine"
-        );
-        assert!(
-            state_with(&[("prefill_compression", "auto")]).pflash_needs_drafter(),
-            "auto without drafter needs one"
-        );
-        assert!(
-            state_with(&[("prefill_compression", "always")]).pflash_needs_drafter(),
-            "always without drafter needs one"
-        );
-        assert!(
-            !state_with(&[
-                ("prefill_compression", "auto"),
-                ("prefill_drafter", "/d.hfq")
-            ])
-            .pflash_needs_drafter(),
-            "auto WITH a drafter is fine"
-        );
+    fn easy_rows_drop_deprecated_pflash_and_rename_spec_decode() {
+        let st = state_with(&[]);
+        let labels: Vec<&str> = st.easy_rows().iter().map(|(l, _, _)| *l).collect();
+        assert!(labels.contains(&"Speculation"), "{labels:?}");
+        assert!(labels.contains(&"PLE format"), "{labels:?}");
+        assert!(!labels.contains(&"Spec decode"), "{labels:?}");
+        assert!(!labels.contains(&"Prefill"), "{labels:?}");
+        let keys: Vec<&str> = st.easy_keys().into_iter().flatten().collect();
+        assert!(keys.contains(&"speculation"), "{keys:?}");
+        assert!(keys.contains(&"ple_format"), "{keys:?}");
+        for key in st
+            .easy_keys()
+            .into_iter()
+            .flatten()
+            .chain(st.easy_help_keys())
+        {
+            assert!(
+                !hipfire_config::is_deprecated_key(key),
+                "easy row surfaces deprecated key {key}"
+            );
+        }
+        for (_, value, desc) in st.easy_rows() {
+            let text = format!("{value} {desc}").to_lowercase();
+            assert!(!text.contains("pflash"), "{text}");
+        }
     }
 
     #[test]
-    fn easy_rows_surface_pflash_with_honest_hint() {
-        // The Prefill easy row exists and flags the missing drafter inline.
-        let st = state_with(&[("prefill_compression", "auto")]);
-        let prefill = st
-            .easy_rows()
-            .into_iter()
-            .find(|(label, _, _)| *label == "Prefill")
-            .expect("Prefill easy row present");
-        assert!(
-            prefill.1.contains("needs drafter"),
-            "no-op state shown: {}",
-            prefill.1
-        );
+    fn speculation_row_reads_the_speculation_key_with_schema_default() {
+        let row = |pairs: &[(&str, &str)]| {
+            state_with(pairs)
+                .easy_rows()
+                .into_iter()
+                .find(|(l, _, _)| *l == "Speculation")
+                .map(|(_, v, _)| v)
+                .unwrap()
+        };
+        assert_eq!(row(&[]), "auto");
+        assert_eq!(row(&[("speculation", "mtp")]), "mtp");
+        // The old row edited dflash_mode; it must not drive this one.
+        assert_eq!(row(&[("dflash_mode", "on")]), "auto");
+    }
 
-        // With a drafter set, the hint goes away.
-        let st2 = state_with(&[
-            ("prefill_compression", "auto"),
-            ("prefill_drafter", "/d.hfq"),
-        ]);
-        let prefill2 = st2
-            .easy_rows()
-            .into_iter()
-            .find(|(label, _, _)| *label == "Prefill")
-            .unwrap();
-        assert!(
-            !prefill2.1.contains("needs drafter"),
-            "hint cleared: {}",
-            prefill2.1
-        );
+    #[test]
+    fn advanced_keys_sort_deprecated_last() {
+        let st = state_with(&[]);
+        let keys = st.advanced_keys();
+        assert_eq!(keys.len(), st.values.len());
+        let first_dep = keys
+            .iter()
+            .position(|k| hipfire_config::is_deprecated_key(k))
+            .expect("schema carries deprecated keys");
+        assert!(keys[first_dep..]
+            .iter()
+            .all(|k| hipfire_config::is_deprecated_key(k)));
+        assert!(keys[..first_dep]
+            .iter()
+            .all(|k| !hipfire_config::is_deprecated_key(k)));
+        // Each partition keeps the map's own (sorted) order.
+        assert!(keys[..first_dep].windows(2).all(|w| w[0] < w[1]));
+        assert!(keys[first_dep..].windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -639,10 +635,7 @@ mod tests {
         assert_eq!(row(&[]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "pcie")]), "over PCIe");
         assert_eq!(row(&[("offload_exec", "cpu")]), "on CPU");
-        assert_eq!(
-            row(&[("offload_exec", "passback")]),
-            "passback (CPU + GPU)"
-        );
+        assert_eq!(row(&[("offload_exec", "passback")]), "passback (CPU + GPU)");
     }
 
     /// The pass-back share row: unset and `auto` both mean "the engine schedules
@@ -659,7 +652,10 @@ mod tests {
         };
 
         assert_eq!(row(&[]), "auto (scheduled)");
-        assert_eq!(row(&[("offload_passback_share", "auto")]), "auto (scheduled)");
+        assert_eq!(
+            row(&[("offload_passback_share", "auto")]),
+            "auto (scheduled)"
+        );
         assert_eq!(row(&[("offload_passback_share", "0")]), "0");
         assert_eq!(row(&[("offload_passback_share", "0.375")]), "0.375");
     }

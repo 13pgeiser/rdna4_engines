@@ -38,6 +38,79 @@ use crate::hipfire::{
 pub struct EditState {
     pub key: String,
     pub buffer: String,
+    /// Insertion point as a CHAR index into `buffer` (`0..=chars`). Typing
+    /// inserts here; Backspace/Delete remove before/after it.
+    pub cursor: usize,
+}
+
+impl EditState {
+    /// A fresh edit seeded with the current value, cursor at the end.
+    pub fn new(key: String, buffer: String) -> Self {
+        let cursor = buffer.chars().count();
+        Self {
+            key,
+            buffer,
+            cursor,
+        }
+    }
+
+    fn byte_at(&self, char_index: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.buffer.len(), |(byte, _)| byte)
+    }
+
+    pub fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.cursor);
+        self.buffer.insert(at, c);
+        self.cursor += 1;
+    }
+
+    /// Remove the char before the cursor.
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let at = self.byte_at(self.cursor);
+            self.buffer.remove(at);
+        }
+    }
+
+    /// Remove the char under the cursor.
+    pub fn delete(&mut self) {
+        if self.cursor < self.buffer.chars().count() {
+            let at = self.byte_at(self.cursor);
+            self.buffer.remove(at);
+        }
+    }
+
+    pub fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.buffer.chars().count());
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.buffer.chars().count();
+    }
+}
+
+/// Status line for a key the inline editor has no control for.
+pub fn not_editable_status(key: &str) -> String {
+    format!("{key} is not editable inline — edit with `hipfire config set {key}`")
+}
+
+/// Status line for a deprecated CASK/PFlash key: shown, never edited inline.
+pub fn deprecated_status(key: &str) -> String {
+    format!(
+        "{key} is deprecated (removal 0.5.0) and read-only here — edit with `hipfire config set {key}`"
+    )
 }
 
 /// A previewed-but-uncommitted enum value (5b). Cycling Left/Right/Space stages
@@ -1437,7 +1510,10 @@ impl App {
                 .iter()
                 .position(|k| matches!(k, Some(s) if *s == key))
         } else {
-            self.config.values.keys().position(|k| k == key)
+            self.config
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == key)
         }
     }
 
@@ -1452,10 +1528,9 @@ impl App {
                 .and_then(|k| k.map(|s| s.to_string()))
         } else {
             self.config
-                .values
-                .iter()
-                .nth(self.settings_selected)
-                .map(|(k, _)| k.clone())
+                .advanced_keys()
+                .get(self.settings_selected)
+                .map(|k| (*k).clone())
         }
     }
 
@@ -1497,19 +1572,6 @@ impl App {
                     self.config.overrides.insert(key.to_string());
                 }
                 self.config.loaded_from_disk = true;
-                // Honest pflash state: turning compression on without a drafter is
-                // a no-op until a prefill_drafter (.hfq) is set.
-                if key == "prefill_compression" && self.config.pflash_needs_drafter() {
-                    self.toast_error(
-                        "prefill_compression on, but prefill_drafter is unset — no-op until set",
-                    );
-                    return (
-                        true,
-                        format!(
-                            "{key} = {as_str} saved; set prefill_drafter (a .hfq path) or it stays off"
-                        ),
-                    );
-                }
                 self.toast_info(format!("{key} saved"));
                 (
                     true,
@@ -1685,9 +1747,14 @@ impl App {
             KeyCode::Right | KeyCode::Char(' ') | KeyCode::Left => {
                 let forward = !matches!(key.code, KeyCode::Left);
                 let Some(k) = self.selected_setting_key() else {
-                    self.last_reload = "this row is not inline-editable".into();
+                    self.last_reload = self.not_inline_editable_status();
                     return;
                 };
+                if hipfire_config::is_deprecated_key(&k) {
+                    self.discard_settings_preview();
+                    self.last_reload = deprecated_status(&k);
+                    return;
+                }
                 match writer::field_spec(&k).map(|s| s.kind) {
                     Some(FieldKind::Enum(_)) => {
                         // Cycle from the current PREVIEW if we're mid-preview on
@@ -1716,7 +1783,7 @@ impl App {
                         self.last_reload = format!("{k} is numeric/text; press Enter to edit");
                     }
                     None => {
-                        self.last_reload = format!("{k} is not editable from the TUI");
+                        self.last_reload = not_editable_status(&k);
                     }
                 }
             }
@@ -1737,20 +1804,25 @@ impl App {
                     return;
                 }
                 let Some(k) = self.selected_setting_key() else {
-                    self.last_reload = "this row is not inline-editable".into();
+                    self.last_reload = self.not_inline_editable_status();
                     return;
                 };
+                if hipfire_config::is_deprecated_key(&k) {
+                    self.last_reload = deprecated_status(&k);
+                    return;
+                }
                 match writer::field_spec(&k).map(|s| s.kind) {
-                    Some(FieldKind::Int { .. })
-                    | Some(FieldKind::Float { .. })
+                    Some(FieldKind::Int)
+                    | Some(FieldKind::Float)
                     | Some(FieldKind::FreeStr { .. }) => {
                         let buffer = self.current_setting_value(&k);
-                        self.settings_edit = Some(EditState {
-                            key: k.clone(),
-                            buffer,
-                        });
-                        self.last_reload =
-                            format!("editing {k}: type a value, Enter to save, Esc to cancel");
+                        self.settings_edit = Some(EditState::new(k.clone(), buffer));
+                        let range = writer::schema_range(&k)
+                            .map(|r| format!(" ({r})"))
+                            .unwrap_or_default();
+                        self.last_reload = format!(
+                            "editing {k}{range}: type a value, Enter to save, Esc to cancel"
+                        );
                     }
                     Some(FieldKind::Enum(_)) => {
                         self.last_reload =
@@ -1760,11 +1832,25 @@ impl App {
                         self.last_reload = format!("{k} is on/off; Left/Right/Space toggles");
                     }
                     None => {
-                        self.last_reload = format!("{k} is not editable from the TUI");
+                        self.last_reload = not_editable_status(&k);
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Status for an easy row with no inline-editable key (the composite Model
+    /// and Serve rows): point at the CLI key behind it.
+    fn not_inline_editable_status(&self) -> String {
+        match self
+            .config
+            .easy_help_keys()
+            .get(self.settings_selected)
+            .filter(|_| self.settings_easy)
+        {
+            Some(key) => not_editable_status(key),
+            None => "this row is not inline-editable".into(),
         }
     }
 
@@ -1799,12 +1885,37 @@ impl App {
             }
             KeyCode::Backspace => {
                 if let Some(edit) = self.settings_edit.as_mut() {
-                    edit.buffer.pop();
+                    edit.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.delete();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(edit) = self.settings_edit.as_mut() {
+                    edit.end();
                 }
             }
             KeyCode::Char(c) => {
                 if let Some(edit) = self.settings_edit.as_mut() {
-                    edit.buffer.push(c);
+                    edit.insert(c);
                 }
             }
             _ => {}
@@ -2223,9 +2334,9 @@ mod tests {
         // Select kv_cache in the advanced list and reset it.
         app.settings_selected = app
             .config
-            .values
-            .keys()
-            .position(|k| k == "kv_cache")
+            .advanced_keys()
+            .iter()
+            .position(|k| k.as_str() == "kv_cache")
             .unwrap();
         app.handle_settings_key(key(KeyCode::Delete));
 
@@ -2257,9 +2368,9 @@ mod tests {
         // kv_cache is NOT overridden here.
         app.settings_selected = app
             .config
-            .values
-            .keys()
-            .position(|k| k == "kv_cache")
+            .advanced_keys()
+            .iter()
+            .position(|k| k.as_str() == "kv_cache")
             .unwrap();
         let before = std::fs::read_to_string(&app.paths.config).unwrap();
         app.handle_settings_key(key(KeyCode::Delete));
@@ -2316,9 +2427,9 @@ mod tests {
         // + marks override (5b: cycle no longer persists on its own).
         app.settings_selected = app
             .config
-            .values
-            .keys()
-            .position(|k| k == "kv_cache")
+            .advanced_keys()
+            .iter()
+            .position(|k| k.as_str() == "kv_cache")
             .unwrap();
         app.handle_settings_key(key(KeyCode::Right));
         app.handle_settings_key(key(KeyCode::Enter));
@@ -2357,9 +2468,9 @@ mod tests {
         app.settings_easy = false;
         app.settings_selected = app
             .config
-            .values
-            .keys()
-            .position(|k| k == "kv_cache")
+            .advanced_keys()
+            .iter()
+            .position(|k| k.as_str() == "kv_cache")
             .unwrap();
         // Confirmed reset-all.
         app.handle_settings_key(key(KeyCode::Char('R')));
@@ -2368,10 +2479,9 @@ mod tests {
         // kv_cache survives as a schema default and remains selected.
         assert_eq!(
             app.config
-                .values
-                .keys()
-                .nth(app.settings_selected)
-                .map(String::as_str),
+                .advanced_keys()
+                .get(app.settings_selected)
+                .map(|k| k.as_str()),
             Some("kv_cache"),
             "cursor follows kv_cache to its new row"
         );
@@ -2427,7 +2537,12 @@ mod tests {
     /// Select the advanced-mode row for `k` and return the on-disk config text.
     fn select_advanced(app: &mut App, k: &str) {
         app.settings_easy = false;
-        app.settings_selected = app.config.values.keys().position(|x| x == k).unwrap();
+        app.settings_selected = app
+            .config
+            .advanced_keys()
+            .iter()
+            .position(|x| x.as_str() == k)
+            .unwrap();
     }
 
     #[test]
@@ -2554,16 +2669,16 @@ mod tests {
         let (mut app, dir) = test_app();
         std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
-        select_advanced(&mut app, "cask"); // default false
+        select_advanced(&mut app, "dflash_adaptive_b"); // default false
 
         app.handle_settings_key(key(KeyCode::Char(' ')));
         assert!(app.settings_pending.is_none(), "bool does not preview");
-        assert!(app.config.is_override("cask"));
+        assert!(app.config.is_override("dflash_adaptive_b"));
         let loaded =
             hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
                 .unwrap();
         assert_eq!(
-            loaded.layer.get("cask"),
+            loaded.layer.get("dflash_adaptive_b"),
             Some(&hipfire_config::ConfigValue::Bool(true))
         );
 
@@ -2851,10 +2966,7 @@ mod tests {
         // so the user can correct in place; a valid value commits + exits edit.
         let (mut app, dir) = test_app();
         // Edit `temperature` (Float 0.0..=2.0) with an out-of-range buffer.
-        app.settings_edit = Some(EditState {
-            key: "temperature".into(),
-            buffer: "5.0".into(),
-        });
+        app.settings_edit = Some(EditState::new("temperature".into(), "5.0".into()));
         app.handle_settings_edit_key(key(KeyCode::Enter));
         assert!(
             app.settings_edit.is_some(),
@@ -3858,5 +3970,205 @@ mod tests {
         app.status.overlay_live(&snap);
         assert!(!app.status.serve_http_ok);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deprecated_rows_are_read_only() {
+        // CASK / PFlash keys: Left/Right/Space/Enter write nothing, open no
+        // editor, and the status says deprecated. Covers a bool, an enum and
+        // numeric/string rows, with the file both present and absent.
+        for absent in [false, true] {
+            let (mut app, dir) = test_app();
+            if absent {
+                std::fs::remove_file(&app.paths.config).unwrap();
+                app.config = ConfigState::load(&app.paths);
+            }
+            let before = std::fs::read(&app.paths.config).ok();
+            for k in [
+                "cask",
+                "prefill_compression",
+                "prefill_threshold",
+                "prefill_drafter",
+                "cask_budget",
+            ] {
+                select_advanced(&mut app, k);
+                for code in [
+                    KeyCode::Left,
+                    KeyCode::Right,
+                    KeyCode::Char(' '),
+                    KeyCode::Enter,
+                ] {
+                    app.last_reload.clear();
+                    app.handle_settings_key(key(code));
+                    assert!(
+                        app.last_reload.contains("deprecated"),
+                        "{k} {code:?}: {}",
+                        app.last_reload
+                    );
+                    assert!(
+                        app.settings_pending.is_none(),
+                        "{k} {code:?} staged a preview"
+                    );
+                    assert!(app.settings_edit.is_none(), "{k} {code:?} opened an editor");
+                    assert!(
+                        !app.config.is_override(k),
+                        "{k} {code:?} became an override"
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read(&app.paths.config).ok(),
+                before,
+                "config.toml must be untouched (absent={absent})"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn deprecated_override_can_still_be_reset() {
+        // Read-only does not mean stuck: Delete removes an existing override.
+        let (mut app, dir) = test_app();
+        std::fs::write(
+            &app.paths.config,
+            "schema_version = 1\n[memory.cask]\nenabled = true\n",
+        )
+        .unwrap();
+        app.config = ConfigState::load(&app.paths);
+        assert!(app.config.is_override("cask"));
+        select_advanced(&mut app, "cask");
+        app.handle_settings_key(key(KeyCode::Delete));
+        assert!(!app.config.is_override("cask"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn easy_speculation_row_writes_the_speculation_mode_key() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        app.settings_selected = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("speculation")))
+            .expect("Speculation easy row");
+        app.handle_settings_key(key(KeyCode::Right)); // auto -> ngram (preview)
+        let staged = app
+            .settings_pending
+            .as_ref()
+            .expect("preview")
+            .value
+            .clone();
+        assert_eq!(staged, "ngram");
+        app.handle_settings_key(key(KeyCode::Enter));
+        let loaded =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
+        assert_eq!(
+            loaded.layer.get("speculation.mode"),
+            Some(&hipfire_config::ConfigValue::String("ngram".into()))
+        );
+        assert!(
+            loaded.layer.get("dflash_mode").is_none(),
+            "the row must not touch dflash_mode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ple_format_is_editable_in_easy_and_advanced() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = true;
+        app.settings_selected = app
+            .config
+            .easy_keys()
+            .iter()
+            .position(|k| matches!(k, Some("ple_format")))
+            .expect("PLE format easy row");
+        app.handle_settings_key(key(KeyCode::Right)); // auto -> q4
+        app.handle_settings_key(key(KeyCode::Enter));
+        let text = std::fs::read_to_string(&app.paths.config).unwrap();
+        assert!(text.contains("ple_format") && text.contains("q4"), "{text}");
+        // Advanced view reaches the same key.
+        select_advanced(&mut app, "ple_format");
+        app.handle_settings_key(key(KeyCode::Right)); // q4 -> q8
+        assert_eq!(app.settings_pending.as_ref().unwrap().value, "q8");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_editable_rows_point_at_the_cli() {
+        let (mut app, dir) = test_app();
+        // Composite Model row (easy).
+        app.settings_easy = true;
+        app.settings_selected = 0;
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.last_reload.contains("hipfire config set default_model"),
+            "{}",
+            app.last_reload
+        );
+        assert!(!app.last_reload.contains("elsewhere"));
+        // An advanced key with no inline editor.
+        select_advanced(&mut app, "kv_backend");
+        app.handle_settings_key(key(KeyCode::Enter));
+        assert!(
+            app.last_reload.contains("hipfire config set kv_backend"),
+            "{}",
+            app.last_reload
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_cursor_inserts_and_deletes_at_the_cursor() {
+        let (mut app, dir) = test_app();
+        app.settings_easy = false;
+        select_advanced(&mut app, "max_seq");
+        app.config.values.insert("max_seq".into(), "32768".into());
+        app.handle_settings_key(key(KeyCode::Enter)); // open the editor
+        let edit = app.settings_edit.as_ref().expect("editor opened");
+        assert_eq!((edit.buffer.as_str(), edit.cursor), ("32768", 5));
+
+        // Home, then step right twice: 32|768 -> insert 9 -> 329|768.
+        app.handle_settings_key(key(KeyCode::Home));
+        app.handle_settings_key(key(KeyCode::Right));
+        app.handle_settings_key(key(KeyCode::Right));
+        app.handle_settings_key(key(KeyCode::Char('9')));
+        let edit = app.settings_edit.as_ref().unwrap();
+        assert_eq!((edit.buffer.as_str(), edit.cursor), ("329768", 3));
+
+        // Backspace removes the char before the cursor, Delete the one under it.
+        app.handle_settings_key(key(KeyCode::Backspace));
+        assert_eq!(app.settings_edit.as_ref().unwrap().buffer, "32768");
+        app.handle_settings_key(key(KeyCode::Delete));
+        let edit = app.settings_edit.as_ref().unwrap();
+        assert_eq!((edit.buffer.as_str(), edit.cursor), ("3268", 2));
+
+        // Clamped at both ends; End jumps to the tail.
+        app.handle_settings_key(key(KeyCode::Home));
+        app.handle_settings_key(key(KeyCode::Left));
+        app.handle_settings_key(key(KeyCode::Backspace));
+        assert_eq!(app.settings_edit.as_ref().unwrap().buffer, "3268");
+        app.handle_settings_key(key(KeyCode::End));
+        app.handle_settings_key(key(KeyCode::Right));
+        app.handle_settings_key(key(KeyCode::Delete));
+        let edit = app.settings_edit.as_ref().unwrap();
+        assert_eq!((edit.buffer.as_str(), edit.cursor), ("3268", 4));
+        app.handle_settings_key(key(KeyCode::Char('1')));
+        assert_eq!(app.settings_edit.as_ref().unwrap().buffer, "32681");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_state_is_char_safe() {
+        let mut edit = EditState::new("chat_template".into(), "é/é".into());
+        edit.home();
+        edit.right();
+        edit.insert('ß');
+        assert_eq!(edit.buffer, "éß/é");
+        edit.end();
+        edit.backspace();
+        assert_eq!(edit.buffer, "éß/");
     }
 }

@@ -1326,19 +1326,109 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
 /// Action hint for the SELECTED settings row, accurate to its field kind: enums
 /// preview-then-commit, booleans toggle immediately, numbers/strings open an
 /// editor (5b — the copy must not promise preview semantics for booleans).
-fn selected_action_hint(app: &App) -> &'static str {
+/// Deprecated and non-editable rows name the CLI command that does edit them.
+fn selected_action_hint(app: &App) -> String {
     use crate::hipfire::writer::{self, FieldKind};
-    match app
-        .selected_setting_key()
-        .and_then(|k| writer::field_spec(&k).map(|s| s.kind))
-    {
-        Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.",
-        Some(FieldKind::Bool) => "Left/Right/Space toggles on/off (applies immediately).",
-        Some(FieldKind::Int { .. })
-        | Some(FieldKind::Float { .. })
-        | Some(FieldKind::FreeStr { .. }) => "Enter to edit the value.",
-        None => "This row is set elsewhere (Models tab / serve).",
+    let Some(key) = app.selected_setting_key() else {
+        // A composite easy row (Model / Serve): its help key names the CLI key.
+        return match settings_help_key(app) {
+            Some(key) => format!("Not editable inline — edit with `hipfire config set {key}`."),
+            None => "Not editable inline.".to_owned(),
+        };
+    };
+    if hipfire_config::is_deprecated_key(&key) {
+        return format!("Deprecated, read-only here — edit with `hipfire config set {key}`.");
     }
+    match writer::field_spec(&key).map(|s| s.kind) {
+        Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.".to_owned(),
+        Some(FieldKind::Bool) => {
+            "Left/Right/Space toggles on/off (applies immediately).".to_owned()
+        }
+        Some(FieldKind::Int) | Some(FieldKind::Float) | Some(FieldKind::FreeStr { .. }) => {
+            match writer::schema_range(&key) {
+                Some(range) => format!("Enter to edit the value (range {range})."),
+                None => "Enter to edit the value.".to_owned(),
+            }
+        }
+        None => format!("Not editable inline — edit with `hipfire config set {key}`."),
+    }
+}
+
+/// The config key whose help the Settings explainer shows: every easy row maps
+/// through `easy_help_keys` (incl. the composite Model/Serve rows), advanced rows
+/// are the key itself.
+fn settings_help_key(app: &App) -> Option<String> {
+    if app.settings_easy {
+        app.config
+            .easy_help_keys()
+            .get(app.settings_selected)
+            .map(|k| k.to_string())
+    } else {
+        app.selected_setting_key()
+    }
+}
+
+/// Visible-range text for a scrolling list: `"rows 1–6 of 13 ↓"`, with `↑`/`↓`
+/// marking rows cut above/below. Empty when every row is on screen.
+fn scroll_indicator(start: usize, visible: usize, total: usize) -> String {
+    if total <= visible {
+        return String::new();
+    }
+    let end = (start + visible).min(total);
+    let up = if start > 0 { "↑" } else { "" };
+    let down = if end < total { "↓" } else { "" };
+    format!("  rows {}–{} of {} {}{}", start + 1, end, total, up, down)
+        .trim_end()
+        .to_owned()
+}
+
+/// Rows `line` occupies when word-wrapped to `width` columns (greedy).
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    let width = width.max(1);
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        if used > 0 && used + 1 + len > width {
+            rows += 1;
+            used = len;
+        } else {
+            used += if used == 0 { len } else { len + 1 };
+        }
+        while used > width {
+            rows += 1;
+            used -= width;
+        }
+    }
+    rows
+}
+
+/// Keep only the lines that start within `height` rows once wrapped to `width`, and never
+/// end on an orphaned section header (`Options:` with none of its rows visible).
+fn fit_explainer_lines(
+    mut lines: Vec<Line<'static>>,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let mut rows = 0;
+    let mut keep = lines.len();
+    for (i, line) in lines.iter().enumerate() {
+        // A line that starts inside the pane stays (its tail may clip).
+        if rows >= height {
+            keep = i;
+            break;
+        }
+        rows += wrapped_rows(line, width);
+    }
+    lines.truncate(keep);
+    while lines.last().is_some_and(|l| {
+        let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+        text == "Options:"
+    }) {
+        lines.pop();
+    }
+    lines
 }
 
 /// The staged enum-preview value for `key`, if a preview (5b) is active for it.
@@ -1392,6 +1482,27 @@ fn settings_row_display(
     (shown, style)
 }
 
+/// Tag appended to deprecated CASK/PFlash rows in the Advanced view.
+const DEPRECATED_TAG: &str = "(deprecated, removal 0.5.0)";
+
+/// The Settings header while a value is being edited: the buffer with the char
+/// under the cursor drawn reversed (a reversed space at the end of the buffer).
+fn settings_edit_line(mode: &str, edit: &crate::app::EditState) -> Line<'static> {
+    let chars: Vec<char> = edit.buffer.chars().collect();
+    let cursor = edit.cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let under = chars.get(cursor).copied().unwrap_or(' ');
+    let after: String = chars.iter().skip(cursor + 1).collect();
+    Line::from(vec![
+        Span::raw(format!("{mode}    editing {} = {before}", edit.key)),
+        Span::styled(
+            under.to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(format!("{after}  (Enter save, Esc cancel, ←/→ move)")),
+    ])
+}
+
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     // header · table · explainer-for-selected-key (5e). The explainer takes a
     // fixed slice; the table keeps the elastic middle so it never disappears.
@@ -1432,12 +1543,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                 "preview {} = {} (uncommitted) — Enter commit, Esc cancel",
                 p.key, p.value
             )
-        } else if let Some(edit) = &app.settings_edit {
-            // Show the live edit buffer.
-            format!(
-                "editing {} = {}_  (Enter save, Esc cancel)",
-                edit.key, edit.buffer
-            )
+        } else if app.settings_edit.is_some() {
+            String::new() // rendered below with a visible cursor
         } else {
             // Tailor the hint to the SELECTED row's kind so the copy never
             // overstates preview semantics (booleans toggle immediately; only
@@ -1450,8 +1557,12 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             };
             format!("{action}  Del resets. Press {switch}.")
         };
+        let line = match &app.settings_edit {
+            Some(edit) if app.settings_pending.is_none() => settings_edit_line(mode, edit),
+            _ => Line::from(format!("{mode}    {note}")),
+        };
         frame.render_widget(
-            Paragraph::new(format!("{mode}    {note}"))
+            Paragraph::new(line)
                 .block(block("Settings"))
                 .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[0],
@@ -1470,10 +1581,12 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .enumerate()
             .collect::<Vec<_>>();
         let start = scroll_start(app.settings_selected, chunks[1].height, 3);
+        let visible = visible_rows(chunks[1].height, 3);
+        let indicator = scroll_indicator(start, visible, rows_all.len());
         let rows = rows_all
             .into_iter()
             .skip(start)
-            .take(visible_rows(chunks[1].height, 3))
+            .take(visible)
             .map(|(idx, (label, value, desc))| {
                 let row_key = easy_keys.get(idx).and_then(|k| *k);
                 let preview = preview_for(app, row_key);
@@ -1499,34 +1612,54 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                 ],
             )
             .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
-            .block(block("User-safe controls  (● = your override)"))
+            .block(block(&format!(
+                "User-safe controls  (● = your override){indicator}"
+            )))
             .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
     } else {
-        let rows_all = app.config.values.iter().enumerate().collect::<Vec<_>>();
+        // Deprecated CASK/PFlash keys sort after every other key.
+        let keys = app.config.advanced_keys();
         let start = scroll_start(app.settings_selected, chunks[1].height, 3);
-        let rows = rows_all
-            .into_iter()
+        let visible = visible_rows(chunks[1].height, 3);
+        let indicator = scroll_indicator(start, visible, keys.len());
+        let rows = keys
+            .iter()
+            .enumerate()
             .skip(start)
-            .take(visible_rows(chunks[1].height, 3))
-            .map(|(idx, (k, v))| {
+            .take(visible)
+            .map(|(idx, k)| {
+                let v = app.config.values.get(k.as_str()).map_or("", String::as_str);
+                let selected = idx == app.settings_selected;
+                if hipfire_config::is_deprecated_key(k) {
+                    // Read-only, dimmed, tagged; never previewed.
+                    let marker = if app.config.is_override(k) {
+                        "● "
+                    } else {
+                        "  "
+                    };
+                    let mut style = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
+                    if selected {
+                        style = style.bg(PANEL_2);
+                    }
+                    return Row::new([(*k).clone(), format!("{marker}{v}  {DEPRECATED_TAG}")])
+                        .style(style);
+                }
                 let preview = preview_for(app, Some(k.as_str()));
                 // Every advanced row maps to a real config key.
                 let override_state = Some(app.config.is_override(k));
-                let (shown, style) = settings_row_display(
-                    v,
-                    preview.as_deref(),
-                    override_state,
-                    idx == app.settings_selected,
-                );
-                Row::new([k.clone(), shown]).style(style)
+                let (shown, style) =
+                    settings_row_display(v, preview.as_deref(), override_state, selected);
+                Row::new([(*k).clone(), shown]).style(style)
             })
             .collect::<Vec<_>>();
         frame.render_widget(
             Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
                 .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block("Advanced config.toml view  (● = your override)"))
+                .block(block(&format!(
+                    "Advanced config.toml view  (● = your override){indicator}"
+                )))
                 .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
@@ -1540,16 +1673,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
 /// load-bearing interaction. Falls back to an honest "no extended help" line for
 /// keys without a curated entry (e.g. low-level advanced keys).
 fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
-    // Resolve the key to explain. Easy mode maps every row (incl. the composite
-    // Model/Serve rows) via easy_help_keys; advanced uses the selected key.
-    let help_key: Option<String> = if app.settings_easy {
-        app.config
-            .easy_help_keys()
-            .get(app.settings_selected)
-            .map(|k| k.to_string())
-    } else {
-        app.selected_setting_key()
-    };
+    let help_key: Option<String> = settings_help_key(app);
 
     // Current committed value + any staged 5b preview for the selected key, so the
     // options list can mark "where you are" and "what you're about to commit".
@@ -1632,17 +1756,74 @@ fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         None => {
-            let label = help_key.unwrap_or_else(|| "this row".into());
-            lines.push(Line::from(Span::styled(
-                format!("No extended help for {label}."),
-                Style::default().fg(MUTED),
-            )));
-            lines.push(Line::from(Span::styled(
-                "It is a low-level / advanced key — edit only if you know what it does.",
-                Style::default().fg(MUTED),
-            )));
+            // No curated entry: fall back to the schema's own help text (every
+            // key has one) rather than claiming there is none.
+            let label = help_key.clone().unwrap_or_else(|| "this row".into());
+            let schema = help_key.as_deref().and_then(hipfire_config::field);
+            let deprecated = help_key
+                .as_deref()
+                .is_some_and(hipfire_config::is_deprecated_key);
+            let mut head = vec![Span::styled(
+                label.clone(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )];
+            if let Some(field) = schema {
+                if field.key != label {
+                    head.push(Span::styled(
+                        format!("  ({})", field.key),
+                        Style::default().fg(MUTED),
+                    ));
+                }
+                head.push(Span::styled(
+                    format!(
+                        "   default: {}",
+                        default_display(
+                            &crate::hipfire::config::default_value(field.key).unwrap_or_default()
+                        )
+                    ),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            if !cur.is_empty() {
+                head.push(Span::styled(
+                    format!("   now: {cur}"),
+                    Style::default().fg(TEXT),
+                ));
+            }
+            lines.push(Line::from(head));
+            if deprecated {
+                lines.push(Line::from(Span::styled(
+                    DEPRECATED_TAG
+                        .trim_matches(|c| c == '(' || c == ')')
+                        .to_uppercase(),
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                )));
+            }
+            match schema {
+                Some(field) => lines.push(Line::from(Span::styled(
+                    field.help,
+                    Style::default().fg(TEXT),
+                ))),
+                None => lines.push(Line::from(Span::styled(
+                    format!("No help text for {label}."),
+                    Style::default().fg(MUTED),
+                ))),
+            }
+            if deprecated {
+                lines.push(Line::from(Span::styled(
+                    format!("Read-only here — edit with `hipfire config set {label}`."),
+                    Style::default().fg(MUTED),
+                )));
+            }
         }
     }
+
+    // Drop what cannot fit, and never end on an orphaned "Options:" header.
+    let lines = fit_explainer_lines(
+        lines,
+        area.width.saturating_sub(2) as usize,
+        area.height.saturating_sub(2) as usize,
+    );
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -2606,9 +2787,9 @@ mod render_tests {
             // Put the override row under the cursor so it is on-screen.
             app.settings_selected = app
                 .config
-                .values
-                .keys()
-                .position(|k| k == "kv_cache")
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "kv_cache")
                 .unwrap();
         });
         assert!(text.contains("● "), "override row marked with a bullet");
@@ -2643,16 +2824,16 @@ mod render_tests {
             app.settings_easy = false;
             app.settings_selected = app
                 .config
-                .values
-                .keys()
-                .position(|k| k == "dflash_mode")
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "dflash_mode")
                 .unwrap();
         });
         assert!(
             text.contains("About this setting"),
             "explainer pane present"
         );
-        assert!(text.contains("Spec decode"), "shows the knob title");
+        assert!(text.contains("DFlash eligibility"), "shows the knob title");
         assert!(
             text.contains("thinking"),
             "surfaces the thinking↔dflash interaction"
@@ -2669,9 +2850,9 @@ mod render_tests {
             app.settings_easy = false;
             app.settings_selected = app
                 .config
-                .values
-                .keys()
-                .position(|k| k == "kv_adaptive")
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "kv_adaptive")
                 .unwrap();
         });
         assert!(text.contains("Options:"), "options section present");
@@ -2703,21 +2884,50 @@ mod render_tests {
     }
 
     #[test]
-    fn settings_explainer_falls_back_for_uncurated_key() {
-        // An advanced key without a curated entry shows an honest fallback, not a
-        // blank pane.
+    fn settings_explainer_falls_back_to_schema_help_for_uncurated_key() {
+        // A key without a curated entry shows the schema's own help text, not a
+        // "no extended help" dead end.
         let text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            // cask_budget has no curated knob entry.
             app.config.values.clear();
+            app.config.values.insert("mtp_k".into(), "auto".into());
+            app.config
+                .values
+                .insert("kv_backend".into(), "legacy".into());
+            app.settings_selected = app
+                .config
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "kv_backend")
+                .unwrap();
+        });
+        assert!(!text.contains("No extended help"), "{text}");
+        let help = hipfire_config::field("kv_backend").unwrap().help;
+        let first_words: String = help.chars().take(24).collect();
+        assert!(
+            text.contains(&first_words),
+            "schema help text shown: wanted {first_words:?}"
+        );
+    }
+
+    #[test]
+    fn settings_deprecated_rows_are_dimmed_tagged_and_last() {
+        let text = render_with(|app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.config.values.clear();
+            app.config.values.insert("cask".into(), "false".into());
             app.config.values.insert("cask_budget".into(), "512".into());
+            app.config.values.insert("zzz_last".into(), "x".into());
             app.settings_selected = 0;
         });
+        // `cask*` sort after `zzz_last` in the advanced list.
         assert!(
-            text.contains("No extended help"),
-            "honest fallback for uncurated key"
+            text.find("zzz_last").unwrap() < text.find("cask_budget").unwrap(),
+            "deprecated rows come last"
         );
+        assert!(text.contains("(deprecated, removal 0.5.0)"), "{text}");
     }
 
     #[test]
@@ -2727,7 +2937,12 @@ mod render_tests {
         let bool_text = render_with(|app| {
             app.tab = Tab::Settings;
             app.settings_easy = false;
-            app.settings_selected = app.config.values.keys().position(|k| k == "cask").unwrap();
+            app.settings_selected = app
+                .config
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "prompt_normalize")
+                .unwrap();
         });
         assert!(
             bool_text.contains("toggles on/off") && bool_text.contains("immediately"),
@@ -2739,9 +2954,9 @@ mod render_tests {
             app.settings_easy = false;
             app.settings_selected = app
                 .config
-                .values
-                .keys()
-                .position(|k| k == "kv_cache")
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "kv_cache")
                 .unwrap();
         });
         assert!(
@@ -2760,9 +2975,9 @@ mod render_tests {
             // Select the previewed row so it's on-screen (scroll follows selection).
             app.settings_selected = app
                 .config
-                .values
-                .keys()
-                .position(|k| k == "dflash_mode")
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "dflash_mode")
                 .unwrap();
             app.settings_pending = Some(crate::app::PendingEnum {
                 key: "dflash_mode".into(),
@@ -3403,5 +3618,149 @@ mod render_tests {
             "a bundled registry is named with its date, not `missing`"
         );
         assert!(text.contains("remote") && text.contains("local"));
+    }
+
+    /// Render the whole UI at an explicit terminal size.
+    fn render_sized(width: u16, height: u16, setup: impl FnOnce(&mut App)) -> String {
+        let mut app = App::load().expect("App::load");
+        setup(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        // Row-major text with a newline per row so line-oriented asserts work.
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn easy_settings_have_no_pflash_and_show_speculation() {
+        for (w, h) in [(80, 24), (160, 48)] {
+            let text = render_sized(w, h, |app| {
+                app.tab = Tab::Settings;
+                app.settings_easy = true;
+                app.settings_selected = 0;
+            });
+            assert!(!text.to_lowercase().contains("pflash"), "{w}x{h}:\n{text}");
+            assert!(!text.contains("Prefill"), "{w}x{h}:\n{text}");
+            assert!(text.contains("Speculation"), "{w}x{h}:\n{text}");
+            assert!(!text.contains("Spec decode"), "{w}x{h}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn easy_settings_show_a_scroll_indicator_when_rows_are_cut() {
+        let text = render_sized(80, 24, |app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.settings_selected = 0;
+        });
+        let total = App::load().unwrap().config.easy_rows().len();
+        assert!(
+            text.contains(&format!("of {total} ↓")),
+            "cut rows must say so:\n{text}"
+        );
+        // Selecting the last row scrolls down and flips the arrow.
+        let text = render_sized(80, 24, |app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.settings_selected = total - 1;
+        });
+        assert!(text.contains(&format!("{total} of {total} ↑")), "{text}");
+        // A tall terminal shows everything and no indicator.
+        let text = render_sized(160, 80, |app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+        });
+        assert!(!text.contains(&format!("of {total}")), "{text}");
+    }
+
+    #[test]
+    fn scroll_indicator_text() {
+        assert_eq!(scroll_indicator(0, 6, 6), "");
+        assert_eq!(scroll_indicator(0, 6, 13), "  rows 1–6 of 13 ↓");
+        assert_eq!(scroll_indicator(3, 6, 13), "  rows 4–9 of 13 ↑↓");
+        assert_eq!(scroll_indicator(7, 6, 13), "  rows 8–13 of 13 ↑");
+    }
+
+    #[test]
+    fn explainer_never_ends_on_an_orphaned_options_header() {
+        let line = |t: &str| Line::from(t.to_owned());
+        let lines = vec![
+            line("title"),
+            line("summary"),
+            line("Options:"),
+            line("a — x"),
+        ];
+        // Room for exactly three rows: the header would be last, so it goes too.
+        let kept = fit_explainer_lines(lines.clone(), 40, 3);
+        let text: Vec<String> = kept
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, ["title", "summary"]);
+        // Enough room keeps the header and its row.
+        assert_eq!(fit_explainer_lines(lines, 40, 4).len(), 4);
+    }
+
+    #[test]
+    fn settings_edit_draws_a_visible_cursor_at_its_position() {
+        let (width, height) = (120, 32);
+        let mut app = App::load().expect("App::load");
+        app.tab = Tab::Settings;
+        app.settings_easy = false;
+        let mut edit = crate::app::EditState::new("max_seq".into(), "32768".into());
+        edit.home();
+        edit.right();
+        edit.right(); // cursor on the '7' of 32|768
+        app.settings_edit = Some(edit);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let reversed: Vec<String> = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+            .map(|(x, y)| buf[(x, y)].symbol().to_owned())
+            .collect();
+        assert_eq!(
+            reversed,
+            ["7"],
+            "exactly the char under the cursor is reversed"
+        );
+    }
+
+    #[test]
+    fn non_editable_row_hint_names_the_cli_not_elsewhere() {
+        let text = render_sized(160, 48, |app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = true;
+            app.settings_selected = 0; // Model row
+        });
+        assert!(!text.contains("set elsewhere"), "{text}");
+        assert!(text.contains("hipfire config set default_model"), "{text}");
+    }
+
+    #[test]
+    fn deprecated_row_hint_and_explainer_say_deprecated() {
+        let text = render_sized(160, 48, |app| {
+            app.tab = Tab::Settings;
+            app.settings_easy = false;
+            app.settings_selected = app
+                .config
+                .advanced_keys()
+                .iter()
+                .position(|k| k.as_str() == "cask")
+                .unwrap();
+        });
+        assert!(text.contains("Deprecated, read-only here"), "{text}");
+        assert!(text.contains("DEPRECATED, REMOVAL 0.5.0"), "{text}");
+        assert!(text.contains("hipfire config set cask"), "{text}");
     }
 }

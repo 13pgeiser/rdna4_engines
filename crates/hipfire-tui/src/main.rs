@@ -28,6 +28,7 @@ fn main() -> Result<()> {
     // Non-interactive argument handling (headless-safe, no TTY required).
     // Only the first argument is inspected — every branch returns/exits, so
     // there is never a second iteration.
+    let mut start_settings = false;
     let profile_wizard = if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -42,6 +43,12 @@ fn main() -> Result<()> {
                 return run_check();
             }
             "--config-profile-wizard" => true,
+            // `hipfire config` launches with this: open on Settings for this
+            // launch only (see `tab_to_persist`).
+            "--settings" => {
+                start_settings = true;
+                false
+            }
             other => {
                 eprintln!("hipfire-tui: unknown argument '{other}'");
                 print_help();
@@ -56,13 +63,17 @@ fn main() -> Result<()> {
     let result = if profile_wizard {
         hipfire::profile_wizard::run(&mut terminal)
     } else {
-        run(&mut terminal)
+        run(&mut terminal, start_settings)
     };
     restore_terminal(&mut terminal)?;
     result
 }
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    format!(
         "hipfire-tui {VERSION} - terminal UI for hipfire\n\
          \n\
          USAGE:\n    \
@@ -74,12 +85,14 @@ fn print_help() {
                  --check              Load config/registry/models without entering the\n                         \
                                       render loop, then exit 0 on success (headless smoke)\n    \
                  --config-profile-wizard\n                         \
-                                      Select/create profiles and browse config variables\n\
+                                      Select/create profiles and browse config variables\n    \
+                 --settings           Open on the Settings tab for this launch (what\n                         \
+                                      `hipfire config` runs); the saved tab is kept\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
          Tabs: Home, Dashboard, Chat, Models, Settings, System, Logs. Tab/Shift+Tab to switch, ? for help, q to quit.\n\
          Esc never quits: it only closes/cancels (help, prompts, edits, chat)."
-    );
+    )
 }
 
 /// Construct the App state (config + registry + local models) WITHOUT entering
@@ -144,9 +157,28 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+/// The tab to write to ui_state.json on exit. A `--settings` launch overrides
+/// the restored tab for that launch only: if the user is still on the forced
+/// Settings tab, the tab ui_state restored (`launch_saved`) stays persisted;
+/// once they navigate elsewhere, wherever they ended up is saved as usual.
+fn tab_to_persist(current: app::Tab, launch_saved: Option<app::Tab>) -> app::Tab {
+    match launch_saved {
+        Some(saved) if current == app::Tab::Settings => saved,
+        _ => current,
+    }
+}
+
+/// Apply `--settings`: switch to the Settings tab and return the tab ui_state
+/// restored, so [`tab_to_persist`] can keep it. `None` when not overridden.
+fn apply_launch_tab(app: &mut App, start_settings: bool) -> Option<app::Tab> {
+    start_settings.then(|| std::mem::replace(&mut app.tab, app::Tab::Settings))
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, start_settings: bool) -> Result<()> {
     let mut app = App::load()?;
+    let launch_saved = apply_launch_tab(&mut app, start_settings);
     let result = event_loop(terminal, &mut app);
+    app.tab = tab_to_persist(app.tab, launch_saved);
     // Persist session UI state (active tab + expanded Models groups) on ANY exit
     // — clean quit OR a propagated error — so the next launch reopens where the
     // user left off. Best-effort (the save swallows its own errors); a panic
@@ -367,6 +399,31 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn settings_flag_opens_on_settings_for_this_launch_only() {
+        let mut app = test_app();
+        app.tab = Tab::Models; // what ui_state.json restored
+        assert_eq!(apply_launch_tab(&mut app, false), None);
+        assert_eq!(app.tab, Tab::Models, "no flag leaves the restored tab");
+
+        let saved = apply_launch_tab(&mut app, true);
+        assert_eq!(saved, Some(Tab::Models));
+        assert_eq!(app.tab, Tab::Settings, "--settings starts on Settings");
+        // Quitting while still on the forced tab keeps the previously saved one.
+        assert_eq!(tab_to_persist(app.tab, saved), Tab::Models);
+        // Navigating elsewhere persists as usual.
+        assert_eq!(tab_to_persist(Tab::Logs, saved), Tab::Logs);
+        // Without the flag nothing is rewritten.
+        assert_eq!(tab_to_persist(Tab::Settings, None), Tab::Settings);
+    }
+
+    #[test]
+    fn help_documents_the_settings_flag() {
+        let help = help_text();
+        assert!(help.contains("--settings"), "{help}");
+        assert!(help.contains("Settings tab"), "{help}");
     }
 
     #[test]

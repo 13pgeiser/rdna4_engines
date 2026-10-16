@@ -642,7 +642,10 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
 pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
-const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
+/// Values of `memory.ple_format`; exported so the TUI offers exactly this list.
+pub const PLE_FORMATS: &[&str] = &["auto", "q4", "q8"];
+/// Values of `speculation.mode`; exported so the TUI offers exactly this list.
+pub const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
     ($key:literal, $legacy:literal, $category:ident, $scope:ident, $default:expr, $rule:expr, $registry:expr, $experimental:expr, $env:expr, $help:literal) => {
@@ -1806,7 +1809,7 @@ pub static FIELDS: &[ConfigField] = &[
         "ple_format",
         Memory,
         DefaultValue::String("auto"),
-        ValueRule::Enum(&["auto", "q4", "q8"]),
+        ValueRule::Enum(PLE_FORMATS),
         false,
         "HIPFIRE_PLE_FORMAT",
         "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, created ahead of time with `hipfire ple derive --format q4 <model>` or `hipfire pull`; a load never derives it and refuses when it is missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
@@ -3930,6 +3933,24 @@ fn valid_developer_suffix(suffix: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Key prefixes (canonical names) of the CASK and PFlash research features,
+/// deprecated since 0.4.0 with removal in 0.5.0.
+const DEPRECATED_KEY_PREFIXES: &[&str] = &[
+    "memory.cask.",
+    "speculation.prefill.",
+    "diagnostic.pflash.",
+];
+
+/// True when `key` (canonical or legacy flat name) belongs to a deprecated
+/// CASK/PFlash family: `memory.cask.*`, `speculation.prefill.*` or
+/// `diagnostic.pflash.*`.
+pub fn is_deprecated_key(key: &str) -> bool {
+    let canonical = field(key).map_or(key, |schema| schema.key);
+    DEPRECATED_KEY_PREFIXES
+        .iter()
+        .any(|prefix| canonical.starts_with(prefix))
 }
 
 pub fn canonical_config_key(key: &str) -> Option<String> {
@@ -6137,6 +6158,46 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deprecated_key_covers_cask_and_pflash_families() {
+        for key in [
+            "memory.cask.enabled",
+            "cask",
+            "cask_sidecar",
+            "speculation.prefill.mode",
+            "prefill_compression",
+            "prefill_drafter",
+            "prefill_threshold",
+            "diagnostic.pflash.score_layer",
+            "pflash_score_layer",
+        ] {
+            assert!(is_deprecated_key(key), "{key} must be deprecated");
+        }
+        for key in [
+            "kv_cache",
+            "speculation.mode",
+            "speculation",
+            "ple_format",
+            "memory.ple_format",
+            "max_seq",
+            "nonexistent.key",
+        ] {
+            assert!(!is_deprecated_key(key), "{key} must not be deprecated");
+        }
+        for field in fields() {
+            let family = ["memory.cask.", "speculation.prefill.", "diagnostic.pflash."]
+                .iter()
+                .any(|prefix| field.key.starts_with(prefix));
+            assert_eq!(is_deprecated_key(field.key), family, "{}", field.key);
+            assert_eq!(
+                is_deprecated_key(field.legacy_key),
+                family,
+                "{}",
+                field.legacy_key
+            );
+        }
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         env::temp_dir().join(format!("hipfire-config-{name}-{}", std::process::id()))

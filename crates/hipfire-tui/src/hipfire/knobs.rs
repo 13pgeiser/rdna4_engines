@@ -152,16 +152,47 @@ pub const KNOBS: &[KnobInfo] = &[
     },
     KnobInfo {
         key: "dflash_mode",
-        title: "Spec decode (DFlash)",
-        summary: "Speculative decoding: a drafter the target verifies in batches — the model's DFlash draft when one is declared, else its MTP head.",
+        title: "DFlash eligibility",
+        summary: "Eligibility policy for DFlash speculative decoding: a paired DFlash draft the target verifies in batches. DFlash needs its own draft; it never falls back to the MTP head.",
         effect: "Big decode speedup on predictable output (code, tool-calls, structured: ~4-5x). On free-form prose the acceptance rate is ~1, so it is a slight loss. Correctness is unchanged (the target verifies every token).",
         default: "off",
-        when: "Turn on for code/agentic workloads with a drafter attached (a DFlash draft or the model's MTP head); a declared draft that is not pulled still refuses the load. `on` arms the head explicitly, which also overrides `auto`'s host-spill decline. Leave off for open-ended chat.",
+        when: "Turn on for code/agentic workloads when the model has a DFlash draft; `on` fails the load without one, even when an MTP head is present. Use the Speculation row (`speculation = mtp`) or mtp_mode to request the MTP head. Leave off for open-ended chat.",
         note: Some("A thinking BUDGET routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
         options: &[
-            ("off", "No speculative decoding (plain autoregressive)."),
-            ("on", "Use the drafter whenever one is attached + the gate allows."),
-            ("auto", "Engage spec-decode when eligible (greedy, thinking-off, arch)."),
+            ("off", "No DFlash speculative decoding (plain autoregressive)."),
+            ("on", "Use the DFlash draft whenever one is attached + the gate allows; fails the load without a draft."),
+            ("auto", "Engage DFlash when eligible (greedy, thinking-off, arch)."),
+        ],
+    },
+    KnobInfo {
+        key: "speculation",
+        title: "Speculation",
+        summary: "The general speculative-decoding selector (speculation.mode): which mechanism drafts tokens the target then verifies.",
+        effect: "auto picks by availability and eligibility (DFlash draft, native MTP head, n-gram, DSpark sidecar); the other values force one mechanism, which refuses the load when its own prerequisite is missing. Output is unchanged; only decode speed differs.",
+        default: "auto",
+        when: "Leave on auto. Force a mechanism to A/B-test it, or `off` for plain autoregressive decode.",
+        note: Some("Forcing `dflash` needs a DFlash draft and never aliases to the MTP head; use `mtp` for the head. The legacy dflash_mode / mtp_mode rows still filter each mechanism under auto."),
+        options: &[
+            ("off", "Plain autoregressive decode, no speculation."),
+            ("auto", "Cascade by availability and eligibility (the default)."),
+            ("ngram", "Prompt n-gram drafting; needs no draft model."),
+            ("dflash", "Force the model's DFlash draft; refuses the load without one."),
+            ("mtp", "Force the model's native MTP head."),
+            ("dspark", "Force the DSpark sidecar drafter."),
+        ],
+    },
+    KnobInfo {
+        key: "ple_format",
+        title: "PLE row format",
+        summary: "Which per-layer-embedding (PLE) row table a Flash-Next (Qwen4) load reads.",
+        effect: "q4 reads the 4-bit Lloyd-Max rows (much smaller on disk and in RAM, tiny quality cost); q8 reads the exact Q8 rows. Only affects PLE-split Qwen4 models; other models ignore it.",
+        default: "auto",
+        when: "Leave on auto (q4 on gfx1151 unified-memory Strix Halo, q8 elsewhere). Force q4 or q8 to pin the table.",
+        note: Some("A load never derives or downloads a missing table: q4 needs <model>.ple-q4 (hipfire pull, or `hipfire ple derive --format q4`). auto uses whichever format is on disk when only one exists."),
+        options: &[
+            ("auto", "q4 on gfx1151, q8 elsewhere; uses the other format when only it is on disk."),
+            ("q4", "4-bit Lloyd-Max rows (<model>.ple-q4); the load refuses when missing."),
+            ("q8", "Exact Q8 rows (embedded, or the <model>.ple-q8 sidecar)."),
         ],
     },
     KnobInfo {
@@ -211,43 +242,6 @@ pub const KNOBS: &[KnobInfo] = &[
             ("max", "32768 tokens — the ceiling; longest bounded reasoning."),
             ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
         ],
-    },
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    KnobInfo {
-        key: "prefill_compression",
-        title: "Prefill compression (PFlash, deprecated, removal in 0.5.0)",
-        summary: "Compresses a long prompt's KV during prefill using a drafter's importance scoring.",
-        effect: "Cuts prefill time and KV footprint on long prompts. Costs a little quality on what it drops, and does nothing without a drafter.",
-        default: "off",
-        when: "Leave off. PFlash is deprecated (removal in 0.5.0) and not supported; prefix caching supersedes it. auto = compress only past prefill_threshold tokens; always = every prefill; off = never.",
-        note: Some("Needs a prefill_drafter (.hfq path). With no drafter set, compression is disabled — the TUI warns when you turn it on."),
-        options: &[
-            ("off", "Never compress the prefill KV."),
-            ("auto", "Compress only when the prompt exceeds prefill_threshold."),
-            ("always", "Compress every eligible prefill (skips the threshold gate). Still bypassed without a drafter and on the DFlash/tool-call paths."),
-        ],
-    },
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    KnobInfo {
-        key: "prefill_drafter",
-        title: "Prefill drafter (PFlash, deprecated)",
-        summary: "Path to the small drafter model (.hfq) that scores prompt importance for pflash.",
-        effect: "Required for prefill_compression to engage. Empty disables compression entirely.",
-        default: "",
-        when: "Set to a drafter .hfq when using prefill compression; leave empty otherwise.",
-        note: Some("An empty drafter disables prefill_compression regardless of its setting (the TUI warns when you enable compression without one)."),
-        options: &[],
-    },
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    KnobInfo {
-        key: "prefill_threshold",
-        title: "Prefill threshold (PFlash, deprecated)",
-        summary: "Token count above which auto-mode prefill compression kicks in.",
-        effect: "Higher = only very long prompts compress; lower = compress sooner. Only relevant when prefill_compression=auto.",
-        default: "32768",
-        when: "Lower it if you want shorter prompts compressed too; raise to restrict to very long contexts.",
-        note: None,
-        options: &[],
     },
     KnobInfo {
         key: "mtp_mode",
@@ -299,20 +293,6 @@ pub const KNOBS: &[KnobInfo] = &[
             ("off", "No outlier sweep — max speed, risks tool-call corruption (#87)."),
             ("on", "Force the per-weight outlier sweep."),
             ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
-        ],
-    },
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    KnobInfo {
-        key: "cask",
-        title: "CASK (deprecated, removal in 0.5.0)",
-        summary: "Deprecated since 0.4.0 and removed in 0.5.0: TriAttention KV-cache eviction. Not supported.",
-        effect: "Switches between m-fold and drop eviction; only actually evicts when a TriAttention sidecar is attached. Loading with CASK prints a deprecation warning.",
-        default: "false",
-        when: "Leave false. Not a production or recommended setting.",
-        note: Some("m-fold eviction + DFlash can produce a repetition attractor; validate together. Eviction needs a sidecar path, not just this toggle."),
-        options: &[
-            ("true", "m-fold eviction policy (needs a sidecar to actually evict)."),
-            ("false", "drop-eviction policy — NOT off (eviction is gated by the sidecar, not this flag; clear cask_sidecar to disable)."),
         ],
     },
     KnobInfo {
@@ -417,23 +397,39 @@ mod tests {
     #[test]
     fn lookup_returns_curated_entry() {
         let dflash = knob_info("dflash_mode").expect("dflash entry");
-        assert_eq!(dflash.title, "Spec decode (DFlash)");
+        assert_eq!(dflash.title, "DFlash eligibility");
         assert!(knob_info("does_not_exist").is_none());
     }
 
     #[test]
-    fn dflash_explainer_claims_the_mtp_head_as_a_drafter() {
-        // The row resolves `on` against the model's attached drafter, so the
-        // copy must not promise DFlash alone: an MTP-only tier
-        // (`qwen3.6:35b-a3b-mq4p`) spec-decodes through its head.
+    fn dflash_explainer_does_not_promise_an_mtp_fallback() {
+        // docs/CONFIG.md: `dflash_mode=on` requires a DFlash draft and never
+        // enables MTP; the general selector is `speculation`.
         let dflash = knob_info("dflash_mode").expect("dflash entry");
         for field in [dflash.summary, dflash.when] {
-            assert!(field.contains("MTP"), "{field}");
+            assert!(
+                !field.contains("else its MTP head"),
+                "dflash copy must not promise an MTP fallback: {field}"
+            );
         }
-        assert!(
-            dflash.when.contains("not pulled"),
-            "the declared-draft fail-closed case must stay in the copy"
-        );
+        assert!(dflash.summary.contains("never falls back"));
+        let spec = knob_info("speculation").expect("speculation entry");
+        assert_eq!(spec.default, "auto");
+        let values: Vec<&str> = spec.options.iter().map(|(v, _)| *v).collect();
+        assert_eq!(values, hipfire_config::SPECULATION_MODES);
+    }
+
+    #[test]
+    fn deprecated_keys_have_no_curated_entry() {
+        // They fall back to the schema's own deprecation help text.
+        for key in [
+            "cask",
+            "prefill_compression",
+            "prefill_drafter",
+            "prefill_threshold",
+        ] {
+            assert!(knob_info(key).is_none(), "{key}");
+        }
     }
 
     #[test]
