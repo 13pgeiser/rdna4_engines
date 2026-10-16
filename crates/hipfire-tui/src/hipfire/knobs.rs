@@ -477,10 +477,10 @@ mod tests {
     #[test]
     fn defaults_match_config_defaults() {
         // STRICT: every knob's `default` must exist in config::defaults() AND
-        // match it — no silent skip. config::defaults() is the TUI's mirror of bun
-        // CONFIG_DEFAULTS (verified key-by-key), so this also pins knob defaults to
-        // the real defaults. A knob without a config default fails loudly so it
-        // can't drift unnoticed (this is exactly the gap that hid default_chatml).
+        // match it — no silent skip. config::defaults() resolves the shared
+        // hipfire-config schema, so this also pins knob defaults to the real
+        // defaults. A knob without a config default fails loudly so it can't
+        // drift unnoticed (this is exactly the gap that hid default_chatml).
         let cfg = crate::hipfire::config::ConfigState::defaults_for_test();
         for k in KNOBS {
             let expected = cfg.get(k.key).unwrap_or_else(|| {

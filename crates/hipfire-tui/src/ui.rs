@@ -183,7 +183,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
         .divider(Span::styled(TAB_DIVIDER, Style::default().fg(PANEL_2)));
     frame.render_widget(tabs, chunks[1]);
 
-    // Record per-tab hit regions for mouse clicks. ratatui 0.29's Tabs layout:
+    // Record per-tab hit regions for mouse clicks. ratatui 0.30's Tabs layout:
     // from the inner left, each tab cell is 1 (left pad) + title + 1 (right pad),
     // with a 3-col " | " divider between cells. The block has only a BOTTOM
     // border, so inner.x == area.x and titles sit on the area's top row.
@@ -482,7 +482,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(pad(area, 1, 0));
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -552,19 +552,26 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
             plain,
         ),
     ]);
-    // Warnings wrap but are capped at two rows each so they cannot push the
-    // Tabs list off a short terminal (the full text lives on Settings / Models).
+    // The registry line shows the same short label as the Models header; a
+    // registry warning (e.g. bundled copy newer than the cache) only tints it,
+    // the full text lives on the Models tab. Config warnings wrap but are
+    // capped at two rows so they cannot push the Tabs list off a short terminal.
     let warn = Style::default().fg(YELLOW);
-    for (label, warning) in [
-        ("Config     ", &app.config.warning),
-        ("Registry   ", &app.registry.warning),
-    ] {
-        if let Some(warning) = warning {
-            let mut rows = wrap_labeled(label, warning, inner_w, warn);
-            rows.truncate(2);
-            status.extend(rows);
-        }
+    if let Some(warning) = &app.config.warning {
+        let mut rows = wrap_labeled("Config     ", warning, inner_w, warn);
+        rows.truncate(2);
+        status.extend(rows);
     }
+    status.push(fit_line(
+        "Registry   ",
+        &registry_label(app),
+        inner_w,
+        if app.registry.warning.is_some() {
+            warn
+        } else {
+            plain
+        },
+    ));
     // Size the Runtime card from its line count (+2 borders); the Tabs list
     // takes whatever height is left.
     let runtime_h = (status.len() as u16).saturating_add(2);
@@ -575,11 +582,11 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(card("Runtime", status), left[0]);
 
     let actions = vec![
-        ListItem::new("Dashboard — live serve status, queue depth, tok/s, VRAM."),
-        ListItem::new("Chat — stream a conversation through your local serve."),
-        ListItem::new("Models — browse the registry and your downloads."),
-        ListItem::new("Settings — edit config (easy/advanced); persists to ~/.hipfire."),
-        ListItem::new("System / Logs — GPU, HIP, path checks; serve.log tail."),
+        ListItem::new("Dashboard — serve status, tok/s, VRAM"),
+        ListItem::new("Chat — talk to your local serve"),
+        ListItem::new("Models — registry, downloads, pulls"),
+        ListItem::new("Settings — edit ~/.hipfire config"),
+        ListItem::new("System / Logs — GPU, paths, serve.log"),
     ];
     frame.render_widget(
         List::new(actions)
@@ -613,12 +620,12 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 
     let keys = vec![
         Row::new(["Tab / Shift+Tab", "switch tabs"]),
-        Row::new(["\u{2191}  \u{2193} · Enter", "move · select / send"]),
+        Row::new(["\u{2191}  \u{2193} · Enter", "move · select"]),
         Row::new(["?", "help for this tab"]),
         Row::new(["r · q", "refresh · quit"]),
     ];
     frame.render_widget(
-        Table::new(keys, [Constraint::Length(16), Constraint::Min(20)])
+        Table::new(keys, [Constraint::Length(15), Constraint::Min(17)])
             .header(Row::new(["Key", "Action"]).style(Style::default().fg(MUTED)))
             .block(block("Keys  (full list in each tab's footer)"))
             .style(Style::default().fg(TEXT).bg(PANEL))
@@ -1099,6 +1106,20 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Short registry source label shared by the Models header and Home: the
+/// fetched cache path, `bundled (<date>)` for the compiled-in copy, or
+/// `missing` when there really is none.
+fn registry_label(app: &App) -> String {
+    match (&app.registry.loaded_path, app.registry.bundled) {
+        (Some(path), _) => path.display().to_string(),
+        (None, true) => match app.registry.generated_at.get(..10) {
+            Some(date) => format!("bundled ({date})"),
+            None => "bundled".into(),
+        },
+        (None, false) => "missing".into(),
+    }
+}
+
 fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     // An in-flight pull or an armed delete-confirm gets a 3-row status strip at
     // the bottom; otherwise the list takes the full height.
@@ -1116,21 +1137,21 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(pad(area, 1, 0));
-    let registry_label = match (&app.registry.loaded_path, app.registry.bundled) {
-        (Some(path), _) => path.display().to_string(),
-        (None, true) => match app.registry.generated_at.get(..10) {
-            Some(date) => format!("bundled ({date})"),
-            None => "bundled".into(),
-        },
-        (None, false) => "missing".into(),
-    };
-    let summary = format!(
-        "active: {}    {} downloaded / {} available    registry: {}    aliases: {}",
-        app.active_model,
-        app.registry.downloaded_count(),
-        app.registry.models.len(),
-        registry_label,
-        app.registry.aliases.len(),
+    let registry_label = registry_label(app);
+    // Whole parts only: at 80 columns a long active tag drops `aliases`
+    // instead of cutting the registry label mid-date.
+    let summary = fit_segments(
+        &[
+            format!("active: {}", app.active_model),
+            format!(
+                "{} downloaded / {} available",
+                app.registry.downloaded_count(),
+                app.registry.models.len()
+            ),
+            format!("registry: {registry_label}"),
+            format!("aliases: {}", app.registry.aliases.len()),
+        ],
+        chunks[0].width.saturating_sub(2) as usize,
     );
     frame.render_widget(
         Paragraph::new(summary)
@@ -1238,7 +1259,13 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                         format!("  {active} {}", row.tag),
                         have.into(),
                         format!("{:.1} GB", row.entry.size_gb),
-                        format!("{:.0} GB", row.entry.min_vram_gb),
+                        // Local files outside the registry carry no VRAM
+                        // estimate; say so instead of a fake "0 GB".
+                        if row.entry.min_vram_gb > 0.0 {
+                            format!("{:.0} GB", row.entry.min_vram_gb)
+                        } else {
+                            "\u{2014}".into()
+                        },
                         notes,
                     ])
                 }
@@ -3544,7 +3571,6 @@ mod render_tests {
                 ..ModelEntry::default()
             },
             downloaded,
-            has_triattn: true,
             has_mtp,
         };
         app.active_model = "qwen3.8:flash-next-mq4-xts-zab".into();

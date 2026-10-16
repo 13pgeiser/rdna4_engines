@@ -614,7 +614,7 @@ impl App {
     }
 
     /// Test seam: inject an in-flight serve-command receiver without spawning a
-    /// real `bun` process, so `drain_serve_command` can be exercised in unit tests.
+    /// real `hipfire` process, so `drain_serve_command` can be exercised in unit tests.
     #[cfg(test)]
     pub fn inject_serve_cmd(&mut self, rx: Receiver<ServeOutcome>) {
         self.serve_cmd = Some(rx);
@@ -3441,7 +3441,6 @@ mod tests {
             tag: tag.into(),
             entry: ModelEntry::default(),
             downloaded,
-            has_triattn: false,
             has_mtp: false,
         };
         app.registry.models = vec![row("zz:remote", false), row("zz:local", true)];

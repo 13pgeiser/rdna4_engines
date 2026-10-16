@@ -30,7 +30,6 @@ pub struct ModelRow {
     pub tag: String,
     pub entry: ModelEntry,
     pub downloaded: bool,
-    pub has_triattn: bool,
     pub has_mtp: bool,
 }
 
@@ -115,11 +114,6 @@ impl RegistryState {
             .into_iter()
             .map(|(tag, entry)| {
                 let downloaded = local_names.contains(entry.file.as_str());
-                let has_triattn = entry
-                    .triattn
-                    .as_ref()
-                    .map(|s| local_names.contains(s.file.as_str()))
-                    .unwrap_or(false);
                 let has_mtp = entry
                     .mtp
                     .as_ref()
@@ -129,7 +123,6 @@ impl RegistryState {
                     tag,
                     entry,
                     downloaded,
-                    has_triattn,
                     has_mtp,
                 }
             })
@@ -147,7 +140,6 @@ impl RegistryState {
                         ..ModelEntry::default()
                     },
                     downloaded: true,
-                    has_triattn: false,
                     has_mtp: false,
                 }),
         );

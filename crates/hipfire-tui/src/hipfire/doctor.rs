@@ -83,7 +83,7 @@ fn run_inner() -> DoctorReport {
 
 /// Extract the top-level JSON object — first `{` to last `}` — from diag's
 /// stdout, tolerating leading log lines AND pretty multi-line formatting (the
-/// CLI emits `JSON.stringify(..., null, 2)`, so a single-line scan would miss it).
+/// CLI prints `serde_json::to_string_pretty`, so a single-line scan would miss it).
 fn extract_json_object(stdout: &str) -> Option<&str> {
     let start = stdout.find('{')?;
     let end = stdout.rfind('}')?;
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn extract_json_object_handles_pretty_multiline_with_log_prefix() {
-        // The CLI emits JSON.stringify(.., null, 2) — pretty + possibly after logs.
+        // The CLI pretty-prints the report, possibly after log lines.
         let stdout = "warming up\n{\n  \"platform\": \"linux\",\n  \"kfd\": true\n}\n";
         let json = extract_json_object(stdout).expect("object extracted");
         let r = parse_diag_json(json);
