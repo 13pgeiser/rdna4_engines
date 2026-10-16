@@ -56,7 +56,10 @@ struct Scratch {
 }
 
 thread_local! {
-    static SCRATCH: RefCell<Option<Scratch>> = const { RefCell::new(None) };
+    /// One scratch per device id: a single submission thread can drive several
+    /// devices (pipeline-parallel bands), and a buffer allocated on one device
+    /// must never be handed to a kernel running on another.
+    static SCRATCH: RefCell<Vec<(i32, Scratch)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn raw(t: &GpuTensor, off: usize, len: usize) -> GpuTensor {
@@ -120,7 +123,13 @@ pub fn run(
     let k = raw(p.projection, q_bytes, q_bytes);
     let v = raw(p.projection, q_bytes * 2, n64 * 6144 * 2);
     let out = raw(p.output, 0, n * 6144 * 2);
-    let mut slot = SCRATCH.with(|s| s.borrow_mut().take());
+    let mut slot = SCRATCH.with(|s| {
+        let mut slots = s.borrow_mut();
+        let index = slots
+            .iter()
+            .position(|(device, _)| *device == gpu.device_id)?;
+        Some(slots.swap_remove(index).1)
+    });
     if slot.as_ref().is_some_and(|s| s.rows < n64) {
         let s = slot.take().unwrap();
         gpu.free_tensor(s.a)?;
@@ -164,7 +173,7 @@ pub fn run(
             &codes, &scales, &s.ef, &out, n,
         )
     })();
-    SCRATCH.with(|c| *c.borrow_mut() = Some(s));
+    SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
     result
 }
 
