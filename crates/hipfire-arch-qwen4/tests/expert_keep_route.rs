@@ -72,7 +72,7 @@ fn masked_router_decode_and_prefill_gfx1201() {
         for normalize in [false, true] {
             for round in [false, true] {
                 gpu.moe_router_softmax_top10_masked_f32(&input, &ids, &weights, rows, normalize, mask.buf.as_ptr() as usize, round).unwrap();
-                gpu.moe_router_softmax_top10_f32(&reference_input, &reference_ids, &reference_weights, rows, normalize, round).unwrap();
+                gpu.moe_router_softmax_top10_f32(&reference_input, &reference_ids, &reference_weights, rows, normalize, round, 0, 0).unwrap();
                 let got_ids = gpu.download_f32(&ids).unwrap();
                 let got_weights = gpu.download_f32(&weights).unwrap();
                 assert_eq!(bits(&got_ids), bits(&gpu.download_f32(&reference_ids).unwrap()), "ids rows={rows} normalize={normalize} round={round}");
