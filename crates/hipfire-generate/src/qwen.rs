@@ -3695,49 +3695,11 @@ pub fn generate_dflash(
                     active_attempt_id(),
                 );
                 if spec_name == "mtp" {
-                    if let Some(obj) = pending_done.as_object_mut() {
-                        obj.remove("dflash");
-                        obj.insert("mtp".to_string(), serde_json::json!(true));
-                        if let Some(stats) = m.speculator.as_ref().map(|s| s.request_stats()) {
-                            if stats.mtp_ngram {
-                                obj.insert("mtp_ngram".into(), serde_json::json!(true));
-                                obj.insert(
-                                    "ngram_mod_windows".into(),
-                                    serde_json::json!(stats.ngram_mod_windows),
-                                );
-                                obj.insert(
-                                    "ngram_mod_drafts".into(),
-                                    serde_json::json!(stats.ngram_mod_drafts),
-                                );
-                                obj.insert(
-                                    "ngram_mod_accepted".into(),
-                                    serde_json::json!(stats.ngram_mod_accepted),
-                                );
-                                obj.insert(
-                                    "ngram_mod_accept_rate".into(),
-                                    serde_json::json!(stats.ngram_mod_accept_rate),
-                                );
-                            }
-                            if stats.mtp_ngram
-                                || stats.mtp_windows != 0
-                                || stats.ar_windows != 0
-                                || stats.mtp_retired
-                            {
-                                obj.insert(
-                                    "mtp_windows".into(),
-                                    serde_json::json!(stats.mtp_windows),
-                                );
-                                obj.insert(
-                                    "ar_windows".into(),
-                                    serde_json::json!(stats.ar_windows),
-                                );
-                                obj.insert(
-                                    "mtp_retired".into(),
-                                    serde_json::json!(stats.mtp_retired),
-                                );
-                            }
-                        }
-                    }
+                    qwen_mtp_done_fields(
+                        &mut pending_done,
+                        run.spec_accepted,
+                        m.speculator.as_ref().map(|s| s.request_stats()),
+                    );
                 }
                 if let Some((reason, alpha)) = pflash {
                     pending_done["pflash"] = serde_json::json!({
@@ -3884,40 +3846,11 @@ pub fn generate_dflash(
             "attempt_id": active_attempt_id(),
         });
         if spec_name == "mtp" {
-            if let Some(obj) = pending_done.as_object_mut() {
-                obj.remove("dflash");
-                obj.insert("mtp".to_string(), serde_json::json!(true));
-                if let Some(stats) = m.speculator.as_ref().map(|s| s.request_stats()) {
-                    if stats.mtp_ngram {
-                        obj.insert("mtp_ngram".into(), serde_json::json!(true));
-                        obj.insert(
-                            "ngram_mod_windows".into(),
-                            serde_json::json!(stats.ngram_mod_windows),
-                        );
-                        obj.insert(
-                            "ngram_mod_drafts".into(),
-                            serde_json::json!(stats.ngram_mod_drafts),
-                        );
-                        obj.insert(
-                            "ngram_mod_accepted".into(),
-                            serde_json::json!(stats.ngram_mod_accepted),
-                        );
-                        obj.insert(
-                            "ngram_mod_accept_rate".into(),
-                            serde_json::json!(stats.ngram_mod_accept_rate),
-                        );
-                    }
-                    if stats.mtp_ngram
-                        || stats.mtp_windows != 0
-                        || stats.ar_windows != 0
-                        || stats.mtp_retired
-                    {
-                        obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
-                        obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
-                        obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
-                    }
-                }
-            }
+            qwen_mtp_done_fields(
+                &mut pending_done,
+                run.spec_accepted,
+                m.speculator.as_ref().map(|s| s.request_stats()),
+            );
         }
         if !pflash_done_field.is_empty() {
             let padded = format!("{{{}}}", pflash_done_field.trim_start_matches(','));
@@ -7260,6 +7193,45 @@ pub fn qwen_dflash_done_value(
     })
 }
 
+/// The native MTP fields of a spec-route `done` (`spec_name == "mtp"`):
+/// `mtp: true` in place of `dflash`; `accepted`, the drafts accepted over
+/// every window, so `tau = accepted / cycles` exactly; the n-gram-mod
+/// counters when that composition was armed; and once any window ran, the
+/// window split `mtp_windows` / `ar_windows` / `mtp_retired`. Windows after
+/// a sticky floor retirement are `ar_windows` and accept nothing, so a
+/// client prices the drafting windows as
+/// `accepted / (cycles - ar_windows)` rather than reading `tau`.
+pub fn qwen_mtp_done_fields(
+    done: &mut serde_json::Value,
+    accepted: usize,
+    stats: Option<hipfire_runtime::spec::MtpRequestStats>,
+) {
+    let Some(obj) = done.as_object_mut() else {
+        return;
+    };
+    obj.remove("dflash");
+    obj.insert("mtp".into(), serde_json::json!(true));
+    obj.insert("accepted".into(), serde_json::json!(accepted));
+    let Some(stats) = stats else {
+        return;
+    };
+    if stats.mtp_ngram {
+        obj.insert("mtp_ngram".into(), serde_json::json!(true));
+        obj.insert("ngram_mod_windows".into(), serde_json::json!(stats.ngram_mod_windows));
+        obj.insert("ngram_mod_drafts".into(), serde_json::json!(stats.ngram_mod_drafts));
+        obj.insert("ngram_mod_accepted".into(), serde_json::json!(stats.ngram_mod_accepted));
+        obj.insert(
+            "ngram_mod_accept_rate".into(),
+            serde_json::json!(stats.ngram_mod_accept_rate),
+        );
+    }
+    if stats.mtp_ngram || stats.mtp_windows != 0 || stats.ar_windows != 0 || stats.mtp_retired {
+        obj.insert("mtp_windows".into(), serde_json::json!(stats.mtp_windows));
+        obj.insert("ar_windows".into(), serde_json::json!(stats.ar_windows));
+        obj.insert("mtp_retired".into(), serde_json::json!(stats.mtp_retired));
+    }
+}
+
 /// Write one Qwen DFlash Malformed terminal via the production fail-closed
 /// error writer (same envelope as step/forced/grammar failures).
 pub fn emit_qwen_dflash_malformed_terminal(
@@ -8179,6 +8151,72 @@ impl MtpWindowTimingSnap {
             (lc::device_sync::time_ns() - self.dsync_start) / 1000,
             (lc::graph_launch::time_ns() - self.glaunch_start) / 1000,
         )
+    }
+}
+
+#[cfg(test)]
+mod mtp_done_fields_tests {
+    use super::{qwen_dflash_done_value, qwen_mtp_done_fields};
+    use hipfire_runtime::spec::MtpRequestStats;
+
+    fn done(tau: f64, cycles: usize) -> serde_json::Value {
+        qwen_dflash_done_value("r", 177, 3.7, 134, 9600.0, 13.9, 4.7, 9600.0, tau, cycles, 0, "length", 1)
+    }
+
+    /// A request the AR floor retired (the shape of the 7900 XTX Flash-Next
+    /// one-card offload run: 177 tokens, 154 windows, tau 0.14): `accepted`
+    /// is the exact numerator of `tau`, and the window split tells the
+    /// drafting windows from the retired AR ones.
+    #[test]
+    fn retired_request_reports_exact_accepted_and_window_split() {
+        let mut value = done(0.14, 154);
+        let stats = MtpRequestStats {
+            mtp_windows: 16,
+            ar_windows: 138,
+            mtp_retired: true,
+            ..MtpRequestStats::default()
+        };
+        qwen_mtp_done_fields(&mut value, 22, Some(stats));
+        assert!(value.get("dflash").is_none());
+        assert_eq!(value["mtp"], true);
+        assert_eq!(value["accepted"], 22);
+        assert_eq!(value["mtp_windows"], 16);
+        assert_eq!(value["ar_windows"], 138);
+        assert_eq!(value["mtp_retired"], true);
+        assert!(value.get("mtp_ngram").is_none());
+        let tau = 22.0 / 154.0;
+        assert_eq!(value["tau"], (tau * 100.0_f64).round() / 100.0);
+    }
+
+    #[test]
+    fn accepted_is_reported_without_drafter_stats_and_ngram_counters_only_when_armed() {
+        let mut bare = done(2.0, 3);
+        qwen_mtp_done_fields(&mut bare, 6, None);
+        assert_eq!(bare["accepted"], 6);
+        assert!(bare.get("mtp_windows").is_none() && bare.get("ar_windows").is_none());
+
+        let mut idle = done(0.0, 0);
+        qwen_mtp_done_fields(&mut idle, 0, Some(MtpRequestStats::default()));
+        assert_eq!(idle["accepted"], 0);
+        assert!(idle.get("mtp_windows").is_none());
+
+        let mut ngram = done(2.34, 53);
+        let stats = MtpRequestStats {
+            mtp_ngram: true,
+            ngram_mod_windows: 26,
+            ngram_mod_drafts: 70,
+            ngram_mod_accepted: 60,
+            ngram_mod_accept_rate: 0.857,
+            mtp_windows: 27,
+            ..MtpRequestStats::default()
+        };
+        qwen_mtp_done_fields(&mut ngram, 124, Some(stats));
+        assert_eq!(ngram["mtp_ngram"], true);
+        assert_eq!(ngram["ngram_mod_accepted"], 60);
+        assert_eq!(ngram["mtp_windows"], 27);
+        assert_eq!(ngram["ar_windows"], 0);
+        assert_eq!(ngram["mtp_retired"], false);
+        assert_eq!(ngram["accepted"], 124);
     }
 }
 

@@ -6278,6 +6278,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut prompt_tokens: Option<u64> = None;
         let mut spec_routes: Vec<Option<String>> = Vec::new();
         let mut spec_tau: Vec<Option<f64>> = Vec::new();
+        let mut spec_mtp: Vec<Option<serde_json::Value>> = Vec::new();
         let mut power_runs = Vec::new();
         for _ in 0..args.runs {
             let sampler = power.start_run();
@@ -6303,6 +6304,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                     .and_then(|_| done.get("tau").and_then(serde_json::Value::as_f64)),
             );
             spec_routes.push(route);
+            spec_mtp.push(bench_spec_mtp(&done));
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6365,6 +6367,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "load_speculation": load_speculation,
                 "spec_route": spec_routes,
                 "spec_tau": spec_tau,
+                "spec_mtp": spec_mtp,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
             }),
             &loaded,
@@ -7060,6 +7063,38 @@ fn bench_spec_route(done: &serde_json::Value) -> Option<String> {
         "speculative"
     };
     Some(route.to_string())
+}
+
+/// The native-MTP window split of a generate `done` event, `None` unless
+/// native MTP speculated: `windows_mtp` (the windows before any AR-floor
+/// retirement: native and n-gram takeover windows plus the floor's timed AR
+/// samples), `windows_ar_retired` (head-free AR tokens after a sticky
+/// retirement, which accept nothing), `retired_at` (index of the first
+/// retired window; `null` when the request never retired) and `tau_mtp`,
+/// accepted drafts per `windows_mtp` window (`null` from a daemon that
+/// does not report `accepted`). `tau` averages over every window, so a
+/// retired request reads near zero whatever its drafts accepted.
+fn bench_spec_mtp(done: &serde_json::Value) -> Option<serde_json::Value> {
+    bench_spec_route(done)?;
+    if done.get("mtp").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let count = |key: &str| done.get(key).and_then(serde_json::Value::as_u64);
+    let cycles = count("cycles")?;
+    let ar_retired = count("ar_windows").unwrap_or(0);
+    let windows = cycles.saturating_sub(ar_retired);
+    let retired = done.get("mtp_retired").and_then(serde_json::Value::as_bool) == Some(true);
+    let accepted = count("accepted");
+    let tau_mtp = accepted
+        .filter(|_| windows > 0)
+        .map(|accepted| (accepted as f64 / windows as f64 * 100.0).round() / 100.0);
+    Some(serde_json::json!({
+        "tau_mtp": tau_mtp,
+        "windows_mtp": windows,
+        "windows_ar_retired": ar_retired,
+        "retired_at": retired.then_some(windows),
+        "accepted": accepted,
+    }))
 }
 
 /// Warning when a speculative selector was requested but every measured run
@@ -17169,6 +17204,52 @@ mod tests {
         assert_eq!(bench_spec_route(&idle), None);
         let eagle = serde_json::json!({"spec": "gemma4_eagle", "tau": 1.8, "rounds": 7});
         assert_eq!(bench_spec_route(&eagle).as_deref(), Some("gemma4_eagle"));
+    }
+
+    /// A request the AR floor retired (the 7900 XTX Flash-Next one-card
+    /// offload shape: 177 tokens, 154 windows, done `tau` 0.14) must not read
+    /// as rejected drafts: its 16 drafting windows accepted 22 drafts.
+    #[test]
+    fn bench_spec_mtp_splits_retired_ar_windows_from_drafting_windows() {
+        let retired = serde_json::json!({
+            "mtp": true, "tau": 0.14, "cycles": 154, "accepted": 22,
+            "mtp_windows": 16, "ar_windows": 138, "mtp_retired": true,
+        });
+        assert_eq!(
+            bench_spec_mtp(&retired),
+            Some(serde_json::json!({
+                "tau_mtp": 1.38, "windows_mtp": 16, "windows_ar_retired": 138,
+                "retired_at": 16, "accepted": 22,
+            }))
+        );
+        // Never retired (n-gram composition on): `tau_mtp` is `tau` and every
+        // window, the n-gram takeovers included, is a drafting window.
+        let live = serde_json::json!({
+            "mtp": true, "mtp_ngram": true, "tau": 2.34, "cycles": 53, "accepted": 124,
+            "mtp_windows": 27, "ngram_mod_windows": 26, "ar_windows": 0, "mtp_retired": false,
+        });
+        assert_eq!(
+            bench_spec_mtp(&live),
+            Some(serde_json::json!({
+                "tau_mtp": 2.34, "windows_mtp": 53, "windows_ar_retired": 0,
+                "retired_at": null, "accepted": 124,
+            }))
+        );
+        // A daemon without `accepted` still splits the windows.
+        let old = serde_json::json!({
+            "mtp": true, "tau": 0.14, "cycles": 154, "ar_windows": 138, "mtp_retired": true,
+        });
+        let split = bench_spec_mtp(&old).unwrap();
+        assert_eq!(split["tau_mtp"], serde_json::Value::Null);
+        assert_eq!(split["retired_at"], 16);
+        // AR, DFlash and idle runs carry no MTP split.
+        for done in [
+            serde_json::json!({"type": "done", "decode_tok_s": 35.0}),
+            serde_json::json!({"dflash": true, "tau": 3.1, "cycles": 9}),
+            serde_json::json!({"mtp": true, "tau": 0.0, "cycles": 0}),
+        ] {
+            assert_eq!(bench_spec_mtp(&done), None, "{done}");
+        }
     }
 
     #[test]
