@@ -2502,6 +2502,37 @@ pub struct IndexedAttentionNormRope<'a> {
     pub yarn: crate::rope::RopeYarn,
 }
 
+/// One operand of a QSA append/norm/pool launch checked under
+/// `qwen4_qsa_extent_check`: arena label, tensor, byte offset into the tensor and
+/// the byte length the kernel actually accesses (guarded, not grid-rounded).
+type QsaAppendExtent<'a> = (&'static str, &'a GpuTensor, usize, usize);
+
+/// Pre-launch extent check of every operand (callers gate the call and the
+/// computation of `extents` on `gpu.flags.qwen4_qsa_extent_check`).
+fn qsa_append_extent_check(
+    gpu: &Gpu,
+    extents: &[QsaAppendExtent<'_>],
+    depth: crate::dispatch::QsaExtentDepth,
+    site: &'static str,
+) {
+    for &(arena, tensor, offset, len) in extents {
+        gpu.qsa_extent_check(arena, tensor, offset, len, depth, site);
+    }
+}
+
+/// Post-launch helper for every operand, called immediately after the launch
+/// (mode 2 synchronizes inside the helper).
+fn qsa_append_extent_post(
+    gpu: &Gpu,
+    extents: &[QsaAppendExtent<'_>],
+    depth: crate::dispatch::QsaExtentDepth,
+    site: &'static str,
+) {
+    for &(arena, tensor, offset, len) in extents {
+        gpu.qsa_extent_post_launch(arena, tensor, offset, len, depth, site);
+    }
+}
+
 pub fn indexed_attention_norm_rope(
     gpu: &mut Gpu,
     p: &IndexedAttentionNormRope<'_>,
@@ -2545,6 +2576,29 @@ pub fn indexed_attention_norm_rope(
     args.push_i32(rotary_dim);
     p.yarn.push(&mut args);
     args.pad_to(16);
+    // Extents: grid `[heads, blocks(head_dim)]` (`blocks(head_dim)` is 1 for
+    // `head_dim <= 256`; the 256-thread round-up never passes the `channel <
+    // head_dim` guard before every access). Head `h` touches `h * head_stride +
+    // channel`, so the guarded extent is `span` = `(heads - 1) * head_stride +
+    // head_dim` F32 of `values`, plus `head_dim` BF16 of `norm` (RoPE partners
+    // are `< rotary_dim <= head_dim`).
+    let extents = || {
+        (
+            [
+                ("qsa_norm_rope_values", p.values, 0usize, span * 4),
+                ("qsa_norm_rope_norm", p.norm, 0, p.head_dim * 2),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: 1,
+                end_position: p.position + 1,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_norm_rope");
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32",
         [head_grid, dim_grid, 1],
@@ -2552,7 +2606,12 @@ pub fn indexed_attention_norm_rope(
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_norm_rope");
+    }
+    Ok(())
 }
 
 pub struct IndexedAttentionNormRopeBatch<'a> {
@@ -2943,6 +3002,61 @@ pub fn indexed_attention_decode_prologue(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents: grid `[index_heads + heads + kv_heads + 1, rows]`; every block does
+    // work and each thread is guarded by `c < index_dim` / `c < head_dim` / `i <
+    // index_kv_width`. Index rows are `index_width` F32 wide, `qgate` rows
+    // `2 * heads * head_dim` wide of which only the query half of each head is
+    // touched (`(rows - 1) * 2 * heads * head_dim + (heads - 1) * 2 * head_dim +
+    // head_dim` elements), K/V rows `kv_width` F32; the caches get `rows` whole
+    // format rows (`kv_row_bytes`: F32 `kv_width * 4`, fp8 `kv_heads *
+    // (head_dim + 2)`, q8 `kv_heads * head_dim / 32 * 34`) at `position *
+    // kv_row_bytes`; the raw index keys `rows * index_kv_width` elements of the
+    // arena dtype at `position * index_kv_width`.
+    let extents = || {
+        let kv_row_bytes = p.format.kv_row_bytes(p.kv_heads, p.head_dim);
+        let raw_elem = p.raw_index_keys.dtype.size();
+        let qgate_elements = (p.rows - 1) * 2 * p.heads * p.head_dim
+            + (p.heads - 1) * 2 * p.head_dim
+            + p.head_dim;
+        (
+            [
+                ("qsa_index_row", p.index_row, 0usize, p.rows * index_width * 4),
+                ("qsa_qgate", p.qgate, 0, qgate_elements * 4),
+                ("qsa_keys", p.keys, 0, p.rows * kv_width * 4),
+                ("qsa_values", p.values, 0, p.rows * kv_width * 4),
+                (
+                    "qsa_full_keys",
+                    p.full_keys,
+                    p.position * kv_row_bytes,
+                    p.rows * kv_row_bytes,
+                ),
+                (
+                    "qsa_full_values",
+                    p.full_values,
+                    p.position * kv_row_bytes,
+                    p.rows * kv_row_bytes,
+                ),
+                (
+                    "qsa_raw_index_keys",
+                    p.raw_index_keys,
+                    p.position * p.index_kv_width * raw_elem,
+                    p.rows * p.index_kv_width * raw_elem,
+                ),
+                ("qsa_index_q_norm", p.index_q_norm, 0, p.index_dim * 2),
+                ("qsa_q_norm", p.q_norm, 0, p.head_dim * 2),
+                ("qsa_k_norm", p.k_norm, 0, p.head_dim * 2),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: end,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_decode_prologue");
+    }
     gpu.launch_blob_recorded(
         kernel,
         [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
@@ -2953,7 +3067,12 @@ pub fn indexed_attention_decode_prologue(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_decode_prologue");
+    }
+    Ok(())
 }
 
 /// QSA prologue of the `MtpStep::Append`-style key-value-only fill of `rows`
@@ -3074,6 +3193,55 @@ pub fn indexed_attention_append_prologue(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents (same kernel as the decode prologue with `heads == 0`; grid
+    // `[index_heads + kv_heads + 1, rows]`, every block does work and each
+    // thread is guarded by `c < index_dim` / `c < head_dim` / `i <
+    // index_kv_width`): index rows are `index_width` F32 wide (query heads +
+    // BF16-rounded key tail), K/V rows `kv_width` F32, the caches get `rows`
+    // whole format rows at `position * kv_row_bytes`, the raw index keys
+    // `rows * index_kv_width` elements of the arena dtype at `position *
+    // index_kv_width`. `qgate`/`q_norm` alias `keys`/`k_norm` and are never
+    // dereferenced (`heads == 0`), so they are not checked as separate operands.
+    let extents = || {
+        let kv_row_bytes = p.format.kv_row_bytes(p.kv_heads, p.head_dim);
+        let raw_elem = p.raw_index_keys.dtype.size();
+        (
+            [
+                ("qsa_index_row", p.index_row, 0usize, p.rows * index_width * 4),
+                ("qsa_keys", p.keys, 0, p.rows * kv_width * 4),
+                ("qsa_values", p.values, 0, p.rows * kv_width * 4),
+                (
+                    "qsa_full_keys",
+                    p.full_keys,
+                    p.position * kv_row_bytes,
+                    p.rows * kv_row_bytes,
+                ),
+                (
+                    "qsa_full_values",
+                    p.full_values,
+                    p.position * kv_row_bytes,
+                    p.rows * kv_row_bytes,
+                ),
+                (
+                    "qsa_raw_index_keys",
+                    p.raw_index_keys,
+                    p.position * p.index_kv_width * raw_elem,
+                    p.rows * p.index_kv_width * raw_elem,
+                ),
+                ("qsa_index_q_norm", p.index_q_norm, 0, p.index_dim * 2),
+                ("qsa_k_norm", p.k_norm, 0, p.head_dim * 2),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: end,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_append_prologue");
+    }
     gpu.launch_blob_recorded(
         kernel,
         [blocks_x, checked_u32(p.rows, "QSA append prologue rows")?, 1],
@@ -3084,7 +3252,12 @@ pub fn indexed_attention_append_prologue(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_append_prologue");
+    }
+    Ok(())
 }
 
 pub fn indexed_attention_norm_rope_batch(
@@ -3157,6 +3330,33 @@ pub fn indexed_attention_norm_rope_batch(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents: grid `[heads, 1, rows]` is exact in x/z; the kernel returns for
+    // `blockIdx.y != 0` and touches `channel = threadIdx.x < head_dim` of head
+    // `h` of row `r` at `r * row_stride + h * head_stride`, so the guarded
+    // extent is `(rows - 1) * row_stride + head_span` F32 (`head_span` =
+    // `(heads - 1) * head_stride + head_dim`) plus `head_dim` norm BF16.
+    let extents = || {
+        (
+            [
+                (
+                    "qsa_norm_rope_values",
+                    p.values,
+                    0usize,
+                    ((p.rows - 1) * p.row_stride + head_span) * 4,
+                ),
+                ("qsa_norm_rope_norm", p.norm, 0, p.head_dim * 2),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: p.position_start + p.rows,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_norm_rope_batch");
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32_batched",
         [head_grid, dim_grid, row_grid],
@@ -3167,7 +3367,12 @@ pub fn indexed_attention_norm_rope_batch(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_norm_rope_batch");
+    }
+    Ok(())
 }
 
 pub struct IndexedAttentionCacheAppend<'a> {
@@ -3213,6 +3418,38 @@ pub fn indexed_attention_cache_append(
     args.push_i32(position);
     args.push_i32(kv_width);
     args.pad_to(16);
+    // Extents: guard `channel < kv_width` (grid.x = blocks(kv_width) rounds up to
+    // 256 threads, never past the guard): one F32 K/V row read, one row written
+    // at `position * kv_width`.
+    let extents = || {
+        (
+            [
+                ("qsa_keys", p.key, 0usize, p.kv_width * 4),
+                ("qsa_values", p.value, 0, p.kv_width * 4),
+                (
+                    "qsa_full_keys",
+                    p.full_keys,
+                    p.position * p.kv_width * 4,
+                    p.kv_width * 4,
+                ),
+                (
+                    "qsa_full_values",
+                    p.full_values,
+                    p.position * p.kv_width * 4,
+                    p.kv_width * 4,
+                ),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: 1,
+                end_position: p.position + 1,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_cache_append");
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_cache_append_f32",
         [grid, 1, 1],
@@ -3220,7 +3457,12 @@ pub fn indexed_attention_cache_append(
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_cache_append");
+    }
+    Ok(())
 }
 
 /// Append `rows` F32 K/V rows at `position_start` to caches in `format`.
@@ -3299,6 +3541,44 @@ pub fn indexed_attention_cache_append_batch(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents: guard `row < rows` and (F32) `channel < kv_width` / (quantized)
+    // `head < kv_heads` with the 256-thread block over one head (`c < head_dim`
+    // guards the reads, `qsa_kv_store` stores nothing for `c >= head_dim`); the
+    // F32 grid.x round-up never passes the guard. K/V are read as
+    // `rows * kv_width` F32; each cache gets exactly `rows` whole format rows
+    // (`kv_row_bytes`: F32 `kv_width * 4`, fp8 `kv_heads * (head_dim + 2)`
+    // codes+f16 scales, q8 `kv_heads * head_dim / 32 * 34`) at
+    // `position_start * kv_row_bytes`.
+    let extents = || {
+        let row_bytes = p.format.kv_row_bytes(p.kv_heads, p.head_dim);
+        (
+            [
+                ("qsa_keys", p.key, 0usize, p.rows * kv_width * 4),
+                ("qsa_values", p.value, 0, p.rows * kv_width * 4),
+                (
+                    "qsa_full_keys",
+                    p.full_keys,
+                    p.position_start * row_bytes,
+                    p.rows * row_bytes,
+                ),
+                (
+                    "qsa_full_values",
+                    p.full_values,
+                    p.position_start * row_bytes,
+                    p.rows * row_bytes,
+                ),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_cache_append_batch");
+    }
     gpu.launch_blob_recorded(
         kernel,
         grid,
@@ -3309,7 +3589,12 @@ pub fn indexed_attention_cache_append_batch(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_cache_append_batch");
+    }
+    Ok(())
 }
 
 /// Prefill index-key tail into a BF16 raw-key arena
@@ -3364,6 +3649,38 @@ pub fn indexed_attention_index_key_append_batch(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents: guard `row < rows && i < index_kv_width` (grid.x = blocks(index_kv_width)
+    // rounds threads up to 256, never past the guard). It reads and rewrites only
+    // the key part of each index row, `[index_q_width, index_q_width +
+    // index_kv_width)` of `index_width`-wide rows, and writes BF16 raw keys at
+    // `(position_start + row) * index_kv_width + i`.
+    let extents = || {
+        (
+            [
+                (
+                    "qsa_index_row",
+                    p.index_rows,
+                    p.index_q_width * 4,
+                    ((p.rows - 1) * index_width + p.index_kv_width) * 4,
+                ),
+                (
+                    "qsa_raw_index_keys",
+                    p.raw_index_keys,
+                    p.position_start * p.index_kv_width * 2,
+                    p.rows * p.index_kv_width * 2,
+                ),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: end,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_index_key_append_batch");
+    }
     gpu.launch_blob_recorded(
         NAME,
         [
@@ -3378,7 +3695,12 @@ pub fn indexed_attention_index_key_append_batch(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_index_key_append_batch");
+    }
+    Ok(())
 }
 pub struct IndexedAttentionSelect<'a> {
     pub query: &'a GpuTensor,
@@ -3436,6 +3758,7 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
             gpu,
             &IndexedAttentionSelectBatch {
                 pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
                 query: p.query,
                 pooled: p.pooled,
                 selected: p.selected,
@@ -3484,6 +3807,15 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
         args.push_i32(value);
     }
     args.pad_to(16);
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_single(
+            gpu,
+            p,
+            kernel_name,
+            kernel_name == "indexed_attention_select_f32_serial",
+            false,
+        );
+    }
     gpu.launch_blob_recorded(
         kernel_name,
         [1, 1, 1],
@@ -3491,7 +3823,494 @@ pub fn indexed_attention_select(gpu: &mut Gpu, p: &IndexedAttentionSelect<'_>) -
         shared_mem,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_single(
+            gpu,
+            p,
+            kernel_name,
+            kernel_name == "indexed_attention_select_f32_serial",
+            true,
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Developer-only QSA extent checks for the select launches
+// (`gpu.flags.qwen4_qsa_extent_check`; mode 2 also synchronizes after every
+// launch). Every helper below is called only from inside an
+// `if gpu.flags.qwen4_qsa_extent_check` block at the launch sites, so the
+// disabled path is that bool test alone.
+//
+// Each formula is the extent the *kernel* touches, read from the kernel source
+// (`kernels/src/tensor_ops.hip`, `qsa_bf16_scores.hip`, `qsa_filter_select.hip`,
+// `indexed_attention_select_exact.hip`, and the builder kernels
+// `peacemaker-isa/src/kernels/qsa_{score,topk}.rip.rs`), not the extent the host
+// validated:
+// - "guarded": an in-kernel bound clamps the access (`block < block_count`,
+//   `block < rbc`, `slot < cap`, `index < capacity`, or a raw-buffer descriptor
+//   `num_records`), so only the guarded extent is checked;
+// - "grid-round": the launch grid is rounded up (256-block score tiles, 4096-block
+//   compact tiles, 16-row groups, the shape bound of a retained replay); the
+//   surplus workgroups/lanes return before touching memory, so the rounded part
+//   is never checked.
+// `rbc` is the kernels' `min((position_start + row + 1) / compress,
+// block_count)`; it is monotone in the row, so the last row of a launch is its
+// maximum. Scores, selected and the control words are 4/4/8-byte-element rows:
+// a `[rows][stride]` buffer is touched up to `(rows - 1) * stride + last_row`
+// elements. All arithmetic saturates: an overflow reports as an over-extent.
+// ---------------------------------------------------------------------------
+
+type QsaSelDepth = crate::dispatch::QsaExtentDepth;
+
+/// Byte size of the F32 / I32 words of the query, scores and selection rows.
+const QSA_SEL_EXT_WORD: usize = 4;
+
+fn qsa_sel_ext_depth(rows: usize, position_start: usize, block_count: usize) -> QsaSelDepth {
+    QsaSelDepth {
+        rows,
+        end_position: position_start.saturating_add(rows),
+        block_count,
+    }
+}
+
+/// `rbc` of the last (maximal) of `rows` rows starting at `position_start`.
+fn qsa_sel_ext_rbc_last(
+    rows: usize,
+    position_start: usize,
+    compress: usize,
+    block_count: usize,
+) -> usize {
+    position_start
+        .saturating_add(rows)
+        .checked_div(compress)
+        .unwrap_or(0)
+        .min(block_count)
+}
+
+/// Elements of a `[rows][stride]` buffer touched when every row uses
+/// `last_row_elems` leading elements; nothing when a row touches none.
+fn qsa_sel_ext_span(rows: usize, stride: usize, last_row_elems: usize) -> usize {
+    if rows == 0 || last_row_elems == 0 {
+        0
+    } else {
+        (rows - 1)
+            .saturating_mul(stride)
+            .saturating_add(last_row_elems)
+    }
+}
+
+/// Elements the serial kernels read through `row_selected[prior * compress]`
+/// (`prior < slot < chosen`, no `capacity` guard on the read): the last row can
+/// reach `(chosen - 2) * compress + 1` elements, which may exceed `capacity`.
+fn qsa_sel_ext_serial_prior(chosen: usize, compress: usize) -> usize {
+    if chosen < 2 {
+        0
+    } else {
+        (chosen - 2).saturating_mul(compress).saturating_add(1)
+    }
+}
+
+/// Query rows `first_row..first_row + rows` (F32, `stride` apart): every row
+/// reads its leading `index_heads * index_dim` elements (the score kernels stage
+/// `4 * index_dim` per row into LDS/SGPRs; the fused kernels read per block).
+#[allow(clippy::too_many_arguments)]
+fn qsa_sel_ext_query(
+    gpu: &Gpu,
+    query: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    stride: usize,
+    width: usize,
+    depth: QsaSelDepth,
+    site: &'static str,
+) {
+    gpu.qsa_extent_check(
+        "qsa_select_query",
+        query,
+        first_row.saturating_mul(stride).saturating_mul(QSA_SEL_EXT_WORD),
+        qsa_sel_ext_span(rows, stride, width).saturating_mul(QSA_SEL_EXT_WORD),
+        depth,
+        site,
+    );
+}
+
+/// Pooled keys (or their BF16 mirror) rows `0..blocks`, `index_dim` elements of
+/// the tensor's own element size each.
+fn qsa_sel_ext_pooled(
+    gpu: &Gpu,
+    pooled: &GpuTensor,
+    arena: &'static str,
+    blocks: usize,
+    index_dim: usize,
+    depth: QsaSelDepth,
+    site: &'static str,
+) {
+    gpu.qsa_extent_check(
+        arena,
+        pooled,
+        0,
+        blocks
+            .saturating_mul(index_dim)
+            .saturating_mul(pooled.dtype.size()),
+        depth,
+        site,
+    );
+}
+
+/// Selected rows `first_row..first_row + rows` of `capacity` I32 each (every
+/// kernel fills its whole row, `i < capacity`); `last_row_elems` is `capacity`
+/// except for the serial kernels' unguarded prior read.
+#[allow(clippy::too_many_arguments)]
+fn qsa_sel_ext_selected(
+    gpu: &Gpu,
+    selected: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    capacity: usize,
+    last_row_elems: usize,
+    depth: QsaSelDepth,
+    site: &'static str,
+) {
+    gpu.qsa_extent_check(
+        "qsa_select_selected",
+        selected,
+        first_row.saturating_mul(capacity).saturating_mul(QSA_SEL_EXT_WORD),
+        qsa_sel_ext_span(rows, capacity, last_row_elems).saturating_mul(QSA_SEL_EXT_WORD),
+        depth,
+        site,
+    );
+}
+
+/// Mirror: the final row's `capacity` I32 (`mirror[i]`, `i < capacity`).
+fn qsa_sel_ext_mirror(
+    gpu: &Gpu,
+    mirror: &GpuTensor,
+    capacity: usize,
+    depth: QsaSelDepth,
+    site: &'static str,
+) {
+    gpu.qsa_extent_check(
+        "qsa_select_mirror",
+        mirror,
+        0,
+        capacity.saturating_mul(QSA_SEL_EXT_WORD),
+        depth,
+        site,
+    );
+}
+
+/// Post-launch hook on the selection rows (the select kernels' output).
+#[allow(clippy::too_many_arguments)]
+fn qsa_sel_ext_post_selected(
+    gpu: &Gpu,
+    selected: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    capacity: usize,
+    position_start: usize,
+    block_count: usize,
+    site: &'static str,
+) {
+    gpu.qsa_extent_post_launch(
+        "qsa_select_selected",
+        selected,
+        first_row.saturating_mul(capacity).saturating_mul(QSA_SEL_EXT_WORD),
+        qsa_sel_ext_span(rows, capacity, capacity).saturating_mul(QSA_SEL_EXT_WORD),
+        qsa_sel_ext_depth(rows, position_start, block_count),
+        site,
+    );
+}
+
+/// `indexed_attention_select_f32{,_serial}`: one workgroup, one row. Query
+/// `index_heads * index_dim`, pooled `block < block_count` (guarded), selected
+/// `capacity` (every slot filled with -1 / written under `< capacity`); the
+/// serial kernel also reads `selected[prior * compress]` unguarded. Scores are in
+/// LDS (no global extent).
+fn qsa_sel_ext_single(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelect<'_>,
+    kernel: &'static str,
+    serial: bool,
+    post: bool,
+) {
+    let depth = QsaSelDepth {
+        rows: 1,
+        end_position: p.visible,
+        block_count: p.block_count,
+    };
+    let last_row = if serial {
+        p.capacity.max(qsa_sel_ext_serial_prior(
+            p.budget_blocks.min(p.block_count),
+            p.compress,
+        ))
+    } else {
+        p.capacity
+    };
+    if post {
+        gpu.qsa_extent_post_launch(
+            "qsa_select_selected",
+            p.selected,
+            0,
+            last_row.saturating_mul(QSA_SEL_EXT_WORD),
+            depth,
+            kernel,
+        );
+        return;
+    }
+    let width = p.index_heads.saturating_mul(p.index_dim);
+    qsa_sel_ext_query(gpu, p.query, 0, 1, width, width, depth, kernel);
+    qsa_sel_ext_pooled(gpu, p.pooled, "qsa_pooled_keys", p.block_count, p.index_dim, depth, kernel);
+    qsa_sel_ext_selected(gpu, p.selected, 0, 1, p.capacity, last_row, depth, kernel);
+}
+
+/// Fused `indexed_attention_select_{f32,bf16}_batched{,_serial,_exact}`, grid
+/// `rows` (no rounding). Per row: query `index_heads * index_dim` at
+/// `row * query_row_stride`; pooled blocks `< row_block_count` (guarded; the last
+/// row's `rbc` is the maximum); selected row `row * capacity + [0, capacity)`;
+/// mirror (last row only) `[0, capacity)`; with global scores (`scores_global`
+/// non-null) `row * scores_stride + [0, row_block_count)` floats, written and
+/// read back (including the float4 reads, which stop at `row_block_count`). The
+/// serial kernels also read `row_selected[prior * compress]` unguarded.
+fn qsa_sel_ext_fused(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    scores_global: *mut std::ffi::c_void,
+    scores_stride: usize,
+    serial: bool,
+    site: &'static str,
+) {
+    let live = qsa_sel_ext_rbc_last(p.rows, p.position_start, p.compress, p.block_count);
+    let depth = qsa_sel_ext_depth(p.rows, p.position_start, p.block_count);
+    qsa_sel_ext_query(
+        gpu,
+        p.query,
+        0,
+        p.rows,
+        p.query_row_stride,
+        p.index_heads.saturating_mul(p.index_dim),
+        depth,
+        site,
+    );
+    qsa_sel_ext_pooled(gpu, p.pooled, "qsa_pooled_keys", live, p.index_dim, depth, site);
+    let last_row = if serial {
+        p.capacity.max(qsa_sel_ext_serial_prior(p.budget_blocks.min(live), p.compress))
+    } else {
+        p.capacity
+    };
+    qsa_sel_ext_selected(gpu, p.selected, 0, p.rows, p.capacity, last_row, depth, site);
+    if let Some(m) = mirror {
+        qsa_sel_ext_mirror(gpu, m, p.capacity, depth, site);
+    }
+    if !scores_global.is_null() {
+        gpu.qsa_extent_check_ptr(
+            "qsa_select_scores",
+            scores_global,
+            0,
+            qsa_sel_ext_span(p.rows, scores_stride, live).saturating_mul(QSA_SEL_EXT_WORD),
+            depth,
+            site,
+        );
+    }
+}
+
+/// Score launch of one row group (`n` rows from `g0`) into `scores`
+/// (`[n][stride]` F32 scratch). Hipcc F32 rows8/16 and the PM F32/BF16 rows16
+/// kernels guard the pooled read by the tile lane (`block < block_count`; the PM
+/// descriptor is `num_records = min(block_count - 256 * wg_x, 256) * row bytes`),
+/// not by row visibility, so `pooled_guarded_by_live == false` checks
+/// `block_count` pooled rows; the hipcc BF16 split kernels return a tile past
+/// `live = min(block_count, (position_start + row0 + nrows) / compress)` and
+/// check `live` rows. Scores are written `row * stride + [0, min(block_count,
+/// visible_blocks(row)))`: `(n - 1) * stride + live` floats. The query is
+/// `4 * index_dim` per row, `(n - 1) * query_row_stride + 4 * index_dim`.
+/// Grid-round: `ceil(block_count / 256)` (or `ceil(bound / 256)`) tiles and
+/// `ceil(n / R)` row tiles; surplus tiles/lanes/rows return before any access.
+#[allow(clippy::too_many_arguments)]
+fn qsa_sel_ext_score(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    g0: usize,
+    n: usize,
+    pooled: &GpuTensor,
+    pooled_guarded_by_live: bool,
+    scores: *mut std::ffi::c_void,
+    scores_arena: &'static str,
+    stride: usize,
+    site: &'static str,
+    post: bool,
+) {
+    let position_start = p.position_start.saturating_add(g0);
+    let live = qsa_sel_ext_rbc_last(n, position_start, p.compress, p.block_count);
+    let depth = qsa_sel_ext_depth(n, position_start, p.block_count);
+    let scores_bytes = qsa_sel_ext_span(n, stride, live).saturating_mul(QSA_SEL_EXT_WORD);
+    // The actual operand read: the BF16 mirror (`pooled` is not `p.pooled`) or
+    // the canonical pooled arena. Both report the mirror's real valid-blocks
+    // watermark (`p.pooled_bf16_valid_blocks`; 0 = no valid mirror), so an F32
+    // fallback taken while the mirror lags `block_count` stays visible.
+    let valid_blocks = p.pooled_bf16_valid_blocks;
+    let pooled_arena = if !std::ptr::eq(pooled, p.pooled) {
+        "mirror"
+    } else if pooled.dtype == DType::F32 {
+        "pooled_f32"
+    } else {
+        "pooled_bf16"
+    };
+    let pooled_blocks = if pooled_guarded_by_live { live } else { p.block_count };
+    let pooled_bytes = pooled_blocks
+        .saturating_mul(p.index_dim)
+        .saturating_mul(pooled.dtype.size());
+    if post {
+        gpu.qsa_extent_post_launch_pooled(
+            pooled_arena,
+            pooled,
+            0,
+            pooled_bytes,
+            depth,
+            site,
+            valid_blocks,
+        );
+        return;
+    }
+    qsa_sel_ext_query(
+        gpu,
+        p.query,
+        g0,
+        n,
+        p.query_row_stride,
+        p.index_heads.saturating_mul(p.index_dim),
+        depth,
+        site,
+    );
+    gpu.qsa_extent_check_pooled(pooled_arena, pooled, 0, pooled_bytes, depth, site, valid_blocks);
+    gpu.qsa_extent_check_ptr(scores_arena, scores, 0, scores_bytes, depth, site);
+}
+
+/// `indexed_attention_select_from_scores{,_pm_gfx1151}` of one row group, grid
+/// `n` (no rounding). Scores are read `row * stride + [0, rbc(row))`
+/// (guarded: the hipcc kernel loops `block < row_block_count`, the PM kernel's
+/// 32-key packet lanes past `rbc` read 0 through the descriptor), selected
+/// `row * capacity + [0, capacity)` (hipcc loop `i < capacity`; PM descriptor
+/// `num_records` drops slots past `capacity`), mirror (last row, non-null) `[0,
+/// capacity)`.
+#[allow(clippy::too_many_arguments)]
+fn qsa_sel_ext_from_scores(
+    gpu: &Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    g0: usize,
+    n: usize,
+    scores: *mut std::ffi::c_void,
+    scores_arena: &'static str,
+    stride: usize,
+    mirror: Option<&GpuTensor>,
+    site: &'static str,
+    post: bool,
+) {
+    let position_start = p.position_start.saturating_add(g0);
+    if post {
+        qsa_sel_ext_post_selected(
+            gpu,
+            p.selected,
+            g0,
+            n,
+            p.capacity,
+            position_start,
+            p.block_count,
+            site,
+        );
+        return;
+    }
+    let live = qsa_sel_ext_rbc_last(n, position_start, p.compress, p.block_count);
+    let depth = qsa_sel_ext_depth(n, position_start, p.block_count);
+    gpu.qsa_extent_check_ptr(
+        scores_arena,
+        scores,
+        0,
+        qsa_sel_ext_span(n, stride, live).saturating_mul(QSA_SEL_EXT_WORD),
+        depth,
+        site,
+    );
+    qsa_sel_ext_selected(gpu, p.selected, g0, n, p.capacity, p.capacity, depth, site);
+    if let Some(m) = mirror {
+        qsa_sel_ext_mirror(gpu, m, p.capacity, depth, site);
+    }
+}
+
+/// One launch of the filter trio (`kernel` names it; `t.rows` rows, grid `rows`
+/// for threshold/finish, `ceil(bound / 4096) x rows` for compact; the surplus
+/// tiles return at `base >= rbc`):
+/// - threshold: scores `row * stride + b`, `b < rbc` sampled (guarded; only rows
+///   with `rbc > cap` read), ctl `[2 * row, 2 * row + 1]` u64 (`rows * 16` B);
+/// - compact: scores `b < rbc` (guarded by `b < rbc`), ctl word 1 (atomic add),
+///   cand `row * cap + slot`, `slot < cap` (guarded): `rows * cap * 8` B;
+/// - finish: scores (repair path, `i < rbc`), ctl, cand `i < count <= cap`,
+///   selected `row * capacity + [0, capacity)`, mirror `[0, capacity)`.
+/// Scores are `(rows - 1) * stride + rbc_last` floats; scratch-owned operands go
+/// through the raw-pointer helper, tensor-owned ones (selected, mirror, lab
+/// scores) through the tensor helper at the group's row offset.
+fn qsa_sel_ext_filter(
+    gpu: &Gpu,
+    t: &QsaFilterTrio<'_>,
+    kernel: &'static str,
+    post: bool,
+) {
+    let live = qsa_sel_ext_rbc_last(t.rows, t.position_start, t.compress, t.block_count);
+    let depth = qsa_sel_ext_depth(t.rows, t.position_start, t.block_count);
+    let ctl_bytes = t.rows.saturating_mul(16);
+    if post {
+        gpu.qsa_extent_post_launch_ptr("qsa_filter_ctl", t.ctl, 0, ctl_bytes, depth, kernel);
+        return;
+    }
+    let scores_bytes = qsa_sel_ext_span(t.rows, t.stride, live).saturating_mul(QSA_SEL_EXT_WORD);
+    // Built under the same flag as this call (`QsaFilterTrio::extent`).
+    let extent = t
+        .extent
+        .as_ref()
+        .expect("QSA filter extent metadata is built whenever the extent check is on");
+    match extent.scores {
+        Some(owner) => gpu.qsa_extent_check(
+            "qsa_filter_scores",
+            owner,
+            extent.first_row.saturating_mul(t.stride).saturating_mul(QSA_SEL_EXT_WORD),
+            scores_bytes,
+            depth,
+            kernel,
+        ),
+        None => gpu.qsa_extent_check_ptr("qsa_filter_scores", t.scores, 0, scores_bytes, depth, kernel),
+    }
+    gpu.qsa_extent_check_ptr("qsa_filter_ctl", t.ctl, 0, ctl_bytes, depth, kernel);
+    if kernel == "qsa_filter_threshold" {
+        return;
+    }
+    gpu.qsa_extent_check_ptr(
+        "qsa_filter_cand",
+        t.cand,
+        0,
+        t.rows
+            .saturating_mul(t.knobs.cap)
+            .saturating_mul(std::mem::size_of::<u64>()),
+        depth,
+        kernel,
+    );
+    if kernel == "qsa_filter_finish" {
+        qsa_sel_ext_selected(
+            gpu,
+            extent.selected,
+            extent.first_row,
+            t.rows,
+            t.capacity,
+            t.capacity,
+            depth,
+            kernel,
+        );
+        if !t.mirror.is_null() {
+            if let Some(m) = extent.mirror {
+                qsa_sel_ext_mirror(gpu, m, t.capacity, depth, kernel);
+            }
+        }
+    }
 }
 
 pub struct IndexedAttentionSelectBatch<'a> {
@@ -3503,6 +4322,11 @@ pub struct IndexedAttentionSelectBatch<'a> {
     /// `qsa_select_pm_fits`, HIPFIRE_QWEN4_QSA_SCORE_PM on, pooled F32), the score reads it;
     /// otherwise `pooled`. Selection bytes identical either way.
     pub pooled_bf16: Option<&'a GpuTensor>,
+    /// Extent-check metadata only (never a kernel argument): the mirror's
+    /// valid-blocks watermark, filled only under
+    /// `gpu.flags.qwen4_qsa_extent_check` (0 elsewhere and for callers without a
+    /// mirror).
+    pub pooled_bf16_valid_blocks: usize,
     pub selected: &'a GpuTensor,
     pub rows: usize,
     pub query_row_stride: usize,
@@ -3724,6 +4548,7 @@ fn indexed_attention_select_fused(
             let selected = p.selected.sub_offset(first * row_bytes, selected_bytes - first * row_bytes);
             let group = IndexedAttentionSelectBatch {
                 pooled_bf16: p.pooled_bf16,
+                pooled_bf16_valid_blocks: p.pooled_bf16_valid_blocks,
                 query: &query,
                 pooled: p.pooled,
                 selected: &selected,
@@ -3850,6 +4675,17 @@ fn indexed_attention_select_fused(
             addend: 0,
         },
     ];
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_fused(
+            gpu,
+            p,
+            mirror,
+            scores_global,
+            scores_stride,
+            kernel_name == serial_kernel,
+            launch_kernel,
+        );
+    }
     gpu.launch_blob_recorded(
         launch_kernel,
         [row_grid, 1, 1],
@@ -3861,6 +4697,18 @@ fn indexed_attention_select_fused(
             kernargs: &bindings,
         },
     )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_post_selected(
+            gpu,
+            p.selected,
+            0,
+            p.rows,
+            p.capacity,
+            p.position_start,
+            p.block_count,
+            launch_kernel,
+        );
+    }
     Ok(mirror.is_some())
 }
 
@@ -4125,6 +4973,21 @@ fn indexed_attention_select_rows8_core(
             args.push_i32(position_start);
             args.push_i32(block_count);
             args.pad_to(16);
+            if gpu.flags.qwen4_qsa_extent_check {
+                qsa_sel_ext_score(
+                    gpu,
+                    p,
+                    g0,
+                    n,
+                    bf16_copy.unwrap_or(p.pooled),
+                    false,
+                    scores,
+                    "fp16_x_scratch",
+                    p.block_count,
+                    score_kernel,
+                    false,
+                );
+            }
             gpu.launch_blob_recorded(
                 score_kernel,
                 [
@@ -4137,6 +5000,21 @@ fn indexed_attention_select_rows8_core(
                 args.as_mut_slice(),
                 crate::dispatch::ReplayLaunchBindings::NONE,
             )?;
+            if gpu.flags.qwen4_qsa_extent_check {
+                qsa_sel_ext_score(
+                    gpu,
+                    p,
+                    g0,
+                    n,
+                    bf16_copy.unwrap_or(p.pooled),
+                    false,
+                    scores,
+                    "fp16_x_scratch",
+                    p.block_count,
+                    score_kernel,
+                    true,
+                );
+            }
         }
         // The persistent selection is the final row's: the last group's.
         let last = g0 + n == p.rows;
@@ -4144,6 +5022,12 @@ fn indexed_attention_select_rows8_core(
             .filter(|_| last)
             .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
         if let Some(knobs) = filter {
+            let extent = gpu.flags.qwen4_qsa_extent_check.then(|| QsaFilterExtent {
+                selected: p.selected,
+                first_row: g0,
+                mirror,
+                scores: None,
+            });
             qsa_filter_launch(
                 gpu,
                 &QsaFilterTrio {
@@ -4160,6 +5044,7 @@ fn indexed_attention_select_rows8_core(
                     position_start: p.position_start + g0,
                     capacity: p.capacity,
                     knobs,
+                    extent,
                 },
             )?;
             if let Some(out) = stats.as_mut() {
@@ -4180,6 +5065,20 @@ fn indexed_attention_select_rows8_core(
         args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
         args.push_ptr(mirror_ptr);
         args.pad_to(16);
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_from_scores(
+                gpu,
+                p,
+                g0,
+                n,
+                scores,
+                "fp16_x_scratch",
+                p.block_count,
+                mirror.filter(|_| last),
+                select_kernel,
+                false,
+            );
+        }
         gpu.launch_blob_recorded(
             select_kernel,
             [rows as u32, 1, 1],
@@ -4188,6 +5087,20 @@ fn indexed_attention_select_rows8_core(
             args.as_mut_slice(),
             crate::dispatch::ReplayLaunchBindings::NONE,
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_from_scores(
+                gpu,
+                p,
+                g0,
+                n,
+                scores,
+                "fp16_x_scratch",
+                p.block_count,
+                None,
+                select_kernel,
+                true,
+            );
+        }
         g0 += n;
     }
     Ok(mirror.is_some())
@@ -4505,6 +5418,21 @@ fn indexed_attention_select_bf16_split(
             block_count_offset,
             position_offset,
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_score(
+                gpu,
+                p,
+                g0,
+                n,
+                p.pooled,
+                true,
+                scores,
+                "qsa_select_scores",
+                bound,
+                score_kernel,
+                false,
+            );
+        }
         gpu.launch_blob_recorded(
             score_kernel,
             [score_tiles, checked_u32(n.div_ceil(score_rows), "QSA select row groups")?, 1],
@@ -4513,11 +5441,32 @@ fn indexed_attention_select_bf16_split(
             args.as_mut_slice(),
             crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: &bindings },
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_score(
+                gpu,
+                p,
+                g0,
+                n,
+                p.pooled,
+                true,
+                scores,
+                "qsa_select_scores",
+                bound,
+                score_kernel,
+                true,
+            );
+        }
         // The persistent selection is the final row's: the last group's.
         let mirror_ptr = mirror
             .filter(|_| g0 + n == p.rows)
             .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
         if let Some(knobs) = filter {
+            let extent = gpu.flags.qwen4_qsa_extent_check.then(|| QsaFilterExtent {
+                selected: p.selected,
+                first_row: g0,
+                mirror,
+                scores: None,
+            });
             qsa_filter_launch_shaped(
                 gpu,
                 &QsaFilterTrio {
@@ -4534,6 +5483,7 @@ fn indexed_attention_select_bf16_split(
                     position_start: p.position_start + g0,
                     capacity: p.capacity,
                     knobs,
+                    extent,
                 },
                 Some(QsaFilterReplay { bound, call_rows: p.rows, first_row: g0 }),
             )?;
@@ -4564,6 +5514,20 @@ fn indexed_attention_select_bf16_split(
             block_count_offset,
             position_offset,
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_from_scores(
+                gpu,
+                p,
+                g0,
+                n,
+                scores,
+                "qsa_select_scores",
+                bound,
+                mirror.filter(|_| g0 + n == p.rows),
+                select_kernel,
+                false,
+            );
+        }
         gpu.launch_blob_recorded(
             select_kernel,
             [rows as u32, 1, 1],
@@ -4572,6 +5536,20 @@ fn indexed_attention_select_bf16_split(
             args.as_mut_slice(),
             crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: &bindings },
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_from_scores(
+                gpu,
+                p,
+                g0,
+                n,
+                scores,
+                "qsa_select_scores",
+                bound,
+                None,
+                select_kernel,
+                true,
+            );
+        }
         g0 += n;
     }
     Ok(mirror.is_some())
@@ -4743,7 +5721,7 @@ fn qsa_filter_ensure_kernels(gpu: &mut Gpu) -> HipResult<()> {
 
 /// One row group of the filter trio. `mirror` is null except for the last
 /// group of a call.
-struct QsaFilterTrio {
+struct QsaFilterTrio<'a> {
     scores: *mut std::ffi::c_void,
     ctl: *mut std::ffi::c_void,
     cand: *mut std::ffi::c_void,
@@ -4757,6 +5735,21 @@ struct QsaFilterTrio {
     position_start: usize,
     capacity: usize,
     knobs: QsaFilterCfg,
+    /// Check-only tensor owners; `Some` only when the extent check is on (built
+    /// under that flag, so the off path stores a `None` and nothing else).
+    extent: Option<QsaFilterExtent<'a>>,
+}
+
+/// Tensor owners of a trio's tensor-derived operands, for the developer extent
+/// check only: `selected` starts `first_row * capacity` words into `selected`,
+/// the trio's `mirror` pointer is `mirror` when non-null, and `scores` is
+/// `scores` at `first_row * stride` words (the from-scores labs); `None` means
+/// the trio's `scores` pointer is scratch.
+struct QsaFilterExtent<'a> {
+    selected: &'a GpuTensor,
+    first_row: usize,
+    mirror: Option<&'a GpuTensor>,
+    scores: Option<&'a GpuTensor>,
 }
 
 /// Replay declarations of a shape-bounded filter launch
@@ -4772,7 +5765,7 @@ struct QsaFilterReplay {
     first_row: usize,
 }
 
-fn qsa_filter_launch(gpu: &mut Gpu, t: &QsaFilterTrio) -> HipResult<()> {
+fn qsa_filter_launch(gpu: &mut Gpu, t: &QsaFilterTrio<'_>) -> HipResult<()> {
     qsa_filter_launch_shaped(gpu, t, None)
 }
 
@@ -4797,7 +5790,7 @@ fn qsa_filter_push_ints(
 /// count, nothing declared).
 fn qsa_filter_launch_shaped(
     gpu: &mut Gpu,
-    t: &QsaFilterTrio,
+    t: &QsaFilterTrio<'_>,
     replay: Option<QsaFilterReplay>,
 ) -> HipResult<()> {
     let rows = checked_i32(t.rows, "QSA filter rows")?;
@@ -4836,6 +5829,9 @@ fn qsa_filter_launch_shaped(
     );
     args.pad_to(16);
     let declared = bindings(bc, ps)?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_filter(gpu, t, "qsa_filter_threshold", false);
+    }
     gpu.launch_blob_recorded(
         "qsa_filter_threshold",
         [row_grid, 1, 1],
@@ -4847,6 +5843,9 @@ fn qsa_filter_launch_shaped(
             kernargs: declared.as_ref().map_or(&[][..], |b| &b[..]),
         },
     )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_filter(gpu, t, "qsa_filter_threshold", true);
+    }
     // Zero live blocks: no tile to compact (a zero grid is not launchable);
     // the finish still writes the tail / sentinel slots and the stats. A
     // shape-bounded grid is never empty: tiles past the live prefix return.
@@ -4864,6 +5863,9 @@ fn qsa_filter_launch_shaped(
         );
         args.pad_to(16);
         let declared = bindings(bc, ps)?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_filter(gpu, t, "qsa_filter_compact", false);
+        }
         gpu.launch_blob_recorded(
             "qsa_filter_compact",
             [tiles, row_grid, 1],
@@ -4875,6 +5877,9 @@ fn qsa_filter_launch_shaped(
                 kernargs: declared.as_ref().map_or(&[][..], |b| &b[..]),
             },
         )?;
+        if gpu.flags.qwen4_qsa_extent_check {
+            qsa_sel_ext_filter(gpu, t, "qsa_filter_compact", true);
+        }
     }
     let mut args = KernargBlob::new();
     args.push_ptr(t.scores);
@@ -4891,6 +5896,9 @@ fn qsa_filter_launch_shaped(
     );
     args.pad_to(16);
     let declared = bindings(bc, ps)?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_filter(gpu, t, "qsa_filter_finish", false);
+    }
     gpu.launch_blob_recorded(
         "qsa_filter_finish",
         [row_grid, 1, 1],
@@ -4901,7 +5909,11 @@ fn qsa_filter_launch_shaped(
             grid: None,
             kernargs: declared.as_ref().map_or(&[][..], |b| &b[..]),
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_filter(gpu, t, "qsa_filter_finish", true);
+    }
+    Ok(())
 }
 
 /// Downloads `rows` control rows `[threshold, count | repaired << 32]`
@@ -5074,6 +6086,12 @@ pub fn qsa_filter_select_from_scores_lab(
             (p.selected.buf.as_ptr() as *mut i32).add(g0 * p.capacity) as *mut std::ffi::c_void
         };
         let last = g0 + n == p.rows;
+        let extent = gpu.flags.qwen4_qsa_extent_check.then(|| QsaFilterExtent {
+            selected: p.selected,
+            first_row: g0,
+            mirror,
+            scores: Some(p.scores),
+        });
         qsa_filter_launch(
             gpu,
             &QsaFilterTrio {
@@ -5092,6 +6110,7 @@ pub fn qsa_filter_select_from_scores_lab(
                 position_start: p.position_start + g0,
                 capacity: p.capacity,
                 knobs: cfg,
+                extent,
             },
         )?;
         raw.extend(qsa_filter_read_ctl(gpu, scratch.ctl, n)?);
@@ -5143,6 +6162,24 @@ pub fn qsa_incumbent_select_from_scores_lab(
     args.push_i32(checked_i32(p.capacity, "QSA from-scores capacity")?);
     args.push_ptr(mirror.map_or(std::ptr::null_mut(), |m| m.buf.as_ptr()));
     args.pad_to(16);
+    if gpu.flags.qwen4_qsa_extent_check {
+        // Scores are read `row * stride + [0, rbc)`; selected `capacity` words per
+        // row; mirror (last row) `capacity` words; grid `rows`, no rounding.
+        let live = qsa_sel_ext_rbc_last(p.rows, p.position_start, p.compress, p.block_count);
+        let depth = qsa_sel_ext_depth(p.rows, p.position_start, p.block_count);
+        gpu.qsa_extent_check(
+            "qsa_filter_scores",
+            p.scores,
+            0,
+            qsa_sel_ext_span(p.rows, p.score_stride, live).saturating_mul(QSA_SEL_EXT_WORD),
+            depth,
+            kernel,
+        );
+        qsa_sel_ext_selected(gpu, p.selected, 0, p.rows, p.capacity, p.capacity, depth, kernel);
+        if let Some(m) = mirror {
+            qsa_sel_ext_mirror(gpu, m, p.capacity, depth, kernel);
+        }
+    }
     gpu.launch_blob_recorded(
         kernel,
         [checked_u32(p.rows, "QSA from-scores row grid")?, 1, 1],
@@ -5150,7 +6187,20 @@ pub fn qsa_incumbent_select_from_scores_lab(
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        qsa_sel_ext_post_selected(
+            gpu,
+            p.selected,
+            0,
+            p.rows,
+            p.capacity,
+            p.position_start,
+            p.block_count,
+            kernel,
+        );
+    }
+    Ok(())
 }
 
 /// Lab entry forcing the filter route (env and block minimum bypassed) with
@@ -5298,6 +6348,27 @@ pub fn indexed_attention_reuse_selection(
             "QSA reuse selection exceeds its LDS snapshot",
         ));
     }
+    if gpu.flags.qwen4_qsa_extent_check {
+        // One workgroup: reads `min(selected_len, capacity)` words, writes up to
+        // `capacity` words of `selected` and the single `selected_len_out` word.
+        let depth = QsaSelDepth { rows: 1, end_position: p.position, block_count: 0 };
+        gpu.qsa_extent_check(
+            "qsa_select_selected",
+            p.selected,
+            0,
+            selected_bytes,
+            depth,
+            "indexed_attention_reuse_selection",
+        );
+        gpu.qsa_extent_check(
+            "qsa_select_len_out",
+            p.selected_len_out,
+            0,
+            std::mem::size_of::<i32>(),
+            depth,
+            "indexed_attention_reuse_selection",
+        );
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_reuse_selection",
         [1, 1, 1],
@@ -5305,7 +6376,18 @@ pub fn indexed_attention_reuse_selection(
         snapshot_bytes as u32,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        gpu.qsa_extent_post_launch(
+            "qsa_select_selected",
+            p.selected,
+            0,
+            selected_bytes,
+            QsaSelDepth { rows: 1, end_position: p.position, block_count: 0 },
+            "indexed_attention_reuse_selection",
+        );
+    }
+    Ok(())
 }
 
 /// Formula inputs for a QSA launch whose active count is a quotient of the
@@ -5487,6 +6569,53 @@ fn indexed_attention_pool_rope_impl(
         (Some(_), false) => &bindings[..1],
         (Some(_), true) => &bindings[..],
     };
+    // Extents the kernel touches (`qsa_pool_rope`): workgroup `blockIdx.x` pools
+    // block `first_block + blockIdx.x` and returns before any access when that
+    // is `>= block_count`, so `grid_bound` above the active count only skips
+    // workgroups and the guarded block count is
+    // `min(block_count - first_block, grid_x)`. Per pooled block it reads
+    // `compress * index_dim` raw elements from `block * compress * index_dim`
+    // (channel `< index_dim`, including the RoPE partner `< rotary_dim <=
+    // index_dim`), `index_dim` norm BF16 elements when a norm is bound, and
+    // writes `index_dim` pooled elements at `block * index_dim`. `dim_grid`
+    // rounds channels up to 256; channels `>= index_dim` only join the
+    // reduction (zero) and touch no memory.
+    let extents = || {
+        let done = p.block_count.saturating_sub(first_block).min(grid_x);
+        let raw_elem = p.raw_keys.dtype.size();
+        let pooled_elem = p.pooled.dtype.size();
+        let mut sites = Vec::with_capacity(3);
+        sites.push((
+            "qsa_raw_index_keys",
+            p.raw_keys,
+            first_block * p.compress * p.index_dim * raw_elem,
+            done * p.compress * p.index_dim * raw_elem,
+        ));
+        sites.push((
+            "qsa_pooled_index_keys",
+            p.pooled,
+            first_block * p.index_dim * pooled_elem,
+            done * p.index_dim * pooled_elem,
+        ));
+        if let Some(norm) = p.norm {
+            sites.push(("qsa_index_key_norm", norm, 0, p.index_dim * 2));
+        }
+        let end_position = p.position.map_or(p.block_count * p.compress, |position| {
+            position.position_start + position.rows
+        });
+        (
+            sites,
+            crate::dispatch::QsaExtentDepth {
+                rows: p.position.map_or(0, |position| position.rows),
+                end_position,
+                block_count: p.block_count,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_check(gpu, &sites, depth, "indexed_attention_pool_rope");
+    }
     gpu.launch_blob_recorded(
         kernel,
         [block_grid, dim_grid, 1],
@@ -5497,7 +6626,12 @@ fn indexed_attention_pool_rope_impl(
             grid: None,
             kernargs,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_append_extent_post(gpu, &sites, depth, "indexed_attention_pool_rope");
+    }
+    Ok(())
 }
 
 pub struct IndexedAttentionAttention<'a> {
@@ -5510,7 +6644,15 @@ pub struct IndexedAttentionAttention<'a> {
     pub n_kv_heads: usize,
     pub head_dim: usize,
     pub selected_len: usize,
+    /// Reserved cache rows (kernel argument; the only in-kernel token bound of
+    /// the single-row kernels).
     pub full_capacity: usize,
+    /// Developer extent-check metadata only (`qwen4_qsa_extent_check`); never a
+    /// kernel argument. The caller guarantees every selected id is below
+    /// `end_position` (the row's visible end, `position + 1`); the check bounds
+    /// K/V by `min(end_position, full_capacity)` rows. Callers compute it
+    /// only when the flag is on and otherwise pass `0`.
+    pub end_position: usize,
     /// K/V cache format.
     pub format: QsaKvFormat,
 }
@@ -5531,14 +6673,49 @@ const COPY_REGIONS_MAX: usize = 64;
 /// of one blit dispatch (and host API call) each. Regions of one call run
 /// concurrently, so none may write another's source or destination. A region
 /// that is not 4-byte aligned takes a plain copy.
+///
+/// This is the shared copy helper of the QSA snapshot/restore, session-cache and
+/// VMM-prefix paths: it writes and reads the QSA K/V, raw/pooled index-key and
+/// F16-arena VMM owners. Under `qwen4_qsa_extent_check` every region (also the
+/// unaligned `memcpy_dtod_at_auto` fallback) has both byte ranges checked
+/// against the buffer's mapped bytes before the copy, and the post-launch
+/// helper runs right after each `copy_regions_u32` launch (and each fallback
+/// copy). Guarded extent: the kernel copies exactly `words = bytes / 4`
+/// words per region (`i < words`; the grid-stride loop and the `grid.x`
+/// round-up never exceed it), so `[offset, offset + bytes)` is exact.
 pub fn copy_regions(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> {
+    // One flag test; the unchecked instantiation carries no check state.
+    if gpu.flags.qwen4_qsa_extent_check {
+        copy_regions_impl::<true>(gpu, regions)
+    } else {
+        copy_regions_impl::<false>(gpu, regions)
+    }
+}
+
+/// Body of [`copy_regions`]; `CHECK` is `qwen4_qsa_extent_check`. Every region
+/// is pre-checked; each flush gets ONE post-launch call on the last region
+/// queued into it (the post helper synchronizes the whole device, so one
+/// representative suffices), and each fallback copy gets its own.
+fn copy_regions_impl<const CHECK: bool>(
+    gpu: &mut Gpu,
+    regions: &[CopyRegion<'_>],
+) -> HipResult<()> {
     let mut table = [(0u64, 0u64, 0u32); COPY_REGIONS_MAX];
     let mut count = 0;
+    let mut last_queued: Option<&CopyRegion<'_>> = None;
+    let depth = crate::dispatch::QsaExtentDepth {
+        rows: regions.len(),
+        end_position: 0,
+        block_count: 0,
+    };
     for region in regions {
         if region.dst_offset + region.bytes > region.dst.size()
             || region.src_offset + region.bytes > region.src.size()
         {
             return Err(HipError::new(0, "copy_regions: region exceeds its buffer"));
+        }
+        if CHECK {
+            qsa_copy_region_extent_check(gpu, region, depth);
         }
         let dst = region.dst.as_ptr() as u64 + region.dst_offset as u64;
         let src = region.src.as_ptr() as u64 + region.src_offset as u64;
@@ -5551,6 +6728,9 @@ pub fn copy_regions(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> 
                 region.src_offset,
                 region.bytes,
             )?;
+            if CHECK {
+                qsa_copy_region_extent_post(gpu, region, depth);
+            }
             continue;
         }
         if words == 0 {
@@ -5558,15 +6738,76 @@ pub fn copy_regions(gpu: &mut Gpu, regions: &[CopyRegion<'_>]) -> HipResult<()> 
         }
         table[count] = (dst, src, words as u32);
         count += 1;
+        if CHECK {
+            last_queued = Some(region);
+        }
         if count == COPY_REGIONS_MAX {
             launch_copy_regions(gpu, &table[..count])?;
+            if CHECK {
+                if let Some(region) = last_queued.take() {
+                    qsa_copy_region_extent_post(gpu, region, depth);
+                }
+            }
             count = 0;
         }
     }
     if count > 0 {
         launch_copy_regions(gpu, &table[..count])?;
+        if CHECK {
+            if let Some(region) = last_queued.take() {
+                qsa_copy_region_extent_post(gpu, region, depth);
+            }
+        }
     }
     Ok(())
+}
+
+/// Extent check of both byte ranges of one [`copy_regions`] region.
+fn qsa_copy_region_extent_check(
+    gpu: &Gpu,
+    region: &CopyRegion<'_>,
+    depth: crate::dispatch::QsaExtentDepth,
+) {
+    gpu.qsa_extent_check_buffer(
+        "qsa_copy_dst",
+        region.dst,
+        region.dst_offset,
+        region.bytes,
+        depth,
+        "copy_regions",
+    );
+    gpu.qsa_extent_check_buffer(
+        "qsa_copy_src",
+        region.src,
+        region.src_offset,
+        region.bytes,
+        depth,
+        "copy_regions",
+    );
+}
+
+/// Post-launch sync/fault check of both byte ranges of one [`copy_regions`] region.
+fn qsa_copy_region_extent_post(
+    gpu: &Gpu,
+    region: &CopyRegion<'_>,
+    depth: crate::dispatch::QsaExtentDepth,
+) {
+    gpu.qsa_extent_post_launch_buffer(
+        "qsa_copy_dst",
+        region.dst,
+        region.dst_offset,
+        region.bytes,
+        depth,
+        "copy_regions",
+    );
+    gpu.qsa_extent_post_launch_buffer(
+        "qsa_copy_src",
+        region.src,
+        region.src_offset,
+        region.bytes,
+        depth,
+        "copy_regions",
+    );
 }
 
 fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()> {
@@ -5593,6 +6834,115 @@ fn launch_copy_regions(gpu: &mut Gpu, table: &[(u64, u64, u32)]) -> HipResult<()
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// Selected-list length of the batched QSA attention kernels for the row whose
+/// visible window ends at `visible` tokens: the kernels' own derivation
+/// (`chosen * compress + visible - block_count * compress`, capped by
+/// `capacity`). Developer extent checks only.
+fn qsa_attention_selected_len(
+    visible: usize,
+    budget_blocks: usize,
+    compress: usize,
+    capacity: usize,
+) -> usize {
+    let block_count = visible.checked_div(compress).unwrap_or(0);
+    budget_blocks
+        .min(block_count)
+        .saturating_mul(compress)
+        .saturating_add(visible - block_count.saturating_mul(compress))
+        .min(capacity)
+}
+
+/// Exact end (exclusive byte) of the block-transposed F16 V
+/// `[token / 4][width][token % 4]` that the first `tokens` cache rows touch:
+/// the last token's last channel, `((last / 4) * width + width - 1) * 8 +
+/// (last % 4) * 2 + 2`. Zero tokens touch nothing. Developer extent checks only.
+fn qsa_vb16_extent(tokens: usize, width: usize) -> usize {
+    if tokens == 0 || width == 0 {
+        return 0;
+    }
+    let last = tokens - 1;
+    (last / 4)
+        .saturating_mul(width)
+        .saturating_mul(8)
+        .saturating_add((width - 1).saturating_mul(8))
+        .saturating_add((last % 4) * 2 + 2)
+}
+
+/// Host extents of one batched QSA attention launch for the developer extent
+/// checks (`gpu.flags.qwen4_qsa_extent_check`); built only inside that flag.
+/// `kv_rows` is the visible end the kernels' token guard admits
+/// (`token < full_capacity && token < visible`, visible <= `end_position`),
+/// never the selected count.
+struct QsaBatchExtents {
+    depth: crate::dispatch::QsaExtentDepth,
+    kv_rows: usize,
+    kv_bytes: usize,
+    q_bytes: usize,
+    selected_bytes: usize,
+    output_bytes: usize,
+}
+
+impl QsaBatchExtents {
+    fn new(p: &IndexedAttentionAttentionBatch<'_>, end_position: usize) -> Self {
+        let f32_bytes = std::mem::size_of::<f32>();
+        let kv_rows = end_position.min(p.full_capacity);
+        let selected_last =
+            qsa_attention_selected_len(end_position, p.budget_blocks, p.compress, p.capacity);
+        Self {
+            depth: crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position,
+                block_count: end_position.checked_div(p.compress).unwrap_or(0),
+            },
+            kv_rows,
+            kv_bytes: kv_rows.saturating_mul(p.format.kv_row_bytes(p.n_kv_heads, p.head_dim)),
+            // Whole `[rows][2 * n_heads * head_dim]` query + gate rows.
+            q_bytes: p
+                .rows
+                .saturating_mul(p.n_heads)
+                .saturating_mul(p.head_dim)
+                .saturating_mul(2)
+                .saturating_mul(f32_bytes),
+            // Row r reads `[r * capacity, r * capacity + selected_len(r))`; the
+            // last row ends furthest (earlier rows end by `r * capacity + capacity`).
+            selected_bytes: p
+                .rows
+                .saturating_sub(1)
+                .saturating_mul(p.capacity)
+                .saturating_add(selected_last)
+                .saturating_mul(std::mem::size_of::<i32>()),
+            output_bytes: p
+                .rows
+                .saturating_mul(p.n_heads)
+                .saturating_mul(p.head_dim)
+                .saturating_mul(f32_bytes),
+        }
+    }
+
+    fn check_query(&self, gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>, site: &'static str) {
+        gpu.qsa_extent_check("qsa_attn_q", p.q_with_gate, 0, self.q_bytes, self.depth, site);
+    }
+
+    fn check_kv(&self, gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>, site: &'static str) {
+        gpu.qsa_extent_check("qsa_full_keys", p.full_keys, 0, self.kv_bytes, self.depth, site);
+        gpu.qsa_extent_check("qsa_full_values", p.full_values, 0, self.kv_bytes, self.depth, site);
+    }
+
+    fn check_selected(&self, gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>, site: &'static str) {
+        gpu.qsa_extent_check("qsa_attn_selected", p.selected, 0, self.selected_bytes, self.depth, site);
+    }
+
+    fn check_output(&self, gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>, site: &'static str) {
+        gpu.qsa_extent_check("qsa_attn_output", p.output, 0, self.output_bytes, self.depth, site);
+    }
+
+    /// Post-launch fault probe: one per launch, named by `site`; the operand
+    /// shown on a fault is the output extent.
+    fn post(&self, gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>, site: &'static str) {
+        gpu.qsa_extent_post_launch("qsa_attn_output", p.output, 0, self.output_bytes, self.depth, site);
+    }
 }
 
 pub fn indexed_attention_attention(
@@ -5679,6 +7029,32 @@ pub fn indexed_attention_attention(
         args.push_i32(value);
     }
     args.pad_to(16);
+    // Single-row kernels take no position: `qsa_attention_single` passes
+    // `visible = full_capacity` and `qsa_attention_serial` has no visible
+    // check, so the kernel's only guard on an indirect K/V read is
+    // `token >= 0 && token < full_capacity`. The host bound is the caller's
+    // `end_position` (instrumentation only, never a kernel argument): callers
+    // guarantee every selected id is `< end_position`, so K/V reads are
+    // bounded by `min(end_position, full_capacity)` cache rows, not by the
+    // reserved `full_capacity` nor the selection count. Selected is read for
+    // `[0, selected_len)`; the per-head `dim_grid * 256` channel rounding is
+    // guarded by `channel >= head_dim`.
+    let single_extents = gpu.flags.qwen4_qsa_extent_check.then(|| {
+        (
+            crate::dispatch::QsaExtentDepth { rows: 1, end_position: p.end_position, block_count: 0 },
+            p.end_position
+                .min(p.full_capacity)
+                .saturating_mul(p.format.kv_row_bytes(p.n_kv_heads, p.head_dim)),
+        )
+    });
+    if let Some((depth, kv_bytes)) = single_extents {
+        let f32_bytes = std::mem::size_of::<f32>();
+        gpu.qsa_extent_check("qsa_attn_q", p.q_with_gate, 0, q_elements.saturating_mul(f32_bytes), depth, kernel_name);
+        gpu.qsa_extent_check("qsa_full_keys", p.full_keys, 0, kv_bytes, depth, kernel_name);
+        gpu.qsa_extent_check("qsa_full_values", p.full_values, 0, kv_bytes, depth, kernel_name);
+        gpu.qsa_extent_check("qsa_attn_selected", p.selected, 0, selected_bytes, depth, kernel_name);
+        gpu.qsa_extent_check("qsa_attn_output", p.output, 0, output_elements.saturating_mul(f32_bytes), depth, kernel_name);
+    }
     gpu.launch_blob_recorded(
         kernel_name,
         [head_grid, dim_grid, 1],
@@ -5686,7 +7062,11 @@ pub fn indexed_attention_attention(
         shared_mem,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if let Some((depth, kv_bytes)) = single_extents {
+        gpu.qsa_extent_post_launch("qsa_full_keys", p.full_keys, 0, kv_bytes, depth, kernel_name);
+    }
+    Ok(())
 }
 
 pub struct IndexedAttentionAttentionBatch<'a> {
@@ -6033,6 +7413,24 @@ fn indexed_attention_attention_batch_arena(
         offset: position_offset,
         addend: 0,
     }];
+    // Guarded vs grid-rounded, all four kernels (per-head parallel/serial, hg4,
+    // hg12): the row grid is exact; the per-head kernels' `dim_grid * 256`
+    // channel rounding is guarded by `channel >= head_dim` (hg4/hg12 require
+    // head_dim == 256 = block size). Every kernel validates
+    // `token >= 0 && token < full_capacity && token < visible` with
+    // `visible = position_start + row + 1 <= end_position`, so indirect K/V
+    // reads (and the value reads of invalid entries, which redirect to row 0)
+    // stay below `min(end_position, full_capacity)` cache rows whatever the
+    // selected count or contents. The selected list is read below each row's
+    // own `selected_len` (<= capacity); Q is read whole per (row, head) and
+    // output is written for every `rows * n_heads * head_dim` element.
+    let extents = gpu.flags.qwen4_qsa_extent_check.then(|| QsaBatchExtents::new(p, end_position));
+    if let Some(e) = &extents {
+        e.check_query(gpu, p, kernel_name);
+        e.check_kv(gpu, p, kernel_name);
+        e.check_selected(gpu, p, kernel_name);
+        e.check_output(gpu, p, kernel_name);
+    }
     gpu.launch_blob_recorded(
         kernel_name,
         grid,
@@ -6043,7 +7441,11 @@ fn indexed_attention_attention_batch_arena(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if let Some(e) = &extents {
+        e.post(gpu, p, kernel_name);
+    }
+    Ok(())
 }
 
 /// Split count of the production QSA split-K decode route
@@ -6249,6 +7651,32 @@ fn qsa_decode_splitk_launch(
         combine.push_i32(value);
     }
     combine.pad_to(16);
+    // Partial kernel, guarded vs grid-rounded: grid `[heads or kv heads,
+    // splits, rows]`, every dimension exact (the kernels return on
+    // `row >= rows` / `head >= n_heads` / `split >= splits`). Each split reads
+    // its slice `[begin, end)` of the row's selected list (below the row's
+    // `len`); tokens are validated `< full_capacity && < visible`
+    // (visible = position_start + row + 1 <= end_position), so K/V reads are
+    // bounded by the visible end `min(end_position, full_capacity)` rows, not
+    // by the selected count. Every split writes its whole 258-float record
+    // (`head_dim + 2`; empty slices write the sentinel record too), so the
+    // workspace write extent is `rows * n_heads * splits` records, not the
+    // fixed-bound reservation. Combine reads exactly those records.
+    let splitk = gpu.flags.qwen4_qsa_extent_check.then(|| {
+        let ws_len = p
+            .rows
+            .saturating_mul(p.n_heads)
+            .saturating_mul(splits)
+            .saturating_mul(p.head_dim + 2)
+            .saturating_mul(std::mem::size_of::<f32>());
+        (QsaBatchExtents::new(p, p.position_start.saturating_add(p.rows)), ws_len)
+    });
+    if let Some((e, ws_len)) = &splitk {
+        e.check_query(gpu, p, QSA_DECODE_SPLITK_PARTIAL);
+        e.check_kv(gpu, p, QSA_DECODE_SPLITK_PARTIAL);
+        e.check_selected(gpu, p, QSA_DECODE_SPLITK_PARTIAL);
+        gpu.qsa_extent_check_ptr("qsa_splitk_workspace", workspace, 0, *ws_len, e.depth, QSA_DECODE_SPLITK_PARTIAL);
+    }
     gpu.launch_blob_recorded(
         QSA_DECODE_SPLITK_PARTIAL,
         [head_grid, split_grid, row_grid],
@@ -6257,6 +7685,17 @@ fn qsa_decode_splitk_launch(
         partial.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    if let Some((e, ws_len)) = &splitk {
+        gpu.qsa_extent_post_launch_ptr("qsa_splitk_workspace", workspace, 0, *ws_len, e.depth, QSA_DECODE_SPLITK_PARTIAL);
+    }
+    // Combine: grid `[n_heads, 1, rows]`, `channel = threadIdx.x < head_dim`
+    // (256 = head_dim, exact). Reads the query gate (within the row's `q`
+    // span), the `splits` records of each (row, head), writes the output row.
+    if let Some((e, ws_len)) = &splitk {
+        e.check_query(gpu, p, QSA_DECODE_SPLITK_COMBINE);
+        gpu.qsa_extent_check_ptr("qsa_splitk_workspace", workspace, 0, *ws_len, e.depth, QSA_DECODE_SPLITK_COMBINE);
+        e.check_output(gpu, p, QSA_DECODE_SPLITK_COMBINE);
+    }
     gpu.launch_blob_recorded(
         QSA_DECODE_SPLITK_COMBINE,
         [combine_head_grid, 1, row_grid],
@@ -6264,7 +7703,11 @@ fn qsa_decode_splitk_launch(
         0,
         combine.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if let Some((e, _)) = &splitk {
+        e.post(gpu, p, QSA_DECODE_SPLITK_COMBINE);
+    }
+    Ok(())
 }
 
 /// Every shape, type and scalar check of the direct split-K entry; returns
@@ -6439,6 +7882,21 @@ fn qsa_dense_wmma(
     args.push_i32(kv_heads);
     args.push_i32(tpad_i);
     args.pad_to(16);
+    // `indexed_attention_kv_f16`: grid `[tpad, n_kv_heads]` x 256 covers `width`
+    // channels exactly; `tok >= tpad` returns. Reads F32 cache rows
+    // `[0, end_position)` (`tok < tokens`); writes F16 K rows
+    // `[0, end_position)` and V^T `[width][tpad]`, where the `tok >= tokens`
+    // columns up to `tpad = ceil32(end_position)` are zero-filled: the V^T
+    // write extent is grid-rounded to `width * tpad` F16, not `end_position`.
+    let dense = gpu.flags.qwen4_qsa_extent_check.then(|| QsaBatchExtents::new(p, end_position));
+    if let Some(e) = &dense {
+        let site = "indexed_attention_kv_f16";
+        let source = k_elements.saturating_mul(4);
+        gpu.qsa_extent_check("qsa_dense_full_keys", p.full_keys, 0, source, e.depth, site);
+        gpu.qsa_extent_check("qsa_dense_full_values", p.full_values, 0, source, e.depth, site);
+        gpu.qsa_extent_check_ptr("qsa_dense_f16_k", k16, 0, k_elements.saturating_mul(2), e.depth, site);
+        gpu.qsa_extent_check_ptr("qsa_dense_f16_vt", vt16, 0, vt_elements.saturating_mul(2), e.depth, site);
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_kv_f16",
         [
@@ -6451,6 +7909,9 @@ fn qsa_dense_wmma(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    if let Some(e) = &dense {
+        gpu.qsa_extent_post_launch_ptr("qsa_dense_f16_vt", vt16, 0, vt_elements.saturating_mul(2), e.depth, "indexed_attention_kv_f16");
+    }
     let mut args = KernargBlob::new();
     args.push_ptr(p.q_with_gate.buf.as_ptr());
     args.push_ptr(k16);
@@ -6462,6 +7923,22 @@ fn qsa_dense_wmma(
     args.push_i32(checked_i32(p.n_heads, "QSA dense heads")?);
     args.push_i32(kv_heads);
     args.pad_to(16);
+    // Guarded vs grid-rounded: block `t0 = blockIdx.x * 16` rows; K tiles of 32
+    // keys are fetched only while `k0 + key < kv_hi` with
+    // `kv_hi = position_start + min(t0 + 16, rows) <= end_position`, so K reads
+    // are guarded to `end_position` rows. V^T tiles are fetched unguarded
+    // per 32-key tile for `k0 < kv_hi`, i.e. up to `tpad = ceil32(end_position)`
+    // columns of every head dim: the grid-rounded extent is all of
+    // `width * tpad` F16. Query rows are guarded `t0 + q < rows` (rows
+    // `[0, rows)` read), output rows `row >= rows` skip; the selection is not
+    // read (whole causal window).
+    if let Some(e) = &dense {
+        let site = "indexed_attention_dense_wmma_f16";
+        e.check_query(gpu, p, site);
+        e.check_output(gpu, p, site);
+        gpu.qsa_extent_check_ptr("qsa_dense_f16_k", k16, 0, k_elements.saturating_mul(2), e.depth, site);
+        gpu.qsa_extent_check_ptr("qsa_dense_f16_vt", vt16, 0, vt_elements.saturating_mul(2), e.depth, site);
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_dense_wmma_f16",
         [
@@ -6473,7 +7950,11 @@ fn qsa_dense_wmma(
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if let Some(e) = &dense {
+        e.post(gpu, p, "indexed_attention_dense_wmma_f16");
+    }
+    Ok(())
 }
 
 /// Static LDS of the gathered kernels: F16 Q (16 heads x 256), two parity
@@ -6740,6 +8221,29 @@ fn qsa_gathered_wmma_launch_with(
             args.push_i32(tokens);
             args.push_i32(kv_heads);
             args.pad_to(16);
+            // Exact guards: grid `[end_position, n_kv_heads]` x 256 threads
+            // covers `width` channels with no rounding (the q8/fp8 twins index
+            // by head and `threadIdx.x`, same coverage); `tok >= tokens`
+            // returns. Reads cache rows `[0, end_position)` of the format's
+            // row bytes; writes F16 K rows `[0, end_position)` and V elements of
+            // tokens `[0, end_position)` only (`tok >= tokens` exits; no padding
+            // is written), i.e. the exact highest stored byte
+            // [`qsa_vb16_extent`], not a whole last block. `bytes` above is the
+            // allocation (K + whole-block V), unchanged.
+            let convert_extents = gpu.flags.qwen4_qsa_extent_check.then(|| {
+                (
+                    QsaBatchExtents::new(p, end_position).depth,
+                    end_position.saturating_mul(p.format.kv_row_bytes(p.n_kv_heads, 256)),
+                    k_elements.saturating_mul(2),
+                    qsa_vb16_extent(end_position, width),
+                )
+            });
+            if let Some((depth, source_len, k_len, v_len)) = convert_extents {
+                gpu.qsa_extent_check("qsa_gather_full_keys", p.full_keys, 0, source_len, depth, convert);
+                gpu.qsa_extent_check("qsa_gather_full_values", p.full_values, 0, source_len, depth, convert);
+                gpu.qsa_extent_check_ptr("qsa_gather_f16_k", k16, 0, k_len, depth, convert);
+                gpu.qsa_extent_check_ptr("qsa_gather_f16_vb", vb16, 0, v_len, depth, convert);
+            }
             gpu.launch_blob_recorded(
                 convert,
                 [checked_u32(end_position, "QSA gathered token grid")?, p.n_kv_heads as u32, 1],
@@ -6748,6 +8252,9 @@ fn qsa_gathered_wmma_launch_with(
                 args.as_mut_slice(),
                 crate::dispatch::ReplayLaunchBindings::NONE,
             )?;
+            if let Some((depth, _, _, v_len)) = convert_extents {
+                gpu.qsa_extent_post_launch_ptr("qsa_gather_f16_vb", vb16, 0, v_len, depth, convert);
+            }
             (k16, vb16)
         }
     };
@@ -6772,6 +8279,44 @@ fn qsa_gathered_wmma_launch_with(
     args.pad_to(16);
     // The validated token list of the longest selection, in 128-entry tiles.
     let lds = checked_u32(max_selected.div_ceil(128) * 128 * 4, "QSA gathered LDS")?;
+    // PM twin (crates/peacemaker-isa/src/kernels/qsa_gather.rip.rs, `prologue` /
+    // `stage` / `attend`): same selection length, token validation and
+    // `token < full_capacity && token < visible` mask. Its raw buffer
+    // descriptors declare selected = `selected_len * 4`, Q = `n_heads * 2048`,
+    // output = `n_heads * 1024` (all per-row bases), k16 = `full_capacity *
+    // width * 2` and vb16 = `ceil4(full_capacity) * width * 2` records; an
+    // invalid token's offset is `GATHER_OOB`, so it touches no memory. The
+    // memory actually touched is therefore the extent checked below.
+    // Guarded vs grid-rounded: one workgroup per (row, kv head), grid is exact.
+    // Selected entries are read only below the row's `selected_len`; the token
+    // list is validated `token >= 0 && token < full_capacity && token < visible`
+    // (visible = position_start + row + 1 <= end_position), so K rows read are
+    // `< min(end_position, full_capacity)` (invalid entries read row 0) and
+    // the V elements of those tokens only: the whole-block 8-byte load needs
+    // all four tokens valid and every other path loads 2 bytes per valid
+    // token, so the highest byte read is [`qsa_vb16_extent`]`(kv_rows, width)`.
+    // The visible end, not the selected count, bounds K/V. The 128-entry tile
+    // rounding of `selected_len` is dynamic LDS only (`lds` above), never
+    // global memory. Q/output are the full `rows` extents; `l16 >= group`
+    // lanes return before touching output.
+    let attend_extents = gpu.flags.qwen4_qsa_extent_check.then(|| QsaBatchExtents::new(p, end_position));
+    if let Some(e) = &attend_extents {
+        e.check_query(gpu, p, attend);
+        e.check_selected(gpu, p, attend);
+        e.check_output(gpu, p, attend);
+        let k_len = e.kv_rows.saturating_mul(width).saturating_mul(2);
+        let v_len = qsa_vb16_extent(e.kv_rows, width);
+        match arena {
+            Some(arena) => {
+                gpu.qsa_extent_check("qsa_f16_arena_keys", arena.keys, 0, k_len, e.depth, attend);
+                gpu.qsa_extent_check("qsa_f16_arena_values", arena.values, 0, v_len, e.depth, attend);
+            }
+            None => {
+                gpu.qsa_extent_check_ptr("qsa_gather_f16_k", k16, 0, k_len, e.depth, attend);
+                gpu.qsa_extent_check_ptr("qsa_gather_f16_vb", vb16, 0, v_len, e.depth, attend);
+            }
+        }
+    }
     gpu.launch_blob_recorded(
         attend,
         [
@@ -6783,7 +8328,11 @@ fn qsa_gathered_wmma_launch_with(
         lds,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if let Some(e) = &attend_extents {
+        e.post(gpu, p, attend);
+    }
+    Ok(())
 }
 
 /// Bring a QSA layer's persistent F16 arena up to `end_tokens` cache rows:
@@ -6876,6 +8425,31 @@ pub fn qsa_f16_arena_sync(
     args.push_i32(tokens);
     args.push_i32(kv_heads);
     args.pad_to(16);
+    // Exact guards: grid `[end_tokens - start, n_kv_heads]` x 256 threads covers
+    // `width = n_kv_heads * 256` channels with no rounding, and the kernel's
+    // `tok >= tokens` guard is the grid itself. Reads the F32 cache rows
+    // `[start, end_tokens)` (offset `start * width * 4`); writes F16 K rows
+    // `[start, end_tokens)` and the block-transposed V elements of tokens
+    // `[start, end_tokens)` at byte offset `start / 4 * width * 8`. The kernel
+    // stores only existing tokens (`tok >= tokens` exits, no padding is
+    // written), so the V extent is the exact highest stored byte
+    // ([`qsa_vb16_extent`] of the local token count; `start` is a multiple of
+    // four), not a whole last block.
+    let sync_extents = gpu.flags.qwen4_qsa_extent_check.then(|| {
+        let rows = end_tokens - start;
+        (
+            crate::dispatch::QsaExtentDepth { rows, end_position: end_tokens, block_count: end_tokens / 4 },
+            rows.saturating_mul(width).saturating_mul(4),
+            rows.saturating_mul(width).saturating_mul(2),
+            qsa_vb16_extent(rows, width),
+        )
+    });
+    if let Some((depth, source_len, k_len, v_len)) = sync_extents {
+        gpu.qsa_extent_check("qsa_f16_sync_full_keys", full_keys, f32_offset, source_len, depth, kernel);
+        gpu.qsa_extent_check("qsa_f16_sync_full_values", full_values, f32_offset, source_len, depth, kernel);
+        gpu.qsa_extent_check("qsa_f16_arena_keys", arena.keys, k_offset, k_len, depth, kernel);
+        gpu.qsa_extent_check("qsa_f16_arena_values", arena.values, v_offset, v_len, depth, kernel);
+    }
     gpu.launch_blob_recorded(
         kernel,
         [checked_u32(end_tokens - start, "QSA F16 arena token grid")?, n_kv_heads as u32, 1],
@@ -6884,6 +8458,9 @@ pub fn qsa_f16_arena_sync(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    if let Some((depth, _, _, v_len)) = sync_extents {
+        gpu.qsa_extent_post_launch("qsa_f16_arena_values", arena.values, v_offset, v_len, depth, kernel);
+    }
     arena.valid_len.converted(end_tokens);
     Ok(())
 }
@@ -6918,6 +8495,22 @@ pub fn indexed_attention_pool(gpu: &mut Gpu, p: &IndexedAttentionPool<'_>) -> Hi
     args.push_i32(block_count);
     args.push_i32(head_dim);
     args.pad_to(16);
+    // `indexed_attention_pool_f32` is not defined anywhere in kernels/src (this
+    // entry point has no caller and `ensure_kernel_public` above fails first),
+    // so these are the host shape-contract extents, not a measured kernel
+    // guard: raw keys `[block_count * 4][head_dim]` read, pooled
+    // `[block_count][head_dim]` written. `dim_grid * 256` may exceed
+    // `head_dim` (grid-rounded); a kernel for this ABI must guard
+    // `channel < head_dim`, which this check cannot see.
+    let pool_depth = gpu.flags.qwen4_qsa_extent_check.then(|| crate::dispatch::QsaExtentDepth {
+        rows: p.block_count,
+        end_position: p.block_count.saturating_mul(4),
+        block_count: p.block_count,
+    });
+    if let Some(depth) = pool_depth {
+        gpu.qsa_extent_check("qsa_pool_raw_keys", p.raw_keys, 0, raw_elements.saturating_mul(4), depth, "indexed_attention_pool_f32");
+        gpu.qsa_extent_check("qsa_pool_pooled", p.pooled, 0, pooled_elements.saturating_mul(4), depth, "indexed_attention_pool_f32");
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_pool_f32",
         [block_grid, dim_grid, 1],
@@ -6925,7 +8518,11 @@ pub fn indexed_attention_pool(gpu: &mut Gpu, p: &IndexedAttentionPool<'_>) -> Hi
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
-    )
+    )?;
+    if let Some(depth) = pool_depth {
+        gpu.qsa_extent_post_launch("qsa_pool_pooled", p.pooled, 0, pooled_elements.saturating_mul(4), depth, "indexed_attention_pool_f32");
+    }
+    Ok(())
 }
 
 /// In-place scalar scaling for learned HC branch projections.
@@ -9600,6 +11197,7 @@ mod tests {
                 head_dim: 1,
                 selected_len: 1,
                 full_capacity: 1,
+                end_position: 1,
                 format: QsaKvFormat::F32,
             },
         )
@@ -9724,6 +11322,7 @@ mod tests {
             &mut gpu,
             &IndexedAttentionSelectBatch {
                 pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
                 query: &query_gpu,
                 pooled: &pooled_gpu,
                 selected: &selected_gpu,
@@ -10007,6 +11606,7 @@ mod tests {
             .expect("selected allocation");
         let params = IndexedAttentionSelectBatch {
             pooled_bf16: None,
+            pooled_bf16_valid_blocks: 0,
             query: &query,
             pooled: &pooled,
             selected: &selected,
@@ -10171,6 +11771,7 @@ mod tests {
                 gpu,
                 &IndexedAttentionSelectBatch {
                     pooled_bf16: None,
+                    pooled_bf16_valid_blocks: 0,
                     query: &t.query,
                     pooled: &t.pooled,
                     selected: &t.selected,
@@ -10745,6 +12346,7 @@ mod tests {
                 gpu,
                 &IndexedAttentionSelectBatch {
                     pooled_bf16: None,
+                    pooled_bf16_valid_blocks: 0,
                     query: &query_gpu,
                     pooled: &pooled_gpu,
                     selected: &selected,
@@ -11385,6 +12987,7 @@ mod tests {
             gpu,
             &IndexedAttentionSelectBatch {
                 pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
                 query: &query_gpu,
                 pooled: &pooled_gpu,
                 selected: &selected,
@@ -12303,6 +13906,7 @@ mod tests {
                     head_dim,
                     selected_len,
                     full_capacity: visible,
+                    end_position: visible,
                     format,
                 },
             )
@@ -12401,6 +14005,7 @@ mod tests {
                     &mut gpu,
                     &IndexedAttentionSelectBatch {
                         pooled_bf16: None,
+                        pooled_bf16_valid_blocks: 0,
                         query: &query_gpu,
                         pooled,
                         selected: &selected,
@@ -12809,6 +14414,7 @@ mod tests {
         fn params(&self) -> IndexedAttentionSelectBatch<'_> {
             IndexedAttentionSelectBatch {
                 pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
                 query: &self.query,
                 pooled: &self.pooled,
                 selected: &self.selected,
@@ -13055,6 +14661,7 @@ mod tests {
                     };
                     let p = IndexedAttentionSelectBatch {
                         pooled_bf16: None,
+                        pooled_bf16_valid_blocks: 0,
                         query: &query_t,
                         pooled: &pooled,
                         selected: &selected,

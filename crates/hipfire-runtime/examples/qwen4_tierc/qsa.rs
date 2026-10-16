@@ -1469,6 +1469,7 @@ fn public_select(
             query: r.query,
             pooled: r.pooled,
             pooled_bf16: None,
+            pooled_bf16_valid_blocks: 0,
             selected: &selected,
             rows: r.rows,
             query_row_stride: IDX_W,
@@ -2014,6 +2015,7 @@ fn case_attention_single(gpu: &mut Gpu) -> Result<String, String> {
             head_dim: HD,
             selected_len: count as usize,
             full_capacity,
+            end_position: s.position + 1,
             format: QsaKvFormat::F32,
         },
     )
@@ -2972,6 +2974,7 @@ fn case_fp8_attention_single(gpu: &mut Gpu) -> Result<String, String> {
             head_dim: HD,
             selected_len: count as usize,
             full_capacity,
+            end_position: s.position + 1,
             format: FP8_FMT,
         },
     )
@@ -3008,6 +3011,7 @@ fn case_fp8_select_attention(gpu: &mut Gpu) -> Result<String, String> {
                 query: &query_t,
                 pooled: &pooled_t,
                 pooled_bf16: None,
+                pooled_bf16_valid_blocks: 0,
                 selected: &selected,
                 rows,
                 query_row_stride: IDX_W,

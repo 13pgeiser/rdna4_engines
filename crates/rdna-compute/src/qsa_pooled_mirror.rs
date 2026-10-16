@@ -214,6 +214,37 @@ pub fn qsa_pooled_bf16_sync(
     args.push_i32(end);
     args.push_i32(dim);
     args.pad_to(16);
+    // Extents (`qsa_pooled_f32_to_bf16_mirror`): thread `q < (end - first) *
+    // index_dim / 4` converts one quad, reading 16 F32 bytes at `first * index_dim *
+    // 4 + q * 16` and writing 8 BF16 bytes at `first * index_dim * 2 + q * 8`;
+    // the `grid_x` round-up to 256 threads never passes that guard, and
+    // `index_dim % 4 == 0` (`plan`) makes the byte lengths exact:
+    // pooled read `(end - first) * index_dim * 4`, mirror write
+    // `(end - first) * index_dim * 2`. Both pointers are whole-tensor bases, so
+    // the tensor helper resolves the backing owner at call time.
+    if gpu.flags.qwen4_qsa_extent_check {
+        let depth = crate::dispatch::QsaExtentDepth {
+            rows: complete_blocks - valid,
+            end_position: 0,
+            block_count: complete_blocks,
+        };
+        gpu.qsa_extent_check(
+            "qsa_pooled_f32",
+            pooled_f32,
+            valid * index_dim * 4,
+            (complete_blocks - valid) * index_dim * 4,
+            depth,
+            "qsa_pooled_bf16_sync",
+        );
+        gpu.qsa_extent_check(
+            "qsa_pooled_bf16_mirror",
+            mirror,
+            valid * index_dim * 2,
+            (complete_blocks - valid) * index_dim * 2,
+            depth,
+            "qsa_pooled_bf16_sync",
+        );
+    }
     gpu.launch_blob_recorded(
         CONVERT,
         [grid, 1, 1],
@@ -222,6 +253,29 @@ pub fn qsa_pooled_bf16_sync(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let depth = crate::dispatch::QsaExtentDepth {
+            rows: complete_blocks - valid,
+            end_position: 0,
+            block_count: complete_blocks,
+        };
+        gpu.qsa_extent_post_launch(
+            "qsa_pooled_f32",
+            pooled_f32,
+            valid * index_dim * 4,
+            (complete_blocks - valid) * index_dim * 4,
+            depth,
+            "qsa_pooled_bf16_sync",
+        );
+        gpu.qsa_extent_post_launch(
+            "qsa_pooled_bf16_mirror",
+            mirror,
+            valid * index_dim * 2,
+            (complete_blocks - valid) * index_dim * 2,
+            depth,
+            "qsa_pooled_bf16_sync",
+        );
+    }
     mark.advance(complete_blocks);
     Ok(())
 }
@@ -255,6 +309,26 @@ pub fn qsa_pooled_bf16_low_nonzero_count(
     args.push_i32(end);
     args.push_i32(dim);
     args.pad_to(16);
+    // Extents (`qsa_pooled_f32_low_nonzero_count`): thread `q < (end - first) *
+    // index_dim / 4` reads one 16-byte F32 quad at `first * index_dim + q * 4`;
+    // the grid round-up to 256 threads never passes that guard. `count` takes
+    // one atomic u32 word.
+    if gpu.flags.qwen4_qsa_extent_check {
+        let depth = crate::dispatch::QsaExtentDepth {
+            rows: end_block - first_block,
+            end_position: 0,
+            block_count: end_block,
+        };
+        gpu.qsa_extent_check(
+            "qsa_pooled_f32",
+            pooled_f32,
+            first_block * index_dim * 4,
+            (end_block - first_block) * index_dim * 4,
+            depth,
+            "qsa_pooled_bf16_low_nonzero_count",
+        );
+        gpu.qsa_extent_check("qsa_pooled_probe_count", &count, 0, 4, depth, "qsa_pooled_bf16_low_nonzero_count");
+    }
     let launched = gpu.launch_blob_recorded(
         PROBE,
         [grid, 1, 1],
@@ -263,6 +337,22 @@ pub fn qsa_pooled_bf16_low_nonzero_count(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     );
+    if launched.is_ok() && gpu.flags.qwen4_qsa_extent_check {
+        let depth = crate::dispatch::QsaExtentDepth {
+            rows: end_block - first_block,
+            end_position: 0,
+            block_count: end_block,
+        };
+        gpu.qsa_extent_post_launch(
+            "qsa_pooled_f32",
+            pooled_f32,
+            first_block * index_dim * 4,
+            (end_block - first_block) * index_dim * 4,
+            depth,
+            "qsa_pooled_bf16_low_nonzero_count",
+        );
+        gpu.qsa_extent_post_launch("qsa_pooled_probe_count", &count, 0, 4, depth, "qsa_pooled_bf16_low_nonzero_count");
+    }
     let bits = launched.and_then(|()| gpu.download_f32(&count));
     let freed = gpu.free_tensor(count);
     let bits = bits?;

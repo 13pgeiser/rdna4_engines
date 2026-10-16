@@ -480,6 +480,41 @@ pub fn indexed_attention_norm_rope_batch_arena(
         offset: position_offset,
         addend: 0,
     }];
+    // Extents (`indexed_attention_norm_rope_batch_arena`): grid `[heads, 1,
+    // rows]` exact; each head copies its whole `head_stride` (the last head the
+    // rest of `row_stride`) from the BF16 arena and writes the F32 row, so the
+    // kernel touches the FULL `row_stride` of every row (wider than the incumbent
+    // launcher's `head_span`): BF16 source `(rows - 1) * src_pitch + row_stride`
+    // elements from `src_col0`, F32 `values` `rows * row_stride`, `head_dim`
+    // norm BF16.
+    let extents = || {
+        (
+            [
+                (
+                    "qsa_norm_rope_src",
+                    src.tensor,
+                    src.col0_elems * 2,
+                    ((p.rows - 1) * src.row_pitch_elems + p.row_stride) * 2,
+                ),
+                (
+                    "qsa_norm_rope_values",
+                    p.values,
+                    0usize,
+                    p.rows * p.row_stride * 4,
+                ),
+                ("qsa_norm_rope_norm", p.norm, 0, p.head_dim * 2),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: p.position_start + p.rows,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_check(gpu, &sites, depth, "indexed_attention_norm_rope_batch_arena");
+    }
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_batch_arena",
         [head_grid, dim_grid, row_grid],
@@ -490,7 +525,12 @@ pub fn indexed_attention_norm_rope_batch_arena(
             grid: None,
             kernargs: &position_binding,
         },
-    )
+    )?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_post(gpu, &sites, depth, "indexed_attention_norm_rope_batch_arena");
+    }
+    Ok(())
 }
 
 fn validate_arena_params(p: &GatedDeltaParamsBatched<'_>, a: Bf16Arena<'_>, b: Bf16Arena<'_>) -> HipResult<usize> {
@@ -599,6 +639,35 @@ pub fn npu_trunk_copy_projection_arena(
         rows, cols, dst_pitch, dst_col0, position_start, false)
 }
 
+/// One operand of an arena QSA append launch checked under
+/// `qwen4_qsa_extent_check`: arena label, tensor, byte offset, accessed bytes.
+type QsaArenaExtent<'a> = (&'static str, &'a GpuTensor, usize, usize);
+
+/// Pre-launch extent check of every operand (callers gate the call and the
+/// computation of `extents` on `gpu.flags.qwen4_qsa_extent_check`).
+fn qsa_arena_extent_check(
+    gpu: &Gpu,
+    extents: &[QsaArenaExtent<'_>],
+    depth: crate::dispatch::QsaExtentDepth,
+    site: &'static str,
+) {
+    for &(arena, tensor, offset, len) in extents {
+        gpu.qsa_extent_check(arena, tensor, offset, len, depth, site);
+    }
+}
+
+/// Post-launch helper for every operand, called immediately after the launch.
+fn qsa_arena_extent_post(
+    gpu: &Gpu,
+    extents: &[QsaArenaExtent<'_>],
+    depth: crate::dispatch::QsaExtentDepth,
+    site: &'static str,
+) {
+    for &(arena, tensor, offset, len) in extents {
+        gpu.qsa_extent_post_launch(arena, tensor, offset, len, depth, site);
+    }
+}
+
 fn arena_copy(
     gpu: &mut Gpu, src: &GpuTensor, src_pitch: usize, src_col0: usize,
     dst: &GpuTensor, rows: usize, cols: usize, dst_pitch: usize,
@@ -642,9 +711,47 @@ fn arena_copy(
     let position_offset = args.len() - 4;
     args.pad_to(16);
     let binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset: position_offset, addend: 0 }];
+    // Extents (`npu_arena_copy_*_pm`): thread `t < cols` of row `r < rows` copies
+    // `src[r * src_pitch + src_col0 + t]` to `dst[(position_start + r) * dst_pitch
+    // + dst_col0 + t]` (the `cols.div_ceil(32)` grid round-up is masked by
+    // `cols > t`). This shared helper writes the QSA full K/V caches (F32 path),
+    // the raw index keys and the index-row tail, so every call is checked.
+    let extents = || {
+        let (src_elem, dst_elem) = (src.dtype.size(), dst.dtype.size());
+        (
+            [
+                (
+                    "qsa_arena_copy_src",
+                    src,
+                    src_col0 * src_elem,
+                    ((rows - 1) * src_pitch + cols) * src_elem,
+                ),
+                (
+                    "qsa_arena_copy_dst",
+                    dst,
+                    (position_start * dst_pitch + dst_col0) * dst_elem,
+                    ((rows - 1) * dst_pitch + cols) * dst_elem,
+                ),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows,
+                end_position: position_start + rows,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_check(gpu, &sites, depth, "arena_copy");
+    }
     gpu.launch_blob_recorded(symbol, [checked_u32(cols.div_ceil(32), "arena copy grid")?, checked_u32(rows, "arena copy rows")?, 1],
         [32,1,1], 0, args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: if bind_position { &binding } else { &[] } })
+        crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: if bind_position { &binding } else { &[] } })?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_post(gpu, &sites, depth, "arena_copy");
+    }
+    Ok(())
 }
 
 /// `key = None` reads normalized F32 K from `p.key`; `Some` reads direct BF16.
@@ -691,9 +798,63 @@ pub fn indexed_attention_cache_append_batch_arena(
     }
     args.push_i32(i32::from(key_bf16));
     let binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset: position_offset, addend: 0 }];
+    // Extents (`qsa_cache_append_batched_arena`): guard `head < kv_heads && row <
+    // rows`, reads (`c < head_dim`) key `row * key_pitch + key_col0 + head *
+    // head_dim + c` (BF16 arena or F32 normalized K) and BF16 value `row *
+    // value_pitch + value_col0 + ...`, i.e. `(rows - 1) * pitch + width`
+    // elements from the column origin; each cache receives `rows` whole format
+    // rows (`kv_row_bytes`: fp8 `kv_heads * (head_dim + 2)`, q8 `kv_heads *
+    // head_dim / 32 * 34`) at `position_start * kv_row_bytes`
+    // (`qsa_kv_store` stores nothing for `c >= head_dim`).
+    let extents = || {
+        let row_bytes = p.format.kv_row_bytes(p.kv_heads, p.head_dim);
+        let key_elem = key_tensor.dtype.size();
+        (
+            [
+                (
+                    "qsa_keys",
+                    key_tensor,
+                    key_col0 * key_elem,
+                    ((p.rows - 1) * key_pitch + width) * key_elem,
+                ),
+                (
+                    "qsa_values",
+                    value.tensor,
+                    value.col0_elems * 2,
+                    ((p.rows - 1) * value.row_pitch_elems + width) * 2,
+                ),
+                (
+                    "qsa_full_keys",
+                    p.full_keys,
+                    p.position_start * row_bytes,
+                    p.rows * row_bytes,
+                ),
+                (
+                    "qsa_full_values",
+                    p.full_values,
+                    p.position_start * row_bytes,
+                    p.rows * row_bytes,
+                ),
+            ],
+            crate::dispatch::QsaExtentDepth {
+                rows: p.rows,
+                end_position: end,
+                block_count: 0,
+            },
+        )
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_check(gpu, &sites, depth, "indexed_attention_cache_append_batch_arena");
+    }
     arena_launch(gpu,kernel,
         [checked_u32(p.kv_heads,"arena KV heads")?,checked_u32(p.rows,"arena KV rows")?,1],256,&mut args,
-        crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: &binding })
+        crate::dispatch::ReplayLaunchBindings { grid: None, kernargs: &binding })?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        let (sites, depth) = extents();
+        qsa_arena_extent_post(gpu, &sites, depth, "indexed_attention_cache_append_batch_arena");
+    }
+    Ok(())
 }
 
 /// Direct BF16 index-key append, also writing the incumbent's F32 tail in

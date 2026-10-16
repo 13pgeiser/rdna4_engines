@@ -1293,6 +1293,7 @@ mod g3 {
         IndexedAttentionSelectBatch {
             query: &b.query, pooled: &b.pooled, selected: &b.selected, rows: c.rows, query_row_stride: c.stride,
             pooled_bf16: None,
+            pooled_bf16_valid_blocks: 0,
             block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
             position_start: c.position_start, capacity: c.capacity, shape_blocks: case.shape_blocks,
         }
@@ -1913,6 +1914,7 @@ mod g3_bf16 {
         IndexedAttentionSelectBatch {
             query: &d.query, pooled: &d.pooled, selected: &d.selected, rows: c.rows, query_row_stride: c.stride,
             pooled_bf16: None,
+            pooled_bf16_valid_blocks: 0,
             block_count: c.block_count, index_heads: 4, index_dim: c.dim, budget_blocks: c.budget, compress: c.compress,
             position_start: c.position_start, capacity: c.capacity, shape_blocks: shape,
         }
@@ -2397,7 +2399,7 @@ mod filter_route {
             let query = d.query.sub_offset(first * c.stride, d.query.numel() - first * c.stride);
             let selected = d.sel.view.sub_offset(first * row_bytes, d.sel.payload - first * row_bytes);
             let p = IndexedAttentionSelectBatch {
-                query: &query, pooled: &d.pooled, pooled_bf16: None, selected: &selected, rows: end - first,
+                query: &query, pooled: &d.pooled, pooled_bf16: None, pooled_bf16_valid_blocks: 0, selected: &selected, rows: end - first,
                 query_row_stride: c.stride, block_count: (c.position_start + end) / c.compress, index_heads: 4,
                 index_dim: c.dim, budget_blocks: c.budget, compress: c.compress, position_start: c.position_start + first,
                 capacity: c.capacity, shape_blocks: case.shape_blocks,

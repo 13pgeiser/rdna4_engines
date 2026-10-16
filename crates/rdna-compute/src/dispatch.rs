@@ -430,6 +430,74 @@ pub struct GpuTensor {
     pub dtype: DType,
 }
 
+/// Host-visible QSA depth associated with a checked kernel launch.
+#[derive(Clone, Copy, Debug)]
+pub struct QsaExtentDepth {
+    pub rows: usize,
+    pub end_position: usize,
+    pub block_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct QsaExtent {
+    numel: usize,
+    elem_bytes: usize,
+    mapped_bytes: usize,
+    /// Checked `bias + offset + len`; `None` when it overflows `usize` or the
+    /// storage is unknown (fail closed).
+    required_end: Option<usize>,
+    valid_blocks: usize,
+}
+
+/// Rejected QSA extent: the arena label, the byte limit (VMM mapped prefix or
+/// allocation size) and the required end offset. `overflow` means the end could
+/// not be computed (`required_end == usize::MAX`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QsaExtentFailure {
+    pub arena: &'static str,
+    pub limit_bytes: usize,
+    pub required_end: usize,
+    pub overflow: bool,
+}
+
+/// Checked `bias + offset + len`; `None` on `usize` overflow.
+pub(crate) fn qsa_required_end(bias: usize, offset: usize, len: usize) -> Option<usize> {
+    bias.checked_add(offset).and_then(|n| n.checked_add(len))
+}
+
+/// View bias and byte limit for a buffer at `ptr`. `owners` yields
+/// `(base, reserved_bytes, mapped_bytes)` of each registered VMM owner: a view
+/// inside an owner's reserved range is limited to that owner's MAPPED prefix
+/// (the view's logical size is not proof the pages are mapped); anything else is
+/// limited to its own allocation size.
+pub(crate) fn qsa_extent_limit(
+    ptr: usize,
+    owners: impl IntoIterator<Item = (usize, usize, usize)>,
+    allocation_bytes: usize,
+) -> (usize, usize) {
+    owners
+        .into_iter()
+        .find_map(|(base, reserved, mapped)| {
+            ptr.checked_sub(base).filter(|&n| n < reserved).map(|n| (n, mapped))
+        })
+        .unwrap_or((0, allocation_bytes))
+}
+
+/// Pure extent decision: `Ok(required_end)` when the end fits `limit_bytes`;
+/// otherwise (including overflow or unknown storage, `required_end == None`) the
+/// failure carries arena, limit and required end.
+pub(crate) fn qsa_extent_verdict(
+    arena: &'static str,
+    required_end: Option<usize>,
+    limit_bytes: usize,
+) -> Result<usize, QsaExtentFailure> {
+    match required_end {
+        Some(end) if end <= limit_bytes => Ok(end),
+        Some(end) => Err(QsaExtentFailure { arena, limit_bytes, required_end: end, overflow: false }),
+        None => Err(QsaExtentFailure { arena, limit_bytes, required_end: usize::MAX, overflow: true }),
+    }
+}
+
 impl GpuTensor {
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
@@ -5636,6 +5704,170 @@ impl Gpu {
             .map(VmmArena::mapped_bytes)
     }
 
+    /// Developer-only mapped extent check. Callers gate argument computation on
+    /// `qwen4_qsa_extent_check`; no allocation, FFI or formatting on the off path.
+    pub fn qsa_extent_check(
+        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(arena, self.qsa_tensor_extent(t, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_pooled(
+        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str, valid_blocks: usize,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            let mut extent = self.qsa_tensor_extent(t, offset_bytes, len_bytes);
+            extent.valid_blocks = valid_blocks;
+            self.qsa_extent_assert(arena, extent, depth, site);
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_pooled(
+        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str, valid_blocks: usize,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            let mut extent = self.qsa_tensor_extent(t, offset_bytes, len_bytes);
+            extent.valid_blocks = valid_blocks;
+            self.qsa_extent_sync(arena, extent, depth, site);
+        }
+    }
+
+    fn qsa_tensor_extent(&self, t: &GpuTensor, offset: usize, len: usize) -> QsaExtent {
+        let mut extent = self.qsa_buffer_extent(&t.buf, offset, len);
+        extent.numel = t.numel();
+        extent.elem_bytes = t.dtype.size();
+        extent
+    }
+
+    fn qsa_buffer_extent(&self, buf: &DeviceBuffer, offset: usize, len: usize) -> QsaExtent {
+        // Views may start inside a VMM owner; a view's buffer size is logical,
+        // not proof that the owner has mapped the range.
+        let (bias, limit) = qsa_extent_limit(
+            buf.as_ptr() as usize,
+            self.vmm_arenas
+                .iter()
+                .map(|(&base, owner)| (base, owner.reserved_bytes(), owner.mapped_bytes())),
+            buf.size(),
+        );
+        QsaExtent {
+            numel: buf.size(), elem_bytes: 1, mapped_bytes: limit,
+            required_end: qsa_required_end(bias, offset, len),
+            valid_blocks: 0,
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_buffer(
+        &self, arena: &'static str, buf: &DeviceBuffer, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(arena, self.qsa_buffer_extent(buf, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_buffer(
+        &self, arena: &'static str, buf: &DeviceBuffer, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(arena, self.qsa_buffer_extent(buf, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    fn qsa_scratch_extent(&self, ptr: *mut c_void, offset: usize, len: usize) -> QsaExtent {
+        let address = ptr as usize;
+        if let Some(t) = self.scratch.qsa_gather_vmm.as_ref() {
+            let base = t.buf.as_ptr() as usize;
+            if let Some(bias) = address.checked_sub(base).filter(|&n| n < t.buf.size()) {
+                return self.qsa_tensor_extent(t, bias.saturating_add(offset), len);
+            }
+        }
+        for (slot, elem_bytes) in [
+            (&self.scratch.fp16_x_scratch, 2),
+            (&self.scratch.qsa_select_scores, 4),
+            (&self.scratch.qsa_gather_f16, 2),
+        ] {
+            if let Some(buf) = slot.as_ref() {
+                let bytes = buf.size();
+                if let Some(bias) = address.checked_sub(buf.as_ptr() as usize).filter(|&n| n < bytes) {
+                    return QsaExtent {
+                        numel: bytes / elem_bytes, elem_bytes, mapped_bytes: bytes,
+                        required_end: qsa_required_end(bias, offset, len),
+                        valid_blocks: 0,
+                    };
+                }
+            }
+        }
+        // Unknown raw storage must fail closed, never silently bless an extent.
+        QsaExtent {
+            numel: 0, elem_bytes: 1, mapped_bytes: 0,
+            required_end: None,
+            valid_blocks: 0,
+        }
+    }
+
+    pub(crate) fn qsa_extent_check_ptr(
+        &self, arena: &'static str, ptr: *mut c_void, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — host metadata only, no device access.
+        if self.flags.qwen4_qsa_extent_check {
+            self.qsa_extent_assert(arena, self.qsa_scratch_extent(ptr, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    fn qsa_extent_assert(&self, arena: &'static str, e: QsaExtent, d: QsaExtentDepth, site: &'static str) {
+        if let Err(f) = qsa_extent_verdict(arena, e.required_end, e.mapped_bytes) {
+            eprintln!("qsa-extent-check FAIL arena={} numel={} elem_bytes={} mapped_bytes={} need_bytes={} overflow={} rows={} end_position={} block_count={} valid_blocks={} site={site}",
+                f.arena, e.numel, e.elem_bytes, f.limit_bytes, f.required_end, f.overflow, d.rows, d.end_position, d.block_count, e.valid_blocks);
+            std::process::abort();
+        }
+    }
+
+    /// Mode 2 deliberately synchronizes the device after each checked launch.
+    pub fn qsa_extent_post_launch(
+        &self, arena: &'static str, t: &GpuTensor, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(arena, self.qsa_tensor_extent(t, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    pub(crate) fn qsa_extent_post_launch_ptr(
+        &self, arena: &'static str, ptr: *mut c_void, offset_bytes: usize,
+        len_bytes: usize, depth: QsaExtentDepth, site: &'static str,
+    ) {
+        // bind_thread: skip — delegated to qsa_extent_sync when enabled.
+        if self.flags.qwen4_qsa_extent_sync {
+            self.qsa_extent_sync(arena, self.qsa_scratch_extent(ptr, offset_bytes, len_bytes), depth, site);
+        }
+    }
+
+    fn qsa_extent_sync(&self, arena: &'static str, e: QsaExtent, d: QsaExtentDepth, site: &'static str) {
+        let result = self.bind_thread().and_then(|()| {
+            self.hip.device_synchronize()?;
+            let code = self.hip.last_error();
+            if code == 0 { Ok(()) } else { Err(HipError::new(code, "hipGetLastError after QSA launch")) }
+        });
+        if let Err(err) = result {
+            eprintln!("qsa-extent-check FAULT after site={site} arena={arena} numel={} elem_bytes={} mapped_bytes={} need_bytes={} rows={} end_position={} block_count={} valid_blocks={} error={err}",
+                e.numel, e.elem_bytes, e.mapped_bytes, e.required_end.unwrap_or(usize::MAX), d.rows, d.end_position, d.block_count, e.valid_blocks);
+            std::process::abort();
+        }
+    }
+
     /// Return the physical allocation granularity for a registered VMM tensor.
     pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
         // bind_thread: skip — pure map lookup, touches no device state.
@@ -7905,6 +8137,77 @@ impl Drop for Gpu {
 
 #[cfg(test)]
 mod tests {
+    const QSA_MIB: usize = 1 << 20;
+
+    fn qsa_verdict(bias: usize, offset: usize, len: usize, limit: usize) -> Result<usize, super::QsaExtentFailure> {
+        super::qsa_extent_verdict("test", super::qsa_required_end(bias, offset, len), limit)
+    }
+
+    #[test]
+    fn qsa_extent_in_bounds_and_exact_end_pass() {
+        assert_eq!(qsa_verdict(0, 0, 0, 0), Ok(0));
+        assert_eq!(qsa_verdict(0, 16, 48, 128), Ok(64));
+        assert_eq!(qsa_verdict(32, 16, 48, 96), Ok(96), "exact end is allowed");
+    }
+
+    #[test]
+    fn qsa_extent_one_over_fails_with_arena_limit_and_end() {
+        let failure = qsa_verdict(32, 16, 49, 96).unwrap_err();
+        assert_eq!(
+            failure,
+            super::QsaExtentFailure { arena: "test", limit_bytes: 96, required_end: 97, overflow: false }
+        );
+    }
+
+    #[test]
+    fn qsa_extent_usize_overflow_is_rejected() {
+        assert_eq!(super::qsa_required_end(usize::MAX, 1, 0), None);
+        assert_eq!(super::qsa_required_end(0, usize::MAX, 1), None);
+        assert_eq!(super::qsa_required_end(1, usize::MAX - 2, 1), Some(usize::MAX));
+        // Even with an unbounded limit an overflowed end must not pass.
+        for (bias, offset, len) in [(usize::MAX, 1, 0), (0, usize::MAX, 1), (usize::MAX / 2 + 1, usize::MAX / 2 + 1, 0)] {
+            let failure = qsa_verdict(bias, offset, len, usize::MAX).unwrap_err();
+            assert!(failure.overflow);
+            assert_eq!(failure.required_end, usize::MAX);
+            assert_eq!(failure.limit_bytes, usize::MAX);
+        }
+        // Unknown storage (required end `None`) fails closed.
+        assert!(super::qsa_extent_verdict("unknown", None, 0).unwrap_err().overflow);
+    }
+
+    #[test]
+    fn qsa_extent_limit_uses_mapped_prefix_not_logical_size() {
+        let base = 0x7000_0000_0000usize;
+        let reserved = 64 * QSA_MIB;
+        let mapped = 4 * QSA_MIB;
+        let owners = [(base, reserved, mapped), (0x1000, 0x1000, 0x800)];
+        // A view 1 MiB into the owner: bias 1 MiB, limit is the mapped prefix.
+        let (bias, limit) = super::qsa_extent_limit(base + QSA_MIB, owners, 32 * QSA_MIB);
+        assert_eq!((bias, limit), (QSA_MIB, mapped));
+        assert!(limit < 32 * QSA_MIB, "mapped prefix is smaller than the logical size");
+        // Logical size is within the view but past the mapped prefix: rejected.
+        let failure = qsa_verdict(bias, 0, 3 * QSA_MIB + 1, limit).unwrap_err();
+        assert_eq!(failure.limit_bytes, mapped);
+        assert_eq!(failure.required_end, QSA_MIB + 3 * QSA_MIB + 1);
+        assert_eq!(qsa_verdict(bias, 0, 3 * QSA_MIB, limit), Ok(mapped));
+        // Outside every owner (and at the reserved end): allocation size.
+        assert_eq!(super::qsa_extent_limit(base + reserved, owners, 4096), (0, 4096));
+        assert_eq!(super::qsa_extent_limit(0x2000, owners, 123), (0, 123));
+        assert_eq!(super::qsa_extent_limit(base, [], 77), (0, 77));
+    }
+
+    #[test]
+    fn qsa_extent_bf16_index_rows_at_dim128_2mib_boundary() {
+        let row_bytes = 128 * super::DType::BF16.size();
+        let limit = 2 * QSA_MIB;
+        assert_eq!(8192 * row_bytes, limit);
+        assert_eq!(qsa_verdict(0, 0, 8192 * row_bytes, limit), Ok(limit));
+        let failure = qsa_verdict(0, 0, 8193 * row_bytes, limit).unwrap_err();
+        assert_eq!(failure.limit_bytes, limit);
+        assert_eq!(failure.required_end, 8193 * row_bytes);
+        assert!(!failure.overflow);
+    }
+
     /// Pins the per-row geometry the per-arch copies used to hard-code.
     #[test]
     fn row_bytes_matches_the_producer_layouts() {

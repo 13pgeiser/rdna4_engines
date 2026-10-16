@@ -2557,6 +2557,7 @@ fn run_qsa(
                 head_dim,
                 selected_len: capacity,
                 full_capacity: tokens,
+                end_position: token + 1,
                 format: QsaKvFormat::F32,
             },
         )
@@ -3447,6 +3448,7 @@ fn run_mtp(
                 selected_len: capacity,
                 full_capacity: tokens,
                 format: QsaKvFormat::F32,
+                end_position: token + 1,
             },
         )
         .map_err(|error| error.to_string())?;

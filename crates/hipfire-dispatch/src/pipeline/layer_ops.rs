@@ -3602,6 +3602,14 @@ fn execute_indexed_attention_hc_impl(
                 selected_len_out,
             },
         ))?;
+        // Extent-check metadata only (never a kernel argument): the reuse
+        // selection above keeps token ids `<= initial_position`, so the row's
+        // visible end is `initial_position + 1`. Computed only under the flag.
+        let end_position = if gpu.flags.qwen4_qsa_extent_check {
+            initial_position + 1
+        } else {
+            0
+        };
         hip(indexed_attention_attention(
             gpu,
             &IndexedAttentionAttention {
@@ -3615,6 +3623,7 @@ fn execute_indexed_attention_hc_impl(
                 head_dim: op.head_dim,
                 selected_len,
                 full_capacity: op.state.full_capacity,
+                end_position,
                 format: op.state.format,
             },
         ))?;
@@ -3634,6 +3643,15 @@ fn execute_indexed_attention_hc_impl(
         pooled_bf16: op.state.pooled_bf16.as_ref().and_then(|mirror| {
             (mirror.valid_blocks.valid(complete) >= complete).then_some(mirror.mirror)
         }),
+        // Extent-check metadata only; computed solely under the flag.
+        pooled_bf16_valid_blocks: if gpu.flags.qwen4_qsa_extent_check {
+            op.state
+                .pooled_bf16
+                .as_ref()
+                .map_or(0, |mirror| mirror.valid_blocks.valid(complete))
+        } else {
+            0
+        },
         selected: &selected_batch,
         rows: op.rows,
         query_row_stride: index_width,

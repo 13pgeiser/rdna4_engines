@@ -453,6 +453,7 @@ impl Fixture {
             query: &self.query,
             pooled,
             pooled_bf16: None,
+            pooled_bf16_valid_blocks: 0,
             selected: &self.selected,
             rows,
             query_row_stride: QUERY_STRIDE,

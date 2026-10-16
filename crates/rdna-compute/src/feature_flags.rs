@@ -655,6 +655,10 @@ pub struct FeatureFlags {
     /// bit-exact against the per-head kernel; acted on only for exact gfx1151
     /// (see `qwen4_qsa_decode_splitk_enabled`).
     pub qwen4_qsa_decode_splitk: bool,
+    /// Developer QSA mapped/allocation extent checks; exactly `1` or `2`.
+    pub qwen4_qsa_extent_check: bool,
+    /// Exactly `2` also synchronizes immediately after each checked launch.
+    pub qwen4_qsa_extent_sync: bool,
 }
 
 impl FeatureFlags {
@@ -688,6 +692,8 @@ impl FeatureFlags {
                 _ => None,
             }
         };
+
+        let qsa_extent_mode = value("HIPFIRE_QWEN4_QSA_EXTENT_CHECK").ok();
 
         let is_gfx906 = arch == "gfx906";
         // The bytewise-identical Halo hyper units (H5 GDN conv+Q/K norm, H4
@@ -1120,6 +1126,8 @@ impl FeatureFlags {
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref() != Some("0"),
+            qwen4_qsa_extent_check: matches!(qsa_extent_mode.as_deref(), Some("1" | "2")),
+            qwen4_qsa_extent_sync: qsa_extent_mode.as_deref() == Some("2"),
         }
     }
 
@@ -1562,6 +1570,8 @@ impl FeatureFlags {
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
             qwen4_qsa_decode_splitk: false,
+            qwen4_qsa_extent_check: false,
+            qwen4_qsa_extent_sync: false,
         }
     }
 }
@@ -1570,6 +1580,31 @@ impl FeatureFlags {
 mod tests {
     use super::*;
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    #[test]
+    fn qsa_extent_check_parses_only_exact_developer_modes() {
+        for (value, check, sync) in [
+            (None, false, false),
+            (Some("1"), true, false),
+            (Some("2"), true, true),
+            (Some("0"), false, false),
+            (Some("3"), false, false),
+            (Some("true"), false, false),
+            (Some("01"), false, false),
+            (Some(" 2"), false, false),
+            (Some(""), false, false),
+        ] {
+            let flags = FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == "HIPFIRE_QWEN4_QSA_EXTENT_CHECK" {
+                    value.map(str::to_owned).ok_or(())
+                } else {
+                    Err(())
+                }
+            });
+            assert_eq!(flags.qwen4_qsa_extent_check, check, "{value:?}");
+            assert_eq!(flags.qwen4_qsa_extent_sync, sync, "{value:?}");
+        }
+    }
 
     #[test]
     fn gfx12_mq4v2_gateup_k5120_opt_in_roundtrip_and_shape() {

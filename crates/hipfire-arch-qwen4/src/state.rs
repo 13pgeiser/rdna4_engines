@@ -670,9 +670,36 @@ fn grow_context_arena(
     let element = tensor.dtype.size();
     let fresh = tensor.buf.size() - growth.offset_bytes;
     let view = tensor.sub_offset(growth.offset_bytes / element, fresh / element);
+    // Developer extent check: the zero-fill covers exactly the newly mapped
+    // bytes `[growth.offset_bytes, growth.offset_bytes + fresh)` of the owner.
+    let depth = || rdna_compute::QsaExtentDepth {
+        rows,
+        end_position: required_rows,
+        block_count: 0,
+    };
+    if gpu.flags.qwen4_qsa_extent_check {
+        gpu.qsa_extent_check(
+            "qsa_context_grow_zero",
+            tensor,
+            growth.offset_bytes,
+            fresh,
+            depth(),
+            "grow_context_arena",
+        );
+    }
     gpu.hip
         .memset(&view.buf, 0, view.buf.size())
         .map_err(StateError::Hip)?;
+    if gpu.flags.qwen4_qsa_extent_check {
+        gpu.qsa_extent_post_launch(
+            "qsa_context_grow_zero",
+            tensor,
+            growth.offset_bytes,
+            fresh,
+            depth(),
+            "grow_context_arena",
+        );
+    }
     Ok(plan.token_capacity(mapped))
 }
 
@@ -1670,9 +1697,36 @@ impl Qwen4State {
                 if tensor.buf.size() == 0 {
                     continue;
                 }
+                // Developer extent check: the memset clears the whole exposed
+                // buffer, which for a VMM owner must lie inside its mapped bytes.
+                let depth = || rdna_compute::QsaExtentDepth {
+                    rows: layer.full_len,
+                    end_position: layer.position,
+                    block_count: layer.pooled_len,
+                };
+                if gpu.flags.qwen4_qsa_extent_check {
+                    gpu.qsa_extent_check(
+                        "qsa_reset_memset",
+                        tensor,
+                        0,
+                        tensor.buf.size(),
+                        depth(),
+                        "Qwen4State::reset",
+                    );
+                }
                 gpu.hip
                     .memset(&tensor.buf, 0, tensor.buf.size())
                     .map_err(StateError::Hip)?;
+                if gpu.flags.qwen4_qsa_extent_check {
+                    gpu.qsa_extent_post_launch(
+                        "qsa_reset_memset",
+                        tensor,
+                        0,
+                        tensor.buf.size(),
+                        depth(),
+                        "Qwen4State::reset",
+                    );
+                }
             }
             layer.full_len = 0;
             layer.raw_len = 0;
