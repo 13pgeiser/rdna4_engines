@@ -1026,7 +1026,8 @@ impl Backend for HipBackend<'_> {
             .pointer_get_attributes(&io.view.buf)
             .map_err(|e| e.to_string())?;
         if attributes.device != gpu.device_id
-            || attributes.mem_type != 1
+            || hip_bridge::MemoryType::from_raw(attributes.mem_type)
+                != Some(hip_bridge::MemoryType::Device)
             || attributes.is_managed != 0
         {
             return Err("boundary activation is not local device memory of its owner".into());
