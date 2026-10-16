@@ -16,7 +16,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag> --no-draft` | Skip the registry's draft/MTP sidecars (MTP, DSpark, DFlash); `--draft` fetches them without asking (the default). Other declared sidecars are always fetched. |
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
 | `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
-| `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default in the CLI and as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice in the TUI, from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
+| `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
@@ -140,9 +140,10 @@ trunk overlay, the client carries the pin, not the registry: it names
 SHA-256. `registry/v1.json` is unchanged, so older clients keep parsing the
 published registry.
 
-- **Pull.** `hipfire pull <tag>` selects the hotset by default. The TUI fetch
-  screen has an independent default-on yes/no choice, **Expert hot set (R9700
-  decode, 213 KB)**, shown in the summary only when selected; the "213 KB" is
+- **Pull.** `hipfire pull <tag>` selects the hotset by default. On a terminal
+  the interactive pull prompt has an independent default-on yes/no choice,
+  **Expert hot set (R9700 decode, 213 KB)**, shown in the summary only when
+  selected (`--yes` and the TUI's Models-tab pull take the default); the "213 KB" is
   the rounded display label, the pinned file is 217676 B (~213 KiB). The hotset
   is downloaded and SHA-256 verified with the other sidecars to the sidecar path
   of the local base file, which may be a renamed local file as long as it matches
@@ -167,7 +168,7 @@ published registry.
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
 | `hipfire stop [port] [--force] [--all]` | Stop the tracked background serve (`~/.hipfire/serve.pid`). `--force` reaps orphan daemons and frees the port; `--all` also reaps orphan quantize jobs. |
-| `hipfire tui [flags...]` | Launch `hipfire-tui` (Home / Dashboard / Chat / Models / Settings / System). Trailing arguments are forwarded to `hipfire-tui` (e.g. `--check`). |
+| `hipfire tui [flags...]` | Launch `hipfire-tui` (Home / Dashboard / Chat / Models / Settings / System / Logs). Trailing arguments are forwarded to `hipfire-tui` (e.g. `--check`, `--settings`). `?` shows each tab's keys; Esc only closes or cancels, `q` quits (it asks first while a Models-tab pull is running). The Models tab pulls with `hipfire pull <tag> --yes` (never the interactive prompt): `p` opens a small chooser for PLE rows (auto/q4/q8 → `--ple`) and draft sidecars (→ `--no-draft`) when the entry has them, and `c` cancels a running pull. |
 
 ### `hipfire run` flags
 Flags may appear before or after the model. CLI help and the native typed schema list stored globals; **effective `run` sampling** is not “global default unless overridden.” The Rust request resolver transmits only explicit CLI flags, per-model overlay values, or registry `recommended_settings`. Otherwise the field is **omitted** so daemon/HFQ/arch fallback applies. Global-only `temperature` / `top_p` / `repeat_penalty` are not sent. **Chat** is the exception (global session snapshot — [CHAT.md](CHAT.md)).
@@ -314,7 +315,7 @@ carries `n_tokens`, with an optional `"kind": "query" | "document"`).
 
 | Command | Purpose |
 |---|---|
-| `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml`. |
+| `hipfire config` | Global interactive TUI → `~/.hipfire/config.toml` (`hipfire-tui --settings`: opens on the Settings tab). |
 | `hipfire config <tag>` | Print resolved per-model policy and override provenance. |
 | `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`-j/--json` on list/get; `reset` with no key removes every override). |
 | `hipfire config explain <key> [-j]` | Explain a key's type, scope, default, effective value and provenance. |

@@ -1,6 +1,6 @@
 # hipfire-tui
 
-Prototype 1 of the Wick-shaped hipfire terminal home.
+The hipfire terminal UI (`hipfire tui`, or bare `hipfire`).
 
 Run from the repository root:
 
@@ -8,32 +8,33 @@ Run from the repository root:
 cargo run -p hipfire-tui
 ```
 
-For the Chat tab to stream, start the native Rust serve process in a separate
-terminal first:
+`hipfire-tui --settings` opens on the Settings tab (what `hipfire config` runs),
+`--config-profile-wizard` opens the profile wizard (`hipfire config profile`),
+and `--check` loads config, registry and local models without a terminal.
 
-```bash
-hipfire serve
-```
+Tabs:
 
-Current scope:
+- **Home**: serve state, endpoint, active model, local/registry counts.
+- **Dashboard**: live serve stats, GPU/VRAM (`amd-smi`, else `rocm-smi`, found
+  through the ROCm-root lookup), live `/metrics`. `s` starts the serve; `x`
+  (stop) and `R` (restart, which force-reaps this install's serve daemons) ask
+  y/n first.
+- **Chat**: streams through the serve's `/v1/chat/completions`. The transcript
+  follows new output; Up/Down/PgUp/PgDn/Home/End scroll, also while a reply
+  streams. When the serve is offline, Enter queues the prompt, starts
+  `hipfire serve -d` if no serve process exists, and sends it once `/health` is
+  online. `/help` lists the slash commands.
+- **Models**: registry tags grouped by family plus local model files (sidecars
+  such as PLE rows, drafts and hot sets are not listed). `Enter` on a local
+  model makes it the default model; `p` pulls with `hipfire pull <tag> --yes`
+  (a chooser offers PLE rows and draft sidecars when the entry has them), `c`
+  cancels the pull, `d` deletes after a y/n.
+- **Settings**: easy and advanced views over the typed global config
+  (`~/.hipfire/config.toml`); deprecated keys are read-only. Per-model overlays
+  stay with `hipfire config <tag> set ...`.
+- **System**: GPU, HIP and path diagnostics; `d` runs `hipfire diag`.
+- **Logs**: the tail of `serve.log`.
 
-- Ratatui shell with Home, Chat, Models, Settings, and System tabs.
-- Reads real `~/.hipfire` config, per-model overlays, local model files, and
-  the bundled `registry/v1.json`.
-- Probes the existing `/health` endpoint and streams chat through
-  `/v1/chat/completions`.
-- Chat can ask the native CLI to start `serve -d` when the endpoint is
-  offline; the typed prompt stays in place so you can retry after health comes
-  online.
-- The Models tab groups registry entries and local-only model files by family.
-  `Enter` expands/collapses a family, and `Enter` on a model selects it for
-  this TUI session without mutating config.
-- Settings edit and persist global typed TOML values. Per-model overlays remain
-  available through `hipfire config <tag> set ...`. Tools such as quantizer,
-  AWQ import, and TriAttention sidecar workflows are intentionally outside the
-  default TUI path.
-
-Out of scope for this spike:
-
-- Agent profiles, skills, plugins, or `/slash` generation.
-- Pull/install progress UI.
+The serve's `/health` is checked every 2 s on every tab. `?` shows the keys of
+the current tab, Esc only closes or cancels, and `q` quits (asking first while a
+pull is running).
