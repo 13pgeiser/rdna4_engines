@@ -34,8 +34,23 @@
 //!    replay observed, no recorded body launched. The refusal poisons the route
 //!    (`retained route binding changed`) and the next forward runs on HIP.
 //!
-//! A check that cannot be evaluated is a failing check with its error, never a
-//! skipped one. Exit status is 0 only when every check passes.
+//! Route admission. The gate is required only where the product itself takes
+//! the retained Redline route by default: after the load, the loaded model's
+//! facts (GPU arch, `qwen4`, file extension, single-GPU mesh, no drafter
+//! installed, expert parallelism, platform refusal) are passed to
+//! `hipfire_runtime::config::retained_redline_default`, the daemon's own
+//! admission (`.mq4r` on gfx1100/gfx1151/gfx1201, or Qwen4 on exact gfx1201
+//! with no drafter). Where the product does not take that route the gate
+//! does not force it: it frees the bundle, runs no capture, positive or
+//! negative phase, and writes a successful structured SKIP report
+//! (`"status": "skip"`, `"ok": true`, no checks, reason
+//! `Redline not on the default route (config.rs:15–22)`). A SKIP is never a
+//! PASS: it carries no check rows, and no result on a forced route is evidence
+//! about the default one.
+//!
+//! On a default route, a check that cannot be evaluated is a failing check
+//! with its error, never a skipped one. Exit status is 0 only when every check
+//! passes (or the route is not the default and the report is a SKIP).
 //!
 //! Usage (gfx1201, discrete GPU; the host-mapped layer split is the same one
 //! `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` selects for the other harnesses):
@@ -212,6 +227,77 @@ struct LoadFacts {
     slab_recipe: bool,
     host_mapped_tensors: usize,
     vocab: usize,
+    /// Loader arch label (`hipfire_loader::arch_label(ARCH_ID)`; the loader
+    /// crate depends on this one, so the label is named here).
+    model_arch: &'static str,
+    /// Mesh parallelism of the load: one rank.
+    pp: usize,
+    tp: usize,
+    /// Whether a speculative drafter was installed by the load. This loader
+    /// builds the bare bundle (no MTP, no DFlash, no n-gram), so never.
+    has_drafter: bool,
+}
+
+const MODEL_ARCH: &str = "qwen4";
+
+/// Why a model that is not on the product's default Redline route is not run.
+const NOT_DEFAULT_REASON: &str = "Redline not on the default route (config.rs:15–22)";
+
+/// The inputs of the daemon's retained-Redline admission for this load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteFacts {
+    gpu_arch: String,
+    model_arch: String,
+    model_path: String,
+    pp: usize,
+    tp: usize,
+    ep: usize,
+    has_drafter: bool,
+    platform_refusal: Option<String>,
+}
+
+impl RouteFacts {
+    fn from_load(gpu_arch: &str, model: &Path, facts: &LoadFacts) -> Self {
+        Self {
+            gpu_arch: gpu_arch.to_string(),
+            model_arch: facts.model_arch.to_string(),
+            model_path: model.to_string_lossy().into_owned(),
+            pp: facts.pp,
+            tp: facts.tp,
+            // The loader's `effective_ep` for a Qwen4 model.
+            ep: hipfire_config::topology::qwen4_ep().unwrap_or(1),
+            has_drafter: facts.has_drafter,
+            platform_refusal: hipfire_config::devices::redline_platform_refusal(),
+        }
+    }
+
+    /// The daemon's decision: `retained_redline_default` and no platform
+    /// refusal. The same function the product calls, not a copy of it.
+    fn default_route(&self) -> bool {
+        hipfire_runtime::config::retained_redline_default(
+            &self.gpu_arch,
+            &self.model_arch,
+            &self.model_path,
+            self.pp,
+            self.tp,
+            self.ep,
+            self.has_drafter,
+        ) && self.platform_refusal.is_none()
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "default_route": self.default_route(),
+            "gpu_arch": self.gpu_arch,
+            "model_arch": self.model_arch,
+            "model_path": self.model_path,
+            "pp": self.pp,
+            "tp": self.tp,
+            "ep": self.ep,
+            "has_drafter": self.has_drafter,
+            "platform_refusal": self.platform_refusal,
+        })
+    }
 }
 
 /// The slab-capable range-loaded path of `qwen4_greedy_ids` / `qwen4_kld`
@@ -343,6 +429,11 @@ fn load_bundle(
             slab_recipe,
             host_mapped_tensors,
             vocab,
+            model_arch: MODEL_ARCH,
+            // `DeviceMesh::single()`: one rank, no pipeline or tensor split.
+            pp: 1,
+            tp: 1,
+            has_drafter: false,
         },
     ))
 }
@@ -1170,6 +1261,32 @@ fn run(args: &Args) -> Result<(Value, bool), String> {
             return Ok((finish(&gate, &report, args, &arch, started), false));
         }
     };
+    // The gate is required only where the product takes the retained Redline
+    // route by default, decided from the loaded model's facts by the daemon's
+    // own admission. Elsewhere it does not force the route: no capture,
+    // positive or negative phase runs, and the report is a successful SKIP.
+    let route = RouteFacts::from_load(&arch, &args.model, &facts);
+    if !route.default_route() {
+        eprintln!(
+            "qwen4_g2_replay_gate: SKIP: {NOT_DEFAULT_REASON} \
+             (gpu_arch={}, model_arch={}, model={}, pp={}, tp={}, ep={}, drafter={}, \
+             platform_refusal={:?})",
+            route.gpu_arch,
+            route.model_arch,
+            route.model_path,
+            route.pp,
+            route.tp,
+            route.ep,
+            route.has_drafter,
+            route.platform_refusal,
+        );
+        if let Err(error) = bundle.free_gpu(&mut gpu) {
+            gate.error("skip_free_bundle", error.to_string());
+            return Ok((finish(&gate, &report, args, &arch, started), false));
+        }
+        return Ok((skip_report(&gate, &route, args, &arch, started), true));
+    }
+    report.insert("route".into(), route.to_json());
     gate.push(
         "artifact_is_expert_slab",
         facts.slab_recipe,
@@ -1182,8 +1299,9 @@ fn run(args: &Args) -> Result<(Value, bool), String> {
         json!({"host_mapped_tensors": facts.host_mapped_tensors, "vocab": facts.vocab}),
     );
 
-    // The daemon's post-load default: Auto backend, retained PM4 transport,
-    // state Armed, automatic lifecycle (the first eligible forward captures).
+    // The daemon's post-load default on a default route: Auto backend,
+    // retained PM4 transport, state Armed, automatic lifecycle (the first
+    // eligible forward captures).
     let configured = gpu.replay.configure_model_default(true);
     let armed = gpu.replay.state() == ReplayState::Armed;
     gate.push(
@@ -1253,6 +1371,10 @@ fn finish(
     let mut out = serde_json::Map::new();
     out.insert("gate".into(), json!("qwen4_g2_replay_gate"));
     out.insert("ok".into(), json!(gate.all_pass()));
+    out.insert(
+        "status".into(),
+        json!(if gate.all_pass() { "pass" } else { "fail" }),
+    );
     out.insert("model".into(), json!(args.model.display().to_string()));
     out.insert("arch".into(), json!(arch));
     let layers = match args.vram_layers {
@@ -1275,6 +1397,28 @@ fn finish(
     out.insert("checks".into(), Value::Array(gate.checks.clone()));
     out.insert("elapsed_s".into(), json!(started.elapsed().as_secs_f64()));
     Value::Object(out)
+}
+
+/// The successful report of a model that is not on the product's default
+/// Redline route: `ok`, no checks and no failed checks, `"status": "skip"` and
+/// the exact reason. Never a PASS (there is no check row to count) and never
+/// a failure (nothing was required of the route). `gate` must hold no checks.
+fn skip_report(
+    gate: &Gate,
+    route: &RouteFacts,
+    args: &Args,
+    arch: &str,
+    started: Instant,
+) -> Value {
+    debug_assert!(gate.checks.is_empty());
+    let mut report = serde_json::Map::new();
+    report.insert("route".into(), route.to_json());
+    let mut out = finish(gate, &report, args, arch, started);
+    let fields = out.as_object_mut().expect("report is an object");
+    fields.insert("status".into(), json!("skip"));
+    fields.insert("skipped".into(), json!(true));
+    fields.insert("reason".into(), json!(NOT_DEFAULT_REASON));
+    out
 }
 
 fn main() {
@@ -1426,5 +1570,136 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         assert_eq!(f32_stats(&bytes), (1, 3));
+    }
+
+    fn load_facts(has_drafter: bool) -> LoadFacts {
+        LoadFacts {
+            slab_recipe: true,
+            host_mapped_tensors: 0,
+            vocab: 1,
+            model_arch: MODEL_ARCH,
+            pp: 1,
+            tp: 1,
+            has_drafter,
+        }
+    }
+
+    /// The route a load of `path` on `gpu_arch` would face: single rank, the
+    /// loader's Qwen4 facts, `ep` 1 and no platform refusal.
+    fn route(gpu_arch: &str, path: &str, has_drafter: bool) -> RouteFacts {
+        RouteFacts {
+            ep: 1,
+            platform_refusal: None,
+            ..RouteFacts::from_load(gpu_arch, Path::new(path), &load_facts(has_drafter))
+        }
+    }
+
+    #[test]
+    fn model_arch_is_the_loader_label_for_qwen4() {
+        assert_eq!(hipfire_arch_qwen4::ARCH_ID, 16, "arch_label(16) == \"qwen4\"");
+        assert_eq!(MODEL_ARCH, "qwen4");
+    }
+
+    #[test]
+    fn halo_mq3_is_not_the_default_route() {
+        // Strix Halo (gfx1151) takes Redline by default only for `.mq4r`; the
+        // gfx1201 Qwen4 exception does not apply to it.
+        for path in ["/m/flash-next-halo.mq3", "/m/flash-next-ctl3-hot.hfq", "/m/x.mq4"] {
+            for has_drafter in [false, true] {
+                assert!(
+                    !route("gfx1151", path, has_drafter).default_route(),
+                    "{path} drafter={has_drafter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mq4r_default_arches_run_the_gate() {
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(
+                route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
+                "{gpu_arch}"
+            );
+            assert!(
+                route(gpu_arch, "/m/FLASH-NEXT.MQ4R", false).default_route(),
+                "{gpu_arch} upper-case extension"
+            );
+        }
+    }
+
+    #[test]
+    fn gfx1201_exception_runs_without_a_drafter_and_skips_with_one() {
+        assert!(route("gfx1201", "/m/ctl3-hot.hfq", false).default_route());
+        assert!(route("gfx1201", "/m/flash-next.mq3", false).default_route());
+        assert!(!route("gfx1201", "/m/ctl3-hot.hfq", true).default_route());
+        // An `.mq4r` is the extension route: a drafter does not take it off.
+        assert!(route("gfx1201", "/m/flash-next.mq4r", true).default_route());
+    }
+
+    #[test]
+    fn unsupported_arch_skips() {
+        for gpu_arch in ["gfx1030", "gfx1100", "gfx1200", "gfx90a", "gfx942"] {
+            assert!(
+                !route(gpu_arch, "/m/ctl3-hot.hfq", false).default_route(),
+                "{gpu_arch} .hfq"
+            );
+        }
+        for gpu_arch in ["gfx1030", "gfx1200", "gfx90a", "gfx942"] {
+            assert!(
+                !route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
+                "{gpu_arch} .mq4r"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_rank_expert_parallel_and_platform_refusal_skip() {
+        let mut facts = route("gfx1201", "/m/ctl3-hot.hfq", false);
+        assert!(facts.default_route());
+        facts.ep = 2;
+        assert!(!facts.default_route());
+        facts.ep = 1;
+        facts.pp = 2;
+        assert!(!facts.default_route());
+        facts.pp = 1;
+        facts.tp = 2;
+        assert!(!facts.default_route());
+        facts.tp = 1;
+        facts.platform_refusal = Some("uncertified platform".into());
+        assert!(!facts.default_route());
+    }
+
+    #[test]
+    fn skip_report_is_ok_checkless_and_names_the_exact_reason() {
+        let args = parse_args(argv("--model /m/halo.mq3")).unwrap();
+        let facts = route("gfx1151", "/m/halo.mq3", false);
+        let report = skip_report(&Gate::default(), &facts, &args, "gfx1151", Instant::now());
+        assert_eq!(report["gate"], "qwen4_g2_replay_gate");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["status"], "skip");
+        assert_eq!(report["skipped"], true);
+        assert_eq!(
+            report["reason"],
+            "Redline not on the default route (config.rs:15–22)"
+        );
+        assert_eq!(report["failed_checks"], json!([]));
+        assert_eq!(report["checks"], json!([]), "no replay phase ran");
+        assert_eq!(report["route"]["default_route"], false);
+        assert_eq!(report["route"]["gpu_arch"], "gfx1151");
+        assert_eq!(report["params"]["expert_vram_layers"], 20);
+    }
+
+    #[test]
+    fn a_run_report_is_pass_or_fail_never_skip() {
+        let args = parse_args(argv("--model /m/ctl3-hot.hfq")).unwrap();
+        let mut gate = Gate::default();
+        gate.count("replay_default_configured", 0, Value::Null);
+        let ok = finish(&gate, &serde_json::Map::new(), &args, "gfx1201", Instant::now());
+        assert_eq!((ok["ok"].clone(), ok["status"].clone()), (json!(true), json!("pass")));
+        assert!(ok.get("skipped").is_none() && ok.get("reason").is_none());
+        gate.count("positive_production_logits_exact", 3, Value::Null);
+        let bad = finish(&gate, &serde_json::Map::new(), &args, "gfx1201", Instant::now());
+        assert_eq!((bad["ok"].clone(), bad["status"].clone()), (json!(false), json!("fail")));
     }
 }

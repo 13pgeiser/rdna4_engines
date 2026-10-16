@@ -53,7 +53,8 @@ the exact command, environment and output directory to reproduce it.
 Usage (outer; submits itself to the scheduler):
   scripts/subq4_g2_carrier.py --smoke-receipt RCPT.json --code-sha SHA [--card C]
                               [--expert-vram-layers 16]
-Exit 0 only when the scheduler job and every check pass.
+Exit 0 only when the scheduler job and every check pass, or pass with the replay gate reporting SKIP
+(the loaded model is not on the product's default Redline route): g2.json status is then SKIP, never PASS.
 """
 
 from __future__ import annotations
@@ -131,6 +132,7 @@ MAX_SEQ = 1024
 MTP_K = 3
 MTP_ROUTES = "cycle"
 REPLAY_FIXED = {"context": 128, "iterations": 5, "max_seq": 1024}
+REPLAY_SKIP_REASON = "Redline not on the default route (config.rs:15–22)"
 
 AR_CONTROLS = {"lane_swap_tokens", "lane_swap_row_slot", "lane_swap_rows", "wrong_position"}
 REPLAY_ARMS = ("production", "plan", "hip_oracle")
@@ -713,6 +715,21 @@ def evaluate_replay(doc: Any, expert_layers: int) -> dict[str, Any]:
     params = replay_params(expert_layers)
     if doc.get("params") != params:
         _fail(v, "report_invalid", f"params={doc.get('params')!r}, expected {params}")
+    if doc.get("status") == "skip":
+        # The gate loaded the model and found Redline off the product's default route: it ran no
+        # capture/positive/negative phase. Accepted only as exactly that report; never a PASS.
+        route = doc.get("route")
+        if doc.get("skipped") is not True or doc.get("reason") != REPLAY_SKIP_REASON:
+            _fail(v, "report_invalid", f"skip report reason={doc.get('reason')!r} skipped={doc.get('skipped')!r}")
+        if doc.get("checks") != []:
+            _fail(v, "report_invalid", "a skip report must carry no check rows")
+        if not isinstance(route, dict) or route.get("default_route") is not False:
+            _fail(v, "report_invalid", f"skip report route={route!r} is not a non-default route")
+        if v["verdict"] == "PASS":
+            v["verdict"] = "SKIP"
+            v["reasons"].append(REPLAY_SKIP_REASON)
+        v["observed"] = {"arch": doc.get("arch"), "route": route, "elapsed_s": doc.get("elapsed_s")}
+        return v
     checks = [c for c in doc.get("checks") or [] if isinstance(c, dict)]
     if not checks:
         _fail(v, "report_invalid", "report has no checks")
@@ -878,12 +895,17 @@ def run_child(spec: dict[str, Any], g2: Path, deadline: float, base_env: dict[st
                     verdict[key] = judged[key]
             verdict["mismatches"] = judged["mismatches"]
             verdict["first_mismatch"] = judged["first_mismatch"]
-            if judged["verdict"] != "PASS":
+            if judged["verdict"] == "SKIP":
+                # Only a clean run (rc 0, report present) may skip; any earlier failure stands.
+                if verdict["verdict"] == "PASS":
+                    verdict["verdict"] = "SKIP"
+                verdict["reasons"] += judged["reasons"]
+            elif judged["verdict"] != "PASS":
                 verdict["verdict"] = "FAIL"
                 verdict["classification"] = _more_specific(verdict["classification"], judged["classification"])
                 verdict["reasons"] += judged["reasons"]
         rec["report_sha256"] = sha256_file(report)
-    if verdict["verdict"] != "PASS":
+    if verdict["verdict"] == "FAIL":
         verdict["stderr_tail"] = tail_lines(stderr_log)
         if verdict["first_mismatch"] is None:
             verdict["first_mismatch"] = {"source": "process", "rc": rc, "stderr_tail": verdict["stderr_tail"][-10:]}
@@ -1019,18 +1041,22 @@ def inner(args: argparse.Namespace) -> int:
     done = {c["name"] for c in doc["checks"]}
     skipped = [s["name"] for s in specs if s["name"] not in done]
     doc["not_run"] = skipped
-    failed = [c["name"] for c in doc["checks"] if c["verdict"] != "PASS"]
+    failed = [c["name"] for c in doc["checks"] if c["verdict"] == "FAIL"]
+    skip_verdicts = [c["name"] for c in doc["checks"] if c["verdict"] == "SKIP"]
     ok = not failed and not skipped and interrupted is None
-    first = next((c for c in doc["checks"] if c["verdict"] != "PASS"), None)
+    first = next((c for c in doc["checks"] if c["verdict"] == "FAIL"), None)
     doc["summary"] = {
         "checks": len(doc["checks"]),
         "failed": failed,
+        "skipped": skip_verdicts,
         "not_run": skipped,
         "mismatches": sum(c["mismatches"] for c in doc["checks"]),
         "first_failure": ({"check": first["name"], "classification": first["classification"],
                            "first_mismatch": first["first_mismatch"]} if first else None),
     }
-    doc["status"] = "PASS" if ok else "FAIL"
+    # A SKIP child (the replay gate on a model not on the product's default Redline route) is
+    # neither a failure nor a PASS: the receipt is SKIP, never PASS, and the carrier exits 0.
+    doc["status"] = "FAIL" if not ok else ("SKIP" if skip_verdicts else "PASS")
     doc["ended_utc"] = utc_now()
     doc["wall_s"] = round(time.monotonic() - t_start, 3)
     write_json_atomic(rcpt / "g2.json", doc)
@@ -1085,12 +1111,12 @@ def outer(args: argparse.Namespace) -> int:
         doc["reasons"] = [f"fabric-run.sh rc {res.returncode} and the job wrote no g2.json (admission refused, "
                           "wait limit, cancel, or the inner carrier refused: see this process's stderr)"]
     doc["scheduler"] = {**doc.get("scheduler", {}), **sched}
-    if res.returncode != 0 and doc.get("status") == "PASS":
-        doc["status"] = "FAIL"
-        doc["reasons"] = [f"fabric-run.sh rc {res.returncode} despite a PASS receipt"]
+    if res.returncode != 0 and doc.get("status") in ("PASS", "SKIP"):
+        was, doc["status"] = doc["status"], "FAIL"
+        doc["reasons"] = [f"fabric-run.sh rc {res.returncode} despite a {was} receipt"]
     write_json_atomic(receipt, doc)
     print(f"[g2-carrier] fabric rc {res.returncode}; g2 {doc['status']}: {receipt}", flush=True)
-    return 0 if (res.returncode == 0 and doc["status"] == "PASS") else 1
+    return 0 if (res.returncode == 0 and doc["status"] in ("PASS", "SKIP")) else 1
 
 
 def _layer_count(raw: str) -> int:

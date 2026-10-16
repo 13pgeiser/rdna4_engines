@@ -166,6 +166,34 @@ class ParityReplayTests(unittest.TestCase):
         d["params"]["iterations"] = 1
         self.assertEqual(c.evaluate_replay(d, c.DEFAULT_EXPERT_LAYERS)["verdict"], "FAIL")
 
+    def skip_doc(self):
+        return {
+            "gate": "qwen4_g2_replay_gate", "ok": True, "status": "skip", "skipped": True,
+            "reason": "Redline not on the default route (config.rs:15–22)", "failed_checks": [], "checks": [],
+            "params": c.replay_params(c.DEFAULT_EXPERT_LAYERS), "arch": "gfx1151",
+            "route": {"default_route": False, "gpu_arch": "gfx1151"},
+        }
+
+    def test_replay_skip_is_skip_not_pass_and_not_rejected(self):
+        v = c.evaluate_replay(self.skip_doc(), c.DEFAULT_EXPERT_LAYERS)
+        self.assertEqual(v["verdict"], "SKIP", v["reasons"])
+        self.assertIsNone(v["classification"])
+
+    def test_replay_skip_must_be_exact_and_checkless(self):
+        for edit in (lambda d: d.update(reason="skipped"), lambda d: d.update(skipped=False),
+                     lambda d: d.update(checks=[{"name": "x", "pass": True}]),
+                     lambda d: d.update(route={"default_route": True}), lambda d: d.pop("route"),
+                     lambda d: d.update(ok=False), lambda d: d.update(failed_checks=["x"]),
+                     lambda d: d.update(params=c.replay_params(1))):
+            d = self.skip_doc()
+            edit(d)
+            self.assertEqual(c.evaluate_replay(d, c.DEFAULT_EXPERT_LAYERS)["verdict"], "FAIL")
+
+    def test_replay_without_skip_status_still_requires_every_check(self):
+        d = self.skip_doc()
+        d.pop("status")
+        self.assertEqual(c.evaluate_replay(d, c.DEFAULT_EXPERT_LAYERS)["verdict"], "FAIL")
+
 
 class SmokeReceiptTests(unittest.TestCase):
     def judge(self, doc):
