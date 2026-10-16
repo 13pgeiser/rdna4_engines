@@ -379,7 +379,10 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire update --branch NAME` | Switch to and track a remote branch such as `master` or `beta`. |
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 | `hipfire setup --source PATH [flags]` | Install or repair this machine's runtime from a source checkout (normally run by `scripts/install.sh`; `--source` is required and must contain `Cargo.toml`). Flags: `--rocm-root PATH`, `--hipcc PATH` (also `HIPFIRE_HIPCC`), `--strict-rocm` (also `HIPFIRE_ROCM_STRICT=1`), `--gpu-arch ARCH`, `--profile auto\|hip\|redline` (`auto` leaves `replay.backend=auto` so `.mq4r` models select Redline), `-y`/`--yes` (alias `--non-interactive`), `--compile-kernels` (compile locally with `hipcc` even when a release kernel pack exists), `--kernel-pack-url URL` (directory or URL holding the kernel-pack assets; default: the tag's GitHub release). A release tag selects that release's prebuilt kernel pack, which needs no device compiler. |
-| `hipfire kernel-pack install --tag TAG --arch ARCH --source PATH [--dest DIR] [--url URL] [--rocm-version V]` | Download, verify and install the prebuilt kernel pack for `TAG` and `ARCH`. `--source` is the checkout the installed daemon was built from; its `HEAD` must be the pack's commit. `--dest` defaults to `~/.hipfire/bin/kernels/compiled/<ARCH>`; `--rocm-version` (default: the resolved ROCm root's `.info/version`) is checked against the pack's supported range. |
+| `hipfire kernel-pack install --tag TAG --arch ARCH --source PATH [--dest DIR] [--url URL] [--rocm-version V]` | Download, verify and install the prebuilt kernel pack for `TAG` and `ARCH`. `--source` is the checkout the installed daemon was built from; its `HEAD` must be the pack's commit. `--dest` defaults to `~/.hipfire/bin/kernels/compiled/<ARCH>`; `--rocm-version` (default: the resolved ROCm root's `.info/version`) is checked against the pack's supported range. A successful install also writes the pack's verified `manifest.json` beside the installed directory as `<ARCH>.manifest.json` (for example `~/.hipfire/bin/kernels/compiled/gfx1151.manifest.json`), through a temporary file and a rename. `hipfire doctor --npu` reads it to name the installed kernel set. |
+| `hipfire doctor --npu [--yes] [-j\|--json] [--apply]` | Strix Halo (gfx1151 + XDNA2) NPU trunk fitness check: GPU-free checks, a tier, then (after confirmation) a GPU-only vs `auto` prefill A/B and a greedy `on`/`emulate` exactness check, about 6–7 minutes. `-j`/`--json` prints one report with no hostname, user, path or PCI address; `--apply` sets `npu_trunk off` on a measured loss or an exactness mismatch and changes nothing else. Linux only. See [below](#hipfire-doctor---npu). |
+| `hipfire doctor --npu --soak [--hours H] [--out DIR] [--yes]` | Stability soak instead of the A/B: cold long-prompt prefills with the NPU and GPU busy together for `H` hours (default 4, at most 24), with a kernel-log watch and a heartbeat. Stops at the first fatal kernel line, hang, daemon exit or low memory. Writes only into `DIR` (default `npu-soak-<UTC timestamp>` in the current directory). |
+| `hipfire doctor --npu --soak-report DIR` | Summarize a soak directory, including the previous boot's kernel log after a freeze and reboot. Runs no checks and does not need the GPU or NPU. |
 
 Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md). Published tables are measured/historical: [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -491,6 +494,132 @@ The bench also prints a `max_seq:` line.
 When any limiter's residency exceeds 10 % of a measured run, the bench prints one `warning:` line naming the worst residency per limiter, and adds it to the JSON `warnings`. The number is then power- or thermal-limited and is comparable only with runs whose power fields match.
 
 **High-TDP APU thermal note.** On a high-TDP Strix Halo box at stock power limits, long prefill (e.g. pp8192) can be limited first by fast PPT and then by GPU temperature, which reaches the thermal point within seconds of prefill start. Capping the four SMU limits (STAPM, fast PPT, slow PPT, APU slow PPT) to a common value around 130 W (`ryzenadj --stapm-limit=130000 --fast-limit=130000 --slow-limit=130000 --apu-slow-limit=130000`, or the BIOS power mode) can keep the GPU below its thermal limit at some cost in burst prefill throughput; lower caps trade more throughput for energy efficiency. The effect depends on chassis, cooling and firmware, so measure the trade-off on your own machine. The power limits need root and are not visible to the bench, so record them with the result.
+
+### `hipfire doctor --npu`
+
+`hipfire doctor --npu` answers one question for a Strix Halo host: can the NPU trunk prefill route run here, and does `npu_trunk = auto` beat the GPU-only route on this machine? It needs `--npu`; the flags are:
+
+| Flag | Purpose |
+|---|---|
+| `--npu` | Required. Check the Strix Halo (gfx1151 + XDNA2) NPU trunk route. |
+| `--yes` | Run the calibration (or soak) without asking first. |
+| `-j`, `--json` | Print the report as one JSON object on stdout. |
+| `--apply` | Set `npu_trunk` to `off` when the calibration measures a loss or an exactness mismatch. Cannot combine with `--soak` or `--soak-report`. |
+| `--soak` | Run the stability soak instead of the calibration. |
+| `--hours H` | Soak duration in hours; default 4; a positive number, at most 24. Needs `--soak`. |
+| `--out DIR` | Soak output directory; default `npu-soak-<UTC timestamp>` (for example `npu-soak-20261016T120000Z`) in the current directory. It must not exist or must be empty. Needs `--soak`. |
+| `--soak-report DIR` | Summarize the soak in `DIR`. Cannot combine with `--soak` or `--apply`. |
+
+The command is Linux only. It reads Linux sysfs, proc and device nodes, so on another OS the first checks fail and the report is `blocked`. The checks open neither the GPU nor the NPU; only the calibration and the soak do.
+
+**Checks.** Every check prints `PASS`, `FAIL` or `INFO` with what it found. A failed check blocks: nothing is run and the exit status is 1. `INFO` checks only report. A failed check prints a `fix:` line.
+
+| Check id | Blocks? | Reads | Fix |
+|---|---|---|---|
+| `gpu_arch` | yes | The KFD topology (`/sys/class/kfd/kfd/topology/nodes`): a `gfx1151` GPU. | None; the route needs a Strix Halo GPU. |
+| `npu_xdna2` | yes | `/sys/class/accel/accel0/device`: driver `amdxdna`, PCI vendor `0x1022`, device `0x17f0`. | Boot a kernel with the `amdxdna` driver (in-tree since Linux 6.14) and enable the NPU (IPU) in the firmware setup. |
+| `accel_node` | yes | `/dev/accel/accel0` is a character device that this user can read and write. | `sudo usermod -aG render $USER`, then log out and in. A missing node points back to `npu_xdna2`. |
+| `npu_firmware` | yes | The `accel0` driver link and a non-empty `fw_version`. | Install `linux-firmware` with `amdnpu/17f0_*` and reload the driver: `sudo modprobe -r amdxdna && sudo modprobe amdxdna`. |
+| `memlock` | yes | `RLIMIT_MEMLOCK` (soft and hard), `CAP_IPC_LOCK` and the process's `VmPin`. Passes when the soft or the hard limit (unlimited counts) covers `VmPin` plus the bytes the armed trunk pins, or when `CAP_IPC_LOCK` is held. | A bounded limit sized from the requirement, not `infinity`: the fix line gives the systemd `LimitMEMLOCK`, the `limits.d` and the `ulimit -l` values. See [Host memlock limit](npu/npu-trunk.md#host-memlock-limit). |
+| `rocm_runtime` | yes | A ROCm root that holds the HIP runtime library (`libamdhip64`). | The ROCm install guidance, printed in the fix line. |
+| `daemon` | yes | Finds `hipfire-daemon` and runs `hipfire-daemon --version` (5 s limit). Passing needs only that the daemon is found; the detail is its version line when it answers. | `hipfire setup` |
+| `model` | yes | The local Flash-Next models (HFQ architecture 16). A model passes when the SHA-256 of its header index equals a calibration record: the built-in records for the `stock` and `overlay:gfx1151-zab-v1` routes, or the override `npu-trunk/calibration.json`. | `hipfire pull qwen3.8:flash-next` |
+| `gpu_free` | yes | Whether `hipfire serve` is running (`serve.pid`) and a non-blocking probe of the GPU's lock file. Reports `INFO` and skips when there is no gfx1151 GPU. | `hipfire stop` |
+| `npu_trunk_config` | no | The effective `fusions.npu_trunk`. | None. |
+| `fclk` | no | The fabric clock state of the GPU (pinned or automatic) and whether it could be pinned without a password (writable attributes or `sudo -n`). Serving runs it on automatic. | None. |
+
+**Tiers and profiles.** The tier follows from the checks and a table of validated host profiles compiled into the CLI:
+
+| Tier | Meaning |
+|---|---|
+| `reference` | No check failed and every profile field equals one validated row. |
+| `compatible-unvalidated` | No check failed, but at least one field differs from every row. The report lists each difference as `field: found X (reference Y)` against the nearest row (fewest differing fields; the earlier row wins a tie). |
+| `blocked` | At least one check failed. |
+
+A profile row holds these fields. The report compares each against the host:
+
+| Field | Host value | Reference row `hipx` |
+|---|---|---|
+| `kernel` | Kernel release (`/proc/sys/kernel/osrelease`). | `7.3.0-rc7-perfopt+` |
+| `iommu.gpu` | IOMMU group domain type of the GPU. | `identity` |
+| `iommu.npu` | IOMMU group domain type of `accel0`. | `identity` |
+| `amdxdna` | The out-of-tree driver version, or `in-tree`. | `in-tree` |
+| `npu_fw` | The NPU firmware version (`fw_version`). | `1.1.2.65` |
+| `model` | The SHA-256 of the matched model's header index. | `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013` |
+| `kernels` | The kernel set the daemon will run (below). | Must be one of the sets the row lists. |
+
+The kernel set is `pack:<tag>@<commit12>` when the install holds a kernel pack with a recorded `<arch>.manifest.json` for gfx1151 (written by `hipfire kernel-pack install`), or `jit:<commit12>` from the third word of `hipfire-daemon --version` when it does not; `commit12` is the first 12 hex digits of the commit. It is `unknown` when neither is available. A kernel set that no row lists makes the host `compatible-unvalidated` by itself, even when every other field matches; a row that lists no kernel set shows `none validated yet` as its reference. The profile id and differences are in the report as `profile` and `profile_diff`.
+
+**Confirmation and exit status.** After the checks the command prints what it is about to do, then asks `Run it now? [y/N]` on a terminal; only `y` or `yes` (any case) runs it. `--yes` skips the question. Without a terminal on stdin and without `--yes` it refuses, runs nothing and exits 2. Answering no exits 0 and still prints the report. Exit status: 0 ok, 1 blocked, a failed calibration or a failed soak, 2 refused. With `--json`, stdout carries only the report; the plan, the prompt, the progress lines, the soak's request lines and summary, and the `--apply` note go to stderr.
+
+**Calibration.** The plan it prints before asking is:
+
+```text
+one daemon with npu_trunk=auto alternates GPU-only and auto prefills at 16K and 32K rows, 2 reps each, on prompts that never hit the prompt cache
+then npu_trunk=on and npu_trunk=emulate daemons each prefill the same prompt and generate 16 tokens greedily; the two outputs must match
+about 6–7 minutes on a Strix Halo (three model loads plus about 2 minutes of prefills)
+uses the GPU and the NPU
+changes no setting and writes no file
+```
+
+- **A/B.** One warm `npu_trunk=auto` daemon takes an unmeasured warm-up pair (GPU-only, then auto, 16384 rows), then two passes over 16384 and 32768 rows. Each size runs once on the GPU-only route and once on `auto` per pass, in alternating order (GPU first on the first pass, `auto` first on the second), so clock and thermal drift reaches both arms alike. The GPU-only arm is the diagnostic route ([below](npu/npu-trunk.md#diagnostic-gpu-only-route)); the daemon's `npu_trunk=auto` setting and its fault latch are not changed. Every prompt is synthetic text with a different leading line, so no request is served from the prompt cache; each generates one token, and the time is the time to first token. A request that was partly served from the cache, a GPU-only request that did not log the diagnostic route line, an `auto` request that did, or a prompt shorter than 9000 rows fails the calibration.
+- **Per size**, from the two samples of each arm: `saved %` = (median off − median auto) / median off × 100, so a loss is negative; `spread %` is the larger of the two arms' (max − min) / median × 100. The verdict is `gain` when `saved %` is above the spread, `loss` when it is below minus the spread, and `no measurable gain` otherwise. The rows shown are the median of the prompt tokens the daemon reported for that size.
+- **Also reported** when `auto` armed: the trunk route, the rate scales the estimator reached (`gpu_x`, `npu_x`, `frozen`, generation), the NPU wait per pair (median and max over the `auto` requests' pairs) and the number of guard trips. When `auto` did not arm (for example the memlock limit is short), the report quotes the daemon's reason and runs no A/B and no exactness check.
+- **Exactness.** A daemon with `npu_trunk=on` and one with `npu_trunk=emulate` each prefill the same 9319-row prompt (one 8192-row chunk plus a 1127-row tail, the smallest prompt that forms an NPU pair) and generate 16 tokens greedily. `exact` means the two outputs are identical; `MISMATCH` names the index of the first token that differs; `not exercised` means `on` ran no NPU pair, so the comparison proves nothing. The daemons' own stderr is not echoed; only their `npu-trunk:` lines are used.
+
+**Recommendation.** The report ends with one recommendation, computed from the calibration and the effective `npu_trunk`:
+
+| Measured | `npu_trunk` is not `off` | `npu_trunk` is `off` |
+|---|---|---|
+| No calibration ran (blocked, declined, refused or failed) | none | none |
+| Exactness `MISMATCH` | `set off`: `hipfire config set npu_trunk off`; the reason asks you to report a bug and attach the `--json` report | none (already off) |
+| `auto` did not arm | none; the daemon's reason | none; the daemon's reason |
+| `loss` at some size and `gain` at none | `set off`: `hipfire config set npu_trunk off` | none (already off) |
+| `gain` at some size and `loss` at none | `keep auto` | `set auto`: `hipfire config set npu_trunk auto` |
+| `gain` and `loss` at different sizes | `keep auto`; the guard bounds any loss | none; stays off |
+| No size beyond the spread | `keep auto`; the guard bounds any loss | none; stays off |
+
+**`--apply`.** Only the `set off` recommendation is applied, by the same write as `hipfire config set npu_trunk off`; the report then says `applied: npu_trunk is now off` (`applied: true` in JSON). In every other case it prints `--apply: no change` with the reason, including when the host is blocked, the question was declined or refused, or the calibration failed. It never sets `auto`; the `set auto` recommendation prints its command for you to run. A `MISMATCH` means the route's `on` and `emulate` outputs disagree, which is a bug; attach the `--json` report to the bug report.
+
+**`--json`.** One object, schema `hipfire-doctor-npu-1`. It carries no hostname, user name, filesystem path or PCI address; check details and the model `tag` (set only for registry models) are written without them. Top-level fields:
+
+| Field | Content |
+|---|---|
+| `schema` | `hipfire-doctor-npu-1`. |
+| `hipfire` | `version` and `commit` (first 12 hex digits) of the CLI. |
+| `tier` | `reference`, `compatible-unvalidated` or `blocked`. |
+| `profile` | Id of the matched or nearest profile row; absent when blocked. |
+| `profile_diff` | List of `{field, reference, found}`; empty for `reference` and `blocked`. |
+| `host` | `gpu_arch`, `npu`, `kernel`, `iommu` (`gpu`, `npu`), `amdxdna`, `npu_fw`, `kernels`, `memlock` (`soft`, `hard`, `required`, `cap_ipc_lock`; `null` is unlimited) and `fclk` (`pinned`, `pinnable`). |
+| `checks` | List of `{id, status, detail}` with `fix` on a failure; `status` is `pass`, `fail` or `info`. |
+| `model` | `tag`, `index_sha256` and `calibration` (`builtin` or `file`, the record that admitted it); absent when no model matched. |
+| `npu_trunk` | The effective `fusions.npu_trunk`. |
+| `calibration` | Absent when none ran. `armed`, `off_reason`, `trunk_route`, `sizes` (per size: `rows`, `off` and `auto` as `samples_ms` and `median_ms`, `saved_pct`, `spread_pct`, `verdict`), `rate_scales`, `npu_wait_per_pair`, `guard_trips`, `exactness` (`verdict`, `prompt_rows`, `tokens`, `first_difference`) and `duration_s`. |
+| `calibration_skipped` | Why no calibration ran: blocked, `declined`, not confirmed (no terminal), soak mode or failed. |
+| `recommendation` | `action` (`keep-auto`, `set-off`, `set-auto` or `none`), `reason`, and `command` when there is one. |
+| `applied` | `true` only when `--apply` changed `npu_trunk`. |
+
+**`--soak`.** `hipfire doctor --npu --soak` replaces the calibration with a long run of the route under load, to find stability faults that the minutes-long A/B cannot. It runs the same checks, prints its plan, asks the same question, and then makes no recommendation. One `npu_trunk=auto` daemon (`max_seq` 65536) takes a loop of cold prompts of 9000, 16000, 32000 and 57000 rows, one token each, with 20 s idle between bursts so the clocks ramp each time. The run ends after `--hours`, or earlier at the first of:
+
+- a fatal kernel log line, checked between requests and every second while idle;
+- a request that does not complete within 1200 s (the daemon is killed), a failed request, or the daemon exiting;
+- `MemAvailable` below 4 GiB;
+- the kernel-log follower exiting (the soak then cannot watch the kernel).
+
+The kernel log comes from `journalctl -k -f`, or from `sudo -n dmesg -w -T --since now` when the journal is not readable; with neither the soak does not start (add yourself to the `systemd-journal` group, or allow passwordless `sudo dmesg`). A line is fatal when it is an `amdgpu` line with `page fault`, `timeout`, `GPU reset`, `device lost`, `MES failed`, `sq_intr`, `Fence fallback` or a ring reset; any other `amdxdna` line; or a `BUG:`, `Oops`, `hung_task`, `soft lockup`, `hard LOCKUP`, `Out of memory`, `watchdog: ` or RCU stall line. The two `amdxdna` messages `amdxdna_insert_pages: Failed to mmap dma buf -22` and `amdxdna_gem_obj_mmap: Failed insert pages, ret -22` (hipfire 0.4.2.x on Linux 7.1 or later, see the changelog) are counted as benign and never stop the run.
+
+A heartbeat line (`<UTC time> load=<1-minute load> memavail_kb=<kB>`) is written and fsync'd every 10 s, so after a freeze the last line shows when the machine stopped. The soak writes only into `--out` (which must be a new or empty directory) and changes no setting. It exits 0 on PASS and 1 on FAIL.
+
+| File in `--out` | Content |
+|---|---|
+| `heartbeat.log` | The heartbeat; its first line is the run start. |
+| `kmsg.log` | The followed kernel log, as read. It still holds the host name and PCI addresses. |
+| `requests.tsv` | One row per request: index, UTC time, requested rows, ok, wall seconds, prompt tokens. |
+| `npu-trunk.log` | The daemon's `npu-trunk:` lines, rewritten after every request. |
+| `summary.txt` | Verdict, route lines, per-size median wall time, kernel-line counts, heartbeat gaps over 30 s and, on FAIL, the kernel log tail (as read, like `kmsg.log`). |
+| `summary.json` | Schema `hipfire-soak/1`: `verdict`, `reason`, `hours`, `requests`, `failed_requests`, `per_size`, `benign_count`, `fatal_count`, `heartbeat_gaps`, `fatal_line` and `host` (kernel, IOMMU, driver and firmware facts; no host name). `reason` and `fatal_line` have the host name and PCI addresses removed. |
+
+After a freeze and reboot, `hipfire doctor --npu --soak-report DIR` reads the start time from the first line of `DIR/heartbeat.log`, collects the previous boot's kernel log since then (`journalctl -k -b -1`; run it as a user that can read that journal, which a volatile journal does not keep), and writes it to `DIR/prev-boot-kmsg.log` and a summary to `DIR/report.txt`. The summary, also printed, gives the last heartbeat, the last request, the kernel-line counts, up to 20 fatal lines and the last 40 kernel lines. It exits 0 and does not run the checks; it fails when `DIR` has no `heartbeat.log`.
 
 ## Where files live
 

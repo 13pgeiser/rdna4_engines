@@ -268,7 +268,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+/// (year, month, day) of a day count since 1970-01-01 (proleptic Gregorian).
+pub(super) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -681,7 +682,7 @@ fn request_loop(
                 wall_s,
                 prompt_tokens,
             });
-            println!(
+            eprintln!(
                 "soak: request {i} rows={rows} {} in {wall_s:.1} s",
                 if ok { "ok" } else { "FAILED" }
             );
@@ -903,7 +904,7 @@ pub(crate) fn run(paths: &crate::Paths, target: &Target, hours: f64, out: &Path)
             return Err(e);
         }
     };
-    println!("soak: following the kernel log; loading the model with npu_trunk=auto ...");
+    eprintln!("soak: following the kernel log; loading the model with npu_trunk=auto ...");
 
     let mut requests = Vec::new();
     let mut npu_lines = Vec::new();
@@ -949,7 +950,7 @@ pub(crate) fn run(paths: &crate::Paths, target: &Target, hours: f64, out: &Path)
     let json = serde_json::to_string_pretty(&summary.json(&host))? + "\n";
     write_synced(&out.join("summary.txt"), &text)?;
     write_synced(&out.join("summary.json"), &json)?;
-    print!("{text}");
+    eprint!("{text}");
     Ok(pass)
 }
 

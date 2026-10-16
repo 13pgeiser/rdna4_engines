@@ -808,6 +808,28 @@ systemd drop-in or `prlimit` for those sessions. Driver citations are in the com
 `railgun::npu::Device::map_heap`. Arenas that need no memlock (driver/TTM allocations
 shared over dma-buf) are planned for 0.4.3.
 
+### Checking a host: `hipfire doctor --npu`
+
+`hipfire doctor --npu` checks a Strix Halo host before anyone arms the route on it. It first runs GPU-free checks (a gfx1151 GPU, the `amdxdna` XDNA2 NPU and its `accel0` node and firmware, the memlock limit above, a ROCm runtime, the daemon, a local Flash-Next model that a calibration record admits, and no running `hipfire serve`) and names a tier: `reference` for a host that matches a validated profile, `compatible-unvalidated` for any other host that passes, `blocked` when a check fails. After confirmation it runs one daemon with `npu_trunk=auto` that alternates the GPU-only route and `auto` on cold 16K and 32K-row prompts (about 6–7 minutes in all), then compares `on` and `emulate` on a short greedy generation, which must be identical. It ends with a recommendation. `--apply` only ever sets `npu_trunk off`, on a measured loss or an exactness mismatch. `--json` prints a report with no hostname, user, path or PCI address, and `--soak` runs a long stability soak instead. The full reference (checks, profiles, how the verdicts are computed, the report fields and the soak files) is in [CLI.md](../CLI.md#hipfire-doctor---npu).
+
+### Diagnostic GPU-only route
+
+The A/B above needs a GPU-only arm on the same loaded daemon, so the daemon accepts a control message:
+
+```json
+{"type":"npu_trunk_route","route":"gpu"}
+```
+
+`route` is `"gpu"` or `"auto"`; the daemon echoes `{"type":"npu_trunk_route","route":"gpu"}` (or `"auto"`) and answers any other value with a validation error. It is a diagnostic control, not a config key or an environment variable, it sets a process-wide switch and touches neither the model nor the GPU, and it exists on Linux only (other platforms answer with an `unsupported` error). The switch is read once, at the next request's begin, and cannot change a request in flight.
+
+A request that begins with the route on `gpu` takes the same path as a tripped fault latch (`route_off`): it runs exactly the `npu_trunk=off` schedule and plans no NPU pair, so it feeds no sample to the rate estimator. It leaves the fault latch and the rate estimator untouched, so switching back to `auto` finds both as they were; a tripped latch stays tripped. Each such request logs one line:
+
+```text
+npu-trunk: rows=<n> route=gpu (diagnostic)
+```
+
+`hipfire-daemon --version` prints `hipfire-daemon <version> <commit>` (the full build commit) and exits. It answers before any tracing, config or GPU work, so it is GPU-free. `hipfire doctor --npu` reads it to name the kernel set (`jit:<commit12>`) when the install holds no kernel-pack manifest.
+
 ### Installing and testing auto on a Strix Halo host (maintainer hardware gate)
 
 After CPU acceptance, install the **same** release CLI/daemon on the Halo host.
